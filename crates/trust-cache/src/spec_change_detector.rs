@@ -8,9 +8,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::FxHashMap;
-
 use sha2::{Digest, Sha256};
+use trust_types::fx::FxHashMap;
 
 use crate::invalidation::{DependencyTracker, InvalidationPlan, plan_invalidation};
 
@@ -372,11 +371,8 @@ mod tests {
         assert!(!empty.has_changes());
 
         // Single-bucket cases: the sum must count each bucket.
-        let only_removed = SpecChangeSummary {
-            modified: vec![],
-            added: vec![],
-            removed: vec!["x".into()],
-        };
+        let only_removed =
+            SpecChangeSummary { modified: vec![], added: vec![], removed: vec!["x".into()] };
         assert_eq!(only_removed.total_changes(), 1);
         assert!(only_removed.has_changes());
     }

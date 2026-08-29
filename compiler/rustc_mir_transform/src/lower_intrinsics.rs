@@ -119,13 +119,32 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             sym::unchecked_shr => BinOp::ShrUnchecked,
                             _ => bug!("unexpected intrinsic"),
                         };
-                        block.statements.push(Statement::new(
-                            terminator.source_info,
-                            StatementKind::Assign(Box::new((
-                                *destination,
-                                Rvalue::BinaryOp(bin_op, Box::new((lhs.node, rhs.node))),
-                            ))),
-                        ));
+                        // Trust: `wrapping_{add,sub,mul}` is where the MODULAR
+                        // identity dies. All three lower onto the very
+                        // `BinOp::{Add,Sub,Mul}` a source-level `+`/`-`/`*`
+                        // lowers to once overflow checks are off, so from here
+                        // on nothing downstream can tell "cannot overflow by
+                        // definition" from "must be proved not to overflow".
+                        // Carry the fact on the statement; the verifier reads it
+                        // to withhold the FALSE no-overflow obligation.
+                        //
+                        // Deliberately NOT the `unchecked_*` arms beside it:
+                        // those are UB on overflow, not modular, and must keep
+                        // their obligation. Nor `three_way_compare`, which is
+                        // not arithmetic at all.
+                        let modular = matches!(
+                            intrinsic.name,
+                            sym::wrapping_add | sym::wrapping_sub | sym::wrapping_mul
+                        );
+                        let assign = StatementKind::Assign(Box::new((
+                            *destination,
+                            Rvalue::BinaryOp(bin_op, Box::new((lhs.node, rhs.node))),
+                        )));
+                        block.statements.push(if modular {
+                            Statement::new_trust_modular_arith(terminator.source_info, assign)
+                        } else {
+                            Statement::new(terminator.source_info, assign)
+                        });
                         terminator.kind = TerminatorKind::Goto { target };
                     }
                     sym::add_with_overflow | sym::sub_with_overflow | sym::mul_with_overflow => {

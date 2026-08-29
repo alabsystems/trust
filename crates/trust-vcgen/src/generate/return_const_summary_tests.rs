@@ -1,12 +1,11 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, Sort,
-    SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan,
+    Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::{
-    build_semantic_guard_map, compute_return_bound_summaries,
-    compute_return_const_set_summaries, compute_return_lower_bound_summaries,
+    build_semantic_guard_map, compute_return_bound_summaries, compute_return_const_set_summaries,
+    compute_return_lower_bound_summaries,
 };
 
 const SMALL_DEN: &str = "test::small_den";
@@ -108,6 +107,7 @@ fn caller_fn() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -182,6 +182,7 @@ fn call_defined_return_site_fails_closed() {
             span: SourceSpan::default(),
             atomic: None,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
         },
     };
@@ -191,6 +192,33 @@ fn call_defined_return_site_fails_closed() {
             && compute_return_bound_summaries(&funcs).is_empty()
             && compute_return_const_set_summaries(&funcs).is_empty(),
         "a call-defined (recursive) return site must fail every summary closed"
+    );
+}
+
+#[test]
+fn tail_call_defined_return_site_fails_closed() {
+    // A TailCall writes the implicit return place.  Treating it as merely an
+    // exit would incorrectly retain the constants from the other arms.
+    let mut func = small_den_fn(true);
+    func.body.blocks[3] = BasicBlock {
+        id: BlockId(3),
+        stmts: vec![],
+        terminator: Terminator::TailCall {
+            func: SMALL_DEN.into(),
+            args: vec![Operand::Copy(Place::local(1))],
+            span: SourceSpan::default(),
+            atomic: None,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
+        },
+    };
+    let funcs = [func];
+    assert!(
+        compute_return_lower_bound_summaries(&funcs).is_empty()
+            && compute_return_bound_summaries(&funcs).is_empty()
+            && compute_return_const_set_summaries(&funcs).is_empty(),
+        "an opaque tail-call return site must fail every const summary closed"
     );
 }
 

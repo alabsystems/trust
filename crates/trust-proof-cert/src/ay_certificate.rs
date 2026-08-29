@@ -922,8 +922,9 @@ asserted q";
 
     #[test]
     fn test_store_ay_certificate_roundtrip() {
-        use crate::{CertificateChain, FunctionHash, ProofCertificate, SolverInfo, VcSnapshot};
         use trust_types::{Formula, ProofStrength, SourceSpan, VcKind, VerificationCondition};
+
+        use crate::{CertificateChain, FunctionHash, ProofCertificate, SolverInfo, VcSnapshot};
 
         let mut store = CertificateStore::new("test-crate");
         let vc = VerificationCondition {
@@ -986,8 +987,9 @@ asserted q";
 
     #[test]
     fn test_get_ay_certificate_empty_trace() {
-        use crate::{CertificateChain, FunctionHash, ProofCertificate, SolverInfo, VcSnapshot};
         use trust_types::{Formula, ProofStrength, SourceSpan, VcKind, VerificationCondition};
+
+        use crate::{CertificateChain, FunctionHash, ProofCertificate, SolverInfo, VcSnapshot};
 
         let mut store = CertificateStore::new("test-crate");
         let vc = VerificationCondition {

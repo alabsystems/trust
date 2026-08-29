@@ -818,6 +818,12 @@ fn configure_cmake(
     if builder.config.llvm_clang_cl.is_some() {
         cflags.push(format!(" --target={target}"));
     }
+    // The ASM lane must mirror the C lane: cmake-rs seeds CMAKE_ASM_FLAGS from
+    // its own PATH-`cc` probe, so a host whose `cc` is clang-flavored injects
+    // clang-only flags (--target=…) that a configured-gcc CMAKE_ASM_COMPILER
+    // rejects. Defining it here suppresses that probe; LLVM's .S files go
+    // through the C compiler, so the C flag set is the right one.
+    cfg.define("CMAKE_ASM_FLAGS", cflags.clone());
     cfg.define("CMAKE_C_FLAGS", cflags);
     let mut cxxflags = ccflags.cxxflags.clone();
     for flag in builder

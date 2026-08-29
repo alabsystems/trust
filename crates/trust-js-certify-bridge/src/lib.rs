@@ -61,8 +61,8 @@ use clean_kernel::name::Name;
 use clean_kernel::{Constructor, Expr, InductiveDecl, InductiveType};
 use sha2::{Digest, Sha256};
 use trust_certify::finite_dfa::{
-    certify_finite_sim, enum_cases_refl_proof, enum_transition_body, recheck_finite_sim,
-    FiniteSimSpec, SimFlavor,
+    FiniteSimSpec, SimFlavor, certify_finite_sim, enum_cases_refl_proof, enum_transition_body,
+    recheck_finite_sim,
 };
 use trust_ir::ProofEvidence;
 
@@ -113,11 +113,7 @@ pub fn ascii_domain() -> InductiveDecl {
     InductiveDecl {
         level_params: vec![],
         num_params: 0,
-        types: vec![InductiveType {
-            name: dom,
-            type_: Expr::type_(),
-            constructors,
-        }],
+        types: vec![InductiveType { name: dom, type_: Expr::type_(), constructors }],
     }
 }
 
@@ -152,13 +148,7 @@ impl CertifiedBuiltin {
     /// the clean kernel (the check an external consumer runs).
     #[must_use]
     pub fn recheck(&self) -> bool {
-        let ProofEvidence::CleanCic {
-            term,
-            context,
-            lineage,
-            ..
-        } = &self.evidence
-        else {
+        let ProofEvidence::CleanCic { term, context, lineage, .. } = &self.evidence else {
             return false;
         };
         recheck_finite_sim(&self.spec, term, context, lineage)
@@ -167,13 +157,7 @@ impl CertifiedBuiltin {
     /// Serialize into a committed [`BuiltinCertificate`].
     #[must_use]
     pub fn to_certificate(&self) -> BuiltinCertificate {
-        let ProofEvidence::CleanCic {
-            term,
-            context,
-            lineage,
-            ..
-        } = &self.evidence
-        else {
+        let ProofEvidence::CleanCic { term, context, lineage, .. } = &self.evidence else {
             unreachable!("CertifiedBuiltin always carries a CleanCic receipt");
         };
         let lineage_hex = to_hex(&lineage.bytes);
@@ -220,9 +204,8 @@ impl CertifiedBuiltin {
     /// return the path.
     pub fn emit_certificate(&self) -> Result<PathBuf, String> {
         let json = self.to_certificate_json()?;
-        let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "certificates", self.meta.cert_filename]
-            .iter()
-            .collect();
+        let path: PathBuf =
+            [env!("CARGO_MANIFEST_DIR"), "certificates", self.meta.cert_filename].iter().collect();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir certificates: {e}"))?;
         }
@@ -261,21 +244,13 @@ fn certify_ascii_table(
 
     let spec = FiniteSimSpec {
         label: meta.label.to_string(),
-        flavor: SimFlavor::EnumCases {
-            domain,
-            impl_def,
-            spec_def,
-        },
+        flavor: SimFlavor::EnumCases { domain, impl_def, spec_def },
     };
 
     match certify_finite_sim(&spec, &term_bytes) {
-        Some(evidence) => Ok(Some(CertifiedBuiltin {
-            meta,
-            evidence,
-            spec,
-            extracted,
-            transcription,
-        })),
+        Some(evidence) => {
+            Ok(Some(CertifiedBuiltin { meta, evidence, spec, extracted, transcription }))
+        }
         None => Ok(None),
     }
 }
@@ -289,7 +264,7 @@ where
     F: Fn(usize) -> String,
     M: Fn(usize, u32) -> Result<u8, String>,
 {
-    use trust_js_interp::{evaluate_case_opts, InterpOutcome};
+    use trust_js_interp::{InterpOutcome, evaluate_case_opts};
     use trust_js_trace::{Completion, ProjectedValue};
 
     let mut table = [0u8; ASCII_DOMAIN];
@@ -311,9 +286,8 @@ where
         let ProjectedValue::Num { v } = value else {
             return Err(format!("code point {i}: completion is not a Number: {value:?}"));
         };
-        let raw: u32 = v
-            .parse()
-            .map_err(|e| format!("code point {i}: unparsable Number {v:?}: {e}"))?;
+        let raw: u32 =
+            v.parse().map_err(|e| format!("code point {i}: unparsable Number {v:?}: {e}"))?;
         *slot = map(i, raw)?;
     }
     Ok(table)
@@ -397,14 +371,15 @@ fn node_candidates() -> Vec<String> {
 fn parse_csv_table(text: &str, engine: &str, bin: &str) -> Result<[u8; ASCII_DOMAIN], String> {
     let parts: Vec<&str> = text.split(',').collect();
     if parts.len() != ASCII_DOMAIN {
-        return Err(format!("{engine} ({bin}) produced {} cells, want {ASCII_DOMAIN}", parts.len()));
+        return Err(format!(
+            "{engine} ({bin}) produced {} cells, want {ASCII_DOMAIN}",
+            parts.len()
+        ));
     }
     let mut table = [0u8; ASCII_DOMAIN];
     for (i, (p, slot)) in parts.iter().zip(table.iter_mut()).enumerate() {
-        let v: u32 = p
-            .trim()
-            .parse()
-            .map_err(|e| format!("{engine} cell {i}: unparsable {p:?}: {e}"))?;
+        let v: u32 =
+            p.trim().parse().map_err(|e| format!("{engine} cell {i}: unparsable {p:?}: {e}"))?;
         if v >= ASCII_DOMAIN as u32 {
             return Err(format!("{engine} cell {i}: out-of-ASCII output {v}"));
         }
@@ -587,8 +562,7 @@ pub const WHITESPACE_ASCII_TRANSCRIPTION: [u8; ASCII_DOMAIN] = {
 
 fn whitespace_meta() -> BuiltinMeta {
     BuiltinMeta {
-        builtin:
-            "String.prototype.trim ASCII whitespace predicate (Byte -> Bool, code points 0..=127)",
+        builtin: "String.prototype.trim ASCII whitespace predicate (Byte -> Bool, code points 0..=127)",
         label: WHITESPACE_OBLIGATION_LABEL,
         goal: "forall (c : Ascii128), Eq Nat (interp_is_ws c) (spec_is_ws c)  -- Bool encoded 0/1",
         codomain: "class predicate (Bool encoded as Nat 0/1)",
@@ -600,10 +574,7 @@ fn whitespace_meta() -> BuiltinMeta {
 
 /// Extract the interpreter's trim-whitespace predicate (0/1) for each ASCII input.
 pub fn extract_interp_whitespace_table() -> Result<[u8; ASCII_DOMAIN], String> {
-    extract_num_table(
-        |i| format!("String.fromCharCode({i}).trim().length"),
-        map_trim_predicate,
-    )
+    extract_num_table(|i| format!("String.fromCharCode({i}).trim().length"), map_trim_predicate)
 }
 
 /// Node's trim-whitespace predicate table (0/1) over the ASCII domain.
@@ -775,11 +746,9 @@ pub const ENCURI_UNRESERVED_ASCII_TRANSCRIPTION: [u8; ASCII_DOMAIN] = {
 
 fn encuri_unreserved_meta() -> BuiltinMeta {
     BuiltinMeta {
-        builtin:
-            "encodeURIComponent unreserved-character predicate (Byte -> Bool, code points 0..=127)",
+        builtin: "encodeURIComponent unreserved-character predicate (Byte -> Bool, code points 0..=127)",
         label: ENCURI_UNRESERVED_OBLIGATION_LABEL,
-        goal:
-            "forall (c : Ascii128), Eq Nat (interp_is_unreserved c) (spec_is_unreserved c)  -- Bool encoded 0/1",
+        goal: "forall (c : Ascii128), Eq Nat (interp_is_unreserved c) (spec_is_unreserved c)  -- Bool encoded 0/1",
         codomain: "class predicate (Bool encoded as Nat 0/1)",
         transcription_sha256: ENCURI_UNRESERVED_TRANSCRIPTION_SHA256,
         honesty_note: ENCURI_UNRESERVED_HONESTY_NOTE,

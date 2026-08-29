@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // stderr parsing: drive the compiler's JSON transport (trust_types::TRANSPORT_PREFIX)
 // out of stderr lines and into VerificationResult records, with a lossy fallback for
 // schema drift and a small diagnostic-level classifier for non-transport lines.
@@ -2949,10 +2950,7 @@ fn add_transport_result_counts(
 ) {
     counts.total += rows.len();
     for (index, result) in rows.iter().enumerate() {
-        if transport_rows
-            .get(index)
-            .is_some_and(|transport| transport.outcome.is_skipped())
-        {
+        if transport_rows.get(index).is_some_and(|transport| transport.outcome.is_skipped()) {
             counts.unknown += 1;
             counts.skipped += 1;
             continue;
@@ -6767,7 +6765,10 @@ mod tests {
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
-            results: vec![transport_row(trust_types::Outcome::Timeout), transport_row(trust_types::Outcome::Skipped)],
+            results: vec![
+                transport_row(trust_types::Outcome::Timeout),
+                transport_row(trust_types::Outcome::Skipped),
+            ],
             proved: 0,
             failed: 0,
             unknown: 2,
@@ -6817,7 +6818,10 @@ mod tests {
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
-            results: vec![transport_row(trust_types::Outcome::Failed), transport_row(trust_types::Outcome::Proved)],
+            results: vec![
+                transport_row(trust_types::Outcome::Failed),
+                transport_row(trust_types::Outcome::Proved),
+            ],
             proved: 1,
             failed: 1,
             unknown: 0,
@@ -6866,23 +6870,24 @@ mod tests {
 
     #[test]
     fn crate_summary_uses_raw_failed_and_unknown_buckets_across_normalization() {
-        let full_verifier_row = |outcome: trust_types::Outcome, status: trust_types::TransportProofStatus| {
-            let mut row = transport_row(outcome);
-            row.solver = "trust-full-verifier".to_string();
-            row.proof_evidence = Some(trust_types::TransportProofEvidence {
-                suite: "trust-wp".to_string(),
-                backend: "trust-full-verifier".to_string(),
-                request_id: Some(format!("request-{outcome}")),
-                proof_id: Some(format!("proof-{outcome}")),
-                native_id: None,
-                status,
-                strength: None,
-                evidence: None,
-                artifacts: Vec::new(),
-                diagnostics: Vec::new(),
-            });
-            row
-        };
+        let full_verifier_row =
+            |outcome: trust_types::Outcome, status: trust_types::TransportProofStatus| {
+                let mut row = transport_row(outcome);
+                row.solver = "trust-full-verifier".to_string();
+                row.proof_evidence = Some(trust_types::TransportProofEvidence {
+                    suite: "trust-wp".to_string(),
+                    backend: "trust-full-verifier".to_string(),
+                    request_id: Some(format!("request-{outcome}")),
+                    proof_id: Some(format!("proof-{outcome}")),
+                    native_id: None,
+                    status,
+                    strength: None,
+                    evidence: None,
+                    artifacts: Vec::new(),
+                    diagnostics: Vec::new(),
+                });
+                row
+            };
         // These intentionally cross buckets in Targo's report projection:
         // raw failed + Proved evidence is conservatively Unknown, while raw
         // proved + Failed evidence is Failed. The compiler terminal summary
@@ -6895,8 +6900,14 @@ mod tests {
                 primary_package: true,
                 verification_session: TEST_SESSION.to_string(),
                 results: vec![
-                    full_verifier_row(trust_types::Outcome::Failed, trust_types::TransportProofStatus::Proved),
-                    full_verifier_row(trust_types::Outcome::Proved, trust_types::TransportProofStatus::Failed),
+                    full_verifier_row(
+                        trust_types::Outcome::Failed,
+                        trust_types::TransportProofStatus::Proved,
+                    ),
+                    full_verifier_row(
+                        trust_types::Outcome::Proved,
+                        trust_types::TransportProofStatus::Failed,
+                    ),
                 ],
                 proved: 1,
                 failed: 1,

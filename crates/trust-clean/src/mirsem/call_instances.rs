@@ -910,7 +910,10 @@ pub(super) fn int_ty_bound(width: u32, signed: bool) -> Option<(i128, i128)> {
 /// The recognizer requires `bad_uses == 0 && bare_uses == 1` so `_t` is
 /// consumed EXACTLY ONCE, as a plain value, with no aliasing — the fail-closed
 /// single-use / no-alias discipline the composed certificate rests on.
-pub(super) fn two_call_chain_intermediate_uses(body: &trust_types::VerifiableBody, t: usize) -> (usize, usize) {
+pub(super) fn two_call_chain_intermediate_uses(
+    body: &trust_types::VerifiableBody,
+    t: usize,
+) -> (usize, usize) {
     use trust_types::{Statement, Terminator};
     let mut bare = 0usize;
     let mut bad = 0usize;
@@ -965,7 +968,12 @@ pub(super) fn tcc_scan_place_projs(p: &trust_types::Place, t: usize, bad: &mut u
 /// Scan one operand for uses of `t`: a BARE (unprojected) `Copy`/`Move` of `_t`
 /// is a plain value read (`bare`); a PROJECTED `Copy`/`Move` of `_t` (`_t.0`) or
 /// an `Index`-projection referencing `t` is out of fragment (`bad`).
-pub(super) fn tcc_scan_operand(op: &trust_types::Operand, t: usize, bare: &mut usize, bad: &mut usize) {
+pub(super) fn tcc_scan_operand(
+    op: &trust_types::Operand,
+    t: usize,
+    bare: &mut usize,
+    bad: &mut usize,
+) {
     if let trust_types::Operand::Copy(p) | trust_types::Operand::Move(p) = op {
         if p.local == t {
             if p.projections.is_empty() {
@@ -981,7 +989,12 @@ pub(super) fn tcc_scan_operand(op: &trust_types::Operand, t: usize, bare: &mut u
 /// Scan one rvalue for uses of `t`: operand reads via [`tcc_scan_operand`], and
 /// any aliasing/opaque place mention (`&_t`, `&raw _t`, `Discriminant(_t)`,
 /// `Len(_t)`, `CopyForDeref(_t)`) as a (bad) use.
-pub(super) fn tcc_scan_rvalue(rv: &trust_types::Rvalue, t: usize, bare: &mut usize, bad: &mut usize) {
+pub(super) fn tcc_scan_rvalue(
+    rv: &trust_types::Rvalue,
+    t: usize,
+    bare: &mut usize,
+    bad: &mut usize,
+) {
     use trust_types::Rvalue;
     match rv {
         Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::Repeat(op, _) | Rvalue::UnaryOp(_, op) => {
@@ -1054,7 +1067,11 @@ pub(crate) fn sem_two_call_chain_of_mir(
         matches!(body.locals.get(local).map(|l| &l.ty), Some(Ty::Int { .. }) | Some(Ty::Bool))
     };
 
-    if body.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(s, trust_types::Statement::Unsupported { .. }))
+    if body
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .any(|s| matches!(s, trust_types::Statement::Unsupported { .. }))
     {
         return None;
     }
@@ -1266,11 +1283,7 @@ pub fn two_call_chain_adequacy_witness(
     if !matches!(outer_verdict, RefinementVerdict::ProvenModulo3) {
         return None;
     }
-    Some(TwoCallChainAdequacyCertificate {
-        chain: chain.clone(),
-        inner_verdict,
-        outer_verdict,
-    })
+    Some(TwoCallChainAdequacyCertificate { chain: chain.clone(), inner_verdict, outer_verdict })
 }
 
 /// Recognize the CALL-THEN-PROJECT shape — see the section doc above. Mirrors
@@ -1309,7 +1322,8 @@ pub(crate) fn sem_call_then_project_of_mir(
         matches!(body.locals.get(local).map(|l| &l.ty), Some(Ty::Int { .. }) | Some(Ty::Bool))
     };
 
-    if body.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(s, Statement::Unsupported { .. })) {
+    if body.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(s, Statement::Unsupported { .. }))
+    {
         return None;
     }
 
@@ -1440,12 +1454,8 @@ pub(crate) fn sem_call_then_project_of_mir(
         _ => None,
     })?;
     // Count ALL writes to `_0` across the whole body (not just the Return block).
-    let writes_0_total = body
-        .blocks
-        .iter()
-        .flat_map(|b| &b.stmts)
-        .filter(|s| stmt_writes_local(s, 0))
-        .count();
+    let writes_0_total =
+        body.blocks.iter().flat_map(|b| &b.stmts).filter(|s| stmt_writes_local(s, 0)).count();
     if writes_0_total != 1 {
         return None;
     }
@@ -1474,7 +1484,10 @@ pub(crate) fn sem_call_then_project_of_mir(
         return None;
     }
 
-    Some(SemCallThenProject { call: SemCallReturn { callee: resolved.to_string(), callee_id, args: sem_args }, field })
+    Some(SemCallThenProject {
+        call: SemCallReturn { callee: resolved.to_string(), callee_id, args: sem_args },
+        field,
+    })
 }
 
 /// Check the per-call CALL-THEN-PROJECT instance against the real clean-kernel.
@@ -1491,7 +1504,8 @@ pub(super) fn call_then_project_instance_verdict(
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
     };
-    if let Err(e) = register_call_inductive(&mut env).and_then(|()| register_call_result(&mut env)) {
+    if let Err(e) = register_call_inductive(&mut env).and_then(|()| register_call_result(&mut env))
+    {
         return RefinementVerdict::KernelRejected(e);
     }
     let lemma_ty = call_contract_type(None);
@@ -1499,7 +1513,9 @@ pub(super) fn call_then_project_instance_verdict(
     {
         let tc = TypeChecker::new(&env);
         if let Err(e) = tc.check_type(&lemma_proof, &lemma_ty) {
-            return RefinementVerdict::KernelRejected(format!("callRefinesContract check_type: {e:?}"));
+            return RefinementVerdict::KernelRejected(format!(
+                "callRefinesContract check_type: {e:?}"
+            ));
         }
     }
     if let Err(e) = env.add_decl(Declaration::Theorem {
@@ -1511,7 +1527,9 @@ pub(super) fn call_then_project_instance_verdict(
         return RefinementVerdict::KernelRejected(format!("add callRefinesContract: {e:?}"));
     }
     let Some(call_arg) = proj.call.args.first() else {
-        return RefinementVerdict::KernelRejected("call-then-project shape has no modeled argument".to_string());
+        return RefinementVerdict::KernelRejected(
+            "call-then-project shape has no modeled argument".to_string(),
+        );
     };
     let field_key = int_lit(i128::from(proj.field));
     let wrap: Box<dyn Fn(Expr) -> Expr> =
@@ -1522,7 +1540,9 @@ pub(super) fn call_then_project_instance_verdict(
     {
         let tc = TypeChecker::new(&env);
         if let Err(e) = tc.check_type(&inst_proof, &inst_ty) {
-            return RefinementVerdict::KernelRejected(format!("callThenProjectInstance check_type: {e:?}"));
+            return RefinementVerdict::KernelRejected(format!(
+                "callThenProjectInstance check_type: {e:?}"
+            ));
         }
     }
     let name = Name::from_string(MIRSEM_CALL_THEN_PROJECT_INSTANCE);
@@ -1541,7 +1561,9 @@ pub(super) fn call_then_project_instance_verdict(
             names.sort();
             RefinementVerdict::Residue(names)
         }
-        None => RefinementVerdict::KernelRejected("callThenProjectInstance decl not found".to_string()),
+        None => {
+            RefinementVerdict::KernelRejected("callThenProjectInstance decl not found".to_string())
+        }
     }
 }
 
@@ -1554,9 +1576,10 @@ pub fn call_then_project_adequacy_witness(
     proj: &SemCallThenProject,
 ) -> Option<CallThenProjectAdequacyCertificate> {
     match call_then_project_instance_verdict(proj, None) {
-        RefinementVerdict::ProvenModulo3 => {
-            Some(CallThenProjectAdequacyCertificate { proj: proj.clone(), verdict: RefinementVerdict::ProvenModulo3 })
-        }
+        RefinementVerdict::ProvenModulo3 => Some(CallThenProjectAdequacyCertificate {
+            proj: proj.clone(),
+            verdict: RefinementVerdict::ProvenModulo3,
+        }),
         _ => None,
     }
 }
@@ -1574,7 +1597,9 @@ pub fn check_mutual_call_contracts() -> RefinementVerdict {
     check_mutual_call_contracts_inner(None)
 }
 
-pub(super) fn check_mutual_call_contracts_inner(claimed_concl_post: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_mutual_call_contracts_inner(
+    claimed_concl_post: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Rust-owned benchmark runners for Trust evidence surfaces.
 //
 // The program-index runner intentionally mirrors the existing declarative
@@ -6303,7 +6304,11 @@ fn run_runtime_slot(
     insert_optional_u64(&mut row, "run_stderr_bytes", Some(stderr_bytes));
     insert_optional_str(&mut row, "run_stdout_sha256", Some(stdout_sha256));
     insert_optional_str(&mut row, "run_stderr_sha256", Some(stderr_sha256));
-    insert_str(&mut row, "run_stderr_normalized_sha256", trust_types::digest::stable_sha256_hex(normalized_stderr.as_bytes()));
+    insert_str(
+        &mut row,
+        "run_stderr_normalized_sha256",
+        trust_types::digest::stable_sha256_hex(normalized_stderr.as_bytes()),
+    );
     insert_str(&mut row, "run_stderr_normalization", "rust-panic-thread-id");
     row.insert(
         "run_stderr_normalized_differs_from_raw".to_string(),
@@ -7625,7 +7630,6 @@ fn file_sha256(path: &Path) -> std::io::Result<String> {
     trust_types::digest::stable_sha256_hex_reader(&mut file)
 }
 
-
 fn update_digest_field(hasher: &mut Sha256, domain: &[u8], bytes: &[u8]) {
     hasher.update((domain.len() as u64).to_be_bytes());
     hasher.update(domain);
@@ -7658,8 +7662,6 @@ fn digest_json_rows<T: Serialize>(
     }
     Ok(trust_types::digest::lowercase_hex(hasher.finalize().as_slice()))
 }
-
-
 
 fn path_for_report(path: &Path, repo_root: &Path) -> String {
     path.strip_prefix(repo_root)

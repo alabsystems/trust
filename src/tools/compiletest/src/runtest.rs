@@ -2578,6 +2578,17 @@ impl<'test> TestCx<'test> {
         {
             normalized = normalized.replace("try `trustc --explain", "try `rustc --explain");
         }
+        // (d) Trust: the solver memory guard (`trust-router/src/memory_guard.rs`)
+        //     prints an RSS-threshold telemetry line straight to stderr whenever
+        //     the in-process solver crosses 75% of its memory limit. Whether it
+        //     fires depends on ambient process RSS — machine state, not program
+        //     semantics — so it can never be a legitimate part of a pinned UI
+        //     baseline and is stripped before comparison (measured flaking
+        //     wrapping_refutation_release_identity across otherwise-identical
+        //     runs, 2026-08-22).
+        normalized = static_regex!(r"(?m)^Trust memory warning: .*\n")
+            .replace_all(&normalized, "")
+            .into_owned();
 
         normalized = Self::normalize_platform_differences(&normalized);
 

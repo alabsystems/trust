@@ -38,9 +38,9 @@ use std::path::{Path, PathBuf};
 
 use trust_clean::trustir_anchor::RefinementVerdict;
 use trust_clean::trustir_fold::{
+    DumpBodies, FoldCmpOp, FoldDecline, FoldExpr, FoldFieldKind, FoldSort,
     check_structural_fold_refinement, check_structural_fold_refinement_claimed, probe_arm_rhs,
-    sem_structural_fold_shape_of_with_bodies, DumpBodies, FoldCmpOp, FoldDecline, FoldExpr,
-    FoldFieldKind, FoldSort,
+    sem_structural_fold_shape_of_with_bodies,
 };
 use trust_types::{
     AssertMessage, BinOp, ConstValue, Operand, Rvalue, Statement, Terminator, Ty, UnOp,
@@ -88,9 +88,9 @@ fn bodies_of(funcs: &[VerifiableFunction]) -> DumpBodies {
 }
 
 fn is_direct_self_recursive(f: &VerifiableFunction) -> bool {
-    f.body.blocks.iter().any(|b| {
-        matches!(&b.terminator, Terminator::Call { func: callee, .. } if *callee == f.def_path)
-    })
+    f.body.blocks.iter().any(
+        |b| matches!(&b.terminator, Terminator::Call { func: callee, .. } if *callee == f.def_path),
+    )
 }
 
 fn fold_verdicts(
@@ -113,11 +113,8 @@ fn fold_verdicts(
 fn corpus_recursion_population() {
     let funcs = load_all();
     assert_eq!(funcs.len(), 90, "expected all 90 core-module dumps to load");
-    let rec: Vec<&str> = funcs
-        .iter()
-        .filter(|f| is_direct_self_recursive(f))
-        .map(|f| f.def_path.as_str())
-        .collect();
+    let rec: Vec<&str> =
+        funcs.iter().filter(|f| is_direct_self_recursive(f)).map(|f| f.def_path.as_str()).collect();
     assert_eq!(rec.len(), 18, "direct-self-recursive population drifted: {rec:?}");
     for expected in [
         "term::Term::max_depth",
@@ -197,10 +194,7 @@ fn has_free_variables_helper_certifies_kernel_witness() {
     // App(t) => f(t.0, depth) || f(t.1, depth) — TWO slots from ONE
     // Box<(Term, Term)> MIR field (G2 per-component IHs).
     assert_eq!(shape.variants[2].name, "App");
-    assert_eq!(
-        shape.variants[2].fields,
-        vec![FoldFieldKind::Recursive, FoldFieldKind::Recursive]
-    );
+    assert_eq!(shape.variants[2].fields, vec![FoldFieldKind::Recursive, FoldFieldKind::Recursive]);
     assert_eq!(
         shape.variants[2].arm,
         FoldExpr::Cond(
@@ -391,8 +385,9 @@ fn box_field_lowering_chain() {
 /// The align block's index (first Misaligned assert) + its null partner.
 fn first_ubcheck_pair(f: &VerifiableFunction) -> (usize, usize) {
     for (i, b) in f.body.blocks.iter().enumerate() {
-        if let Terminator::Assert { msg: AssertMessage::MisalignedPointerDereference, target, .. } =
-            &b.terminator
+        if let Terminator::Assert {
+            msg: AssertMessage::MisalignedPointerDereference, target, ..
+        } = &b.terminator
         {
             let null_idx = f
                 .body
@@ -481,10 +476,9 @@ fn forgery_dropped_null_negation_declines_box_deref_drift() {
 /// field is not `std::ptr::Unique`). The G1a walk is a whole-chain pin.
 #[test]
 fn forgery_non_box_unique_walk_declines() {
-    let raw = std::fs::read_to_string(
-        corpus_dir().join("term__Term__has_free_variables_helper.json"),
-    )
-    .expect("read dump");
+    let raw =
+        std::fs::read_to_string(corpus_dir().join("term__Term__has_free_variables_helper.json"))
+            .expect("read dump");
 
     // (a) `Box` renamed: the fields no longer classify as recursive Box
     // children, so the fingerprinted idiom has no pinned-Box provenance.

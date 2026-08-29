@@ -15,13 +15,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
 use std::rc::Rc;
+
 use trust_js_parse::ast::{DeclKind, Expr, ForInit, Func, Pat, Stmt};
 use trust_js_value::{
-    to_integer_or_infinity, units_from_str, ErrKind, FnData, JsValue, NativeFn, ObjId, ObjKind,
-    PropKey, Units,
+    ErrKind, FnData, JsValue, NativeFn, ObjId, ObjKind, PropKey, Units, to_integer_or_infinity,
+    units_from_str,
 };
+
+use crate::interp::{Abrupt, ERes, Interp};
 
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 /// Comparator-sort element cap (the consistency matrix is O(n²) calls).
@@ -66,11 +68,7 @@ impl Interp {
 
     fn delete_property_or_throw(&mut self, oid: ObjId, key: &PropKey) -> Result<(), Abrupt> {
         let ok = self.delete_prop(oid, key)?;
-        if ok {
-            Ok(())
-        } else {
-            Err(self.throw_type_error())
-        }
+        if ok { Ok(()) } else { Err(self.throw_type_error()) }
     }
 
     /// Relative index clamp (slice family): -∞→0, negative→len+n (≥0),
@@ -157,11 +155,7 @@ impl Interp {
                 if n == f64::NEG_INFINITY {
                     return Ok(JsValue::Num(-1.0));
                 }
-                let mut k = if n >= 0.0 {
-                    n.min(u2f(len) - 1.0)
-                } else {
-                    u2f(len) + n
-                };
+                let mut k = if n >= 0.0 { n.min(u2f(len) - 1.0) } else { u2f(len) + n };
                 while k >= 0.0 {
                     self.charge_loop()?;
                     let key = key_f64(k);
@@ -235,11 +229,8 @@ impl Interp {
                 let cb = arg(0);
                 self.require_callable(&cb)?;
                 let this_arg = arg(1);
-                let order: Box<dyn Iterator<Item = u64>> = if last {
-                    Box::new((0..len).rev())
-                } else {
-                    Box::new(0..len)
-                };
+                let order: Box<dyn Iterator<Item = u64>> =
+                    if last { Box::new((0..len).rev()) } else { Box::new(0..len) };
                 for k in order {
                     self.charge_loop()?;
                     let v = self.arr_get(oid, k)?;
@@ -252,11 +243,7 @@ impl Interp {
                         return Ok(if index { JsValue::Num(u2f(k)) } else { v });
                     }
                 }
-                Ok(if index {
-                    JsValue::Num(-1.0)
-                } else {
-                    JsValue::Undefined
-                })
+                Ok(if index { JsValue::Num(-1.0) } else { JsValue::Undefined })
             }
             N::ArrayFill => {
                 let oid = self.to_object(&this)?;
@@ -361,11 +348,8 @@ impl Interp {
                 if len == 0 && !has_init {
                     return Err(self.throw_type_error());
                 }
-                let order: Box<dyn Iterator<Item = u64>> = if right {
-                    Box::new((0..len).rev())
-                } else {
-                    Box::new(0..len)
-                };
+                let order: Box<dyn Iterator<Item = u64>> =
+                    if right { Box::new((0..len).rev()) } else { Box::new(0..len) };
                 let mut iter = order;
                 let mut acc = if has_init {
                     arg(1)
@@ -407,17 +391,11 @@ impl Interp {
                     self.charge_loop()?;
                     let upper = len - lower - 1;
                     let lower_exists = self.arr_has(oid, lower)?;
-                    let lower_value = if lower_exists {
-                        Some(self.arr_get(oid, lower)?)
-                    } else {
-                        None
-                    };
+                    let lower_value =
+                        if lower_exists { Some(self.arr_get(oid, lower)?) } else { None };
                     let upper_exists = self.arr_has(oid, upper)?;
-                    let upper_value = if upper_exists {
-                        Some(self.arr_get(oid, upper)?)
-                    } else {
-                        None
-                    };
+                    let upper_value =
+                        if upper_exists { Some(self.arr_get(oid, upper)?) } else { None };
                     match (lower_value, upper_value) {
                         (Some(lv), Some(uv)) => {
                             self.arr_set(oid, lower, uv)?;
@@ -512,11 +490,7 @@ impl Interp {
                 let out = self.array_create_checked(len)?;
                 for k in 0..len {
                     self.charge_loop()?;
-                    let v = if u2f(k) == actual {
-                        value.clone()
-                    } else {
-                        self.arr_get(oid, k)?
-                    };
+                    let v = if u2f(k) == actual { value.clone() } else { self.arr_get(oid, k)? };
                     self.create_data_property_or_throw(out, &k.to_string(), v)?;
                 }
                 Ok(JsValue::Obj(out))
@@ -606,9 +580,7 @@ impl Interp {
         }
         // Otherwise GetMethod(items, @@iterator): a modeled hit drives the
         // full iterator protocol (S1e); a danger hop refuses inside get_method.
-        let ikey = PropKey::Sym(trust_js_value::SymId::WellKnown(
-            trust_js_value::WkSym::Iterator,
-        ));
+        let ikey = PropKey::Sym(trust_js_value::SymId::WellKnown(trust_js_value::WkSym::Iterator));
         if let Some(using) = self.get_method(&items, &ikey)? {
             let a = self.array_from_new_target(c)?;
             let iterator = self.call_value(&using, items.clone(), vec![])?;
@@ -616,11 +588,7 @@ impl Interp {
                 return Err(self.throw_type_error());
             };
             let next = self.get_from_object(io, &PropKey::from_str("next"), iterator.clone())?;
-            let it = crate::destr::FastIter::User {
-                iter: io,
-                next,
-                done: false,
-            };
+            let it = crate::destr::FastIter::User { iter: io, next, done: false };
             return self.array_from_iterate(it, a, mapping, &mapfn, &this_arg);
         }
         // Array-like path (no @@iterator anywhere on a modeled chain).
@@ -629,7 +597,8 @@ impl Interp {
         }
         let array_like = self.to_object(&items)?;
         let len = self.length_of_array_like(array_like)?;
-        let a = if self.is_constructor(c) && !matches!(c, JsValue::Obj(o) if *o == self.intr.array_ctor)
+        let a = if self.is_constructor(c)
+            && !matches!(c, JsValue::Obj(o) if *o == self.intr.array_ctor)
         {
             let av = self.construct(c, vec![JsValue::Num(u2f(len))], None)?;
             let JsValue::Obj(ao) = av else {
@@ -656,7 +625,8 @@ impl Interp {
     /// Array.of (23.1.2.3).
     fn array_of(&mut self, c: &JsValue, args: &[JsValue]) -> ERes {
         let len = args.len() as u64;
-        let a = if self.is_constructor(c) && !matches!(c, JsValue::Obj(o) if *o == self.intr.array_ctor)
+        let a = if self.is_constructor(c)
+            && !matches!(c, JsValue::Obj(o) if *o == self.intr.array_ctor)
         {
             let av = self.construct(c, vec![JsValue::Num(u2f(len))], None)?;
             let JsValue::Obj(ao) = av else {
@@ -730,11 +700,8 @@ impl Interp {
     fn array_splice(&mut self, this: &JsValue, args: &[JsValue]) -> ERes {
         let oid = self.to_object(this)?;
         let len = self.length_of_array_like(oid)?;
-        let rel_start = if args.is_empty() {
-            0.0
-        } else {
-            to_integer_or_infinity(self.to_number(&args[0])?)
-        };
+        let rel_start =
+            if args.is_empty() { 0.0 } else { to_integer_or_infinity(self.to_number(&args[0])?) };
         let actual_start = self.rel_index(rel_start, len);
         let (insert_count, actual_delete): (u64, u64) = if args.is_empty() {
             (0, 0)
@@ -769,11 +736,7 @@ impl Interp {
             }
         }
         self.set_len(a, actual_delete)?;
-        let items: Vec<JsValue> = if args.len() > 2 {
-            args[2..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let items: Vec<JsValue> = if args.len() > 2 { args[2..].to_vec() } else { Vec::new() };
         let item_count = items.len() as u64;
         if item_count < actual_delete {
             let mut k = actual_start;
@@ -823,11 +786,8 @@ impl Interp {
     fn array_to_spliced(&mut self, this: &JsValue, args: &[JsValue]) -> ERes {
         let oid = self.to_object(this)?;
         let len = self.length_of_array_like(oid)?;
-        let rel_start = if args.is_empty() {
-            0.0
-        } else {
-            to_integer_or_infinity(self.to_number(&args[0])?)
-        };
+        let rel_start =
+            if args.is_empty() { 0.0 } else { to_integer_or_infinity(self.to_number(&args[0])?) };
         let actual_start = self.rel_index(rel_start, len);
         let (insert_count, actual_skip): (u64, u64) = if args.is_empty() {
             (0, 0)
@@ -931,7 +891,11 @@ impl Interp {
     }
 
     /// The exactness-gated sort core (see the module header).
-    fn sort_items(&mut self, items: Vec<JsValue>, comparator: &JsValue) -> Result<Vec<JsValue>, Abrupt> {
+    fn sort_items(
+        &mut self,
+        items: Vec<JsValue>,
+        comparator: &JsValue,
+    ) -> Result<Vec<JsValue>, Abrupt> {
         if items.len() <= 1 {
             return Ok(items);
         }
@@ -939,9 +903,7 @@ impl Interp {
             return self.sort_default(items);
         }
         // User comparator: provably-pure comparator + primitive elements.
-        if items
-            .iter()
-            .any(|v| matches!(v, JsValue::Obj(_) | JsValue::Sym(_) | JsValue::BigInt(_)))
+        if items.iter().any(|v| matches!(v, JsValue::Obj(_) | JsValue::Sym(_) | JsValue::BigInt(_)))
         {
             return Err(Abrupt::Fatal(
                 "comparator sort over non-primitive elements (coercion order engine-specific)"
@@ -977,7 +939,7 @@ impl Interp {
                     Err(Abrupt::Throw(_)) => {
                         return Err(Abrupt::Fatal(
                             "throwing comparator (pair coverage engine-specific)".to_string(),
-                        ))
+                        ));
                     }
                     Err(e) => return Err(e),
                 };
@@ -1029,10 +991,8 @@ impl Interp {
                     .to_string(),
             ));
         }
-        let non_undef: Vec<&JsValue> = items
-            .iter()
-            .filter(|v| !matches!(v, JsValue::Undefined))
-            .collect();
+        let non_undef: Vec<&JsValue> =
+            items.iter().filter(|v| !matches!(v, JsValue::Undefined)).collect();
         if non_undef.len() >= 2 && non_undef.iter().any(|v| matches!(v, JsValue::Sym(_))) {
             // Any comparison involving a symbol runs ToString(symbol).
             return Err(self.throw_type_error());
@@ -1167,27 +1127,22 @@ fn pure_stmt(s: &Stmt, locals: &[String]) -> bool {
         Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
             pure_expr(test, locals) && pure_stmt(body, locals)
         }
-        Stmt::For {
-            init,
-            test,
-            update,
-            body,
-        } => {
+        Stmt::For { init, test, update, body } => {
             let init_ok = match init {
                 None => true,
                 Some(ForInit::Expr(e)) => pure_expr(e, locals),
-                Some(ForInit::Decl(_, decls)) => decls
-                    .iter()
-                    .all(|(_, e)| e.as_ref().is_none_or(|e| pure_expr(e, locals))),
+                Some(ForInit::Decl(_, decls)) => {
+                    decls.iter().all(|(_, e)| e.as_ref().is_none_or(|e| pure_expr(e, locals)))
+                }
             };
             init_ok
                 && test.as_ref().is_none_or(|e| pure_expr(e, locals))
                 && update.as_ref().is_none_or(|e| pure_expr(e, locals))
                 && pure_stmt(body, locals)
         }
-        Stmt::Decl { decls, .. } => decls
-            .iter()
-            .all(|(_, e)| e.as_ref().is_none_or(|e| pure_expr(e, locals))),
+        Stmt::Decl { decls, .. } => {
+            decls.iter().all(|(_, e)| e.as_ref().is_none_or(|e| pure_expr(e, locals)))
+        }
         _ => false,
     }
 }

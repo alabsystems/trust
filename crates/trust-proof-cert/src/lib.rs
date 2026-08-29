@@ -145,6 +145,13 @@ pub use generate::{
     check_generated_record_integrity, generate_certificate_record,
     generate_certificate_record_with_env,
 };
+// ProofBundle format re-exports.
+pub use proof_bundle::{
+    AssumptionSet, CodegenCertificate, CodegenOption, DependencyRef, EnvironmentFingerprint,
+    FunctionCertificate, PROOF_BUNDLE_VERSION, PanicStrategy, ProofBundle, ProofBundleBuilder,
+    ProvenArtifact, RecordInventory, ReportedAssurance, SelfCertLevel, SelfCertificate,
+    SolverVersion, TransvalCertificate, TrustAssumption, TrustAssumptionLevel,
+};
 pub use proof_replay::{
     ProofStep as ReplayProofStep, ReplayAuditEntry, ReplayAuditLog, ReplayConfig, ReplayEngine,
     ReplayError, ReplayErrorKind, ReplayResult, StepKind, StepVerdict,
@@ -163,13 +170,6 @@ pub use verifier::{
     CertificateIntegrityInspector, CertificateIntegrityReport, CertificateIntegrityResult,
     IntegrityCheckResult, check_certificate_integrity, inspect_certificate_integrity,
     inspect_certificate_records,
-};
-// ProofBundle format re-exports.
-pub use proof_bundle::{
-    AssumptionSet, CodegenCertificate, CodegenOption, DependencyRef, EnvironmentFingerprint,
-    FunctionCertificate, PROOF_BUNDLE_VERSION, PanicStrategy, ProofBundle, ProofBundleBuilder,
-    ProvenArtifact, RecordInventory, ReportedAssurance, SelfCertLevel, SelfCertificate,
-    SolverVersion, TransvalCertificate, TrustAssumption, TrustAssumptionLevel,
 };
 #[cfg(test)]
 mod tests {
@@ -844,10 +844,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod proptest_cert {
-        use super::*;
         use proptest::prelude::*;
-
         use trust_types::{AssuranceLevel, ProofEvidence, ProofStrength, ReasoningKind, SmtTheory};
+
+        use super::*;
 
         fn arb_smt_theory() -> impl Strategy<Value = SmtTheory> {
             prop_oneof![

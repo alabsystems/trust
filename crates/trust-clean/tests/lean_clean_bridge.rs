@@ -624,8 +624,7 @@ fn bridge_gate_default_on() {
             assert_eq!(summary.cast_fail_closed_controls, 1, "one Cast forgery probe rejected");
 
             assert_eq!(
-                summary.stepinst_binop_bridged,
-                1,
+                summary.stepinst_binop_bridged, 1,
                 "spot stepInst-BinOp set: Add only: {:?}",
                 summary.stepinst_binop_pinned_list
             );
@@ -954,6 +953,53 @@ fn bridge_gate_tampered_olean_fails_closed() {
         "expected ShaMismatch, got: {err:?}"
     );
     std::fs::remove_dir_all(&tampered).ok();
+}
+
+/// NEGATIVE CONTROL — a vendored tree that does not cover THIS platform must
+/// fail closed, never silently verify some other platform's bytes.
+///
+/// Schema v2 partitions artifacts by build platform, because two platforms
+/// genuinely disagree about a couple of Lean-core oleans. The dangerous
+/// failure mode is not a missing file — it is a tree that looks complete
+/// because another platform populated it. This drives the manifest to declare
+/// only a platform we are definitely not running on, and asserts the gate
+/// refuses rather than falling through to the shared table.
+#[test]
+fn bridge_gate_foreign_platform_fails_closed() {
+    let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+    let foreign = temp_dir("foreign-platform");
+    copy_dir(&config.trustir_olean_dir, &foreign);
+
+    // Keep [files] intact and replace the whole platform section with a single
+    // triple no host can match, so the ONLY defect is platform coverage.
+    let manifest_path = foreign.join("MANIFEST.toml");
+    let text = std::fs::read_to_string(&manifest_path).expect("read manifest");
+    let head = match text.find("[platforms.") {
+        Some(i) => text[..i].to_string(),
+        None => text.clone(),
+    };
+    std::fs::write(
+        &manifest_path,
+        format!(
+            "{head}[platforms.\"nonexistent-arch-unknown-nonexistent-os\"]\n\
+             lean_version = \"Lean (version 4.8.0, nonexistent, commit 0, Release)\"\n\
+             built_on = \"1970-01-01\"\n"
+        ),
+    )
+    .expect("write manifest");
+
+    let commit = manifest_commit(&config.trustir_olean_dir);
+    let foreign_config = BridgeGateConfig {
+        trustir_olean_dir: foreign.clone(),
+        expected_trustir_commit: Some(commit),
+        ..config
+    };
+    let err = run_bridge_gate(&foreign_config).expect_err("foreign-only platform must fail closed");
+    assert!(
+        matches!(err, BridgeGateError::PlatformNotVendored { .. }),
+        "expected PlatformNotVendored, got: {err:?}"
+    );
+    std::fs::remove_dir_all(&foreign).ok();
 }
 
 /// NEGATIVE CONTROL — a missing vendored artifact must fail closed.

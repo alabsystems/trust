@@ -226,9 +226,8 @@ fn eval_binop(l: i128, op: BinOp, r: i128) -> Option<i128> {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::SymexError;
-
     use super::*;
+    use crate::error::SymexError;
 
     #[test]
     fn test_state_concrete_eval_addition() {

@@ -14,9 +14,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::{FxHashMap, FxHashSet};
-
 use sha2::{Digest, Sha256};
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{Formula, Symbol, VerificationCondition, VerificationResult};
 
 use crate::independence::{ConstraintIndependence, free_variables, partition_constraints};

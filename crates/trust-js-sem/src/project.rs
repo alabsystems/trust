@@ -10,11 +10,13 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::collections::HashMap;
+
+use trust_js_trace::{ProjectedValue, PropKey, ThrownProjection};
+
 use crate::interp::Interp;
 use crate::number::projection_number_repr;
 use crate::value::{ObjId, ObjKind, PropVal, Value};
-use std::collections::HashMap;
-use trust_js_trace::{ProjectedValue, PropKey, ThrownProjection};
 
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_KEYS: usize = 64;
@@ -75,12 +77,7 @@ pub fn escape_units(u: &[u16]) -> String {
 /// Project one top-level value with fresh id-state (one console.log argument,
 /// or the completion value).
 pub fn project(it: &Interp, v: &Value) -> P<ProjectedValue> {
-    let mut st = ProjState {
-        seen: HashMap::new(),
-        next_id: 0,
-        depth: 0,
-        nodes: 0,
-    };
+    let mut st = ProjState { seen: HashMap::new(), next_id: 0, depth: 0, nodes: 0 };
     project_value(it, v, &mut st)
 }
 
@@ -93,16 +90,12 @@ fn project_value(it: &Interp, v: &Value, st: &mut ProjState) -> P<ProjectedValue
         Value::Undefined => Ok(ProjectedValue::Undefined),
         Value::Null => Ok(ProjectedValue::Null),
         Value::Bool(b) => Ok(ProjectedValue::Bool { v: *b }),
-        Value::Num(n) => Ok(ProjectedValue::Num {
-            v: projection_number_repr(*n),
-        }),
+        Value::Num(n) => Ok(ProjectedValue::Num { v: projection_number_repr(*n) }),
         // The driver's projectValue does `Number.prototype.toString.apply(v, [])`
         // for a bigint, which throws TypeError — so reaching a bigint under the
         // deep-print walk is a throw, not a value.
         Value::BigInt(_) => Err(ProjErr::BigIntTypeError),
-        Value::Str(s) => Ok(ProjectedValue::Str {
-            v: escape_units(s),
-        }),
+        Value::Str(s) => Ok(ProjectedValue::Str { v: escape_units(s) }),
         Value::Sym(s) => Ok(crate::symbol::project_symbol(it.sym_data(*s))),
         Value::Obj(id) => {
             // Array.prototype is ObjKind::Array (spec: an Array exotic
@@ -260,11 +253,8 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
         match &p.val {
             PropVal::Data { value, .. } => {
                 let pv = project_value(it, value, st)?;
-                let entry = if p.enumerable {
-                    pv
-                } else {
-                    ProjectedValue::Nonenum { v: Box::new(pv) }
-                };
+                let entry =
+                    if p.enumerable { pv } else { ProjectedValue::Nonenum { v: Box::new(pv) } };
                 props.push((key_repr, entry));
             }
             // Accessors project un-invoked and WITHOUT an enumerability
@@ -272,10 +262,7 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
             PropVal::Accessor { get, set } => {
                 props.push((
                     key_repr,
-                    ProjectedValue::Accessor {
-                        get: get.is_some(),
-                        set: set.is_some(),
-                    },
+                    ProjectedValue::Accessor { get: get.is_some(), set: set.is_some() },
                 ));
             }
         }
@@ -290,20 +277,14 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
         match &p.val {
             PropVal::Data { value, .. } => {
                 let pv = project_value(it, value, st)?;
-                let entry = if p.enumerable {
-                    pv
-                } else {
-                    ProjectedValue::Nonenum { v: Box::new(pv) }
-                };
+                let entry =
+                    if p.enumerable { pv } else { ProjectedValue::Nonenum { v: Box::new(pv) } };
                 props.push((key_repr, entry));
             }
             PropVal::Accessor { get, set } => {
                 props.push((
                     key_repr,
-                    ProjectedValue::Accessor {
-                        get: get.is_some(),
-                        set: set.is_some(),
-                    },
+                    ProjectedValue::Accessor { get: get.is_some(), set: set.is_some() },
                 ));
             }
         }
@@ -314,11 +295,7 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
         cls,
         props: Some(props),
         unintrospectable: None,
-        keycap: if total_keys > MAX_KEYS {
-            Some(total_keys as u64)
-        } else {
-            None
-        },
+        keycap: if total_keys > MAX_KEYS { Some(total_keys as u64) } else { None },
     })
 }
 
@@ -326,9 +303,7 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
 /// via the prototype chain (data descriptors only) + proto.constructor.name.
 pub fn project_thrown(it: &Interp, v: &Value) -> P<ThrownProjection> {
     let Value::Obj(oid) = v else {
-        return Ok(ThrownProjection::Prim {
-            v: project(it, v)?,
-        });
+        return Ok(ThrownProjection::Prim { v: project(it, v)? });
     };
     // A thrown proxy would have its traps invoked by the driver's deep-print
     // (ctor / name chain walk) — refuse soundly.
@@ -346,11 +321,7 @@ pub fn project_thrown(it: &Interp, v: &Value) -> P<ThrownProjection> {
             break;
         }
         if let Some(p) = it.obj(o).props.get(&name_key) {
-            if let PropVal::Data {
-                value: Value::Str(s),
-                ..
-            } = &p.val
-            {
+            if let PropVal::Data { value: Value::Str(s), .. } = &p.val {
                 name = Some(escape_units(s));
             }
             break; // any own `name` descriptor stops the walk (accessor → null)
@@ -363,18 +334,10 @@ pub fn project_thrown(it: &Interp, v: &Value) -> P<ThrownProjection> {
     if let Some(proto) = it.obj(*oid).proto {
         let ctor_key = crate::value::units_from_str("constructor");
         if let Some(cp) = it.obj(proto).props.get(&ctor_key) {
-            if let PropVal::Data {
-                value: Value::Obj(cf),
-                ..
-            } = &cp.val
-            {
+            if let PropVal::Data { value: Value::Obj(cf), .. } = &cp.val {
                 if it.obj(*cf).is_callable() {
                     if let Some(np) = it.obj(*cf).props.get(&name_key) {
-                        if let PropVal::Data {
-                            value: Value::Str(s),
-                            ..
-                        } = &np.val
-                        {
+                        if let PropVal::Data { value: Value::Str(s), .. } = &np.val {
                             ctor_name = Some(escape_units(s));
                         }
                     }
@@ -382,11 +345,7 @@ pub fn project_thrown(it: &Interp, v: &Value) -> P<ThrownProjection> {
             }
         }
     }
-    Ok(ThrownProjection::Error {
-        ctor,
-        name,
-        ctor_name,
-    })
+    Ok(ThrownProjection::Error { ctor, name, ctor_name })
 }
 
 #[cfg(test)]

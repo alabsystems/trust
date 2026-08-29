@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use std::rc::Rc;
+
 use trust_js_reactor::{
     Capability, Completion, Host, PromiseId, Reactor, ReactorError, RejectionEvent, ThenLookup,
     TimerId,
@@ -34,7 +35,10 @@ pub enum TestVal {
     Str(String),
     Arr(Vec<TestVal>),
     /// An allSettled result record.
-    Settled { fulfilled: bool, payload: Box<TestVal> },
+    Settled {
+        fulfilled: bool,
+        payload: Box<TestVal>,
+    },
     /// An AggregateError's collected errors (Promise.any all-reject).
     Aggregate(Vec<TestVal>),
     /// A host error value (e.g. the self-resolution TypeError).
@@ -80,7 +84,11 @@ pub fn val_str(v: &TestVal) -> String {
         TestVal::Promise(p) => format!("Promise({p})"),
         TestVal::Arr(_) => "[array]".into(),
         TestVal::Settled { fulfilled, .. } => {
-            if *fulfilled { "settled:fulfilled".into() } else { "settled:rejected".into() }
+            if *fulfilled {
+                "settled:fulfilled".into()
+            } else {
+                "settled:rejected".into()
+            }
         }
         TestVal::Aggregate(_) => "AggregateError".into(),
         TestVal::Thenable(_) => "[thenable]".into(),
@@ -201,7 +209,9 @@ pub fn void(f: impl Fn(&mut Rx, &mut TestHost) + 'static) -> TestFn {
     TestFn::Void(Rc::new(f))
 }
 
-pub fn reaction(f: impl Fn(&mut Rx, &mut TestHost, TestVal) -> Completion<TestVal> + 'static) -> TestFn {
+pub fn reaction(
+    f: impl Fn(&mut Rx, &mut TestHost, TestVal) -> Completion<TestVal> + 'static,
+) -> TestFn {
     TestFn::Reaction(Rc::new(f))
 }
 
@@ -312,7 +322,12 @@ impl Rt {
         });
         self.rx.then(&mut self.host, p, Some(f), None)
     }
-    pub fn then_fn(&mut self, p: PromiseId, on_f: Option<TestFn>, on_r: Option<TestFn>) -> PromiseId {
+    pub fn then_fn(
+        &mut self,
+        p: PromiseId,
+        on_f: Option<TestFn>,
+        on_r: Option<TestFn>,
+    ) -> PromiseId {
         self.rx.then(&mut self.host, p, on_f, on_r)
     }
     pub fn catch_log(&mut self, p: PromiseId, marker: &str) -> PromiseId {

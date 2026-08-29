@@ -3,9 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#[cfg(any(feature = "macho", feature = "elf"))]
-use crate::{FunctionBoundary, Lifter};
-use crate::{LiftError, LiftedFunction};
 use trust_types::{
     BinaryAddressRange, BinaryMemoryModel, BinaryOrigin, BinarySegment, BinarySegmentPermissions,
     SourceSpan,
@@ -15,6 +12,10 @@ use trust_types::{
     BinaryFactEvidence, BinaryMemoryRegion, Endianness, MemoryRegionKind, ModelAssumption,
     TrustLevel, UnsupportedRecord,
 };
+
+#[cfg(any(feature = "macho", feature = "elf"))]
+use crate::{FunctionBoundary, Lifter};
+use crate::{LiftError, LiftedFunction};
 
 /// Which functions to lift from a binary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1933,8 +1934,9 @@ mod tests {
 
     #[cfg(any(feature = "macho", feature = "elf"))]
     fn minimal_lifted_function() -> LiftedFunction {
-        use crate::cfg::{Cfg, LiftedBlock};
         use trust_types::{BlockId, Terminator, TrustLevel, Ty, UnsupportedLedger, VerifiableBody};
+
+        use crate::cfg::{Cfg, LiftedBlock};
 
         let mut cfg = Cfg::new();
         cfg.add_block(LiftedBlock {
@@ -1991,8 +1993,9 @@ mod tests {
     #[cfg(feature = "elf")]
     #[test]
     fn big_endian_elf_is_rejected_before_lifting() {
-        let error = lift_binary_to_trust_ir(&minimal_big_endian_elf(), BinaryLiftOptions::default())
-            .unwrap_err();
+        let error =
+            lift_binary_to_trust_ir(&minimal_big_endian_elf(), BinaryLiftOptions::default())
+                .unwrap_err();
         assert!(matches!(
             error,
             LiftError::UnsupportedBinaryFormat {
@@ -2005,8 +2008,8 @@ mod tests {
     #[cfg(feature = "elf")]
     #[test]
     fn elf32_i386_is_rejected_before_elf64_parse() {
-        let error =
-            lift_binary_to_trust_ir(&minimal_elf32_i386(), BinaryLiftOptions::default()).unwrap_err();
+        let error = lift_binary_to_trust_ir(&minimal_elf32_i386(), BinaryLiftOptions::default())
+            .unwrap_err();
         assert!(matches!(
             error,
             LiftError::UnsupportedBinaryFormat {

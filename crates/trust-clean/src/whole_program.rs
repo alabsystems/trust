@@ -184,6 +184,7 @@ pub fn main_like_caller() -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     unwind: trust_types::UnwindEdge::Unreachable,
                 },
@@ -336,6 +337,45 @@ fn ensures_certified_modulo_3(callee: &VerifiableFunction) -> bool {
     }
     let mut saw_postcondition_vc = false;
     let vcs = trust_vcgen::generate_vcs(callee);
+    // A DECLINED row is not an obligation to refute — it is the emitter reporting a
+    // construct it does not model. `UnsupportedMir::proof_level()` IS `L0Safety`, so the
+    // filter below selects it, and this loop's only test was whether its formula refutes.
+    // That made the decision FORMULA-level over a PLACEHOLDER: the slice-range emitter's
+    // placeholder was `Bool(false)`, which is UNSAT, so the declined row read as
+    // discharged and carried
+    // `fixtures/decline-handling-2026-08-25/dumps/vec_range_index_with_ensures` — a body
+    // that panics on `(len 0, end 1)` — to `ProofStatus::Certified` and
+    // `ProofStatusRegistry::is_assumable`, i.e. to ASSUMPTION AUTHORITY for every caller.
+    // Refuse by KIND, so no placeholder polarity can matter here again.
+    //
+    // NO KIND IS SPARED AT THIS TIER, and in particular not the `Rvalue::PtrOffset`
+    // hand-off `prove::function_ptr_offsets_all_discharged` receives. That lane closes
+    // the OFFSET's own in-bounds obligation and says nothing about the rest of the body,
+    // whereas this tier's verdict is whole-body panic-freedom plus assumption authority
+    // for every caller. Skipping the row therefore reproduces Channel 2 one level down:
+    // on the probes below the decline is the ONLY L0 row, so the surviving L0 set is
+    // EMPTY and the loop's panic-freedom half is vacuous. Both halves are measured by
+    // `decline_gate_tests::ptr_offset_decline_earns_no_certification_tier`:
+    //   * `probe::count_after_panicking_leaf` PANICS 24/24 under the runtime oracle
+    //     (`fixtures/decline-handling-2026-08-25/sources/oracle_d1.rs`), yet with the row
+    //     skipped it reached `proved` here and `ProofStatus::Certified` in
+    //     `certify_function_in_graph`, on an offset that discharges perfectly.
+    //   * the SAME offset written as the `ptr::add` intrinsic keeps a real
+    //     `Assertion { "[unsafe:sep:offset] …" }` row that does NOT refute, so the
+    //     intrinsic spelling is refused. Crediting the compensation here made the
+    //     `Rvalue::PtrOffset` spelling STRICTLY MORE authoritative than the intrinsic;
+    //     refusing every decline is what makes the two spellings agree at this tier.
+    // The hand-off keeps its full effect where it is earned — `mirsem::function_has_open_declined_vc`
+    // still spares it for `prove::function_safety_vcs_all_discharged`, the trust-ir
+    // safety-faithfulness gate and `prove::diagnose_fully_faithful_gate`, which is the
+    // verdict `mirsem::tests::ptr_offset_binop_count_certifies_identically_to_intrinsic`
+    // pins (both spellings still `fully_faithful`).
+    //
+    // The gate reads `vcs` — the SAME row set the loop iterates — so no row can be
+    // declined-and-unseen, and there is no `continue` below for a decline to take.
+    if vcs.iter().any(|vc| crate::mirsem::is_declined_vc_kind_pub(&vc.kind)) {
+        return false;
+    }
     // Safety first documents and enforces the dependency of the checked
     // postcondition return relation on panic/overflow freedom. Do not pull L1/L2
     // domain obligations into this lane: its contract is exactly L0 safety plus
@@ -1092,6 +1132,7 @@ fn global_callee_hypotheses_have_supported_scope(func: &VerifiableFunction) -> b
             Terminator::Call {
                 target: Some(target),
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 ..
             } if calls_may_continue
@@ -1169,6 +1210,27 @@ fn certify_function_in_graph(
     // is provable but whose arithmetic may overflow is not certifiable/assumable.
     let mut saw_postcondition_vc = false;
     let vcs = trust_vcgen::generate_vcs(func);
+    // DECLINE IS NOT DISCHARGE — the same fail-closed clause as
+    // `ensures_certified_modulo_3`, for the same reason: `UnsupportedMir` is `L0Safety`
+    // so the filter below admits it, but its formula is a placeholder and refuting a
+    // placeholder proves nothing about the body. Refuse by KIND, and — as there —
+    // spare NO kind, not even the `Rvalue::PtrOffset` hand-off: see that function for
+    // the measurement. `probe::count_after_panicking_leaf` is the graph-path witness;
+    // it panics 24/24 under the runtime oracle, its offset discharges, and while the
+    // row was skipped this function returned `ProofStatus::Certified` for it.
+    // The gate reads `vcs`, the SAME row set the loop iterates.
+    if let Some(declined) = vcs.iter().find(|vc| crate::mirsem::is_declined_vc_kind_pub(&vc.kind)) {
+        return FunctionVerdict {
+            def_path: func.def_path.clone(),
+            status: ProofStatus::Trusted,
+            assumed_callees,
+            open_reason: Some(format!(
+                "an obligation is a DECLINED row {:?} — the emitter does not model this \
+                 construct, so panic-freedom is not established at the certification tier",
+                declined.kind
+            )),
+        };
+    }
     for vc in vcs
         .iter()
         .filter(|vc| vc.kind.proof_level() == ProofLevel::L0Safety)
@@ -1475,6 +1537,7 @@ fn diamond_intermediate(
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
@@ -1568,6 +1631,7 @@ pub fn diamond_top() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
@@ -1583,6 +1647,7 @@ pub fn diamond_top() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
@@ -1842,6 +1907,7 @@ pub fn sum_to_n_recursive() -> RecursiveFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     unwind: trust_types::UnwindEdge::Unreachable,
                 },
@@ -2387,6 +2453,7 @@ fn mutual_member(name: &str, def_path: &str, other_path: &str) -> RecursiveFunct
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     unwind: trust_types::UnwindEdge::Unreachable,
                 },
@@ -2542,6 +2609,7 @@ fn scc_ensures_as_ih(
 #[cfg(test)]
 mod tests {
     use trust_types::UnwindEdge;
+
     use super::*;
 
     /// (a) The callee certifies `Modulo3`: `helper`'s `ensures 0 <= ret <= 100`
@@ -3454,6 +3522,7 @@ mod tests {
                             span: SourceSpan::default(),
                             atomic: None,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                         },
                     },

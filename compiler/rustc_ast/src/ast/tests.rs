@@ -166,11 +166,7 @@ fn rejects_ambiguous_non_dense_missing_and_unmarked_metadata() {
     missing.clause_order.push(marker(0, Requires, Typed, 0));
     assert_eq!(
         missing.ordered_clause_refs().unwrap_err(),
-        FnContractClauseOrderError::MissingLaneValue {
-            kind: Requires,
-            lane: Typed,
-            lane_index: 0,
-        }
+        FnContractClauseOrderError::MissingLaneValue { kind: Requires, lane: Typed, lane_index: 0 }
     );
 
     let mut unmarked = FnContract::default();

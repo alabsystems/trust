@@ -39,7 +39,6 @@ fn lldb_gate_rejects_binary_without_python_scripting() {
 
     // A missing binary must gate, not panic.
     let err =
-        lldb_can_run_batch_driver(Utf8Path::new("/nonexistent/lldb-does-not-exist"))
-            .unwrap_err();
+        lldb_can_run_batch_driver(Utf8Path::new("/nonexistent/lldb-does-not-exist")).unwrap_err();
     assert!(err.contains("failed to spawn"), "unexpected reason: {err}");
 }

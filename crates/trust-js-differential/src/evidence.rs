@@ -9,10 +9,10 @@
 use std::path::Path;
 
 use crate::model::{
-    EvidenceClaims, EvidenceKernelReceipt, EvidenceLedgers, EvidenceReport, EvidenceValidation,
-    EVIDENCE_SCHEMA, SCORECARD_SCHEMA,
+    EVIDENCE_SCHEMA, EvidenceClaims, EvidenceKernelReceipt, EvidenceLedgers, EvidenceReport,
+    EvidenceValidation, SCORECARD_SCHEMA,
 };
-use crate::util::{git_head, now_utc_iso, validation_date, Finding};
+use crate::util::{Finding, git_head, now_utc_iso, validation_date};
 use crate::validate::validate_ledgers;
 
 /// Mint and independently re-check the JS→Clean-kernel receipts.
@@ -29,13 +29,20 @@ use crate::validate::validate_ledgers;
 /// the interpreter changed under the transcription or the bridge is broken, and
 /// neither is a thing to publish a conformance claim next to.
 fn kernel_receipts(findings: &mut Vec<Finding>) -> Vec<EvidenceKernelReceipt> {
-    type Certifier = (&'static str, fn() -> Result<Option<trust_js_certify_bridge::CertifiedBuiltin>, String>);
+    type Certifier =
+        (&'static str, fn() -> Result<Option<trust_js_certify_bridge::CertifiedBuiltin>, String>);
     const CERTIFIERS: &[Certifier] = &[
         ("String.prototype.toLowerCase", trust_js_certify_bridge::certify_tolowercase_ascii),
         ("String.prototype.toUpperCase", trust_js_certify_bridge::certify_touppercase_ascii),
-        ("String.prototype.trim (whitespace class)", trust_js_certify_bridge::certify_whitespace_ascii),
+        (
+            "String.prototype.trim (whitespace class)",
+            trust_js_certify_bridge::certify_whitespace_ascii,
+        ),
         ("URI-Decode hex value", trust_js_certify_bridge::certify_hexval_ascii),
-        ("encodeURIComponent unreserved set", trust_js_certify_bridge::certify_encuri_unreserved_ascii),
+        (
+            "encodeURIComponent unreserved set",
+            trust_js_certify_bridge::certify_encuri_unreserved_ascii,
+        ),
     ];
 
     let mut receipts = Vec::new();
@@ -67,16 +74,19 @@ fn kernel_receipts(findings: &mut Vec<Finding>) -> Vec<EvidenceKernelReceipt> {
                 "kernel-receipt-withheld",
                 format!("{name}: no receipt was minted"),
             )),
-            Err(reason) => findings.push(Finding::new(
-                "kernel-receipt-error",
-                format!("{name}: {reason}"),
-            )),
+            Err(reason) => {
+                findings.push(Finding::new("kernel-receipt-error", format!("{name}: {reason}")))
+            }
         }
     }
     receipts
 }
 
-pub fn run_evidence(scorecard_path: &Path, ledgers_dir: &Path, out_path: &Path) -> anyhow::Result<i32> {
+pub fn run_evidence(
+    scorecard_path: &Path,
+    ledgers_dir: &Path,
+    out_path: &Path,
+) -> anyhow::Result<i32> {
     let vdate = validation_date();
     let mut findings: Vec<Finding> = Vec::new();
 
@@ -121,9 +131,8 @@ pub fn run_evidence(scorecard_path: &Path, ledgers_dir: &Path, out_path: &Path) 
     findings.extend(ledger_findings);
 
     // --- repo head (read-only) ---
-    let repo_head = git_head(ledgers_dir)
-        .or_else(|| git_head(Path::new(".")))
-        .unwrap_or_else(|| {
+    let repo_head =
+        git_head(ledgers_dir).or_else(|| git_head(Path::new("."))).unwrap_or_else(|| {
             findings.push(Finding::new("repo-head-unavailable", "git rev-parse HEAD failed"));
             "unknown".to_string()
         });
@@ -132,10 +141,7 @@ pub fn run_evidence(scorecard_path: &Path, ledgers_dir: &Path, out_path: &Path) 
     let receipts = kernel_receipts(&mut findings);
 
     // --- computed claim ---
-    let gate_pass = scorecard
-        .pointer("/gate/pass")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let gate_pass = scorecard.pointer("/gate/pass").and_then(|v| v.as_bool()).unwrap_or(false);
     let claim = gate_pass && findings.is_empty();
 
     let report = EvidenceReport {
@@ -164,8 +170,7 @@ pub fn run_evidence(scorecard_path: &Path, ledgers_dir: &Path, out_path: &Path) 
         }
     }
     std::fs::write(out_path, serde_json::to_string_pretty(&report)?)?;
-    let rechecked =
-        report.kernel_receipts.iter().filter(|r| r.kernel_recheck_passed).count();
+    let rechecked = report.kernel_receipts.iter().filter(|r| r.kernel_recheck_passed).count();
     println!(
         "evidence: wrote {} (claimed: {}, validation: {}, kernel receipts: {}/{} re-checked)",
         out_path.display(),
@@ -204,11 +209,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert!(!report.claims.calibration_gate_claimed);
         assert_eq!(report.validation.status, "fail");
-        assert!(report
-            .validation
-            .findings
-            .iter()
-            .any(|f| f.contains("scorecard-partial")));
+        assert!(report.validation.findings.iter().any(|f| f.contains("scorecard-partial")));
 
         // The kernel receipts ride along on every evidence run, and each one is
         // re-checked here rather than trusted from the committed certificate.

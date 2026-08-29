@@ -12,8 +12,8 @@
 #![cfg_attr(not(test), allow(unused))]
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::*;
 use trust_types::fx::FxHashSet;
+use trust_types::*;
 
 use super::detection::{
     attach_safety_comments, detect_unsafe_blocks, generate_safety_vcs, has_raw_deref,
@@ -79,7 +79,13 @@ impl<'a> UnsafeVerifier<'a> {
         let Some(mir_block) = mir_block else { return };
 
         // Check terminator for specific unsafe patterns
-        if let Terminator::Call { func: callee, span, .. } = &mir_block.terminator {
+        let call = match &mir_block.terminator {
+            Terminator::Call { func, span, .. } | Terminator::TailCall { func, span, .. } => {
+                Some((func, span))
+            }
+            _ => None,
+        };
+        if let Some((callee, span)) = call {
             let lower = callee.to_lowercase();
 
             // Transmute detection

@@ -175,10 +175,8 @@ fn declared_mul_width_cap() -> u32 {
     let src = repo_root().join("crates/trust-cg-bridge/src/verify_output.rs");
     let text = std::fs::read_to_string(&src)
         .unwrap_or_else(|e| panic!("must read {}: {e}", src.display()));
-    let line = text
-        .lines()
-        .find(|l| l.contains("const MAX_RECHECKABLE_MUL_WIDTH"))
-        .unwrap_or_else(|| {
+    let line =
+        text.lines().find(|l| l.contains("const MAX_RECHECKABLE_MUL_WIDTH")).unwrap_or_else(|| {
             panic!(
                 "MAX_RECHECKABLE_MUL_WIDTH must still exist in {}: if the tractability guard was \
                  removed, the wide-Mul kernel grade is being claimed on an inspection-level \

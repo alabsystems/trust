@@ -1,14 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! **C10 — THE RECURSION PROBE (probe only, no compiler work).**
+//! **C10→C11 — THE RECURSION BOUNDARY AND ITS PROOF-CHECKED CLOSURE.**
 //!
-//! Measures, at the kernel, whether definitional equality — the SAME judgment
-//! `check_faithful` applies (`gate.rs`: `TypeChecker::is_def_eq` on side A's
-//! body against the reflected lowering) — can identify a RECURSIVE definition
-//! with anything at all. The campaign plan's Stage 5 named this the single
-//! riskiest step and required the measurement BEFORE any `Recursive` shape is
-//! sequenced.
+//! First measures whether definitional equality can identify a recursive
+//! definition, then exercises the deliberately separate structural-induction
+//! fallback in `check_faithful`. The campaign required the raw measurement
+//! before any recursive emission was sequenced; both the refusal boundary and
+//! the proof-checked closure remain pinned here.
 //!
 //! Ground (scouted 2026-08-20, recorded in the campaign plan): the kernel has
 //! NO recursive declaration form — `Declaration` is
@@ -33,21 +32,29 @@
 //! 3. A SYMBOLIC RECURSION ARGUMENT is stuck, and defeq has no inductive
 //!    reasoning: `n + 0 ≡ n` admits, `0 + n ≡ n` is refused — the same
 //!    identity, decided purely by which side the variable sits on. This is
-//!    the Stage-5 verdict: a `Recursive` shape cannot ride the defeq gate —
-//!    the check must be EXTENDED (fixpoint/functional induction) before the
-//!    generator may emit one (v7/D2: capability extends the CHECK, never
-//!    trust). Fail-closed today: the refusal direction is over-rejection.
+//!    the Stage-5 verdict: a recursive shape cannot ride the defeq gate.
+//!    C11 closes exactly the structural identity case with a real `Nat.rec`
+//!    proof. Automation proposes the term; the kernel rechecks it and an audit
+//!    excluding every non-foundational domain/trust assumption is mandatory. A false constant mutation is
+//!    refused, so this is neither defeq relabelling nor an accept-all fallback.
 //!
-//! No side-B route exists either — none of the four `admit_*` producers can
-//! mint a recursive term (their fragment is flat arithmetic + parameter
-//! select), so recursion is doubly outside the fragment: no reflection path
-//! (probe g's category) AND no identification judgment for symbolic inputs.
+//! Side B remains independently non-recursive: the compiler emits an ordinary
+//! parameter projection and the gate proves the recursive side A extensionally
+//! equal to it. General recursive bodies still have neither an emitted shape
+//! nor a proof and therefore refuse.
 
-use clean_kernel::{Environment, Expr, Name, TypeChecker};
+use clean_kernel::{Declaration, Environment, Expr, Name, TypeChecker};
+use trust_clean_carrier::carrier_for;
+use trust_clean_origin::{FaithfulnessMethod, check_faithful};
 
 fn env_nat() -> Environment {
+    // The raw defeq measurements need only Nat, but the induction search also
+    // needs the Eq/classical bridge declarations before it can propose a
+    // closed recursor proof for the kernel to re-check.
     let mut env = Environment::new();
     env.init_nat().expect("Nat + its recursors must init");
+    env.init_eq().expect("Eq must init for the induction goal");
+    env.init_classical().expect("the induction search bridge must init");
     env
 }
 
@@ -83,8 +90,7 @@ fn constructor_headed_symbolic_major_still_computes() {
         nat.clone(),
         Expr::app(nat_const("Nat.pred"), Expr::app(nat_const("Nat.succ"), Expr::bvar(0))),
     );
-    let identity =
-        Expr::lam(clean_kernel::BinderInfo::Default, nat, Expr::bvar(0));
+    let identity = Expr::lam(clean_kernel::BinderInfo::Default, nat, Expr::bvar(0));
     assert!(
         tc.is_def_eq(&pred_succ, &identity),
         "iota must fire on `succ n` — the major is constructor-headed"
@@ -143,7 +149,7 @@ fn nested_fold_with_closed_recursion_argument_still_computes() {
 /// trusting it.
 #[test]
 fn symbolic_recursion_argument_is_stuck_no_fixpoint_reasoning() {
-    let env = env_nat();
+    let mut env = env_nat();
     let tc = TypeChecker::new(&env);
     let nat = nat_const("Nat");
     let lam = |body| Expr::lam(clean_kernel::BinderInfo::Default, nat.clone(), body);
@@ -162,5 +168,59 @@ fn symbolic_recursion_argument_is_stuck_no_fixpoint_reasoning() {
     assert!(
         !tc.is_def_eq(&zero_plus_n, &identity),
         "MEASURED BOUNDARY: 0 + n ≡ n requires induction, and defeq must refuse it"
+    );
+
+    // The faithfulness gate closes that measured boundary with a genuine
+    // recursor proof. Side A is a fully kernel-checked definition; side B is
+    // the independently reflected projection. The returned evidence records
+    // induction rather than laundering it as defeq.
+    drop(tc);
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string("zero_plus"),
+        level_params: vec![],
+        type_: Expr::arrow(nat.clone(), nat.clone()),
+        value: zero_plus_n,
+        is_reducible: true,
+    })
+    .expect("zero_plus definition must kernel-check");
+    let nat_carrier = carrier_for(&nat).expect("Nat has the exact bignum carrier");
+    let faithful = check_faithful(&env, "zero_plus", &identity, &nat_carrier)
+        .expect("a kernel-checked structural induction proof closes 0+n=n");
+    assert_eq!(faithful.method(), FaithfulnessMethod::StructuralInduction);
+
+    // Anti-vacuity: the same proof lane must not certify a false equation.
+    let always_zero = lam(nat_const("Nat.zero"));
+    assert!(
+        check_faithful(&env, "zero_plus", &always_zero, &nat_carrier).is_err(),
+        "induction must distinguish the faithful projection from a wrong constant"
+    );
+}
+
+#[test]
+fn recursive_candidate_alone_cannot_enable_the_induction_lane() {
+    let mut env = env_nat();
+    let nat = nat_const("Nat");
+    let identity = Expr::lam(clean_kernel::BinderInfo::Default, nat.clone(), Expr::bvar(0));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string("plain_identity"),
+        level_params: vec![],
+        type_: Expr::arrow(nat.clone(), nat.clone()),
+        value: identity,
+        is_reducible: true,
+    })
+    .expect("plain identity definition");
+
+    // This candidate is extensionally equal, but only the candidate delegates
+    // to Nat.rec. The bounded fallback is a lane for a recursive CLEAN source;
+    // a lowering cannot buy proof search by injecting a recursor of its own.
+    let recursive_candidate = Expr::lam(
+        clean_kernel::BinderInfo::Default,
+        nat.clone(),
+        Expr::apps(nat_const("Nat.add"), [Expr::nat_lit(0), Expr::bvar(0)]),
+    );
+    let carrier = carrier_for(&nat).expect("Nat bignum carrier");
+    assert!(
+        check_faithful(&env, "plain_identity", &recursive_candidate, &carrier).is_err(),
+        "a recursive candidate must not widen a non-recursive Clean definition"
     );
 }

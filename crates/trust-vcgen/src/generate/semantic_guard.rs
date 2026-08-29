@@ -79,8 +79,13 @@ pub(super) fn has_intrinsic_unsafe_surface(func: &VerifiableFunction) -> bool {
         // handled fail-closed by the dedicated FFI lane (`is_foreign ||
         // is_extern_call` below), and opening the doc-lint gate for every libc
         // call would ADD demands — the opposite of this over-refutation fix.
-        if let Terminator::Call { func: callee, is_unsafe_sig, .. } = &block.terminator
-            && (*is_unsafe_sig || crate::unsafe_verify::detection::is_unsafe_fn_call(callee))
+        let unsafe_call = match &block.terminator {
+            Terminator::Call { func, is_unsafe_sig, .. }
+            | Terminator::TailCall { func, is_unsafe_sig, .. } => Some((func, *is_unsafe_sig)),
+            _ => None,
+        };
+        if let Some((callee, is_unsafe_sig)) = unsafe_call
+            && (is_unsafe_sig || crate::unsafe_verify::detection::is_unsafe_fn_call(callee))
         {
             return true;
         }
@@ -247,6 +252,69 @@ pub(super) fn ord_min_max_clamp_result_facts(
         facts.push(fact);
     }
     facts
+}
+
+/// The byte size the Rust language fixes for a PRIMITIVE type name, independent
+/// of target. `usize`/`isize`/pointers are deliberately absent: their size is
+/// target-dependent, and this function has no target to consult.
+///
+/// The names are the ones `trust-mir-extract` writes into the callee path's
+/// turbofish (`core::mem::size_of::<u64>`), i.e. the type as the input program
+/// declared it — the same authority class as a `u8` parameter's `[0, 255]`.
+fn primitive_type_size_bytes(ty_name: &str) -> Option<i128> {
+    Some(match ty_name {
+        "u8" | "i8" | "bool" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "f32" | "char" => 4,
+        "u64" | "i64" | "f64" => 8,
+        "u128" | "i128" => 16,
+        _ => return None,
+    })
+}
+
+/// The `T` of a `core::mem::NAME::<T>` / `std::mem::NAME::<T>` callee path, or
+/// `None` for any other spelling. An EXACT path match (never a substring or a
+/// suffix test) so a user function called `size_of` in a module named `mem`
+/// cannot be credited with `core::mem::size_of`'s semantics.
+fn mem_layout_query_arg<'a>(callee: &'a str, name: &str) -> Option<&'a str> {
+    let rest = callee
+        .strip_prefix("core::mem::")
+        .or_else(|| callee.strip_prefix("std::mem::"))?
+        .strip_prefix(name)?
+        .strip_prefix("::<")?;
+    rest.strip_suffix('>')
+}
+
+/// The layout facts for a `mem::size_of::<T>()` / `mem::align_of::<T>()` call at
+/// a primitive `T`, bound to `dest_var`. Empty for any other callee, and for any
+/// `T` whose layout is not language-fixed.
+///
+/// * `size_of::<T>()` is CONST-FOLDED to its exact value. For the primitives in
+///   [`primitive_type_size_bytes`] that value is fixed by the language (`u64` is
+///   64 bits on every target), so the equation is a fact about the type the
+///   input program wrote — not an assumption about libcore's implementation.
+/// * `align_of::<T>()` is NOT folded: the alignment of `u64`/`f64`/`u128` is
+///   target-dependent (4 on x86-32, 8 on aarch64), and this lane has no target.
+///   What IS target-independent is `1 <= align_of::<T>()` (alignment is always a
+///   positive power of two) and `align_of::<T>() <= size_of::<T>()`, which
+///   follows from `size_of::<T>()` being a nonzero multiple of `align_of::<T>()`
+///   for these non-ZST primitives. Those two bounds are what make an
+///   `align_of`-divisor obligation and an `align_of`-index obligation decidable.
+fn mem_layout_call_dest_facts(callee: &str, dest_var: &Formula) -> Vec<Formula> {
+    if let Some(ty_name) = mem_layout_query_arg(callee, "size_of")
+        && let Some(size) = primitive_type_size_bytes(ty_name)
+    {
+        return vec![Formula::Eq(Box::new(dest_var.clone()), Box::new(Formula::Int(size)))];
+    }
+    if let Some(ty_name) = mem_layout_query_arg(callee, "align_of")
+        && let Some(size) = primitive_type_size_bytes(ty_name)
+    {
+        return vec![
+            Formula::Ge(Box::new(dest_var.clone()), Box::new(Formula::Int(1))),
+            Formula::Le(Box::new(dest_var.clone()), Box::new(Formula::Int(size))),
+        ];
+    }
+    Vec::new()
 }
 
 pub(crate) fn build_semantic_guard_map(
@@ -418,6 +486,24 @@ pub(super) fn build_semantic_guard_map_impl(
                         Box::new(Formula::Int(i64::MAX as i128)),
                     ));
                 }
+            }
+
+            // `mem::size_of::<T>()` / `mem::align_of::<T>()` at a primitive `T`
+            // are compile-time constants of the INPUT PROGRAM. Left havoc'd,
+            // `1024 / size_of::<u64>()` is refuted for division by zero on a
+            // closed, input-free body. See `mem_layout_call_dest_facts` for what
+            // each fact is derived from.
+            if dest.projections.is_empty()
+                && args.is_empty()
+                && func
+                    .body
+                    .locals
+                    .iter()
+                    .any(|d| d.index == dest.local && d.ty.int_width().is_some())
+                && is_single_static_assignment(func, dest.local)
+            {
+                let dest_var = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
+                term_facts.extend(mem_layout_call_dest_facts(callee, &dest_var));
             }
 
             // Model the ordered-min/max/clamp stdlib calls with their defining
@@ -706,4 +792,81 @@ pub(super) fn build_semantic_guard_map_impl(
     }
 
     result
+}
+
+#[cfg(test)]
+mod mem_layout_fact_tests {
+    use super::*;
+
+    fn facts(callee: &str) -> Vec<Formula> {
+        mem_layout_call_dest_facts(callee, &Formula::Var("_1".to_string(), Sort::Int))
+    }
+
+    /// `size_of::<T>()` at a primitive is CONST-FOLDED to its exact value — the
+    /// value the Rust language fixes for that type on every target.
+    #[test]
+    fn size_of_at_a_primitive_is_folded_to_its_exact_value() {
+        assert_eq!(
+            facts("core::mem::size_of::<u64>"),
+            vec![Formula::Eq(
+                Box::new(Formula::Var("_1".to_string(), Sort::Int)),
+                Box::new(Formula::Int(8))
+            )]
+        );
+        assert_eq!(
+            facts("std::mem::size_of::<bool>"),
+            vec![Formula::Eq(
+                Box::new(Formula::Var("_1".to_string(), Sort::Int)),
+                Box::new(Formula::Int(1))
+            )]
+        );
+    }
+
+    /// `align_of::<T>()` must NEVER be folded to an exact value. The alignment of
+    /// `u64`/`f64`/`u128` is 8 on aarch64 and x86-64 but 4 on x86-32 Linux, and
+    /// this lane has no target to consult — an equation here would be a false
+    /// fact on a real supported target. Only the two target-independent bounds
+    /// are emitted, so this test fails if anyone "simplifies" it to a fold.
+    #[test]
+    fn align_of_is_bounded_never_folded() {
+        let f = facts("core::mem::align_of::<u64>");
+        assert_eq!(f.len(), 2, "align_of emits exactly the two bounds: {f:?}");
+        assert!(
+            !f.iter().any(|x| matches!(x, Formula::Eq(..))),
+            "align_of must not be pinned to an exact value (target-dependent): {f:?}"
+        );
+        let v = Formula::Var("_1".to_string(), Sort::Int);
+        assert_eq!(f[0], Formula::Ge(Box::new(v.clone()), Box::new(Formula::Int(1))));
+        assert_eq!(f[1], Formula::Le(Box::new(v), Box::new(Formula::Int(8))));
+    }
+
+    /// A type whose size the LANGUAGE does not fix gets NO fact. `usize`/`isize`
+    /// are target-dependent; a generic parameter is not even a type yet; a
+    /// user ADT has a layout the compiler chooses.
+    #[test]
+    fn non_language_fixed_types_get_no_fact() {
+        for callee in [
+            "core::mem::size_of::<usize>",
+            "core::mem::size_of::<isize>",
+            "core::mem::size_of::<T>",
+            "core::mem::align_of::<T>",
+            "core::mem::size_of::<mycrate::Widget>",
+        ] {
+            assert!(facts(callee).is_empty(), "{callee} must yield no layout fact");
+        }
+    }
+
+    /// The path match is EXACT. A user function that merely spells `size_of` in
+    /// a module named `mem` is a different function with a different meaning.
+    #[test]
+    fn only_the_canonical_core_std_paths_match() {
+        for callee in [
+            "mycrate::mem::size_of::<u64>",
+            "core::mem::size_of_val::<u64>",
+            "core::men::size_of::<u64>",
+            "size_of::<u64>",
+        ] {
+            assert!(facts(callee).is_empty(), "{callee} must not be credited with mem::size_of");
+        }
+    }
 }

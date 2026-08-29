@@ -684,7 +684,10 @@ pub(crate) fn mirsem_branch_refinement_env() -> Result<Environment, String> {
 /// RHS is the LIVE-grounded `Formula::Ite`. `claimed_rhs = Some` swaps the live-grounded
 /// RHS (fail-closed test); `None` (the function returns `None`) means the live grounder
 /// declined `r.to_formula()`.
-pub(super) fn branch_refinement_statement(r: &SemCfReturn, claimed_rhs: Option<&Expr>) -> Option<Expr> {
+pub(super) fn branch_refinement_statement(
+    r: &SemCfReturn,
+    claimed_rhs: Option<&Expr>,
+) -> Option<Expr> {
     let bd = || BinderData::from(BinderInfo::Default);
     let indices = r.var_indices();
     let n = indices.len();
@@ -736,7 +739,10 @@ pub fn check_branch_refinement(r: &SemCfReturn) -> RefinementVerdict {
     check_branch_refinement_inner(r, None)
 }
 
-pub(super) fn check_branch_refinement_inner(r: &SemCfReturn, claimed_rhs: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_branch_refinement_inner(
+    r: &SemCfReturn,
+    claimed_rhs: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_branch_refinement_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),

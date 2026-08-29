@@ -1,10 +1,8 @@
 //! Per-suite native TrustIr bundle evidence helpers (trust-wp / trust_vc / trust-mc).
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(feature = "trust-build")]
 use trust_bmc::TrustMcVerifierApiAdapter;

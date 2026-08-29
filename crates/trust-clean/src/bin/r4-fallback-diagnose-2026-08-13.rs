@@ -57,9 +57,7 @@ fn main() {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&p) else { continue };
-            let Ok(func) =
-                serde_json::from_str::<trust_types::VerifiableFunction>(&text)
-            else {
+            let Ok(func) = serde_json::from_str::<trust_types::VerifiableFunction>(&text) else {
                 continue;
             };
             // Composition-blind: an empty registry. A row that needs a certified
@@ -81,13 +79,7 @@ fn main() {
             } else {
                 shape_gaps += 1;
             }
-            println!(
-                "{tag}\t{}\t{}\t{}\t{}",
-                d.via_ir_shape,
-                d.via_ir_safety,
-                dir,
-                func.name
-            );
+            println!("{tag}\t{}\t{}\t{}\t{}", d.via_ir_shape, d.via_ir_safety, dir, func.name);
         }
     }
 
@@ -95,6 +87,10 @@ fn main() {
     eprintln!("=== R4 FALLBACK DIAGNOSIS (composition-blind) ===");
     eprintln!("fully_faithful rows seen   {rows}");
     eprintln!("  via_trustir              {faithful_via_ir}");
-    eprintln!("  fallback: SHAPE_GAP      {shape_gaps}   (no trust-ir recognizer accepted the body)");
-    eprintln!("  fallback: SAFETY_GAP     {safety_gaps}   (recognizer accepted; safety pillar declined)");
+    eprintln!(
+        "  fallback: SHAPE_GAP      {shape_gaps}   (no trust-ir recognizer accepted the body)"
+    );
+    eprintln!(
+        "  fallback: SAFETY_GAP     {safety_gaps}   (recognizer accepted; safety pillar declined)"
+    );
 }

@@ -202,11 +202,135 @@ if __name__ == "__main__":
                 % rc
             )
 
+    # Trust: BUILD-TREE MUTUAL EXCLUSION (scripts/trust_build_lock.sh).
+    #
+    # The build tree is a single exclusive resource shared by every lane, and a
+    # measurement sweep reading `stage1/bin/rustc` cannot survive a build, because
+    # `x.py build` deletes that binary at start. Measured in one session,
+    # 2026-08-20: four destroyed measurement runs, one of them 4m27s in.
+    #
+    # THE ASYMMETRY. Lanes were told to check for a running BUILD before building.
+    # Nobody checked for a running MEASUREMENT before building, so the sweep side
+    # published an advisory sentinel that nothing was obliged to read. A wait is
+    # not a lock. This is the other half: the SAME lock the sweep takes, taken
+    # here, held for the whole build, released on every exit path.
+    #
+    # WHY HERE. `x.py` is the one choke point every entry point funnels through --
+    # `x`, `x.ps1` and `python3 x.py` alike -- and, decisively, it is what
+    # `scripts/hooks/pre-push` runs when it invokes `x.py check --stage 1`. A PUSH
+    # IS A BUILD for interlock purposes, and putting the lock here means there is
+    # no second place to remember that. bootstrap.py would also work and is merged
+    # from upstream constantly; this file already carries a Trust block, so the
+    # merge surface is one hunk instead of two.
+    #
+    # FAIL-SAFE ABOUT ITSELF, FAIL-CLOSED ABOUT ITS VERDICT -- the same split the
+    # preflight above uses. A missing, crashing or hanging lock script lets the
+    # build proceed with a warning, because a guard that can brick x.py gets
+    # deleted and takes its real findings with it. Only exit code 3, the script's
+    # explicit REFUSED contract, stops a build.
+    _lock_token = [None]
+
+    def _trust_build_lock_acquire(rust_dir, argv):
+        import subprocess
+
+        # Not a build: `fmt`, `setup`, `vendor`, `--help`. `clean` IS in the list
+        # -- it deletes the very stage1 binary a sweep is measuring.
+        lockish = frozenset((
+            "build", "b", "check", "c", "clippy", "fix", "doc", "d",
+            "test", "t", "miri", "bench", "run", "r", "dist", "install", "clean",
+        ))
+        sub = None
+        for arg in argv:
+            if arg == "--":
+                break
+            if arg in lockish:
+                sub = arg
+                break
+        if sub is None:
+            return
+
+        script = os.path.join(rust_dir, "scripts", "trust_build_lock.sh")
+        if not os.path.isfile(script) or not os.path.exists("/bin/sh"):
+            return  # no lock in this tree; not a reason to refuse to build
+
+        # A nested x.py (bootstrap's own test suite shells out to one) inherits
+        # this and must not block on its own parent. The lock verifies the token
+        # against what is actually on disk rather than believing the variable.
+        cmd = [
+            "/bin/sh", script, "acquire", "--kind", "build",
+            "--purpose", "x.py %s" % " ".join(argv[:6]),
+            "--pid", str(os.getpid()),
+            "--wait", os.environ.get("TRUST_BUILD_LOCK_WAIT", "0"),
+            "--contract", "a build is rewriting stage1/; do not measure against it",
+        ]
+        reason = os.environ.get("TRUST_BUILD_LOCK_BREAK", "")
+        if reason:
+            cmd += ["--break", "--reason", reason]
+
+        try:
+            # stderr is inherited so the refusal streams to the terminal as it is
+            # produced; stdout carries only the token.
+            proc = subprocess.Popen(cmd, cwd=rust_dir, stdout=subprocess.PIPE)
+            out, _ = proc.communicate(timeout=86400)
+            rc = proc.returncode
+        except Exception as _e:
+            sys.stderr.write(
+                "x.py: build lock did not run (%s: %s) -- continuing UNLOCKED.\n"
+                % (_e.__class__.__name__, _e)
+            )
+            return
+
+        if rc == 3:
+            sys.stderr.write(
+                "x.py: refusing to build while the build tree is held (see above).\n"
+            )
+            sys.exit(1)
+        token = (out or b"").decode("utf-8", "replace").strip()
+        if rc != 0 or not token:
+            sys.stderr.write(
+                "x.py: build lock did not reach a verdict (exit %s) -- continuing\n"
+                "      UNLOCKED. This is NOT a finding about the tree.\n" % rc
+            )
+            return
+        _lock_token[0] = token
+        os.environ["TRUST_BUILD_LOCK_TOKEN"] = token
+
+    def _trust_build_lock_release(*_a):
+        token = _lock_token[0]
+        if not token:
+            return
+        _lock_token[0] = None
+        import subprocess
+
+        try:
+            subprocess.run(
+                ["/bin/sh", os.path.join(rust_dir, "scripts", "trust_build_lock.sh"),
+                 "release", token],
+                cwd=rust_dir, timeout=60,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass  # a leaked lock is reclaimable by pid; a crash here is not
+
     try:
-        _trust_preflight(rust_dir, sys.argv[1:])
+        _trust_build_lock_acquire(rust_dir, sys.argv[1:])
     except SystemExit:
         raise
     except KeyboardInterrupt:
+        raise
+    except Exception as _e:  # never let the guard itself break the build
+        sys.stderr.write(
+            "x.py: build lock hook error (%s: %s) -- continuing UNLOCKED.\n"
+            % (_e.__class__.__name__, _e)
+        )
+
+    try:
+        _trust_preflight(rust_dir, sys.argv[1:])
+    except SystemExit:
+        _trust_build_lock_release()
+        raise
+    except KeyboardInterrupt:
+        _trust_build_lock_release()
         raise
     except Exception as _e:  # never let the guard itself break the build
         sys.stderr.write(
@@ -214,9 +338,33 @@ if __name__ == "__main__":
             % (_e.__class__.__name__, _e)
         )
 
+    # Trust: release on every path out. SIGTERM does NOT run `finally` or atexit
+    # handlers -- the default action terminates the process -- so it needs an
+    # explicit handler. SIGINT arrives as KeyboardInterrupt and is covered by the
+    # `finally`; atexit is the backstop for an exit path neither of them sees.
+    # A lock that survives its holder is reclaimable by pid, so none of this is
+    # load-bearing for correctness -- it is what stops the next lane having to
+    # read a stale-lock banner to find that out.
+    import atexit
+    import signal
+
+    atexit.register(_trust_build_lock_release)
+    for _sig in ("SIGTERM", "SIGHUP"):
+        _num = getattr(signal, _sig, None)
+        if _num is None:
+            continue
+        try:
+            signal.signal(_num, lambda s, f: (_trust_build_lock_release(),
+                                              sys.exit(128 + s)))
+        except (ValueError, OSError, RuntimeError):
+            pass  # not the main thread, or the platform disallows it
+
     # For the import below, have Python search in src/bootstrap first.
     sys.path.insert(0, os.path.join(rust_dir, "src", "bootstrap"))
 
     import bootstrap
 
-    bootstrap.main()
+    try:
+        bootstrap.main()
+    finally:
+        _trust_build_lock_release()

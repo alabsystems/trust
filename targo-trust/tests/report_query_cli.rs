@@ -169,10 +169,32 @@ fn report_query_cli_preserves_skipped_and_runtime_checked_splits() {
     );
     let value: Value =
         serde_json::from_slice(&runtime_json.stdout).expect("report-query stdout should be JSON");
-    assert_eq!(value["focused_summary"]["runtime_checked"], 1);
-    assert_eq!(value["focused_summary"]["unknown"], 0);
+    // `report-query` reads a report off disk, and 6476f7a003 fail-closed saved
+    // report authority: a deserialized `runtime_checked` row (like a
+    // deserialized `proved` row) is downgraded to `unknown` with a NAMED
+    // reason, because a serialized monitor claim carries no live authenticated
+    // compiler/monitor capability. The split this test guards is still exact —
+    // the row does not become a timeout or a skip, and the downgrade says why.
+    // The live, in-process query (`targo trust check --function`, which never
+    // round-trips through a file) is where `runtime_checked` survives as
+    // itself.
+    assert_eq!(value["focused_summary"]["runtime_checked"], 0);
+    assert_eq!(value["focused_summary"]["unknown"], 1);
     assert_eq!(value["focused_summary"]["timed_out"], 0);
     assert_eq!(value["focused_summary"]["skipped"], 0);
+    let downgraded = &value["functions"][0]["obligations"][0];
+    assert_eq!(
+        downgraded["kind"], "arithmetic_overflow_add",
+        "the downgraded row must still be the runtime-checked obligation: {downgraded}"
+    );
+    assert_eq!(downgraded["outcome"]["status"], "unknown");
+    assert!(
+        downgraded["outcome"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("deserialized runtime_checked outcome")
+                && reason.contains("no live authenticated compiler/monitor capability")),
+        "the saved runtime-checked row must be downgraded with its reason named, not silently rebucketed: {downgraded}"
+    );
 
     let terminal_output = Command::new(targo_trust_binary())
         .args(["trust", "report-query", "--report"])

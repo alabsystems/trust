@@ -85,7 +85,10 @@ fn unsupported_cast_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition>
 fn dyn_ref(mutable: bool) -> Ty {
     Ty::Ref {
         mutable,
-        inner: Box::new(Ty::Dynamic { trait_name: "test::T".to_string(), principal_key: Some("test::T".to_string()) }),
+        inner: Box::new(Ty::Dynamic {
+            trait_name: "test::T".to_string(),
+            principal_key: Some("test::T".to_string()),
+        }),
     }
 }
 
@@ -98,14 +101,20 @@ fn trait_object_pointer_unsize_mints_no_obligation() {
             "*const dyn T",
             Ty::RawPtr {
                 mutable: false,
-                pointee: Box::new(Ty::Dynamic { trait_name: "test::T".to_string(), principal_key: Some("test::T".to_string()) }),
+                pointee: Box::new(Ty::Dynamic {
+                    trait_name: "test::T".to_string(),
+                    principal_key: Some("test::T".to_string()),
+                }),
             },
         ),
         (
             "*mut dyn T",
             Ty::RawPtr {
                 mutable: true,
-                pointee: Box::new(Ty::Dynamic { trait_name: "test::T".to_string(), principal_key: Some("test::T".to_string()) }),
+                pointee: Box::new(Ty::Dynamic {
+                    trait_name: "test::T".to_string(),
+                    principal_key: Some("test::T".to_string()),
+                }),
             },
         ),
     ] {
@@ -126,7 +135,10 @@ fn trait_object_pointer_unsize_mints_no_obligation() {
 /// shape rather than merely spotting `Ty::Dynamic` anywhere in the target.
 #[test]
 fn bare_dynamic_cast_target_still_fails_closed() {
-    let target = Ty::Dynamic { trait_name: "test::T".to_string(), principal_key: Some("test::T".to_string()) };
+    let target = Ty::Dynamic {
+        trait_name: "test::T".to_string(),
+        principal_key: Some("test::T".to_string()),
+    };
     let vcs = unsupported_cast_vcs(&cast_fn(target));
     assert!(
         !vcs.is_empty(),

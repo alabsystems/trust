@@ -271,7 +271,7 @@ fn terminator_violation(
             deterministic: false,
             no_panic: true,
         }),
-        Terminator::Call { func: callee, .. } => {
+        Terminator::Call { func: callee, .. } | Terminator::TailCall { func: callee, .. } => {
             // RULED 2026-07-25 (docs/design/2026-07-25-e6-call-admission-ruling-request.md):
             // a call no longer poisons every facet outright. It is permitted
             // exactly when the callee is ITSELF structurally certified, which
@@ -326,7 +326,13 @@ mod tests {
             name: "f".to_string(),
             def_path: "test::f".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count,
+                return_ty,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -724,6 +730,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         let scan = scan_structural_facets(&f);
         for finding in [&scan.pure, &scan.total, &scan.deterministic, &scan.no_panic] {

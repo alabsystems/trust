@@ -59,7 +59,14 @@ pub fn clamped_to_u8(x: u32) -> u8 {
 #[repr(u8)]
 #[derive(Clone, Copy)]
 pub enum SmallEnum {
-    A, B, C, D, E, F, G, H,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
 }
 
 #[no_mangle]

@@ -1326,7 +1326,11 @@ pub(super) fn counter_loop_succ_ranking(i_idx: u64, bound_idx: u64) -> Expr {
 /// `hlt := Int.add_le_add_right (e i)(e n) <guard: i ≤ n> 1 : Int.le (i+1)(n+1) ≡ Int.lt i (n+1)`.
 /// `loopRankDecrease i (n+1) hlt : Nat.lt (toNat((n+1)-(i+1))) (toNat((n+1)-i))` = the decrease
 /// for `R` over `[i:=i+1]` (the body makes `R(exec) = toNat((n+1)-(i+1))`).
-pub(super) fn counter_loop_le_decrease_proof(lf: &SemLoopFunction, i_idx: u64, bound_idx: u64) -> Expr {
+pub(super) fn counter_loop_le_decrease_proof(
+    lf: &SemLoopFunction,
+    i_idx: u64,
+    bound_idx: u64,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let cond_expr = lf.cond.to_cond_expr();
     // under `λ e λ hg`: hg=0, e=1.
@@ -1395,7 +1399,12 @@ pub(super) fn stride_loop_ranking(i_idx: u64, n_idx: u64) -> Expr {
 /// This is the stride analogue of [`counter_loop_decrease_proof`]; the `+1` case `k=1` is
 /// also covered by `strideRankDecrease` but the production dispatch keeps the dedicated
 /// `loopRankDecrease` path for `k=1` so existing certificates reduce byte-identically.
-pub(super) fn stride_loop_decrease_proof(lf: &SemLoopFunction, i_idx: u64, n_idx: u64, k: i128) -> Expr {
+pub(super) fn stride_loop_decrease_proof(
+    lf: &SemLoopFunction,
+    i_idx: u64,
+    n_idx: u64,
+    k: i128,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let cond_expr = lf.cond.to_cond_expr();
     // under `λ (e : Env) λ (hg : eval_cond e cond = true)`: hg=0, e=1.
@@ -1564,7 +1573,11 @@ pub(super) fn loop_total_instance_conclusion_type(lf: &SemLoopFunction, ranking:
 /// application at the conclusion type IS the per-function corollary. `ranking` is the
 /// PROVIDED `R`; `decrease` is the concrete decrease proof for it (a WRONG ranking with a
 /// decrease proof that does not type-check against the conclusion fails closed).
-pub(super) fn loop_total_instance_proof(lf: &SemLoopFunction, ranking: &Expr, decrease: &Expr) -> Expr {
+pub(super) fn loop_total_instance_proof(
+    lf: &SemLoopFunction,
+    ranking: &Expr,
+    decrease: &Expr,
+) -> Expr {
     let i_expr = lf.invariant_expr(None);
     let cond_expr = lf.cond.to_cond_expr();
     let body_expr = lf.body_list_expr();

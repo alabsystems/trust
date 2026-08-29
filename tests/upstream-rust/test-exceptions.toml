@@ -70,6 +70,34 @@ allowed_patterns = [
     "compiled successfully where upstream expects unterminated character literal",
 ]
 
+# DO NOT RETIRE THIS ROW AS "STALE". Checked 2026-08-23, because a triage pass
+# proposed exactly that on the grounds that char-3 passes and this file's own
+# doctrine says a row exists to waive a failure. It passes for the WRONG REASON.
+#
+# Commit 8d02ef4d303 (2026-07-12) rewrote the upstream test's own `//~ ERROR`
+# annotations from upstream's expectations
+#     //~^ ERROR unterminated character literal
+#     //[rust2021]~| ERROR prefix `world` is unknown
+# to Trust's divergent prime-notation output
+#     //~^ ERROR expected `while`, `for`, `loop` or `{` after a label
+#     //~| ERROR labeled expression must be followed by `:`
+#     //~| ERROR expected `,`, found `'`
+# and re-blessed all three .stderr revisions to match. The divergence is LIVE:
+# measured 2026-08-23, upstream nightly emits 2 errors for this file
+# (`prefix `world` is unknown`, `E0762 unterminated character literal`) while
+# Trust emits 4. The test is green only because the upstream expectation was
+# replaced by Trust's opinion — the anti-pattern this ledger exists to avoid.
+# Deleting this row would erase the last remaining record of that.
+#
+# The principled repair is to restore the pristine upstream annotations and the
+# three upstream .stderr files, and let this row waive the resulting honest
+# failure. IT IS NOT DONE HERE because it does not currently work: char-3 is a
+# 3-revision test, `parse_compiletest_fail_line` scrapes the path verbatim as
+# `<path>.rs#<revision>`, and `failure_covering_exception` compares that against
+# this row's `path` with no revision handling — so restoring it would produce
+# three PERMANENTLY UNNETTABLE failures. See the revision-keying gate defect
+# noted at the end of this file; fix that first, then restore char-3.
+
 [[exceptions]]
 id = "test-exc.lexer.str-as-char-3.prime-superset"
 test_id = "upstream.tests.ui.lexer.lex-bad-str-literal-as-char-3.rs"
@@ -149,3 +177,110 @@ expires_on = "2026-09-25"
 allowed_patterns = [
     "cycle detected when computing type of",
 ]
+
+[[exceptions]]
+id = "test-exc.hygiene.unpretty-debug-lifetimes.symbol-width-wrap"
+test_id = "upstream.tests.ui.hygiene.unpretty-debug-lifetimes.rs"
+suite = "ui"
+path = "tests/ui/hygiene/unpretty-debug-lifetimes.rs"
+revision = "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0"
+kind = "intentional_divergence"
+status = "active"
+owner = "@trust-compiler"
+reason = "PRETTY-PRINTER LAYOUT ONLY; the hygiene facts this test guards match upstream exactly. `-Zunpretty=expanded,hygiene` prints raw preinterned symbol INDICES, and Trust's spec-surface grammar keywords (`clean`, `decreases`, `ensures`, `exists`, `forall`, and `invariant`/`requires` after it) live in the mid-list `Symbols` block of compiler/rustc_span/src/symbol.rs rather than the `AppendOnly` tail. That pushes `sym::ident` across the 3-to-4 digit boundary: measured 2026-08-23, Trust renders `ident` as `1000#0` where upstream renders `992#0` (nightly-2026-07-22) / `990#0` (nightly-2026-07-08, the [rust_alignment] pin). Upstream's macro-rule line is then EXACTLY 78 characters and `MARGIN` is 78 (compiler/rustc_ast_pretty/src/pp.rs:205), so the single extra digit makes it 79 and the printer wraps one token earlier, emitting `*/>) =>` on the next line. The test's own `//@ normalize-stdout: \"\\d+#\" -> \"0#\"` cannot undo this: normalization runs on already-laid-out text, so the upstream author's stated intent (don't break when symbol numbering changes) is defeated by a one-character overflow at a margin upstream sits exactly on. NOT BLESSED, deliberately: the expectation is not stale — upstream at Trust's own alignment pin reproduces the checked-in .stdout byte-for-byte after normalization, so blessing would record a Trust-specific wrap as an upstream expectation and would silently flip back the moment any symbol addition or removal moves `ident` under 1000. EXIT CONDITION (fix-trust, scheduled not waived): move Trust's mid-list symbols that sort before `ident` into the `AppendOnly { }` section, which is exactly the discipline symbol.rs already mandates; that restores a 3-digit index and makes the output byte-identical. It is not done here because it moves `SYMBOL_DIGITS_BASE` off 2318, and the compile-time assertion at symbol.rs guards that value precisely because renumbering stops every sealed driver and every prebuilt .rmeta — including the frozen stage1 std — from interoperating. Retire this row at the next preinterned-index renumbering / frozen-std rebuild, which is the moment the migration is free."
+issue = "local:docs/FROZEN_STD_SYMBOL_INDEX_ABI.md"
+reviewed_on = "2026-08-23"
+expires_on = "2026-11-23"
+allowed_patterns = [
+    "unpretty stdout differs only in pretty-printer line wrapping",
+    "symbol index width pushes the macro-rule line past MARGIN",
+]
+
+# =====================================================================
+# NEEDS OWNER — tests/ui/generics/issue-94923.rs SIGBUS. NO ACTIVE ROW
+# IS WRITTEN FOR IT ON PURPOSE. READ THIS BEFORE ADDING ONE.
+# =====================================================================
+#
+# 2026-08-23, the same domination run that produced the rows above: this
+# `//@ run-pass` test kills the compiler with signal 10 (SIGBUS) at
+# `-Copt-level=3`. It is a COMPILER CRASH on valid upstream Rust, which
+# "all valid Rust must compile identically" cannot accommodate, so it is
+# the most severe item in that run.
+#
+# An exception row was deliberately NOT added. `ExceptionStatus` has only
+# Active/Expired/Resolved, and `failure_covering_exception` nets any Active
+# row whose kind accounts for Failed — so ANY row written here turns a
+# reproducible compiler crash into a green scorecard. A crash must stay
+# visible until it is fixed. Do not "unblock the gate" by adding one.
+#
+# ROOT CAUSE (measured; it is NOT a Trust compiler-logic defect):
+#   * It is a stack overflow — macOS reports guard-page hits as SIGBUS —
+#     in LLVM's ScalarEvolution mutual recursion
+#     (getRangeRef -> getMulExpr -> createSCEV -> createSCEVIter ->
+#     createAddRecFromPHI -> createSCEV). The test is purpose-built to
+#     inline a 2^8 = 256-deep CHAIN of loops into one function, so SCEV
+#     recursion depth scales with the chain.
+#   * RUST_MIN_STACK bisect on the crashing input: 2 MiB and 8 MiB SIGBUS;
+#     16 MiB and 32 MiB exit 0. At 32 MiB the produced binary RUNS and its
+#     assertion holds — there is NO miscompile and no soundness exposure.
+#   * The difference from upstream is the LLVM this clone LINKS, not any
+#     Trust code. `bootstrap.toml` (gitignored, machine-local) sets
+#     `[target.aarch64-apple-darwin] llvm-config` to Homebrew's LLVM 22.1.7
+#     with `download-ci-llvm = false`. Homebrew's STATIC archives carry
+#     enormous frames: measured with `otool -tvV -p` on the shipped
+#     librustc_driver, `llvm::ScalarEvolution::createSCEV` reserves 13,376
+#     bytes of stack, against 384 bytes for the SAME function in this
+#     tree's own already-built LLVM (build/<host>/llvm, 22.1.2-rust-dev) —
+#     a 35x difference, and the cycle enters createSCEV twice per level.
+#   * Upstream nightly compiles the identical file in 0.46 s at the default
+#     stack. Trust's own pre- and post-optimization LLVM IR for it is the
+#     same shape as upstream's, so codegen is not diverging.
+#   * `scripts/recreate_bootstrap.py` does NOT generate this setting; it
+#     defaults to an in-tree LLVM build and only emits `llvm-config` when
+#     explicitly asked. The repo is not at fault — this clone's local
+#     config is.
+#
+# OPTIONS FOR THE OWNER (none taken here; all need a build, which the
+# agent that filed this was not permitted to run):
+#   1. PREFERRED — stop linking Homebrew LLVM: drop the `llvm-config` line
+#      from bootstrap.toml and build against `src/llvm-project` (already
+#      built in this tree), or set `download-ci-llvm`. In-tree frames are
+#      35x smaller, which puts the same recursion well inside the default
+#      stack. Not verified end-to-end, because verifying it is a rebuild.
+#   2. Raise the codegen thread's stack. REJECTED as a band-aid: both
+#      candidate sites (`DEFAULT_STACK_SIZE` in rustc_interface, and the
+#      spawn in rustc_codegen_ssa's back/write.rs) are UPSTREAM files, and
+#      patching them papers over a build-config defect that is wrong for a
+#      shipped toolchain for independent reasons.
+#   3. Decide what the release gate may run ON. This is the gate-integrity
+#      question and it is genuinely an owner call: `targo trust domination
+#      upstream-tests --release --execute` was run against a toolchain
+#      whose own config file says of itself "Not for release; local build
+#      bring-up only." A release gate measuring a build a release would
+#      never produce is a category error independent of this crash.
+#
+# RIDER, probably the same bug: bootstrap.toml disables tool debuginfo
+# (`debuginfo-level-tools = 0`) to dodge a SIGBUS in LLVM's RECURSIVE DWARF
+# scope emitter. That is the same fat-Homebrew-frames mechanism overflowing
+# the same thread stack. If option 1 is taken, re-test whether that
+# workaround is still needed — today it costs every Trust tool (clean, ay,
+# ty) its debug info, possibly for nothing.
+
+# =====================================================================
+# GATE DEFECT — this ledger CANNOT net a revision-bearing test.
+# Measured 2026-08-23. Needs an owner; it is a code fix, not a row.
+# =====================================================================
+#
+# `parse_compiletest_fail_line` (crates/trust-upstream-compat/src/porting.rs)
+# takes the failing path VERBATIM from compiletest's `[ui] <path> ... F` line.
+# For a test with `//@ revisions:` that path carries the revision suffix, e.g.
+#     tests/ui/cfg/assume-incomplete-release/assume-incomplete.rs#assume
+# `failure_covering_exception` then requires `exception.path == path`. No row
+# in this file carries a `#<revision>` suffix, and the `revision` FIELD holds
+# the upstream rust-lang/rust sha, not the compiletest revision — so it cannot
+# match either. Consequence: a revision-bearing failure can never be waived.
+#
+# This is why the char-3 restoration above is blocked, and it is a latent trap
+# for anyone writing a row for a revisioned test: the row will parse, validate,
+# and silently never net. Fix in porting.rs (match on the path stem, or key on
+# an explicit revision field), not by pasting `#rev` into `path`.

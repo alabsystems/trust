@@ -91,11 +91,13 @@ pub enum BridgeError {
 
 pub use binary_conversion::{
     BinaryTrustCgCheckedCertificateEvidence, BinaryTrustCgConversion, BinaryTrustCgConversionError,
-    BinaryTrustCgProofBindingInput, BinaryTrustCgProofConsumerEvidence, BinaryTrustCgProofConsumerRecord,
-    BinaryTrustCgProofConsumerStatus, BinaryTrustCgProofReplayEvidence, BinaryTrustCgSymbolicFormula,
+    BinaryTrustCgProofBindingInput, BinaryTrustCgProofConsumerEvidence,
+    BinaryTrustCgProofConsumerRecord, BinaryTrustCgProofConsumerStatus,
+    BinaryTrustCgProofReplayEvidence, BinaryTrustCgSymbolicFormula,
     BinaryTrustCgSymbolicFormulaEvidence, BinaryTrustCgTargetProofBinding,
     BinaryTrustCgUnsupportedLedgerEvidence, BinaryTrustCgValidationBlocker,
-    BinaryTrustCgValidationStatus, CanonicalTrustCgConversion, lower_binary_decompiled_function_to_lir,
+    BinaryTrustCgValidationStatus, CanonicalTrustCgConversion,
+    lower_binary_decompiled_function_to_lir,
     lower_binary_decompiled_function_to_lir_with_entry_bindings, lower_binary_trust_ir_to_lir,
     lower_binary_trust_ir_to_lir_with_entry_bindings, lower_canonical_trust_ir_to_lir,
 };

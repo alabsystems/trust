@@ -7,7 +7,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_sem::{evaluate_case, SemOutcome};
+use trust_js_sem::{SemOutcome, evaluate_case};
 use trust_js_trace::{Completion, HostEvent, ProjectedValue};
 
 fn stdout_of(body: &str) -> Vec<ProjectedValue> {
@@ -116,10 +116,7 @@ fn live_length_shrink() {
             "var a = [1, 2, 3]; var it = a.values(); it.next(); a.length = 1;\n\
              console.log(it.next().done, it.next().done);"
         ),
-        vec![
-            ProjectedValue::Bool { v: true },
-            ProjectedValue::Bool { v: true }
-        ]
+        vec![ProjectedValue::Bool { v: true }, ProjectedValue::Bool { v: true }]
     );
 }
 
@@ -151,9 +148,7 @@ fn next_wrong_receiver_typeerror() {
             "var next = [].values().next; var t = false;\n\
              try { next.call({}); } catch (e) { t = e instanceof TypeError; } t;"
         ),
-        Completion::Normal {
-            v: Some(ProjectedValue::Bool { v: true })
-        }
+        Completion::Normal { v: Some(ProjectedValue::Bool { v: true }) }
     );
 }
 
@@ -186,10 +181,7 @@ fn self_return_iterator_result_shape() {
 #[test]
 fn toplevel_values_returns_iterator() {
     // The completion value of `.values()` is an iterator object (typeof).
-    assert_eq!(
-        stdout_of("console.log(typeof [].values().next);"),
-        vec![s("function")]
-    );
+    assert_eq!(stdout_of("console.log(typeof [].values().next);"), vec![s("function")]);
 }
 
 #[test]
@@ -233,10 +225,7 @@ fn string_iterator_forof_and_spread() {
             "var r = []; for (var c of 'a\\u{1F600}b'[Symbol.iterator]()) r.push(c);\n\
              console.log(r.length, r.join('|'));"
         ),
-        vec![
-            ProjectedValue::Num { v: "3".to_string() },
-            s("a|\\ud83d\\ude00|b")
-        ]
+        vec![ProjectedValue::Num { v: "3".to_string() }, s("a|\\ud83d\\ude00|b")]
     );
     // A raw string for-of code-points too (fast path).
     assert_eq!(
@@ -254,10 +243,7 @@ fn iterator_prototype_self_return() {
             "var it = [1].values(); console.log(it[Symbol.iterator]() === it);\n\
              var s = 'x'[Symbol.iterator](); console.log(s[Symbol.iterator]() === s);"
         ),
-        vec![
-            ProjectedValue::Bool { v: true },
-            ProjectedValue::Bool { v: true }
-        ]
+        vec![ProjectedValue::Bool { v: true }, ProjectedValue::Bool { v: true }]
     );
 }
 

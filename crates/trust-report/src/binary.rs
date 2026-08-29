@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
-use trust_types::stable_sha256_hex;
 use trust_types::{
     Aarch64AtomicSemanticFact, Aarch64ExclusiveMonitorSemantics, Aarch64SyncBoundaryKind,
     Aarch64SyncBoundarySemanticFact, Aarch64SyncOrdering, Aarch64SyncScope, BinaryAddressRange,
@@ -25,7 +24,7 @@ use trust_types::{
     SolverDispatchStatus, SolverFallbackAttemptEvidence, SolverQuerySemantics,
     SolverTimeoutEvidence, SolverTimeoutEvidenceStatus, Sort, SourceSpan, TargetValidationBlocker,
     TrustLevel, UnsupportedFamilyCount, UnsupportedLedger, VerificationResult,
-    collect_free_var_decls,
+    collect_free_var_decls, stable_sha256_hex,
 };
 
 const BINARY_SOURCE_PROVENANCE_ARTIFACT_SCHEMA_VERSION: &str =

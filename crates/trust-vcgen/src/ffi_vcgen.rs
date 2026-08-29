@@ -511,7 +511,9 @@ mod tests {
             &args,
             "_ret",
             &SourceSpan::default(),
-            &db, &Default::default());
+            &db,
+            &Default::default(),
+        );
 
         // malloc: non-null param + range param + return contract + allocation side effect
         assert!(!vcs.is_empty(), "malloc should produce VCs");
@@ -552,8 +554,15 @@ mod tests {
             Formula::Var("src".into(), Sort::Int),
             Formula::Var("n".into(), Sort::Int),
         ];
-        let vcs =
-            generate_call_site_vcs("test_fn", "memcpy", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "memcpy",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         assert!(!vcs.is_empty(), "memcpy should produce VCs");
 
@@ -579,7 +588,9 @@ mod tests {
             &[],
             "_ret",
             &SourceSpan::default(),
-            &db, &Default::default());
+            &db,
+            &Default::default(),
+        );
         assert_eq!(vcs.len(), 1, "unmodeled extern must emit one conservative VC");
         assert!(
             matches!(vcs[0].kind, VcKind::FfiBoundaryViolation { .. }),
@@ -606,7 +617,9 @@ mod tests {
             &[],
             "_ret",
             &SourceSpan::default(),
-            &db, &Default::default());
+            &db,
+            &Default::default(),
+        );
         assert!(
             vcs.iter().any(|vc| matches!(&vc.kind, VcKind::FfiBoundaryViolation { desc, .. }
                 if desc.contains("UnsafeUnknown"))
@@ -619,8 +632,15 @@ mod tests {
     fn test_generate_call_site_vcs_printf_symbolic_format_fails_closed() {
         let db = FfiSummaryDb::new();
         let args = vec![Formula::Var("user_format".into(), Sort::Int)];
-        let vcs =
-            generate_call_site_vcs("test_fn", "printf", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "printf",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         let vc = vcs
             .iter()
@@ -641,8 +661,15 @@ mod tests {
     fn test_generate_call_site_vcs_printf_constant_format_no_format_vc() {
         let db = FfiSummaryDb::new();
         let args = vec![Formula::BitVec { value: 0x4000, width: 64 }];
-        let vcs =
-            generate_call_site_vcs("test_fn", "printf", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "printf",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         assert!(
             !vcs.iter().any(|vc| matches!(&vc.kind, VcKind::FormatStringViolation { .. })),
@@ -660,7 +687,9 @@ mod tests {
             &args,
             "_ret",
             &SourceSpan::default(),
-            &db, &Default::default());
+            &db,
+            &Default::default(),
+        );
 
         // The format-string check still fires without a summary (the point of
         // this test). round-19: an unmodeled printf-family extern ALSO now gets
@@ -685,8 +714,15 @@ mod tests {
         // assumption channel at this layer it must simply not be emitted.
         let db = FfiSummaryDb::new();
         let args = vec![Formula::Var("s".into(), Sort::Int)];
-        let vcs =
-            generate_call_site_vcs("test_fn", "strlen", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "strlen",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         assert!(
             !vcs.iter().any(|vc| matches!(
@@ -718,8 +754,15 @@ mod tests {
             Formula::Var("nmemb".into(), Sort::Int),
             Formula::Var("stream".into(), Sort::Int),
         ];
-        let vcs =
-            generate_call_site_vcs("test_fn", "fwrite", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "fwrite",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         assert!(
             !vcs.iter().any(|vc| matches!(
@@ -750,8 +793,15 @@ mod tests {
             Formula::Var("buf".into(), Sort::Int),
             Formula::Var("count".into(), Sort::Int),
         ];
-        let vcs =
-            generate_call_site_vcs("test_fn", "write", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "write",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         assert_eq!(vcs.len(), 1, "write must demand exactly one thing (buf non-null); got {vcs:?}");
         assert!(
@@ -778,8 +828,15 @@ mod tests {
     fn test_generate_call_site_vcs_free_side_effect() {
         let db = FfiSummaryDb::new();
         let args = vec![Formula::Var("ptr".into(), Sort::Int)];
-        let vcs =
-            generate_call_site_vcs("test_fn", "free", &args, "_ret", &SourceSpan::default(), &db, &Default::default());
+        let vcs = generate_call_site_vcs(
+            "test_fn",
+            "free",
+            &args,
+            "_ret",
+            &SourceSpan::default(),
+            &db,
+            &Default::default(),
+        );
 
         // free: nullable param (no null check) + FreesMemory side effect
         assert!(

@@ -6,7 +6,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_parse::{parse_script, ParseOutcome};
+use trust_js_parse::{ParseOutcome, parse_script};
 
 fn accepts(src: &str, strict: bool) {
     match parse_script(src, strict) {
@@ -686,13 +686,10 @@ fn module_and_script_goals_diverge_where_expected() {
 
 #[test]
 fn string_property_keys_have_utf16_semantics() {
-    use trust_js_parse::{parse_script, ParseOutcome};
+    use trust_js_parse::{ParseOutcome, parse_script};
     // A surrogate PAIR in a key composes to the astral character (it must
     // parse as a Script — the exact key value is exercised by the interp).
-    assert!(matches!(
-        parse_script(r#"({ "😀": 1 });"#, false),
-        ParseOutcome::Script(_)
-    ));
+    assert!(matches!(parse_script(r#"({ "😀": 1 });"#, false), ParseOutcome::Script(_)));
     // A LONE surrogate key is unrepresentable in the cooked AST: sound
     // refusal, never a silently mis-keyed property.
     assert!(matches!(
@@ -701,8 +698,5 @@ fn string_property_keys_have_utf16_semantics() {
     ));
     // Lone surrogates in ordinary string VALUES stay in-grammar (the
     // evaluator decodes the raw text at the code-unit level).
-    assert!(matches!(
-        parse_script(r#"var s = "\uD800";"#, false),
-        ParseOutcome::Script(_)
-    ));
+    assert!(matches!(parse_script(r#"var s = "\uD800";"#, false), ParseOutcome::Script(_)));
 }

@@ -1,11 +1,7 @@
-use lambda_calculus::{
-    parse,
-    parser::{ParseError, parse_with_context},
-    term::{
-        Context,
-        Notation::{Classic, DeBruijn},
-    },
-};
+use lambda_calculus::parse;
+use lambda_calculus::parser::{ParseError, parse_with_context};
+use lambda_calculus::term::Context;
+use lambda_calculus::term::Notation::{Classic, DeBruijn};
 
 #[test]
 fn parse_debruijn_and_classic() -> Result<(), ParseError> {

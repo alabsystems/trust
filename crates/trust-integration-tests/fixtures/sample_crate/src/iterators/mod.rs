@@ -12,9 +12,7 @@ pub fn zip_sum(a: &[i32], b: &[i32]) -> Vec<i32> {
 }
 
 pub fn flat_map_split(v: &[String]) -> Vec<String> {
-    v.iter()
-        .flat_map(|s| s.split(',').map(String::from))
-        .collect()
+    v.iter().flat_map(|s| s.split(',').map(String::from)).collect()
 }
 
 pub fn skip_take(v: &[i32], skip: usize, take: usize) -> Vec<i32> {

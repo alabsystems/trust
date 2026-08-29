@@ -20,4 +20,3 @@ preference, which is why it is tracked into the crate hash: a build that proved
 more must not share an artifact identity with one that proved less. It also
 enters the verification cache key, so an included-dependencies run cannot reuse
 a cached excluded-dependencies verdict.
-

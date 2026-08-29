@@ -3,7 +3,6 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::UnwindEdge;
 use trust_ir::Constant as TrustIrConstant;
 use trust_ir::dialect::AttrValue;
 use trust_ir::inst::{
@@ -17,10 +16,11 @@ use trust_ir_build::validate_module;
 use trust_types::{
     AggregateKind, AtomicOpKind, AtomicOperation, AtomicOrdering, BasicBlock as TrustBlock, BinOp,
     BinaryArtifactDigest, BinaryArtifactMetadata, BinaryOrigin, BinarySelectedImageIdentity,
-    BinarySourceProvenanceSummary, BlockId, CallableDefPathHash, CallableKind, ClosureCallKind, ConstValue, Contract, ContractKind,
-    DecompilationArtifact, DecompiledFunction, EnumReprHint, Formula, LocalDecl, Operand, Place,
-    Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnOp, VariantDef,
-    VerifiableBody, VerifiableFunction, stable_sha256_hex,
+    BinarySourceProvenanceSummary, BlockId, CallableDefPathHash, CallableKind, ClosureCallKind,
+    ConstValue, Contract, ContractKind, DecompilationArtifact, DecompiledFunction, EnumReprHint,
+    Formula, LocalDecl, Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement,
+    Terminator, Ty, UnOp, UnwindEdge, VariantDef, VerifiableBody, VerifiableFunction,
+    stable_sha256_hex,
 };
 
 use crate::lower::{
@@ -33,8 +33,8 @@ use crate::lower::{
     is_element_free_total_std_type, is_ratio_new_absent_callee, is_ratio_recip_absent_callee,
     is_trusted_panic_free_absent_callee, lower_functions_to_trust_ir, lower_to_trust_ir,
     lower_to_trust_ir_functions, lower_to_trust_ir_functions_with_assumed_total_context,
-    lower_to_trust_ir_functions_with_context,
-    lower_to_trust_ir_functions_with_test_paired_context, map_binop, map_type, map_unop,
+    lower_to_trust_ir_functions_with_context, lower_to_trust_ir_functions_with_test_paired_context,
+    array_receiver_static_len, map_binop, map_type, map_unop, reconstruct_slice_len_formula,
     verifiable_function_lowers_in_module_context,
 };
 use crate::{
@@ -186,12 +186,16 @@ fn test_map_type_tuple_precise_and_layout_dependent_types_fail_closed() {
         TrustIrTy::Tuple(vec![TrustIrTy::I32, TrustIrTy::Bool])
     );
     assert!(matches!(
-        map_type(&Ty::Adt { adt_kind: None, layout: None, 
+        map_type(&Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Pair".into(),
             fields: vec![("x".into(), Ty::i32())],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
         Err(BridgeError::UnsupportedType(_))
     ));
     assert!(matches!(
@@ -339,6 +343,67 @@ fn test_lower_add_function() {
 
     let has_return = bb0.body.iter().any(|node| matches!(&node.inst, Inst::Return { .. }));
     assert!(has_return, "should have a Return instruction");
+    assert_valid_module(&module);
+}
+
+#[test]
+fn test_tail_call_lowers_to_direct_call_result_then_return() {
+    let caller = VerifiableFunction {
+        name: "tail_caller".to_string(),
+        def_path: "test::tail_caller".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".to_string()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: Vec::new(),
+                terminator: Terminator::TailCall {
+                    func: "test::identity".to_string(),
+                    args: vec![Operand::Copy(Place::local(1))],
+                    span: SourceSpan::default(),
+                    atomic: None,
+                    is_foreign: false,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                },
+            }],
+            arg_count: 1,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        spec: Default::default(),
+    };
+    let mut callee = caller.clone();
+    callee.name = "identity".to_string();
+    callee.def_path = "test::identity".to_string();
+    callee.body.blocks[0] = TrustBlock {
+        id: BlockId(0),
+        stmts: vec![Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+            span: SourceSpan::default(),
+        }],
+        terminator: Terminator::Return,
+    };
+
+    let module = lower_to_trust_ir_functions("tail_call", &[caller, callee])
+        .expect("a local TailCall must lower through ordinary call semantics");
+    let body = &module.functions[0].blocks[0].body;
+    let call = body
+        .iter()
+        .position(|node| matches!(&node.inst, Inst::Call { callee, .. } if callee.index() == 1))
+        .expect("TailCall must retain its direct call edge");
+    let ret = body
+        .iter()
+        .position(|node| matches!(&node.inst, Inst::Return { values } if values.len() == 1))
+        .expect("TailCall must return the callee result");
+    assert!(call < ret);
     assert_valid_module(&module);
 }
 
@@ -549,7 +614,11 @@ fn test_lower_rust_call_closure_shim_uses_registered_env_and_flattens_tuple_args
                             span: SourceSpan::default(),
                         },
                     ],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
                         dest: Place::local(4),
@@ -681,7 +750,11 @@ fn test_rust_call_closure_shim_without_body_fails_closed() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![
                             Operand::Move(Place::local(2)),
@@ -2828,10 +2901,7 @@ fn test_lower_unary_not() {
     assert_valid_module(&module);
     for input in [false, true] {
         let outcome = Interpreter::with_module(&module)
-            .execute_func(
-                trust_ir::FuncId::new(0),
-                vec![InterpretValue::bool(input)],
-            )
+            .execute_func(trust_ir::FuncId::new(0), vec![InterpretValue::bool(input)])
             .expect("the respelled bool `!` must interpret");
         assert_eq!(
             outcome.returns[0].as_bool().expect("a bool result"),
@@ -2997,12 +3067,7 @@ fn test_bool_not_of_in_band_opaque_scalar_keeps_membership_and_validates() {
     // (a) MEMBERSHIP: the bundling probe must keep it. This is the assertion a
     // fail-closed `BridgeError` on this shape breaks.
     assert!(
-        verifiable_function_lowers_in_module_context(
-            &[target, planted.clone()],
-            1,
-            &empty,
-            &empty
-        ),
+        verifiable_function_lowers_in_module_context(&[target, planted.clone()], 1, &empty, &empty),
         "a bool `!` of an in-band bool OpaqueScalar must not be EVICTED from the bundle"
     );
     // (b) VALIDITY: and the module it lowers to must actually validate, which the
@@ -3408,6 +3473,133 @@ fn test_lower_checked_add() {
         bb0.body.iter().filter(|node| matches!(&node.inst, Inst::InsertField { .. })).count() >= 2,
         "CheckedBinaryOp should insert both tuple fields"
     );
+}
+
+/// Build `pub const T: <ptr-sized int> = <opaque> + <opaque>` as a single-block
+/// `CheckedBinaryOp` whose destination value type is the FAITHFUL `PtrSizedInt`
+/// spelling — the exact shape rustc emits for `const TWO: usize = ONE + ONE`
+/// and for `where [(); N + 1]:`, where the named const / const-generic param is
+/// unevaluable at `mir_built` time and extracts as the value-less opaque family.
+fn ptr_sized_checked_add_of_opaque(
+    name: &str,
+    signed: bool,
+    lhs: Operand,
+    rhs: Operand,
+) -> VerifiableFunction {
+    let ptr_int = Ty::PtrSizedInt { signed };
+    VerifiableFunction {
+        name: name.to_string(),
+        def_path: format!("test::{name}"),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: ptr_int.clone(), name: None },
+                LocalDecl { index: 1, ty: Ty::Tuple(vec![ptr_int.clone(), Ty::Bool]), name: None },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::CheckedBinaryOp(BinOp::Add, lhs, rhs),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: ptr_int,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// An OPAQUE integer constant has no value, so it cannot be fit-checked the way
+/// a literal is; its only admissible context adoption is a RESPELL at an
+/// already-identical width and signedness. Both directions are pinned here
+/// because only the pair is a fix:
+///
+///  (a) `OpaqueScalar`/`ConstParam` of pointer width in a `PtrSizedInt`
+///      destination must LOWER, and the `Undef` it mints must carry the
+///      destination's `Usize`/`Isize` spelling — not the contextless
+///      `U64`/`I64`, which would be an ill-typed operand of the
+///      `Inst::Overflow { ty: Usize|Isize }` emitted right after it.
+///  (b) A width MISMATCH must still refuse. This is the fail-closed half that
+///      stands in for the missing fit check: it is what a non-64-bit-pointer
+///      target degenerates to, since `PtrSizedInt::int_width()` is the pinned
+///      64 while the extractor's opaque width is `tcx.data_layout`-derived.
+#[test]
+fn test_checked_binop_opaque_int_adopts_ptr_sized_spelling_only_at_equal_width() {
+    let opaque_scalar =
+        |width, signed| Operand::Constant(ConstValue::OpaqueScalar { width, signed });
+    let const_param = |width, signed| {
+        Operand::Constant(ConstValue::ConstParam { index: 0, name: "N".to_string(), width, signed })
+    };
+
+    // (a) ADOPTS — usize (OpaqueScalar pair, the `const TWO: usize = ONE + ONE`
+    // shape) and isize (ConstParam + literal, the `N + 1` shape).
+    for (name, signed, lhs, rhs, want) in [
+        (
+            "opaque_usize",
+            false,
+            opaque_scalar(64, false),
+            opaque_scalar(64, false),
+            TrustIrTy::Usize,
+        ),
+        (
+            "constparam_isize",
+            true,
+            const_param(64, true),
+            Operand::Constant(ConstValue::Int(1)),
+            TrustIrTy::Isize,
+        ),
+    ] {
+        let func = ptr_sized_checked_add_of_opaque(name, signed, lhs, rhs);
+        let module =
+            lower_to_trust_ir(&func).unwrap_or_else(|err| panic!("{name} must lower, got {err:?}"));
+        assert_valid_module(&module);
+        let bb0 = &module.functions[0].blocks[0];
+        let overflow = bb0
+            .body
+            .iter()
+            .find_map(|node| match &node.inst {
+                Inst::Overflow { ty, .. } => Some(ty.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} must emit Inst::Overflow"));
+        assert_eq!(overflow, want, "{name}: Overflow must carry the faithful spelling");
+        // The paired half: the opaque operand's own `Undef` must be stamped with
+        // the SAME spelling. Without the emission change this assertion fails
+        // while the type check above passes — a +0-by-construction edit.
+        assert!(
+            bb0.body.iter().any(|node| matches!(&node.inst, Inst::Undef { ty } if *ty == want)),
+            "{name}: the opaque operand's Undef must be respelled to {want}, body={:?}",
+            bb0.body.iter().map(|n| format!("{:?}", n.inst)).collect::<Vec<_>>()
+        );
+    }
+
+    // (b) REFUSES on any width/sign disagreement — the fail-closed half.
+    for (name, signed, width, opaque_signed) in [
+        ("narrower", false, 32u32, false),
+        ("wider", false, 128u32, false),
+        ("sign_flip", true, 64u32, false),
+        ("in_band_bool", false, 1u32, false),
+    ] {
+        let func = ptr_sized_checked_add_of_opaque(
+            name,
+            signed,
+            opaque_scalar(width, opaque_signed),
+            opaque_scalar(width, opaque_signed),
+        );
+        let err = lower_to_trust_ir(&func)
+            .expect_err("a non-identical opaque width/sign must keep failing closed");
+        assert!(
+            format!("{err:?}").contains("CheckedBinaryOp operands must match"),
+            "{name}: expected the unchanged operand/destination refusal, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -4253,12 +4445,16 @@ fn test_lower_drop_terminator() {
 
 #[test]
 fn test_nontrivial_drop_fails_soft_with_honest_panic_obligation() {
-    let drop_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let drop_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "NeedsDrop".to_string(),
         fields: vec![("x".to_string(), Ty::i64())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "drop_nontrivial_fn".to_string(),
         def_path: "test::drop_nontrivial_fn".to_string(),
@@ -4456,7 +4652,9 @@ fn test_drop_glue_proves_for_result_of_plain_struct_and_fieldless_enum() {
         vec![("numerator".to_string(), Ty::i64()), ("denominator".to_string(), Ty::i64())],
     );
     // `CheckError` — a FIELDLESS user enum, also compiler-certified no-`Drop`.
-    let check_error_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let check_error_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "myapp::CheckError".to_string(),
         fields: vec![("__tag".to_string(), Ty::i64())],
         variants: vec![
@@ -4472,11 +4670,15 @@ fn test_drop_glue_proves_for_result_of_plain_struct_and_fieldless_enum() {
             },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     // `core::result::Result<Rat, CheckError>` — the vetted std payload enum,
     // flattened exactly as the real extractor's `lower_enum_adt` shapes it
     // (`__tag` + one `__v{idx}_{field}` entry per variant field).
-    let result_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let result_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".to_string(),
         fields: vec![
             ("__tag".to_string(), Ty::i64()),
@@ -4496,7 +4698,9 @@ fn test_drop_glue_proves_for_result_of_plain_struct_and_fieldless_enum() {
             },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
 
     let structural_drop: std::collections::HashSet<String> =
         ["myapp::Rat".to_string(), "myapp::CheckError".to_string()].into_iter().collect();
@@ -4892,18 +5096,20 @@ fn test_drop_glue_unlicensed_user_enum_keeps_the_blanket_row() {
     );
 }
 
-
-
 #[test]
 fn test_drop_glue_vec_of_plain_element_fails_closed_when_element_is_erased() {
     // A flattened `Vec` field tree does not authenticate its generic element or
     // allocator. A primitive-looking payload therefore cannot grant Drop authority.
-    let vec_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let vec_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "alloc::vec::Vec".to_string(),
         fields: vec![("elem".to_string(), Ty::i64())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let module = lower_to_trust_ir_functions("test_mod", &[drop_glue_test_fn(vec_ty)])
         .expect("Vec<i64> drop must lower");
     assert_valid_module(&module);
@@ -4922,12 +5128,16 @@ fn test_drop_glue_kept_for_vec_of_user_drop_element() {
     // carries a possible user `Drop`, so the whole must decline (never a false
     // proof from trusting the container alone).
     let guard_ty = Ty::adt("myapp::PanickyGuard", vec![("x".to_string(), Ty::i64())]);
-    let vec_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let vec_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "alloc::vec::Vec".to_string(),
         fields: vec![("elem".to_string(), guard_ty)],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let module = lower_to_trust_ir_functions("test_mod", &[drop_glue_test_fn(vec_ty)])
         .expect("Vec<PanickyGuard> drop must lower fail-soft, not Err");
     assert_valid_module(&module);
@@ -4975,12 +5185,22 @@ fn test_drop_glue_classifier_terminates_on_deep_recursive_type() {
 fn test_trait_object_drop_is_fatal_and_generic_param_drop_is_expected_absent() {
     // `Box<dyn MyTrait>` — a trait object's concrete drop glue is unknowable
     // (dynamic dispatch to whatever concrete type is behind the vtable).
-    let boxed_dyn_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let boxed_dyn_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "alloc::boxed::Box".to_string(),
-        fields: vec![("0".to_string(), Ty::Dynamic { trait_name: "myapp::MyTrait".to_string(), principal_key: Some("myapp::MyTrait".to_string()) })],
+        fields: vec![(
+            "0".to_string(),
+            Ty::Dynamic {
+                trait_name: "myapp::MyTrait".to_string(),
+                principal_key: Some("myapp::MyTrait".to_string()),
+            },
+        )],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let module = lower_to_trust_ir_functions("test_mod", &[drop_glue_test_fn(boxed_dyn_ty)])
         .expect("Box<dyn Trait> drop must lower fail-soft, not Err");
     assert_valid_module(&module);
@@ -5096,12 +5316,16 @@ fn test_build5_drop_glue_std_composed_arena_with_erased_maps_fails_closed() {
             (
                 "values".into(),
                 // Vec<i64> stands in for Vec<BigRational> (element visible & panic-free).
-                Ty::Adt { adt_kind: None, layout: None, 
+                Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
                     name: "alloc::vec::Vec".to_string(),
                     fields: vec![("elem".into(), Ty::i64())],
                     variants: vec![],
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                },
             ),
             // HashMap whose K/V hashbrown erases. A visible safe-looking scaffold must
             // not turn the absent K/V evidence into a vacuous proof.
@@ -5381,7 +5605,9 @@ fn test_build5_drop_glue_fails_closed_on_user_drop_in_field_tree() {
 /// foreign `Sign` enum inside (which would DECLINE if recursed) also proves the
 /// leaf short-circuit is what fires.
 fn ty_ratio_bigint_full() -> Ty {
-    let sign = Ty::Adt { adt_kind: None, layout: None, 
+    let sign = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "num_bigint::Sign".to_string(),
         fields: vec![("__tag".to_string(), Ty::i64())],
         variants: vec![
@@ -5390,7 +5616,9 @@ fn ty_ratio_bigint_full() -> Ty {
             trust_types::VariantDef { name: "Plus".to_string(), discriminant: 2, fields: vec![] },
         ],
         disc_index_safe: true,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let biguint = Ty::adt(
         "num_bigint::BigUint",
         vec![("data".to_string(), Ty::adt("std::vec::Vec", vec![("len".to_string(), Ty::u64())]))],
@@ -5515,7 +5743,11 @@ fn test_lower_unresolved_call_fails_soft_with_honest_panic_obligation() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "callee".to_string(),
                         args: vec![Operand::Constant(ConstValue::Int(10))],
                         dest: Place::local(0),
@@ -5586,7 +5818,11 @@ fn test_panic_call_lowers_to_panic_freedom_obligation() {
             blocks: vec![TrustBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    is_foreign: false,
                     func: "core::panicking::panic".to_string(),
                     args: vec![],
                     dest: Place::local(0),
@@ -5648,6 +5884,7 @@ fn panic_call_aggregate_has_no_independent_per_site_carrier() {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::panicking::panic".to_string(),
                     args: vec![],
@@ -5724,24 +5961,32 @@ fn str_pattern_method_with_panicking_closure_is_not_summarized_total() {
             locals: vec![
                 LocalDecl {
                     index: 0,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "core::option::Option".into(),
                         fields: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: None,
                 },
                 LocalDecl {
                     index: 1,
                     ty: Ty::Ref {
                         mutable: false,
-                        inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                        inner: Box::new(Ty::Adt {
+                            adt_kind: None,
+                            layout: None,
                             variants: Vec::new(),
                             name: "str".into(),
                             fields: vec![],
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, }),
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                        }),
                     },
                     name: Some("s".into()),
                 },
@@ -5761,7 +6006,9 @@ fn str_pattern_method_with_panicking_closure_is_not_summarized_total() {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
-                        is_unsafe_sig: false, is_foreign: false,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::str::<impl str>::find".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
@@ -5773,12 +6020,16 @@ fn str_pattern_method_with_panicking_closure_is_not_summarized_total() {
                 TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
             ],
             arg_count: 1,
-            return_ty: Ty::Adt { adt_kind: None, layout: None, 
+            return_ty: Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 variants: Vec::new(),
                 name: "core::option::Option".into(),
                 fields: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             datatype_defs: Default::default(),
         },
         contracts: vec![],
@@ -5851,7 +6102,11 @@ fn test_lower_intra_module_call_terminator_validates() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "test::callee".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -5922,6 +6177,213 @@ fn test_lower_cast_widening() {
     let bb0 = &module.functions[0].blocks[0];
     let has_cast = bb0.body.iter().any(|n| matches!(&n.inst, Inst::Cast { .. }));
     assert!(has_cast, "should have a Cast instruction for widening");
+}
+
+#[test]
+fn test_fat_to_thin_cast_lowers_to_ptr_data_not_bitcast() {
+    // `*const [u8] -> *const u8` (the `as_ptr` leg of the `fmt::Arguments`
+    // packing) must be the designed `PtrData` data-lane read: a 128b->64b
+    // `Bitcast` is invalid trust-ir (the module validator's cast layout rule
+    // refuses it), so the old spelling could never reach a proof-grade solve.
+    let fat =
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let thin = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+    let func = VerifiableFunction {
+        name: "as_ptr_leg".to_string(),
+        def_path: "test::as_ptr_leg".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: thin.clone(), name: None },
+                LocalDecl { index: 1, ty: fat, name: Some("p".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), thin),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) },
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("fat->thin cast should lower");
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::PtrData { .. })),
+        "fat->thin must be spelled as the PtrData data-lane read"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Cast { .. })),
+        "no size-changing Bitcast may be emitted for the fat->thin reinterpret"
+    );
+}
+
+#[test]
+fn test_fat_reborrow_keeps_the_metadata_lane_so_the_module_validates() {
+    // `_2 = &(*_1); _3 = _2 as *const [u8]` with `_1: &[u8]` — the shape
+    // `str::from_utf8_unchecked` compiles to inside `fmt::Arguments::as_str`,
+    // i.e. the shape reached from ANY `write!`.
+    //
+    // `Inst::Borrow`/`Inst::BorrowMut` are THIN by trust-ir's own spec —
+    // `inst_result_tys` types both `Ty::Ptr` — so spelling a FAT borrow with
+    // them retyped the metadata-carrying value as a bare data pointer. The next
+    // consumer that declared the Rust type (here the fat->fat reinterpret) then
+    // failed the WHOLE module's typed validation:
+    //
+    //   bb0: cast bitcast operand type ptr does not match declared source type
+    //   fatptr<slice ty.0>
+    //
+    // That is a PRODUCER INVARIANT VIOLATION, not an honest decline: an invalid
+    // module strips proof authority from every obligation in the body and
+    // reports an internal validation error where a per-construct refusal belongs.
+    let slice_ref =
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let raw_slice =
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let func = VerifiableFunction {
+        name: "fat_reborrow".to_string(),
+        def_path: "test::fat_reborrow".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: slice_ref.clone(), name: Some("p".into()) },
+                LocalDecl { index: 2, ty: slice_ref, name: Some("r".into()) },
+                LocalDecl { index: 3, ty: raw_slice.clone(), name: Some("q".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Ref {
+                            mutable: false,
+                            place: Place { local: 1, projections: vec![Projection::Deref] },
+                        },
+                        span: SourceSpan::default(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::Cast(Operand::Copy(Place::local(2)), raw_slice),
+                        span: SourceSpan::default(),
+                    },
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("a fat reborrow must lower");
+    // The point of the test: the module the producer mints is WELL-TYPED.
+    assert_valid_module(&module);
+
+    let bb0 = &module.functions[0].blocks[0];
+    let fat = TrustIrTy::FatPtr(trust_ir::FatPtrKind::Slice(trust_ir::TyId::new(0)));
+    // The borrow keeps the fat type and keeps its borrow CLAIM — nothing is
+    // dropped and nothing is added, only the spelling is well-typed.
+    let borrow = bb0
+        .body
+        .iter()
+        .find(|n| matches!(&n.inst, Inst::Copy { ty, .. } if matches!(ty, TrustIrTy::FatPtr(_))))
+        .expect("a fat reborrow must be spelled at the fat type, not thinned to Inst::Borrow");
+    assert_eq!(
+        borrow.inst,
+        Inst::Copy { ty: fat.clone(), operand: trust_ir::ValueId::new(0) },
+        "the fat reborrow must alias the operand at its own fat type"
+    );
+    assert!(
+        borrow.proofs.contains(&trust_ir::proof::ProofAnnotation::SharedBorrow),
+        "the shared-borrow claim must survive the respelling"
+    );
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::Borrow { .. } | Inst::BorrowMut { .. })),
+        "a THIN Inst::Borrow cannot carry a fat pointer's metadata lane"
+    );
+    // The downstream reinterpret is the consumer that used to fail validation.
+    assert!(
+        bb0.body
+            .iter()
+            .any(|n| matches!(&n.inst, Inst::Cast { src_ty, .. } if *src_ty == fat)),
+        "the fat->fat reinterpret must still be emitted at the fat source type"
+    );
+}
+
+#[test]
+fn test_extern_fmt_dispatch_result_undef_is_stamped_fresh_symbolic_havoc() {
+    // The extern-dispatch arm's opaque result must carry the exact
+    // Undef+FreshSymbolicHavoc pair the proof floor admits — an unmarked Undef
+    // fails the whole module's proof-authority preflight.
+    let func = VerifiableFunction {
+        name: "dispatches".to_string(),
+        def_path: "test::dispatches".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i32(), name: None },
+                LocalDecl { index: 1, ty: Ty::i32(), name: Some("x".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
+                        func: "core::fmt::write".to_string(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("extern dispatch should lower");
+    let bb0 = &module.functions[0].blocks[0];
+    let undefs: Vec<_> =
+        bb0.body.iter().filter(|n| matches!(&n.inst, Inst::Undef { .. })).collect();
+    assert!(!undefs.is_empty(), "the dispatch result must be an opaque Undef");
+    for undef in &undefs {
+        assert!(
+            undef.proofs.contains(&trust_ir::ProofAnnotation::FreshSymbolicHavoc),
+            "the dispatch-result Undef must be stamped FreshSymbolicHavoc"
+        );
+    }
+    assert!(
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::Assert { .. })
+            && n.proofs.contains(&trust_ir::ProofAnnotation::NoPanic)),
+        "the honest may-panic Assert(false)+NoPanic marker must stay"
+    );
 }
 
 #[test]
@@ -6436,7 +6898,9 @@ fn test_nested_field_projected_store_rebuilds_outer_aggregate() {
 }
 
 fn multi_variant_projected_store_ty(faithful: bool) -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "test::MultiProjected".into(),
         fields: vec![
             ("__tag".into(), Ty::isize()),
@@ -6453,7 +6917,9 @@ fn multi_variant_projected_store_ty(faithful: bool) -> Ty {
             },
         ],
         disc_index_safe: true,
-        faithful_enum_repr: if faithful { Some(None) } else { None }, enum_layout: None, }
+        faithful_enum_repr: if faithful { Some(None) } else { None },
+        enum_layout: None,
+    }
 }
 
 fn projected_store_through_pointer(
@@ -6501,8 +6967,9 @@ fn assert_variant_interior_store_lowers_as_sound_havoc(func: &VerifiableFunction
     // `Undef` — a strict over-approximation of the real post-state, so no
     // dependent obligation can falsely prove, and the B3-1b G1 silent-WRONG-
     // write hazard is structurally gone (no write is modeled at all). The
-    // DEREF/address-walk path is unchanged and still fails closed (see the
-    // `assert_variant_interior_address_walk_fails_closed` fixtures).
+    // A DEREF/store address walk still fails closed because it has no typed
+    // borrow expectation. The separately tested `Rvalue::Ref` lane may lower
+    // to an explicitly undefined pointer, never to a guessed address.
     let module = lower_to_trust_ir(func).expect("an enum-interior store now lowers (sound havoc)");
     let function = &module.functions[0];
     let mut saw_undef = false;
@@ -6533,6 +7000,38 @@ fn assert_variant_interior_address_walk_fails_closed(func: &VerifiableFunction) 
         ),
         "unexpected enum-interior address-walk error: {err:?}"
     );
+}
+
+fn assert_imprecise_borrow_lowers_as_sound_pointer_havoc(
+    func: &VerifiableFunction,
+    mutable: bool,
+) -> trust_ir::Module {
+    let module = lower_to_trust_ir(func)
+        .expect("a typed enum-interior borrow should lower as explicit pointer havoc");
+    assert_valid_module(&module);
+    assert!(
+        module.proof_obligations.is_empty(),
+        "pointer havoc must not fabricate or discharge a proof obligation"
+    );
+
+    let body = module.functions[0].blocks.iter().flat_map(|block| block.body.iter());
+    let undef_ptrs = body
+        .clone()
+        .filter_map(|node| match (&node.inst, node.results.as_slice()) {
+            (Inst::Undef { ty: TrustIrTy::Ptr }, [result]) => Some(*result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!undef_ptrs.is_empty(), "the imprecise address must be an explicit Ptr Undef");
+    assert!(
+        body.clone().any(|node| match &node.inst {
+            Inst::BorrowMut { ptr } if mutable => undef_ptrs.contains(ptr),
+            Inst::Borrow { ptr } if !mutable => undef_ptrs.contains(ptr),
+            _ => false,
+        }),
+        "the borrow must consume the undefined pointer directly"
+    );
+    module
 }
 
 fn address_of_test_function(
@@ -6613,7 +7112,7 @@ fn enum_interior_address_cases() -> Vec<(&'static str, Ty, Place)> {
 }
 
 #[test]
-fn test_ref_into_variant_bearing_adt_interior_fails_closed() {
+fn test_ref_into_variant_bearing_adt_interior_lowers_as_sound_havoc() {
     for (shape, base_ty, place) in enum_interior_address_cases() {
         let func = address_of_test_function(
             &format!("ref_into_{shape}_enum"),
@@ -6623,12 +7122,12 @@ fn test_ref_into_variant_bearing_adt_interior_fails_closed() {
             false,
             false,
         );
-        assert_variant_interior_address_walk_fails_closed(&func);
+        assert_imprecise_borrow_lowers_as_sound_pointer_havoc(&func, false);
     }
 }
 
 #[test]
-fn test_mutable_ref_into_variant_bearing_adt_interior_fails_closed() {
+fn test_mutable_ref_into_variant_bearing_adt_interior_lowers_as_sound_havoc() {
     for (shape, base_ty, place) in enum_interior_address_cases() {
         let func = address_of_test_function(
             &format!("mutable_ref_into_{shape}_enum"),
@@ -6638,7 +7137,7 @@ fn test_mutable_ref_into_variant_bearing_adt_interior_fails_closed() {
             false,
             true,
         );
-        assert_variant_interior_address_walk_fails_closed(&func);
+        assert_imprecise_borrow_lowers_as_sound_pointer_havoc(&func, true);
     }
 }
 
@@ -6844,12 +7343,16 @@ fn faithful_enum_ty(name: &str, repr: Option<EnumReprHint>, variants: Vec<Varian
             fields.push((format!("__v{variant_index}_{field_index}"), field_ty.clone()));
         }
     }
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: name.into(),
         fields,
         variants,
         disc_index_safe: true,
-        faithful_enum_repr: Some(repr), enum_layout: None, }
+        faithful_enum_repr: Some(repr),
+        enum_layout: None,
+    }
 }
 
 fn discriminant_read_function(name: &str, enum_ty: Ty) -> VerifiableFunction {
@@ -7104,7 +7607,9 @@ fn test_faithful_downcast_field_reads_variant_local_payload_lane() {
 }
 
 fn mismatched_variant_operand_function(faithful: bool, op: BinOp) -> VerifiableFunction {
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "test::MismatchedVariantOperands".into(),
         fields: vec![
             ("__tag".into(), Ty::PtrSizedInt { signed: true }),
@@ -7124,7 +7629,9 @@ fn mismatched_variant_operand_function(faithful: bool, op: BinOp) -> VerifiableF
             },
         ],
         disc_index_safe: true,
-        faithful_enum_repr: if faithful { Some(Some(EnumReprHint::U8)) } else { None }, enum_layout: None, };
+        faithful_enum_repr: if faithful { Some(Some(EnumReprHint::U8)) } else { None },
+        enum_layout: None,
+    };
     let return_ty = if op == BinOp::Eq { Ty::Bool } else { Ty::u8() };
     VerifiableFunction {
         name: format!("{}_variant_{op:?}", if faithful { "faithful" } else { "legacy" }),
@@ -7397,10 +7904,7 @@ fn test_dominating_writer_lowered_after_reader_uses_entry_slot() {
     let outcome = Interpreter::with_module(&module)
         .execute_func(trust_ir::FuncId::new(0), vec![])
         .expect("the real CFG writes before it reads");
-    assert_eq!(
-        outcome.returns[0].kind,
-        InterpretValue::int(TrustIrTy::I32, 41).unwrap().kind
-    );
+    assert_eq!(outcome.returns[0].kind, InterpretValue::int(TrustIrTy::I32, 41).unwrap().kind);
 }
 
 #[test]
@@ -7418,10 +7922,7 @@ fn test_implicit_return_slot_read_participates_in_dominance() {
     let outcome = Interpreter::with_module(&module)
         .execute_func(trust_ir::FuncId::new(0), vec![])
         .expect("the real CFG initializes `_0` before Return");
-    assert_eq!(
-        outcome.returns[0].kind,
-        InterpretValue::int(TrustIrTy::I32, 73).unwrap().kind
-    );
+    assert_eq!(outcome.returns[0].kind, InterpretValue::int(TrustIrTy::I32, 73).unwrap().kind);
 }
 
 fn sibling_borrow_function() -> VerifiableFunction {
@@ -7493,15 +7994,14 @@ fn test_address_taken_local_alloca_dominates_sibling_use() {
                 vec![InterpretValue::int(TrustIrTy::U8, choice).unwrap()],
             )
             .expect("both sibling paths read the initialized entry slot");
-        assert_eq!(
-            outcome.returns[0].kind,
-            InterpretValue::int(TrustIrTy::I32, 55).unwrap().kind
-        );
+        assert_eq!(outcome.returns[0].kind, InterpretValue::int(TrustIrTy::I32, 55).unwrap().kind);
     }
 }
 
 fn fieldless_enum_reassignment_function(faithful: bool) -> VerifiableFunction {
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "test::FieldlessReassignment".into(),
         fields: vec![("__tag".into(), Ty::i64())],
         variants: vec![
@@ -7509,7 +8009,9 @@ fn fieldless_enum_reassignment_function(faithful: bool) -> VerifiableFunction {
             VariantDef { name: "Reassigned".into(), discriminant: 1, fields: vec![] },
         ],
         disc_index_safe: true,
-        faithful_enum_repr: if faithful { Some(None) } else { None }, enum_layout: None, };
+        faithful_enum_repr: if faithful { Some(None) } else { None },
+        enum_layout: None,
+    };
     let variant = |local, index| Statement::Assign {
         place: Place::local(local),
         rvalue: Rvalue::Aggregate(
@@ -7805,14 +8307,18 @@ fn test_downcast_then_nested_aggregate_field_resets_active_variant() {
     // fails with "Field projection on non-ADT with active variant N". Regression
     // for the stale-`active_variant` bug in `resolve_place`.
     let payload = Ty::Tuple(vec![Ty::u64(), Ty::u64()]);
-    let option_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "std::option::Option".into(),
         // ty_convert encodes a variant's field as `__v{variant}_{field}`; Some is
         // variant 1, its single payload field is `__v1_0` (here the (u64, u64) tuple).
         fields: vec![("__v1_0".into(), payload.clone())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "downcast_nested_field".to_string(),
         def_path: "test::downcast_nested_field".to_string(),
@@ -7986,7 +8492,11 @@ fn test_fetch_nand_atomic_rejected() {
             blocks: vec![TrustBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    is_foreign: false,
                     func: "atomic_fetch_nand".to_string(),
                     args: vec![],
                     dest: Place::local(0),
@@ -8037,7 +8547,11 @@ fn test_atomic_store_metadata_without_authenticated_evidence_rejected() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "atomic_store_release".to_string(),
                         args: vec![
                             Operand::Copy(Place::local(1)),
@@ -8093,7 +8607,11 @@ fn test_atomic_load_metadata_without_authenticated_evidence_rejected() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "atomic_load_acquire".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -8146,7 +8664,11 @@ fn test_atomic_fetch_add_metadata_without_authenticated_evidence_rejected() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "atomic_fetch_add".to_string(),
                         args: vec![
                             Operand::Copy(Place::local(1)),
@@ -8202,7 +8724,11 @@ fn test_atomic_fetch_min_metadata_without_authenticated_evidence_rejected() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "atomic_fetch_min".to_string(),
                         args: vec![
                             Operand::Copy(Place::local(1)),
@@ -8258,7 +8784,11 @@ fn test_atomic_compare_exchange_metadata_without_authenticated_evidence_rejected
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "atomic_compare_exchange".to_string(),
                         args: vec![
                             Operand::Copy(Place::local(1)),
@@ -8650,7 +9180,10 @@ fn test_lower_array_raw_ptr_to_slice_raw_ptr_cast_builds_fat_pointer() {
 fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
     let data_ptr_ty = Ty::RawPtr { pointee: Box::new(Ty::u8()), mutable: false };
     let dyn_ptr_ty = Ty::RawPtr {
-        pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
+        pointee: Box::new(Ty::Dynamic {
+            trait_name: "Debug".into(),
+            principal_key: Some("Debug".into()),
+        }),
         mutable: false,
     };
     let func = VerifiableFunction {
@@ -8670,7 +9203,10 @@ fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
                     place: Place::local(3),
                     rvalue: Rvalue::Aggregate(
                         AggregateKind::RawPtr {
-                            pointee_ty: Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) },
+                            pointee_ty: Ty::Dynamic {
+                                trait_name: "Debug".into(),
+                                principal_key: Some("Debug".into()),
+                            },
                             mutable: false,
                         },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -8705,8 +9241,13 @@ fn test_lower_fat_raw_ptr_aggregate_rejects_dyn_vtable() {
 #[test]
 fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
     let trait_name = "core::fmt::Debug";
-    let dyn_ref_ty =
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }) };
+    let dyn_ref_ty = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Dynamic {
+            trait_name: trait_name.into(),
+            principal_key: Some(trait_name.into()),
+        }),
+    };
     let func = VerifiableFunction {
         name: "unsize_to_dyn_fn".to_string(),
         def_path: "test::unsize_to_dyn_fn".to_string(),
@@ -8757,9 +9298,7 @@ fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
             }
             _ => None,
         })
-        .unwrap_or_else(|| {
-            panic!("expected a TraitObject PtrFromParts, got {:?}", bb0.body)
-        });
+        .unwrap_or_else(|| panic!("expected a TraitObject PtrFromParts, got {:?}", bb0.body));
     assert_ne!(data, metadata, "the data lane must not be the vtable lane");
 
     // Trust (vtable slice 3): the vtable lane is a Load of the SHARED named identity
@@ -8768,11 +9307,10 @@ fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
     // the THIR producer emits, which is the whole point.
     let expected_name = trust_ir::stable_vtable_global_name(trait_name, "i32")
         .expect("the (Debug, i32) key is mintable");
-    let global_idx = module
-        .globals
-        .iter()
-        .position(|g| g.name == expected_name)
-        .unwrap_or_else(|| panic!("expected global `{expected_name}`, got {:?}", module.globals));
+    let global_idx =
+        module.globals.iter().position(|g| g.name == expected_name).unwrap_or_else(|| {
+            panic!("expected global `{expected_name}`, got {:?}", module.globals)
+        });
     let g = &module.globals[global_idx];
     assert!(g.initializer.is_none(), "the vtable identity global carries NO value");
     assert_eq!(g.ty, TrustIrTy::Ptr);
@@ -8809,8 +9347,13 @@ fn test_lower_trait_object_unsize_cast_keeps_real_data_lane() {
 #[test]
 fn test_trait_object_unsize_same_key_shares_one_vtable_global() {
     let trait_name = "core::fmt::Debug";
-    let dyn_ref_ty =
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }) };
+    let dyn_ref_ty = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Dynamic {
+            trait_name: trait_name.into(),
+            principal_key: Some(trait_name.into()),
+        }),
+    };
     let func = VerifiableFunction {
         name: "unsize_twice_fn".to_string(),
         def_path: "test::unsize_twice_fn".to_string(),
@@ -8899,8 +9442,13 @@ fn test_trait_object_unsize_same_key_shares_one_vtable_global() {
 #[test]
 fn test_trait_object_unsize_nominal_source_declines_identity_keeps_havoc() {
     let trait_name = "core::fmt::Debug";
-    let dyn_ref_ty =
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Dynamic { trait_name: trait_name.into(), principal_key: Some(trait_name.into()) }) };
+    let dyn_ref_ty = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Dynamic {
+            trait_name: trait_name.into(),
+            principal_key: Some(trait_name.into()),
+        }),
+    };
     let adt_src = Ty::Ref {
         mutable: false,
         inner: Box::new(Ty::adt(
@@ -8945,9 +9493,7 @@ fn test_trait_object_unsize_nominal_source_declines_identity_keeps_havoc() {
     );
     let bb0 = &module.functions[0].blocks[0];
     assert!(
-        bb0.body
-            .iter()
-            .any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Ptr)),
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Ptr)),
         "the vtable lane must stay the slice-1 fresh havoc when no identity is mintable"
     );
     assert!(
@@ -8966,7 +9512,10 @@ fn test_trait_object_unsize_nominal_source_declines_identity_keeps_havoc() {
 fn test_lower_thin_mut_dyn_unsize_cast_stays_a_whole_value_havoc() {
     let dyn_mut_ref_ty = Ty::Ref {
         mutable: true,
-        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Debug".into(), principal_key: Some("core::fmt::Debug".into()) }),
+        inner: Box::new(Ty::Dynamic {
+            trait_name: "core::fmt::Debug".into(),
+            principal_key: Some("core::fmt::Debug".into()),
+        }),
     };
     let func = VerifiableFunction {
         name: "unsize_to_mut_dyn_fn".to_string(),
@@ -9004,9 +9553,7 @@ fn test_lower_thin_mut_dyn_unsize_cast_stays_a_whole_value_havoc() {
     assert_valid_module(&module);
     let bb0 = &module.functions[0].blocks[0];
     assert!(
-        bb0.body
-            .iter()
-            .any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Ptr)),
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::Undef { ty } if *ty == TrustIrTy::Ptr)),
         "a thin `&mut dyn` coercion must keep the status-quo whole-value havoc, got {:?}",
         bb0.body
     );
@@ -9340,7 +9887,9 @@ fn test_lower_discriminant_rvalue() {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "MyEnum".to_string(),
                         fields: vec![
@@ -9348,7 +9897,9 @@ fn test_lower_discriminant_rvalue() {
                             ("tag".to_string(), Ty::u64()),
                         ],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("e".into()),
                 },
             ],
@@ -9392,12 +9943,16 @@ fn test_lower_discriminant_rvalue_untagged_adt_fails_closed() {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "Untagged".to_string(),
                         fields: vec![("payload".to_string(), Ty::i32())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("e".into()),
                 },
             ],
@@ -9438,12 +9993,16 @@ fn test_lower_discriminant_rvalue_result_type_mismatch_fails_closed() {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "Tagged".to_string(),
                         fields: vec![("tag".to_string(), Ty::u8())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("e".into()),
                 },
             ],
@@ -9803,13 +10362,17 @@ fn discriminant_range_fixture(discs: &[i128], disc_index_safe: bool) -> Verifiab
             fields: vec![],
         })
         .collect();
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "DiscEnum".to_string(),
         // `__tag` is the signed pointer-width int the extractor synthesizes.
         fields: vec![("__tag".to_string(), Ty::isize())],
         variants,
         disc_index_safe,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     VerifiableFunction {
         name: "disc_range".to_string(),
         def_path: "test::disc_range".to_string(),
@@ -9897,6 +10460,132 @@ fn test_discriminant_no_assume_when_negative_discriminant() {
     );
 }
 
+/// Same as [`discriminant_range_fixture`] but with an explicit `Discriminant`
+/// DEST type, so the real `#[repr(iN)]` shape (dest = the repr int, `__tag` =
+/// isize) can be built. `discriminant_range_fixture` pins the dest at isize,
+/// which is exactly the case that never hits the width mismatch.
+fn discriminant_dest_fixture(
+    discs: &[i128],
+    disc_index_safe: bool,
+    dest: Ty,
+) -> VerifiableFunction {
+    let variants: Vec<trust_types::VariantDef> = discs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| trust_types::VariantDef {
+            name: format!("V{i}"),
+            discriminant: *d,
+            fields: vec![],
+        })
+        .collect();
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "ReprEnum".to_string(),
+        fields: vec![("__tag".to_string(), Ty::isize())],
+        variants,
+        disc_index_safe,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    VerifiableFunction {
+        name: "disc_dest".to_string(),
+        def_path: "test::disc_dest".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: dest.clone(), name: None },
+                LocalDecl { index: 1, ty: enum_ty, name: Some("e".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Discriminant(Place::local(1)),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: dest,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// Trust (enum-disc-negative-havoc): the `core::cmp::Ordering` shape — a
+/// `disc_index_safe` enum with a NEGATIVE declared tag whose `Discriminant`
+/// dest is the REPR int (`i8`), not the synthetic `__tag` type (`isize`).
+/// GATE-NONNEG suppresses the range fact (previous test), and the dest/tag
+/// mismatch then fell into the `dest_ty != field_ty` hard `Err`, which drops
+/// the WHOLE function's lowering — reported end-to-end as "native typed-TrustIr
+/// lowering did not complete" and turning `match a.cmp(&b) { Equal => 1, _ => x
+/// }`, which cannot fault, into an incompleteness.
+///
+/// It must LOWER, modeling the dest as a fresh UNCONSTRAINED value: exactly one
+/// `Undef` at the DEST type, and NO fact of any kind — no `Assume`, no `Const`,
+/// and no `ExtractField` (the exact-extract path is unavailable at this width,
+/// and taking it would state an equality this arm must not state).
+#[test]
+fn test_discriminant_negative_tag_repr_dest_havocs_instead_of_failing_closed() {
+    let func = discriminant_dest_fixture(&[-1, 0, 1], true, Ty::i8());
+    let module = lower_to_trust_ir(&func)
+        .expect("negative-tag repr-typed Discriminant dest must lower, not fail closed");
+    assert_valid_module(&module);
+    assert_eq!(count_assumes(&module), 0, "the havoc arm must state no range fact");
+    assert_eq!(
+        count_insts(&module, |i| matches!(i, Inst::Const { .. })),
+        0,
+        "the havoc arm must emit no constant (a bound needs one)"
+    );
+    assert_eq!(
+        count_insts(&module, |i| matches!(i, Inst::ExtractField { .. })),
+        0,
+        "the havoc arm must not extract the isize __tag into an i8 dest"
+    );
+    assert_eq!(
+        count_insts(&module, |i| matches!(i, Inst::Undef { ty: TrustIrTy::I8 })),
+        1,
+        "the dest must be exactly one fresh unconstrained value at the DEST type"
+    );
+}
+
+/// The same negative-tag repr-typed shape but NOT layout-classified
+/// `disc_index_safe`: the havoc arm carries the layout gate, so this still
+/// fails CLOSED with the width-mismatch diagnostic. Without this the rescue
+/// would silently widen to niche layouts, whose `__tag` slot the arm has never
+/// been reasoned about against.
+#[test]
+fn test_discriminant_negative_tag_repr_dest_still_fails_closed_when_not_disc_index_safe() {
+    let func = discriminant_dest_fixture(&[-1, 0, 1], false, Ty::i8());
+    let err = lower_to_trust_ir(&func)
+        .expect_err("a non-disc_index_safe negative-tag enum must still fail closed");
+    assert!(
+        matches!(err, BridgeError::UnsupportedOp(ref msg) if msg.contains("does not match explicit discriminant/tag field type")),
+        "expected the width-mismatch diagnostic, got {err:?}"
+    );
+}
+
+/// A NON-negative repr-typed dest must keep taking the CONSTRAINED range path,
+/// not the new havoc arm: the two are separated by `min_disc < 0` alone, and
+/// collapsing them would silently drop the `[min, max]` bound that lets
+/// `arr[e as usize]` prove.
+#[test]
+fn test_discriminant_nonnegative_repr_dest_still_takes_the_range_path() {
+    let func = discriminant_dest_fixture(&[0, 1, 2], true, Ty::i8());
+    let module = lower_to_trust_ir(&func).expect("non-negative repr-typed dest should lower");
+    assert_valid_module(&module);
+    assert_eq!(
+        count_assumes(&module),
+        2,
+        "a non-negative disc_index_safe enum keeps both range bounds"
+    );
+}
+
 #[test]
 fn test_discriminant_cross_width_u8_dest_isize_tag_bounds_and_assigns() {
     // The REAL `#[repr(u8)]` MIR shape: `__tag` is isize but the `Discriminant`
@@ -9906,12 +10595,16 @@ fn test_discriminant_cross_width_u8_dest_isize_tag_bounds_and_assigns() {
     let variants: Vec<trust_types::VariantDef> = (0..4i128)
         .map(|d| trust_types::VariantDef { name: format!("V{d}"), discriminant: d, fields: vec![] })
         .collect();
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ReprU8".to_string(),
         fields: vec![("__tag".to_string(), Ty::isize())],
         variants,
         disc_index_safe: true,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "disc_u8".to_string(),
         def_path: "test::disc_u8".to_string(),
@@ -9976,12 +10669,16 @@ fn test_discriminant_range_assume_uses_true_min_max() {
 
 #[test]
 fn test_lower_set_discriminant_explicit_tag_inserts_tag_field() {
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Tagged".into(),
         fields: vec![("payload".into(), Ty::i32()), ("__tag".into(), Ty::Bool)],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "set_discr".to_string(),
         def_path: "test::set_discr".to_string(),
@@ -10028,12 +10725,16 @@ fn test_lower_set_discriminant_explicit_tag_inserts_tag_field() {
 
 #[test]
 fn test_lower_set_discriminant_untagged_adt_fails_closed() {
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Untagged".into(),
         fields: vec![("payload".into(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "set_discr_untagged".to_string(),
         def_path: "test::set_discr_untagged".to_string(),
@@ -10128,12 +10829,16 @@ fn test_lower_set_discriminant_bare_int_stores_fresh_unconstrained_tag() {
 
 #[test]
 fn test_lower_tagged_option_none_aggregate_sets_false_tag() {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "std::option::Option".into(),
         fields: vec![("__payload".into(), Ty::i32()), ("__tag".into(), Ty::isize())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "option_none".to_string(),
         def_path: "test::option_none".to_string(),
@@ -10187,12 +10892,16 @@ fn test_lower_tagged_option_none_aggregate_sets_false_tag() {
 
 #[test]
 fn test_lower_tagged_option_some_aggregate_sets_payload_and_true_tag() {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "std::option::Option".into(),
         fields: vec![("__payload".into(), Ty::i32()), ("__tag".into(), Ty::isize())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "option_some".to_string(),
         def_path: "test::option_some".to_string(),
@@ -10250,12 +10959,16 @@ fn test_lower_tagged_option_some_aggregate_sets_payload_and_true_tag() {
 
 #[test]
 fn test_lower_tagged_option_some_symbolic_payload_sets_tag() {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "std::option::Option".into(),
         fields: vec![("__payload".into(), Ty::i32()), ("__tag".into(), Ty::isize())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "option_some_symbolic".to_string(),
         def_path: "test::option_some_symbolic".to_string(),
@@ -10451,12 +11164,16 @@ fn test_lower_nested_compacted_field_read_keeps_unrelated_obligations() {
     // obligation (a checked add on a different local) keeps a native verdict
     // instead of the whole function collapsing to one Unsupported note.
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "qpair_like".to_string(),
         def_path: "test::qpair_like".to_string(),
@@ -10562,12 +11279,16 @@ fn test_lower_compacted_field_read_without_expected_type_still_fails_closed() {
     // (a BinaryOp operand types the place BEFORE resolution) keeps the
     // original hard fail — we never fabricate an untyped value.
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "compacted_binop".to_string(),
         def_path: "test::compacted_binop".to_string(),
@@ -10623,12 +11344,16 @@ fn test_lower_projected_store_into_compacted_field_still_fails_closed() {
     // need the read-modify-write chain to walk structure the marker does not
     // carry, so it keeps the fail-closed refusal.
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "compacted_store".to_string(),
         def_path: "test::compacted_store".to_string(),
@@ -10718,10 +11443,7 @@ fn marker_field_store_func(marker_name: &str, projections: Vec<Projection>) -> V
 
 #[test]
 fn test_projected_store_into_opaque_datatype_havocs_the_whole_object() {
-    let func = marker_field_store_func(
-        "dt2::Node",
-        vec![Projection::Deref, Projection::Field(0)],
-    );
+    let func = marker_field_store_func("dt2::Node", vec![Projection::Deref, Projection::Field(0)]);
     let module = lower_to_trust_ir(&func)
         .expect("a field store into an opaque datatype object must fail-soft, not drop the fn");
     assert_valid_module(&module);
@@ -10765,8 +11487,7 @@ fn test_projected_store_into_opaque_datatype_carries_no_fact() {
     // SOUNDNESS PIN: the fail-soft is a pure havoc. It must emit no `Assume`,
     // no constant, and no equality about the object's contents — otherwise it
     // would be asserting something about memory it did not model.
-    let func =
-        marker_field_store_func("dt2::Node", vec![Projection::Deref, Projection::Field(0)]);
+    let func = marker_field_store_func("dt2::Node", vec![Projection::Deref, Projection::Field(0)]);
     let module = lower_to_trust_ir(&func).expect("lowers");
     let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
     assert!(
@@ -10891,12 +11612,16 @@ fn test_lower_compacted_field_read_as_known_call_arg_fail_softs() {
     // the caller still lowers and the call edge stays a real `Inst::Call`
     // (the callee's own obligations keep propagating to the caller).
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let callee = VerifiableFunction {
         name: "test::sink".to_string(),
         def_path: "test::sink".to_string(),
@@ -10940,6 +11665,7 @@ fn test_lower_compacted_field_read_as_known_call_arg_fail_softs() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "test::sink".to_string(),
                         args: vec![Operand::Move(Place {
@@ -10986,12 +11712,16 @@ fn test_lower_aggregate_from_compacted_field_read_fail_softs() {
     // declared field type supplies the havoc's type, so construction still
     // lowers as the canonical Undef + InsertField chain.
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "compacted_aggregate".to_string(),
         def_path: "test::compacted_aggregate".to_string(),
@@ -11044,22 +11774,27 @@ fn test_lower_aggregate_from_compacted_field_read_fail_softs() {
 }
 
 #[test]
-fn test_lower_borrow_of_compacted_field_fail_softs_to_dest_typed_gep() {
+fn test_lower_borrow_of_compacted_field_fail_softs_to_pointer_havoc() {
     // Task #56: a BORROW of a `.0` INTO the compacted marker — `&(c.0).0` —
-    // routes through `address_of_place` / `address_from_pointer` (the GEP
+    // routes through `address_of_place` / `address_from_pointer` (the address
     // path), NOT `resolve_place_expecting`, so the Lever-A read fail-soft
     // does not apply. Pre-fix this hard-failed in `field_type`
     // (`UnsupportedOp("Field projection .0 on non-aggregate type Datatype {
     // name: \"__trust_compacted_aggregate\", variants: [] }")`), dropping the
-    // whole function. Now the dest's declared `&u64` pointee types ONE
-    // fail-soft GEP (havoc'd by the trust-mc consumer — fact-free).
+    // whole function. The dest's declared `&u64` pointee now admission-gates
+    // ONE explicit undefined pointer. A guessed GEP is not fact-free under
+    // TrustIr's literal semantics, even if one consumer chooses to havoc it.
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "compacted_borrow".to_string(),
         def_path: "test::compacted_borrow".to_string(),
@@ -11099,20 +11834,12 @@ fn test_lower_borrow_of_compacted_field_fail_softs_to_dest_typed_gep() {
         spec: Default::default(),
     };
 
-    let module = lower_to_trust_ir(&func)
-        .expect("a borrow of a compacted `.0` must fail-soft to a dest-typed GEP");
-    assert_valid_module(&module);
+    let module = assert_imprecise_borrow_lowers_as_sound_pointer_havoc(&func, false);
     let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
-    // The compacted `.0` address is ONE GEP typed at the dest's pointee
-    // (`u64`) — the same result shape as the precise field-address arm.
     assert!(
-        body.iter().any(|node| matches!(&node.inst, Inst::GEP { pointee_ty: TrustIrTy::U64, .. })),
-        "the compacted `.0` address must lower to a dest-pointee-typed GEP"
-    );
-    // The borrow itself still lowers as a real shared borrow.
-    assert!(
-        body.iter().any(|node| matches!(&node.inst, Inst::Borrow { .. })),
-        "the borrow must still lower to a real Inst::Borrow"
+        !body.iter().any(|node| matches!(&node.inst,
+            Inst::GEP { pointee_ty: TrustIrTy::U64, .. })),
+        "the compacted `.0` address must never be guessed as a literal u64-scaled GEP"
     );
     assert!(
         !body.iter().any(|node| matches!(&node.inst, Inst::Assume { .. })),
@@ -11129,7 +11856,7 @@ fn test_lower_borrow_through_ref_of_compacted_datatype_field_fail_softs() {
     // whose `Field` arm pre-fix hard-failed in `field_type` — the lowering
     // failure then cascaded transitively as ~136 absent-callee unknowns in
     // ny-cert. The dest's declared `&BigInt` pointee (itself an opaque
-    // datatype) types the fail-soft GEP.
+    // datatype) admission-gates the fail-soft pointer havoc.
     let ratio = datatype_ref_ty("num_rational::Ratio<num_bigint::BigInt>");
     let func = VerifiableFunction {
         name: "qpair_numer".to_string(),
@@ -11177,11 +11904,9 @@ fn test_lower_borrow_through_ref_of_compacted_datatype_field_fail_softs() {
         spec: Default::default(),
     };
 
-    let module = lower_to_trust_ir(&func)
-        .expect("the qpair `&(*r).0` borrow must fail-soft to a dest-typed GEP");
-    assert_valid_module(&module);
+    let module = assert_imprecise_borrow_lowers_as_sound_pointer_havoc(&func, false);
     // The dest pointee is itself an opaque datatype: its zero-field struct
-    // must be registered and type the fail-soft GEP.
+    // must be registered by the expectation gate before pointer havoc is emitted.
     let opaque = module
         .structs
         .iter()
@@ -11190,13 +11915,8 @@ fn test_lower_borrow_through_ref_of_compacted_datatype_field_fail_softs() {
     assert!(opaque.fields.is_empty(), "datatype struct must be a zero-field havoc slot");
     let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
     assert!(
-        body.iter().any(|node| matches!(&node.inst,
-            Inst::GEP { pointee_ty: TrustIrTy::Struct(id), .. } if *id == opaque.id)),
-        "the compacted `.0` address must lower to a GEP typed at the dest pointee"
-    );
-    assert!(
-        body.iter().any(|node| matches!(&node.inst, Inst::Borrow { .. })),
-        "the borrow must still lower to a real Inst::Borrow"
+        !body.iter().any(|node| matches!(&node.inst, Inst::GEP { .. })),
+        "the direct compacted `.0` walk must not encode a guessed literal address"
     );
     assert!(
         !body.iter().any(|node| matches!(&node.inst, Inst::Assume { .. })),
@@ -11206,17 +11926,21 @@ fn test_lower_borrow_through_ref_of_compacted_datatype_field_fail_softs() {
 
 #[test]
 fn test_lower_borrow_of_compacted_field_with_unmappable_dest_still_fails_closed() {
-    // Task #56 pin: the borrow/GEP fail-soft is EXPECTATION-GATED. When the
-    // dest's pointee type is itself unmappable (`Ty::Unsupported`), no typed
-    // havoc can be fabricated, so the borrow keeps the ORIGINAL fail-closed
+    // Task #56 pin: the borrow/address fail-soft is EXPECTATION-GATED. When the
+    // dest's pointee type is itself unmappable (`Ty::Unsupported`), no pointer
+    // havoc can be admitted, so the borrow keeps the ORIGINAL fail-closed
     // `field_type` error — never an untyped value.
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let outer = Ty::Adt { adt_kind: None, layout: None, 
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "certz::Compacted".to_string(),
         fields: vec![("payload".to_string(), marker), ("len".to_string(), Ty::u64())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "compacted_borrow_unmappable".to_string(),
         def_path: "test::compacted_borrow_unmappable".to_string(),
@@ -11290,37 +12014,53 @@ fn test_lower_borrow_of_compacted_field_with_unmappable_dest_still_fails_closed(
 /// cascading as absent-callee unknowns in ny-cert).
 fn compacted_vec_box_write_func(operands: Vec<Operand>) -> VerifiableFunction {
     let marker = datatype_ref_ty("__trust_compacted_aggregate");
-    let value_enum = Ty::Adt { adt_kind: None, layout: None, 
+    let value_enum = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "serde_json::Value".into(),
         fields: vec![("__v3_0".into(), marker.clone()), ("__tag".into(), Ty::isize())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let pointee = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let pointee = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "std::mem::MaybeUninit".to_string(),
         fields: vec![
             ("uninit".to_string(), Ty::Unit),
             (
                 "value".to_string(),
-                Ty::Adt { adt_kind: None, layout: None, 
+                Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
                     name: "std::mem::ManuallyDrop".to_string(),
                     fields: vec![(
                         "value".to_string(),
-                        Ty::Adt { adt_kind: None, layout: None, 
+                        Ty::Adt {
+                            adt_kind: None,
+                            layout: None,
                             name: "std::mem::MaybeDangling".to_string(),
                             fields: vec![("0".to_string(), marker)],
                             variants: Vec::new(),
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                        },
                     )],
                     variants: Vec::new(),
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                },
             ),
         ],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     VerifiableFunction {
         name: "compacted_box_write".to_string(),
         def_path: "test::compacted_box_write".to_string(),
@@ -11337,7 +12077,9 @@ fn compacted_vec_box_write_func(operands: Vec<Operand>) -> VerifiableFunction {
                 LocalDecl { index: 3, ty: value_enum, name: None },
                 LocalDecl {
                     index: 4,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "certz::Compacted".to_string(),
                         fields: vec![(
                             "payload".to_string(),
@@ -11345,7 +12087,9 @@ fn compacted_vec_box_write_func(operands: Vec<Operand>) -> VerifiableFunction {
                         )],
                         variants: Vec::new(),
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("c".into()),
                 },
             ],
@@ -11514,12 +12258,16 @@ fn test_lower_enum_aggregate_with_datatype_payload_field() {
     // aggregate must lower (tag write + opaque payload write); the payload
     // value is havoc downstream, which is sound (never a false proof).
     let dt = datatype_ref_ty("selfcheck::CheckError");
-    let result_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let result_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "std::result::Result".into(),
         fields: vec![("__v1_0".into(), dt.clone()), ("__tag".into(), Ty::isize())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "result_err".to_string(),
         def_path: "test::result_err".to_string(),
@@ -11576,15 +12324,7 @@ fn test_lower_enum_aggregate_with_datatype_payload_field() {
 // ---------------------------------------------------------------------------
 
 fn typed_absent_call(func: &str, arg_tys: Vec<Ty>, dest_ty: Ty) -> VerifiableFunction {
-    typed_absent_call_with_metadata(
-        func,
-        arg_tys,
-        dest_ty,
-        false,
-        false,
-        Some(BlockId(1)),
-        None,
-    )
+    typed_absent_call_with_metadata(func, arg_tys, dest_ty, false, false, Some(BlockId(1)), None)
 }
 
 fn typed_absent_call_with_metadata(
@@ -11618,6 +12358,7 @@ fn typed_absent_call_with_metadata(
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig,
                         is_foreign,
+                        callee_identity: None,
                         func: func.into(),
                         args,
                         dest: Place::local(0),
@@ -11668,9 +12409,7 @@ fn test_primitive_ord_gate_requires_canonical_trait_and_primitive_types() {
         "unsigned min must compare with Ule"
     );
     assert!(
-        primitive_body
-            .iter()
-            .any(|inst| matches!(inst, Inst::Select { ty: TrustIrTy::U64, .. })),
+        primitive_body.iter().any(|inst| matches!(inst, Inst::Select { ty: TrustIrTy::U64, .. })),
         "integer min must select one exact operand"
     );
     assert!(
@@ -11696,9 +12435,7 @@ fn test_primitive_ord_gate_requires_canonical_trait_and_primitive_types() {
         "signed max must compare with Sge"
     );
     assert!(
-        signed_body
-            .iter()
-            .any(|inst| matches!(inst, Inst::Select { ty: TrustIrTy::I64, .. })),
+        signed_body.iter().any(|inst| matches!(inst, Inst::Select { ty: TrustIrTy::I64, .. })),
         "integer max must select one exact operand"
     );
     assert!(signed_body.iter().all(|inst| !matches!(inst, Inst::Undef { .. })));
@@ -12011,15 +12748,7 @@ fn test_wrapping_refutation_marker_metadata_and_shape_fail_closed() {
         "foreign call metadata",
     );
     assert_wrapping_call_fails_closed(
-        typed_absent_call_with_metadata(
-            I32_ADD,
-            i32_args(),
-            Ty::i32(),
-            false,
-            false,
-            None,
-            None,
-        ),
+        typed_absent_call_with_metadata(I32_ADD, i32_args(), Ty::i32(), false, false, None, None),
         "missing normal-return target",
     );
     assert_wrapping_call_fails_closed(
@@ -12075,6 +12804,7 @@ fn test_int_try_from_lowered_total_no_panic_obligation() {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "std::convert::TryFrom::try_from".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -12154,6 +12884,7 @@ fn absent_call_test_fn(callee: &str, is_foreign: bool) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -12299,12 +13030,7 @@ fn paired_site_test_capability(
 fn compiler_paired_condvar_authority_requires_exact_fresh_call_site_identity() {
     const CALLEE: &str = "std::sync::Condvar::wait::<u64>";
     let func = absent_call_test_fn(CALLEE, false);
-    let exact = paired_site_test_capability(
-        func.def_path.clone(),
-        &func.body,
-        BlockId(0),
-        CALLEE,
-    );
+    let exact = paired_site_test_capability(func.def_path.clone(), &func.body, BlockId(0), CALLEE);
     let module = lower_absent_call_with_paired_sites(&func, &[exact])
         .expect("an exact compiler-certified paired-condvar site must lower");
     assert_valid_module(&module);
@@ -12331,12 +13057,7 @@ fn stale_or_wrong_paired_condvar_authority_confers_nothing() {
             BlockId(0),
             CALLEE,
         )],
-        vec![paired_site_test_capability(
-            func.def_path.clone(),
-            &func.body,
-            BlockId(1),
-            CALLEE,
-        )],
+        vec![paired_site_test_capability(func.def_path.clone(), &func.body, BlockId(1), CALLEE)],
         vec![paired_site_test_capability(
             func.def_path.clone(),
             &func.body,
@@ -12375,12 +13096,7 @@ fn stale_or_wrong_paired_condvar_authority_confers_nothing() {
 fn duplicate_paired_condvar_authority_rejects_the_context() {
     const CALLEE: &str = "std::sync::Condvar::wait::<u64>";
     let func = absent_call_test_fn(CALLEE, false);
-    let exact = paired_site_test_capability(
-        func.def_path.clone(),
-        &func.body,
-        BlockId(0),
-        CALLEE,
-    );
+    let exact = paired_site_test_capability(func.def_path.clone(), &func.body, BlockId(0), CALLEE);
     let error = lower_absent_call_with_paired_sites(&func, &[exact.clone(), exact])
         .expect_err("duplicate exact authority must reject instead of deduplicating");
     assert!(matches!(error, BridgeError::DuplicatePairedCondvarAuthority { .. }));
@@ -12390,12 +13106,8 @@ fn duplicate_paired_condvar_authority_rejects_the_context() {
 fn altered_body_or_wrong_digest_paired_condvar_authority_confers_nothing() {
     const CALLEE: &str = "std::sync::Condvar::wait::<u64>";
     let original = absent_call_test_fn(CALLEE, false);
-    let exact_for_original = paired_site_test_capability(
-        original.def_path.clone(),
-        &original.body,
-        BlockId(0),
-        CALLEE,
-    );
+    let exact_for_original =
+        paired_site_test_capability(original.def_path.clone(), &original.body, BlockId(0), CALLEE);
 
     let mut altered = original.clone();
     let Terminator::Call { span, .. } = &mut altered.body.blocks[0].terminator else {
@@ -12476,7 +13188,11 @@ fn test_lower_absent_callee_fail_soft() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         // A genuinely-absent, NON-allowlisted std callee (F5's
                         // trusted-panic-free allowlist covers `BTreeMap::{new,keys}`
                         // but NOT `insert`), so it stays fail-soft with the honest
@@ -12519,8 +13235,7 @@ fn test_lower_absent_callee_fail_soft() {
     assert!(
         insts.iter().any(|node| {
             matches!(node.inst, Inst::Undef { .. })
-                && node.proofs.as_slice()
-                    == [trust_ir::ProofAnnotation::FreshSymbolicHavoc]
+                && node.proofs.as_slice() == [trust_ir::ProofAnnotation::FreshSymbolicHavoc]
         }),
         "the absent-callee result must carry only fresh-havoc admission"
     );
@@ -12568,6 +13283,7 @@ fn test_cleanup_edge_is_emitted_and_uses_only_fresh_havoc() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Cleanup(BlockId(2)),
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "mycrate::may_unwind".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -12648,6 +13364,7 @@ fn test_noop_landing_pad_is_not_wired_and_leaves_no_havoc() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Cleanup(BlockId(2)),
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "mycrate::may_unwind".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -12677,10 +13394,10 @@ fn test_noop_landing_pad_is_not_wired_and_leaves_no_havoc() {
     assert_valid_module(&module);
     let f = &module.functions[0];
     assert!(
-        !f.blocks.iter().flat_map(|b| b.body.iter()).any(|node| matches!(
-            node.inst,
-            Inst::Undef { ty: TrustIrTy::Bool }
-        )),
+        !f.blocks
+            .iter()
+            .flat_map(|b| b.body.iter())
+            .any(|node| matches!(node.inst, Inst::Undef { ty: TrustIrTy::Bool })),
         "a no-op landing pad must not mint a demonic `Undef bool` selector"
     );
     assert!(
@@ -12693,21 +13410,15 @@ fn test_noop_landing_pad_is_not_wired_and_leaves_no_havoc() {
     // The call's own panic obligation is untouched — declining to model the pad
     // removes no check.
     assert!(
-        module
-            .proof_obligations
-            .iter()
-            .any(|o| o.kind == trust_ir::ObligationKind::PanicFreedom),
+        module.proof_obligations.iter().any(|o| o.kind == trust_ir::ObligationKind::PanicFreedom),
         "the may-unwind call must keep its panic-freedom obligation"
     );
 }
 
 #[test]
 fn test_closure_bearing_total_name_keeps_its_cleanup_edge() {
-    let closure_ty = Ty::Closure {
-        name: "test::panicking_pattern".into(),
-        upvars: vec![],
-        call: None,
-    };
+    let closure_ty =
+        Ty::Closure { name: "test::panicking_pattern".into(), upvars: vec![], call: None };
     let func = VerifiableFunction {
         name: "closure_cleanup_edge".into(),
         def_path: "test::closure_cleanup_edge".into(),
@@ -12725,14 +13436,12 @@ fn test_closure_bearing_total_name_keeps_its_cleanup_edge() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Cleanup(BlockId(2)),
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         // The flat spelling is recognized, but the closure
                         // operand makes this call higher-order and may-panic.
                         func: "core::str::<impl str>::contains::<char>".into(),
-                        args: vec![
-                            Operand::Copy(Place::local(1)),
-                            Operand::Copy(Place::local(2)),
-                        ],
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
@@ -12772,8 +13481,10 @@ fn test_closure_bearing_total_name_keeps_its_cleanup_edge() {
                 && [then_target.index(), else_target.index()].contains(&1)
     )));
     assert!(
-        module.proof_obligations.iter().any(|obligation| obligation.kind
-            == trust_ir::ObligationKind::PanicFreedom),
+        module
+            .proof_obligations
+            .iter()
+            .any(|obligation| obligation.kind == trust_ir::ObligationKind::PanicFreedom),
         "the closure-bearing call must retain its panic obligation"
     );
 }
@@ -12804,6 +13515,7 @@ fn test_expected_absent_call_emits_site_and_counted_function_carrier() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: skipped.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -12885,6 +13597,7 @@ fn assumed_total_absent_call_is_marked_and_expected_absent_wins() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -12962,45 +13675,19 @@ fn assumed_total_absent_call_is_marked_and_expected_absent_wins() {
     }));
 }
 
-/// Trust (assumption-root gate — the compiler-side census coupling depends on this
-/// row having NO counted whole-function carrier).
+/// Trust (assumed-total disclosure carrier).
 ///
-/// `lower_function`'s aggregate-carrier block gives a counted
-/// `mir-assertions:<fn>:panic-freedom` obligation to the absent-callee,
-/// expected-absent, drop-glue and coroutine-resume prefixes.
-/// `ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX` is deliberately NOT in that list, and
-/// the sibling test above pins the expected-absent case getting one — so the two
-/// together show the difference is a decision, not an oversight.
-///
-/// WHY A TEST AND NOT A COMMENT. The previous revision of this comment said the
-/// compiler-side census is "sound because the `assumed_total` SET is the only
-/// channel a user axiom has into a verdict". That is FALSE and the compiler's own
-/// probe output refutes it: on the fn-pointer program X2 the census printed
-/// `user_axiom_keys=1, assumed_total=0` — an axiom recorded by a channel that
-/// touches no bridge set at all.
-///
-/// What is true and measured: the census has TWO channels, and NEITHER is complete
-/// on its own.
-///
-/// * The bridge sets (`assumed_total` / `expected_absent`), written for a user
-///   declaration only by `insert_user_axiom_absent_call_identity`, which records
-///   the census key in the same statement. This is the channel that also changes
-///   how the call LOWERS.
-/// * The census-only keys written by `collect_user_axiom_value_mentions` and
-///   `census_user_axioms_in_constant_memory` — a reified `fn` pointer, or a
-///   function pointer sitting in a `static`'s evaluated allocation. These change no
-///   lowering and reach no bridge set, so nothing about `assumed_total` sees them.
-///
-/// Both are read by `bundle_census_is_axiom_free`, which additionally fails closed
-/// when the DefId walk or the constant-memory walk could not read what it needed.
-/// Adding the assumed-total prefix to the aggregate-carrier list HERE would open a
-/// THIRD channel — a counted caller-side obligation — that neither census site
-/// gates, and a bundle could then publish `axiom_free` while resting on the axiom.
-/// That change may well be the right one to make; it is not right to make it
-/// WITHOUT re-measuring the census. Landing it turns this test red, which is the
-/// point.
+/// An authenticated per-site `#[trust::assume_total]` row must remain visible in
+/// the public result even when it is the only may-panic assumption in the body.
+/// `lower_function` therefore emits exactly one counted whole-function
+/// `mir-assertions:<fn>:panic-freedom` carrier. Compiler policy recognizes the
+/// authenticated per-site row, records it non-fatally as an assumption, and never
+/// awards proof credit for it; the carrier exists for disclosure, not discharge.
+/// The assumption-root census independently covers direct call identities plus
+/// function-pointer/constant-memory mentions and fails closed on an incomplete
+/// walk, so publishing this carrier does not create an uncensused authority lane.
 #[test]
-fn assumed_total_row_gets_no_counted_carrier_the_axiom_census_would_not_gate() {
+fn assumed_total_row_gets_exactly_one_disclosure_only_counted_carrier() {
     let callee = "test::audited_wrapper";
     let caller = VerifiableFunction {
         name: "calls_audited_wrapper".to_string(),
@@ -13018,6 +13705,7 @@ fn assumed_total_row_gets_no_counted_carrier_the_axiom_census_would_not_gate() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -13075,12 +13763,11 @@ fn assumed_total_row_gets_no_counted_carrier_the_axiom_census_would_not_gate() {
         })
         .filter(|source_id| source_id.starts_with("mir-assertions:"))
         .collect::<Vec<_>>();
-    assert!(
-        aggregate_source_ids.is_empty(),
-        "an assumed-total row must not acquire a counted whole-function carrier; the \
-         assumption-root census in rustc_mir_transform gates the `assumed_total` SET channel \
-         and does NOT gate this one. Re-measure `bundle_census_is_axiom_free`'s coupling \
-         before landing that change. Got: {aggregate_source_ids:?}"
+    assert_eq!(
+        aggregate_source_ids,
+        vec!["mir-assertions:test::calls_audited_wrapper:panic-freedom".to_string()],
+        "an assumed-total row needs exactly one aggregate disclosure carrier; it must not \
+         disappear and duplicate carriers must not amplify it into proof authority"
     );
 }
 
@@ -13134,6 +13821,7 @@ fn test_marked_str_range_index_keeps_gap3_recognition() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(3))],
@@ -13272,6 +13960,7 @@ fn test_absent_callee_allowlist_discharges_panic_obligation() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: func.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -13368,6 +14057,7 @@ fn test_round5_thin_tail_flat_entries_discharge_and_controls_keep() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: func.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -13472,6 +14162,7 @@ fn test_build3_absent_callee_discharge() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: func.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -13520,6 +14211,7 @@ fn test_build3_absent_callee_discharge() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::collections::BTreeMap::<K, u64>::insert".to_string(),
                         args: vec![
@@ -13628,7 +14320,9 @@ fn test_build3_absent_callee_discharge() {
     // flattened enum's integer `__tag`; otherwise the std-total-Ord gate would
     // silently discharge a call whose user `Ord::cmp` may panic.
     let user_key = Ty::adt("my_crate::PanickyKey", vec![("x".into(), Ty::i64())]);
-    let key_enum = Ty::Adt { adt_kind: None, layout: None, 
+    let key_enum = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "my_crate::KeyCarrier".into(),
         fields: vec![
             ("__tag".into(), Ty::i64()),
@@ -13648,7 +14342,9 @@ fn test_build3_absent_callee_discharge() {
             },
         ],
         disc_index_safe: true,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let projected_insert = VerifiableFunction {
         name: "projected_user_key_insert".into(),
         def_path: "test::projected_user_key_insert".into(),
@@ -13674,6 +14370,7 @@ fn test_build3_absent_callee_discharge() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::collections::BTreeMap::<K, u64>::insert".into(),
                         args: vec![
@@ -13842,6 +14539,7 @@ fn test_f6_bigint_arith_discharges_but_primitive_and_div_keep() {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: func.to_string(),
                             args,
@@ -13956,6 +14654,7 @@ fn f8_call(func: &str, args: Vec<Operand>, dest: Place, target: usize) -> Termin
     Terminator::Call {
         unwind: UnwindEdge::Unreachable,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
         func: func.to_string(),
         args,
@@ -14202,12 +14901,16 @@ fn test_f8_ratio_new_iszero_guarded_discharges_conditionally() {
 /// state (the exact shape it exercises is otherwise unchanged).
 #[test]
 fn test_f8_ratio_new_iszero_guard_real_mir_shape_keeps_blanket_fail_closed() {
-    let opt_ratio = Ty::Adt { adt_kind: None, layout: None,
+    let opt_ratio = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::option::Option".into(),
         fields: vec![("__payload".into(), ty_ratio(ty_bigint())), ("__tag".into(), Ty::isize())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let span = SourceSpan::default;
     let assign_bool = |local: usize, v: bool| Statement::Assign {
         place: Place::local(local),
@@ -14218,18 +14921,17 @@ fn test_f8_ratio_new_iszero_guard_real_mir_shape_keeps_blanket_fail_closed() {
     // (drop-flag switchInts + drops, bb7-bb11 in the dump) contains NO writes, so
     // it is witness-irrelevant — modeled-call lowering leaves it unreachable in the
     // output module (validator error), hence elided here with `Continue`.
-    let call = |func: &str, args: Vec<Operand>, dest: usize, target: usize| {
-        Terminator::Call {
-            unwind: UnwindEdge::Continue,
-            is_unsafe_sig: false,
-            is_foreign: false,
-            func: func.to_string(),
-            args,
-            dest: Place::local(dest),
-            target: Some(BlockId(target)),
-            span: span(),
-            atomic: None,
-        }
+    let call = |func: &str, args: Vec<Operand>, dest: usize, target: usize| Terminator::Call {
+        unwind: UnwindEdge::Continue,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        is_foreign: false,
+        func: func.to_string(),
+        args,
+        dest: Place::local(dest),
+        target: Some(BlockId(target)),
+        span: span(),
+        atomic: None,
     };
     let func = VerifiableFunction {
         name: "from_bigints".to_string(),
@@ -14967,7 +15669,13 @@ fn test_f6ext_ratio_new_const_nonzero_denom_fully_discharges() {
             name: "rat".to_string(),
             def_path: "test::rat".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 2, return_ty: ratio_ty, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 2,
+                return_ty: ratio_ty,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -15440,6 +16148,7 @@ fn test_build1_collect_clone_refcell_discharge_and_keep() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: func.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -15598,6 +16307,7 @@ fn test_round6_clone_datatype_and_closure_receivers() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: func.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -15714,6 +16424,7 @@ fn test_round6_fnonce_erased_zst_receiver_fail_soft() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ops::FnOnce::call_once".to_string(),
                         args: vec![
@@ -15791,7 +16502,10 @@ fn test_round6_fnonce_erased_zst_receiver_fail_soft() {
 fn test_lower_dyn_callable_receiver_fail_soft() {
     let dyn_recv_ty = Ty::Ref {
         mutable: true,
-        inner: Box::new(Ty::Dynamic { trait_name: "core::ops::function::FnMut".into(), principal_key: Some("core::ops::function::FnMut".into()) }),
+        inner: Box::new(Ty::Dynamic {
+            trait_name: "core::ops::function::FnMut".into(),
+            principal_key: Some("core::ops::function::FnMut".into()),
+        }),
     };
     let func = VerifiableFunction {
         name: "calls_dyn".to_string(),
@@ -15807,7 +16521,11 @@ fn test_lower_dyn_callable_receiver_fail_soft() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnMut::call_mut".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
@@ -15891,7 +16609,11 @@ fn test_opaque_const_call_arg_types_as_slice_fat_pointer() {
                 TrustBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::iter::Iterator::fold".to_string(),
                         args: vec![
                             Operand::Constant(ConstValue::OpaqueConst),
@@ -15983,8 +16705,7 @@ fn test_str_constant_lowers_to_exact_length_fact_and_nothing_more() {
 
     // The havoc seed survives (value/data pointer stays opaque) and carries the
     // floor-admitted FreshSymbolicHavoc pair.
-    let undefs: Vec<_> =
-        insts.iter().filter(|n| matches!(n.inst, Inst::Undef { .. })).collect();
+    let undefs: Vec<_> = insts.iter().filter(|n| matches!(n.inst, Inst::Undef { .. })).collect();
     assert_eq!(undefs.len(), 1, "exactly one havoc seed for the constant value");
     assert!(
         undefs[0].proofs.contains(&trust_ir::ProofAnnotation::FreshSymbolicHavoc),
@@ -16024,8 +16745,7 @@ fn test_str_constant_lowers_to_exact_length_fact_and_nothing_more() {
         .collect();
     assert_eq!(eq_cmp.len(), 1, "exactly one metadata == length comparison");
     let cond = eq_cmp[0].results[0];
-    let assumes: Vec<_> =
-        insts.iter().filter(|n| matches!(n.inst, Inst::Assume { .. })).collect();
+    let assumes: Vec<_> = insts.iter().filter(|n| matches!(n.inst, Inst::Assume { .. })).collect();
     assert_eq!(assumes.len(), 1, "the length equality is the ONLY assumed fact");
     assert!(
         matches!(assumes[0].inst, Inst::Assume { cond: c } if c == cond),
@@ -16036,10 +16756,7 @@ fn test_str_constant_lowers_to_exact_length_fact_and_nothing_more() {
     // constant: no data-pointer or fat-assembly facts, no address arithmetic.
     assert!(
         !insts.iter().any(|n| {
-            matches!(
-                n.inst,
-                Inst::PtrData { .. } | Inst::PtrFromParts { .. } | Inst::GEP { .. }
-            )
+            matches!(n.inst, Inst::PtrData { .. } | Inst::PtrFromParts { .. } | Inst::GEP { .. })
         }),
         "no data-pointer/provenance construct may be asserted for a Str constant"
     );
@@ -16097,9 +16814,7 @@ fn test_opaque_const_stays_fact_free_undef() {
         "OpaqueConst keeps its Undef seed"
     );
     assert!(
-        !insts.iter().any(|n| {
-            matches!(n.inst, Inst::Assume { .. } | Inst::PtrMetadata { .. })
-        }),
+        !insts.iter().any(|n| { matches!(n.inst, Inst::Assume { .. } | Inst::PtrMetadata { .. }) }),
         "OpaqueConst must not acquire any asserted fact (no Assume, no metadata lane)"
     );
 }
@@ -16197,10 +16912,7 @@ fn test_str_constant_at_byte_array_ref_dest_lowers_to_bytes_global_address() {
 #[test]
 fn test_str_constant_at_str_ref_dest_lowers_to_fat_pointer_over_bytes_global() {
     let bytes = b"abc";
-    let func = str_const_assign_func(
-        bytes,
-        Ty::Ref { mutable: false, inner: Box::new(Ty::Str) },
-    );
+    let func = str_const_assign_func(bytes, Ty::Ref { mutable: false, inner: Box::new(Ty::Str) });
     let module = lower_to_trust_ir(&func).expect("a str-ref Str constant must lower");
     assert_valid_module(&module);
 
@@ -16209,8 +16921,7 @@ fn test_str_constant_at_str_ref_dest_lowers_to_fat_pointer_over_bytes_global() {
     assert!(module.globals[0].initializer.is_some());
 
     let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
-    let ga: Vec<_> =
-        insts.iter().filter(|n| matches!(n.inst, Inst::GlobalAddr { .. })).collect();
+    let ga: Vec<_> = insts.iter().filter(|n| matches!(n.inst, Inst::GlobalAddr { .. })).collect();
     assert_eq!(ga.len(), 1, "one address of the bytes global");
     let data = ga[0].results[0];
     assert!(
@@ -16280,12 +16991,8 @@ fn test_str_constant_out_of_shape_dests_keep_fact_free_undef() {
     {
         let module = lower_to_trust_ir(&func).expect("out-of-shape Str constants still lower");
         assert_valid_module(&module);
-        assert!(
-            module.globals.is_empty(),
-            "{what}: no bytes global may be minted out of shape"
-        );
-        let insts: Vec<_> =
-            module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+        assert!(module.globals.is_empty(), "{what}: no bytes global may be minted out of shape");
+        let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
         assert!(
             insts.iter().any(|n| matches!(n.inst, Inst::Undef { .. })),
             "{what}: the typed fact-free Undef seed is kept"
@@ -16306,11 +17013,8 @@ fn test_str_constant_out_of_shape_dests_keep_fact_free_undef() {
 #[test]
 fn test_bundled_hof_closure_does_not_erase_wrapper_panic_paths() {
     let closure_name = "test::hof::{closure#0}".to_string();
-    let closure_ty = Ty::Closure {
-        name: closure_name.clone(),
-        upvars: vec![Ty::u32()],
-        call: None,
-    };
+    let closure_ty =
+        Ty::Closure { name: closure_name.clone(), upvars: vec![Ty::u32()], call: None };
     let caller = VerifiableFunction {
         name: "hof_caller".into(),
         def_path: "test::hof_caller".into(),
@@ -16333,6 +17037,7 @@ fn test_bundled_hof_closure_does_not_erase_wrapper_panic_paths() {
                         span: SourceSpan::default(),
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         atomic: None,
                     },
@@ -16551,7 +17256,11 @@ fn test_fn_def_callable_receiver_resolves_direct_call() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![Operand::Move(Place::local(1)), Operand::Move(Place::local(2))],
                         dest: Place::local(3),
@@ -16675,7 +17384,11 @@ fn test_fn_def_callable_item_const_receiver_resolves_direct_call() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         // The receiver is the fn item's IDENTITY as a ZST const, NOT
                         // a `Ty::FnDef` local — this is the shape extraction produces.
@@ -16749,8 +17462,7 @@ fn test_fn_def_callable_item_const_receiver_resolves_direct_call() {
         .find(|f| f.name == "test::mapper")
         .map(|f| f.id)
         .expect("mapper bundled");
-    let caller_fn =
-        module.functions.iter().find(|f| f.name == "caller").expect("caller present");
+    let caller_fn = module.functions.iter().find(|f| f.name == "caller").expect("caller present");
     let call = caller_fn
         .blocks
         .iter()
@@ -16763,9 +17475,10 @@ fn test_fn_def_callable_item_const_receiver_resolves_direct_call() {
     assert_eq!(call.len(), 1, "receiver dropped, tuple flattened to the single param");
     // It resolved — so it did NOT take the untypeable may-panic arm.
     assert!(
-        !module.proof_obligations.iter().any(|o| o
-            .description
-            .contains("untypeable callable receiver")),
+        !module
+            .proof_obligations
+            .iter()
+            .any(|o| o.description.contains("untypeable callable receiver")),
         "a bundled CallableItem receiver must not emit the untypeable may-panic obligation"
     );
 }
@@ -16796,7 +17509,11 @@ fn test_fn_def_callable_item_const_receiver_unbundled_fail_closed() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![
                             Operand::Constant(ConstValue::CallableItem {
@@ -16837,8 +17554,7 @@ fn test_fn_def_callable_item_const_receiver_unbundled_fail_closed() {
     let module = lower_to_trust_ir(&caller)
         .expect("unbundled FnDef CallableItem receiver must lower fail-soft, not Err");
     assert_valid_module(&module);
-    let insts: Vec<_> =
-        module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
     assert!(
         insts.iter().any(|n| matches!(n.inst, Inst::Assert { .. })
             && n.proofs.contains(&trust_ir::ProofAnnotation::NoPanic)),
@@ -16847,15 +17563,19 @@ fn test_fn_def_callable_item_const_receiver_unbundled_fail_closed() {
     let marked: Vec<_> = module
         .proof_obligations
         .iter()
-        .filter(|o| o.kind == trust_ir::ObligationKind::PanicFreedom
-            && o.description
-                .starts_with(trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX)
-            && o.description.contains("untypeable callable receiver"))
+        .filter(|o| {
+            o.kind == trust_ir::ObligationKind::PanicFreedom
+                && o.description
+                    .starts_with(trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX)
+                && o.description.contains("untypeable callable receiver")
+        })
         .collect();
     assert_eq!(marked.len(), 1, "expected exactly one marked untypeable PanicFreedom obligation");
     assert!(
-        !insts.iter().any(|n| matches!(n.inst, Inst::Call { .. })
-            || matches!(n.inst, Inst::CallIndirect { .. })),
+        !insts
+            .iter()
+            .any(|n| matches!(n.inst, Inst::Call { .. })
+                || matches!(n.inst, Inst::CallIndirect { .. })),
         "an UNBUNDLED CallableItem receiver must not fabricate a phantom Call"
     );
 }
@@ -16890,7 +17610,11 @@ fn test_closure_callable_item_const_receiver_resolves_direct_call() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![
                             Operand::Constant(ConstValue::CallableItem {
@@ -16955,9 +17679,8 @@ fn test_closure_callable_item_const_receiver_resolves_direct_call() {
         spec: Default::default(),
     };
 
-    let module =
-        lower_to_trust_ir_functions("closure_callable_item", &[caller, closure_body])
-            .expect("bundled Closure CallableItem receiver must resolve, not fail closed");
+    let module = lower_to_trust_ir_functions("closure_callable_item", &[caller, closure_body])
+        .expect("bundled Closure CallableItem receiver must resolve, not fail closed");
     assert_valid_module(&module);
     let closure_id = module
         .functions
@@ -16965,11 +17688,8 @@ fn test_closure_callable_item_const_receiver_resolves_direct_call() {
         .find(|f| f.name == closure_name)
         .map(|f| f.id)
         .expect("closure body bundled");
-    let caller_fn = module
-        .functions
-        .iter()
-        .find(|f| f.name == "closure_caller")
-        .expect("caller present");
+    let caller_fn =
+        module.functions.iter().find(|f| f.name == "closure_caller").expect("caller present");
     let call = caller_fn
         .blocks
         .iter()
@@ -16981,9 +17701,10 @@ fn test_closure_callable_item_const_receiver_resolves_direct_call() {
         .expect("expected a DIRECT call to the closure body");
     assert_eq!(call.len(), 2, "env receiver kept, tuple flattened to the single input");
     assert!(
-        !module.proof_obligations.iter().any(|o| o
-            .description
-            .contains("untypeable callable receiver")),
+        !module
+            .proof_obligations
+            .iter()
+            .any(|o| o.description.contains("untypeable callable receiver")),
         "a bundled CallableItem closure receiver must not emit the untypeable may-panic obligation"
     );
 }
@@ -17013,7 +17734,11 @@ fn test_closure_callable_item_const_receiver_unbundled_fail_closed() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![
                             Operand::Constant(ConstValue::CallableItem {
@@ -17052,8 +17777,7 @@ fn test_closure_callable_item_const_receiver_unbundled_fail_closed() {
     let module = lower_to_trust_ir(&caller)
         .expect("unbundled Closure CallableItem receiver must lower fail-soft, not Err");
     assert_valid_module(&module);
-    let insts: Vec<_> =
-        module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    let insts: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
     assert!(
         insts.iter().any(|n| matches!(n.inst, Inst::Assert { .. })
             && n.proofs.contains(&trust_ir::ProofAnnotation::NoPanic)),
@@ -17062,15 +17786,19 @@ fn test_closure_callable_item_const_receiver_unbundled_fail_closed() {
     let marked: Vec<_> = module
         .proof_obligations
         .iter()
-        .filter(|o| o.kind == trust_ir::ObligationKind::PanicFreedom
-            && o.description
-                .starts_with(trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX)
-            && o.description.contains("untypeable callable receiver"))
+        .filter(|o| {
+            o.kind == trust_ir::ObligationKind::PanicFreedom
+                && o.description
+                    .starts_with(trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX)
+                && o.description.contains("untypeable callable receiver")
+        })
         .collect();
     assert_eq!(marked.len(), 1, "expected exactly one marked untypeable PanicFreedom obligation");
     assert!(
-        !insts.iter().any(|n| matches!(n.inst, Inst::Call { .. })
-            || matches!(n.inst, Inst::CallIndirect { .. })),
+        !insts
+            .iter()
+            .any(|n| matches!(n.inst, Inst::Call { .. })
+                || matches!(n.inst, Inst::CallIndirect { .. })),
         "an UNBUNDLED CallableItem closure receiver must not fabricate a phantom Call"
     );
 }
@@ -17273,6 +18001,7 @@ fn test_round3_absent_callee_gates_engine() {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: func.to_string(),
                             args,
@@ -17547,6 +18276,7 @@ fn test_round3_display_fmt_resolves_local_impl() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::fmt::Display::fmt".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -17689,6 +18419,7 @@ fn test_round3_bundle_context_probe() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::ops::function::FnOnce::call_once".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
@@ -17824,6 +18555,7 @@ fn test_round3_range_iterator_next_discharges() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::iter::Iterator::next".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -18022,10 +18754,7 @@ fn copy_nonoverlapping_loads_all_elements_before_storing_any() {
         .collect();
     let first_store = kinds.iter().position(|k| *k == "store").expect("a store must be emitted");
     let last_load = kinds.iter().rposition(|k| *k == "load").expect("a load must be emitted");
-    assert!(
-        last_load < first_store,
-        "all loads must precede all stores, got {kinds:?}"
-    );
+    assert!(last_load < first_store, "all loads must precede all stores, got {kinds:?}");
 }
 
 /// FAIL-CLOSED, and this is the soundness core of the lowering. A symbolic count
@@ -18037,11 +18766,7 @@ fn copy_nonoverlapping_loads_all_elements_before_storing_any() {
 #[test]
 fn copy_nonoverlapping_symbolic_count_fails_closed() {
     let mut func = copy_nonoverlapping_func(Ty::u32(), Operand::Copy(Place::local(3)));
-    func.body.locals.push(LocalDecl {
-        index: 3,
-        ty: Ty::usize(),
-        name: Some("count".into()),
-    });
+    func.body.locals.push(LocalDecl { index: 3, ty: Ty::usize(), name: Some("count".into()) });
     func.body.arg_count = 3;
     let err = lower_to_trust_ir(&func)
         .expect_err("a symbolic element count must not be partially modeled");
@@ -18081,8 +18806,10 @@ fn saturating_intrinsics_are_total_but_unchecked_ones_are_not() {
         );
     }
 
-    // Pure functions of the bit pattern; no partial cases.
-    for name in ["ctpop", "ctlz", "cttz", "bswap", "bitreverse"] {
+    // Pure functions of the bit pattern; no partial cases. The rotations take
+    // their shift mod the width (`#[rustc_nounwind]`, safe `pub const fn`), so
+    // they belong to the same no-panic-path class.
+    for name in ["ctpop", "ctlz", "cttz", "bswap", "bitreverse", "rotate_left", "rotate_right"] {
         let callee = format!("{P}core::intrinsics::{name}::<u64>");
         assert!(total_no_panic_call_summary(&callee), "{name} is total");
     }
@@ -18275,8 +19002,7 @@ fn coroutine_contract_entry_read_emits_live_state_assume_and_refutable_sentinels
     );
 
     // Sentinel blocks: refutable Assert, NOT the by-construction Assume(false).
-    let sink_blocks: Vec<_> =
-        f.blocks.iter().filter(|b| b.id.0 == 2 || b.id.0 == 3).collect();
+    let sink_blocks: Vec<_> = f.blocks.iter().filter(|b| b.id.0 == 2 || b.id.0 == 3).collect();
     assert_eq!(sink_blocks.len(), 2);
     for bb in sink_blocks {
         assert!(
@@ -18296,9 +19022,8 @@ fn coroutine_contract_entry_read_emits_live_state_assume_and_refutable_sentinels
         .proof_obligations
         .iter()
         .filter(|ob| {
-            ob.description.starts_with(
-                trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
-            )
+            ob.description
+                .starts_with(trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX)
         })
         .collect();
     assert_eq!(marked.len(), 2, "one obligation per ResumedAfter* sentinel");
@@ -18314,10 +19039,7 @@ fn coroutine_contract_entry_read_emits_live_state_assume_and_refutable_sentinels
     // The counted whole-function carrier must exist: without it the sentinel
     // rows would live only in module.proof_obligations (the R3 fail-open).
     assert!(
-        module
-            .proof_obligations
-            .iter()
-            .any(|ob| ob.description.ends_with(": all assertions hold")),
+        module.proof_obligations.iter().any(|ob| ob.description.ends_with(": all assertions hold")),
         "contract-lowered coroutine must emit the whole-function panic-freedom carrier"
     );
 }
@@ -18346,14 +19068,12 @@ fn coroutine_without_certificate_keeps_fail_closed_pruning() {
         assert!(
             !bb.body.iter().any(|n| matches!(&n.inst, Inst::Assert { .. })),
             "no contract => no refutable sentinel Assert (it would falsely refute)",
-            
         );
     }
     assert!(
         !module.proof_obligations.iter().any(|ob| {
-            ob.description.starts_with(
-                trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX,
-            )
+            ob.description
+                .starts_with(trust_types::assumption::COROUTINE_RESUME_CONTRACT_OBLIGATION_PREFIX)
         }),
         "no contract => no marker obligations"
     );
@@ -18410,10 +19130,7 @@ fn coroutine_contract_one_await_live_set_is_a_disjunction() {
         "live-state Assume + exhaustive-switch case Assume (see the zero-await pin)"
     );
     assert!(
-        entry
-            .body
-            .iter()
-            .any(|n| matches!(&n.inst, Inst::BinOp { op: TrustIrBinOp::Or, .. })),
+        entry.body.iter().any(|n| matches!(&n.inst, Inst::BinOp { op: TrustIrBinOp::Or, .. })),
         "a two-state live set must join its equalities with Or"
     );
     let evidence = crate::lower::coroutine_resume_contract_module_evidence(&func, &module)
@@ -18465,6 +19182,7 @@ fn coroutine_resume_callsite_mints_unprovable_precondition_obligation() {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         unwind: UnwindEdge::Unreachable,
                     },
                 },
@@ -18677,6 +19395,7 @@ fn linked_call_literal_bundle(param_ty: Ty, literal: ConstValue) -> trust_ir::Mo
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "test::callee".to_string(),
                         args: vec![Operand::Constant(literal)],
@@ -18746,10 +19465,8 @@ fn test_linked_call_uint_literal_arg_adopts_ptr_sized_param_identity() {
     // The measured locals-in-const-fn/mod-pub-access shape: `foo(42)` at a
     // declared `usize` param. Pre-fix the fixed-width `ConstValue::Uint(_, 64)`
     // emitted U64 against the faithful Usize param ("expected usize, got u64").
-    let module = linked_call_literal_bundle(
-        Ty::PtrSizedInt { signed: false },
-        ConstValue::Uint(42, 64),
-    );
+    let module =
+        linked_call_literal_bundle(Ty::PtrSizedInt { signed: false }, ConstValue::Uint(42, 64));
     assert_eq!(
         linked_call_arg0_const_ty(&module),
         TrustIrTy::Usize,
@@ -18805,7 +19522,11 @@ fn test_faithful_struct_payload_enum_construction_seeds_const_no_undef() {
                 discriminant: 0,
                 fields: vec![("0".into(), payload.clone())],
             },
-            VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), Ty::Unit)] },
+            VariantDef {
+                name: "Err".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), Ty::Unit)],
+            },
         ],
     );
     let func = VerifiableFunction {
@@ -18865,17 +19586,12 @@ fn test_faithful_struct_payload_enum_construction_seeds_const_no_undef() {
     assert_eq!(seed[0], trust_ir::Constant::Int(0), "head must be the effective discriminant");
     assert_eq!(
         seed[1],
-        trust_ir::Constant::Aggregate(vec![
-            trust_ir::Constant::Int(0),
-            trust_ir::Constant::Int(0)
-        ]),
+        trust_ir::Constant::Aggregate(vec![trust_ir::Constant::Int(0), trust_ir::Constant::Int(0)]),
         "a struct payload lane seeds as the recursive struct zero (interpreter-typed), never Int(0)"
     );
     // The payload lane is then overwritten positionally at 1 + 0.
     assert!(
-        bb0.body
-            .iter()
-            .any(|n| matches!(&n.inst, Inst::InsertField { field: 1, .. })),
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::InsertField { field: 1, .. })),
         "the struct payload operand must overwrite lane 1"
     );
     assert_valid_module(&module);
@@ -18906,10 +19622,7 @@ fn test_enum_field_zero_seed_recursive_and_fat_refusal() {
     let inner_id = module.add_enum_def(inner);
     assert_eq!(
         first_class_enum_field_zero_seed(&module, &TrustIrTy::Enum(inner_id), 0).unwrap(),
-        trust_ir::Constant::Aggregate(vec![
-            trust_ir::Constant::Int(7),
-            trust_ir::Constant::Int(0)
-        ]),
+        trust_ir::Constant::Aggregate(vec![trust_ir::Constant::Int(7), trust_ir::Constant::Int(0)]),
         "a nested enum lane seeds variant 0 at its EFFECTIVE discriminant with recursive zeros"
     );
     assert_eq!(
@@ -18918,12 +19631,1005 @@ fn test_enum_field_zero_seed_recursive_and_fat_refusal() {
         "a thin pointer lane seeds the (Ty::Ptr, Int(0)) NullPtr pairing"
     );
     assert!(
-        first_class_enum_field_zero_seed(
-            &module,
-            &TrustIrTy::FatPtr(trust_ir::FatPtrKind::Str),
-            0
-        )
-        .is_err(),
+        first_class_enum_field_zero_seed(&module, &TrustIrTy::FatPtr(trust_ir::FatPtrKind::Str), 0)
+            .is_err(),
         "a fat lane must refuse — no fat-pointer constant spelling exists"
+    );
+}
+
+#[test]
+fn test_thin_to_thin_pointer_cast_still_uses_bitcast() {
+    // Narrowness pin for the arm above: a THIN -> THIN pointer reinterpret is a
+    // same-provenance `Bitcast` and must NOT be rewritten into a data-lane read
+    // (there is no metadata to drop, and `PtrData` on a thin source is not a
+    // shape the floor or the translator model).
+    let src = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+    let dst = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) };
+    let func = VerifiableFunction {
+        name: "thin_reinterpret".to_string(),
+        def_path: "test::thin_reinterpret".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: dst.clone(), name: None },
+                LocalDecl { index: 1, ty: src, name: Some("p".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), dst.clone()),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: dst,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("thin->thin cast should lower");
+    let bb0 = &module.functions[0].blocks[0];
+    assert!(
+        !bb0.body.iter().any(|n| matches!(&n.inst, Inst::PtrData { .. })),
+        "a thin->thin reinterpret must not become a PtrData read"
+    );
+    assert!(
+        bb0.body.iter().any(|n| matches!(&n.inst, Inst::Cast { .. })),
+        "a thin->thin reinterpret keeps its honest Cast spelling"
+    );
+}
+
+fn fn_ptr_scope_ty() -> Ty {
+    Ty::FnPtr {
+        sig: Box::new(trust_types::FnSig { params: vec![Ty::i32()], ret: Box::new(Ty::i32()) }),
+    }
+}
+
+fn fn_ptr_holder_ty() -> Ty {
+    Ty::adt(
+        "test::FnPtrHolder",
+        vec![("f".to_string(), fn_ptr_scope_ty()), ("n".to_string(), Ty::i32())],
+    )
+}
+
+fn fn_ptr_scope_seed() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "fn_ptr_scope_seed".to_string(),
+        def_path: "test::fn_ptr_scope_seed".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i32(), name: None },
+                LocalDecl { index: 1, ty: fn_ptr_holder_ty(), name: Some("holder".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+fn fn_ptr_scope_reader() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "fn_ptr_scope_reader".to_string(),
+        def_path: "test::fn_ptr_scope_reader".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: fn_ptr_scope_ty(), name: None },
+                LocalDecl { index: 1, ty: fn_ptr_holder_ty(), name: Some("holder".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place {
+                        local: 1,
+                        projections: vec![Projection::Field(0)],
+                    })),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: fn_ptr_scope_ty(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn test_fn_pointer_field_keeps_one_bundle_wide_function_type_identity() {
+    let module =
+        lower_to_trust_ir_functions("fn_ptr_scope", &[fn_ptr_scope_seed(), fn_ptr_scope_reader()])
+            .expect("bundle lowers");
+    let holder = module
+        .structs
+        .iter()
+        .find(|def| def.name == "test::FnPtrHolder")
+        .expect("holder is registered");
+    let field_ty = holder.fields[0].ty.clone();
+    let extracted = module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.body.iter())
+        .find_map(|node| match &node.inst {
+            Inst::ExtractField { ty, field: 0, .. } if matches!(ty, TrustIrTy::Func(_)) => {
+                Some(ty.clone())
+            }
+            _ => None,
+        })
+        .expect("reader extracts the function-pointer field");
+    assert_eq!(extracted, field_ty, "the cached aggregate and reader must share one FuncTyId");
+    assert_valid_module(&module);
+}
+
+fn identity_struct_cast_function(from: Ty, to: Ty) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "identity_struct_cast".to_string(),
+        def_path: "test::identity_struct_cast".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: to.clone(), name: None },
+                LocalDecl { index: 1, ty: from, name: Some("value".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), to.clone()),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: to,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn test_identity_struct_reinterpret_forwards_instead_of_emitting_an_invalid_cast() {
+    let ty = Ty::adt("test::IdentityCast", vec![("value".into(), Ty::u32())]);
+    let module = lower_to_trust_ir(&identity_struct_cast_function(ty.clone(), ty))
+        .expect("identity cast lowers");
+    assert!(
+        !module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.body.iter())
+            .any(|node| matches!(node.inst, Inst::Cast { .. })),
+        "an exact identity must not emit a layout-unevidenceable cast"
+    );
+    assert_valid_module(&module);
+}
+
+fn erased_identity_param_ty() -> Ty {
+    Ty::Unsupported { kind: "TyKind::Param".into(), detail: "E".into() }
+}
+
+fn erased_identity_concrete_ty(name: &str) -> Ty {
+    Ty::adt(name, vec![("code".into(), Ty::u32())])
+}
+
+fn erased_identity_body() -> VerifiableFunction {
+    let param = erased_identity_param_ty();
+    VerifiableFunction {
+        name: "erased_identity".into(),
+        def_path: "test::erased_identity".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: param.clone(), name: None },
+                LocalDecl { index: 1, ty: param.clone(), name: Some("value".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: param,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+fn erased_identity_caller(argument_ty: Ty, destination_ty: Ty) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "erased_identity_caller".into(),
+        def_path: "test::erased_identity_caller".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: destination_ty.clone(), name: None },
+                LocalDecl { index: 1, ty: argument_ty, name: Some("value".into()) },
+                LocalDecl { index: 2, ty: destination_ty.clone(), name: Some("result".into()) },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
+                        func: "test::erased_identity::<test::Concrete>".into(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(2),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: destination_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+fn caller_direct_call_count(module: &trust_ir::Module) -> usize {
+    module
+        .functions
+        .iter()
+        .find(|function| function.name == "erased_identity_caller")
+        .into_iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.body.iter())
+        .filter(|node| matches!(node.inst, Inst::Call { .. }))
+        .count()
+}
+
+#[test]
+fn test_exact_erased_generic_identity_forwards_the_concrete_value() {
+    let concrete = erased_identity_concrete_ty("test::Concrete");
+    let module = lower_to_trust_ir_functions(
+        "erased_identity",
+        &[erased_identity_caller(concrete.clone(), concrete), erased_identity_body()],
+    )
+    .expect("exact erased identity lowers");
+    assert_eq!(caller_direct_call_count(&module), 0, "the exact identity is forwarded");
+    assert_valid_module(&module);
+}
+
+#[test]
+fn test_erased_identity_near_misses_keep_the_fail_closed_call() {
+    let concrete = erased_identity_concrete_ty("test::Concrete");
+
+    let mut non_identity = erased_identity_body();
+    non_identity.body.blocks[0].stmts[0] = Statement::Assign {
+        place: Place::local(0),
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Unit)),
+        span: SourceSpan::default(),
+    };
+
+    let mut specified_identity = erased_identity_body();
+    specified_identity.spec.requires.push("true".into());
+
+    for (label, callee) in [("non-identity body", non_identity), ("specified identity", specified_identity)] {
+        let module = lower_to_trust_ir_functions(
+            label,
+            &[erased_identity_caller(concrete.clone(), concrete.clone()), callee],
+        )
+        .expect("near miss remains representable for fail-closed validation");
+        assert_eq!(caller_direct_call_count(&module), 1, "{label} must not be forwarded");
+        assert!(
+            !validate_module(&module).is_empty(),
+            "the retained erased-signature call must remain visibly invalid/fail-closed"
+        );
+    }
+}
+
+#[test]
+fn test_erased_identity_argument_destination_mismatch_fails_before_ir_emission() {
+    let argument = erased_identity_concrete_ty("test::Concrete");
+    let destination = erased_identity_concrete_ty("test::OtherConcrete");
+    let error = lower_to_trust_ir_functions(
+        "erased_identity_mismatch",
+        &[erased_identity_caller(argument, destination), erased_identity_body()],
+    )
+    .expect_err("a mismatched destination must fail closed");
+    assert!(
+        matches!(error, BridgeError::UnsupportedOp(ref message)
+            if message.contains("exact argument/destination type equality")),
+        "the refusal must name the independent emission-site type gate: {error}"
+    );
+}
+
+/// The bounded `len()` summary result carries `FreshSymbolicHavoc`.
+///
+/// FALSIFY-ONCE PREMISE. Without the marker the trust-mc proof-authority floor
+/// refuses the whole solve at its `Undef` arm — measured on the real
+/// `<W as core::fmt::Write>::write_str` bundle from
+/// `tests/ui/trust/native_bundle_foreign_body_local_impl_callee.rs`:
+/// "function `write_str` block #0 instruction 3 executes Undef, which is TrustIr
+/// undefined behavior but is diagnostic havoc in the CHC translator". So EVERY
+/// body that measures a `str`/slice length is locked out of proof-grade
+/// verification.
+///
+/// The marker is not a narrowing capability: the floor rejects it on any
+/// non-`Undef` instruction, and the range `Assume` emitted beside it is admitted
+/// only under the independent live source-generation authority (trust-mc-driver
+/// `native.rs`: "The marker grants no permission to narrow the value with
+/// `Assume`, pointer metadata, or any other source-authority-gated construct").
+/// Measured on the same bundle: the stamped symbol still REFUTES a planted
+/// `Assert(len == 0)`, and a serialized/replayed bundle whose capability does not
+/// authorize it is still refused at its first authority-gated construct.
+#[test]
+fn bounded_len_summary_result_is_marked_fresh_symbolic_havoc() {
+    let func = VerifiableFunction {
+        name: "measure".to_string(),
+        def_path: "test::measure".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::usize(), name: None },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { inner: Box::new(Ty::Str), mutable: false },
+                    name: Some("s".into()),
+                },
+            ],
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
+                        func: "core::str::<impl str>::len".to_string(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::usize(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("len summary must lower");
+    let bb0 = &module.functions[0].blocks[0];
+
+    // The isize::MAX range Assume is the thing that makes this a BOUNDED summary;
+    // if it disappears the test below is measuring the wrong instruction.
+    assert!(
+        bb0.body.iter().any(|node| matches!(&node.inst, Inst::Assume { .. })),
+        "a str::len summary must still carry its isize::MAX range Assume"
+    );
+
+    let summary_result = bb0
+        .body
+        .iter()
+        .find(|node| matches!(&node.inst, Inst::Undef { .. }))
+        .expect("the len summary result is an Undef seed");
+    assert!(
+        summary_result.proofs.contains(&trust_ir::ProofAnnotation::FreshSymbolicHavoc),
+        "the bounded len summary result must carry FreshSymbolicHavoc; without it the \
+         proof-authority floor refuses every body that measures a length"
+    );
+}
+
+/// Trust (LOCKSTEP REPAIR, measured 2026-08-25): `arr[a..b]` on a fixed-size
+/// array passes the receiver as `&[T; N]`, NEVER as a bare `[T; N]`.
+///
+/// `reconstruct_slice_len_formula` gates `slice_range_index_call_plan`, and that
+/// gate is documented to work "via the SAME helper the VC lane's formula uses --
+/// gating here is what keeps the two consumers in lockstep". The two had
+/// DIVERGED: trust-vcgen's `slice_len_formula` has always resolved `&[T; N]` /
+/// `*mut [T; N]` to the constant `N`, while this twin handled only the BARE
+/// array and `&[T]`. So every array range-index declined to the fail-closed
+/// absent-callee arm despite a compile-time-constant bound — measured on
+/// trust-sha2, 15 rows and the largest absent-callee class in the crate.
+///
+/// SOUNDNESS (the vcgen arm's, restored here): `N` is the EXACT array length,
+/// never an over-approximation, so this can only PROVE a genuinely in-bounds
+/// range — an out-of-range constant still folds the violation to true.
+#[test]
+fn slice_len_formula_resolves_a_reference_to_a_fixed_size_array_to_its_constant_length() {
+    let arr = |len: u64| Ty::Array { elem: Box::new(Ty::u8()), len };
+    let locals = vec![
+        // &[u8; 128] — the shape rustc passes for `buf[..n]`. THE REGRESSION.
+        LocalDecl {
+            index: 0,
+            ty: Ty::Ref { mutable: false, inner: Box::new(arr(128)) },
+            name: Some("buf".into()),
+        },
+        // &mut [u8; 64] — same, through a mutable borrow.
+        LocalDecl {
+            index: 1,
+            ty: Ty::Ref { mutable: true, inner: Box::new(arr(64)) },
+            name: Some("mbuf".into()),
+        },
+        // *const [u8; 32] — thin pointer to an array, same static length.
+        LocalDecl {
+            index: 2,
+            ty: Ty::RawPtr { mutable: false, pointee: Box::new(arr(32)) },
+            name: Some("praw".into()),
+        },
+        // The pre-existing arms must be untouched.
+        LocalDecl { index: 3, ty: arr(16), name: Some("bare".into()) },
+        LocalDecl {
+            index: 4,
+            ty: Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) },
+            name: Some("s".into()),
+        },
+        // A reference to a NON-array, NON-slice must still decline (fail-closed).
+        LocalDecl {
+            index: 5,
+            ty: Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) },
+            name: Some("n".into()),
+        },
+    ];
+    let op = |i: usize| Operand::Copy(Place::local(i));
+
+    assert_eq!(
+        reconstruct_slice_len_formula(&locals, &op(0)),
+        Some(Formula::Int(128)),
+        "&[u8; 128] must resolve to its constant length -- this is the arm that was missing"
+    );
+    assert_eq!(reconstruct_slice_len_formula(&locals, &op(1)), Some(Formula::Int(64)));
+    assert_eq!(reconstruct_slice_len_formula(&locals, &op(2)), Some(Formula::Int(32)));
+    assert_eq!(
+        reconstruct_slice_len_formula(&locals, &op(3)),
+        Some(Formula::Int(16)),
+        "the pre-existing bare-array arm must be unchanged"
+    );
+    assert_eq!(
+        reconstruct_slice_len_formula(&locals, &op(4)),
+        Some(Formula::var("s__slice_len", Sort::Int)),
+        "the pre-existing &[T] arm must still use the symbolic length var"
+    );
+    assert_eq!(
+        reconstruct_slice_len_formula(&locals, &op(5)),
+        None,
+        "a reference to a non-array/non-slice must stay fail-closed"
+    );
+}
+
+/// Trust (THIN-RECEIVER CORRECTNESS, 2026-08-25): the range-index plan's ADMIT
+/// helper and its EMIT helper must agree on exactly which receivers carry a
+/// static length.
+///
+/// `reconstruct_slice_len_formula` decides whether the plan admits a receiver;
+/// `array_receiver_static_len` decides how an admitted receiver's length is
+/// emitted. When the first started admitting `&[T; N]` and the second did not
+/// exist, the lowering fell through to `emit_slice_metadata` and emitted
+/// `PtrMetadata { ptr_ty: Ptr, metadata_ty: U64 }` — fat metadata read off a
+/// THIN pointer — whose value then fed the `Ule` bounds comparison. MEASURED in
+/// the shipped bundles before the fix: 17 such instructions across 17 modules,
+/// i.e. 17 bounds comparisons against a junk length. Fixed: 0, with the 108
+/// legitimate fat-slice reads unchanged.
+///
+/// So this pins the BICONDITIONAL, not just the happy path: a constant formula
+/// from the admit side iff a static length from the emit side.
+#[test]
+fn array_static_len_and_the_range_index_admit_gate_agree_on_every_receiver_shape() {
+    let arr = |len: u64| Ty::Array { elem: Box::new(Ty::u8()), len };
+    let slice = || Ty::Slice { elem: Box::new(Ty::u8()) };
+    let cases: Vec<(&str, Ty, Option<u64>)> = vec![
+        ("&[u8; 128]", Ty::Ref { mutable: false, inner: Box::new(arr(128)) }, Some(128)),
+        ("&mut [u8; 64]", Ty::Ref { mutable: true, inner: Box::new(arr(64)) }, Some(64)),
+        ("*const [u8; 32]", Ty::RawPtr { mutable: false, pointee: Box::new(arr(32)) }, Some(32)),
+        ("*mut [u8; 16]", Ty::RawPtr { mutable: true, pointee: Box::new(arr(16)) }, Some(16)),
+        ("[u8; 8]", arr(8), Some(8)),
+        // Fat receivers: length is in metadata, NOT static. Must stay None here so
+        // the lowering keeps its metadata read.
+        ("&[u8]", Ty::Ref { mutable: false, inner: Box::new(slice()) }, None),
+        ("*const [u8]", Ty::RawPtr { mutable: false, pointee: Box::new(slice()) }, None),
+        ("[u8]", slice(), None),
+        // Not a sliceable receiver at all.
+        ("&i32", Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) }, None),
+    ];
+
+    for (label, ty, want) in cases {
+        assert_eq!(array_receiver_static_len(&ty), want, "static len for {label}");
+
+        // Lockstep: the admit gate yields a CONSTANT formula exactly when the emit
+        // side yields a static length. Anything else means the plan can admit a
+        // receiver whose length the lowering cannot honestly produce.
+        let locals = vec![LocalDecl { index: 0, ty: ty.clone(), name: Some("r".into()) }];
+        let admitted = reconstruct_slice_len_formula(&locals, &Operand::Copy(Place::local(0)));
+        let admitted_is_const = matches!(admitted, Some(Formula::Int(_)));
+        assert_eq!(
+            admitted_is_const,
+            want.is_some(),
+            "admit/emit lockstep broken for {label}: admit={admitted:?} emit={want:?}"
+        );
+        if let (Some(n), Some(Formula::Int(k))) = (want, admitted) {
+            assert_eq!(k, i128::from(n), "the two helpers must agree on the VALUE for {label}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native module-validity: the two producer emit-spellings that made the whole
+// module invalid (and therefore stripped native proof authority from EVERY
+// obligation of the function). Measured 2026-08-27 on trust-convergence +
+// trust-semantics: 111 bodies failed `validate_module`, of which these two
+// classes covered 85 and 33 bodies respectively.
+// ---------------------------------------------------------------------------
+
+/// An ARRAY aggregate must be built with `InsertElement`.
+///
+/// `validate_field_access` resolves `InsertField` against a
+/// struct/record/tuple/enum/closure DEFINITION and rejects everything else
+/// ("insert_field: aggregate operand must be a struct/record/tuple/enum/closure,
+/// got [ty.N x N]"), so the field spelling made the module invalid. Element reads
+/// have always used `ExtractElement`; this pins the write side to match.
+#[test]
+fn array_aggregate_is_built_with_insert_element_and_validates() {
+    let array_ty = Ty::Array { elem: Box::new(Ty::i32()), len: 2 };
+    let func = VerifiableFunction {
+        name: "array_agg".to_string(),
+        def_path: "test::array_agg".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: Ty::i32(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: Ty::i32(), name: Some("b".into()) },
+                LocalDecl { index: 3, ty: array_ty, name: Some("out".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(3),
+                    rvalue: Rvalue::Aggregate(
+                        AggregateKind::Array,
+                        vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("array aggregate should lower");
+    // The point of the fix: the module VALIDATES. Before it did not, and an
+    // invalid module is rejected wholesale by the native trust-mc lane.
+    assert_valid_module(&module);
+
+    let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert_eq!(
+        body.iter().filter(|node| matches!(&node.inst, Inst::InsertElement { .. })).count(),
+        2,
+        "a 2-element array aggregate is two InsertElement writes"
+    );
+    assert!(
+        !body.iter().any(|node| matches!(&node.inst,
+            Inst::InsertField { ty: TrustIrTy::Array(_, _), .. })),
+        "an array must never be written through the FIELD spelling"
+    );
+}
+
+/// A ZERO-SIZED aggregate constant must be minted at the CONSUMER's declared type.
+///
+/// The extractor's dataless-value carrier is `ConstValue::Unit` and it erases
+/// WHICH zst it is, so the contextless `emit_const` types every one of them
+/// `TrustIrTy::Unit` — while the declared payload type of a fieldless ADT is its
+/// registered zero-field `TrustIrTy::Struct(id)`. `Err(fmt::Error)` then failed
+/// typed validation ("insert_field value type mismatch: expected struct.N, got ()").
+#[test]
+fn fieldless_adt_constant_payload_is_minted_at_the_declared_field_type() {
+    let payload_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "core::fmt::Error".into(),
+        fields: Vec::new(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let result_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "core::result::Result".into(),
+        fields: vec![("__payload".into(), payload_ty), ("__tag".into(), Ty::isize())],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let func = VerifiableFunction {
+        name: "make_err".to_string(),
+        def_path: "test::make_err".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: result_ty, name: Some("out".into()) },
+            ],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(1),
+                    rvalue: Rvalue::Aggregate(
+                        AggregateKind::Adt {
+                            name: "core::result::Result".into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
+                        vec![Operand::Constant(ConstValue::Unit)],
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let module = lower_to_trust_ir(&func).expect("fieldless-payload variant should lower");
+    assert_valid_module(&module);
+
+    let payload_struct = module
+        .structs
+        .iter()
+        .find(|s| s.name.contains("core::fmt::Error"))
+        .expect("the fieldless payload ADT must be registered as a zero-field struct");
+    assert!(payload_struct.fields.is_empty(), "the payload struct carries no fields");
+    let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        body.iter().any(|node| matches!(&node.inst,
+            Inst::Const { ty: TrustIrTy::Struct(id), value: TrustIrConstant::Aggregate(elems) }
+                if *id == payload_struct.id && elems.is_empty())),
+        "the dataless payload constant must be minted at the declared zero-field struct type, \
+         as the empty aggregate — not as TrustIrTy::Unit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CALL-ARGTY: the by-NAME+ARITY bind chose the wrong ARGUMENT LOWERING.
+//
+// `resolve_known_function` binds a bundled body by name and arity alone, and
+// `resolve_call_target` then emitted `AsWritten` unconditionally. A rust-call
+// ABI call site carries `[receiver, args_tuple]` while the bundled body declares
+// the UNTUPLED `[receiver, field0, …]`, so a ONE-field tuple makes the arities
+// coincide and the whole tuple was handed to a parameter declared as its single
+// field. Measured 2026-08-27 as the largest module-validity class on
+// trust-convergence, in two spellings that are one defect:
+//   `call to {closure#0} arg 1 type mismatch: expected ptr, got (ptr)`
+//   `call to {closure#0} has 2 args, expected 1`
+// An invalid module is rejected wholesale, so every obligation of the function
+// loses native proof authority before any engine sees it.
+// ---------------------------------------------------------------------------
+
+/// Build a caller that calls `callee_path` BY NAME with rust-call ABI arguments
+/// (`[closure env, args tuple]`), plus the untupled closure body it names.
+///
+/// `tuple_fields` is the argument tuple's field list; the body declares
+/// `[env, tuple_fields…]`, which is exactly the shape that makes the by-name bind
+/// pick the wrong lowering.
+fn rust_call_by_name_pair(
+    callee_path: &str,
+    tuple_fields: Vec<Ty>,
+) -> (VerifiableFunction, VerifiableFunction) {
+    let env_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: format!("closure_env::{callee_path}"),
+        fields: Vec::new(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let tuple_ty = if tuple_fields.is_empty() {
+        Ty::Unit
+    } else {
+        Ty::Tuple(tuple_fields.clone())
+    };
+
+    // caller: _2 = <env>; _3 = (<fields…>); _4 = callee(move _2, move _3)
+    let mut caller_locals = vec![
+        LocalDecl { index: 0, ty: Ty::Unit, name: None },
+        LocalDecl { index: 1, ty: env_ty.clone(), name: Some("env".into()) },
+        LocalDecl { index: 2, ty: tuple_ty, name: Some("args".into()) },
+    ];
+    for (i, field) in tuple_fields.iter().enumerate() {
+        caller_locals.push(LocalDecl {
+            index: 3 + i,
+            ty: field.clone(),
+            name: Some(format!("f{i}")),
+        });
+    }
+    let caller = VerifiableFunction {
+        name: "caller".to_string(),
+        def_path: "test::caller".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: caller_locals,
+            blocks: vec![
+                TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Aggregate(
+                            AggregateKind::Tuple,
+                            (0..tuple_fields.len())
+                                .map(|i| Operand::Copy(Place::local(3 + i)))
+                                .collect(),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
+                        func: callee_path.to_string(),
+                        args: vec![
+                            Operand::Copy(Place::local(1)),
+                            Operand::Move(Place::local(2)),
+                        ],
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                    },
+                },
+                TrustBlock {
+                    id: BlockId(1),
+                    stmts: vec![],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1 + tuple_fields.len(),
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    // callee: the UNTUPLED body — params `[env, tuple_fields…]`.
+    let mut callee_locals =
+        vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }, LocalDecl {
+            index: 1,
+            ty: env_ty,
+            name: Some("self".into()),
+        }];
+    for (i, field) in tuple_fields.iter().enumerate() {
+        callee_locals.push(LocalDecl {
+            index: 2 + i,
+            ty: field.clone(),
+            name: Some(format!("a{i}")),
+        });
+    }
+    let callee = VerifiableFunction {
+        name: callee_path.to_string(),
+        def_path: callee_path.to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: callee_locals,
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1 + tuple_fields.len(),
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    (caller, callee)
+}
+
+/// A ONE-field rust-call tuple makes the ARITY coincide, so the by-name bind used
+/// to hand the whole tuple to a parameter declared as its single field
+/// (`expected ptr, got (ptr)`). The tuple must be FLATTENED instead.
+#[test]
+fn one_field_rust_call_tuple_is_flattened_at_a_by_name_bind() {
+    let (caller, callee) = rust_call_by_name_pair(
+        "test::{closure#0}",
+        vec![Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) }],
+    );
+    let module = lower_to_trust_ir_functions("call_argty", &[caller, callee])
+        .expect("a rust-call shaped by-name call should lower");
+
+    // The point of the fix: the module VALIDATES. Before it did not, and an
+    // invalid module is rejected wholesale by the native trust-mc lane.
+    assert_valid_module(&module);
+
+    let caller_body: Vec<_> =
+        module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    let call = caller_body
+        .iter()
+        .find_map(|node| match &node.inst {
+            Inst::Call { callee, args } => Some((*callee, args.clone())),
+            _ => None,
+        })
+        .expect("the caller emits a direct call edge");
+    assert_eq!(call.0.index(), 1, "the call edge still names the SAME bundled body");
+    assert_eq!(call.1.len(), 2, "receiver plus the ONE flattened tuple field");
+    assert!(
+        caller_body
+            .iter()
+            .any(|node| matches!(&node.inst, Inst::ExtractField { field: 0, .. })),
+        "the rust-call tuple's field must be projected out before the call"
+    );
+}
+
+/// The ARITY-SPLIT spelling of the same defect: a zero-field rust-call tuple
+/// (`FnOnce<()>`) against a one-parameter body was emitted as two arguments
+/// (`has 2 args, expected 1`).
+#[test]
+fn zero_field_rust_call_tuple_drops_to_the_receiver_at_a_by_name_bind() {
+    let (caller, callee) = rust_call_by_name_pair("test::{closure#1}", vec![]);
+    let module = lower_to_trust_ir_functions("call_argcount", &[caller, callee])
+        .expect("a zero-arg rust-call shaped by-name call should lower");
+
+    assert_valid_module(&module);
+
+    let call_args = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| b.body.iter())
+        .find_map(|node| match &node.inst {
+            Inst::Call { args, .. } => Some(args.len()),
+            _ => None,
+        })
+        .expect("the caller emits a direct call edge");
+    assert_eq!(call_args, 1, "an empty rust-call tuple contributes NO arguments");
+}
+
+/// The rebind may only ever replace a module the validator REJECTS. A call whose
+/// as-written binding already type-checks keeps its existing lowering — nothing is
+/// projected, nothing is dropped.
+#[test]
+fn a_well_typed_as_written_call_is_not_rebound_as_a_rust_call_tuple() {
+    // Same shape, but the callee's declared params ARE the call's written args:
+    // `[env, (u32,)]`. Flattening here would be a wrong-arguments call.
+    let tuple_ty = Ty::Tuple(vec![Ty::u32()]);
+    let (caller, mut callee) = rust_call_by_name_pair("test::{closure#2}", vec![Ty::u32()]);
+    callee.body.locals = vec![
+        LocalDecl { index: 0, ty: Ty::Unit, name: None },
+        LocalDecl { index: 1, ty: callee.body.locals[1].ty.clone(), name: Some("self".into()) },
+        LocalDecl { index: 2, ty: tuple_ty, name: Some("args".into()) },
+    ];
+
+    let module = lower_to_trust_ir_functions("as_written", &[caller, callee])
+        .expect("an as-written well-typed call should lower");
+
+    assert_valid_module(&module);
+
+    let caller_body: Vec<_> =
+        module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        caller_body.iter().any(|node| matches!(&node.inst, Inst::Call { args, .. }
+            if args.len() == 2)),
+        "the as-written binding is preserved: receiver plus the tuple itself"
+    );
+    assert!(
+        !caller_body
+            .iter()
+            .any(|node| matches!(&node.inst, Inst::ExtractField { field: 0, .. })),
+        "a well-typed as-written call must NOT be respelled as a flattened rust-call"
+    );
+}
+
+/// The second CALL-ARGTY sub-shape: a reference-shaped CONSTANT argument.
+///
+/// `emit_const` hardcodes the byte-slice fat spelling for `OpaqueConst` (and for
+/// `Str`/`UnitVariantRef`), and `resolve_operand_expecting` — the resolver the
+/// as-written call-argument lane used — is documented to never re-type a constant.
+/// A callee declaring anything else for that parameter therefore got
+/// `expected (), got fatptr<slice ty.0>`, 54 occurrences on trust-convergence.
+#[test]
+fn a_reference_shaped_constant_argument_is_minted_at_the_declared_param_type() {
+    let (mut caller, callee) = rust_call_by_name_pair("test::{closure#3}", vec![Ty::Unit]);
+    // Replace the tuple argument with the fact-free reference constant the
+    // extractor mints for an unevaluable promoted/coerced reference.
+    if let Terminator::Call { args, .. } = &mut caller.body.blocks[0].terminator {
+        args[1] = Operand::Constant(ConstValue::OpaqueConst);
+    } else {
+        panic!("the fixture's block 0 terminator is a Call");
+    }
+
+    let module = lower_to_trust_ir_functions("const_argty", &[caller, callee])
+        .expect("a constant rust-call argument should lower");
+
+    assert_valid_module(&module);
+
+    let caller_body: Vec<_> =
+        module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(
+        caller_body.iter().any(|node| matches!(&node.inst, Inst::Undef { ty: TrustIrTy::Unit })),
+        "the fact-free constant must be minted at the DECLARED param type"
+    );
+    assert!(
+        !caller_body.iter().any(|node| matches!(&node.inst,
+            Inst::Undef { ty: TrustIrTy::FatPtr(trust_ir::FatPtrKind::Slice(_)) })),
+        "the hardcoded byte-slice fat spelling must not reach a non-slice parameter"
     );
 }

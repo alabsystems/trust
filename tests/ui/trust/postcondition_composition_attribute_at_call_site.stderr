@@ -1,0 +1,29 @@
+
+=== Trust Verification Report (postcondition_composition_attribute_at_call_site) ===
+
+note: Trust verification: 3 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 3 obligation(s)
+  --> $DIR/postcondition_composition_attribute_at_call_site.rs:46:1
+   |
+LL | / pub fn positive_part(x: i32) -> i32
+LL | |     requires x > 0
+LL | | {
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+   = note: [unknown] conditional definition-entry assumption; every caller must establish the requires contract
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/postcondition_composition_attribute_at_call_site.rs:52:1
+   |
+LL | / pub fn triple(x: i32) -> i32 {
+LL | |     if x > 0 {
+LL | |         let y = positive_part(x);
+LL | |         if y < 100 { y * 3 } else { 0 }
+...  |
+LL | | }
+   | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

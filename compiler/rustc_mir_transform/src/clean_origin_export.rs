@@ -47,7 +47,9 @@ pub(crate) fn trust_clean_verdict_digest(tcx: TyCtxt<'_>, def: LocalDefId) -> Op
     // the certification audit is what records the axiom closure the digest discloses.
     let mut facets = trust_spec_elab::FacetTable::new();
     let status = match trust_certify::clean_island::admit_certified_island_definition(
-        env, &name, &mut facets,
+        env,
+        &name,
+        &mut facets,
     ) {
         Ok(admission) => admission.status().clone(),
         Err(error) => tcx.dcx().span_fatal(
@@ -107,9 +109,5 @@ pub(crate) fn trust_clean_island_sources(tcx: TyCtxt<'_>, LocalCrate: LocalCrate
 
 /// Local arm of `trust_clean_origin_exports` — the registry projection.
 pub(crate) fn trust_clean_origin_exports(tcx: TyCtxt<'_>, LocalCrate: LocalCrate) -> Vec<DefIndex> {
-    tcx.resolutions(())
-        .clean_origin_defs
-        .iter()
-        .map(|&(def, _, _)| def.to_def_id().index)
-        .collect()
+    tcx.resolutions(()).clean_origin_defs.iter().map(|&(def, _, _)| def.to_def_id().index).collect()
 }

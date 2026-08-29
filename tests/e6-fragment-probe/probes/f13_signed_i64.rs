@@ -6,4 +6,6 @@
 clean { def ident_i (x : Int) : Int := x }
 pub fn idi(x: i64) -> i64
     ensures result == ident_i(x)
-{ x }
+{
+    x
+}

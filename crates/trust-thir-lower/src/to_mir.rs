@@ -194,7 +194,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rustc_abi::{FIRST_VARIANT, FieldIdx};
-use rustc_hir::def::DefKind;
+use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::{HirId, ItemLocalId, PatKind};
 use rustc_index::IndexVec;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -381,6 +381,113 @@ enum StatementRule {
 /// by [`plan_loop_markers`]'s `needs`-is-the-condition clause. See [`StatementRule::Allow`].
 fn loop_source_form_admits<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> bool {
     source_form_gate(tcx, def, StatementRule::Allow)
+}
+
+/// Trust (lane ROT): the `HirId` of a bare local read (`b`), or `None` for anything else.
+fn hir_local_path_id(ex: &rustc_hir::Expr<'_>) -> Option<HirId> {
+    let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = ex.kind else {
+        return None;
+    };
+    match path.res {
+        rustc_hir::def::Res::Local(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Trust (lane ROT, 2026-08-21): **THE ROTATION-`let` SOURCE WITNESS** — does this body's source
+/// spell EXACTLY the measured rotation shape whose `let` cluster the loop plan can synthesize?
+///
+/// The trust-ir instruction stream cannot see a `let` at all (`let t = b` on a loop-carried
+/// value is pure SSA aliasing — measured: `r1_rot_let_and`'s body block carries only the `and`),
+/// and the scope table says only that ONE `let`-visibility scope exists, not what it binds. What
+/// built mints for it — `StorageLive(_9); _9 = copy _2; …; StorageLive(_13); _13 = copy _9;
+/// _1 = move _13; StorageDead(_13); …; StorageDead(_9)`
+/// (`reports/parallel-move-2026-08-21/built_walk_gshape.txt`, `g8`/`g2`) — exists because the
+/// source spelled ONE simple `let` of a bare loop-carried variable, read back once into the
+/// other variable. This gate witnesses exactly that spelling and refuses everything else:
+///
+///   * the fn body is `{ loop { … }  <tail> }` — one loop statement, a tail expression;
+///   * the loop block is `[<head stmt>, let <t> = <v>;, <v> = <expr>;, <w> = <t>;]` with no
+///     trailing expression — the head statement is anything but a `let` (a second binding is a
+///     second scope, which the plan's scope-shape clause refuses anyway);
+///   * the `let` is a SIMPLE binding (no `ref`, no subpattern, no ascription, no `else`) whose
+///     initializer is a BARE local read;
+///   * the middle statement assigns THE SAME local the `let` read (`b = …` after `let t = b`),
+///     and the last statement assigns a DIFFERENT local from the `let` binding and nothing else.
+///
+/// FAIL-CLOSED: any other shape answers `false`, which keeps today's refusal. A `true` here
+/// never places a marker by itself — the trust-ir plan ([`plan_loop_markers`]'s rotation
+/// section) and the sequence model still pin the instruction stream, and the differential
+/// oracle still compares the result against built marker-for-marker.
+fn rot_let_source_admits<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> bool {
+    let Some(body) = tcx.hir_maybe_body_owned_by(def) else {
+        return false;
+    };
+    if !hir_params_are_simple_bindings(body) {
+        return false;
+    }
+    let rustc_hir::ExprKind::Block(fnblk, None) = body.value.kind else {
+        return false;
+    };
+    if !matches!(fnblk.rules, rustc_hir::BlockCheckMode::DefaultBlock) || fnblk.expr.is_none() {
+        return false;
+    }
+    let [loop_stmt] = fnblk.stmts else {
+        return false;
+    };
+    let (rustc_hir::StmtKind::Expr(loop_ex) | rustc_hir::StmtKind::Semi(loop_ex)) = loop_stmt.kind
+    else {
+        return false;
+    };
+    let rustc_hir::ExprKind::Loop(lblk, _, rustc_hir::LoopSource::Loop, _) = loop_ex.kind else {
+        return false;
+    };
+    if lblk.expr.is_some() || !matches!(lblk.rules, rustc_hir::BlockCheckMode::DefaultBlock) {
+        return false;
+    }
+    let [head, s_let, s_upd, s_pass] = lblk.stmts else {
+        return false;
+    };
+    if !matches!(head.kind, rustc_hir::StmtKind::Expr(_) | rustc_hir::StmtKind::Semi(_)) {
+        return false;
+    }
+    // `let <t> = <v>;` — simple binding, bare-local initializer.
+    let rustc_hir::StmtKind::Let(lt) = s_let.kind else {
+        return false;
+    };
+    if lt.els.is_some() || lt.ty.is_some() {
+        return false;
+    }
+    let rustc_hir::PatKind::Binding(rustc_hir::BindingMode(rustc_hir::ByRef::No, _), t_id, _, None) =
+        lt.pat.kind
+    else {
+        return false;
+    };
+    let Some(v_id) = lt.init.and_then(hir_local_path_id) else {
+        return false;
+    };
+    // `<v> = <expr>;` — the update writes the SAME local the `let` read.
+    let rustc_hir::StmtKind::Semi(upd) = s_upd.kind else {
+        return false;
+    };
+    let rustc_hir::ExprKind::Assign(upd_lhs, _, _) = upd.kind else {
+        return false;
+    };
+    if hir_local_path_id(upd_lhs) != Some(v_id) {
+        return false;
+    }
+    // `<w> = <t>;` — the readback: a DIFFERENT local, from the `let` binding, bare on both sides.
+    let rustc_hir::StmtKind::Semi(pass) = s_pass.kind else {
+        return false;
+    };
+    let rustc_hir::ExprKind::Assign(pass_lhs, pass_rhs, _) = pass.kind else {
+        return false;
+    };
+    let (Some(w_id), Some(rhs_id)) = (hir_local_path_id(pass_lhs), hir_local_path_id(pass_rhs))
+    else {
+        return false;
+    };
+    rhs_id == t_id && w_id != v_id
 }
 
 fn source_form_gate<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId, stmts: StatementRule) -> bool {
@@ -1062,6 +1169,2276 @@ fn plan_interior_borrow_markers<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> boo
     reborrow && hir_place_is_marker_free(typeck, inner)
 }
 
+/// Trust (wave-CF, 2026-08-20; revived by wave-FR 2026-08-21): what the CALL-FORWARD marker
+/// plan owns — the ARGUMENT temps built mints for one tail call, in OPERAND order, each with
+/// the producer's own type annotation.
+///
+/// A CONSTANT argument is absent: `Category::Constant` folds into the operand and built mints
+/// no temp for it (measured, `-Zdump-mir=built`: `_2 = C::impu(move _3, const 0_u64)` — one
+/// marker pair for the place argument, none for the literal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfCallFwdPlan {
+    /// `(argument value, the producer's block-parameter type)` in OPERAND order. Every entry is
+    /// a BLOCK PARAMETER of the body's single block, and they are pairwise DISTINCT — see
+    /// [`plan_call_fwd_markers`]. Length >= 1.
+    args: Vec<(ValueId, Ty)>,
+    /// Trust (wave-CF-STR): the subset of `args` that are `&str` LITERAL chains, in operand
+    /// order. Built mints TWO locals for such an argument — the `as_temp` argument temp AND the
+    /// literal's own `&str` local (`_5 = const "lit"; _4 = &(*_5)`, measured verbatim) — so it
+    /// carries TWO marker pairs, and the second one is retired AFTER every argument temp.
+    /// Empty unless the `&str` extension is compiled in.
+    lits: Vec<ValueId>,
+    /// Trust (lane EM): [`super::SatPerturb::CfLitOrder`] — swap each literal pair's LIVE order
+    /// (`StorageLive(_5)` before `StorageLive(_4)`), on BOTH sides of the marker law at once
+    /// (the plan carries the bit, so `predict_call_fwd` and the emitter's `mf_mark_call_fwd`
+    /// site read ONE decision). The law stays green and only the ORACLE
+    /// (`mir_differential::canon_markers` against built) can reject the result — the same
+    /// design as `mc-plan`. Set only in [`MfPlans::seal`], only under the flag, and only when
+    /// the plan really carries a literal.
+    lit_swap: bool,
+    /// Trust (lane S1F, 2026-08-22): the subset of `args` whose SOURCE form is the OFFSET-0
+    /// FIELD PROJECTION of a reference parameter, autoref'd shared — the `self.map.len()`
+    /// receiver and the derived `PartialEq::eq`'s `self.f == other.f` operands. The producer
+    /// erased that borrow to the base pointer (the wave-25 offset-0 tautology, field 0 only), so
+    /// the trust-ir spells it as a bare forwarded `Ptr` param and cannot tell it from one; the
+    /// HIR can, and this is where the two derivations are reconciled. Built mints ONE temp for
+    /// it exactly as for a bare forward — `StorageLive(_2); _2 = &((*_1).0: HashMap<..>)`,
+    /// measured verbatim (`probes/s1f.rs` a1..a4, e2) — so the marker SEQUENCE is the bare
+    /// class's and only the temp's RVALUE differs: the emitter reconstructs the interior borrow
+    /// (`try_reconstruct_interior_arg`, wave-30's own reconstruction) into the marked temp.
+    fields: Vec<ValueId>,
+    /// Trust (lane S1F): [`super::SatPerturb::CfFieldDrop`] — emit every FIELD argument's temp
+    /// WITHOUT its marker pair (today's wave-30 spelling), on BOTH sides of the marker law at
+    /// once. The law stays green and only the ORACLE can refuse the result — the same design as
+    /// `cf-lit-order`. Set only in [`MfPlans::seal`], only under the flag, and only when the plan
+    /// really carries a field argument.
+    field_drop: bool,
+    /// Trust (lane S1F, 2026-08-22): the call is a STATEMENT of a unit body — `{ f(self); }`,
+    /// `{ self.m(); }` — not its tail expression. `rustc_mir_build::stmt_expr` sends the
+    /// statement's value through `as_temp`, so built mints a `()` temp for it, OPENED BEFORE
+    /// every argument temp and RETIRED AFTER every one, writes the call into that temp, and
+    /// then spells the unit body's `_0 = const ()` at the successor (measured verbatim,
+    /// `probes/s1f.rs` b1/b2: `live _2; live _3; _3 = &mut (*_1); _2 = f(move _3) -> bb1;
+    /// bb1: dead _3; dead _2; _0 = const (); return`). The trust-ir cannot see the semicolon —
+    /// `call f(%0); ret` is the same for both forms — so the HIR decides, and the plan carries
+    /// the answer to BOTH sides of the marker law.
+    unit_stmt: bool,
+    /// Trust (lane S1F): [`super::SatPerturb::CfUnitLate`] — open the `()` temp's
+    /// `StorageLive` AFTER the argument temps instead of before them, on BOTH sides of the
+    /// marker law at once. The law stays green and only the ORACLE can refuse. Set only in
+    /// [`MfPlans::seal`], only under the flag, and only when the plan really is a unit
+    /// statement.
+    unit_late: bool,
+    /// Trust (lane S1F, 2026-08-22): the subset of `args` whose source form is the EXPLICIT
+    /// borrow of the offset-0 field, `&p.0`, carrying the reborrow coercion pair — the derived
+    /// `Ord::cmp`'s `::core::cmp::Ord::cmp(&self.0, &other.0)`. Built mints TWO locals per such
+    /// argument: the field borrow's own local `u = &((*_p).0: F)` and the `as_temp` argument
+    /// temp `t = &(*u)`, opened `live t; live u` before either assign (measured verbatim,
+    /// `probes/s1f.rs` {impl#16}::cmp, {impl#28}::cmp). The retirement order is the tail
+    /// expression's EDITION-2024 temporary rule — every pair member in reverse creation order,
+    /// `dead u_n; dead t_n; …; dead u_1; dead t_1` — which is what the built-in derives expand
+    /// under (their spans carry `core`'s edition); the 2021 rule retires the argument temps
+    /// first and the field locals after (`dead t_n..t_1; dead u_n..u_1`, measured on the same
+    /// probe at `--edition 2021`), has no body in the corpus, and is REFUSED by the plan.
+    pairs: Vec<ValueId>,
+    /// Trust (lane S1F): [`super::SatPerturb::CfPairOrder`] — retire the pairs in the
+    /// measured EDITION-2021 order instead of the 2024 one, on BOTH sides of the marker law at
+    /// once. Set only in [`MfPlans::seal`], only under the flag, and only when the plan really
+    /// carries a pair.
+    pair_swap: bool,
+    /// Trust (lane S1F, 2026-08-22): the call's REFERENCE result is REBORROWED into `_0` — the
+    /// returned-reference coercion on the tail call (`fn deref(&self) -> &R { self.resources() }`,
+    /// typeck `[Deref(Builtin), Borrow(Ref(Not))]` on the call) or the overloaded-`Deref`
+    /// coercion of `self` (`fn as_ref(&self) -> &L { self }`, typeck `[Deref(Builtin),
+    /// Deref(Overloaded), Borrow(Ref(Not))]`, the producer's call being `Deref::deref`). Built
+    /// routes the call into a temp `d` opened BEFORE the argument temps, and at the successor
+    /// head writes `_0 = &(*d)` BEFORE the retirements, retiring `d` last (measured verbatim,
+    /// `probes/s1f.rs` {impl#6}::deref, {impl#8}::as_ref: `live _2; live _3; _3 = &(*_1);
+    /// _2 = f(move _3) -> bb1; bb1: _0 = &(*_2); dead _3; dead _2; return`).
+    ret_reborrow: bool,
+    /// Trust (lane S1F): [`super::SatPerturb::CfRetLate`] — open the destination temp AFTER
+    /// the argument temps instead of before them, on BOTH sides of the marker law at once.
+    ret_late: bool,
+    /// Trust (lane R53, 2026-08-22): the POST-OP form — the call's result is the operand of one
+    /// further scalar operation whose result is returned. See [`CfPostOp`]. `None` is wave-CF's
+    /// original grammar, verbatim.
+    post: Option<CfPostOp>,
+    /// Trust (lane R53): the CALL RESULT's own trust-ir type, for the two scalar post-op forms —
+    /// read off the post-op instruction's operand annotation, never guessed. `Ty::Unit` and
+    /// unused for [`CfPostOp::Field`], whose slot token is [`mf_gate::MfTy::Opaque`].
+    post_ty: Ty,
+    /// Trust (lane R53): [`super::SatPerturb::CfPostLate`] — open the post-op destination temp
+    /// AFTER the argument temps instead of before them, on BOTH sides of the marker law at once
+    /// (the same design as `cf-ret-late`). The law stays green and only the ORACLE can refuse:
+    /// built's first-appearance slot is the destination, the perturbed body's is the first
+    /// argument, so both the alpha indices and the TYPE component move. Set only in
+    /// [`MfPlans::seal`], only under the flag, and only when the plan really carries a post-op.
+    post_late: bool,
+}
+
+impl MfCallFwdPlan {
+    /// Trust (wave-CF-STR): is `v` a `&str` literal argument — the two-local shape?
+    fn is_lit(&self, v: ValueId) -> bool {
+        self.lits.iter().any(|a| *a == v)
+    }
+
+    /// Trust (lane S1F): is `v` an offset-0 FIELD-projection argument — the reconstructed
+    /// interior borrow, one temp, built's own `&((*_p).0)` spelling?
+    fn is_field(&self, v: ValueId) -> bool {
+        self.fields.iter().any(|a| *a == v)
+    }
+
+    /// Trust (lane S1F): is `v` an explicit-borrow PAIR argument — `&p.0` with the reborrow
+    /// coercion, the two-local shape?
+    fn is_pair(&self, v: ValueId) -> bool {
+        self.pairs.iter().any(|a| *a == v)
+    }
+
+    /// Trust (lane S1F): does built materialise a MARKER PAIR for the argument `v` under this
+    /// plan? Every argument does, except a field argument under [`Self::field_drop`] — the
+    /// control's whole content. Asked by BOTH sides of the marker law, so they move together.
+    fn marks_pair(&self, v: ValueId) -> bool {
+        self.marks_arg(v) && !(self.field_drop && self.is_field(v))
+    }
+
+    /// Does built materialise a marker-carrying temp for the argument `v`? Asked by the
+    /// emitter's own marking method, so an arm cannot take the class's permission and then mark
+    /// an argument the plan does not name — the rule every other emission method here obeys.
+    fn marks_arg(&self, v: ValueId) -> bool {
+        self.args.iter().any(|(a, _)| *a == v)
+    }
+}
+
+/// Trust (wave-CF-STR): is the `&str`-literal ARGUMENT extension compiled into this driver?
+/// A build-time constant rather than a flag: the two variants are measured as two SEALED
+/// DRIVERS, one hunk apart, which is this programme's own way of proving a lever moved a row.
+const CF_STR: bool = true;
+
+/// Trust (wave-CF, 2026-08-20; revived by wave-FR on top of the landed wave-MC): **THE
+/// CALL-FORWARD MARKER PLAN** — the TENTH whole-body claim, and the second whose class is a
+/// CALL (wave-MC's by-value call chain landed first; this one owns the BY-REF tail-forward
+/// family wave-MC's own census named as its class boundary).
+///
+/// # Why the class exists
+///
+/// `plan_operand_marker_temps`' `operands_of` has no `Inst::Call` arm (`_ => return None`), and
+/// `plan_call_markers` (wave-MC) refuses every `Ty::Ptr` operand — its measured class boundary
+/// ("the by-ref family needs `_2 = &(*_1)`, which `mf_operand` does not mint"). So EVERY
+/// single-block tail call whose arguments are forwarded REFERENCE parameters is outside all
+/// nine prior classes, and the wave-8a forward ("built spells this `_x = &(*_p);
+/// call(move _x)`; forwarding `_p` with `move` is congruent") means the shim minted no temp
+/// and therefore no marker. Measured on `clean-kernel` (2026-08-20, whole crate, both
+/// optimisation levels): of the 416 bodies that flip at `-O0` and are refused at `-O`, **403
+/// contain at least one call and 394 are single-block, scope-free call bodies** — the marker
+/// channel is the ONLY gate refusing them, and the call is the shape.
+///
+/// # The grammar, and what built does with it
+///
+/// One block, no lexical `let` scope, `[Const]* Call Return`, the call's result IS the returned
+/// value (or the body returns unit), and every argument is either a BLOCK PARAMETER or one of
+/// those scalar constants. Built spells exactly that body (measured, `-Zdump-mir=built`,
+/// `fn a_def_eq(s: &C, a: &E, b: &E) -> bool { s.imp3(a, b) }`, verbatim):
+///
+/// ```text
+///     bb0: StorageLive(_4); _4 = &(*_1);
+///          StorageLive(_5); _5 = &(*_2);
+///          StorageLive(_6); _6 = &(*_3);
+///          _0 = C::imp3(move _4, move _5, move _6) -> [return: bb1, unwind: bb2];
+///     bb1: StorageDead(_6); StorageDead(_5); StorageDead(_4); return;
+/// ```
+///
+/// One temp per place argument, OPENED and then ASSIGNED (so the k-th `StorageLive` sits k
+/// assigns in), and retired at the entry of the call's SUCCESSOR in REVERSE operand order — the
+/// `as_temp` scope-exit order. A `&T`/`&mut T` argument takes built's reborrow (`_4 = &(*_1)`);
+/// a by-value scalar takes built's copy (`_4 = copy _2`, measured on `d_scalar`).
+///
+/// # What is refused, and why each refusal is not free
+///
+/// * A `let` scope (the wave-MF firewall, unchanged).
+/// * A preamble that is neither scalar constants nor — when [`CF_STR`] is on — the
+///   `global_addr`/`const`/`ptr_from_parts` chain of a `&str` LITERAL argument. That chain is
+///   the second class this plan covers, and built spells it with TWO locals per literal
+///   (`StorageLive(_4); StorageLive(_5); _5 = const "lit"; _4 = &(*_5)`), retired AFTER every
+///   argument temp. With `CF_STR` off the chain is refused and only the place-argument class
+///   remains — which is exactly the one-hunk control that isolates what the extension bought.
+/// * A repeated argument (`f(a, a)`): built mints TWO temps for one value and this plan names a
+///   slot BY its value, so the two would alpha-rename onto one another.
+/// * Any body whose SOURCE form does not independently witness one temp per argument — see
+///   [`call_fwd_source_admits`]. The trust-ir cannot see a destructuring parameter's binding
+///   local or an argument expression that is not a bare place, and both mint markers this plan
+///   does not predict.
+fn plan_call_fwd_markers<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    func: &trust_ir::Function,
+) -> Option<MfCallFwdPlan> {
+    // The wave-MF firewall, unchanged: any lexical `let` scope puts the body outside every
+    // instruction-stream plan, because the scope table is what the instruction stream cannot see.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let [blk] = func.blocks.as_slice() else { return None };
+    let (term, body) = blk.body.split_last()?;
+    let Inst::Return { values } = &term.inst else { return None };
+    // Trust (lane R53, 2026-08-22): the block splits at THE call, which need no longer be the
+    // last body node. `pre` is wave-CF's preamble, verbatim; `post` is empty for wave-CF's own
+    // grammar and is otherwise the ONE scalar post-op (with its folded constants) whose result
+    // is returned. Exactly ONE `Inst::Call` may appear: a second one is wave-WB8's chain class
+    // and is refused here rather than modelled, so the two classes stay disjoint on their own
+    // instruction sets.
+    let call_ix = body.iter().position(|n| matches!(n.inst, Inst::Call { .. }))?;
+    if body.iter().filter(|n| matches!(n.inst, Inst::Call { .. })).count() != 1 {
+        return None;
+    }
+    let (pre, rest) = body.split_at(call_ix);
+    let (call, post) = rest.split_first()?;
+    let Inst::Call { args, .. } = &call.inst else { return None };
+    // Trust (wave-CF-STR): the DEFINING node of every SSA value in this one block, so the `&str`
+    // literal chains this call passes can be recognized with the SAME recognizer the emitter
+    // uses (`recognize_str_return`) rather than a second spelling of the same three-node shape.
+    let mut value_def: HashMap<ValueId, &InstrNode> = HashMap::new();
+    for n in &blk.body {
+        for r in &n.results {
+            value_def.insert(*r, n);
+        }
+    }
+    let mut chain_nodes: HashSet<ValueId> = HashSet::new();
+    let mut lits: Vec<ValueId> = Vec::new();
+    if CF_STR {
+        for a in args {
+            if lits.contains(a) {
+                // The same literal passed twice would be TWO built temps for one value, which
+                // this plan cannot name (it names a slot BY its value). Refuse, as for a
+                // repeated place argument.
+                return None;
+            }
+            if let Some((_, _, skip)) = recognize_str_return(&value_def, *a) {
+                for s in skip {
+                    chain_nodes.insert(s);
+                }
+                lits.push(*a);
+            }
+        }
+    }
+    // The preamble: SCALAR constants, plus the nodes of a recognized `&str` chain. Anything else
+    // (a load, another call, an unrecognized fat-pointer construction) is a shape whose marker
+    // sequence this plan does not model.
+    let mut consts: HashSet<ValueId> = HashSet::new();
+    for n in pre {
+        let &[r] = n.results.as_slice() else { return None };
+        if chain_nodes.contains(&r) {
+            continue;
+        }
+        let Inst::Const { value, .. } = &n.inst else { return None };
+        if !matches!(
+            value,
+            Constant::Int(_) | Constant::U128(_) | Constant::Float(_) | Constant::Bool(_)
+        ) {
+            return None;
+        }
+        consts.insert(r);
+    }
+    // The call's result IS the returned value, or the body returns unit. Built then writes the
+    // call straight into `_0` and its successor block holds nothing but the retirements, which is
+    // what puts every `StorageDead` at position 0 of that block.
+    //
+    // Trust (lane R53): OR the call's result is the operand of exactly one further scalar
+    // operation whose result is returned — the POST-OP form. `post_ir` is what the TRUST-IR
+    // witnesses; the source side answers independently below and the two must AGREE.
+    let mut post_ir: Option<(CfPostOp, Ty)> = None;
+    if post.is_empty() {
+        match (call.results.as_slice(), values.as_slice()) {
+            ([], []) => {}
+            (&[r], &[v]) if r == v => {}
+            _ => return None,
+        }
+    } else {
+        let &[r] = call.results.as_slice() else { return None };
+        let &[v] = values.as_slice() else { return None };
+        // Every post node but the LAST is a scalar constant (folded, no statement, no marker);
+        // the last one is the post-op and its result is the returned value.
+        let (op_node, post_consts) = post.split_last()?;
+        let mut post_const_ids: HashSet<ValueId> = HashSet::new();
+        for n in post_consts {
+            let &[c] = n.results.as_slice() else { return None };
+            let Inst::Const { value, .. } = &n.inst else { return None };
+            if !matches!(
+                value,
+                Constant::Int(_) | Constant::U128(_) | Constant::Float(_) | Constant::Bool(_)
+            ) {
+                return None;
+            }
+            post_const_ids.insert(c);
+        }
+        if op_node.results.as_slice() != [v] {
+            return None;
+        }
+        // The call's result feeds the post-op and NOTHING else — a second use would be a temp
+        // read this class has no marker model for. [`value_used_in`] is the file's own use
+        // census; every instruction this class admits (`Const`, `Call`, the five post-op arms,
+        // `Return`) is enumerated in it, so its conservative `_ => false` default cannot
+        // under-count here.
+        let uses_of_r =
+            blk.body.iter().filter(|n| value_used_in(std::slice::from_ref(*n), r)).count();
+        if uses_of_r != 1 || !value_used_in(std::slice::from_ref(op_node), r) {
+            return None;
+        }
+        // The post-op's shape, and the SLOT TYPE it hands the predicted side. `ty` on `ICmp` /
+        // `BinOp` / `UnOp` / `Select` annotates the OPERAND type, which for these four is the
+        // call result's own type; `ExtractField`'s annotates the FIELD, so that arm carries no
+        // type and is admitted only against a non-scalar source witness (below).
+        post_ir = Some(match &op_node.inst {
+            Inst::ICmp { ty, lhs, rhs, .. } => {
+                if *lhs != r || !post_const_ids.contains(rhs) {
+                    return None;
+                }
+                (CfPostOp::BinLit, ty.clone())
+            }
+            Inst::BinOp { op, ty, lhs, rhs } => {
+                if *lhs != r || !post_const_ids.contains(rhs) {
+                    return None;
+                }
+                // A SHIFT is the one binary operation the shim recognizes as a `Cast + BinOp`
+                // UNIT, reading its operands outside `mf_operand` — wave-MF's and lane K's own
+                // measured hazard, refused here for the same reason.
+                if matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
+                    return None;
+                }
+                (CfPostOp::BinLit, ty.clone())
+            }
+            Inst::UnOp { op: UnOp::Not, ty, operand } => {
+                if *operand != r || *ty != Ty::Bool {
+                    return None;
+                }
+                (CfPostOp::NotUnary, Ty::Bool)
+            }
+            // The producer's own spelling of `!c`: `select c, false, true`.
+            Inst::Select { ty, cond, then_val, else_val } => {
+                if *cond != r || *ty != Ty::Bool {
+                    return None;
+                }
+                if !post_const_ids.contains(then_val) || !post_const_ids.contains(else_val) {
+                    return None;
+                }
+                let val_of = |q: &ValueId| {
+                    post_consts.iter().find(|n| n.results.as_slice() == [*q]).and_then(|n| match &n
+                        .inst
+                    {
+                        Inst::Const { value: Constant::Bool(b), .. } => Some(*b),
+                        _ => None,
+                    })
+                };
+                if val_of(then_val) != Some(false) || val_of(else_val) != Some(true) {
+                    return None;
+                }
+                (CfPostOp::NotUnary, Ty::Bool)
+            }
+            Inst::ExtractField { aggregate, .. } => {
+                if *aggregate != r || !post_consts.is_empty() {
+                    return None;
+                }
+                (CfPostOp::Field, Ty::Unit)
+            }
+            _ => return None,
+        });
+    }
+    let params: HashMap<ValueId, Ty> = blk.params.iter().cloned().collect();
+    let mut plan: Vec<(ValueId, Ty)> = Vec::new();
+    // `mask[i]` is what built does with argument `i`: fold it, mint one temp for it, or mint the
+    // two-local `&str` literal shape. The mask is handed to the source-side gate so the two
+    // derivations — the trust-ir's and the HIR's — must AGREE, rather than one being assumed
+    // from the other.
+    let mut mask: Vec<CfArg> = Vec::with_capacity(args.len());
+    for a in args {
+        if consts.contains(a) {
+            mask.push(CfArg::Folded);
+            continue;
+        }
+        if plan.iter().any(|(v, _)| v == a) {
+            return None;
+        }
+        if lits.contains(a) {
+            // The literal's own type comes off the fat-pointer construction the producer
+            // emitted, which is the type built declares BOTH of its locals at.
+            let Inst::PtrFromParts { ptr_ty, .. } = &value_def.get(a)?.inst else { return None };
+            plan.push((*a, ptr_ty.clone()));
+            mask.push(CfArg::StrLit);
+            continue;
+        }
+        let ty = params.get(a)?.clone();
+        plan.push((*a, ty));
+        mask.push(CfArg::Place);
+    }
+    if plan.is_empty() {
+        return None;
+    }
+    // Trust (lane S1F): the HIR side now ANSWERS per argument rather than merely agreeing —
+    // a `Place` slot is either a bare parameter path or the offset-0 field projection the
+    // producer erased, and only the source form can say which. The answer is recorded on the
+    // plan so the emitter reconstructs exactly the arguments the HIR witnessed as fields, and
+    // refuses (fail closed, at the CF site) any argument whose MIR type disagrees with that.
+    // Trust (lane R53): the source side is asked what the trust-ir witnessed and must ANSWER
+    // the same post-op form — a disagreement (either direction) refuses the body.
+    let (forms, unit_stmt, edition_2024, ret_reborrow, post_src) =
+        call_fwd_source_admits(tcx, def, &mask, post_ir.as_ref().map(|(k, _)| *k))?;
+    if post_src != post_ir.as_ref().map(|(k, _)| *k) {
+        return None;
+    }
+    // A post-op stands ALONE: beside a `&str` literal, a field/pair argument, a unit statement
+    // or a reborrowed return it is an unmeasured mix of two disciplines and is refused rather
+    // than modelled.
+    if post_src.is_some() && (unit_stmt || ret_reborrow || !lits.is_empty()) {
+        return None;
+    }
+    if forms.len() != args.len() {
+        return None;
+    }
+    let fields: Vec<ValueId> = args
+        .iter()
+        .zip(forms.iter())
+        .filter(|(_, f)| **f == CfForm::Field0)
+        .map(|(a, _)| *a)
+        .collect();
+    // A field argument is a `Place` slot of the plan, never a literal or a folded constant.
+    if fields
+        .iter()
+        .any(|a| lits.contains(a) || consts.contains(a) || !plan.iter().any(|(v, _)| v == a))
+    {
+        return None;
+    }
+    // Trust (lane S1F, unit statement): the HIR saw `{ call; }`. Built's `()` temp exists only
+    // because the statement's VALUE is unit and discarded; the trust-ir must agree that the call
+    // declares no result and the body returns none (the producer's unit convention), or the two
+    // derivations disagree and the body is refused.
+    if unit_stmt && !(call.results.is_empty() && values.is_empty()) {
+        return None;
+    }
+    // Trust (lane S1F, explicit-borrow pairs): the two-local shape is admitted ONLY under the
+    // edition-2024 tail-expression temporary rule (the derive expansion), and ONLY alone — a
+    // pair beside a `&str` literal pair or inside a unit statement is an unmeasured mix of two
+    // retirement disciplines and is refused rather than modelled.
+    let pairs: Vec<ValueId> = args
+        .iter()
+        .zip(forms.iter())
+        .filter(|(_, f)| **f == CfForm::AddrOfField0)
+        .map(|(a, _)| *a)
+        .collect();
+    if !pairs.is_empty() && (!edition_2024 || !lits.is_empty() || unit_stmt) {
+        return None;
+    }
+    // Trust (lane S1F, reborrowed return): the call's result must BE the returned value (the
+    // trust-ir folded built's `_0 = &(*d)` into the forward) and the class is admitted ALONE —
+    // beside a literal pair, a field temp, an explicit-borrow pair or a unit statement it is an
+    // unmeasured mix and is refused rather than modelled.
+    if ret_reborrow
+        && (unit_stmt
+            || !lits.is_empty()
+            || !fields.is_empty()
+            || !pairs.is_empty()
+            || !matches!((call.results.as_slice(), values.as_slice()), (&[r], &[v]) if r == v))
+    {
+        return None;
+    }
+    if pairs.iter().any(|a| consts.contains(a) || !plan.iter().any(|(v, _)| v == a)) {
+        return None;
+    }
+    // Trust (lane R53): the post-op form is refused beside a FIELD or PAIR argument for the
+    // same reason it is refused beside a literal — two measured disciplines, one body, no
+    // measurement of the mix.
+    if post_src.is_some() && (!fields.is_empty() || !pairs.is_empty()) {
+        return None;
+    }
+    Some(MfCallFwdPlan {
+        args: plan,
+        lits,
+        lit_swap: false,
+        fields,
+        field_drop: false,
+        unit_stmt,
+        unit_late: false,
+        pairs,
+        pair_swap: false,
+        ret_reborrow,
+        ret_late: false,
+        post: post_src,
+        post_ty: post_ir.map(|(_, t)| t).unwrap_or(Ty::Unit),
+        post_late: false,
+    })
+}
+
+/// Trust (wave-CF): the SOURCE-side half of the call-forward plan — does the body's own HIR
+/// independently witness "one `as_temp` operand temp per non-literal argument, and nothing else
+/// in the body that mints a marker"?
+///
+/// The trust-ir cannot see three things that each mint markers this plan does not predict: a
+/// destructuring parameter's binding local (`hir_params_are_simple_bindings`, the same one
+/// decision the other source-side plans consult), a statement in the body block, and an
+/// argument expression that is not a bare place or a literal. Each is refused here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CfArg {
+    /// A scalar literal: `Category::Constant`, folded into the operand, no temp.
+    Folded,
+    /// A place expression (a parameter path): one `as_temp` operand temp.
+    Place,
+    /// A `&str` literal: built mints the operand temp AND the literal's own local.
+    StrLit,
+}
+
+/// Trust (lane S1F, 2026-08-22): what the SOURCE side saw for one argument — the trust-ir's
+/// [`CfArg`] classification, refined where the source can see more than the instruction stream.
+/// A trust-ir `Place` is EITHER a bare parameter path (`Bare`) OR the offset-0 field projection
+/// of a reference parameter the producer erased to the base pointer (`Field0`); both mint ONE
+/// built temp, but the temp's RVALUE differs (`&(*_p)` vs `&((*_p).0)`), so the emitter must be
+/// told which, and must be told by the side that can see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CfForm {
+    /// A scalar literal: folded, no temp.
+    Folded,
+    /// A bare parameter path: one temp, built's `&(*_p)` reborrow or `copy _p`.
+    Bare,
+    /// `p.f` with `f` the DECLARATION-index-0 field of the struct behind the reference parameter
+    /// `p`, autoref'd SHARED: one temp, built's `&((*_p).0: F)` interior borrow, measured
+    /// verbatim (`probes/s1f.rs` a1/a2/a3/a4 and the derived-`PartialEq` e2 / `{impl#19}`).
+    /// Index 0 is not a convenience: the producer erases an interior borrow to the base pointer
+    /// ONLY at declared field 0 (`zero_displacement_agrees`), so a trust-ir `Place` slot whose
+    /// source is `p.f` with `f != 0` cannot exist — that body lowers through a `GEP` and is
+    /// outside this plan's grammar. Requiring 0 here makes the agreement CHECKED on both sides.
+    Field0,
+    /// `&p.0` — the EXPLICIT shared borrow of the declaration-index-0 field of the struct behind
+    /// the reference parameter `p`, carrying the reborrow coercion pair
+    /// (`[Deref(Builtin), Borrow(Ref(Not))]`): TWO locals, `u = &((*_p).0: F); t = &(*u)`,
+    /// measured verbatim on the derived `Ord::cmp` (`probes/s1f.rs` {impl#16}::cmp).
+    AddrOfField0,
+    /// A `&str` literal: the two-local shape.
+    StrLit,
+}
+
+/// Trust (lane R53, 2026-08-22): the call-forward POST-OP — the ONE scalar operation the class
+/// now admits BETWEEN the call and the `Return`.
+///
+/// Wave-CF's grammar required the call's result to BE the returned value; lane S1F added the
+/// reborrowed return, which is still that shape with a coercion. This variant is different in
+/// kind: the call's result is an OPERAND of one further expression, so built routes the call
+/// into a destination temp `d` opened BEFORE every argument temp, retires the argument temps at
+/// the successor head, writes the post-op into `_0`, and retires `d` LAST — a THIRD retirement
+/// discipline, measured verbatim on `probes/r53.rs` y1/y2/y6/y7/y9/y10 and on both closure
+/// forms (y11/y12):
+///
+/// ```text
+/// bb0: live d; live t1; …; live tk; t1 = &(*_p1); …; tk = &(*_pk); d = f(move t1, …) -> bb1
+/// bb1: dead tk; …; dead t1; _0 = <post>(move d, …); dead d; return
+/// ```
+///
+/// The post-op costs exactly ONE assign at the successor, which is what puts `dead d` one assign
+/// in while every argument retirement sits at position 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CfPostOp {
+    /// `call(..) <op> <scalar literal>` — a BUILT-IN binary operator or comparison whose other
+    /// operand is a folded constant. Built: `_0 = <Op>(move d, const k)`. The trust-ir spells it
+    /// `Inst::ICmp`/`Inst::BinOp`, whose `ty` annotation IS the call result's type, so the slot's
+    /// type token is read from the producer rather than guessed.
+    BinLit,
+    /// `!call(..)` — a BUILT-IN `Not` on a `bool`. Built: `_0 = Not(move d)`. The producer spells
+    /// it either as `Inst::UnOp { op: Not }` or as the `Inst::Select { cond, false, true }`
+    /// idiom; both are ONE assign and both carry a `bool` `ty`.
+    NotUnary,
+    /// `call(..).f` — a field read of the call's aggregate result. Built: `_0 = copy (d.f: F)`.
+    /// The trust-ir's `Inst::ExtractField { ty, .. }` annotates the FIELD's type, not the
+    /// aggregate's, so the slot's type token cannot be read from the producer; the class is
+    /// therefore admitted ONLY when the source side witnesses a NON-SCALAR call return, which
+    /// makes [`mf_gate::MfTy::Opaque`] a CHECKED token on both sides rather than a guess — the
+    /// same discipline wave-WB8's chain slots get from `chain_fwd_source_admits`.
+    Field,
+}
+
+fn call_fwd_source_admits<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    mask: &[CfArg],
+    want_post: Option<CfPostOp>,
+) -> Option<(Vec<CfForm>, bool, bool, bool, Option<CfPostOp>)> {
+    let body = tcx.hir_maybe_body_owned_by(def)?;
+    if !hir_params_are_simple_bindings(body) {
+        return None;
+    }
+    let root = tcx.typeck_root_def_id(def.to_def_id()).as_local()?;
+    let typeck = tcx.typeck(root);
+    // A closure body is the expression itself; a fn body is a block whose tail it is.
+    // Trust (lane S1F, 2026-08-22): TWO body forms, told apart here because the trust-ir cannot.
+    // The TAIL form `{ call }` writes the call straight into `_0` (the wave-CF grammar); the
+    // STATEMENT form `{ call; }` of a UNIT body mints a `()` temp for the statement's value
+    // (`rustc_mir_build::stmt_expr` -> `as_temp`), opened before and retired after every
+    // argument temp, and then writes `_0 = const ()` — measured verbatim (`probes/s1f.rs` b1/b2).
+    // Exactly ONE non-item statement and NO tail, or NO non-item statement and a tail; anything
+    // else mints markers this plan does not predict and is refused.
+    let (tail, unit_stmt) = match body.value.kind {
+        rustc_hir::ExprKind::Block(b, None) => {
+            if !matches!(b.rules, rustc_hir::BlockCheckMode::DefaultBlock) {
+                return None;
+            }
+            let stmts: Vec<&rustc_hir::Stmt<'tcx>> = b
+                .stmts
+                .iter()
+                .filter(|s| !matches!(s.kind, rustc_hir::StmtKind::Item(_)))
+                .collect();
+            match (stmts.as_slice(), b.expr) {
+                ([], Some(e)) => (e, false),
+                ([s], None) => match s.kind {
+                    rustc_hir::StmtKind::Semi(e) if typeck.expr_ty(e).is_unit() => (e, true),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        _ => (body.value, false),
+    };
+    // Trust (lane R53, 2026-08-22): THE POST-OP PEEL. When the trust-ir witnessed a post-op the
+    // tail is not the call — it is one scalar expression AROUND the call — and the source side
+    // must say which of the three measured forms it is, on the same expression the instruction
+    // stream saw. A body the trust-ir called post-op-free never enters this block, so wave-CF's
+    // and lane S1F's grammars are reached verbatim.
+    //
+    // Every arm refuses an ADJUSTED sub-expression: an adjustment on the inner call is a temp
+    // this class does not model (it is lane S1F's `ret_reborrow`, which is refused beside a
+    // post-op), and one on the outer expression is an overloaded operator — a CALL, whose
+    // built shape is a second call and not `_0 = <Op>(move d, ..)`.
+    let (tail, post_src) = match want_post {
+        None => (tail, None),
+        Some(k) => {
+            if !typeck.expr_adjustments(tail).is_empty() {
+                return None;
+            }
+            let peeled = match (k, tail.kind) {
+                (CfPostOp::BinLit, rustc_hir::ExprKind::Binary(_, lhs, rhs)) => {
+                    if typeck.is_method_call(tail) {
+                        return None;
+                    }
+                    // The other operand must be the folded scalar literal the trust-ir saw.
+                    if !matches!(rhs.kind, rustc_hir::ExprKind::Lit(_))
+                        || !typeck.expr_adjustments(rhs).is_empty()
+                    {
+                        return None;
+                    }
+                    lhs
+                }
+                (CfPostOp::NotUnary, rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Not, e)) => {
+                    if typeck.is_method_call(tail) || !typeck.expr_ty(tail).is_bool() {
+                        return None;
+                    }
+                    e
+                }
+                (CfPostOp::Field, rustc_hir::ExprKind::Field(e, _)) => {
+                    // The aggregate's type token is [`mf_gate::MfTy::Opaque`] on the predicted
+                    // side; that is a CHECKED fact only if the call's return really is outside
+                    // the sixteen body scalars, which only the source side can say.
+                    let agg = typeck.expr_ty(e);
+                    if SCALAR_CANDS.iter().any(|c| scalar_rustc_ty(tcx, c) == Some(agg)) {
+                        return None;
+                    }
+                    e
+                }
+                _ => return None,
+            };
+            if !typeck.expr_adjustments(peeled).is_empty() {
+                return None;
+            }
+            (peeled, Some(k))
+        }
+    };
+    // Trust (lane S1F, 2026-08-22): THE REBORROWED RETURN. An adjustment on the CALL ITSELF is
+    // a temp the original plan did not model — and it is now modelled for EXACTLY one list, the
+    // returned-reference reborrow coercion `[Deref(Builtin), Borrow(Ref(Not))]` on a tail that is
+    // a shared reference: built routes the call into a temp opened before the argument temps and
+    // writes `_0 = &(*d)` at the successor head (measured verbatim, `probes/s1f.rs`
+    // {impl#6}::deref). The overloaded-`Deref` coercion of a bare `self` — `[Deref(Builtin),
+    // Deref(Overloaded), Borrow(Ref(Not))]` on a local path, the producer's call being
+    // `Deref::deref` with `self` forwarded bare — is the SAME built shape ({impl#8}::as_ref) and
+    // is admitted below as the tail's own form. Any other adjustment list refuses.
+    let shared_reborrow_pair = |adj: &[ty::adjustment::Adjustment<'tcx>]| {
+        matches!(
+            adj,
+            [a, b] if matches!(
+                a.kind,
+                ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+            ) && matches!(
+                b.kind,
+                ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                    if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+            )
+        )
+    };
+    let tail_is_shared_ref = matches!(typeck.expr_ty(tail).kind(), ty::Ref(_, _, m) if m.is_not());
+    let mut ret_reborrow = false;
+    match typeck.expr_adjustments(tail) {
+        [] => {}
+        adj if shared_reborrow_pair(adj)
+            && tail_is_shared_ref
+            && matches!(
+                tail.kind,
+                rustc_hir::ExprKind::Call(..) | rustc_hir::ExprKind::MethodCall(..)
+            ) =>
+        {
+            ret_reborrow = true;
+        }
+        // The overloaded-deref coercion of a bare local: `[Deref(Builtin), Deref(Overloaded),
+        // Borrow(Ref(Not))]`. The trust-ir's call is `Deref::deref(%p)`; its ONE argument is
+        // the local, forwarded bare.
+        [a, b, c]
+            if matches!(
+                tail.kind,
+                rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path))
+                    if matches!(path.res, rustc_hir::def::Res::Local(_))
+            ) && matches!(
+                a.kind,
+                ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+            ) && matches!(
+                b.kind,
+                ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Overloaded(_))
+            ) && matches!(
+                c.kind,
+                ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                    if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+            ) && tail_is_shared_ref
+                && !unit_stmt
+                && mask == [CfArg::Place] =>
+        {
+            let edition_2024 = tail.span.edition().at_least_rust_2024();
+            return Some((vec![CfForm::Bare], false, edition_2024, true, post_src));
+        }
+        _ => return None,
+    }
+    if ret_reborrow && unit_stmt {
+        return None;
+    }
+    let exprs: Vec<&'tcx rustc_hir::Expr<'tcx>> = match tail.kind {
+        rustc_hir::ExprKind::Call(callee, cargs) => {
+            // The callee must be a bare path to a fn item — a ZST constant, for which built
+            // mints no temp. Any other callee expression has temps of its own.
+            if !matches!(callee.kind, rustc_hir::ExprKind::Path(_))
+                || !typeck.expr_adjustments(callee).is_empty()
+            {
+                return None;
+            }
+            cargs.iter().collect()
+        }
+        // The receiver is argument 0, exactly as the producer spells it.
+        rustc_hir::ExprKind::MethodCall(_, recv, cargs, _) => {
+            std::iter::once(recv).chain(cargs.iter()).collect()
+        }
+        // Trust (lane S1F): an OVERLOADED binary operator — `self.f == other.f`, the derived
+        // `PartialEq::eq` on a `Vec` field — is the trait-method call `PartialEq::eq(&lhs, &rhs)`
+        // with a shared AUTOREF on each operand, and built spells it exactly as the two-argument
+        // method call above: one `&((*_p).0)` temp per operand, in operand order, retired in
+        // reverse at the successor (measured verbatim, `probes/s1f.rs` {impl#19}::eq / e2). A
+        // BUILT-IN binary operator mints a `BinOp`, not a `Call`, and the trust-ir mask then
+        // never reaches here; the guard makes that a checked fact rather than an assumption.
+        rustc_hir::ExprKind::Binary(_, lhs, rhs) => {
+            if !typeck.is_method_call(tail) {
+                return None;
+            }
+            vec![lhs, rhs]
+        }
+        _ => return None,
+    };
+    if exprs.len() != mask.len() {
+        return None;
+    }
+    let forms = exprs
+        .into_iter()
+        .zip(mask)
+        .map(|(e, kind)| call_fwd_arg_admits(typeck, e, *kind))
+        .collect::<Option<Vec<CfForm>>>()?;
+    // Trust (lane S1F): the TAIL EXPRESSION's edition decides the temporary-scope rule
+    // `rustc_hir_analysis::check::region::resolve_block` applies to it — under 2024 the tail's
+    // temporaries share the call's own scope and retire in reverse creation order; under 2021
+    // they outlive the argument temps. A built-in derive's expansion carries `core`'s edition,
+    // which is how the derived `Ord::cmp` in an edition-2021 crate measures as 2024.
+    let edition_2024 = tail.span.edition().at_least_rust_2024();
+    Some((forms, unit_stmt, edition_2024, ret_reborrow, post_src))
+}
+
+/// Trust (lane S1F): is `e` the field projection `p.f` with `p` a bare local path through a
+/// reference parameter (adjustments EXACTLY `[Deref(Builtin)]`), the deref'd base a STRUCT, and
+/// `f` its DECLARATION-index-0 field — the one field the producer erases to the base pointer
+/// (`zero_displacement_agrees`)? Shared by the autoref form and the explicit-borrow form.
+fn field0_of_ref_param<'tcx>(
+    typeck: &'tcx ty::TypeckResults<'tcx>,
+    e: &'tcx rustc_hir::Expr<'tcx>,
+) -> bool {
+    let rustc_hir::ExprKind::Field(base, _) = e.kind else { return false };
+    let base_is_local = matches!(
+        base.kind,
+        rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path))
+            if matches!(path.res, rustc_hir::def::Res::Local(_))
+    );
+    if !base_is_local {
+        return false;
+    }
+    let base_deref_only = matches!(
+        typeck.expr_adjustments(base),
+        [a] if matches!(
+            a.kind,
+            ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+        )
+    );
+    if !base_deref_only {
+        return false;
+    }
+    if !matches!(typeck.expr_ty_adjusted(base).kind(), ty::Adt(adt, _) if adt.is_struct()) {
+        return false;
+    }
+    typeck.opt_field_index(e.hir_id) == Some(FieldIdx::ZERO)
+}
+
+/// Trust (wave-CF): one argument expression, against the trust-ir's own classification of it.
+/// Trust (lane S1F): answers WHAT it saw ([`CfForm`]) rather than only whether it agrees, so
+/// the plan can carry the field-projection slots to the emitter. `None` refuses the body.
+fn call_fwd_arg_admits<'tcx>(
+    typeck: &'tcx ty::TypeckResults<'tcx>,
+    e: &'tcx rustc_hir::Expr<'tcx>,
+    kind: CfArg,
+) -> Option<CfForm> {
+    let folded = kind == CfArg::Folded;
+    match e.kind {
+        // A LITERAL. A SCALAR one is `Category::Constant`: built folds it into the operand and
+        // mints no temp. A `&str` one is not — built spells `_5 = const "lit"; _4 = &(*_5)`, two
+        // locals — so the two are separated HERE by the literal's own type, and the separation
+        // must agree with the trust-ir's (`recognize_str_return` found a chain, or it did not).
+        //
+        // Trust (lane EM, 2026-08-21): the two-local `&str` spelling EXISTS BECAUSE OF the
+        // literal's reborrow coercion, so StrLit requires the adjustment pair rather than
+        // refusing on it. Measured both directions (`-Zdump-mir=built`, laneEM probes em2.rs):
+        //   * `f.ws("hello")` with `ws(&mut self, s: &str)` — the literal (`&'static str`)
+        //     coerces to the param's `&'x str`, typeck records `[Deref(Builtin),
+        //     Borrow(Ref(Not))]`, and built spells the TWO locals
+        //     (`_4 = const "hello"; _3 = &(*_4)`) — the shape the plan's StrLit slot models.
+        //   * `f.wstatic("hello")` with `s: &'static str` — types equal, NO adjustment, and
+        //     built FOLDS the literal (`wstatic(move _2, const "hello")`) — NO locals, NO
+        //     markers. The trust-ir cannot see the difference (the producer emits the same
+        //     fat-pointer chain either way), so the ADJUSTMENT-FREE `&str` literal is refused
+        //     here: trust-ir says StrLit, this side says no, the masks disagree, and the body
+        //     ships marker-free — fail closed, exactly as it does today.
+        // The original wave-CF-STR clause demanded an ADJUSTMENT-FREE `&str` literal, a shape
+        // built never mints temps for — which is why the CF_STR emission, compiled in since
+        // wave-FR, measurably never fired (wave-WB's sizing correction: all 351 agreed
+        // `expecting` bodies' derived marker channel `<end>`).
+        // A SCALAR literal with ANY adjustment is still refused: an adjustment would make it a
+        // place again.
+        rustc_hir::ExprKind::Lit(_) => {
+            let is_str = matches!(
+                typeck.expr_ty(e).kind(),
+                ty::Ref(_, inner, m) if m.is_not() && inner.is_str()
+            );
+            // The `&str` literal's own reborrow pair — `[Deref(Builtin), Borrow(Ref)]` with the
+            // borrow SHARED (`&str` is a shared ref; a mutable autoborrow here is a shape this
+            // plan has not measured and is refused).
+            let has_shared_reborrow_pair = match typeck.expr_adjustments(e) {
+                [a, b] => {
+                    matches!(
+                        a.kind,
+                        ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+                    ) && matches!(
+                        b.kind,
+                        ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                            if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+                    )
+                }
+                _ => false,
+            };
+            match kind {
+                CfArg::Folded if !is_str && typeck.expr_adjustments(e).is_empty() => {
+                    Some(CfForm::Folded)
+                }
+                CfArg::StrLit if is_str && has_shared_reborrow_pair => Some(CfForm::StrLit),
+                _ => None,
+            }
+        }
+        // A PATH TO A LOCAL is a place expression: `as_operand` sends it through `as_temp` and
+        // built mints EXACTLY ONE marked temp — a reborrow when the adjustment pair is present
+        // (`[Deref(Builtin), Borrow(Ref(_))]`, the same pair `plan_interior_borrow_markers`
+        // requires), a copy when there is no adjustment at all. Any other adjustment list (a
+        // coercion, an overloaded deref, an unsizing) is a different shape.
+        rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path))
+            if matches!(path.res, rustc_hir::def::Res::Local(_)) =>
+        {
+            if folded || kind == CfArg::StrLit {
+                return None;
+            }
+            let ok = match typeck.expr_adjustments(e) {
+                [] => true,
+                [a, b] => {
+                    matches!(
+                        a.kind,
+                        ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+                    ) && matches!(
+                        b.kind,
+                        ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(_))
+                    )
+                }
+                _ => false,
+            };
+            ok.then_some(CfForm::Bare)
+        }
+        // Trust (lane S1F, 2026-08-22): THE OFFSET-0 FIELD PROJECTION of a reference parameter,
+        // autoref'd SHARED — `self.map.len()`'s receiver, `self.f == other.f`'s operands. Built
+        // spells ONE temp, `StorageLive(_t); _t = &((*_p).0: F)` (measured verbatim,
+        // `probes/s1f.rs` a1..a4 and {impl#19}::eq), opened and retired exactly where the bare
+        // reborrow's temp is. Four things are checked, each load-bearing:
+        //   * the BASE is a bare local path with adjustments EXACTLY `[Deref(Builtin)]` — the
+        //     auto-deref through the `&T`/`&mut T` parameter. A by-value struct parameter has
+        //     no adjustment and its trust-ir slot is not a `Ptr` (refused); an overloaded deref
+        //     is a call with temps of its own (refused);
+        //   * the FIELD expression's own adjustments are EXACTLY `[Borrow(Ref(Not))]` — the
+        //     shared autoref. A `&mut` autoref is unmeasured and outside the shared-only
+        //     reconstruction the emitter uses, so it is refused rather than modelled; an
+        //     explicit `&p.f` (`ExprKind::AddrOf`) is a DIFFERENT measured shape — the derived
+        //     `Ord::cmp`'s `&self.0` carries a reborrow pair and mints TWO locals
+        //     (`_4 = &((*_1).0); _3 = &(*_4)`, `probes/s1f.rs` {impl#16}::cmp) — and lands in
+        //     the `_ => None` arm below;
+        //   * the field is DECLARATION index 0 of a STRUCT — the only field the producer erases
+        //     (`zero_displacement_agrees`), so the trust-ir `Place` slot and this form describe
+        //     the same borrow; anything else is a `GEP` body outside the grammar;
+        //   * the trust-ir classified the slot `Place` (a literal or a constant cannot be a
+        //     field projection).
+        rustc_hir::ExprKind::Field(..) => {
+            if kind != CfArg::Place || !field0_of_ref_param(typeck, e) {
+                return None;
+            }
+            let shared_autoref = matches!(
+                typeck.expr_adjustments(e),
+                [a] if matches!(
+                    a.kind,
+                    ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                        if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+                )
+            );
+            if !shared_autoref {
+                return None;
+            }
+            Some(CfForm::Field0)
+        }
+        // Trust (lane S1F, 2026-08-22): THE EXPLICIT BORROW `&p.0` WITH THE REBORROW COERCION
+        // PAIR — the derived `Ord::cmp`'s `::core::cmp::Ord::cmp(&self.0, &other.0)`. Built
+        // spells TWO locals: the borrow's own `u = &((*_p).0: F)` (the operand of the coercion)
+        // and the `as_temp` argument temp `t = &(*u)`, `live t; live u` before either assign
+        // (measured verbatim, `probes/s1f.rs` {impl#16}::cmp). The pair is REQUIRED: an
+        // adjustment-free `&p.0` would be one local (the field form's shape reached by another
+        // spelling) and is unmeasured here, so it is refused rather than folded into `Field0`.
+        // The inner field expression carries NO adjustment of its own (it is the operand of an
+        // explicit `&`), and is checked by the same field-0-of-a-ref-param predicate.
+        rustc_hir::ExprKind::AddrOf(
+            rustc_hir::BorrowKind::Ref,
+            rustc_hir::Mutability::Not,
+            inner,
+        ) => {
+            if kind != CfArg::Place {
+                return None;
+            }
+            let reborrow_pair = matches!(
+                typeck.expr_adjustments(e),
+                [a, b] if matches!(
+                    a.kind,
+                    ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+                ) && matches!(
+                    b.kind,
+                    ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                        if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+                )
+            );
+            if !reborrow_pair
+                || !typeck.expr_adjustments(inner).is_empty()
+                || !field0_of_ref_param(typeck, inner)
+            {
+                return None;
+            }
+            Some(CfForm::AddrOfField0)
+        }
+        _ => None,
+    }
+}
+
+/// Trust (lane SC, 2026-08-24): one CALL GROUP of the STATEMENT-CALL SEQUENCE plan — the
+/// argument temps built mints for ONE of the sequence's N result-less calls, in OPERAND order,
+/// each with the producer's own type annotation, plus the call's index in its block's body.
+///
+/// The group index is carried because a sequence's calls typically pass THE SAME value — every
+/// corpus body here is `self.a(); self.b(); …`, i.e. `call @f(%0)` N times — and built mints a
+/// DIFFERENT temp for each (`_3`, `_5`, `_7`, all `= &mut (*_1)`). A slot named by the value
+/// alone would alpha-rename the N temps onto one another; `MfSlot::SeqArg(group, value)` cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SeqCallGroup {
+    /// The call's index in its block's body node list. The plan's groups are the body's calls,
+    /// in body order, so this is `0..N`; it is RECORDED rather than assumed so the emitter can
+    /// name its own group by the node index it is standing on, and so
+    /// [`predict_seq_call`] can re-derive the same map from the trust-ir and refuse a
+    /// disagreement.
+    node: usize,
+    /// `(argument value, the producer's block-parameter type)` in OPERAND order. Every entry is
+    /// a BLOCK PARAMETER of the body's single block, and they are pairwise DISTINCT WITHIN THE
+    /// GROUP (built mints two temps for one repeated argument and a value-named slot cannot name
+    /// both). Length >= 1.
+    args: Vec<(ValueId, Ty)>,
+}
+
+/// Trust (lane SC, 2026-08-24): **THE STATEMENT-CALL SEQUENCE MARKER PLAN** — the thirteenth
+/// whole-body claim, and the first whose class is a SEQUENCE of calls rather than one call or one
+/// chain.
+///
+/// # Why the class exists, and why it is not a widening of wave-CF
+///
+/// Lane S1F's `unit_stmt` extension of [`MfCallFwdPlan`] already models `{ f(self); }` — ONE
+/// result-less call as a unit body's only statement — and five `clean-kernel` bodies flip through
+/// it today, each printing `4 marker line(s) identical`. `plan_call_fwd_markers` refuses N > 1 at
+/// its own `!= 1` call count, so `{ f(self); g(self); }` — the SAME discipline, twice — has no
+/// class at all. That refusal is what this plan closes, and it closes it in a SEPARATE class so
+/// that the N == 1 path is not merely gated away from the change but structurally untouched by
+/// it: `plan_call_fwd_markers` is not edited, and its plan, its predicted walk and its emission
+/// sites are byte-identical to what they were.
+///
+/// # The grammar
+///
+/// One block, no lexical `let` scope, N >= 2 nodes before a VALUE-LESS `Inst::Return`, every one
+/// of them an `Inst::Call` that declares NO result, every argument of every call a BLOCK
+/// PARAMETER, and — independently witnessed by the HIR — a body whose block is exactly those N
+/// unit-typed `Semi` statements with no tail expression and no other statement.
+///
+/// # What built does with it, measured verbatim
+///
+/// `-Zdump-mir=built` on `probes/sc.rs::Env::n3_mut` (`{ self.s1(); self.s2(); self.s3(); }`):
+///
+/// ```text
+///     bb0: StorageLive(_2); StorageLive(_3); _3 = &mut (*_1);
+///          _2 = Env::s1(move _3) -> [return: bb1, unwind: bb4];
+///     bb1: StorageDead(_3); StorageDead(_2);
+///          StorageLive(_4); StorageLive(_5); _5 = &mut (*_1);
+///          _4 = Env::s2(move _5) -> [return: bb2, unwind: bb4];
+///     bb2: StorageDead(_5); StorageDead(_4);
+///          StorageLive(_6); StorageLive(_7); _7 = &mut (*_1);
+///          _6 = Env::s3(move _7) -> [return: bb3, unwind: bb4];
+///     bb3: StorageDead(_7); StorageDead(_6); _0 = const (); return;
+/// ```
+///
+/// So the discipline is lane S1F's, ONE GROUP PER CALL and nothing else: the statement's `()`
+/// temp opened FIRST at assign ordinal 0, then each argument temp opened-and-assigned in operand
+/// order, and at the call's successor the argument temps retired in REVERSE operand order
+/// followed by the `()` temp — after which the NEXT group's opens begin, in the same block, still
+/// at assign ordinal 0. **FOUR marker lines per call**, and the final successor carries the last
+/// group's retirement and then the unit body's own `_0 = const ()`.
+///
+/// # The block graph is NOT a widening problem
+///
+/// The shim allocates one MIR block per trust-ir block and each `Inst::Call`'s `new_block`
+/// appends, so an N-call single-block body derives blocks `0..=N` in exactly built's order and
+/// with exactly built's edges — measured on both corpus bodies before this plan existed
+/// (`init_bitvec_native_reducers`: built 4 reachable, derived 4; `agreed`, 8 canonical lines
+/// identical). Nothing in this class is block arithmetic; it is marker emission and nothing else.
+///
+/// # What is refused, and why each refusal is not free
+///
+/// * `N == 1` — that is lane S1F's class, which already flips. The gate is the whole reason
+///   nothing currently flipping can move.
+/// * A lexical `let` scope (the wave-MF firewall, unchanged).
+/// * A call that DECLARES a result, or a value-bearing `Return`: built then binds the result and
+///   the body is not the statement discipline this plan measured.
+/// * A nullary call: it mints the `()` temp with NO assign after it, a marker position this plan
+///   has not measured.
+/// * An argument that is not a bare block parameter, or one repeated WITHIN a call.
+/// * Any argument whose SOURCE form is not a bare place — a `&str` literal, an offset-0 field
+///   projection or an explicit `&p.0` each mint locals with their own retirement discipline
+///   ([`CfForm`]), and a MIX of two measured disciplines in one body is refused rather than
+///   modelled, exactly as [`plan_call_fwd_markers`] refuses its own mixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfSeqCallPlan {
+    /// One group per call, in body order. Length >= 2 — see the grammar above.
+    groups: Vec<SeqCallGroup>,
+    /// Trust (lane SC): [`super::SatPerturb::SeqUnitLate`] — open EVERY group's `()` temp AFTER
+    /// its argument temps instead of before them, on BOTH sides of the marker law at once (the
+    /// plan carries the bit, so [`predict_seq_call`] and the emitter's own site read ONE
+    /// decision). The law stays green and only the ORACLE
+    /// (`mir_differential::canon_markers` against built) can reject the result — the same design
+    /// as `cf-unit-late`, which it is the N >= 2 sibling of. Set only in [`MfPlans::seal`], only
+    /// under the flag, and only when a plan really exists to perturb.
+    unit_late: bool,
+}
+
+impl MfSeqCallPlan {
+    /// The group standing at body node `node`, with its index — the emitter's own question, asked
+    /// of the sealed plan rather than recomputed from the instruction stream.
+    fn group_at(&self, node: usize) -> Option<(usize, &SeqCallGroup)> {
+        self.groups.iter().position(|g| g.node == node).map(|k| (k, &self.groups[k]))
+    }
+
+    /// Does built materialise a marker-carrying temp for argument `v` OF GROUP `gi`? Asked by
+    /// BOTH sides of the marker law, so they move together, and asked PER GROUP so an emission
+    /// site cannot take one group's permission and mark another group's temp.
+    fn marks_arg(&self, gi: usize, v: ValueId) -> bool {
+        self.groups.get(gi).is_some_and(|g| g.args.iter().any(|(a, _)| *a == v))
+    }
+
+    /// Does the plan own a group at index `gi`? The `()` temp's permission — one per group, and
+    /// the group must exist.
+    fn marks_unit(&self, gi: usize) -> bool {
+        gi < self.groups.len()
+    }
+}
+
+/// Trust (lane SC, 2026-08-24): the STATEMENT-CALL SEQUENCE plan — see [`MfSeqCallPlan`] for the
+/// grammar, the measurement and every refusal.
+fn plan_seq_call_markers<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    func: &trust_ir::Function,
+) -> Option<MfSeqCallPlan> {
+    let groups = seq_call_groups(func)?;
+    // Trust (lane SC): the SOURCE side answers independently — the trust-ir cannot see a
+    // destructuring parameter's binding local, a tail expression, a non-`Semi` statement, or an
+    // argument expression that is not a bare place, and each of those mints markers this plan
+    // does not predict.
+    seq_call_source_admits(tcx, def, &groups)?;
+    Some(MfSeqCallPlan { groups, unit_late: false })
+}
+
+/// Trust (lane SC, 2026-08-24): the TRUST-IR half of [`plan_seq_call_markers`] — a TOTAL FUNCTION
+/// of the instruction stream, split out so the grammar's refusals are exercised by unit tests
+/// rather than only by the corpus. It reads no `TyCtxt` and answers no source question; the HIR
+/// half is [`seq_call_source_admits`] and the two must BOTH admit a body.
+fn seq_call_groups(func: &trust_ir::Function) -> Option<Vec<SeqCallGroup>> {
+    // The wave-MF firewall, unchanged: any lexical `let` scope puts the body outside every
+    // instruction-stream plan, because the scope table is what the instruction stream cannot see.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let [blk] = func.blocks.as_slice() else { return None };
+    let (term, body) = blk.body.split_last()?;
+    let Inst::Return { values } = &term.inst else { return None };
+    // The producer's unit convention: a value-less `Return`, which the `Return` arm spells as
+    // built's own `_0 = const ()`. A value-bearing return is a tail expression, not a statement
+    // sequence.
+    if !values.is_empty() {
+        return None;
+    }
+    // **THE N >= 2 GATE.** One call is lane S1F's `unit_stmt` class, which already flips; this
+    // plan must never reach it, and the refusal is here rather than at a later disagreement so
+    // that the two classes are disjoint on their own instruction COUNTS and not merely on their
+    // outcomes.
+    if body.len() < 2 {
+        return None;
+    }
+    let params: HashMap<ValueId, Ty> = blk.params.iter().cloned().collect();
+    let mut groups: Vec<SeqCallGroup> = Vec::with_capacity(body.len());
+    for (node, n) in body.iter().enumerate() {
+        let Inst::Call { args, .. } = &n.inst else { return None };
+        // A result-declaring call binds a value the statement discipline does not: built's
+        // destination temp is then read, and this plan has no marker model for that read.
+        if !n.results.is_empty() {
+            return None;
+        }
+        let mut g: Vec<(ValueId, Ty)> = Vec::with_capacity(args.len());
+        for a in args {
+            // Repeated WITHIN one call (`f(a, a)`): built mints TWO temps for one value and this
+            // plan names a slot by `(group, value)`, so the two would alpha-rename onto one
+            // another. ACROSS groups is the normal case and is exactly what the group index
+            // keeps apart.
+            if g.iter().any(|(v, _)| v == a) {
+                return None;
+            }
+            // Every argument is a BLOCK PARAMETER — `params.get` is what refuses a folded
+            // constant, an instruction result and anything else the preamble would have to carry.
+            let ty = params.get(a)?.clone();
+            g.push((*a, ty));
+        }
+        // A NULLARY call mints the `()` temp and then the call terminator, with NO assign between
+        // the two groups' markers — a position this plan has not measured. Refused rather than
+        // modelled, for the same reason `plan_call_fwd_markers` refuses an empty argument plan.
+        if g.is_empty() {
+            return None;
+        }
+        groups.push(SeqCallGroup { node, args: g });
+    }
+    Some(groups)
+}
+
+/// Trust (lane SC, 2026-08-24): the SOURCE-side half of the statement-call sequence plan — does
+/// the body's own HIR independently witness "N unit-typed `Semi` statements, each a call, each
+/// with one `as_temp` operand temp per argument, and NOTHING ELSE in the body that mints a
+/// marker"?
+///
+/// It is a sibling of [`call_fwd_source_admits`] and asks the same three questions that function
+/// asks — simple parameter bindings, a block whose statements this plan can account for, and a
+/// per-argument form — but it asks them of a LIST of statements rather than of one tail. What it
+/// deliberately does NOT inherit is that function's family of extensions: a `&str` literal, a
+/// field projection, an explicit `&p.0`, a post-op and a reborrowed return each carry their own
+/// measured retirement discipline, none of which has been measured INSIDE a sequence, so every
+/// argument here must answer [`CfForm::Bare`] and anything else refuses the whole body.
+fn seq_call_source_admits<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    groups: &[SeqCallGroup],
+) -> Option<()> {
+    let body = tcx.hir_maybe_body_owned_by(def)?;
+    if !hir_params_are_simple_bindings(body) {
+        return None;
+    }
+    let root = tcx.typeck_root_def_id(def.to_def_id()).as_local()?;
+    let typeck = tcx.typeck(root);
+    // The body must be a plain block with NO tail expression and exactly N non-item statements.
+    // A tail expression is wave-CF's grammar (its value is returned); an `unsafe`/`const` block
+    // is a different region shape; a `let` is the firewall the trust-ir side already refused, and
+    // refusing it again here is what makes the two derivations AGREE rather than one being
+    // assumed from the other.
+    let rustc_hir::ExprKind::Block(b, None) = body.value.kind else { return None };
+    if !matches!(b.rules, rustc_hir::BlockCheckMode::DefaultBlock) || b.expr.is_some() {
+        return None;
+    }
+    let stmts: Vec<&rustc_hir::Stmt<'tcx>> =
+        b.stmts.iter().filter(|s| !matches!(s.kind, rustc_hir::StmtKind::Item(_))).collect();
+    if stmts.len() != groups.len() {
+        return None;
+    }
+    for (s, g) in stmts.iter().zip(groups.iter()) {
+        // Each statement is `expr;` and its value is UNIT — which is why built mints the `()`
+        // temp for it at all (`rustc_mir_build::stmt_expr` sends the statement's value through
+        // `as_temp`). A `let`, an expression statement of non-unit type, or a trailing
+        // expression is a different shape.
+        let rustc_hir::StmtKind::Semi(e) = s.kind else { return None };
+        if !typeck.expr_ty(e).is_unit() {
+            return None;
+        }
+        // An ADJUSTMENT on the call itself is lane S1F's `ret_reborrow` shape — a destination
+        // temp with its own discipline — and is refused here rather than modelled.
+        if !typeck.expr_adjustments(e).is_empty() {
+            return None;
+        }
+        let exprs: Vec<&'tcx rustc_hir::Expr<'tcx>> = match e.kind {
+            rustc_hir::ExprKind::Call(callee, cargs) => {
+                // The callee must be a bare path to a fn item — a ZST constant, for which built
+                // mints no temp. Any other callee expression has temps of its own.
+                if !matches!(callee.kind, rustc_hir::ExprKind::Path(_))
+                    || !typeck.expr_adjustments(callee).is_empty()
+                {
+                    return None;
+                }
+                cargs.iter().collect()
+            }
+            // The receiver is argument 0, exactly as the producer spells it.
+            rustc_hir::ExprKind::MethodCall(_, recv, cargs, _) => {
+                std::iter::once(recv).chain(cargs.iter()).collect()
+            }
+            _ => return None,
+        };
+        if exprs.len() != g.args.len() {
+            return None;
+        }
+        // Every argument must be a BARE place — the one form whose built shape is the single
+        // `as_temp` temp this plan predicts. `call_fwd_arg_admits` is the SAME per-argument
+        // decision wave-CF makes, asked here so there is one implementation of it.
+        for x in exprs {
+            if call_fwd_arg_admits(typeck, x, CfArg::Place) != Some(CfForm::Bare) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Trust (lane G17, 2026-08-25): one ARGUMENT of one call in the DEEP UNIT CHAIN — the form
+/// built gives it, which is what decides whether it mints a local at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UcOperand {
+    /// A forwarded REFERENCE parameter: ONE temp `t = &[mut](*_p)`, opened AND assigned at its
+    /// evaluation point. Carries the parameter value and the producer's own annotation of it.
+    /// A parameter may appear here MORE THAN ONCE in a body — `|c| c.set(c.get() + 1)` passes
+    /// `c` to two different calls — and built mints a DIFFERENT temp for each, which is why the
+    /// slot is keyed by `(call index, operand index)` and never by the value.
+    Place(ValueId, Ty),
+    /// A folded SCALAR literal. Built spells it as an inline `const 1_u32` operand of the call
+    /// and mints NO local (measured verbatim, `probes/g17.rs` c4/c5/c8/c9:
+    /// `_5 = saturating_add(move _6, const 1_u64)`), so the plan mints no slot for it and the
+    /// walk skips it in both the opening and the retirement run.
+    Lit(ValueId),
+    /// The PRECEDING call's result. The temp IS that call's destination — opened at this
+    /// argument's evaluation point, written by that call's terminator, and retired at THIS
+    /// call's successor as this call's own argument temp (measured: `probes/g17.rs` c9's
+    /// `bb2: StorageDead(_6)` retires the `get` destination at the `saturating_add`
+    /// successor, not at `get`'s own).
+    Chain(ValueId),
+}
+
+/// Trust (lane G17, 2026-08-25): one call of the DEEP UNIT CHAIN.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UcCall {
+    /// The call's index in its block's body node list. The plan's calls are the body's calls in
+    /// body order, so this is `0..N`; it is RECORDED rather than assumed so that
+    /// [`predict_unit_chain`] can re-derive the same map from the instruction stream and refuse
+    /// a disagreement, exactly as [`SeqCallGroup::node`] is.
+    node: usize,
+    /// The arguments, in OPERAND order. At most one [`UcOperand::Chain`], and nothing but
+    /// [`UcOperand::Lit`] may follow it — see the grammar on [`MfUnitChainPlan`].
+    args: Vec<UcOperand>,
+    /// This call's single result, or `None` for the FINAL, result-less call.
+    result: Option<ValueId>,
+    /// The CALLEE's declared return type, read from the producer's own function-type table
+    /// (`Module::functions[callee].ty` -> `Module::func_types`), or `None` for the final call.
+    /// This is the annotation that lets the predicted side spell a SCALAR chain temp's type;
+    /// see the type note on [`MfUnitChainPlan`].
+    ret_ty: Option<Ty>,
+}
+
+/// Trust (lane G17, 2026-08-25): **THE DEEP UNIT-CHAIN MARKER PLAN** — the SEVENTEENTH
+/// whole-body claim, and the first whose call graph is a CHAIN OF DEPTH GREATER THAN TWO.
+///
+/// # The two bodies, and why no existing class reaches them
+///
+/// The residual `-O0`/`-O3` gap's last unmodelled all-call shape is `|c| c.set(c.get() + 1)`
+/// over a `Cell` — `env::decl_add::MmAxiomOnlyGuard::enter::{closure#0}` and
+/// `sorry::accounting::record_ay_reconstruction_success::{closure#0}`, the same source line
+/// twice at `u32` and `u64`. Their trust-ir, verbatim:
+///
+/// ```text
+/// bb0(%0: (), %1: ptr):
+///   %2 = call @get(%1)
+///   %3 = const u32 1
+///   %4 = call @sat_add(%2, %3)
+///   call @set(%1, %4)          ; NO result
+///   ret                        ; NO value
+/// ```
+///
+/// Wave-WB8's chain-forward class is the nearest, and it refuses this on FOUR independent
+/// lines, each measured on its own control in `probes/g17.rs` through the sealed CONTROL
+/// driver:
+///
+///   * **`Inst::Const` in the body** — WB8's "NOTHING BUT CALLS" clause. (Control `c3`.)
+///   * **depth > 2** — WB8 requires every inner result to be an argument of the FINAL call;
+///     here `%2` feeds `%4`, another inner call. (Control `c1`.)
+///   * **a REPEATED parameter** — WB8 names temps BY value and refuses `uses[a] != 1`; `%1`
+///     is passed to both `get` and `set`. (Control `c2`.)
+///   * **a SCALAR by-value chain result** — `chain_fwd_source_admits` refuses one outright,
+///     because WB8's predicted side spells every chain local [`mf_gate::MfTy::Opaque`] and a
+///     scalar-typed emitter local would fail the LAW closed. That clause refuses even WB8's
+///     OWN two-call unit shape (`sink(inner(a))`, control `c0`, `markers_exact` FALSE today).
+///
+/// Widening WB8 by four clauses would move a class four `clean-kernel` bodies flip through
+/// today. This is a SEPARATE class for that reason and for lane SC's: `plan_chain_fwd_markers`
+/// is not edited, and its plan, its predicted walk and its emission sites are byte-identical to
+/// what they were.
+///
+/// # The grammar
+///
+/// One block, no lexical `let` scope, N >= 2 body nodes before a VALUE-LESS `Inst::Return`,
+/// each node either an `Inst::Const` or an `Inst::Call`; the LAST node is a call that declares
+/// NO result; every earlier call declares EXACTLY ONE result, which is used EXACTLY ONCE, as an
+/// argument of the IMMEDIATELY FOLLOWING call — a STRICT LINEAR CHAIN. Every `Inst::Const`
+/// result is used exactly once, as an argument of some call. Every remaining argument is a
+/// BLOCK PARAMETER of pointer type (repeats allowed ACROSS calls, refused WITHIN one). Nothing
+/// but literals may follow the chain argument in a call's operand list — see the ordering note
+/// below. And, independently witnessed by the HIR, a body that is exactly ONE nested call
+/// expression, as a `Semi` statement or as a tail expression.
+///
+/// # What built does with it, measured verbatim
+///
+/// `-Zdump-mir=built` through the sealed CONTROL driver on `probes/g17.rs::c9::{closure#0}`
+/// (`|c| { c.set(c.get().saturating_add(1)); }`, the `Semi` spelling — the corpus body's own
+/// trust-ir, node for node, 8 canonical lines and the same first marker divergence):
+///
+/// ```text
+/// bb0: StorageLive(_3);                      // the STATEMENT's `()` temp, FIRST
+///      StorageLive(_4); _4 = &(*_2);         // the FINAL call's operand 0
+///      StorageLive(_5);                      // the FINAL call's operand 1 = sat_add's dest
+///      StorageLive(_6);                      // sat_add's operand 0 = get's dest
+///      StorageLive(_7); _7 = &(*_2);         // get's operand 0
+///      _6 = Cell::<u64>::get(move _7) -> bb1;
+/// bb1: StorageDead(_7);
+///      _5 = saturating_add(move _6, const 1_u64) -> bb2;
+/// bb2: StorageDead(_6);
+///      _3 = Cell::<u64>::set(move _4, move _5) -> bb3;
+/// bb3: StorageDead(_5); StorageDead(_4); StorageDead(_3); _0 = const (); return;
+/// ```
+///
+/// So the discipline is a plain LIFO region walk, and it is stated once here because both sides
+/// of the marker law read it from this one plan:
+///
+///   1. The block-0 opening run is the OUTERMOST call's operand list walked left to right, with
+///      the chain operand replaced by a descent into the call that produces it — so the temps
+///      appear in the order `call N-1`'s operands, then `call N-2`'s, down to `call 0`'s. A
+///      `Place` operand is opened AND assigned at its own position; a `Lit` mints nothing; a
+///      `Chain` operand opens one temp (the inner call's destination) and nothing else.
+///   2. Call `k`'s terminator ends MIR block `k`; its successor is MIR block `k + 1`.
+///   3. At block `k + 1`, call `k`'s OWN argument temps retire in REVERSE operand order.
+///   4. At block `N` — the final call's successor — the final call's argument temps retire
+///      first (rule 3), and THEN the statement's `()` temp, after which the unit body's own
+///      `_0 = const ()` follows (one assign AFTER every marker, so it moves nothing).
+///
+/// The TAIL-EXPRESSION spelling (`probes/g17.rs::c8::{closure#0}`, and the corpus's
+/// `MmAxiomOnlyGuard::enter::{closure#0}`) differs in EXACTLY ONE thing: there is no statement
+/// `()` temp, and the final call writes `_0` directly. Eight marker lines instead of ten, and
+/// the plan carries the difference as one bit (`unit_stmt`), derived on the SOURCE side, which
+/// is the only side that can see a semicolon.
+///
+/// # The ordering restriction, and why it is not free
+///
+/// A `Place` operand AFTER the chain operand would have its temp opened in a LATER MIR block
+/// (built evaluates operands in order, and the inner call has already split the block by then)
+/// — a "delayed" discipline this lane has not measured. Both corpus bodies put the chain
+/// operand last among the temp-minting operands, so the restriction costs nothing here and is
+/// refused rather than modelled.
+///
+/// # The slot type, from the producer's own annotation
+///
+/// A chain temp here is SCALAR-typed (`u32`, `u64` — the counters), so the predicted side
+/// cannot spell it `Opaque` the way wave-WB8 does. `Inst::Call` carries no result annotation,
+/// but the CALLEE's declaration does: `Module::func_types[Module::functions[callee].ty]`
+/// `.returns[0]`, tokenized by `ir_ty_token` exactly as a block parameter's annotation is —
+/// the same move lane S3 makes with `Module::struct_def`. The observed side tokenizes the
+/// FINISHED body's `local_decls`, so the two sides still derive the type from different places,
+/// and a callee whose declared return is absent, plural or non-scalar refuses the plan.
+///
+/// # What is refused, and why each refusal is not free
+///
+///   * N < 2 — one call is wave-CF's class, which already flips.
+///   * A value-bearing `Return`, or a FINAL call that declares a result: built then binds the
+///     result and the body is not the statement discipline this plan measured.
+///   * An interior call that declares no result, or more than one: the first is lane SC's
+///     statement-sequence class, the second is not a chain.
+///   * A chain result used anywhere but the IMMEDIATELY following call, or used twice.
+///   * A `Const` whose result is unused, or used twice, or used by no call.
+///   * An argument that is neither a chain result, a `Const` result, nor a block parameter of
+///     `Ty::Ptr`; a parameter repeated WITHIN one call (built mints two temps for one value and
+///     a `(call, operand)` key would still name both, but the SOURCE side cannot tell the two
+///     apart, so it is refused rather than modelled); a nullary call.
+///   * A `Place` operand after the chain operand (the ordering note above).
+///   * Any body whose SOURCE form does not independently witness one nested call expression
+///     with the same per-argument forms — see [`unit_chain_source_admits`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfUnitChainPlan {
+    /// The calls, in body order. Length >= 2; the LAST is the final, result-less call.
+    calls: Vec<UcCall>,
+    /// Does built mint the statement's `()` temp? True for the `Semi` spelling, false for the
+    /// tail-expression spelling. Derived on the SOURCE side — the trust-ir cannot see a
+    /// semicolon — exactly as lane S1F's `unit_stmt` is.
+    unit_stmt: bool,
+    /// Trust (lane G17): [`super::SatPerturb::UcUnitLate`] — open the statement's `()` temp
+    /// AFTER every argument temp instead of before them, on BOTH sides of the marker law at
+    /// once (the plan carries the bit, so [`predict_unit_chain`] and the emitter's own site read
+    /// ONE decision). The law stays green and only the ORACLE
+    /// (`mir_differential::canon_markers` against built) can reject the result — the same design
+    /// as `cf-unit-late` and `seq-unit-late`, which it is the deep-chain sibling of. Set only in
+    /// [`MfPlans::seal`], only under the flag, and only when a `()` temp really exists to move.
+    unit_late: bool,
+}
+
+impl MfUnitChainPlan {
+    /// The call standing at body node `node`, with its index — the emitter's own question, asked
+    /// of the sealed plan rather than recomputed from the instruction stream.
+    fn call_at(&self, node: usize) -> Option<(usize, &UcCall)> {
+        self.calls.iter().position(|c| c.node == node).map(|k| (k, &self.calls[k]))
+    }
+
+    /// Does built materialise a marker-carrying temp for operand `pos` of call `ci`? Asked by
+    /// BOTH sides of the marker law, so they move together, and asked PER (call, operand) so an
+    /// emission site cannot take one call's permission and mark another call's temp — the
+    /// reason [`MfSlot::SeqArg`] carries a group index, one class further along.
+    fn marks_arg(&self, ci: usize, pos: usize) -> bool {
+        self.calls
+            .get(ci)
+            .and_then(|c| c.args.get(pos))
+            .is_some_and(|a| !matches!(a, UcOperand::Lit(_)))
+    }
+
+    /// Does the plan own the statement's `()` temp at all? The unit temp's permission — one per
+    /// body, and only in the `Semi` spelling.
+    fn marks_unit(&self) -> bool {
+        self.unit_stmt
+    }
+}
+
+/// Trust (lane G17, 2026-08-25): the TRUST-IR half of [`plan_unit_chain_markers`] — a TOTAL
+/// FUNCTION of the instruction stream and the producer's own callee-result annotation, split out
+/// so the
+/// grammar's refusals are exercised by unit tests rather than only by the corpus. It reads no
+/// `TyCtxt` and answers no source question; the HIR half is [`unit_chain_source_admits`] and the
+/// two must BOTH admit a body.
+fn unit_chain_calls(
+    func: &trust_ir::Function,
+    callee_ret: &dyn Fn(trust_ir::FuncId) -> Option<Ty>,
+) -> Option<Vec<UcCall>> {
+    // The wave-MF firewall, unchanged: any lexical `let` scope puts the body outside every
+    // instruction-stream plan, because the scope table is what the instruction stream cannot see.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let [blk] = func.blocks.as_slice() else { return None };
+    let (term, body) = blk.body.split_last()?;
+    let Inst::Return { values } = &term.inst else { return None };
+    // The producer's unit convention: a value-less `Return`, which the `Return` arm spells as
+    // built's own `_0 = const ()`. A value-bearing return is a different destination discipline.
+    if !values.is_empty() {
+        return None;
+    }
+    let params: HashMap<ValueId, Ty> = blk.params.iter().cloned().collect();
+    // ONE census of the whole body first: what defines each value, and how many times each is
+    // used. Both refusals below are stated against it rather than against a partial walk.
+    let mut consts: HashMap<ValueId, Ty> = HashMap::new();
+    let mut call_ix: Vec<usize> = Vec::new();
+    for (i, n) in body.iter().enumerate() {
+        match &n.inst {
+            Inst::Call { .. } => call_ix.push(i),
+            Inst::Const { ty, .. } => {
+                let &[r] = n.results.as_slice() else { return None };
+                // A scalar literal only: built folds one into the call operand and mints no
+                // local. A `&str` literal is wave-CF-STR's TWO-local shape and an aggregate
+                // constant is lane S3's; neither is modelled here.
+                if !SCALAR_CANDS.contains(ty) {
+                    return None;
+                }
+                if consts.insert(r, ty.clone()).is_some() {
+                    return None;
+                }
+            }
+            // Anything else is a statement shape this walk does not model.
+            _ => return None,
+        }
+    }
+    // The calls must be the body's nodes in body order with nothing between them but the
+    // literals they consume, and there must be at least TWO: one call is wave-CF's class.
+    if call_ix.len() < 2 {
+        return None;
+    }
+    // The LAST body node is the FINAL call — a `Const` after it would be a value nothing reads.
+    if call_ix.last().copied() != Some(body.len() - 1) {
+        return None;
+    }
+    let mut uses: HashMap<ValueId, u32> = HashMap::new();
+    for n in body {
+        let Inst::Call { args, .. } = &n.inst else { continue };
+        for a in args {
+            *uses.entry(*a).or_insert(0) += 1;
+        }
+    }
+    // Every literal is consumed EXACTLY ONCE, by a call. A literal used twice would be one
+    // `Inst::Const` behind two inline operands, which built spells the same way — but a literal
+    // used ZERO times is a node this walk emits nothing for and the model would be one node
+    // short of the body.
+    if consts.keys().any(|c| uses.get(c).copied() != Some(1)) {
+        return None;
+    }
+    let mut calls: Vec<UcCall> = Vec::with_capacity(call_ix.len());
+    for (k, &node) in call_ix.iter().enumerate() {
+        let n = &body[node];
+        let Inst::Call { callee, args } = &n.inst else { return None };
+        let last = k + 1 == call_ix.len();
+        // The FINAL call declares NO result; every earlier call declares EXACTLY ONE, which is
+        // the chain link. A result-less interior call is lane SC's statement-sequence class.
+        let result = match (last, n.results.as_slice()) {
+            (true, []) => None,
+            (false, &[r]) => Some(r),
+            _ => return None,
+        };
+        // The chain link is used EXACTLY ONCE, and by the IMMEDIATELY following call — the
+        // strict linearity that makes the opening run a single descent.
+        if let Some(r) = result {
+            if uses.get(&r).copied() != Some(1) {
+                return None;
+            }
+            let next = &body[call_ix[k + 1]];
+            let Inst::Call { args: nargs, .. } = &next.inst else { return None };
+            if !nargs.contains(&r) {
+                return None;
+            }
+        }
+        let prev_result = if k == 0 { None } else { calls[k - 1].result };
+        let mut ops: Vec<UcOperand> = Vec::with_capacity(args.len());
+        let mut seen_chain = false;
+        let mut seen_params: Vec<ValueId> = Vec::new();
+        for a in args {
+            if Some(*a) == prev_result {
+                // At most ONE chain operand per call: the previous result is used once, which
+                // the census above already established, so a second occurrence is impossible —
+                // and refusing it here keeps the walk total rather than relying on that.
+                if seen_chain {
+                    return None;
+                }
+                seen_chain = true;
+                ops.push(UcOperand::Chain(*a));
+                continue;
+            }
+            if consts.contains_key(a) {
+                ops.push(UcOperand::Lit(*a));
+                continue;
+            }
+            let ty = params.get(a)?.clone();
+            // A REFERENCE parameter only: the emitter's per-argument model is the reborrow
+            // `t = &[mut](*_p)`, so a by-value parameter here is an unmeasured shape.
+            if !matches!(ty, Ty::Ptr) {
+                return None;
+            }
+            // Repeated WITHIN one call (`f(a, a)`): built mints TWO temps for one value and the
+            // SOURCE side sees two identical argument expressions it cannot tell apart. ACROSS
+            // calls is the normal case here and is exactly what the call index keeps apart.
+            if seen_params.contains(a) {
+                return None;
+            }
+            seen_params.push(*a);
+            // A `Place` operand AFTER the chain operand would open its temp in a later MIR
+            // block — the delayed discipline this plan has not measured.
+            if seen_chain {
+                return None;
+            }
+            ops.push(UcOperand::Place(*a, ty));
+        }
+        // A NULLARY call mints no operand temp at all, a position this plan has not measured;
+        // and every non-final call must really carry the chain link it was told it has.
+        if ops.is_empty() || (k > 0 && !seen_chain) {
+            return None;
+        }
+        // The callee's DECLARED return type, from the producer's own function-type table. The
+        // final call returns unit and needs none; every other call's result is a marked temp and
+        // its type is what the predicted side spells.
+        let ret_ty = if last {
+            None
+        } else {
+            let t = callee_ret(*callee)?;
+            if !SCALAR_CANDS.contains(&t) {
+                return None;
+            }
+            Some(t)
+        };
+        calls.push(UcCall { node, args: ops, result, ret_ty });
+    }
+    Some(calls)
+}
+
+/// Trust (lane G17, 2026-08-25): the CALLEE's result type, from the PRODUCER's own callee ledger
+/// — the one annotation that lets the predicted side spell a SCALAR chain temp's type without
+/// reading rustc's answer (see the type note on [`MfUnitChainPlan`]).
+///
+/// **IT IS THE LEDGER AND NOT THE MODULE, AND THAT IS MEASURED.** The obvious source is the
+/// callee's declared `FuncTy` in the body's module, the way lane S3 reads its field types from
+/// `Module::struct_def`. It does not exist there: [`MfPlans::seal`] is handed the body's OWN
+/// module, whose callee DECLARATIONS get their signature only at CRATE ASSEMBLY, so every
+/// per-body lookup answers `None` — by position AND through
+/// [`trust_ir::Module::function_by_id`]. This lane sealed and measured TWO whole-crate drivers on
+/// that route before the ledger was found: both NULL, `+0` at either level, `coverage_O3` sha256
+/// byte-identical to the control, every unit test green. The ledger is where the producer records
+/// it: [`crate::CalleeRef::ret_ty`] is "the RESULT type this crate's call sites actually bind from
+/// this callee", observed AT THE SITE and deliberately not re-derived from the callee's rustc
+/// signature — which is exactly the independence this side needs, since [`observe`] reads the
+/// finished body's `local_decls`.
+///
+/// Fail-closed at every step: no ledger entry, a poisoned (`ret_ty_conflict`) entry, an entry with
+/// no recorded type, two entries for one `FuncId` that disagree, or a type outside the sixteen
+/// body scalars all answer `None` and refuse the plan — no plan, no marker, today's flip kept.
+fn unit_chain_callee_ret(callees: &[CalleeRef], id: trust_ir::FuncId) -> Option<Ty> {
+    let mut found: Option<&Ty> = None;
+    for c in callees.iter().filter(|c| c.func_id == id) {
+        if c.ret_ty_conflict {
+            return None;
+        }
+        let t = c.ret_ty.as_ref()?;
+        match found {
+            None => found = Some(t),
+            Some(prev) if prev == t => {}
+            Some(_) => return None,
+        }
+    }
+    found.cloned()
+}
+
+/// Trust (lane G17, 2026-08-25): the DEEP UNIT-CHAIN plan — see [`MfUnitChainPlan`] for the
+/// grammar, the measurement and every refusal.
+fn plan_unit_chain_markers<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    func: &trust_ir::Function,
+    callees: &[CalleeRef],
+) -> Option<MfUnitChainPlan> {
+    let calls = unit_chain_calls(func, &|id| unit_chain_callee_ret(callees, id))?;
+    // Trust (lane G17): the SOURCE side answers independently — the trust-ir cannot see a
+    // destructuring parameter's binding local, a semicolon, a second statement, or an argument
+    // expression that is not a bare place or a folded literal, and each of those mints markers
+    // this plan does not predict. It alone decides `unit_stmt`.
+    let unit_stmt = unit_chain_source_admits(tcx, def, &calls)?;
+    Some(MfUnitChainPlan { calls, unit_stmt, unit_late: false })
+}
+
+/// Trust (lane G17, 2026-08-25): the SOURCE-side half of the deep unit-chain plan — does the
+/// body's own HIR independently witness "ONE nested call expression, each argument a bare place
+/// or a folded scalar literal, and NOTHING ELSE in the body that mints a marker"? Returns the
+/// `unit_stmt` bit (true for the `Semi` spelling), or `None` for any body outside the shape.
+///
+/// It is a sibling of [`seq_call_source_admits`] and asks the same questions that function asks
+/// — simple parameter bindings, a block this plan can account for, and a per-argument form — but
+/// it asks them of a NEST rather than of a list, walking the expression tree from the outermost
+/// call inward in lockstep with the plan's calls in REVERSE body order. What it deliberately
+/// does not inherit is wave-CF's family of extensions: a `&str` literal, a field projection, an
+/// explicit `&p.0` and a post-op each carry their own built spelling and their own retirement
+/// discipline, and a MIX of two measured disciplines in one body is refused rather than modelled.
+fn unit_chain_source_admits<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    calls: &[UcCall],
+) -> Option<bool> {
+    let body = tcx.hir_maybe_body_owned_by(def)?;
+    if !hir_params_are_simple_bindings(body) {
+        return None;
+    }
+    let root = tcx.typeck_root_def_id(def.to_def_id()).as_local()?;
+    let typeck = tcx.typeck(root);
+    // The body is either a block with ONE `Semi` statement and no tail (built mints the
+    // statement's `()` temp), or a block whose only content is a tail expression (it does not),
+    // or the bare expression. An `unsafe`/`const` block is a different region shape and a `let`
+    // is the firewall the trust-ir side already refused; refusing both again here is what makes
+    // the two derivations AGREE rather than one being assumed from the other.
+    let (tail, unit_stmt) = match body.value.kind {
+        rustc_hir::ExprKind::Block(b, None) => {
+            if !matches!(b.rules, rustc_hir::BlockCheckMode::DefaultBlock) {
+                return None;
+            }
+            let stmts: Vec<&rustc_hir::Stmt<'tcx>> = b
+                .stmts
+                .iter()
+                .filter(|s| !matches!(s.kind, rustc_hir::StmtKind::Item(_)))
+                .collect();
+            match (stmts.as_slice(), b.expr) {
+                ([], Some(e)) => (e, false),
+                ([s], None) => {
+                    let rustc_hir::StmtKind::Semi(e) = s.kind else { return None };
+                    // The statement's value is UNIT — which is why built mints the `()` temp for
+                    // it at all (`rustc_mir_build::stmt_expr` sends it through `as_temp`).
+                    if !typeck.expr_ty(e).is_unit() {
+                        return None;
+                    }
+                    (e, true)
+                }
+                _ => return None,
+            }
+        }
+        _ => (body.value, false),
+    };
+    // Walk the nest from the OUTERMOST call inward: the plan's calls in reverse body order.
+    let mut e = tail;
+    for (k, c) in calls.iter().enumerate().rev() {
+        // An adjustment on the call itself (an autoderef of the result, a coercion) is a temp
+        // this plan does not model — lane S1F's `ret_reborrow` shape, refused rather than mixed.
+        if !typeck.expr_adjustments(e).is_empty() {
+            return None;
+        }
+        let exprs: Vec<&'tcx rustc_hir::Expr<'tcx>> = match e.kind {
+            rustc_hir::ExprKind::Call(callee, cargs) => {
+                // The callee must be a bare path to a fn item — a ZST constant, for which built
+                // mints no temp. Any other callee expression has temps of its own.
+                if !matches!(callee.kind, rustc_hir::ExprKind::Path(_))
+                    || !typeck.expr_adjustments(callee).is_empty()
+                {
+                    return None;
+                }
+                cargs.iter().collect()
+            }
+            // The receiver is argument 0, exactly as the producer spells it.
+            rustc_hir::ExprKind::MethodCall(_, recv, cargs, _) => {
+                std::iter::once(recv).chain(cargs.iter()).collect()
+            }
+            _ => return None,
+        };
+        if exprs.len() != c.args.len() {
+            return None;
+        }
+        let mut inner: Option<&'tcx rustc_hir::Expr<'tcx>> = None;
+        for (x, op) in exprs.into_iter().zip(c.args.iter()) {
+            match op {
+                // A BARE place — the one form whose built shape is the single `as_temp` temp
+                // this plan predicts. `call_fwd_arg_admits` is the SAME per-argument decision
+                // wave-CF makes, asked here so there is one implementation of it.
+                UcOperand::Place(..) => {
+                    if call_fwd_arg_admits(typeck, x, CfArg::Place) != Some(CfForm::Bare) {
+                        return None;
+                    }
+                }
+                // A FOLDED scalar literal — adjustment-free, non-`&str`, no local at all.
+                UcOperand::Lit(_) => {
+                    if call_fwd_arg_admits(typeck, x, CfArg::Folded) != Some(CfForm::Folded) {
+                        return None;
+                    }
+                }
+                // The chain: this argument must BE the next call inward, and there is exactly
+                // one of them (the trust-ir side already refused a second).
+                UcOperand::Chain(_) => {
+                    if inner.replace(x).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        e = match inner {
+            Some(x) => x,
+            // Only the INNERMOST call has no chain argument, and it is the last one walked.
+            None => return (k == 0).then_some(unit_stmt),
+        };
+    }
+    None
+}
+
+/// Trust (wave-WB8, 2026-08-21): one FINAL-call argument slot of the CHAIN-FORWARD plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChainSlot {
+    /// A forwarded parameter place: ONE argument temp (`t = &[mut](*_p)` for a reference,
+    /// `t = copy _p` for a by-value scalar), opened and assigned at its evaluation point.
+    Place(ValueId, Ty),
+    /// An inner call's BY-VALUE result: the final argument temp IS the inner call's
+    /// destination (measured, `-Zdump-mir=built`, probes/em3.rs `Co::needs_recheck`:
+    /// `StorageLive(_2); StorageLive(_3); _3 = &(*_1); _2 = trust(move _3)` — `_2` is both
+    /// the inner call's dest and the outer call's argument temp).
+    ByValue(ValueId),
+    /// An inner call's REFERENCE result: TWO locals — the outer argument temp `t` opened
+    /// BEFORE the inner call, the in-transit destination `u` after it, bridged by built's
+    /// reborrow `t = &(*u)` at position 0 of the inner call's SUCCESSOR block (measured,
+    /// probes/em3.rs `Ax::fmt`: `_4 = &(*_5); StorageDead(_6)` at the successor entry).
+    Reborrow(ValueId),
+}
+
+/// Trust (wave-WB8, 2026-08-21): **THE CHAIN-FORWARD MARKER PLAN** — the eleventh whole-body
+/// claim: a single-block body of NOTHING BUT CALLS, each inner call's single result feeding
+/// the FINAL call, whose own result is routed to `_0`. This is the wall-B chain family the
+/// wave-EM measurement deferred (`data/crystal_cf_str_emission_2026-08-21.json`,
+/// `wb8_chain_shapes` S1): `ConstantOrigin::needs_recheck`, `<LevelArc as PartialEq>::eq`,
+/// `<AxiomId as Display>::fmt`, `<CleanMode as Display>::fmt` — four of the five;
+/// `<LevelArc as Debug>::fmt`'s explicit `&**self` spelling mints a THREE-local chain with
+/// a different successor discipline and is refused at [`chain_inner_admits`], measured not
+/// assumed (probes/em3.rs d3).
+///
+/// # The LIFO-region model, measured
+///
+/// `-Zdump-mir=built` on `probes/em3.rs` (d1/d2/d3/d4 — the REAL source spellings, isolated
+/// on custom types), one discipline in all of them:
+///
+///   1. The final call's arguments are evaluated LEFT TO RIGHT; a Place slot's temp is
+///      opened-and-assigned at its evaluation point, a chain slot's locals are opened at its
+///      evaluation point and the inner call splits the block there.
+///   2. A BY-VALUE chain result's temp doubles as the inner call's destination; a REFERENCE
+///      chain result takes the two-local in-transit shape, its reborrow assigned at position
+///      0 of the inner call's successor.
+///   3. Each inner call's own argument temps are retired at the entry of ITS successor —
+///      after the reborrow assign when there is one — in reverse operand order (LIFO).
+///   4. The FINAL retirement, at the entry of the final call's successor: the final
+///      argument temps in REVERSE slot order, then the in-transit locals in REVERSE
+///      creation order.
+///
+/// # What is refused, and why each refusal is not free
+///
+///   * Any instruction that is not an `Inst::Call` (or the `Return`): a constant, a load, an
+///     insertfield — each mints (or folds into) a statement this walk does not model.
+///   * A body with fewer than two calls — the one-call tail-forward is wave-CF's class, and
+///     the two must not both claim one body.
+///   * An inner result consumed anywhere but the FINAL call's argument list (depth > 2), or
+///     consumed more than once, or an inner call with more than one result.
+///   * A repeated parameter anywhere in the body — the plan names temps BY value.
+///   * Inner calls whose SSA order is not the final call's left-to-right argument order —
+///     built evaluates the final call's arguments in order, so an out-of-order producer
+///     spelling has a marker sequence this plan does not model.
+///   * Any body whose SOURCE form does not independently witness the same shape — see
+///     [`chain_fwd_source_admits`]. The reborrow-vs-by-value split is derived THERE, from
+///     the typeck adjustments that make built mint the second local; the trust-ir is silent
+///     on it, and a wrong bit costs `markers_exact` (the oracle compares against built) and
+///     the `-O` flip — never a wrong body (`derived_mir: agreed` is checked independently).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfChainFwdPlan {
+    /// The FINAL call's argument slots, in operand order. At least one chain slot.
+    slots: Vec<ChainSlot>,
+    /// Per inner call, in SSA (= final-argument) order: `(body node index, its own place
+    /// arguments in operand order)`.
+    inners: Vec<(usize, Vec<(ValueId, Ty)>)>,
+    /// The FINAL call's body-node index.
+    final_node: usize,
+    /// Trust (wave-WB8): [`super::SatPerturb::ChainRetOrder`] — swap the FINAL retirement's
+    /// two runs (in-transit locals before argument temps), on BOTH sides of the marker law
+    /// at once (the bit rides the sealed plan, so `predict_chain_fwd` and the emitter read
+    /// ONE decision). The law stays green and only the ORACLE can reject the sequence — the
+    /// `cf-lit-order`/`mc-plan` design. Set only in [`MfPlans::seal`], only under the flag,
+    /// and only when the plan really carries an in-transit local to displace.
+    ret_swap: bool,
+}
+
+impl MfChainFwdPlan {
+    /// Is `v` a FINAL argument slot's temp value — a Place slot's parameter or a chain
+    /// slot's inner result (whose temp is the outer argument temp)?
+    fn marks_arg(&self, v: ValueId) -> bool {
+        self.slots.iter().any(|s| match s {
+            ChainSlot::Place(a, _) | ChainSlot::ByValue(a) | ChainSlot::Reborrow(a) => *a == v,
+        })
+    }
+
+    /// Is `v` a Reborrow slot's inner result — the value whose in-transit destination local
+    /// carries its own marker pair?
+    fn marks_transit(&self, v: ValueId) -> bool {
+        self.slots.iter().any(|s| matches!(s, ChainSlot::Reborrow(a) if *a == v))
+    }
+
+    /// Is `v` one of an inner call's own place arguments?
+    fn marks_inner_arg(&self, v: ValueId) -> bool {
+        self.inners.iter().any(|(_, args)| args.iter().any(|(a, _)| *a == v))
+    }
+}
+
+/// Trust (wave-WB8): the SOURCE-side skeleton of one FINAL-call argument, handed to
+/// [`chain_fwd_source_admits`] so the HIR and the trust-ir must AGREE on the shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainArgSkel {
+    /// A parameter path: one temp.
+    Place,
+    /// An inner call with this many place arguments of its own.
+    Chain { n_args: usize },
+}
+
+fn plan_chain_fwd_markers<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    func: &trust_ir::Function,
+) -> Option<MfChainFwdPlan> {
+    // The wave-MF firewall, unchanged: any lexical `let` scope is out.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let [blk] = func.blocks.as_slice() else { return None };
+    let (term, body) = blk.body.split_last()?;
+    let Inst::Return { values } = &term.inst else { return None };
+    // NOTHING BUT CALLS: any other instruction is a statement shape this plan does not model.
+    if body.iter().any(|n| !matches!(n.inst, Inst::Call { .. })) {
+        return None;
+    }
+    // At least two calls: the one-call tail-forward is wave-CF's class.
+    if body.len() < 2 {
+        return None;
+    }
+    let (fin, inners_ir) = body.split_last()?;
+    let final_node = body.len() - 1;
+    let Inst::Call { args: fin_args, .. } = &fin.inst else { return None };
+    // The final call's result IS the returned value, or both are unit — the routed form,
+    // which is what puts every final retirement at position 0 of the successor.
+    match (fin.results.as_slice(), values.as_slice()) {
+        ([], []) => {}
+        (&[r], &[v]) if r == v => {}
+        _ => return None,
+    }
+    let params: HashMap<ValueId, Ty> = blk.params.iter().cloned().collect();
+    // Every parameter is used AT MOST ONCE in the whole body, and every inner result EXACTLY
+    // once, as a FINAL argument. One census, then the per-slot classification below.
+    let mut uses: HashMap<ValueId, u32> = HashMap::new();
+    for n in body {
+        let Inst::Call { args, .. } = &n.inst else { return None };
+        for a in args {
+            *uses.entry(*a).or_insert(0) += 1;
+        }
+    }
+    for v in values {
+        *uses.entry(*v).or_insert(0) += 1;
+    }
+    let mut inners: Vec<(usize, Vec<(ValueId, Ty)>)> = Vec::new();
+    let mut inner_results: Vec<ValueId> = Vec::new();
+    for (i, n) in inners_ir.iter().enumerate() {
+        let Inst::Call { args, .. } = &n.inst else { return None };
+        let &[r] = n.results.as_slice() else { return None };
+        // The inner result: used exactly once, and that use is a FINAL argument.
+        if uses.get(&r).copied() != Some(1) || !fin_args.contains(&r) {
+            return None;
+        }
+        let mut iargs: Vec<(ValueId, Ty)> = Vec::new();
+        for a in args {
+            // Inner calls take PARAMETER places only (depth two, the measured class) — and
+            // only REFERENCE parameters (`Ty::Ptr`): the emitter's per-argument model is the
+            // reborrow `w = &[mut](*_p)`, so a by-value parameter here is an unmeasured shape
+            // and refuses the whole plan (a plan that admitted it would unsup at emission and
+            // LOSE the flip the body has today).
+            let t = params.get(a)?.clone();
+            if !matches!(t, Ty::Ptr) || uses.get(a).copied() != Some(1) {
+                return None;
+            }
+            iargs.push((*a, t));
+        }
+        inner_results.push(r);
+        inners.push((i, iargs));
+    }
+    // The final call's slots, and the SSA-order == argument-order rule.
+    let mut slots: Vec<ChainSlot> = Vec::new();
+    let mut skel: Vec<ChainArgSkel> = Vec::new();
+    let mut chain_seen = 0usize;
+    for a in fin_args {
+        if let Some(k) = inner_results.iter().position(|r| r == a) {
+            // Inner calls appear as final arguments in their own SSA order.
+            if k != chain_seen {
+                return None;
+            }
+            chain_seen += 1;
+            // The slot's reborrow bit is decided by the SOURCE side below; seed ByValue and
+            // patch after — the skeleton is what both sides must agree on.
+            slots.push(ChainSlot::ByValue(*a));
+            skel.push(ChainArgSkel::Chain { n_args: inners[k].1.len() });
+            continue;
+        }
+        let t = params.get(a)?.clone();
+        // A Place slot must be a REFERENCE parameter, for the emitter-model reason above.
+        if !matches!(t, Ty::Ptr) || uses.get(a).copied() != Some(1) {
+            return None;
+        }
+        if slots.iter().any(|s| matches!(s, ChainSlot::Place(v, _) if v == a)) {
+            return None;
+        }
+        slots.push(ChainSlot::Place(*a, t));
+        skel.push(ChainArgSkel::Place);
+    }
+    // Every inner call was consumed by the final argument list.
+    if chain_seen != inners.len() || inners.is_empty() {
+        return None;
+    }
+    // THE SOURCE SIDE: the HIR must independently witness the same skeleton, and it alone
+    // decides each chain slot's reborrow bit (the adjustment that makes built mint the
+    // second local). `None` is a shape outside the measured spellings — no plan, no marker.
+    let rebs = chain_fwd_source_admits(tcx, def, &skel)?;
+    if rebs.len() != inners.len() {
+        return None;
+    }
+    let mut k = 0usize;
+    for s in slots.iter_mut() {
+        if let ChainSlot::ByValue(a) = s {
+            if rebs[k] {
+                *s = ChainSlot::Reborrow(*a);
+            }
+            k += 1;
+        }
+    }
+    Some(MfChainFwdPlan { slots, inners, final_node, ret_swap: false })
+}
+
+/// Trust (wave-WB8): the SOURCE-side half of the chain-forward plan. Returns the reborrow
+/// bit per chain slot (in slot order), or `None` for any body whose HIR does not
+/// independently witness the trust-ir's skeleton.
+///
+/// The reborrow bit is the one fact the trust-ir cannot carry: built mints the SECOND local
+/// exactly when the argument expression's recorded adjustments reborrow the inner call's
+/// reference result (`[Deref(Builtin), Borrow(Ref(Not))]` on a bare call argument, the
+/// autoref `[Borrow(Ref(Not))]` of an overloaded-binop operand, or an explicit `&**self`
+/// borrow). A wrong bit is fail-safe: the oracle compares the derived marker sequence
+/// against built's and refuses `markers_exact`, exactly today's state.
+fn chain_fwd_source_admits<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    skel: &[ChainArgSkel],
+) -> Option<Vec<bool>> {
+    let body = tcx.hir_maybe_body_owned_by(def)?;
+    if !hir_params_are_simple_bindings(body) {
+        return None;
+    }
+    let root = tcx.typeck_root_def_id(def.to_def_id()).as_local()?;
+    let typeck = tcx.typeck(root);
+    let tail = match body.value.kind {
+        rustc_hir::ExprKind::Block(b, None) => {
+            if !matches!(b.rules, rustc_hir::BlockCheckMode::DefaultBlock) {
+                return None;
+            }
+            if b.stmts.iter().any(|s| !matches!(s.kind, rustc_hir::StmtKind::Item(_))) {
+                return None;
+            }
+            b.expr?
+        }
+        _ => body.value,
+    };
+    // An adjustment on the FINAL call itself (an autoderef of the result, a coercion) is a
+    // temp this plan does not model.
+    if !typeck.expr_adjustments(tail).is_empty() {
+        return None;
+    }
+    let exprs: Vec<&'tcx rustc_hir::Expr<'tcx>> = match tail.kind {
+        rustc_hir::ExprKind::Call(callee, cargs) => {
+            if !matches!(callee.kind, rustc_hir::ExprKind::Path(_))
+                || !typeck.expr_adjustments(callee).is_empty()
+            {
+                return None;
+            }
+            cargs.iter().collect()
+        }
+        rustc_hir::ExprKind::MethodCall(_, recv, cargs, _) => {
+            std::iter::once(recv).chain(cargs.iter()).collect()
+        }
+        // An overloaded binary operator (`**self == **other`): the desugared trait-method
+        // call, operands in order. A BUILT-IN binop never reaches this plan (its trust-ir
+        // is a `BinOp`/`ICmp`, not a `Call`, so the skeleton cannot match).
+        rustc_hir::ExprKind::Binary(_, l, r) if typeck.is_method_call(tail) => {
+            vec![l, r]
+        }
+        _ => return None,
+    };
+    if exprs.len() != skel.len() {
+        return None;
+    }
+    let mut rebs: Vec<bool> = Vec::new();
+    for (e, kind) in exprs.into_iter().zip(skel) {
+        match kind {
+            ChainArgSkel::Place => {
+                // Trust (lane S1F): the chain class forwards a place BARE (no field
+                // reconstruction at its emitter), so only the bare-path form is admitted here —
+                // a field projection or an explicit borrow now ANSWERS a different form and
+                // keeps refusing this plan exactly as it did before the answer existed.
+                if call_fwd_arg_admits(typeck, e, CfArg::Place) != Some(CfForm::Bare) {
+                    return None;
+                }
+            }
+            ChainArgSkel::Chain { n_args } => {
+                let reb = chain_inner_admits(typeck, e, *n_args)?;
+                // The chain temp's type class, made a CHECKED fact rather than a guess: the
+                // predicted side spells both of a chain slot's locals [`MfTy::Opaque`], so a
+                // scalar-typed by-value chain result would make the emitter's rustc-typed
+                // local tokenize `Scalar`, fail the LAW closed, and LOSE the `-O0` flip the
+                // body has today. Refuse it here — no plan, no marker, flip kept. (A
+                // Reborrow slot's locals are references, which no scalar candidate names.)
+                if !reb {
+                    let ty = typeck.expr_ty(e);
+                    if SCALAR_CANDS.iter().any(|c| scalar_rustc_ty(tcx, c) == Some(ty)) {
+                        return None;
+                    }
+                }
+                rebs.push(reb);
+            }
+        }
+    }
+    Some(rebs)
+}
+
+/// Trust (wave-WB8): one CHAIN argument expression — an inner call whose own arguments the
+/// HIR must witness as single-temp places — returning its reborrow bit. Three measured
+/// spellings (probes/em3.rs d1/d2/d4), each refused unless exact:
+///
+///   * a bare call with NO adjustments — the by-value shape (`self.trust()`);
+///   * a bare call with the reborrow pair `[Deref(Builtin), Borrow(Ref(Not))]` — the
+///     coerced reference result (`self.name()` passed to `&str`);
+///   * the autoref'd `**self` operand of an overloaded binop — an overloaded-`Deref` call
+///     under the operator-minted shared borrow (the two-local shape, measured).
+///
+/// The EXPLICIT `&**self` spelling (`Debug::fmt(&**self, f)` — `<LevelArc as Debug>::fmt`)
+/// is REFUSED, measured not assumed (-Zdump-mir=built, probes/em3.rs d3): the spelled-out
+/// borrow mints a THREE-local chain (`_4 = &(*_5); _3 = &(*_4)`) and retires the inner
+/// argument temp BEFORE the bridge assigns (`bb1: StorageDead(_6); _4 = &(*_5); …`) — a
+/// different successor discipline than the adjustment-minted two-local shape this plan
+/// models. Claiming it would predict a sequence built refutes; refusing keeps the body
+/// marker-free and its -O0 flip intact, exactly today's state. Its emission is a next-wave
+/// slot kind, modelled from that dump.
+fn chain_inner_admits<'tcx>(
+    typeck: &'tcx ty::TypeckResults<'tcx>,
+    e: &'tcx rustc_hir::Expr<'tcx>,
+    n_args: usize,
+) -> Option<bool> {
+    // The shared reborrow pair on a bare call argument.
+    let shared_reborrow_pair = |x: &rustc_hir::Expr<'tcx>| match typeck.expr_adjustments(x) {
+        [a, b] => {
+            matches!(
+                a.kind,
+                ty::adjustment::Adjust::Deref(ty::adjustment::DerefAdjustKind::Builtin)
+            ) && matches!(
+                b.kind,
+                ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                    if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+            )
+        }
+        _ => false,
+    };
+    // A bare shared autoref (the overloaded-binop operand's minted `&`).
+    let shared_autoref = |x: &rustc_hir::Expr<'tcx>| match typeck.expr_adjustments(x) {
+        [a] => matches!(
+            a.kind,
+            ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+        ),
+        _ => false,
+    };
+    // The inner call's own arguments: each a parameter path minting exactly one temp —
+    // the measured spellings' receivers are all bare paths (`self.trust()`, `a.name()`);
+    // anything else is an unmeasured shape and refuses.
+    let inner_args_ok = |exprs: Vec<&'tcx rustc_hir::Expr<'tcx>>| -> bool {
+        exprs.len() == n_args
+            && exprs
+                .into_iter()
+                .all(|x| call_fwd_arg_admits(typeck, x, CfArg::Place) == Some(CfForm::Bare))
+    };
+    match e.kind {
+        // A bare inner call: by-value (no adjustments) or reborrowed (the pair).
+        rustc_hir::ExprKind::MethodCall(_, recv, cargs, _) => {
+            let reb = if typeck.expr_adjustments(e).is_empty() {
+                false
+            } else if shared_reborrow_pair(e) {
+                true
+            } else {
+                return None;
+            };
+            inner_args_ok(std::iter::once(recv).chain(cargs.iter()).collect()).then_some(reb)
+        }
+        rustc_hir::ExprKind::Call(callee, cargs) => {
+            if !matches!(callee.kind, rustc_hir::ExprKind::Path(_))
+                || !typeck.expr_adjustments(callee).is_empty()
+            {
+                return None;
+            }
+            let reb = if typeck.expr_adjustments(e).is_empty() {
+                false
+            } else if shared_reborrow_pair(e) {
+                true
+            } else {
+                return None;
+            };
+            inner_args_ok(cargs.iter().collect()).then_some(reb)
+        }
+        // The autoref'd `**self` operand of an overloaded binop: the borrow minted by the
+        // operator desugar — the measured two-local shape (probes/em3.rs d2). The EXPLICIT
+        // `&**self` spelling deliberately has NO arm here: see the doc above — built mints a
+        // THREE-local chain for it, outside this plan's model, so it must fall to `None`.
+        rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, _) if shared_autoref(e) => {
+            chain_overloaded_deref(typeck, e, n_args).then_some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Trust (wave-WB8): is `e` the place `**p` — a builtin deref of a parameter under an
+/// OVERLOADED outer deref (one `Deref::deref` call whose receiver autoref mints exactly one
+/// temp)? The `n_args == 1` pin is the skeleton agreement: the trust-ir side saw exactly one
+/// inner-call argument.
+fn chain_overloaded_deref<'tcx>(
+    typeck: &'tcx ty::TypeckResults<'tcx>,
+    e: &'tcx rustc_hir::Expr<'tcx>,
+    n_args: usize,
+) -> bool {
+    if n_args != 1 {
+        return false;
+    }
+    let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, base) = e.kind else {
+        return false;
+    };
+    // The OUTER deref is the overloaded one — a `Deref::deref` call in disguise.
+    if !typeck.is_method_call(e) {
+        return false;
+    }
+    // Its operand is the builtin-deref'd parameter place `*p`, autoref'd shared into the
+    // `deref` receiver (one temp), with no further adjustment surprises.
+    let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, root) = base.kind else {
+        return false;
+    };
+    if typeck.is_method_call(base) {
+        return false;
+    }
+    if !matches!(
+        root.kind,
+        rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, p))
+            if matches!(p.res, rustc_hir::def::Res::Local(_))
+    ) || !typeck.expr_adjustments(root).is_empty()
+    {
+        return false;
+    }
+    match typeck.expr_adjustments(base) {
+        [a] => matches!(
+            a.kind,
+            ty::adjustment::Adjust::Borrow(ty::adjustment::AutoBorrow::Ref(m))
+                if matches!(m, ty::adjustment::AutoBorrowMutability::Not)
+        ),
+        _ => false,
+    }
+}
+
 /// Trust (wave-CK, 2026-08-17): what the CHECKED-ARITHMETIC-CHAIN marker plan owns — the chain
 /// links, in SSA order, with the producer's own type annotation for each.
 ///
@@ -1134,10 +3511,7 @@ impl MfCheckedPlan {
 /// emitter drift apart, and a drifted plan is a marker sequence that is not built's.
 ///
 /// Returns `(result, overflowed, ty, lhs, rhs)`; the unit is always exactly five nodes.
-fn checked_unit(
-    nodes: &[InstrNode],
-    i: usize,
-) -> Option<(ValueId, ValueId, Ty, ValueId, ValueId)> {
+fn checked_unit(nodes: &[InstrNode], i: usize) -> Option<(ValueId, ValueId, Ty, ValueId, ValueId)> {
     let n0 = nodes.get(i)?;
     let Inst::Overflow { ty, lhs, rhs, .. } = &n0.inst else { return None };
     let (&res, &of) = match n0.results.as_slice() {
@@ -1345,11 +3719,7 @@ fn plan_checked_markers(func: &trust_ir::Function) -> Option<MfCheckedPlan> {
     let param_leaves: HashSet<ValueId> = {
         let defined: HashSet<ValueId> =
             body.iter().flat_map(|n| n.results.iter().copied()).collect();
-        blk.params
-            .iter()
-            .map(|(v, _)| *v)
-            .filter(|v| !defined.contains(v))
-            .collect()
+        blk.params.iter().map(|(v, _)| *v).filter(|v| !defined.contains(v)).collect()
     };
     // --- left-nested, linear, single-use ----------------------------------------------------
     let mut leaves: Vec<(ValueId, Ty)> = Vec::new();
@@ -2177,6 +4547,752 @@ fn plan_deref_match_markers(func: &trust_ir::Function) -> Option<MfDrPlan> {
     Some(MfDrPlan { arms: roles, tramps, logical, join, last_arm: groups[last].1[0].1 })
 }
 
+/// Trust (lane F8, 2026-08-23): what the SWITCH-TO-JOIN match plan owns — the scrutinee slot the
+/// head mints and the join retires, and the trampoline chain each switch edge is routed through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfSwPlan {
+    /// The head block: the one whose terminator is the `Inst::Switch`.
+    head: BlockId,
+    /// The scrutinee computation's RESULT value. Built opens its temp at the head's position 0
+    /// and retires it at the JOIN, at position 0 — the same discipline lane K gives a `CondBr`
+    /// condition, one terminator over.
+    scrutinee: ValueId,
+    /// The single `Return` block every arm branches to.
+    join: BlockId,
+    /// Producer block -> how many chained empty `Goto` blocks its incoming switch edge is routed
+    /// through, reproducing built's own match-candidate `falseEdge` pre-blocks. See
+    /// [`plan_switch_join_markers`] for the derivation.
+    tramps: Vec<(BlockId, u8)>,
+    /// The arm block of the LAST source candidate — the one edge built gives no `falseEdge`
+    /// block. Recorded so the `sw-tramp` SAT control has a semantically inert edge to move a
+    /// trampoline ONTO.
+    last_arm: BlockId,
+}
+
+/// Trust (lane F8, 2026-08-23): **THE SWITCH-TO-JOIN MATCH MARKER PLAN** — a `match <expr> { c0
+/// => k0, .., _ => kn }` whose arms are all folded constants and whose candidates are all SINGLE
+/// (no or-pattern). Returns `None` — today's behaviour, no derived marker anywhere — unless the
+/// WHOLE body is inside the class.
+///
+/// # What built does, measured
+///
+/// `-Zdump-mir=built` through this lane's own sealed control driver, on
+/// `scratchpad/laneF8/probes/f8.rs::c1` (the `cert::cross_project::hex_digit` shape at five arms):
+///
+/// ```text
+/// bb0:  StorageLive(_2); StorageLive(_3); _3 = copy _1; _2 = BitAnd(move _3, const 15_u8);
+///       StorageDead(_3); PlaceMention(_2); switchInt(copy _2) -> [0: bb2, .., otherwise: bb1];
+/// bb2:  falseEdge -> [real: bb14, imaginary: bb4];   // ONE per NON-LAST candidate
+/// bb14: _0 = const '0'; goto -> bb15;
+/// bb15: StorageDead(_2); return;                     // the JOIN
+/// ```
+///
+/// Three facts, all three load-bearing and all three MEASURED, not assumed:
+///
+///   1. The scrutinee expression mints TWO slots — its own RESULT temp (`_2`) and one OPERAND
+///      temp per non-constant operand (`_3`) — both opened at position 0, the result FIRST, and
+///      the operand temps retired in the HEAD immediately after the computing assign. That is
+///      wave-MF's discipline verbatim, which is why this plan OWNS `operand` and places nothing
+///      itself: `mf_operand` / `mf_mark_result` / `mf_retire` are the one implementation.
+///   2. The RESULT temp is retired at the JOIN, at position 0 — it is the matched PLACE and lives
+///      across the whole match. Lane K's `CondBr` condition gets exactly this treatment; the only
+///      difference is the terminator.
+///   3. Built's match lowering interposes ONE `falseEdge` candidate block per NON-LAST candidate
+///      and none on the last. `mir_differential::canon_markers` walks the RAW CFG with no goto
+///      threading, so a derived body missing them has every fine block index after them shifted
+///      and the marker channel refuses whatever the markers themselves say. Without the
+///      trampolines the join sits at derived fine 2 against built's fine 3 — measured, and the
+///      whole reason this class was refused before this lane.
+///
+/// # The admitted class, and why each condition is load-bearing
+///
+///   * **`func.scopes.is_none()`** — wave-MF's firewall, consulted FIRST and unchanged. A source
+///     `let` mints a named local plus a `FakeRead` the instruction stream cannot see.
+///   * **the head is folded constants plus EXACTLY ONE result-minting computation, and the switch
+///     is on its result.** Two computations would be an expression TREE whose inner temps built
+///     opens in an order this walk has not measured; zero would be a bare-place scrutinee, which
+///     built marks with NOTHING (`PlaceMention(_1); switchInt(copy _1)`) and which is the
+///     `param_cond`/`match_bool` indistinguishability lane K already refuses.
+///   * **every operand of that computation is a head PARAM or a folded constant.** A nested
+///     marked result at a non-leftmost operand position is `clamp_u32`'s wall (lane K's ordering
+///     rule 2) and is refused here for the same measured reason.
+///   * **every arm is one folded `Inst::Const` and a `Br(join, [that constant])`.** One derived
+///     assign per arm — the edge copy — against built's one. A computing arm carries its own
+///     temps at positions this walk has not measured.
+///   * **the join is the body's ONLY `Inst::Return`, of its own single block parameter.**
+///   * **every switch edge, default included, is a distinct arm block, and every arm block is a
+///     switch edge.** A block the plan cannot name would be lowered with no schedule behind it.
+///   * **the arms' own source locations are PAIRWISE DISTINCT.** This is what makes the
+///     trampoline table derivable rather than guessed: built shares ONE `falseEdge` block between
+///     the alternatives of an OR-PATTERN candidate and funnels each alternative into it through a
+///     `goto` block, and the producer stamps the alternatives of one source arm with ONE
+///     arm-expression location (MEASURED: `probes/f8.rs::a1` gives its two identical-bodied arms
+///     `15:17` and `16:17`, `b1` gives its two or-pattern alternatives `25:25` twice). Distinct
+///     locations therefore mean one candidate per edge, which is the only table this class
+///     claims. An or-pattern is REFUSED, not grouped.
+///   * **the DEFAULT edge is the LAST candidate by source position.** Built gives the last
+///     candidate no `falseEdge` block; a folded default that is not last would put the missing
+///     block somewhere this walk has not modelled.
+///   * **the arms and the join are lowered AFTER the head.** The emitter schedules the join's
+///     retirement while it lowers the head, so a join lowered first would drop it.
+///
+/// **NOT A RELAXATION.** Everything here only ADDS statements and empty `Goto` blocks to the
+/// derived body. The semantic channel threads every `Goto` onto its incoming edges (LEDGER L3),
+/// so the added blocks can cost no `agreed` — and this lane MEASURES that rather than citing it.
+/// `mir_differential::canon_markers` is untouched and still decides.
+///
+/// **NECESSARY-NOT-SUFFICIENT**, exactly as every other plan says of itself: nothing above
+/// establishes that an admitted body's derived marker sequence IS built's. The comparator remains
+/// the authority; a wrong plan yields a wrong sequence, `markers_exact: false` and NO flip —
+/// precisely the state every body in this class is in today.
+fn plan_switch_join_markers(func: &trust_ir::Function) -> Option<MfSwPlan> {
+    // Wave-MF's firewall, first and unchanged.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let head = func.blocks.first()?;
+    if head.id != func.entry || func.blocks.len() < 4 {
+        return None;
+    }
+    let (term, hbody) = head.body.split_last()?;
+    let Inst::Switch { value, default, default_args, cases, .. } = &term.inst else {
+        return None;
+    };
+    if !default_args.is_empty() || cases.len() < 2 {
+        return None;
+    }
+    // --- the head: folded constants plus EXACTLY ONE result-minting computation ---------------
+    let mut comp: Option<&InstrNode> = None;
+    for n in hbody {
+        match &n.inst {
+            Inst::Const { .. } => {}
+            Inst::BinOp { op: BinOp::Shl | BinOp::LShr | BinOp::AShr, .. } => return None,
+            Inst::BinOp { .. } | Inst::ICmp { .. } | Inst::UnOp { .. } | Inst::Cast { .. } => {
+                if comp.is_some() {
+                    return None;
+                }
+                comp = Some(n);
+            }
+            _ => return None,
+        }
+    }
+    let comp = comp?;
+    let &[scrutinee] = comp.results.as_slice() else {
+        return None;
+    };
+    if *value != scrutinee {
+        return None;
+    }
+    let ops: Vec<ValueId> = match &comp.inst {
+        Inst::BinOp { lhs, rhs, .. } | Inst::ICmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } => vec![*operand],
+        _ => return None,
+    };
+    let is_head_param = |v: &ValueId| head.params.iter().any(|(p, _)| p == v);
+    let is_head_const = |v: &ValueId| {
+        hbody.iter().any(|n| matches!(n.inst, Inst::Const { .. }) && n.results.first() == Some(v))
+    };
+    if ops.iter().any(|o| !is_head_param(o) && !is_head_const(o)) {
+        return None;
+    }
+    // --- the join: the body's ONLY `Return`, of its own single block parameter -----------------
+    let mut join: Option<BlockId> = None;
+    for b in &func.blocks {
+        let Some(last) = b.body.last() else {
+            return None;
+        };
+        if let Inst::Return { values } = &last.inst {
+            let [(p, _)] = b.params.as_slice() else {
+                return None;
+            };
+            if b.body.len() != 1 || values.as_slice() != [*p] || join.is_some() {
+                return None;
+            }
+            join = Some(b.id);
+        }
+    }
+    let join = join?;
+    // --- every other block is an ARM: one folded constant, then `Br(join, [it])` ---------------
+    let mut arms: Vec<(BlockId, (u32, u32, u32))> = Vec::new();
+    for b in &func.blocks {
+        if b.id == head.id || b.id == join {
+            continue;
+        }
+        if !b.params.is_empty() {
+            return None;
+        }
+        let [c, t] = b.body.as_slice() else {
+            return None;
+        };
+        if !matches!(c.inst, Inst::Const { .. }) {
+            return None;
+        }
+        let k = *c.results.first()?;
+        let Inst::Br { target, args } = &t.inst else {
+            return None;
+        };
+        if *target != join || args.as_slice() != [k] {
+            return None;
+        }
+        let s = c.span.as_ref()?;
+        arms.push((b.id, (s.file, s.line, s.col)));
+    }
+    // --- the switch edges: one per arm, each named exactly once --------------------------------
+    let mut edges: Vec<BlockId> = Vec::with_capacity(cases.len() + 1);
+    for c in cases {
+        if !c.args.is_empty() {
+            return None;
+        }
+        edges.push(c.target);
+    }
+    edges.push(*default);
+    if edges.len() != arms.len() {
+        return None;
+    }
+    for (i, t) in edges.iter().enumerate() {
+        if edges[..i].contains(t) || !arms.iter().any(|(b, _)| b == t) {
+            return None;
+        }
+    }
+    // ALL arm locations distinct, in ONE file: this class is the all-single-candidate match, and
+    // an or-pattern (two arm blocks stamped with ONE arm-expression location) is a different
+    // trampoline table. Refuse it rather than group it.
+    let file = arms.first()?.1.0;
+    for (i, (_, s)) in arms.iter().enumerate() {
+        if s.0 != file || arms[..i].iter().any(|(_, o)| (o.1, o.2) == (s.1, s.2)) {
+            return None;
+        }
+    }
+    // The DEFAULT edge must be the LAST source candidate.
+    let dloc = arms.iter().find(|(b, _)| b == default)?.1;
+    if arms.iter().any(|(_, s)| (s.1, s.2) > (dloc.1, dloc.2)) {
+        return None;
+    }
+    // Block ORDER: the emitter schedules the join's retirement while it lowers the head.
+    let ord = |id: BlockId| func.blocks.iter().position(|b| b.id == id);
+    let h = ord(head.id)?;
+    if ord(join)? <= h || arms.iter().any(|(b, _)| ord(*b).is_none_or(|k| k <= h)) {
+        return None;
+    }
+    // --- the trampoline table: ONE per non-last candidate, none on the last --------------------
+    let tramps: Vec<(BlockId, u8)> =
+        arms.iter().filter(|(b, _)| b != default).map(|(b, _)| (*b, 1u8)).collect();
+    if tramps.is_empty() {
+        return None;
+    }
+    Some(MfSwPlan { head: head.id, scrutinee, join, tramps, last_arm: *default })
+}
+
+/// Trust (lane F8B, 2026-08-23): **THE ROLE ONE ADMITTED ARM BLOCK PLAYS** in a match on an
+/// enum DISCRIMINANT whose candidates may be OR-PATTERNS.
+///
+/// The shapes are `cert::types::proof_cert_has_recursive_children`,
+/// `mode::CleanMode::allows_large_elimination` and `tc::reduction::cofib::CofibAtom::var` — lane
+/// F8's sub-shapes B and C, the ones its all-single-candidate switch plan refused by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwrArm {
+    /// `[Const, Br(join, [k])]` — a folded constant arm. ONE derived assign (the edge copy) and
+    /// no marker of its own; classified rather than ignored because a block the plan cannot name
+    /// fails the body CLOSED.
+    Const,
+    /// `[Const false, Const true, Select { cond: p }, Br(join, [r])]` — the producer's spelling
+    /// of `!p` on a BODY PARAMETER. TWO derived assigns (the `Not` and the edge copy), and the
+    /// one arm shape in this class that mints a temp of its own.
+    NotParam,
+    /// `[ExtractField { aggregate: the matched param, field }, Br(join, [r])]` — an or-pattern
+    /// alternative that BINDS the matched value's payload. ONE derived assign (the edge copy,
+    /// which reads the projected place).
+    Bind,
+}
+
+/// Trust (lane F8B): WHICH slot this class's one marker pair names, and where built puts it.
+/// Each variant is one MEASURED position pair, not a family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwrSlot {
+    /// The MATCH VALUE's own temp. The `!` sits at the JOIN and its operand is the match's
+    /// value, so built materialises the match's destination: `StorageLive` at the HEAD, position
+    /// 0 — before the discriminant read — and `StorageDead` at the JOIN one assign in, after the
+    /// join's own `Not`. Measured verbatim on `probes/f8b.rs::p1`
+    /// (`cert::types::proof_cert_has_recursive_children`):
+    ///
+    /// ```text
+    /// bb0:  StorageLive(_2); PlaceMention(_1); _3 = discriminant((*_1)); switchInt(move _3) ..
+    /// bb21: _0 = Not(move _2); StorageDead(_2); return;
+    /// ```
+    MatchValue,
+    /// The `!param` ARM's own operand temp, in ONE arm block: `StorageLive` at position 0 and
+    /// `StorageDead` after that block's two assigns. Measured verbatim on `probes/f8b.rs::p2`
+    /// (`mode::CleanMode::allows_large_elimination`):
+    ///
+    /// ```text
+    /// bb17: StorageLive(_4); _4 = copy _2; _0 = Not(move _4); StorageDead(_4); goto -> bb19;
+    /// ```
+    ///
+    /// Built lowers an or-pattern's arm body ONCE and funnels every alternative into it; the
+    /// producer DUPLICATES it per alternative. So exactly one derived arm block stands where
+    /// built's real arm body stands — the one the trampoline table gives two pre-blocks — and it
+    /// is the only one marked; the duplicates stand where built's bare `goto` blocks stand and
+    /// mint nothing.
+    ArmNot,
+    /// The or-pattern PAYLOAD BINDING: `StorageLive` at position 0 of EVERY alternative arm (built
+    /// duplicates a BINDING arm body rather than sharing it) and `StorageDead` at the JOIN one
+    /// assign in — which is also the one shape in this class that needs built's RETURN SPLIT.
+    /// Measured verbatim on `probes/f8b.rs::p3` (`tc::reduction::cofib::CofibAtom::var`):
+    ///
+    /// ```text
+    /// bb6: StorageLive(_3); _3 = copy ((_1 as Eq0).0: u32); goto -> bb7;
+    /// bb4: StorageLive(_3); _3 = copy ((_1 as Eq1).0: u32); goto -> bb7;
+    /// bb7: _0 = copy _3; StorageDead(_3); goto -> bb8;
+    /// bb8: return;
+    /// ```
+    Binding,
+}
+
+/// Trust (lane F8B): what the DISCRIMINANT-MATCH marker plan owns — every block it classifies,
+/// the trampoline chain each switch edge is routed through, and the ONE slot it marks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfSwrPlan {
+    /// The head block: the one whose terminator is the `Inst::Switch`.
+    head: BlockId,
+    /// The single `Return` block every arm branches to.
+    join: BlockId,
+    /// Producer block -> role, for every block that is neither the head nor the join.
+    arms: Vec<(BlockId, SwrArm)>,
+    /// Producer block -> how many chained empty `Goto` blocks its incoming switch edge is routed
+    /// through, reproducing built's own match-candidate pre-blocks. See
+    /// [`plan_switch_ref_markers`] for the derivation and why each count is what it is.
+    tramps: Vec<(BlockId, u8)>,
+    /// The arm block on the DEFAULT edge — the one edge this plan never puts a trampoline on.
+    /// Recorded so the `swr-tramp` SAT control has a semantically inert edge to move one ONTO.
+    last_arm: BlockId,
+    /// Which slot is marked, and therefore where.
+    slot: SwrSlot,
+    /// The blocks whose ENTRY opens the slot (position 0), in trust-ir order.
+    open_at: Vec<BlockId>,
+    /// The block the slot is RETIRED in, and the number of assigns that block performs BEFORE the
+    /// retirement. The emitter RE-COUNTS the assigns it actually pushed and fails CLOSED on a
+    /// disagreement, so a wrong count here costs a flip this class never had rather than shipping
+    /// a marker at a position the shim did not emit.
+    close_at: (BlockId, usize),
+    /// The slot's trust-ir type, read off the producer's own annotation.
+    ty: Ty,
+    /// Built's RETURN SPLIT: the join's `Return` becomes `Goto R` plus a bare `R: return`.
+    ret_split: bool,
+}
+
+/// Trust (lane F8B, 2026-08-23): **THE DISCRIMINANT-MATCH MARKER PLAN** — a `match` on an enum
+/// discriminant (by reference or by value) whose arms are folded constants, one `!param`
+/// expression, or one payload binding, and whose candidates may be OR-PATTERNS. Returns `None` —
+/// today's behaviour, no derived marker anywhere — unless the WHOLE body is inside the class.
+///
+/// # Why this class exists, and what it is not
+///
+/// Lane F8 built the ALL-SINGLE-CANDIDATE switch-to-join plan and refused an or-pattern by name,
+/// because built shares ONE `falseEdge` block between an or-pattern's alternatives and funnels
+/// each through its own `goto`, which is a different trampoline table. Wave-DR measured that
+/// table and implements it for the deref-recursion class; this plan is the third reader of it and
+/// the FIRST for a match whose join is a plain `Return` of a scalar.
+///
+/// # The trampoline table, re-measured at HEAD
+///
+/// `-Zdump-mir=built` through this lane's own sealed CONTROL driver, on `probes/f8b.rs`:
+///
+///   * **a NON-LAST SINGLE candidate takes 1.** Built puts one `falseEdge` block on its edge
+///     (`p2` bb2, bb8, bb10).
+///   * **a NON-LAST OR-PATTERN candidate whose arm binds nothing takes 2 on its LOWEST-valued
+///     alternative and 0 on every other.** Built gives each alternative a `goto` block and the
+///     candidate ONE shared `falseEdge` before the single arm body (`p1` bb2/bb4/../bb16 ->
+///     bb19 -> bb20; `p2` bb4/bb6 -> bb14 -> bb17). The producer duplicates the arm body per
+///     alternative, so the two sides agree block for block once the lowest alternative's edge
+///     carries the pair.
+///   * **the LAST candidate takes 0.** Built gives it no `falseEdge` (`p1` bb1, `p2` bb12).
+///   * **the SOLE candidate, an or-pattern that BINDS, takes 1 on every alternative but the one
+///     on the DEFAULT edge.** Built duplicates the binding arm body rather than sharing it, so
+///     there is no `goto`-per-alternative layer at all (`p3` bb2 -> bb6, and bb4 bare).
+///
+/// The counts are `p1` 11 derived blocks -> 13 = built 13; `p2` 9 -> 14 = built 14; `p3` 5 -> 7
+/// (with the return split) = built 7, and in each case the FINE indices then coincide element for
+/// element.
+///
+/// # What makes the grouping DERIVABLE rather than guessed
+///
+/// Two producer facts, both measured, not assumed:
+///
+///   1. the producer stamps each source arm's OWN location on the arm's first instruction (lane
+///      F8 measured this: two identical-bodied SEPARATE arms carry `15:17` and `16:17`, two
+///      OR-PATTERN alternatives carry `25:25` TWICE), and
+///   2. where a MACRO erases that signal — `matches!` stamps every arm with the macro call's own
+///      location, measured on `p1`, where all nine arms carry `45:5` — the arm's OWN folded value
+///      still separates the candidates, and it is read off the producer's instruction exactly as
+///      the location is.
+///
+/// So a candidate is a maximal run of edges whose arm blocks agree on BOTH the location and the
+/// arm's first instruction. Two NON-DEFAULT candidates that still collide on a location are
+/// refused rather than ordered by a guess.
+///
+/// The LAST candidate is the group holding the DEFAULT edge. In every shape this class admits
+/// that is a fact of the source: a `_` wildcard is the final arm of the `matches!` expansion, and
+/// an exhaustive fieldless match folds its final variant onto the default edge (wave-V's own
+/// reshape). A body where it is not the last candidate gets a wrong table, a wrong fine index and
+/// `markers_exact: false` — a flip this class never had, never a wrong marker.
+///
+/// # The admitted class, and why each condition is load-bearing
+///
+///   * **`func.scopes.is_none()`** — wave-MF's firewall, consulted FIRST and unchanged.
+///   * **the head is the DISCRIMINANT READ and nothing else** — `[Load{Enum, ptr = param},
+///     ExtractField{_, 0}]` by reference or `[ExtractField{param, 0}]` by value, and the switch
+///     is on its result. One derived assign, `_d = Discriminant(place)`, exactly as built.
+///   * **every other block is an ARM of one of the three measured shapes**, with no block
+///     parameters, and its `Br` goes to the join carrying the arm's own value.
+///   * **the join is the body's ONLY `Return`**, of its single block parameter, either bare or
+///     through the producer's `!` idiom (`const false; const true; select p, f, t`).
+///   * **every switch edge is an arm block and every arm block is a switch edge**, each named
+///     once. A block the plan cannot name would be lowered with no schedule behind it.
+///   * **the arms and the join are lowered AFTER the head.**
+///   * **the plan carries at least one trampoline and exactly one marked slot.** A body with no
+///     slot keeps today's behaviour byte for byte rather than acquiring an empty claim.
+///
+/// **NOT A RELAXATION.** Everything here only ADDS storage markers and empty `Goto` blocks to the
+/// derived body, plus — for the binding shape alone — one `Goto`/`return` split that is the same
+/// program. The semantic channel threads every `Goto` onto its incoming edges (LEDGER L3), so the
+/// added blocks can cost no `agreed`, and this lane MEASURES that rather than citing it.
+/// `mir_differential::canon_markers` is untouched and still decides.
+///
+/// **NECESSARY-NOT-SUFFICIENT**, exactly as every other plan says of itself: nothing here
+/// establishes that an admitted body's derived marker sequence IS built's. The comparator remains
+/// the authority; a wrong plan yields a wrong sequence, `markers_exact: false` and NO flip —
+/// precisely the state every body in this class is in today.
+fn plan_switch_ref_markers(func: &trust_ir::Function) -> Option<MfSwrPlan> {
+    // Wave-MF's firewall, first and unchanged.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let head = func.blocks.first()?;
+    if head.id != func.entry || func.blocks.len() < 3 {
+        return None;
+    }
+    let (term, hbody) = head.body.split_last()?;
+    let Inst::Switch { value, default, default_args, cases, .. } = &term.inst else {
+        return None;
+    };
+    if !default_args.is_empty() || cases.is_empty() {
+        return None;
+    }
+    // --- the head: the DISCRIMINANT READ, by reference or by value -----------------------------
+    let (disc, matched) = match hbody {
+        // BY REFERENCE: `%a = load enum, ptr %p ; %d = extractfield %a, 0`.
+        [ld, ef] => {
+            let Inst::Load { ty: lty, ptr, volatile: false, align: None } = &ld.inst else {
+                return None;
+            };
+            if !matches!(lty, Ty::Enum(_)) || !head.params.iter().any(|(p, _)| p == ptr) {
+                return None;
+            }
+            let agg = *ld.results.first()?;
+            let Inst::ExtractField { aggregate, field: 0, .. } = &ef.inst else {
+                return None;
+            };
+            if *aggregate != agg {
+                return None;
+            }
+            (*ef.results.first()?, None)
+        }
+        // BY VALUE: `%d = extractfield %p, 0` off the matched PARAMETER itself, which is also
+        // the aggregate every binding arm reads.
+        [ef] => {
+            let Inst::ExtractField { aggregate, field: 0, .. } = &ef.inst else {
+                return None;
+            };
+            if !head.params.iter().any(|(p, _)| p == aggregate) {
+                return None;
+            }
+            (*ef.results.first()?, Some(*aggregate))
+        }
+        _ => return None,
+    };
+    if *value != disc {
+        return None;
+    }
+    // --- the JOIN: the body's ONLY `Return`, of its own single parameter ------------------------
+    let mut join: Option<(BlockId, Ty, bool)> = None;
+    for b in &func.blocks {
+        let last = b.body.last()?;
+        let Inst::Return { values } = &last.inst else {
+            continue;
+        };
+        if join.is_some() {
+            return None;
+        }
+        let [(p, pty)] = b.params.as_slice() else {
+            return None;
+        };
+        let not_join = match b.body.as_slice() {
+            // `ret %p` — the bare forwarding join.
+            [_] => {
+                if values.as_slice() != [*p] {
+                    return None;
+                }
+                false
+            }
+            // `const false; const true; select %p, f, t; ret %r` — the producer's `!%p`, which
+            // built spells `_0 = Not(move d)` over the match's own destination temp.
+            [c0, c1, sel, _] => {
+                if !matches!(c0.inst, Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                    || !matches!(c1.inst, Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                {
+                    return None;
+                }
+                let (f, t) = (*c0.results.first()?, *c1.results.first()?);
+                let Inst::Select { ty: Ty::Bool, cond, then_val, else_val } = &sel.inst else {
+                    return None;
+                };
+                if *cond != *p || *then_val != f || *else_val != t {
+                    return None;
+                }
+                if values.as_slice() != [*sel.results.first()?] {
+                    return None;
+                }
+                true
+            }
+            _ => return None,
+        };
+        join = Some((b.id, pty.clone(), not_join));
+    }
+    let (join, jty, not_join) = join?;
+    // --- every other block is an ARM of one of the three measured shapes ------------------------
+    let is_body_param = |v: &ValueId| head.params.iter().any(|(p, _)| p == v);
+    let mut arms: Vec<(BlockId, SwrArm, (u32, u32, u32), Inst)> = Vec::new();
+    for b in &func.blocks {
+        if b.id == head.id || b.id == join {
+            continue;
+        }
+        if !b.params.is_empty() {
+            return None;
+        }
+        let (role, first) = match b.body.as_slice() {
+            [c, t] => {
+                let k = *c.results.first()?;
+                let Inst::Br { target, args } = &t.inst else {
+                    return None;
+                };
+                if *target != join || args.as_slice() != [k] {
+                    return None;
+                }
+                match &c.inst {
+                    Inst::Const { .. } => (SwrArm::Const, c),
+                    // A payload read off the MATCHED value, at a field that is not the tag.
+                    Inst::ExtractField { aggregate, field, .. }
+                        if Some(*aggregate) == matched && *field != 0 =>
+                    {
+                        (SwrArm::Bind, c)
+                    }
+                    _ => return None,
+                }
+            }
+            [c0, c1, sel, t] => {
+                if !matches!(c0.inst, Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                    || !matches!(c1.inst, Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                {
+                    return None;
+                }
+                let (f, tt) = (*c0.results.first()?, *c1.results.first()?);
+                let Inst::Select { ty: Ty::Bool, cond, then_val, else_val } = &sel.inst else {
+                    return None;
+                };
+                if *then_val != f || *else_val != tt || !is_body_param(cond) {
+                    return None;
+                }
+                let r = *sel.results.first()?;
+                let Inst::Br { target, args } = &t.inst else {
+                    return None;
+                };
+                if *target != join || args.as_slice() != [r] {
+                    return None;
+                }
+                (SwrArm::NotParam, c0)
+            }
+            _ => return None,
+        };
+        let s = first.span.as_ref()?;
+        arms.push((b.id, role, (s.file, s.line, s.col), first.inst.clone()));
+    }
+    if arms.len() < 2 {
+        return None;
+    }
+    // --- the switch edges: one per arm, each named exactly once ---------------------------------
+    let mut edges: Vec<(Option<i128>, BlockId)> = Vec::with_capacity(cases.len() + 1);
+    for c in cases {
+        if !c.args.is_empty() {
+            return None;
+        }
+        let Constant::Int(v) = &c.value else {
+            return None;
+        };
+        // Non-negative and below the signed 64-bit ceiling, so ordering by the raw value is the
+        // ordering by the emitter's masked case value without this side carrying a width.
+        if *v < 0 || *v > i128::from(i64::MAX) {
+            return None;
+        }
+        edges.push((Some(*v), c.target));
+    }
+    edges.push((None, *default));
+    if edges.len() != arms.len() {
+        return None;
+    }
+    for (i, (_, t)) in edges.iter().enumerate() {
+        if *t == head.id
+            || *t == join
+            || edges[..i].iter().any(|(_, u)| u == t)
+            || !arms.iter().any(|(b, ..)| b == t)
+        {
+            return None;
+        }
+    }
+    let role_of = |b: BlockId| arms.iter().find(|(x, ..)| *x == b).map(|(_, r, ..)| *r);
+    // --- candidate GROUPING, from the producer's own arm location AND the arm's own instruction -
+    let mut groups: Vec<((u32, u32, u32), Inst, Vec<(Option<i128>, BlockId)>)> = Vec::new();
+    for (v, t) in &edges {
+        let a = arms.iter().find(|(x, ..)| x == t)?;
+        match groups.iter().position(|(s, k, _)| *s == a.2 && *k == a.3) {
+            Some(i) => groups[i].2.push((*v, *t)),
+            None => groups.push((a.2, a.3.clone(), vec![(*v, *t)])),
+        }
+    }
+    // The LAST candidate is the group holding the DEFAULT edge.
+    let last = groups.iter().position(|(_, _, m)| m.iter().any(|(v, _)| v.is_none()))?;
+    // Every OTHER candidate must be at its own source position: two non-default candidates at one
+    // location would make "which is first" undecidable here, and the table is ordered.
+    for (i, (s, _, _)) in groups.iter().enumerate() {
+        if i == last {
+            continue;
+        }
+        if groups
+            .iter()
+            .enumerate()
+            .any(|(j, (o, _, _))| j != i && j != last && (o.1, o.2) == (s.1, s.2))
+        {
+            return None;
+        }
+    }
+    // --- the trampoline table --------------------------------------------------------------------
+    let mut tramps: Vec<(BlockId, u8)> = Vec::new();
+    if groups.len() == 1 {
+        // THE SOLE CANDIDATE, an OR-PATTERN that BINDS. Built duplicates the arm body per
+        // alternative and gives every alternative but the one on the DEFAULT edge its own
+        // `falseEdge` block. Admitted at the arity this lane MEASURED and no wider.
+        let m = &groups[0].2;
+        if m.len() != 2 || !m.iter().all(|(_, b)| role_of(*b) == Some(SwrArm::Bind)) {
+            return None;
+        }
+        for (v, b) in m {
+            if v.is_some() {
+                tramps.push((*b, 1));
+            }
+        }
+    } else {
+        // The last candidate must be SINGLE: an or-pattern in the last position cannot be
+        // realigned by a count (built gives it neither a `falseEdge` nor the `goto` layer).
+        if groups[last].2.len() != 1 {
+            return None;
+        }
+        for (gi, (_, _, m)) in groups.iter().enumerate() {
+            if gi == last {
+                continue;
+            }
+            if m.len() == 1 {
+                tramps.push((m[0].1, 1));
+                continue;
+            }
+            // A NON-LAST OR-PATTERN candidate. A BINDING alternative is refused: built duplicates
+            // a binding arm body instead of sharing it, which is a different table and one this
+            // lane has measured only in the sole-candidate position.
+            if m.iter().any(|(_, b)| {
+                role_of(*b) != Some(SwrArm::Const) && role_of(*b) != Some(SwrArm::NotParam)
+            }) {
+                return None;
+            }
+            let mut lowest: Option<(i128, BlockId)> = None;
+            for (v, b) in m {
+                let v = (*v)?;
+                if lowest.is_none_or(|(lv, _)| v < lv) {
+                    lowest = Some((v, *b));
+                }
+            }
+            tramps.push((lowest?.1, 2));
+        }
+    }
+    if tramps.is_empty() {
+        return None;
+    }
+    // --- the ONE marked slot ---------------------------------------------------------------------
+    let (slot, open_at, close_at, ty, ret_split) = if not_join {
+        // The `!` is at the JOIN and its operand is the match VALUE: built materialises the
+        // match's own destination temp. Every arm must then be a folded constant — a computing
+        // arm would mint a second temp this class does not model.
+        if arms.iter().any(|(_, r, ..)| *r != SwrArm::Const) {
+            return None;
+        }
+        (SwrSlot::MatchValue, vec![head.id], (join, 1usize), jty.clone(), false)
+    } else if arms.iter().any(|(_, r, ..)| *r == SwrArm::NotParam) {
+        // The `!` is in an ARM and its operand is a body PARAMETER: built materialises the
+        // operand temp inside the arm block. Every other arm must be a folded constant.
+        if arms.iter().any(|(_, r, ..)| !matches!(r, SwrArm::Const | SwrArm::NotParam)) {
+            return None;
+        }
+        // The marked block is the ONE derived arm that stands where built's real arm body stands
+        // — the member the table gives pre-blocks, i.e. a single candidate's own block or an
+        // or-pattern's LOWEST-valued alternative.
+        let g = groups
+            .iter()
+            .find(|(_, _, m)| m.iter().any(|(_, b)| role_of(*b) == Some(SwrArm::NotParam)))?;
+        if !g.2.iter().all(|(_, b)| role_of(*b) == Some(SwrArm::NotParam)) {
+            return None;
+        }
+        if arms.iter().filter(|(_, r, ..)| *r == SwrArm::NotParam).count() != g.2.len() {
+            return None;
+        }
+        let mark = if g.2.len() == 1 {
+            g.2[0].1
+        } else {
+            let mut lowest: Option<(i128, BlockId)> = None;
+            for (v, b) in &g.2 {
+                let v = (*v)?;
+                if lowest.is_none_or(|(lv, _)| v < lv) {
+                    lowest = Some((v, *b));
+                }
+            }
+            lowest?.1
+        };
+        (SwrSlot::ArmNot, vec![mark], (mark, 2usize), Ty::Bool, false)
+    } else if arms.iter().all(|(_, r, ..)| *r == SwrArm::Bind) {
+        // The or-pattern payload binding, with built's RETURN SPLIT.
+        let open: Vec<BlockId> = arms.iter().map(|(b, ..)| *b).collect();
+        (SwrSlot::Binding, open, (join, 1usize), jty.clone(), true)
+    } else {
+        // No modelled slot: keep today's behaviour byte for byte.
+        return None;
+    };
+    // Block ORDER: the arms and the join are lowered AFTER the head, so nothing this plan opens
+    // is scheduled into a block already past.
+    let ord = |id: BlockId| func.blocks.iter().position(|b| b.id == id);
+    let h = ord(head.id)?;
+    if ord(join)? <= h || arms.iter().any(|(b, ..)| ord(*b).is_none_or(|k| k <= h)) {
+        return None;
+    }
+    Some(MfSwrPlan {
+        head: head.id,
+        join,
+        arms: arms.iter().map(|(b, r, ..)| (*b, *r)).collect(),
+        tramps,
+        last_arm: *default,
+        slot,
+        open_at,
+        close_at,
+        ty,
+        ret_split,
+    })
+}
+
 /// Trust (lane MF-ZERO-3): is this an assignment LEFT-HAND SIDE (or a borrowed place) that built
 /// lowers with `as_place` and NO temp of its own?
 ///
@@ -2386,6 +5502,258 @@ fn recognize_agg_return_chain(
             _ => return None,
         }
     }
+}
+
+/// Trust (lane S3, 2026-08-21): **THE AGGREGATE-OF-CALL-RESULTS PLAN** — the TWELFTH whole-body
+/// claim: a single-block, parameter-free body of NOTHING BUT nullary calls whose results are the
+/// fields of the returned struct aggregate, in field order — `derive(Default)`'s expansion
+/// `S { a: Default::default(), b: Default::default() }` (and the tuple-struct spelling
+/// `S(Default::default())`, which THIR lowers to the same aggregate). This is wall-B's S3
+/// shape, which wave-WB8 measured and deferred (clean
+/// `data/crystal_wb8_chain_emission_2026-08-21.json`, `wb8_disposition.S3`); the GAP2 census
+/// (clean `data/crystal_gap_partition_2026-08-21.json`) sizes the family in the residual
+/// -O0/-O3 gap.
+///
+/// # The model, measured
+///
+/// `-Zdump-mir=built` on `probes/em3.rs` d7 (the derive expansion, isolated; recorded verbatim
+/// in the WB8 JSON) and on `probes/s3.rs` (this lane: one field, a tuple struct, three scalar
+/// fields, a written-out-of-order literal):
+///
+/// ```text
+/// bb0: StorageLive(_1); _1 = <Bi as Default>::default() -> bb1;
+/// bb1: StorageLive(_2); _2 = <Mu as Default>::default() -> bb2;
+/// bb2: _0 = Bd { info: move _1, mult: move _2 };
+///      StorageDead(_2); StorageDead(_1); return;
+/// ```
+///
+/// One live per call destination, at the head of the call's own block; the aggregate assign
+/// consumes them all as its bare operands, in field order; the retirement follows it in REVERSE
+/// creation order. A one-field body is the same law with one run of length one.
+///
+/// # What is refused
+///
+///   * a call with arguments, or with other than one result, or a result consumed anywhere but
+///     the `Const(Aggregate)`/`InsertField` chain, or out of field order (the k-th call's result
+///     must be field k — `field_vals == results`, the wall the M-COR mutation deletes);
+///   * any body node that is neither one of the LEADING calls nor part of the recognized chain
+///     the `Return` arm collapses ([`recognize_agg_return_chain`] — the SAME recognizer, so the
+///     plan and the emitter cannot disagree about which nodes are the chain);
+///   * a block parameter (the measured bodies are parameter-free), a lexical scope, a second
+///     block, a second aggregate seed;
+///   * a field whose DECLARED type (the producer's own struct table, `Module::struct_def`) is
+///     neither one of the sixteen body scalars nor a `Ty::Enum`: a struct-typed marked call
+///     destination is an admission the flip gate has not measured on this class, so it is
+///     refused here — no plan, no marker, today's flip kept;
+///   * any body whose SOURCE form does not independently witness the same shape
+///     ([`agg_call_source_admits`]: a struct literal whose k-th written field is field index k,
+///     or a tuple-struct constructor call; every field a bare nullary path call; no adjustment
+///     anywhere).
+///
+/// # The slot type, from the producer's own annotation
+///
+/// Unlike the chain plan's slots, a call-result temp here may be SCALAR-typed (`usize`, `bool`,
+/// `f64` — the stats structs), so the predicted side cannot spell every slot `Opaque`. The
+/// trust-ir `Inst::Call` carries no result annotation, but the returned struct's definition
+/// does: `field_tys[k]` is `StructDef.fields[k].ty`, read through [`MfPlans::seal`]'s module
+/// handle and tokenized by `ir_ty_token` exactly as a block parameter's annotation is. The
+/// observed side tokenizes the finished body's `local_decls` — the callee's declared return
+/// type, rustc's answer — so the two sides still derive the type from different places, and the
+/// emitter's own struct-return field-type wall (the wave-P gate in the `Return` arm) has already
+/// proven the operand's type equals the field's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfAggCallPlan {
+    /// The call results, in SSA (= field-index) order. Length >= 1.
+    results: Vec<ValueId>,
+    /// The body-node index of each call, in the same order.
+    call_nodes: Vec<usize>,
+    /// The returned struct's DECLARED field types, in field order — the producer's annotation.
+    field_tys: Vec<Ty>,
+    /// Trust (lane S3): [`SatPerturb::ChainRetOrder`] on THIS class: retire the call-result
+    /// temps FORWARD instead of reverse, on both sides of the law at once. Set only in
+    /// [`MfPlans::seal`], only under the flag, and only when there are at least two temps to
+    /// displace (a one-field body has one run of length one — the swap would be inert and is
+    /// not counted as an application).
+    ret_swap: bool,
+}
+
+impl MfAggCallPlan {
+    fn marks(&self, v: ValueId) -> bool {
+        self.results.contains(&v)
+    }
+}
+
+/// Trust (lane S3): the trust-ir half of the aggregate-of-call-results plan, a pure function of
+/// the body and the producer's struct table — so `agg_call_tests` can exercise every refusal on
+/// synthetic trust-ir without a compiler. Returns `(results, call_nodes, field_tys)`.
+fn agg_call_skeleton(
+    func: &trust_ir::Function,
+    struct_fields: &dyn Fn(trust_ir::StructId) -> Option<Vec<Ty>>,
+) -> Option<(Vec<ValueId>, Vec<usize>, Vec<Ty>)> {
+    // The wave-MF firewall, unchanged: any lexical `let` scope is out.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let [blk] = func.blocks.as_slice() else { return None };
+    if !blk.params.is_empty() {
+        return None;
+    }
+    let (term, body) = blk.body.split_last()?;
+    let Inst::Return { values } = &term.inst else { return None };
+    let &[ret_val] = values.as_slice() else { return None };
+    // The LEADING run of nullary single-result calls.
+    let mut results: Vec<ValueId> = Vec::new();
+    let mut call_nodes: Vec<usize> = Vec::new();
+    for (i, n) in body.iter().enumerate() {
+        let Inst::Call { args, .. } = &n.inst else { break };
+        if !args.is_empty() {
+            return None;
+        }
+        let &[r] = n.results.as_slice() else { return None };
+        results.push(r);
+        call_nodes.push(i);
+    }
+    if results.is_empty() {
+        return None;
+    }
+    let rest = &body[results.len()..];
+    // A call after a non-call node is outside the measured shape.
+    if rest.iter().any(|n| matches!(n.inst, Inst::Call { .. })) {
+        return None;
+    }
+    // The aggregate chain: the `Return` arm's own recognizer, re-used — the field values must
+    // BE the call results, in order, and the chain must be exactly the non-call remainder.
+    let mut value_def: HashMap<ValueId, &InstrNode> = HashMap::new();
+    for n in &blk.body {
+        for r in &n.results {
+            value_def.insert(*r, n);
+        }
+    }
+    let (field_vals, skip) = recognize_agg_return_chain(&value_def, ret_val)?;
+    if field_vals != results {
+        return None;
+    }
+    if skip.len() != rest.len() {
+        return None;
+    }
+    let chain: HashSet<ValueId> = skip.into_iter().collect();
+    let mut seed: Option<trust_ir::StructId> = None;
+    for n in rest {
+        let &[r] = n.results.as_slice() else { return None };
+        if !chain.contains(&r) {
+            return None;
+        }
+        if let Inst::Const { ty: Ty::Struct(sid), value: Constant::Aggregate(_) } = &n.inst {
+            if seed.replace(*sid).is_some() {
+                return None;
+            }
+        }
+    }
+    // The struct's DECLARED field types, from the producer's own table: one per call, each a
+    // body scalar or an enum — the two marked call-destination classes the flip gate admits.
+    let field_tys = struct_fields(seed?)?;
+    if field_tys.len() != results.len() {
+        return None;
+    }
+    if !field_tys.iter().all(|t| SCALAR_CANDS.contains(t) || matches!(t, Ty::Enum(_))) {
+        return None;
+    }
+    Some((results, call_nodes, field_tys))
+}
+
+fn plan_agg_call_markers<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    func: &trust_ir::Function,
+    module: &trust_ir::Module,
+) -> Option<MfAggCallPlan> {
+    let (results, call_nodes, field_tys) = agg_call_skeleton(func, &|sid| {
+        module.struct_def(sid).map(|d| d.fields.iter().map(|f| f.ty.clone()).collect())
+    })?;
+    if !agg_call_source_admits(tcx, def, results.len()) {
+        return None;
+    }
+    Some(MfAggCallPlan { results, call_nodes, field_tys, ret_swap: false })
+}
+
+/// Trust (lane S3): the SOURCE-side half — the HIR must independently witness the skeleton. Two
+/// measured spellings, each refused unless exact: a struct literal in DECLARATION order (the
+/// k-th WRITTEN field is field index k — built evaluates fields in written order and mints the
+/// k-th destination for the k-th call, which is what pins the trust-ir's SSA order to the field
+/// order; a literal written out of order is refused, since built then retires in written order
+/// while the aggregate consumes in field order, a sequence this plan does not model) with no
+/// base expression, or a tuple-struct constructor CALL (`S(Default::default())` — the
+/// `derive(Default)` expansion for a tuple struct); every field a bare nullary path call with
+/// no adjustments on the call or its callee, and no adjustment on the literal itself.
+fn agg_call_source_admits<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId, n: usize) -> bool {
+    let Some(body) = tcx.hir_maybe_body_owned_by(def) else {
+        return false;
+    };
+    if !body.params.is_empty() {
+        return false;
+    }
+    let Some(root) = tcx.typeck_root_def_id(def.to_def_id()).as_local() else {
+        return false;
+    };
+    let typeck = tcx.typeck(root);
+    let tail = match body.value.kind {
+        rustc_hir::ExprKind::Block(b, None) => {
+            if !matches!(b.rules, rustc_hir::BlockCheckMode::DefaultBlock) {
+                return false;
+            }
+            if b.stmts.iter().any(|s| !matches!(s.kind, rustc_hir::StmtKind::Item(_))) {
+                return false;
+            }
+            match b.expr {
+                Some(e) => e,
+                None => return false,
+            }
+        }
+        _ => body.value,
+    };
+    if !typeck.expr_adjustments(tail).is_empty() {
+        return false;
+    }
+    let exprs: Vec<&'tcx rustc_hir::Expr<'tcx>> = match tail.kind {
+        rustc_hir::ExprKind::Struct(_, fields, rustc_hir::StructTailExpr::None) => {
+            if fields
+                .iter()
+                .enumerate()
+                .any(|(k, f)| typeck.opt_field_index(f.hir_id).map(|i| i.as_usize()) != Some(k))
+            {
+                return false;
+            }
+            fields.iter().map(|f| f.expr).collect()
+        }
+        rustc_hir::ExprKind::Call(callee, cargs) => {
+            let rustc_hir::ExprKind::Path(qpath) = &callee.kind else {
+                return false;
+            };
+            if !matches!(
+                typeck.qpath_res(qpath, callee.hir_id),
+                Res::Def(DefKind::Ctor(CtorOf::Struct, CtorKind::Fn), _)
+            ) || !typeck.expr_adjustments(callee).is_empty()
+            {
+                return false;
+            }
+            cargs.iter().collect()
+        }
+        _ => return false,
+    };
+    if exprs.len() != n {
+        return false;
+    }
+    exprs.iter().all(|e| {
+        let ok_call = match e.kind {
+            rustc_hir::ExprKind::Call(callee, cargs) => {
+                cargs.is_empty()
+                    && matches!(callee.kind, rustc_hir::ExprKind::Path(_))
+                    && typeck.expr_adjustments(callee).is_empty()
+            }
+            _ => false,
+        };
+        ok_call && typeck.expr_adjustments(e).is_empty()
+    })
 }
 
 /// Trust (B3-2a/B3-2c): recognize the producer's sole first-class `Ty::Enum`
@@ -3052,10 +6420,7 @@ const SCALAR_CANDS: [Ty; 16] = [
 /// honest way to do that — the alternative is an `unwrap` on a value that came from an encoder in
 /// a different crate. `None` declines the site (the caller returns `unsup`), which is the same
 /// outcome the encoder's own `None` produces: miss a flip, never make a wrong one.
-fn rebuild_site_args<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    enc: &[SiteArg],
-) -> Option<ty::GenericArgsRef<'tcx>> {
+fn rebuild_site_args<'tcx>(tcx: TyCtxt<'tcx>, enc: &[SiteArg]) -> Option<ty::GenericArgsRef<'tcx>> {
     let mut out = Vec::with_capacity(enc.len());
     for a in enc {
         out.push(match a {
@@ -3079,10 +6444,7 @@ fn rebuild_site_const<'tcx>(tcx: TyCtxt<'tcx>, c: &SiteConst) -> Option<ty::Cons
     Some(ty::Const::new_value(tcx, valtree, ty))
 }
 
-fn rebuild_site_valtree<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    vt: &SiteValTree,
-) -> Option<ty::ValTree<'tcx>> {
+fn rebuild_site_valtree<'tcx>(tcx: TyCtxt<'tcx>, vt: &SiteValTree) -> Option<ty::ValTree<'tcx>> {
     Some(match vt {
         SiteValTree::Leaf(bits, size_bytes) => {
             // The width is part of the value's identity — see `SiteValTree::Leaf`. A `None` here
@@ -3117,6 +6479,16 @@ fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> RustcTy<'tcx> {
         }
         SiteTy::Slice(el) => RustcTy::new_slice(tcx, rebuild_site_ty(tcx, el)),
         SiteTy::Array(el, n) => RustcTy::new_array(tcx, rebuild_site_ty(tcx, el), *n),
+        // Trust (wave-CRT): rebuild a reference at `ReErased`. The encoder dropped the region
+        // (`SiteTy::Ref`); the differential erases regions on BOTH sides before pinning callee
+        // identity, so this is intern-equal MODULO regions, which is the equality the comparator
+        // actually tests. A lossy rebuild can only MISS a flip, never make a wrong one.
+        SiteTy::Ref(pointee, mutbl) => RustcTy::new_ref(
+            tcx,
+            tcx.lifetimes.re_erased,
+            rebuild_site_ty(tcx, pointee),
+            *mutbl,
+        ),
         SiteTy::Adt(did, args) => {
             let adt = tcx.adt_def(*did);
             let ga = tcx.mk_args_from_iter(
@@ -3301,6 +6673,180 @@ enum SatPerturb {
     /// This is the wave-DR counterpart of `MarkerOrder`, which acts in `mf_retire` — a function
     /// this class does not use — and is therefore INERT on it.
     DrRetire,
+    /// Trust (wave-MC, 2026-08-20): **CORRUPT THE CALL-CHAIN PLAN ITSELF**, at its single
+    /// constructor — drop the LAST marked call result from the plan's `needs` set.
+    ///
+    /// Every other marker control in this enum perturbs an EMISSION SITE, which the marker LAW
+    /// (`mf_gate::predict` vs `mf_gate::observe`) catches first: the body fails closed as
+    /// `unsupported` and the ORACLE never gets to speak. That makes those controls a fine test of
+    /// the law and NO test of the oracle's marker channel.
+    ///
+    /// This one is deliberately different. Both sides of the law read the SEALED PLAN — the
+    /// emitter through `mf_mark_result`/`mf_operand`, the predicted side through
+    /// `mf_gate::predict_call` — so corrupting the plan moves them TOGETHER, the law stays green,
+    /// and the derived body reaches the comparator carrying a marker sequence that is not built's.
+    /// The property it witnesses is therefore the one this wave rests on: `markers_exact` is a
+    /// real predicate on the call class, and a wrong plan costs the flip at `-O` instead of
+    /// shipping a wrong sequence.
+    ///
+    /// INERT on every body outside `plan_call_markers`' class, and inert on a body whose calls are
+    /// all routed to `_0` (no marked result to drop) — `sat_perturb_count` reports the difference,
+    /// so a control that reached nothing cannot be quoted as one that reached something.
+    McPlan,
+    /// Trust (lane EM, 2026-08-21): the call-forward `&str`-LITERAL pair's control. Swap each
+    /// pair's LIVE order (`StorageLive(_5)` before `StorageLive(_4)`) on BOTH sides of the
+    /// marker law at once — the bit rides the sealed plan, so `predict_call_fwd` and the
+    /// emitter read ONE decision, the law stays green, and the ORACLE
+    /// (`mir_differential::canon_markers` against built) is what must reject the result: the
+    /// two locals are same-typed (`&str`) and same-positioned, but the RETIREMENT run's alpha
+    /// indices — args in reverse operand order, then literal locals — no longer match built's
+    /// first-appearance numbering, so `markers_exact` refuses and the `-O` flip vanishes.
+    /// `MarkerOrder`/`MarkerDrop` act in `mf_retire`, which this class's live site never
+    /// reaches; this is the control the CF_STR emission owns over its own LIVE half, exactly
+    /// as `mc-plan` is wave-MC's control over its plan.
+    CfLitOrder,
+    /// Trust (wave-WB8, 2026-08-21): the chain-forward FINAL retirement's control. Swap the
+    /// retirement's two runs — the in-transit locals retire BEFORE the argument temps — on
+    /// BOTH sides of the marker law at once (the bit rides the sealed plan, so
+    /// `predict_chain_fwd` and the emitter read ONE decision). Every value, every live and
+    /// every dead is still present and balanced; only the run ORDER is wrong, so the law
+    /// stays green and the ORACLE (`mir_differential::canon_markers` against built) is what
+    /// must reject the result — built retires args first, so the first-appearance alpha
+    /// numbering of the swapped run no longer matches and `markers_exact` refuses, taking
+    /// the `-O` flip with it. Set only when the plan carries at least one in-transit local
+    /// (a ByValue-only chain has one run and the swap is inert — `sat_perturb_count` reports
+    /// the difference, so a control that reached nothing cannot be quoted as one that did).
+    ///
+    /// Trust (lane S3, 2026-08-21): the same bit drives the AGGREGATE-OF-CALL-RESULTS class
+    /// ([`MfAggCallPlan::ret_swap`]): its one retirement run — the call-result temps after the
+    /// aggregate assign — runs FORWARD instead of in reverse creation order, on both sides of
+    /// the law at once. Set there only when the run has two or more temps (a one-field body's
+    /// run is inert under the swap), and counted through `agg_perturb_applied`.
+    ChainRetOrder,
+    /// Trust (lane S1F, 2026-08-22): the call-forward FIELD-projection class's control. Emit
+    /// every field argument's reconstructed temp WITHOUT its marker pair — today's wave-30
+    /// spelling, `_t = &((*_p).0); f(move _t)` with no `StorageLive`/`StorageDead` — on BOTH
+    /// sides of the marker law at once: the bit rides the sealed plan (`field_drop`), so
+    /// `predict_call_fwd` and the emitter read ONE decision, the law stays green, and the
+    /// ORACLE (`mir_differential::canon_markers` against built) is what must reject the
+    /// result: built's sequence carries the pair, the derived one does not, `markers_exact`
+    /// refuses and the `-O` flip vanishes — exactly the state these bodies are in before this
+    /// lane. Inert on a body whose plan carries no field argument (`sat_perturb_count` reports
+    /// the difference, so a control that reached nothing cannot be quoted as one that did).
+    CfFieldDrop,
+    /// Trust (lane S1F, 2026-08-22): the call-forward UNIT-STATEMENT class's control. Open the
+    /// statement's `()` temp AFTER the argument temps instead of BEFORE them, on BOTH sides of
+    /// the marker law at once (the bit rides the sealed plan, `unit_late`). The law stays
+    /// green; the ORACLE must refuse: built opens the `()` temp first, so its first-appearance
+    /// alpha slot is `()`-typed, while the perturbed body's is the reference argument's — the
+    /// TYPE component of the marker event sees it, `markers_exact` refuses, and the `-O` flip
+    /// vanishes. Inert on a body whose plan is not a unit statement (`sat_perturb_count`
+    /// reports the difference).
+    CfUnitLate,
+    /// Trust (lane S1F, 2026-08-22): the call-forward EXPLICIT-BORROW PAIR class's control.
+    /// Retire the pairs in the measured EDITION-2021 order (argument temps first, field locals
+    /// after) instead of the 2024 order the derive expansion is built under, on BOTH sides of
+    /// the marker law at once (the bit rides the sealed plan, `pair_swap`). The law stays
+    /// green; the ORACLE must refuse: the retirement run's alpha indices no longer match
+    /// built's first-appearance numbering, `markers_exact` refuses, the `-O` flip vanishes.
+    /// Inert on a body whose plan carries no pair (`sat_perturb_count` reports the difference).
+    CfPairOrder,
+    /// Trust (lane S1F, 2026-08-22): the call-forward REBORROWED-RETURN class's control. Open
+    /// the destination temp AFTER the argument temps instead of BEFORE them, on BOTH sides of
+    /// the marker law at once (the bit rides the sealed plan, `ret_late`). The law stays green;
+    /// the ORACLE must refuse: built's first-appearance slot is the destination (`&Target`),
+    /// the perturbed body's is the argument (`&Self`) — the TYPE component sees it,
+    /// `markers_exact` refuses, the `-O` flip vanishes. Inert outside the class.
+    CfRetLate,
+    /// Trust (lane R53, 2026-08-22): the call-forward POST-OP class's control. Open the post-op
+    /// destination temp AFTER the argument temps instead of BEFORE them, on BOTH sides of the
+    /// marker law at once (the bit rides the sealed plan, `post_late`). The law stays green; the
+    /// ORACLE must refuse: built's first-appearance slot is the destination (the callee's
+    /// return), the perturbed body's is the first argument (a reference) — the alpha indices AND
+    /// the TYPE component both move, `markers_exact` refuses, the `-O` flip vanishes. Inert on a
+    /// body whose plan carries no post-op (`sat_perturb_count` reports the difference).
+    CfPostLate,
+    /// Trust (lane F8, 2026-08-23): the SWITCH-TO-JOIN class's match-candidate TRAMPOLINE, MOVED
+    /// off the plan's first non-last candidate and onto the LAST candidate's edge, which the plan
+    /// never puts one on.
+    ///
+    /// The TOTAL is unchanged, so every later `new_block` index is unchanged and the marker law —
+    /// which models the allocation, not the placement — stays green. An empty `Goto` on either
+    /// edge is the same program, so the derived-MIR channel cannot refuse it either. The ONLY
+    /// channel that can is `mir_differential::canon_markers`, which walks the RAW CFG and
+    /// therefore sees the join one fine block early. A perturbed compile that still reports
+    /// `markers_exact` is a marker channel that is not reading block position at all.
+    ///
+    /// `sat_perturb_count` is bumped only when the plan really had a trampoline to move — a class
+    /// that never fires is an INERT control.
+    SwTramp,
+    /// Trust (lane F8B, 2026-08-23): the DISCRIMINANT-MATCH class's match-candidate TRAMPOLINE,
+    /// MOVED off the plan's first entry and onto the DEFAULT edge's arm block, which the plan
+    /// never puts one on.
+    ///
+    /// The TOTAL is unchanged, so every later `new_block` index is unchanged and the marker law —
+    /// which models the allocation, not the placement — stays green. An empty `Goto` on either
+    /// edge is the same program, so the derived-MIR channel cannot refuse it either. The ONLY
+    /// channel that can is `mir_differential::canon_markers`, which walks the RAW CFG and
+    /// therefore sees this class's marked blocks at different fine indices. A perturbed compile
+    /// that still reports `markers_exact` is a marker channel that is not reading block position.
+    ///
+    /// `sat_perturb_count` is bumped only when the plan really had a trampoline to move — a class
+    /// that never fires is an INERT control.
+    SwrTramp,
+    /// Trust (lane G25, 2026-08-23): the two lane-G25 emissions, each MOVED to a position the
+    /// plan never puts it at, with the TOTAL unchanged — so the marker law (which models the
+    /// same move on both sides, from the same sealed bit) stays GREEN and only the frozen ORACLE
+    /// can refuse.
+    ///
+    ///   * the DELAYED statement is hoisted to the top of its consumer's group — emitted
+    ///     immediately after the consumer's own result temp, BEFORE the leading operand temp,
+    ///     instead of at the operand position built evaluates it at. Same three `StorageLive`s,
+    ///     same three assigns, two of them exchanged;
+    ///   * the SUGAR condition's `StorageDead` is scheduled at the THEN arm's entry instead of
+    ///     the JOIN. Built retires it at the join (`bb3: StorageDead(_4); return`); the whole-body
+    ///     multiset of markers is unchanged and only the BLOCK differs.
+    ///
+    /// The bit is set only when the sealed plan really carries one of the two to move, so a body
+    /// the class never reaches is not counted (an inert control is not a control).
+    /// Trust (lane SC, 2026-08-24): the STATEMENT-CALL SEQUENCE class's control — EVERY
+    /// group's `()` temp opened AFTER its argument temps instead of before them. It is the
+    /// N >= 2 sibling of [`Self::CfUnitLate`] and rides the sealed plan the same way, so BOTH
+    /// sides of the marker law move together, the law stays GREEN, and only the ORACLE
+    /// (`mir_differential::canon_markers` against built) can reject the result.
+    ///
+    /// It is observable for a reason worth stating: built's FIRST-APPEARANCE slot in block 0 is
+    /// the `()` temp, and the perturbed body's is the first argument temp, so BOTH components the
+    /// canonical event carries move at once — the alpha index (`s0` becomes the argument) and the
+    /// declared TYPE (`()` becomes the argument's reference type). A perturbation that moved only
+    /// one of the two would be a weaker control.
+    SeqUnitLate,
+    /// Trust (lane G21, 2026-08-25): the SHORT-CIRCUIT-OVER-CALLS class's control — the RHS
+    /// call's argument temps retired FORWARD at its successor instead of in reverse creation
+    /// order. Same statements, same markers, two of them exchanged.
+    ///
+    /// It rides the SEALED PLAN — one bit, read ONCE in [`mf_gate::MfPlans::seal`] and then by
+    /// BOTH the emitter and [`mf_gate::predict_bc`] — so the marker law stays GREEN and the
+    /// frozen ORACLE is the only thing that can reject it. That is the whole point of a control
+    /// of this shape: a class whose markers were decorative would still flip under it.
+    ///
+    /// The bit is set only when the RHS call really carries TWO OR MORE argument temps to
+    /// exchange, so `g21_perturb_applied` counts real applications and an inert body is never
+    /// counted as a control that fired.
+    G21RetOrder,
+    /// Trust (lane G17, 2026-08-25): the DEEP UNIT-CHAIN class's control — the statement's `()`
+    /// temp opened AFTER every argument temp instead of before them. It is the deep-chain sibling
+    /// of [`Self::CfUnitLate`] and [`Self::SeqUnitLate`] and rides the sealed plan the same way,
+    /// so BOTH sides of the marker law move together, the law stays GREEN, and only the ORACLE
+    /// (`mir_differential::canon_markers` against built) can reject the result.
+    ///
+    /// It is observable for the reason lane SC's is: built's FIRST-APPEARANCE slot in block 0 is
+    /// the `()` temp, and the perturbed body's is the outermost call's leading argument temp, so
+    /// BOTH components of the canonical event move at once — the alpha index and the declared
+    /// TYPE (`()` becomes the argument's reference type). The bit is set only when a `()` temp
+    /// really exists to move, so `uc_unit_perturb_applied` counts real applications only.
+    UcUnitLate,
+    G25Hoist,
 }
 
 impl SatPerturb {
@@ -3319,6 +6865,20 @@ impl SatPerturb {
             "payload-tramp" => Self::PayloadTramp,
             "dr-tramp" => Self::DrTramp,
             "dr-retire" => Self::DrRetire,
+            "mc-plan" => Self::McPlan,
+            "cf-lit-order" => Self::CfLitOrder,
+            "chain-ret-order" => Self::ChainRetOrder,
+            "cf-field-drop" => Self::CfFieldDrop,
+            "cf-unit-late" => Self::CfUnitLate,
+            "cf-pair-order" => Self::CfPairOrder,
+            "cf-ret-late" => Self::CfRetLate,
+            "cf-post-late" => Self::CfPostLate,
+            "sw-tramp" => Self::SwTramp,
+            "swr-tramp" => Self::SwrTramp,
+            "seq-unit-late" => Self::SeqUnitLate,
+            "uc-unit-late" => Self::UcUnitLate,
+            "g21-ret-order" => Self::G21RetOrder,
+            "g25-hoist" => Self::G25Hoist,
             _ => return None,
         })
     }
@@ -3375,7 +6935,9 @@ fn mf_split_arm_deads(order: Vec<Local>, perturb: bool) -> (Vec<Local>, Vec<Loca
 ///    the same HIR and trust-ir the plans always read and computes the same answer every time.
 ///    `cx.mf_borrow = true` does not compile (no such field); `cx.mf_plans.borrow = true` does not
 ///    compile (private field); and the strongest legal spelling, re-sealing
-///    (`cx.mf_plans = MfPlans::seal(tcx, def, func)`), is a no-op BY CONSTRUCTION. Attack 1 is
+///    (`cx.mf_plans = MfPlans::seal(tcx, def, func, module, callees)`), is a no-op BY
+///    CONSTRUCTION.
+///    Attack 1 is
 ///    closed at compile time, not by a check.
 /// 2. **THE DECISION AND THE EMISSION ARE ONE OPERATION** ([`super::ShimCx::mf_mark_result`] and
 ///    its four siblings). The plan query is INSIDE the emitting method, in this module, and there
@@ -3419,19 +6981,25 @@ mod mf_gate {
 
     use rustc_index::IndexVec;
     use rustc_middle::mir::{
-        BasicBlock, BasicBlockData, Local, LocalDecl, Operand, Rvalue, Statement, StatementKind,
+        BasicBlock, BasicBlockData, Local, LocalDecl, Operand, Place, Rvalue, Statement,
+        StatementKind,
     };
     use rustc_middle::ty::{self, TyCtxt};
     use rustc_span::def_id::LocalDefId;
-    use trust_ir::{BlockId, Inst, Ty, ValueId};
+    use trust_ir::{BlockId, Constant, Inst, InstrNode, Ty, ValueId};
 
     use super::{
-        DrArm, MfBranch, MfBranchPlan, MfCheckedPlan, MfDrPlan, MfLoopPlan, MfPayloadPlan,
-        MfWritePlan, RustcTy, agg_return_chains, checked_params_mint_no_local, loop_plan_available,
-        loop_source_form_admits, plan_branch_markers, plan_checked_markers,
-        plan_deref_match_markers, plan_field_write_markers, plan_interior_borrow_markers,
-        plan_loop_markers, plan_operand_marker_temps, plan_payload_markers, source_form_admits,
-        source_form_marker_plan_available,
+        BcRole, CfPostOp, ChainSlot, DrArm, MfAggCallPlan, MfBcPlan, MfBranch, MfBranchPlan,
+        MfCallFwdPlan, MfCallPlan, MfChainFwdPlan, MfCheckedPlan, MfDrPlan, MfLoopPlan,
+        MfPayloadPlan, MfSeqCallPlan, MfSwPlan, MfSwrPlan, MfUnitChainPlan, MfWritePlan, RustcTy,
+        SeqCallGroup, SwrSlot, UcOperand, agg_return_chains, checked_params_mint_no_local,
+        loop_plan_available, loop_source_form_admits, plan_agg_call_markers, plan_bc_markers,
+        plan_branch_markers, plan_call_fwd_markers, plan_call_markers, plan_chain_fwd_markers,
+        plan_checked_markers, plan_deref_match_markers, plan_field_write_markers,
+        plan_interior_borrow_markers, plan_loop_markers, plan_operand_marker_temps,
+        plan_payload_markers, plan_seq_call_markers, plan_switch_join_markers,
+        plan_switch_ref_markers, plan_unit_chain_markers, recognize_str_return,
+        rot_let_source_admits, source_form_admits, source_form_marker_plan_available,
     };
 
     /// Trust (lane MF-R7, 2026-08-14): **THE SEALED PLANS.** Every marker permission this shim
@@ -3455,6 +7023,13 @@ mod mf_gate {
         payload: Option<MfPayloadPlan>,
         /// Trust (wave-CK): the checked-arithmetic chain — one pair per non-outermost link.
         checked: Option<MfCheckedPlan>,
+        /// Trust (lane G21, 2026-08-25): the SHORT-CIRCUIT-OVER-CALLS plan — `f(..) || g(..)`,
+        /// the first class whose body carries BOTH a `CondBr` and an `Inst::Call`. When it holds
+        /// it OWNS `branch` (and therefore `operand`) through [`super::MfBcPlan::branch_plan`], so
+        /// lane K's trampoline, its arm-entry deads and its join retirement are placed by the one
+        /// implementation that already places them; this field carries the two things lane K has
+        /// no shape for — which call node each role owns, and each call's argument list.
+        bc: Option<MfBcPlan>,
         /// Trust (lane L9): the LOOP plan — the six-block `loop { if c { break; } BODY }` shape,
         /// the first marker plan whose class carries a BACK EDGE. When it holds, `branch` and
         /// `operand` are DERIVED FROM IT ([`super::MfLoopPlan::branch_plan`]) so the condition's
@@ -3465,6 +7040,54 @@ mod mf_gate {
         /// Trust (wave-DR): the deref-recursion match plan — the whole marker sequence of a
         /// by-ref match whose payload arms recurse through an overloaded `Deref`.
         dr: Option<MfDrPlan>,
+        /// Trust (wave-MC): the by-value CALL-CHAIN plan — the ninth whole-body claim, and the
+        /// first whose class is defined by an instruction that SPLITS the MIR chain inside one
+        /// trust-ir block. When it holds, `operand` is DERIVED FROM IT (its marked-result set), so
+        /// the argument temps and their retirements are placed by wave-MF's existing
+        /// `mf_operand`/`mf_retire_at` machinery and there is exactly one implementation of them.
+        call: Option<MfCallPlan>,
+        /// Trust (wave-CF, revived by wave-FR): the CALL-FORWARD plan — the argument temps of a
+        /// `[Const]* Call Return` tail-forward body, in operand order. Asked LAST, when every
+        /// other claim (wave-MC's by-value call chain included) has declined.
+        call_fwd: Option<MfCallFwdPlan>,
+        /// Trust (lane F8, 2026-08-23): the SWITCH-TO-JOIN plan — the scrutinee slot of an
+        /// all-single-candidate const-armed `match`, plus the match-candidate trampoline table
+        /// its derived block graph needs. When it holds it OWNS `operand` (its one marked result
+        /// IS the operand set), so the scrutinee's temps are placed by wave-MF's existing
+        /// `mf_operand`/`mf_mark_result`/`mf_retire` machinery and its cross-block retirement by
+        /// lane K's existing `mf_entry_deads`; there is exactly one implementation of each.
+        sw: Option<MfSwPlan>,
+        /// Trust (lane F8B, 2026-08-23): the DISCRIMINANT-MATCH plan — an enum-discriminant
+        /// `match` whose candidates may be OR-PATTERNS, with the one marker pair built mints for
+        /// it. It does NOT own `operand`: its head mints no marked result (the discriminant read
+        /// is built's `_d = Discriminant(place)`, which built gives no temp), so the operand
+        /// machinery has nothing to place and stands aside untouched.
+        swr: Option<MfSwrPlan>,
+        /// Trust (wave-WB8, 2026-08-21): the CHAIN-FORWARD plan — the whole marker model of a
+        /// single-block all-calls chain body (`[call]+ final-call ret`). Asked LAST of all,
+        /// when every other claim — the one-call tail-forward included — has declined.
+        chain: Option<MfChainFwdPlan>,
+        /// Trust (lane S3, 2026-08-21): the AGGREGATE-OF-CALL-RESULTS plan — the whole marker
+        /// model of a `[call]+ const insertfield+ ret` body whose calls are nullary and whose
+        /// results are the returned struct's fields in order (`derive(Default)`). Asked LAST of
+        /// all, after even the chain-forward class has declined.
+        agg_call: Option<MfAggCallPlan>,
+        /// Trust (lane SC, 2026-08-24): the STATEMENT-CALL SEQUENCE plan — the whole marker model
+        /// of an `[call]{2,} ret` body whose calls are all RESULT-LESS unit statements. Asked
+        /// LAST of all, after even the aggregate-of-call-results class has declined.
+        seq_call: Option<MfSeqCallPlan>,
+        /// Trust (lane G17): the DEEP UNIT-CHAIN plan — see [`MfUnitChainPlan`].
+        unit_chain: Option<MfUnitChainPlan>,
+        /// Trust (lane G25, 2026-08-23): did [`super::SatPerturb::G25Hoist`] find something to
+        /// move in THIS body — a delayed statement or a sugar condition? Read ONCE, in the plan
+        /// constructor, so BOTH sides of the marker law move together and the count reports real
+        /// applications only.
+        g25_hoist: bool,
+        /// Trust (wave-MC): did [`super::SatPerturb::McPlan`] REALLY drop a marked result from
+        /// this body's plan? A control that reached nothing must not be counted as one that
+        /// reached something, so `lower_ir_to_mir` bumps `sat_perturb_count` from this and from
+        /// nothing else.
+        mc_perturbed: bool,
     }
 
     /// Trust (lane MF-R7): **THE RUNTIME IDENTITY PIN** — does `def` name the body `func` is?
@@ -3475,7 +7098,9 @@ mod mf_gate {
     /// let def = tcx.typeck_root_def_id(def.to_def_id()).as_local().unwrap_or(def);
     /// ```
     ///
-    /// It leaves both `MfPlans::seal(tcx, def, func)` spellings verbatim, the occurrence pin at
+    /// It leaves both `MfPlans::seal(tcx, def, func, module, callees)` spellings verbatim, the
+    /// occurrence
+    /// pin at
     /// two, `cx.mf_plans =` at zero — and points BOTH sides of the law at a different body's HIR.
     /// Four closure bodies went admitted-and-wrong, and four more moved the other way. Occurrence
     /// counting cannot see a shadow, so the pin has to be a RUNTIME comparison against an identity
@@ -3508,7 +7133,47 @@ mod mf_gate {
         /// exclusive — every one of them is a claim about the WHOLE body, so two holding at once is
         /// two whole-body claims about one body, which is the state the third review measured — and
         /// this is the one place that exclusivity is resolved.
-        pub(super) fn seal(tcx: TyCtxt<'_>, def: LocalDefId, func: &trust_ir::Function) -> MfPlans {
+        ///
+        /// Trust (lane S3): `module` is the body's OWN module — the producer's struct table the
+        /// aggregate-of-call-results plan reads its field types from — and nothing else is
+        /// read from it; `func` is that module's `FuncId(0)` function.
+        ///
+        /// Trust (lane G17): `callees` is the producer's identity ledger for THIS body, and
+        /// exactly one thing is read from it — [`crate::CalleeRef::ret_ty`], the result type the
+        /// call sites bind, which the deep unit-chain plan needs and the per-body module does not
+        /// carry. It is threaded here rather than re-derived because re-deriving it would mean
+        /// asking `tcx` for the callee's signature — the source the EMITTER types its locals from
+        /// — so the two sides of the marker law would then agree by construction and the type
+        /// component would go vacuous.
+        pub(super) fn seal(
+            tcx: TyCtxt<'_>,
+            def: LocalDefId,
+            func: &trust_ir::Function,
+            module: &trust_ir::Module,
+            callees: &[super::CalleeRef],
+        ) -> MfPlans {
+            // Trust (wave-MC): the ONE read of the SAT control inside the plan constructor. It is
+            // read here rather than at an emission site precisely so that BOTH sides of the marker
+            // law move together — see [`super::SatPerturb::McPlan`].
+            let mc_perturb = tcx
+                .sess
+                .opts
+                .unstable_opts
+                .trust_sat_perturb
+                .as_deref()
+                .and_then(super::SatPerturb::from_flag)
+                == Some(super::SatPerturb::McPlan);
+            // Trust (lane G25): the ONE read of THIS lane's SAT control, in the plan constructor
+            // and nowhere else — so both readers of the move (the predicted walk and the emitter)
+            // take it from the same sealed value and the marker law stays green.
+            let g25_perturb = tcx
+                .sess
+                .opts
+                .unstable_opts
+                .trust_sat_perturb
+                .as_deref()
+                .and_then(super::SatPerturb::from_flag)
+                == Some(super::SatPerturb::G25Hoist);
             let none = MfPlans {
                 operand: None,
                 branch: None,
@@ -3517,7 +7182,18 @@ mod mf_gate {
                 payload: None,
                 checked: None,
                 loop_: None,
+                bc: None,
                 dr: None,
+                call: None,
+                call_fwd: None,
+                sw: None,
+                swr: None,
+                chain: None,
+                agg_call: None,
+                seq_call: None,
+                unit_chain: None,
+                g25_hoist: false,
+                mc_perturbed: false,
             };
             // Trust (lane MF-R7): the identity pin, before any HIR is read. See
             // [`names_this_body`].
@@ -3567,10 +7243,107 @@ mod mf_gate {
             } else {
                 None
             };
+            // Trust (lane F8, 2026-08-23): a whole-body claim resolved HERE, against every
+            // plan already answered above, in the one place that resolves them. The exclusions
+            // are STRUCTURAL and each is a CHECKED fact rather than a coincidence of refusals:
+            // this class's head terminator is an `Inst::Switch`, which is outside
+            // `plan_operand_marker_temps`' single-block class and outside `plan_branch_markers`'
+            // (and therefore `plan_loop_markers`') `Br|CondBr|Return` terminator set; its body
+            // carries no `Overflow`/`Select`/`Assert` (`plan_checked_markers`) and no
+            // `Inst::Call` at all (`plan_call_markers`, `plan_call_fwd_markers`,
+            // `plan_chain_fwd_markers`, the aggregate-of-calls class); and the two `Switch`-head
+            // classes that do exist are disjoint from it by their own arm grammars — a payload
+            // arm and a deref-call unit are neither a folded `Inst::Const`. The conjunction below
+            // does not RELY on any of that: `sw` stands aside for all of them, checked. It is
+            // asked BEFORE `source_form_ok` because when it holds it OWNS `operand`.
+            let sw = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+            {
+                plan_switch_join_markers(func)
+            } else {
+                None
+            };
+            // Trust (lane F8B, 2026-08-23): the FIFTEENTH whole-body claim, resolved HERE
+            // against every plan already answered above, in the one place that resolves them.
+            // Asked AFTER wave-DR and lane F8 and gated on both, because all three read a
+            // `Switch`-headed body and the honest resolution of an overlap is that the plan
+            // that measured the body first keeps it. The exclusions below are STRUCTURAL and
+            // each is a CHECKED fact rather than a coincidence of refusals: this class's head
+            // terminator is an `Inst::Switch`, which is outside `plan_operand_marker_temps`'
+            // single-block class and outside `plan_branch_markers`' (and therefore
+            // `plan_loop_markers`') `Br|CondBr|Return` terminator set; its body carries no
+            // `Overflow`/`Assert` (`plan_checked_markers`) and no `Inst::Call` at all
+            // (`plan_call_markers`, `plan_call_fwd_markers`, `plan_chain_fwd_markers`, the
+            // aggregate-of-calls class).
+            let swr = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && sw.is_none()
+            {
+                plan_switch_ref_markers(func)
+            } else {
+                None
+            };
+            // Trust (lane G21, 2026-08-25): the SIXTEENTH whole-body claim, resolved HERE
+            // against every plan already answered above, in the one place that resolves them, and
+            // BEFORE the source-form lane is decided — because when it holds it OWNS `branch`,
+            // exactly as the loop plan does.
+            //
+            // The exclusions are STRUCTURAL and each is a CHECKED fact rather than a coincidence
+            // of refusals: this class's head block is `[Call, CondBr]`, and a `CondBr` terminator
+            // is outside `plan_payload_markers`' and `plan_deref_match_markers`' and lane F8's and
+            // lane F8B's `Switch`-headed grammars and outside `plan_checked_markers`' one-block
+            // `Overflow`/`Select`/`Assert` grammar, while the `Inst::Call` is outside
+            // `plan_operand_marker_temps`' and `plan_branch_markers`' operand lists (neither has a
+            // `Call` arm) and outside wave-MC's ONE-block call class. The two SOURCE-FORM plans
+            // are read from HIR rather than from the trust-ir, so their disjointness is not
+            // visible in an instruction set at all and they are excluded by the conjuncts below,
+            // in the same order and for the same reason every other class excludes them: a body
+            // may carry exactly one whole-body marker claim. The ORDER is what makes that
+            // fail-closed rather than assumed.
+            let bc = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && sw.is_none()
+                && swr.is_none()
+                && source_form_admits(tcx, def)
+            {
+                // Trust (lane G21): the ONE read of this class's SAT control, inside the plan
+                // constructor for the same reason every other class reads its control here —
+                // BOTH sides of the marker law take the move from the same sealed value. The bit
+                // is set only when there really are two or more temps to exchange, so
+                // `g21_perturb_applied` counts real applications and an inert body is not one.
+                let g21_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::G21RetOrder);
+                plan_bc_markers(func).map(|mut p| {
+                    if g21_perturb && p.rhs_args.len() >= 2 {
+                        p.ret_swap = true;
+                    }
+                    p
+                })
+            } else {
+                None
+            };
             let source_form_ok = payload.is_none()
                 && checked.is_none()
                 && dr.is_none()
-                && source_form_marker_plan_available(write, borrow, source_form_admits(tcx, def));
+                && source_form_marker_plan_available(write, borrow, source_form_admits(tcx, def))
+                && sw.is_none()
+                && swr.is_none()
+                && bc.is_none();
             let branch = if source_form_ok { plan_branch_markers(func) } else { None };
             // Trust (lane L9): the SEVENTH whole-body claim, resolved here against the other six
             // in the one place that resolves them. It is asked ONLY when the acyclic branch plan
@@ -3591,20 +7364,449 @@ mod mf_gate {
             let loop_ = if loop_plan_available(write, borrow, &payload, &checked, &dr, &branch)
                 && loop_source_form_admits(tcx, def)
             {
-                plan_loop_markers(func)
+                plan_loop_markers(func, rot_let_source_admits(tcx, def))
             } else {
                 None
             };
+            // Trust (lane G21): the loop plan and this one cannot both hold — this class is
+            // ACYCLIC (four blocks: head, two arms, join, no back edge) and `plan_loop_markers`
+            // REQUIRES a back edge — but the resolution is written down rather than assumed,
+            // fail-closed and in the older claim's favour: a body that somehow satisfied both
+            // keeps the loop plan and this one stands aside entirely. Spelled HERE rather than as
+            // a conjunct in the gate above so the loop plan stays gated on its RELATION and
+            // nothing else, which `plan_exclusivity_tests` pins character for character.
+            let bc = if loop_.is_some() { None } else { bc };
             let branch = match &loop_ {
                 Some(lp) => Some(lp.branch_plan()),
                 None => branch,
+            };
+            // Trust (lane G21): when the short-circuit-over-calls class holds it OWNS `branch`,
+            // exactly as the loop plan owns it one statement up — its table is lane K's own
+            // `MfBranch` for the one head, and its marked-result set becomes `operand` below, so
+            // the trampoline, the arm-entry deads and the join retirement have exactly one
+            // implementation placing them. The value it replaces is ALWAYS `None`:
+            // `source_form_ok` carries `bc.is_none()` and `branch` is gated on `source_form_ok`,
+            // and `loop_` is gated on `bc.is_none()` as well.
+            let branch = match &bc {
+                Some(p) => Some(p.branch_plan()),
+                None => branch,
+            };
+            // Trust (wave-MC): the NINTH whole-body claim, resolved here against the other eight
+            // in the one place that resolves them, and BEFORE the operand lane is decided —
+            // because when it holds it OWNS `operand` exactly as the loop plan owns `branch`.
+            //
+            // The exclusions are STRUCTURAL and each is a CHECKED fact, not a coincidence of
+            // refusals:
+            //
+            //   * `plan_operand_marker_temps` and `plan_branch_markers` have no `Inst::Call` arm
+            //     in their operand lists, and `plan_call_markers` REQUIRES one — so the three are
+            //     disjoint by their own instruction sets, in both directions.
+            //   * `plan_checked_markers` demands `Overflow`/`Select`/`Assert`, `plan_payload_markers`
+            //     a four-block `Switch` body, `plan_deref_match_markers` a `Switch` head, and
+            //     `plan_loop_markers` a back edge; this class is ONE block whose instruction set
+            //     contains none of those.
+            //   * the two SOURCE-FORM plans (`write`, `borrow`) are read from HIR rather than from
+            //     the trust-ir, so their disjointness is not visible in an instruction set at all.
+            //     They are excluded by the conjuncts below, in the same order and for the same
+            //     reason the payload plan excludes them: a body may carry exactly one whole-body
+            //     marker claim.
+            //
+            // The ORDER is what makes that fail-closed rather than assumed: `call` is asked only
+            // after every other plan has answered, and it stands aside for all of them.
+            let call = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && branch.is_none()
+                && loop_.is_none()
+                && source_form_admits(tcx, def)
+            {
+                plan_call_markers(func).map(|(mut needs, plan)| {
+                    let mut hit = false;
+                    if mc_perturb {
+                        // Drop the LAST marked result, by SSA order, so the corruption is
+                        // deterministic and names one slot. `hit` is the honest report of whether
+                        // there WAS one to drop.
+                        if let Some(last) = plan
+                            .call_nodes
+                            .iter()
+                            .rev()
+                            .filter_map(|i| func.blocks[0].body[*i].results.first().copied())
+                            .find(|r| needs.contains(r))
+                        {
+                            needs.remove(&last);
+                            hit = true;
+                        }
+                    }
+                    (needs, plan, hit)
+                })
+            } else {
+                None
             };
             let operand = match &branch {
                 Some(p) => Some(p.needs.clone()),
                 None if source_form_ok => plan_operand_marker_temps(func),
                 None => None,
             };
-            MfPlans { operand, branch, write, borrow, payload, checked, loop_, dr }
+            // Trust (lane F8): when the switch-to-join class holds it OWNS `operand`, exactly as
+            // the loop plan owns `branch` and wave-MC owns `operand` below — its ONE marked
+            // result is the operand set, so `mf_mark_result`/`mf_operand`/`mf_retire` place the
+            // scrutinee's temps through the one implementation lane K and wave-MF already share.
+            // The value it replaces is ALWAYS `None`: `source_form_ok` carries `sw.is_none()` and
+            // `branch` is gated on `source_form_ok`, so both arms above have already declined.
+            let operand = match &sw {
+                Some(p) => {
+                    let mut needs: HashSet<ValueId> = HashSet::new();
+                    needs.insert(p.scrutinee);
+                    Some(needs)
+                }
+                None => operand,
+            };
+            // Trust (wave-MC): when the call class holds it OWNS `operand`, exactly as the loop
+            // plan owns `branch` two statements up — its marked-result set IS the operand set, so
+            // `mf_mark_result`/`mf_operand`/`mf_retire_at` place its temps through the one
+            // implementation lane K and wave-MF already share, and the plan itself stays in
+            // `call`, where only `MfPlans::call_site` can read it.
+            //
+            // The value it replaces is ALWAYS `None`, and that is a checked fact rather than an
+            // assumption: `plan_call_markers` requires an `Inst::Call` and
+            // `plan_operand_marker_temps`' `operands_of` has no `Call` arm, so the general lane
+            // has already declined every body this one claims. Writing it as an override rather
+            // than as an arm of the match above keeps that match character-for-character the
+            // expression `a_specialized_body_cannot_also_hold_the_operand_or_branch_plan` pins.
+            let mut mc_perturbed = false;
+            let (operand, call) = match call {
+                Some((needs, plan, hit)) => {
+                    mc_perturbed = hit;
+                    (Some(needs), Some(plan))
+                }
+                None => (operand, None),
+            };
+            // Trust (wave-CF, revived by wave-FR 2026-08-21): the TENTH whole-body claim,
+            // resolved here against the other nine in the one place that resolves them — and
+            // asked LAST, so every one of them has already DECLINED before it is asked. That
+            // ordering is what makes the exclusion a checked fact rather than a coincidence of
+            // nine refusals.
+            //
+            // The structural reasons each one declines are worth stating, because "they happen
+            // to refuse it" is exactly the premise that stops being true one wave later: a
+            // `[Const]* Call Return` tail-forward body is outside `plan_operand_marker_temps`'
+            // instruction set (`operands_of` has no `Inst::Call` arm), outside
+            // `plan_branch_markers`' and `plan_loop_markers`' classes (no `CondBr`, no back
+            // edge), outside `plan_payload_markers`' and `plan_deref_match_markers`' four-block
+            // `Switch` grammars, outside `plan_checked_markers`'
+            // `Overflow`/`Select`/`Assert` grammar, outside both source-form plans (whose
+            // bodies are a field write and a single `&place`) — and outside wave-MC's
+            // `plan_call_markers`, whose operand admission has its class boundary at `Ty::Ptr`
+            // (a reference argument refuses it) while THIS plan's grammar requires the call to
+            // be the last body node with its result routed to `_0`, a shape wave-MC also
+            // admits but only for by-value operands. The conjunction below does not RELY on
+            // any of that: `call_fwd` stands aside for every one of them, checked.
+            let call_fwd = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && branch.is_none()
+                && loop_.is_none()
+                && call.is_none()
+                && operand.is_none()
+            {
+                // Trust (lane EM): the ONE read of the CF SAT control, inside the plan
+                // constructor for the same reason wave-MC reads `mc_perturb` here — BOTH sides
+                // of the marker law move together. The bit is set only when the plan really
+                // carries a literal pair to swap, so `cf_perturb_applied` counts real
+                // applications only (a class that never fires is an inert control).
+                let cf_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::CfLitOrder);
+                // Trust (lane S1F): the ONE read of the field-drop control, here for the same
+                // reason — the bit is set only when the plan really carries a field argument.
+                let cf_field_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::CfFieldDrop);
+                let cf_unit_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::CfUnitLate);
+                let cf_pair_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::CfPairOrder);
+                let cf_ret_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::CfRetLate);
+                let cf_post_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::CfPostLate);
+                plan_call_fwd_markers(tcx, def, func).map(|mut p| {
+                    if cf_perturb && !p.lits.is_empty() {
+                        p.lit_swap = true;
+                    }
+                    if cf_field_perturb && !p.fields.is_empty() {
+                        p.field_drop = true;
+                    }
+                    if cf_unit_perturb && p.unit_stmt {
+                        p.unit_late = true;
+                    }
+                    if cf_pair_perturb && !p.pairs.is_empty() {
+                        p.pair_swap = true;
+                    }
+                    if cf_ret_perturb && p.ret_reborrow {
+                        p.ret_late = true;
+                    }
+                    if cf_post_perturb && p.post.is_some() {
+                        p.post_late = true;
+                    }
+                    p
+                })
+            } else {
+                None
+            };
+            // Trust (wave-WB8, 2026-08-21): the ELEVENTH whole-body claim, asked LAST of all —
+            // after even the call-forward class has declined — so every exclusion is a checked
+            // fact. The structural reasons each other plan declines: an all-calls body is
+            // outside every instruction-set class (no plan's operand list carries `Inst::Call`
+            // except wave-MC's, whose `Ptr`-param boundary and marked-operand-in-call refusal
+            // exclude a chain of forwarded references), outside the `Switch`/`CondBr`/back-edge
+            // grammars (one block, one `Return`), outside `plan_call_fwd_markers` (its preamble
+            // admits `Const`/`&str`-chain nodes only — an `Inst::Call` there refuses), and
+            // outside both source-form plans. The conjunction below does not RELY on any of
+            // that: `chain` stands aside for every one of them, checked.
+            let chain = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && branch.is_none()
+                && loop_.is_none()
+                && call.is_none()
+                && operand.is_none()
+                && call_fwd.is_none()
+            {
+                // Trust (wave-WB8): the ONE read of the chain SAT control, inside the plan
+                // constructor for the same reason wave-MC and lane EM read theirs here — BOTH
+                // sides of the marker law move together. The bit is set only when the plan
+                // really carries an in-transit local to displace, so `chain_perturb_applied`
+                // counts real applications only (a class that never fires is an inert control).
+                let chain_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::ChainRetOrder);
+                plan_chain_fwd_markers(tcx, def, func).map(|mut p| {
+                    if chain_perturb
+                        && p.slots.iter().any(|s| matches!(s, super::ChainSlot::Reborrow(_)))
+                    {
+                        p.ret_swap = true;
+                    }
+                    p
+                })
+            } else {
+                None
+            };
+            // Trust (lane S3, 2026-08-21): the TWELFTH whole-body claim, asked LAST of all —
+            // after even the chain-forward class has declined — so every exclusion is a checked
+            // fact. The structural reasons each other plan declines: a body of nullary calls
+            // feeding a `Const(Aggregate)`/`InsertField` chain is outside every instruction-set
+            // class (no plan's operand list carries `Inst::Call` except wave-MC's, whose
+            // marked-operand discipline has no aggregate-field consumer, wave-CF's one-call
+            // routed-return grammar and wave-WB8's all-calls grammar — an `InsertField` refuses
+            // both), outside the `Switch`/`CondBr`/back-edge grammars (one block, one
+            // `Return`), and outside both source-form plans. The conjunction below does not
+            // RELY on any of that: `agg_call` stands aside for every one of them, checked.
+            let agg_call = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && branch.is_none()
+                && loop_.is_none()
+                && call.is_none()
+                && operand.is_none()
+                && call_fwd.is_none()
+                && chain.is_none()
+            {
+                // Trust (lane S3): the ONE read of the retirement-order SAT control for this
+                // class, inside the plan constructor for the same reason every other class
+                // reads its control here — BOTH sides of the marker law move together. The bit
+                // is set only when there are at least two temps to displace, so
+                // `agg_perturb_applied` counts real applications only.
+                let agg_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::ChainRetOrder);
+                plan_agg_call_markers(tcx, def, func, module).map(|mut p| {
+                    if agg_perturb && p.results.len() >= 2 {
+                        p.ret_swap = true;
+                    }
+                    p
+                })
+            } else {
+                None
+            };
+            // Trust (lane SC, 2026-08-24): the THIRTEENTH whole-body claim, asked LAST of all —
+            // after even the aggregate-of-call-results class has declined — so every exclusion is
+            // a checked fact. The structural reasons each other plan declines: a body of N
+            // result-less calls is outside every instruction-set class (no plan's operand list
+            // carries `Inst::Call` except wave-MC's, whose marked-operand discipline has no
+            // statement-sequence consumer), outside the `Switch`/`CondBr`/back-edge grammars (one
+            // block, one `Return`), outside `plan_call_fwd_markers` and `plan_agg_call_markers`
+            // (both refuse a second `Inst::Call` at their own call counts), outside
+            // `plan_chain_fwd_markers` (its calls FEED one another; these declare no result at
+            // all), and outside both source-form plans. The conjunction below does not RELY on
+            // any of that: `seq_call` stands aside for every one of them, checked.
+            let seq_call = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && branch.is_none()
+                && loop_.is_none()
+                && call.is_none()
+                && operand.is_none()
+                && call_fwd.is_none()
+                && chain.is_none()
+                && agg_call.is_none()
+            {
+                // Trust (lane SC): the ONE read of this class's SAT control, inside the plan
+                // constructor for the same reason every other class reads its control here —
+                // BOTH sides of the marker law move together. The bit is set only when a plan
+                // really exists to perturb, so `seq_perturb_applied` counts real applications
+                // only (a class that never fires is an inert control).
+                let seq_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::SeqUnitLate);
+                plan_seq_call_markers(tcx, def, func).map(|mut p| {
+                    if seq_perturb {
+                        p.unit_late = true;
+                    }
+                    p
+                })
+            } else {
+                None
+            };
+            // Trust (lane G17, 2026-08-25): the SEVENTEENTH whole-body claim, asked LAST of all
+            // — after even the statement-call sequence class has declined — so every exclusion is
+            // a checked fact. The structural reasons each other plan declines: a body whose nodes
+            // are nothing but calls and folded literals is outside every instruction-set class
+            // (no plan's operand list carries `Inst::Call` except wave-MC's, whose `Ty::Ptr`
+            // operand boundary refuses a forwarded reference), outside the
+            // `Switch`/`CondBr`/back-edge grammars (one block, one `Return`), outside
+            // `plan_call_fwd_markers` and `plan_agg_call_markers` (both refuse a second
+            // `Inst::Call` at their own call counts), outside `plan_chain_fwd_markers` (whose
+            // "nothing but calls" clause refuses the `Inst::Const`, whose depth-two clause
+            // refuses a chain link consumed by another inner call, and whose per-value naming
+            // refuses the repeated parameter — three independent refusals, each measured on its
+            // own control in `probes/g17.rs`), outside `plan_seq_call_markers` (whose calls
+            // declare NO result; these feed one another), and outside both source-form plans.
+            // The conjunction below does not RELY on any of that: `unit_chain` stands aside for
+            // every one of them, checked.
+            let unit_chain = if write.is_none()
+                && !borrow
+                && payload.is_none()
+                && checked.is_none()
+                && dr.is_none()
+                && branch.is_none()
+                && loop_.is_none()
+                && call.is_none()
+                && operand.is_none()
+                && call_fwd.is_none()
+                && chain.is_none()
+                && agg_call.is_none()
+                && seq_call.is_none()
+            {
+                // Trust (lane G17): the ONE read of this class's SAT control, inside the plan
+                // constructor for the same reason every other class reads its control here —
+                // BOTH sides of the marker law move together. The bit is set only when a `()`
+                // temp really exists to displace, so `uc_unit_perturb_applied` counts real
+                // applications only (a class that never fires is an inert control).
+                let uc_perturb = tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .trust_sat_perturb
+                    .as_deref()
+                    .and_then(super::SatPerturb::from_flag)
+                    == Some(super::SatPerturb::UcUnitLate);
+                plan_unit_chain_markers(tcx, def, func, callees).map(|mut p| {
+                    if uc_perturb && p.unit_stmt {
+                        p.unit_late = true;
+                    }
+                    p
+                })
+            } else {
+                None
+            };
+            // Trust (lane G25): the bit is set only when this body really carries one of the two
+            // emissions to move. A class that reached nothing must not be counted as one that
+            // reached something — an inert control is not a control.
+            let g25_hoist = g25_perturb
+                && branch
+                    .as_ref()
+                    .is_some_and(|p| !p.delayed.is_empty() || !p.sugar.is_empty());
+            MfPlans {
+                operand,
+                branch,
+                write,
+                borrow,
+                payload,
+                checked,
+                loop_,
+                bc,
+                dr,
+                call,
+                call_fwd,
+                sw,
+                swr,
+                chain,
+                agg_call,
+                seq_call,
+                unit_chain,
+                g25_hoist,
+                mc_perturbed,
+            }
         }
 
         /// Trust (lane MF-R7): the plans as a VALUE, for the law's own unit tests. `#[cfg(test)]`
@@ -3623,7 +7825,47 @@ mod mf_gate {
                 payload: None,
                 checked: None,
                 loop_: None,
+                bc: None,
                 dr: None,
+                call: None,
+                call_fwd: None,
+                sw: None,
+                swr: None,
+                chain: None,
+                agg_call: None,
+                seq_call: None,
+                unit_chain: None,
+                g25_hoist: false,
+                mc_perturbed: false,
+            }
+        }
+
+        /// Trust (lane ROT): the loop plan as a VALUE, for the law's own unit tests — wired the
+        /// way [`MfPlans::seal`] wires it: the plan OWNS `branch`, and `operand` is the branch
+        /// table's needs. `#[cfg(test)]` — it does not exist in a shipped driver.
+        #[cfg(test)]
+        pub(super) fn loop_for_test(lp: MfLoopPlan) -> MfPlans {
+            let branch = lp.branch_plan();
+            MfPlans {
+                operand: Some(branch.needs.clone()),
+                branch: Some(branch),
+                write: None,
+                borrow: false,
+                payload: None,
+                checked: None,
+                loop_: Some(lp),
+                bc: None,
+                dr: None,
+                call: None,
+                call_fwd: None,
+                sw: None,
+                swr: None,
+                chain: None,
+                agg_call: None,
+                seq_call: None,
+                unit_chain: None,
+                g25_hoist: false,
+                mc_perturbed: false,
             }
         }
 
@@ -3641,7 +7883,18 @@ mod mf_gate {
                 payload: None,
                 checked: None,
                 loop_: None,
+                bc: None,
                 dr: None,
+                call: None,
+                call_fwd: None,
+                sw: None,
+                swr: None,
+                chain: None,
+                agg_call: None,
+                seq_call: None,
+                unit_chain: None,
+                g25_hoist: false,
+                mc_perturbed: false,
             }
         }
 
@@ -3657,7 +7910,18 @@ mod mf_gate {
                 payload: Some(payload),
                 checked: None,
                 loop_: None,
+                bc: None,
                 dr: None,
+                call: None,
+                call_fwd: None,
+                sw: None,
+                swr: None,
+                chain: None,
+                agg_call: None,
+                seq_call: None,
+                unit_chain: None,
+                g25_hoist: false,
+                mc_perturbed: false,
             }
         }
 
@@ -3666,11 +7930,151 @@ mod mf_gate {
             self.operand.as_ref().is_some_and(|p| p.contains(&r))
         }
 
+        /// Trust (lane G25): is this head's `CondBr` condition the `||`/`&&` SUGAR — a bare block
+        /// parameter built materialises into a temp of its own? `false` for every head lane K
+        /// admitted before this lane, which is what keeps the emitter's pre-lane form reachable.
+        fn sugar_cond(&self, blk: BlockId) -> bool {
+            self.branch.as_ref().is_some_and(|p| p.sugar.contains(&blk))
+        }
+
+        /// Trust (lane G25): is `r` a DELAYED marked result — one whose whole statement belongs at
+        /// its consumer's operand position rather than at its own node?
+        fn delays(&self, r: ValueId) -> bool {
+            self.branch.as_ref().is_some_and(|p| p.delayed.contains(&r))
+        }
+
         /// Is the body in the operand-temp class at all? (Operand temps and their retirements have
         /// no per-value name of their own; the class is what authorises them, and
         /// [`MfPlans::predict`] is what places them.)
         fn operand_class(&self) -> bool {
             self.operand.is_some()
+        }
+
+        /// Trust (wave-MC): does the call plan own the `Inst::Call` at body-node index `i`? The
+        /// emitter asks this at the ONE site that lowers a call, immediately before it mints the
+        /// destination temp, and gets `false` for every body outside the class — where the arm
+        /// keeps its pre-wave form exactly (no destination marker, `cx.operand` for every
+        /// argument, no retirement at the successor). A call the plan does not list therefore
+        /// ships marker-free rather than with an unbalanced pair.
+        pub(super) fn call_site(&self, i: usize) -> bool {
+            self.call.as_ref().is_some_and(|p| p.call_nodes.contains(&i))
+        }
+
+        /// Trust (lane G21): does the short-circuit-over-calls plan own the `Inst::Call` at body
+        /// node `i` of producer block `blk`, and in which role? The emitter asks this at the ONE
+        /// site that lowers a call and gets `None` for every body outside the class, where the arm
+        /// keeps its pre-lane form exactly.
+        pub(super) fn bc_role(&self, blk: BlockId, i: usize) -> Option<BcRole> {
+            self.bc.as_ref().and_then(|p| p.call_role(blk, i))
+        }
+
+        /// Trust (lane G21): the planned argument list of one role, read by the emitter to
+        /// cross-check the call's own arguments before it mints a single temp.
+        pub(super) fn bc_args(&self, role: BcRole) -> Vec<(ValueId, Ty)> {
+            self.bc.as_ref().map(|p| p.args(role).to_vec()).unwrap_or_default()
+        }
+
+        /// Trust (lane G21): does the plan mark the RHS call's result — i.e. does a POST-OP in
+        /// that call's successor consume it?
+        pub(super) fn bc_rhs_marked(&self) -> bool {
+            self.bc.as_ref().is_some_and(|p| p.rhs_post.is_some())
+        }
+
+        /// Trust (lane G21): the sealed retirement-order bit, read by BOTH sides of the law.
+        pub(super) fn bc_ret_swap(&self) -> bool {
+            self.bc.as_ref().is_some_and(|p| p.ret_swap)
+        }
+
+        /// Trust (lane G21): did [`super::SatPerturb::G21RetOrder`] really exchange THIS body's
+        /// argument retirement? Derived from the plan value itself, so the report cannot drift
+        /// from the decision the two emission sides read.
+        pub(super) fn g21_perturb_applied(&self) -> bool {
+            self.bc.as_ref().is_some_and(|p| p.ret_swap)
+        }
+
+        /// Trust (wave-MC): did [`super::SatPerturb::McPlan`] really corrupt THIS body's plan?
+        pub(super) fn mc_perturb_applied(&self) -> bool {
+            self.mc_perturbed
+        }
+
+        /// Trust (lane G25): did [`super::SatPerturb::G25Hoist`] really find one of this lane's
+        /// two emissions to MOVE in this body? Derived from the sealed plan itself, so the count
+        /// reports real applications and an inert body is not counted.
+        pub(super) fn g25_perturb_applied(&self) -> bool {
+            self.g25_hoist
+        }
+
+        /// Trust (lane G25): the sealed move bit, read by BOTH sides of the marker law.
+        fn hoists(&self) -> bool {
+            self.g25_hoist
+        }
+
+        /// Trust (lane EM): did [`super::SatPerturb::CfLitOrder`] really swap a literal pair's
+        /// live order in THIS body's plan? Derived from the plan value itself rather than a
+        /// sibling field, so the report cannot drift from the decision the two emission sides
+        /// read.
+        pub(super) fn cf_perturb_applied(&self) -> bool {
+            self.call_fwd.as_ref().is_some_and(|p| p.lit_swap)
+        }
+
+        /// Trust (lane S1F): did [`super::SatPerturb::CfFieldDrop`] really strip a field
+        /// argument's marker pair from THIS body's plan? Derived from the plan value itself,
+        /// so the report cannot drift from the decision the two emission sides read.
+        pub(super) fn cf_field_perturb_applied(&self) -> bool {
+            self.call_fwd.as_ref().is_some_and(|p| p.field_drop)
+        }
+
+        /// Trust (lane S1F): did [`super::SatPerturb::CfUnitLate`] really displace THIS body's
+        /// `()` temp? Derived from the plan value itself.
+        pub(super) fn cf_unit_perturb_applied(&self) -> bool {
+            self.call_fwd.as_ref().is_some_and(|p| p.unit_late)
+        }
+
+        /// Trust (lane SC): did [`super::SatPerturb::SeqUnitLate`] really displace THIS body's
+        /// `()` temps? Derived from the plan value itself, so the report cannot drift from the
+        /// decision the two emission sides read.
+        pub(super) fn seq_perturb_applied(&self) -> bool {
+            self.seq_call.as_ref().is_some_and(|p| p.unit_late)
+        }
+
+        /// Trust (lane G17): did [`super::SatPerturb::UcUnitLate`] really displace THIS body's
+        /// `()` temp? Derived from the plan value itself, so the report cannot drift from the
+        /// decision the two emission sides read.
+        pub(super) fn uc_unit_perturb_applied(&self) -> bool {
+            self.unit_chain.as_ref().is_some_and(|p| p.unit_late)
+        }
+
+        /// Trust (lane S1F): did [`super::SatPerturb::CfPairOrder`] really swap THIS body's
+        /// pair retirement order? Derived from the plan value itself.
+        pub(super) fn cf_pair_perturb_applied(&self) -> bool {
+            self.call_fwd.as_ref().is_some_and(|p| p.pair_swap)
+        }
+
+        /// Trust (lane S1F): did [`super::SatPerturb::CfRetLate`] really displace THIS body's
+        /// destination temp? Derived from the plan value itself.
+        pub(super) fn cf_ret_perturb_applied(&self) -> bool {
+            self.call_fwd.as_ref().is_some_and(|p| p.ret_late)
+        }
+
+        /// Trust (lane R53): did [`super::SatPerturb::CfPostLate`] really displace THIS body's
+        /// post-op destination temp? Derived from the plan value itself, so the report cannot
+        /// drift from the decision the two emission sides read.
+        pub(super) fn cf_post_perturb_applied(&self) -> bool {
+            self.call_fwd.as_ref().is_some_and(|p| p.post_late)
+        }
+
+        /// Trust (wave-WB8): did [`super::SatPerturb::ChainRetOrder`] really swap the final
+        /// retirement's two runs in THIS body's plan? Derived from the plan value itself, so
+        /// the report cannot drift from the decision the two emission sides read.
+        pub(super) fn chain_perturb_applied(&self) -> bool {
+            self.chain.as_ref().is_some_and(|p| p.ret_swap)
+        }
+
+        /// Trust (lane S3): did [`super::SatPerturb::ChainRetOrder`] really swap THIS body's
+        /// aggregate-of-call-results retirement run? Derived from the plan value itself, so
+        /// the report cannot drift from the decision the two emission sides read.
+        pub(super) fn agg_perturb_applied(&self) -> bool {
+            self.agg_call.as_ref().is_some_and(|p| p.ret_swap)
         }
 
         /// Lane K's admitted `CondBr` for one producer block.
@@ -3746,6 +8150,12 @@ mod mf_gate {
                 && self.payload.is_none()
                 && self.checked.is_none()
                 && self.dr.is_none()
+                && self.call_fwd.is_none()
+                && self.chain.is_none()
+                && self.agg_call.is_none()
+                && self.seq_call.is_none()
+                && self.unit_chain.is_none()
+                && self.swr.is_none()
             {
                 return Ok(MfSeq::default());
             }
@@ -3773,6 +8183,66 @@ mod mf_gate {
             // predicted sequence bit-identical.
             if let Some(p) = &self.dr {
                 return predict_dr(func, p);
+            }
+            // Trust (lane F8B): the discriminant-match class has its own whole-body walk, for the
+            // same reason the three above do — its markers are placed by the BLOCK the plan names
+            // rather than by the instruction the general walk is standing on, and the general
+            // walk has no model for an `Inst::Switch` outside lane F8's own class. Dispatching
+            // HERE keeps every other class's predicted sequence bit-identical.
+            if let Some(p) = &self.swr {
+                return predict_swr(func, p);
+            }
+            // Trust (lane G21): the short-circuit-over-calls class has its own whole-body
+            // walk, for the same reason the four above do — an `Inst::Call` SPLITS the MIR chain
+            // inside a trust-ir block and lane K's trampoline appends another, so its markers land
+            // in blocks the general walk (one MIR block per trust-ir block) does not visit.
+            // Dispatching HERE keeps every other class's predicted sequence bit-identical.
+            if let Some(p) = &self.bc {
+                return predict_bc(func, p);
+            }
+            // Trust (wave-MC): the call-chain class has its own whole-body walk, for the same
+            // reason the three above do — an `Inst::Call` SPLITS the MIR chain inside a single
+            // trust-ir block, so its markers land in blocks the general walk (which enumerates one
+            // MIR block per trust-ir block) does not visit. Dispatching HERE keeps every other
+            // class's predicted sequence bit-identical.
+            if let Some(p) = &self.call {
+                return predict_call(func, p, self.operand.as_ref());
+            }
+            // Trust (wave-CF, revived by wave-FR): the call-forward class has its own
+            // whole-body walk, for the same reason the four above do — its retirements land in
+            // a MIR block the general walk does not enumerate (the call's SUCCESSOR, appended
+            // after every trust-ir block). Dispatching HERE keeps every other class's
+            // predicted sequence bit-identical.
+            if let Some(p) = &self.call_fwd {
+                return predict_call_fwd(func, p);
+            }
+            // Trust (wave-WB8): the chain-forward class has its own whole-body walk, for the
+            // same reason the five above do — every one of its markers lands in or around MIR
+            // blocks the general walk does not enumerate (each call's `new_block` successor).
+            // Dispatching HERE keeps every other class's predicted sequence bit-identical.
+            if let Some(p) = &self.chain {
+                return predict_chain_fwd(func, p);
+            }
+            // Trust (lane S3): the aggregate-of-call-results class has its own whole-body
+            // walk, for the same reason the six above do — each call's successor is a MIR
+            // block the general walk does not enumerate. Dispatching HERE keeps every other
+            // class's predicted sequence bit-identical.
+            if let Some(p) = &self.agg_call {
+                return predict_agg_call(func, p);
+            }
+            // Trust (lane SC): the statement-call sequence class has its own whole-body walk,
+            // for the same reason the seven above do — every one of its retirements lands in a
+            // MIR block the general walk does not enumerate (each call's `new_block` successor).
+            // Dispatching HERE keeps every other class's predicted sequence bit-identical.
+            if let Some(p) = &self.seq_call {
+                return predict_seq_call(func, p);
+            }
+            // Trust (lane G17): the deep unit-chain class has its own whole-body walk, for the
+            // same reason the eight above do — every one of its retirements lands in a MIR block
+            // the general walk does not enumerate (each call's `new_block` successor).
+            // Dispatching HERE keeps every other class's predicted sequence bit-identical.
+            if let Some(p) = &self.unit_chain {
+                return predict_unit_chain(func, p);
             }
             if matches!(ret_rty.kind(), ty::Adt(adt, _) if adt.is_enum()) {
                 // The `Return` arm's enum-construction reconstruction (`emit_enum_variant`) has a
@@ -3812,6 +8282,12 @@ mod mf_gate {
                             not decide it"
                     .to_string());
             }
+            // Trust (lane F8B): the same runtime refusal, for the same reason and in every build.
+            if self.swr.is_some() {
+                return Err("the discriminant-match class has its own sequence walk; this one \
+                            must not decide it"
+                    .to_string());
+            }
             // Trust (wave-CK): the same refusal, for the same reason and in every build. A body
             // that reached this line with a checked-chain plan fails CLOSED — it ships marker-free
             // — rather than being decided by a walk that cannot see its split blocks.
@@ -3821,6 +8297,72 @@ mod mf_gate {
                         .to_string(),
                 );
             }
+            // Trust (lane G21): the same runtime refusal, for the same reason and in every
+            // build — a body that reached this line with a short-circuit-over-calls plan fails
+            // CLOSED rather than being decided by a walk whose `other =>` arm cannot see a `Call`
+            // and whose block map does not carry lane K's trampoline.
+            if self.bc.is_some() {
+                return Err("the short-circuit-over-calls class has its own sequence walk; this \
+                            one must not decide it"
+                    .to_string());
+            }
+            // Trust (wave-MC): the same runtime refusal, for the same reason — one walk decides
+            // any given body, and a body that reached this line with a call-chain plan fails
+            // CLOSED rather than being decided by a walk whose `other =>` arm cannot see a `Call`.
+            if self.call.is_some() {
+                return Err(
+                    "the call-chain class has its own sequence walk; this one must not decide it"
+                        .to_string(),
+                );
+            }
+            // Trust (wave-CF, revived by wave-FR): the same runtime refusal, for the same
+            // reason and in every build — a body that reached this line with a call-forward
+            // plan fails CLOSED rather than being decided by a walk whose `other =>` arm
+            // cannot see a `Call`.
+            if self.call_fwd.is_some() {
+                return Err("the call-forward class has its own sequence walk; this one must \
+                            not decide it"
+                    .to_string());
+            }
+            // Trust (wave-WB8): the same runtime refusal, for the same reason and in every
+            // build — a body that reached this line with a chain-forward plan fails CLOSED
+            // rather than being decided by a walk whose `other =>` arm cannot see a `Call`.
+            if self.chain.is_some() {
+                return Err("the chain-forward class has its own sequence walk; this one must \
+                            not decide it"
+                    .to_string());
+            }
+            // Trust (lane S3): the same runtime refusal, for the same reason and in every
+            // build — a body that reached this line with an aggregate-of-call-results plan
+            // fails CLOSED rather than being decided by a walk whose `other =>` arm cannot
+            // see a `Call`.
+            if self.agg_call.is_some() {
+                return Err("the aggregate-of-call-results class has its own sequence walk; \
+                            this one must not decide it"
+                    .to_string());
+            }
+            // Trust (lane SC): the same runtime refusal, for the same reason and in every
+            // build — a body that reached this line with a statement-call sequence plan fails
+            // CLOSED rather than being decided by a walk whose `other =>` arm cannot see a
+            // `Call`.
+            if self.seq_call.is_some() {
+                return Err("the statement-call sequence class has its own sequence walk; this \
+                            one must not decide it"
+                    .to_string());
+            }
+            // Trust (lane G17): the same runtime refusal, for the same reason and in every
+            // build — a body that reached this line with a deep unit-chain plan fails CLOSED
+            // rather than being decided by a walk whose `other =>` arm cannot see a `Call` and
+            // which does not enumerate the `new_block` successor each of this class's
+            // retirements lands in. This clause was MISSING when the class landed: the tenth
+            // walk had its dispatch and its single caller but no fail-closed backstop, so
+            // "exactly one walk decides any given body" was a reading of the dispatch order and
+            // not a checked runtime fact — the one thing the count pin above cannot see.
+            if self.unit_chain.is_some() {
+                return Err("the deep unit-chain class has its own sequence walk; this one must \
+                            not decide it"
+                    .to_string());
+            }
             let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
             let mut keys: Vec<(MfSlot, MfKey)> = Vec::new();
             let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
@@ -3829,6 +8371,10 @@ mod mf_gate {
             }
             let empty: HashSet<ValueId> = HashSet::new();
             let needs = self.operand.as_ref().unwrap_or(&empty);
+            // Trust (lane G25): the DELAY SET, read from the same sealed plan the emitter reads.
+            // Empty for every class but lane K's, and empty there for every body lane K admitted
+            // before this lane — so the walk below is byte-identical wherever it is.
+            let delayed = self.branch.as_ref().map_or(&empty, |p| &p.delayed);
             let in_class = self.operand_class();
             let mut def_of: HashMap<ValueId, &Inst> = HashMap::new();
             // **THE DECLARED TYPE OF EVERY VALUE, FROM THE PRODUCER'S OWN ANNOTATION.** A block
@@ -3866,6 +8412,34 @@ mod mf_gate {
             let mut entry: HashMap<BlockId, Vec<MfSlot>> = HashMap::new();
             let mut temps = 0u32;
             let mut marked_writes = 0usize;
+            // Trust (lane ROT): the rotation extension's coordinates. The split index REPLAYS
+            // the emitter's appended-block allocation in block-LIST order: the loop-header
+            // trampoline is minted while the PRE-HEADER (the entry, always first) is lowered,
+            // lane K's false-edge trampoline while the HEADER is, and the div-guard assert's
+            // continuation while the BODY is — `new_block` appends, so each takes the next
+            // index after the producer blocks. [`observe`] walks the finished body in INDEX
+            // order, so the split block's markers must land in the sequence AFTER every
+            // producer block's — they are STASHED during the body block's walk and flushed
+            // after the loop.
+            let rot = self.loop_.as_ref().and_then(|lp| lp.rot.as_ref());
+            let mut rot_split: Option<usize> = None;
+            if let (Some(lp), Some(ro)) = (self.loop_.as_ref(), rot) {
+                if ro.guard {
+                    let mut next = func.blocks.len();
+                    for blk in &func.blocks {
+                        if blk.id == lp.preheader || blk.id == lp.header {
+                            next += 1;
+                        } else if blk.id == lp.body {
+                            rot_split = Some(next);
+                            next += 1;
+                        }
+                    }
+                    if rot_split.is_none() {
+                        return Err("lane ROT: the guarded body block is not in the list".into());
+                    }
+                }
+            }
+            let mut rot_stash: Option<(usize, Vec<MfSlot>)> = None;
             for (bi, blk) in func.blocks.iter().enumerate() {
                 b.block(bi);
                 for d in entry.remove(&blk.id).unwrap_or_default() {
@@ -3877,6 +8451,16 @@ mod mf_gate {
                 if self.loop_.as_ref().is_some_and(|lp| lp.preheader == blk.id) {
                     tys.push((MfSlot::LoopVal, MfTy::Opaque));
                     b.mark(true, MfSlot::LoopVal);
+                }
+                // Trust (lane ROT): the `let` local opens at the TOP of the body block, right
+                // after the join's entry deads — built's `bb8.0:dead _6; dead _5; live _9` —
+                // and its one copy-assign follows immediately.
+                if let Some(ro) = rot {
+                    if self.loop_.as_ref().is_some_and(|lp| lp.body == blk.id) {
+                        tys.push((MfSlot::RotLet, ir_ty_token(&ro.pass.2)));
+                        b.mark(true, MfSlot::RotLet);
+                        b.assign();
+                    }
                 }
                 let br = self.branch.as_ref().and_then(|p| p.branch.get(&blk.id)).copied();
                 let nodes = &blk.body;
@@ -3943,6 +8527,56 @@ mod mf_gate {
                             continue;
                         }
                     }
+                    // Trust (lane ROT): the div-guard idiom, modelled AS the emitter lowers it
+                    // — the update's operand temps FIRST (built materialises them before the
+                    // guard: `live _10; live _11` at bb8.1/bb8.2), then the guard's one assign
+                    // reading the DIVISOR's temp, then the assert SPLITS the chain: the update,
+                    // its retirements and the whole `let`-cluster tail land in the APPENDED
+                    // block, stashed here and flushed after the walk.
+                    if let Some(ro) = rot.filter(|ro| ro.guard) {
+                        if self.loop_.as_ref().is_some_and(|lp| lp.body == blk.id) {
+                            if let Some(idm) = super::div_idiom(nodes, i) {
+                                if idm.result != ro.fused {
+                                    return Err(
+                                        "lane ROT: a div idiom that is not the fused update"
+                                            .to_string(),
+                                    );
+                                }
+                                if i + idm.len + 1 != nodes.len() {
+                                    return Err(
+                                        "lane ROT: the idiom must end the body block".to_string()
+                                    );
+                                }
+                                let deads = mint_operands(
+                                    &mut b,
+                                    &mut temps,
+                                    &mut tys,
+                                    needs,
+                                    delayed,
+                                    self.hoists(),
+                                    &def_of,
+                                    &ty_of,
+                                    &[idm.dividend, idm.divisor],
+                                    in_class,
+                                );
+                                if deads.len() != 2 {
+                                    return Err(
+                                        "lane ROT: the guard's operands must both mint".to_string()
+                                    );
+                                }
+                                // the guard reads the DIVISOR's temp: `Eq(copy _11, const 0)`.
+                                keys.push((deads[1], Some((bi, b.at(), 0))));
+                                b.assign();
+                                let Some(split) = rot_split else {
+                                    return Err("lane ROT: a guard without a split index".into());
+                                };
+                                rot_stash = Some((split, deads));
+                                // the `Br` terminator's whole tail lives in the split block; the
+                                // stash flush models it.
+                                break;
+                            }
+                        }
+                    }
                     let r0 = node.results.first().copied();
                     let is_cond = br.is_some_and(|x| Some(x.cond) == r0);
                     // Trust (lane L9): rule 2 — the `if`-STATEMENT's `()` value is opened in the
@@ -3979,6 +8613,8 @@ mod mf_gate {
                                 &mut temps,
                                 &mut tys,
                                 needs,
+                                delayed,
+                                self.hoists(),
                                 &def_of,
                                 &ty_of,
                                 &[*lhs, *rhs],
@@ -3986,6 +8622,13 @@ mod mf_gate {
                             );
                             close_group(&mut b, &mut keys, bi, &deads, is_cond, br, &mut entry);
                         }
+                        // Trust (lane G25): a DELAYED result mints NOTHING here. Its whole
+                        // statement — the `StorageLive` and the one assign — is emitted at the
+                        // consumer's operand position, by `mint_operands` above, because that is
+                        // where built puts it. The emitter's `Inst::Cast` arm stashes for exactly
+                        // the same set, so the two sides move together or not at all.
+                        Inst::UnOp { .. } | Inst::Cast { .. }
+                            if r0.is_some_and(|r| delayed.contains(&r)) => {}
                         Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } => {
                             if let Some(r) = r0.filter(|r| self.marks_result(*r)) {
                                 let s = MfSlot::Res(r);
@@ -3997,6 +8640,8 @@ mod mf_gate {
                                 &mut temps,
                                 &mut tys,
                                 needs,
+                                delayed,
+                                self.hoists(),
                                 &def_of,
                                 &ty_of,
                                 &[*operand],
@@ -4013,6 +8658,8 @@ mod mf_gate {
                                     &mut temps,
                                     &mut tys,
                                     needs,
+                                    delayed,
+                                    self.hoists(),
                                     &def_of,
                                     &ty_of,
                                     &agg_chains[v],
@@ -4044,18 +8691,76 @@ mod mf_gate {
                         },
                         // Each edge argument is copied into the target block's parameter local.
                         Inst::Br { args, .. } => {
-                            for _ in args {
+                            // Trust (lane ROT): the rotation back edge takes built's `let`
+                            // cluster tail instead of one-assign-per-arg — the fused update was
+                            // written into its param local by the `BinOp` arm (no edge assign:
+                            // exact self-assignment), and the passthrough rides the READ temp:
+                            // `live _13; _13 = copy _9; _1 = move _13; dead _13; _4 = const ();
+                            // dead _9` (built `g8` bb8.4–bb8.7).
+                            let rot_edge = rot.filter(|_| {
+                                self.loop_.as_ref().is_some_and(|lp| lp.body == blk.id)
+                            });
+                            if let Some(ro) = rot_edge {
+                                tys.push((MfSlot::RotRead, ir_ty_token(&ro.pass.2)));
+                                b.mark(true, MfSlot::RotRead);
+                                keys.push((MfSlot::RotLet, Some((bi, b.at(), 0))));
                                 b.assign();
+                                keys.push((MfSlot::RotRead, Some((bi, b.at(), 0))));
+                                b.assign();
+                                b.mark(false, MfSlot::RotRead);
+                                b.assign();
+                                b.mark(false, MfSlot::RotLet);
+                            } else {
+                                for _ in args {
+                                    b.assign();
+                                }
                             }
                         }
                         // A terminator mints no statement, and it is the ONE consumer that is not
                         // an assignment — so the condition's temp has no use site on either side.
                         // It is retired at the join, at position 0, which is where built puts it.
+                        // Trust (lane F8): the switch-to-join class's SCRUTINEE. A terminator
+                        // mints no statement and is the one consumer that is not an assignment,
+                        // so the slot carries no use site; built retires it at the JOIN, at
+                        // position 0 — `bb15: StorageDead(_2); return` — exactly as it retires a
+                        // `CondBr` condition. A `Switch` in any body this plan does not own has
+                        // no model here and fails the body CLOSED, which is what it did before
+                        // this lane.
+                        Inst::Switch { .. } => {
+                            let Some(p) = self.sw.as_ref().filter(|p| p.head == blk.id) else {
+                                return Err("no marker sequence model for Inst::Switch".into());
+                            };
+                            let s = MfSlot::Res(p.scrutinee);
+                            tys.push((s, ty_at(&ty_of, p.scrutinee)));
+                            entry.entry(p.join).or_default().push(s);
+                        }
                         Inst::CondBr { .. } => {
                             if let Some(x) = br {
                                 let s = MfSlot::Res(x.cond);
                                 tys.push((s, ty_at(&ty_of, x.cond)));
-                                entry.entry(x.join).or_default().push(s);
+                                // Trust (lane G25): the `||`/`&&` SUGAR condition's own temp —
+                                // minted HERE, at the terminator, because the producer switches on
+                                // the bare parameter and has no instruction to hang it on. Built
+                                // opens it and copies the parameter into it before the branch
+                                // (`StorageLive(_4); _4 = copy _2; switchInt(move _4)`), so this
+                                // side spells one `live` and one assign, and the retirement rides
+                                // the join schedule below exactly as a computed condition's does.
+                                let sugar_here = self
+                                    .branch
+                                    .as_ref()
+                                    .is_some_and(|p| p.sugar.contains(&blk.id));
+                                if sugar_here {
+                                    b.mark(true, s);
+                                    b.assign();
+                                }
+                                // Trust (lane G25): the MOVE control's second half — a SUGAR
+                                // condition retired at the THEN arm's entry instead of the JOIN.
+                                // Built retires it at the join; the whole-body marker multiset is
+                                // unchanged and only the BLOCK differs, so the law stays green and
+                                // the ORACLE is the one that must refuse.
+                                let dead_at =
+                                    if sugar_here && self.hoists() { x.then_target } else { x.join };
+                                entry.entry(dead_at).or_default().push(s);
                                 // Trust (lane L9): a loop's condition region has TWO exits and no
                                 // single join, which is the half `plan_branch_markers` cannot
                                 // express. `x.join` above is the BODY — built's `if`-join, the
@@ -4081,6 +8786,30 @@ mod mf_gate {
                     }
                     i += 1;
                 }
+            }
+            // Trust (lane ROT): flush the guarded body's split-block tail — the APPENDED MIR
+            // block, walked LAST by [`observe`]'s index order: the update (one assign, the
+            // dividend temp's use site), its operand temps' retirement in reverse, then the
+            // `let` cluster's read-back and the tail unit — built `g2` bb9.1–bb9.4.
+            if let Some((split, deads)) = rot_stash {
+                let Some(ro) = rot else {
+                    return Err("lane ROT: a stash without a rotation plan".to_string());
+                };
+                b.block(split);
+                keys.push((deads[0], Some((split, b.at(), 0))));
+                b.assign();
+                for d in deads.iter().rev() {
+                    b.mark(false, *d);
+                }
+                tys.push((MfSlot::RotRead, ir_ty_token(&ro.pass.2)));
+                b.mark(true, MfSlot::RotRead);
+                keys.push((MfSlot::RotLet, Some((split, b.at(), 0))));
+                b.assign();
+                keys.push((MfSlot::RotRead, Some((split, b.at(), 0))));
+                b.assign();
+                b.mark(false, MfSlot::RotRead);
+                b.assign();
+                b.mark(false, MfSlot::RotLet);
             }
             // The field-write plan is derived from the SOURCE and this walk is derived from the
             // TRUST-IR; they are two derivations of one number and they must agree.
@@ -4158,10 +8887,8 @@ mod mf_gate {
         let [blk] = func.blocks.as_slice() else {
             return Err("wave-CK: the checked chain is a one-block class".to_string());
         };
-        let (term, body) = blk
-            .body
-            .split_last()
-            .ok_or_else(|| "wave-CK: empty block".to_string())?;
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "wave-CK: empty block".to_string())?;
         if !matches!(term.inst, Inst::Return { .. }) {
             return Err("wave-CK: the checked chain must end in a Return".to_string());
         }
@@ -4241,9 +8968,11 @@ mod mf_gate {
             }
         }
         if k != n {
-            return Err("wave-CK: the trust-ir carries a different number of chain units than the \
+            return Err(
+                "wave-CK: the trust-ir carries a different number of chain units than the \
                         plan"
-                .to_string());
+                    .to_string(),
+            );
         }
         Ok(b.finish(&keys, &tys))
     }
@@ -4505,6 +9234,1186 @@ mod mf_gate {
         Ok(b.finish(&keys, &tys))
     }
 
+    /// **THE PREDICTED SIDE FOR THE LANE-F8B DISCRIMINANT-MATCH CLASS** — the whole canonical
+    /// sequence, from the sealed plan and the trust-ir, reading no emitted statement.
+    ///
+    /// The class marks exactly ONE slot, so every component of every event is short and each is
+    /// derived rather than defaulted:
+    ///
+    ///   * the BLOCK. This class admits no block-SPLITTING instruction — no `Inst::Call`, no
+    ///     `Inst::Overflow`, no `Inst::Assert` — so the shim allocates exactly one MIR block per
+    ///     trust-ir block, in order, and a marked block's index IS its trust-ir ordinal. The
+    ///     head's exhaustive-fold `Unreachable`, every trampoline and (for the binding shape) the
+    ///     return split are `new_block`s APPENDED after all of them; none of them carries a
+    ///     marker, so they take no position in this walk. The emitter re-checks the identity
+    ///     `block_map[b] == ordinal(b)` for every block it marks and fails CLOSED otherwise.
+    ///   * the POSITION. An opening is at assign 0 — the emitter pushes it at the block's ENTRY,
+    ///     before any statement of that block. A retirement is `close_at.1` assigns in, and the
+    ///     emitter RE-COUNTS the assigns it actually pushed against that number.
+    ///   * the SLOT and its DECLARED TYPE, from the plan's own `ty` (the producer's annotation on
+    ///     the join parameter, or `Ty::Bool` for the `!param` operand temp) rather than from any
+    ///     local declaration the emitter wrote. One slot means alpha index 0 everywhere.
+    ///   * the USE SITE. The match value and the payload binding are both moved out by the JOIN's
+    ///     own single assign (`_0 = Not(copy d)` / `_0 = copy d`), operand position 0; the
+    ///     `!param` operand temp is moved out by its arm's SECOND assign (the `Br` edge copy),
+    ///     one assign in, operand position 0. Both are ordinary `Rvalue` operands that
+    ///     [`rvalue_operand_locals`] gives a position, so the key is a derivation and not a
+    ///     `None` default.
+    ///
+    /// Fails CLOSED on any plan/trust-ir disagreement — a planned block that is not in the body.
+    /// The plan and this walk are two readers of one trust-ir, and a disagreement between them is
+    /// a body that ships marker-free.
+    pub(super) fn predict_swr(
+        func: &trust_ir::Function,
+        plan: &MfSwrPlan,
+    ) -> Result<MfSeq, String> {
+        /// The class's ONE slot. A `u8` rather than an `MfSlot`, for the same reason wave-DR
+        /// carries its own `DrSlot`: this walk's alphabet is its own and cannot alpha-rename
+        /// onto another class's.
+        const S: u8 = 0;
+        let idx = |id: BlockId| -> Result<usize, String> {
+            func.blocks
+                .iter()
+                .position(|x| x.id == id)
+                .ok_or_else(|| "lane F8B: a planned block is not in the body".to_string())
+        };
+        let key = match plan.slot {
+            SwrSlot::MatchValue | SwrSlot::Binding => (idx(plan.join)?, 0, 0),
+            SwrSlot::ArmNot => (idx(plan.close_at.0)?, 1, 0),
+        };
+        for b in plan.open_at.iter().chain(std::iter::once(&plan.close_at.0)) {
+            idx(*b)?;
+        }
+        let keys: Vec<(u8, MfKey)> = vec![(S, Some(key))];
+        let tys: Vec<(u8, MfTy)> = vec![(S, ir_ty_token(&plan.ty))];
+        let mut b: MfSeqBuild<u8> = MfSeqBuild::new();
+        for (bi, blk) in func.blocks.iter().enumerate() {
+            b.block(bi);
+            if plan.open_at.contains(&blk.id) {
+                b.mark(true, S);
+            }
+            if plan.close_at.0 == blk.id {
+                for _ in 0..plan.close_at.1 {
+                    b.assign();
+                }
+                b.mark(false, S);
+            }
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// **THE PREDICTED SIDE FOR THE WAVE-MC BY-VALUE CALL-CHAIN CLASS** — the whole canonical
+    /// sequence, from the sealed plan and the trust-ir, reading no emitted statement.
+    ///
+    /// This is the fourth class whose markers land in MIR blocks that are NOT the image of a
+    /// trust-ir block, and it is the simplest of the four: the admitted instruction set contains
+    /// exactly ONE block-splitting instruction (`Inst::Call` — `Overflow`/`Assert`/`Switch` are all
+    /// outside [`super::plan_call_markers`]' set), and the shim allocates its successor with
+    /// `cx.new_block()`, which appends after the one trust-ir block. So call `k` (0-based, SSA
+    /// order) has successor MIR block `k + 1`, counted here and nowhere else. A marker in any other
+    /// block has no counterpart on this side and fails the body CLOSED.
+    ///
+    /// Every component of every event is derived here:
+    ///
+    ///   * the LIVE of a call's RESULT temp lands before any of its argument temps, at whatever
+    ///     assign ordinal the walk has reached in the current block. Rule 1 of the class
+    ///     (`as_operand` opens the destination and only then recurses into the arguments), measured
+    ///     on `probes/mc_call.rs::q1` and `::q5`.
+    ///   * the LIVES of the ARGUMENT temps, in ARGUMENT order, each followed by its own assign —
+    ///     so the second argument's `StorageLive` sits one assign later than the first's, which is
+    ///     a different event. [`mint_operands`] is the one derivation of that interleaving and it
+    ///     is shared with the general walk rather than copied.
+    ///   * the DEADS of both kinds, in REVERSE creation order, at the head of the call's successor
+    ///     block (arguments and any consumed prior temp) or after the consuming assign (a result
+    ///     consumed by an rvalue). Both are the single scope-exit rule `mf_operand`'s `deads`
+    ///     vector records and `mf_retire`/`mf_retire_at` replay.
+    ///   * the declared TYPE. A parameter's comes from the block's own parameter list; an
+    ///     rvalue result's from the instruction that defines it; and a CALL result's — which
+    ///     `Inst::Call` carries NO annotation for — from the OPERAND type its single consumer
+    ///     declares (`ICmp.ty`, `BinOp.ty`, `UnOp.ty`, `Cast.src_ty`). That is a derivation from
+    ///     the producer's own annotations and reads nothing the emitter reads (which types the
+    ///     destination from the callee's rustc signature). A call result with no such consumer is
+    ///     refused BY THE PLAN, so this side never falls back to [`MfTy::Unknown`] for one.
+    ///   * the USE SITE. A call's arguments are moved out by the call TERMINATOR, which [`observe`]
+    ///     does not walk, so every temp this class retires at a block head has key `None` on both
+    ///     sides. A result consumed by an rvalue takes its position from [`close_group`], the same
+    ///     derivation the general walk uses.
+    ///
+    /// Fails CLOSED on any plan/trust-ir disagreement — a `Call` at a node the plan does not list,
+    /// a terminator that is not a `Return`, an instruction outside the class's set. The plan and
+    /// this walk are two readers of one trust-ir, and a disagreement between them is a body that
+    /// ships marker-free.
+    pub(super) fn predict_call(
+        func: &trust_ir::Function,
+        plan: &MfCallPlan,
+        needs: Option<&HashSet<ValueId>>,
+    ) -> Result<MfSeq, String> {
+        let empty: HashSet<ValueId> = HashSet::new();
+        let needs = needs.unwrap_or(&empty);
+        let [blk] = func.blocks.as_slice() else {
+            return Err("wave-MC: the call chain is a one-block class".to_string());
+        };
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "wave-MC: empty block".to_string())?;
+        let ret_vals: Vec<ValueId> = match &term.inst {
+            Inst::Return { values } => values.clone(),
+            _ => return Err("wave-MC: the call chain must end in a Return".to_string()),
+        };
+        // THE DECLARED TYPE OF EVERY VALUE, from the producer's own annotations.
+        let mut def_of: HashMap<ValueId, &Inst> = HashMap::new();
+        let mut ty_of: HashMap<ValueId, MfTy> = HashMap::new();
+        for (p, t) in &blk.params {
+            ty_of.insert(*p, ir_ty_token(t));
+        }
+        for node in &blk.body {
+            for r in &node.results {
+                def_of.insert(*r, &node.inst);
+            }
+            let Some(r) = node.results.first() else { continue };
+            let t = match &node.inst {
+                Inst::Const { ty, .. } | Inst::BinOp { ty, .. } | Inst::UnOp { ty, .. } => {
+                    ir_ty_token(ty)
+                }
+                Inst::ICmp { .. } => ir_ty_token(&Ty::Bool),
+                Inst::Cast { dst_ty, .. } => ir_ty_token(dst_ty),
+                // `Inst::Call` carries no result annotation; typed from its consumer below.
+                _ => continue,
+            };
+            ty_of.insert(*r, t);
+        }
+        // A CALL result is typed from the OPERAND annotation of the instruction that consumes it.
+        for node in &blk.body {
+            let (ops, t): (Vec<ValueId>, &Ty) = match &node.inst {
+                Inst::ICmp { ty, lhs, rhs, .. } | Inst::BinOp { ty, lhs, rhs, .. } => {
+                    (vec![*lhs, *rhs], ty)
+                }
+                Inst::UnOp { ty, operand, .. } => (vec![*operand], ty),
+                Inst::Cast { src_ty, operand, .. } => (vec![*operand], src_ty),
+                _ => continue,
+            };
+            for o in ops {
+                if matches!(def_of.get(&o), Some(Inst::Call { .. })) {
+                    ty_of.insert(o, ir_ty_token(t));
+                }
+            }
+        }
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        let mut keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        let mut entry: HashMap<BlockId, Vec<MfSlot>> = HashMap::new();
+        let mut temps = 0u32;
+        let mut calls = 0usize;
+        // Trust (lane G25): the call-chain class carries no DELAY SET — the delay lives on lane
+        // K's branch plan and this class holds none, so the operand walk below is unchanged.
+        let mc_no_delay: HashSet<ValueId> = HashSet::new();
+        let mut cur = 0usize;
+        let mut routed: Option<ValueId> = None;
+        b.block(0);
+        for (i, node) in body.iter().enumerate() {
+            match &node.inst {
+                // Folded by `as_constant`: no statement, no marker.
+                Inst::Const { .. } => {}
+                Inst::Call { args, .. } => {
+                    if !plan.call_nodes.contains(&i) {
+                        return Err("wave-MC: a Call at a node the plan does not own".to_string());
+                    }
+                    let r0 = node.results.first().copied();
+                    // Rule 1: the destination temp opens BEFORE any argument temp. A result the
+                    // shim routes straight into `_0` takes none, and built takes none either.
+                    match r0 {
+                        Some(r) if needs.contains(&r) => {
+                            let s = MfSlot::Res(r);
+                            tys.push((s, ty_at(&ty_of, r)));
+                            b.mark(true, s);
+                        }
+                        Some(r) if ret_vals.contains(&r) && i + 1 == body.len() => {
+                            routed = Some(r);
+                        }
+                        _ => {}
+                    }
+                    // Rule 2: the argument temps, in argument order, each opened then assigned.
+                    let deads = mint_operands(
+                        &mut b, &mut temps, &mut tys, needs, &mc_no_delay, false, &def_of, &ty_of, args, true,
+                    );
+                    // The terminator mints no statement. The successor is the `k + 1`-th MIR
+                    // block, and rule 3 puts the retirement run at its HEAD, in reverse order.
+                    calls += 1;
+                    cur = calls;
+                    b.block(cur);
+                    for d in deads.iter().rev() {
+                        b.mark(false, *d);
+                    }
+                }
+                Inst::BinOp { lhs, rhs, .. } | Inst::ICmp { lhs, rhs, .. } => {
+                    if let Some(r) = node.results.first().filter(|r| needs.contains(r)) {
+                        let s = MfSlot::Res(*r);
+                        tys.push((s, ty_at(&ty_of, *r)));
+                        b.mark(true, s);
+                    }
+                    let deads = mint_operands(
+                        &mut b,
+                        &mut temps,
+                        &mut tys,
+                        needs,
+                        &mc_no_delay,
+                        false,
+                        &def_of,
+                        &ty_of,
+                        &[*lhs, *rhs],
+                        true,
+                    );
+                    close_group(&mut b, &mut keys, cur, &deads, false, None, &mut entry);
+                }
+                Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } => {
+                    if let Some(r) = node.results.first().filter(|r| needs.contains(r)) {
+                        let s = MfSlot::Res(*r);
+                        tys.push((s, ty_at(&ty_of, *r)));
+                        b.mark(true, s);
+                    }
+                    let deads = mint_operands(
+                        &mut b,
+                        &mut temps,
+                        &mut tys,
+                        needs,
+                        &mc_no_delay,
+                        false,
+                        &def_of,
+                        &ty_of,
+                        std::slice::from_ref(operand),
+                        true,
+                    );
+                    close_group(&mut b, &mut keys, cur, &deads, false, None, &mut entry);
+                }
+                other => {
+                    return Err(format!(
+                        "wave-MC: no marker sequence model for Inst::{}",
+                        super::inst_name(other)
+                    ));
+                }
+            }
+        }
+        // The `Return` arm writes `_0` — unless a preceding call already did, in which case it
+        // emits only the terminator (the wave-J routed-destination guard). One assign or none, and
+        // it comes after every marker this class places, so it can only move a marker that a wave
+        // widening puts after it.
+        if routed.is_none() && !ret_vals.is_empty() {
+            b.assign();
+        }
+        // A retirement scheduled at a producer block entry has nowhere to land in a one-block
+        // class; `close_group` only fills `entry` for a `CondBr` condition, which this class has
+        // no terminator for. Refuse rather than silently drop one.
+        if !entry.is_empty() {
+            return Err("wave-MC: a cross-block retirement in a one-block class".to_string());
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (wave-CF, revived by wave-FR): the CALL-FORWARD class's whole-body walk.
+    ///
+    /// The sequence is a closed form of the plan: one `StorageLive` per planned argument in
+    /// OPERAND order, each opened and then assigned (so the k-th sits k assigns in), and one
+    /// `StorageDead` each at position 0 of the call's SUCCESSOR block, in REVERSE operand order.
+    /// Block 1 is that successor: the shim allocates exactly one MIR block per trust-ir block
+    /// before it lowers anything, this class has exactly one trust-ir block, and the call's
+    /// `new_block` is therefore the first appended one.
+    ///
+    /// No use-site key is registered, and that is derived rather than omitted: every argument
+    /// temp is moved out by the CALL TERMINATOR, and [`observe_with`] walks STATEMENTS only, so
+    /// the observed side has no key for them either. A temp read by an assignment instead would
+    /// carry a key on the observed side and none here, and the body would fail closed.
+    pub(super) fn predict_call_fwd(
+        func: &trust_ir::Function,
+        plan: &MfCallFwdPlan,
+    ) -> Result<MfSeq, String> {
+        let [blk] = func.blocks.as_slice() else {
+            return Err("wave-CF: the call-forward class is a one-block class".to_string());
+        };
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "wave-CF: empty block".to_string())?;
+        if !matches!(term.inst, Inst::Return { .. }) {
+            return Err("wave-CF: the call-forward class must end in a Return".to_string());
+        }
+        // Trust (lane R53): the block splits at THE call, re-derived HERE from the trust-ir
+        // rather than inherited from the plan — the same discipline the `&str` chain gets. The
+        // POST region is empty for wave-CF's own grammar and is otherwise the ONE scalar post-op
+        // with its folded constants; its size is the one thing that decides where the
+        // destination temp's retirement lands, so it is re-counted rather than trusted.
+        let call_ix = body
+            .iter()
+            .position(|n| matches!(n.inst, Inst::Call { .. }))
+            .ok_or_else(|| "wave-CF: a call-forward body with no call".to_string())?;
+        if body.iter().filter(|n| matches!(n.inst, Inst::Call { .. })).count() != 1 {
+            return Err("wave-CF: more than one call in a call-forward body".to_string());
+        }
+        let (pre, rest) = body.split_at(call_ix);
+        let (_call, post) = rest
+            .split_first()
+            .ok_or_else(|| "wave-CF: a call-forward body with no instruction".to_string())?;
+        match (plan.post.is_some(), post.is_empty()) {
+            (false, true) | (true, false) => {}
+            (false, false) => {
+                return Err("wave-CF: the call is not the last instruction".to_string());
+            }
+            (true, true) => {
+                return Err("lane-R53: a post-op plan on a body with no post region".to_string());
+            }
+        }
+        // Every post node but the last is a folded scalar constant; the last is the post-op and
+        // it mints EXACTLY ONE assign at the successor. A non-constant filler would mint a
+        // statement this sequence does not model.
+        if let Some((_, post_consts)) = post.split_last() {
+            for n in post_consts {
+                if !matches!(
+                    n.inst,
+                    Inst::Const {
+                        value: Constant::Int(_)
+                            | Constant::U128(_)
+                            | Constant::Float(_)
+                            | Constant::Bool(_),
+                        ..
+                    }
+                ) {
+                    return Err(
+                        "lane-R53: no marker sequence model for a non-constant post filler"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        // The preamble emits NO statement — a scalar `Inst::Const` folds into the operand and a
+        // recognized `&str` chain is skipped whole — which is what puts the k-th `StorageLive`
+        // at exactly k assigns. RE-DERIVED here from the trust-ir rather than inherited from the
+        // plan: the chain is recognized again, with the same recognizer, so an instruction the
+        // plan somehow admitted but the emitter would lower to a statement fails the body closed.
+        let mut value_def: HashMap<ValueId, &InstrNode> = HashMap::new();
+        for n in &blk.body {
+            for r in &n.results {
+                value_def.insert(*r, n);
+            }
+        }
+        let mut chain_nodes: HashSet<ValueId> = HashSet::new();
+        for v in plan.lits.iter() {
+            let Some((_, _, skip)) = recognize_str_return(&value_def, *v) else {
+                return Err(
+                    "wave-CF-STR: a planned literal is not a recognized `&str` chain".to_string()
+                );
+            };
+            for sk in skip {
+                chain_nodes.insert(sk);
+            }
+        }
+        for n in pre {
+            let &[r] = n.results.as_slice() else {
+                return Err("wave-CF: a preamble node without a single result".to_string());
+            };
+            if chain_nodes.contains(&r) {
+                continue;
+            }
+            if !matches!(n.inst, Inst::Const { .. }) {
+                return Err(
+                    "wave-CF: no marker sequence model for a non-constant preamble".to_string()
+                );
+            }
+        }
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        // Trust (lane R53): the POST-OP class is the FIRST call-forward shape with a use-site
+        // key. Wave-CF registers none, and that is DERIVED: every argument temp is moved out by
+        // the call TERMINATOR, which `observe_with` does not walk. The post-op destination temp
+        // is different — `_0 = <Op>(move d, ..)` is an ASSIGNMENT, so the observed side DOES key
+        // it, at block 1 (the call's successor), 0 assigns in, operand position 0 (measured:
+        // `BinaryOp(Gt, Copy(d), const)` and `UnaryOp(Not, Copy(d))`, `probes/r53.rs` y6/y2).
+        // The FIELD form reads `d` through a place PROJECTION (`Use(Copy(d.0))`), which carries
+        // no bare-operand sequence and therefore no key — the same reason a reborrow temp has
+        // none. Omitting the key on the two operand forms is what the first whole-crate run
+        // refused, by name, at line 0.
+        let mut keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        b.block(0);
+        // Trust (lane S1F, unit statement): the statement's `()` temp is opened FIRST — before
+        // any argument temp, at assign ordinal 0 (measured, `probes/s1f.rs` b1/b2) — and under
+        // [`super::SatPerturb::CfUnitLate`] LAST instead, from the one `unit_late` bit the
+        // sealed plan carries.
+        if plan.unit_stmt {
+            tys.push((MfSlot::CfUnit, ir_ty_token(&Ty::Unit)));
+            if !plan.unit_late {
+                b.mark(true, MfSlot::CfUnit);
+            }
+        }
+        // Trust (lane S1F, reborrowed return): the destination temp is opened FIRST — before
+        // any argument temp (measured, `probes/s1f.rs` {impl#6}::deref) — and under
+        // [`super::SatPerturb::CfRetLate`] LAST instead, from the one `ret_late` bit the
+        // sealed plan carries. Its type is the callee's reference return: an opaque token on
+        // both sides.
+        if plan.ret_reborrow {
+            tys.push((MfSlot::CfRet, ir_ty_token(&Ty::Ptr)));
+            if !plan.ret_late {
+                b.mark(true, MfSlot::CfRet);
+            }
+        }
+        // Trust (lane R53): the POST-OP destination temp is opened FIRST — before any argument
+        // temp (measured verbatim, `probes/r53.rs` y1/y2/y6/y7/y9/y10/y11/y12) — and under
+        // [`super::SatPerturb::CfPostLate`] LAST instead, from the one `post_late` bit the
+        // sealed plan carries. Its TYPE is the call's result type: read from the post-op's own
+        // operand annotation for the three scalar forms, and [`MfTy::Opaque`] for the field
+        // form, whose non-scalar source witness `call_fwd_source_admits` checked.
+        if let Some(k) = plan.post {
+            let tok = match k {
+                CfPostOp::Field => MfTy::Opaque,
+                CfPostOp::BinLit | CfPostOp::NotUnary => ir_ty_token(&plan.post_ty),
+            };
+            tys.push((MfSlot::CfPost, tok));
+            if matches!(k, CfPostOp::BinLit | CfPostOp::NotUnary) {
+                keys.push((MfSlot::CfPost, Some((1, 0, 0))));
+            }
+            if !plan.post_late {
+                b.mark(true, MfSlot::CfPost);
+            }
+        }
+        for (v, t) in plan.args.iter() {
+            let s = MfSlot::Arg(*v);
+            // Trust (lane S1F): a FIELD argument's temp is opened and assigned exactly where
+            // a bare forward's is — the reconstruction changes the RVALUE, never the sequence
+            // (measured, `probes/s1f.rs` a1..a4). Under [`super::SatPerturb::CfFieldDrop`] the
+            // pair is absent on this side AND at the emitter, from the one `field_drop` bit the
+            // sealed plan carries; the assign still happens (the temp exists, unmarked).
+            if !plan.marks_pair(*v) {
+                b.assign();
+                continue;
+            }
+            tys.push((s, ir_ty_token(t)));
+            if plan.is_lit(*v) {
+                // Trust (wave-CF-STR): the literal's own local is opened IMMEDIATELY after the
+                // argument temp and BEFORE either is assigned — `StorageLive(_4); StorageLive(_5);
+                // _5 = const "lit"; _4 = &(*_5)`, measured verbatim — so both markers sit at the
+                // same assign ordinal and the pair costs TWO assigns, not one.
+                //
+                // Trust (lane EM): under [`super::SatPerturb::CfLitOrder`] the pair's LIVE order
+                // is swapped HERE AND at the emission site, from the one `lit_swap` bit the plan
+                // carries — the law stays green, and the ORACLE must reject the sequence (the
+                // retirement run's alpha indices no longer match built's).
+                let l = MfSlot::ArgLit(*v);
+                tys.push((l, ir_ty_token(t)));
+                if plan.lit_swap {
+                    b.mark(true, l);
+                    b.mark(true, s);
+                } else {
+                    b.mark(true, s);
+                    b.mark(true, l);
+                }
+                b.assign();
+            } else if plan.is_pair(*v) {
+                // Trust (lane S1F): the explicit-borrow pair — `live t; live u; u = &((*_p).0);
+                // t = &(*u)` (measured verbatim, `probes/s1f.rs` {impl#16}::cmp): both markers
+                // at the same assign ordinal, the pair costs TWO assigns.
+                let u = MfSlot::ArgInner(*v);
+                tys.push((u, ir_ty_token(t)));
+                b.mark(true, s);
+                b.mark(true, u);
+                b.assign();
+            } else {
+                b.mark(true, s);
+            }
+            b.assign();
+        }
+        if plan.unit_stmt && plan.unit_late {
+            b.mark(true, MfSlot::CfUnit);
+        }
+        if plan.ret_reborrow && plan.ret_late {
+            b.mark(true, MfSlot::CfRet);
+        }
+        if plan.post.is_some() && plan.post_late {
+            b.mark(true, MfSlot::CfPost);
+        }
+        b.block(1);
+        // Trust (lane S1F, reborrowed return): `_0 = &(*d)` is the successor's FIRST statement,
+        // before any retirement (measured, `probes/s1f.rs` {impl#6}::deref / {impl#8}::as_ref:
+        // `bb1: _0 = &(*_2); dead _3; dead _2`), so every retirement below sits one assign in.
+        if plan.ret_reborrow {
+            b.assign();
+        }
+        for (v, _) in plan.args.iter().rev() {
+            if !plan.marks_pair(*v) {
+                continue;
+            }
+            // Trust (lane S1F): the explicit-borrow pair retires INNER-then-OUTER per argument
+            // under the edition-2024 rule (`dead u_n; dead t_n; …`, measured verbatim on the
+            // derived `Ord::cmp`); under [`super::SatPerturb::CfPairOrder`] the measured 2021
+            // order is used instead — the field locals retire AFTER every argument temp (below).
+            if plan.is_pair(*v) && !plan.pair_swap {
+                b.mark(false, MfSlot::ArgInner(*v));
+            }
+            b.mark(false, MfSlot::Arg(*v));
+        }
+        if plan.pair_swap {
+            for (v, _) in plan.args.iter().rev() {
+                if plan.is_pair(*v) {
+                    b.mark(false, MfSlot::ArgInner(*v));
+                }
+            }
+        }
+        // Trust (wave-CF-STR): the literal locals outlive EVERY argument temp — built retires
+        // them after the whole argument run (`StorageDead(_4); StorageDead(_3); StorageDead(_5)`,
+        // measured on a two-argument call with one `&str`). Their order AMONG THEMSELVES is
+        // reverse-operand for consistency with every other retirement run in this shim and is
+        // UNWITNESSED on today's corpus (no measured body passes two `&str` literals).
+        for v in plan.lits.iter().rev() {
+            b.mark(false, MfSlot::ArgLit(*v));
+        }
+        // Trust (lane S1F, unit statement): the `()` temp is retired LAST — after every argument
+        // temp and every literal local — and the successor's `_0 = const ()` follows it
+        // (measured, `probes/s1f.rs` b1/b2: `dead _3; dead _2; _0 = const (); return`).
+        if plan.unit_stmt {
+            b.mark(false, MfSlot::CfUnit);
+        }
+        // Trust (lane S1F, reborrowed return): the destination temp retires LAST.
+        if plan.ret_reborrow {
+            b.mark(false, MfSlot::CfRet);
+        }
+        // Trust (lane R53): the POST-OP's own assign lands at the successor AFTER every argument
+        // retirement (`bb1: dead t; _0 = <Op>(move d, ..); dead d`, measured verbatim), so the
+        // destination temp's retirement sits ONE assign in — the one position in this whole
+        // class that is not zero, and the one the oracle checks hardest.
+        if plan.post.is_some() {
+            b.assign();
+            b.mark(false, MfSlot::CfPost);
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (lane SC, 2026-08-24): the STATEMENT-CALL SEQUENCE class's whole-body walk.
+    ///
+    /// The sequence is a CLOSED FORM of the plan — one group per call, four marker lines each:
+    ///
+    /// ```text
+    ///   block k      (k = 0..N-1):  [the group k-1 retirement, when k > 0]
+    ///                               live(unit_k) @ 0
+    ///                               live(arg_k,j) @ 0, then one assign, for j in operand order
+    ///   block N                  :  dead(arg_{N-1},j) for j in REVERSE operand order
+    ///                               dead(unit_{N-1})
+    /// ```
+    ///
+    /// with the group `k` retirement being `dead(arg_k,j)` in reverse operand order followed by
+    /// `dead(unit_k)`, all at assign ordinal 0 of block `k + 1`. Measured verbatim against built
+    /// on `probes/sc.rs` (`n2_mut`, `n2_shared`, `n2_free`, `n3_mut`, `n4_mut`) — see
+    /// [`MfSeqCallPlan`] for the dump.
+    ///
+    /// The block map is DERIVED, not assumed: the shim allocates one MIR block per trust-ir block
+    /// (this class has exactly one) and each `Inst::Call`'s `new_block` appends, so the k-th
+    /// call's successor is MIR block `k + 1`, in body order — which is exactly built's `bb0..bbN`
+    /// chain. The final block's trailing `_0 = const ()` is one assign AFTER the last marker and
+    /// therefore contributes nothing to the sequence, which is why it is not spelled here.
+    ///
+    /// No use-site key is registered, and that is DERIVED rather than omitted, exactly as in
+    /// [`predict_call_fwd`]: every argument temp is moved out by a call TERMINATOR and every `()`
+    /// temp is a call DESTINATION, and [`observe_with`] walks STATEMENTS only, so the observed
+    /// side has no key for any of them either. A temp read by an assignment instead would carry a
+    /// key on the observed side and none here, and the body would fail closed.
+    pub(super) fn predict_seq_call(
+        func: &trust_ir::Function,
+        plan: &MfSeqCallPlan,
+    ) -> Result<MfSeq, String> {
+        let [blk] = func.blocks.as_slice() else {
+            return Err("lane-SC: the statement-call sequence class is a one-block class".into());
+        };
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "lane-SC: empty block".to_string())?;
+        match &term.inst {
+            Inst::Return { values } if values.is_empty() => {}
+            _ => {
+                return Err(
+                    "lane-SC: the sequence class must end in a value-less Return".to_string()
+                );
+            }
+        }
+        // The plan's groups are RE-DERIVED here against the trust-ir rather than inherited: the
+        // walk below reads the plan's argument lists, and a plan that named a node the
+        // instruction stream does not carry — or named it in a different order — would place
+        // markers this body's emitter never emits. The three checks are the class's whole grammar
+        // restated on the other side of the seal.
+        if body.len() != plan.groups.len() || plan.groups.len() < 2 {
+            return Err("lane-SC: the plan's group count is not the body's call count".to_string());
+        }
+        for (k, g) in plan.groups.iter().enumerate() {
+            if g.node != k {
+                return Err("lane-SC: the plan's groups are not the body's calls in order".into());
+            }
+            let n = &body[k];
+            let Inst::Call { args, .. } = &n.inst else {
+                return Err("lane-SC: a sequence body node that is not a call".to_string());
+            };
+            if !n.results.is_empty() {
+                return Err("lane-SC: a sequence call that declares a result".to_string());
+            }
+            if args.len() != g.args.len()
+                || args.iter().zip(g.args.iter()).any(|(a, (v, _))| a != v)
+            {
+                return Err("lane-SC: the plan's arguments are not the call's".to_string());
+            }
+        }
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        // No use-site key for any slot in this class — see the doc comment above. The empty list
+        // is passed explicitly so that a future slot with a key cannot be added without touching
+        // this line.
+        let keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        // One retirement run, written once and used at both the inter-group boundary and the
+        // final block, so the two cannot drift apart.
+        fn retire(b: &mut MfSeqBuild<MfSlot>, k: usize, g: &SeqCallGroup) {
+            for (v, _) in g.args.iter().rev() {
+                b.mark(false, MfSlot::SeqArg(k as u32, *v));
+            }
+            b.mark(false, MfSlot::SeqUnit(k as u32));
+        }
+        for (k, g) in plan.groups.iter().enumerate() {
+            b.block(k);
+            // The PREVIOUS group's retirement is at the entry of THIS block — this block IS that
+            // call's successor — and it precedes this group's own opens with no assign between
+            // them, which is what puts both runs at assign ordinal 0 (measured verbatim:
+            // `bb1: StorageDead(_3); StorageDead(_2); StorageLive(_4); StorageLive(_5);`).
+            if k > 0 {
+                retire(&mut b, k - 1, &plan.groups[k - 1]);
+            }
+            // The statement's `()` temp is opened FIRST — before any argument temp, at assign
+            // ordinal 0 (measured, `probes/sc.rs` n2_mut/n3_mut) — and under
+            // [`super::SatPerturb::SeqUnitLate`] LAST instead, from the one `unit_late` bit the
+            // sealed plan carries.
+            let u = MfSlot::SeqUnit(k as u32);
+            tys.push((u, ir_ty_token(&Ty::Unit)));
+            if !plan.unit_late {
+                b.mark(true, u);
+            }
+            for (v, t) in g.args.iter() {
+                let s = MfSlot::SeqArg(k as u32, *v);
+                tys.push((s, ir_ty_token(t)));
+                b.mark(true, s);
+                b.assign();
+            }
+            if plan.unit_late {
+                b.mark(true, u);
+            }
+        }
+        // The LAST group retires at the FINAL successor — block N, which the last call's
+        // `new_block` appended — and the unit body's own `_0 = const ()` follows it, one assign
+        // after the last marker.
+        let last = plan.groups.len() - 1;
+        b.block(plan.groups.len());
+        retire(&mut b, last, &plan.groups[last]);
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (lane G17, 2026-08-25): the DEEP UNIT-CHAIN class's whole-body walk.
+    ///
+    /// The sequence is a CLOSED FORM of the plan — one LIFO region walk, stated once on
+    /// [`MfUnitChainPlan`] and read here and by the emitter from that one place:
+    ///
+    /// ```text
+    ///   block 0   :  live(UcUnit) @ 0                        [the `Semi` spelling only]
+    ///                for k = N-1 down to 0, for each operand in OPERAND order:
+    ///                    Place -> live(UcArg(k, pos)) then ONE assign
+    ///                    Chain -> live(UcArg(k, pos))
+    ///                    Lit   -> nothing at all
+    ///   block k+1 :  dead(UcArg(k, pos)) for pos in REVERSE operand order, skipping Lit
+    ///   block N   :  the same for the FINAL call, then dead(UcUnit)
+    /// ```
+    ///
+    /// Measured verbatim against built on `probes/g17.rs` (`c4`, `c5`, `c8::{closure#0}`,
+    /// `c9::{closure#0}`) — see [`MfUnitChainPlan`] for the dump.
+    ///
+    /// The block map is DERIVED, not assumed: the shim allocates one MIR block per trust-ir block
+    /// (this class has exactly one) and each `Inst::Call`'s `new_block` appends, so the k-th
+    /// call's successor is MIR block `k + 1`, in body order — exactly built's `bb0..bbN` chain.
+    /// The final block's trailing `_0 = const ()` is one assign AFTER the last marker and
+    /// therefore contributes nothing to the sequence, which is why it is not spelled here.
+    ///
+    /// No use-site key is registered, and that is DERIVED rather than omitted, exactly as in
+    /// [`predict_seq_call`]: every argument temp is moved out by a call TERMINATOR and the `()`
+    /// temp is a call DESTINATION, and [`observe_with`] walks STATEMENTS only, so the observed
+    /// side has no key for any of them either. A temp read by an assignment instead would carry a
+    /// key on the observed side and none here, and the body would fail closed.
+    ///
+    /// The slot TYPE tokens: a `Place` operand's temp is typed from the producer's own
+    /// block-parameter annotation, a `Chain` operand's temp from the PRODUCING call's declared
+    /// return type in the module's function-type table, and the `()` temp from `Ty::Unit` —
+    /// every one of them tokenized by [`ir_ty_token`], never read off a rustc local.
+    pub(super) fn predict_unit_chain(
+        func: &trust_ir::Function,
+        plan: &MfUnitChainPlan,
+    ) -> Result<MfSeq, String> {
+        let [blk] = func.blocks.as_slice() else {
+            return Err("lane-G17: the deep unit-chain class is a one-block class".into());
+        };
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "lane-G17: empty block".to_string())?;
+        match &term.inst {
+            Inst::Return { values } if values.is_empty() => {}
+            _ => {
+                return Err(
+                    "lane-G17: the deep unit-chain class must end in a value-less Return".into()
+                );
+            }
+        }
+        // The plan's calls are RE-DERIVED here against the trust-ir rather than inherited: the
+        // walk below reads the plan's operand lists, and a plan that named a node the instruction
+        // stream does not carry — or named it in a different order, or with different arguments —
+        // would place markers this body's emitter never emits. This is the class's whole grammar
+        // restated on the other side of the seal.
+        if plan.calls.len() < 2 {
+            return Err("lane-G17: fewer than two calls in a deep unit chain".to_string());
+        }
+        for (k, c) in plan.calls.iter().enumerate() {
+            let n = body.get(c.node).ok_or_else(|| "lane-G17: a plan node outside the body")?;
+            let Inst::Call { args, .. } = &n.inst else {
+                return Err("lane-G17: a planned node that is not a call".to_string());
+            };
+            let last = k + 1 == plan.calls.len();
+            if last && c.node + 1 != body.len() {
+                return Err("lane-G17: the final planned call is not the body's last node".into());
+            }
+            match (last, n.results.as_slice(), c.result) {
+                (true, [], None) => {}
+                (false, &[r], Some(pr)) if r == pr => {}
+                _ => return Err("lane-G17: the plan's result does not match the call".to_string()),
+            }
+            if k > 0 && c.node <= plan.calls[k - 1].node {
+                return Err("lane-G17: the plan's calls are not in body order".to_string());
+            }
+            if args.len() != c.args.len() {
+                return Err("lane-G17: the plan's arity is not the call's".to_string());
+            }
+            for (a, op) in args.iter().zip(c.args.iter()) {
+                let v = match op {
+                    UcOperand::Place(v, _) | UcOperand::Lit(v) | UcOperand::Chain(v) => *v,
+                };
+                if v != *a {
+                    return Err("lane-G17: the plan's arguments are not the call's".to_string());
+                }
+            }
+        }
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        // No use-site key for any slot in this class — see the doc comment above. The empty list
+        // is passed explicitly so that a future slot with a key cannot be added without touching
+        // this line.
+        let keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        b.block(0);
+        // The statement's `()` temp, FIRST — or LAST under [`super::SatPerturb::UcUnitLate`],
+        // from the one `unit_late` bit the sealed plan carries, the same bit the emitter reads.
+        if plan.unit_stmt {
+            tys.push((MfSlot::UcUnit, ir_ty_token(&Ty::Unit)));
+            if !plan.unit_late {
+                b.mark(true, MfSlot::UcUnit);
+            }
+        }
+        // The opening run: the OUTERMOST call's operands first, descending inward. A `Chain`
+        // operand's temp is the PRODUCING call's destination, so its declared type is that
+        // call's `ret_ty` — the producer's own function-table annotation.
+        for (k, c) in plan.calls.iter().enumerate().rev() {
+            for (pos, op) in c.args.iter().enumerate() {
+                let s = MfSlot::UcArg(k as u32, pos as u32);
+                match op {
+                    UcOperand::Place(_, t) => {
+                        tys.push((s, ir_ty_token(t)));
+                        b.mark(true, s);
+                        b.assign();
+                    }
+                    UcOperand::Chain(_) => {
+                        let prev = plan
+                            .calls
+                            .get(k.wrapping_sub(1))
+                            .ok_or_else(|| "lane-G17: a chain operand at the first call")?;
+                        let t = prev
+                            .ret_ty
+                            .as_ref()
+                            .ok_or_else(|| "lane-G17: a chain operand without a declared type")?;
+                        tys.push((s, ir_ty_token(t)));
+                        b.mark(true, s);
+                    }
+                    // A folded literal mints no local and no assign — built spells it inline.
+                    UcOperand::Lit(_) => {}
+                }
+            }
+        }
+        if plan.unit_stmt && plan.unit_late {
+            b.mark(true, MfSlot::UcUnit);
+        }
+        // Each call's own argument temps retire at ITS successor, in reverse operand order.
+        for (k, c) in plan.calls.iter().enumerate() {
+            b.block(k + 1);
+            for (pos, op) in c.args.iter().enumerate().rev() {
+                if matches!(op, UcOperand::Lit(_)) {
+                    continue;
+                }
+                b.mark(false, MfSlot::UcArg(k as u32, pos as u32));
+            }
+        }
+        // The statement's `()` temp retires LAST, in the final call's successor, and the unit
+        // body's own `_0 = const ()` follows it — one assign after every marker.
+        if plan.unit_stmt {
+            b.mark(false, MfSlot::UcUnit);
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (lane G21, 2026-08-25): the SHORT-CIRCUIT-OVER-CALLS class's whole-body walk — the
+    /// marker sequence as a closed form of the sealed plan and the trust-ir, reading no emitted
+    /// statement.
+    ///
+    /// The block map is DERIVED, not assumed: the shim allocates one MIR block per trust-ir block
+    /// in `func.blocks` order before it lowers anything, and every later `new_block` appends. This
+    /// class's appends are, in creation order, the HEAD call's successor (minted while the head
+    /// block is lowered), lane K's false-edge TRAMPOLINE (minted by the head's own `CondBr`, one
+    /// instruction later, in the same block) and the RHS call's successor — so they are `4`, `5`
+    /// and `6`, and only the last of the three ever carries a marker.
+    ///
+    /// No use-site key is registered for the condition temp (moved by the `switchInt` TERMINATOR,
+    /// which `observe_with` does not walk) nor for any argument temp (moved by a call TERMINATOR,
+    /// and assigned through a `Rvalue::Ref`, which carries no operand sequence). The post-op'd RHS
+    /// result HAS one: built's `_0 = Eq(move _4, const 0_u32)` is an ordinary assignment in the
+    /// call's successor, at assign ordinal 0 and operand position 0 — a folded constant takes no
+    /// position in an operand sequence, on either side of the law.
+    pub(super) fn predict_bc(func: &trust_ir::Function, plan: &MfBcPlan) -> Result<MfSeq, String> {
+        // RE-DERIVED from the trust-ir rather than inherited from the plan: a plan that named a
+        // block or a call the instruction stream does not carry would place markers this body's
+        // emitter never emits.
+        if func.blocks.len() != 4 {
+            return Err(
+                "lane G21: the short-circuit-over-calls class is a four-block class".to_string()
+            );
+        }
+        let ix = |id: BlockId| {
+            func.blocks.iter().position(|b| b.id == id).ok_or_else(|| {
+                "lane G21: the plan names a block the body does not carry".to_string()
+            })
+        };
+        let ih = ix(plan.head)?;
+        let ir = ix(plan.rhs_arm)?;
+        let ic = ix(plan.const_arm)?;
+        let ij = ix(plan.join)?;
+        if ih != 0 || ir == 0 || ic == 0 || ij == 0 || ir == ic || ir == ij || ic == ij {
+            return Err("lane G21: the plan's block roles are not the body's".to_string());
+        }
+        // The call the plan owns in each block IS that block's first node, its result is the
+        // plan's and so are its arguments — checked here, on the other side of the seal.
+        for (bi, args, res) in
+            [(ih, &plan.head_args, plan.head_res), (ir, &plan.rhs_args, plan.rhs_res)]
+        {
+            let n = func.blocks[bi]
+                .body
+                .first()
+                .ok_or_else(|| "lane G21: an empty block".to_string())?;
+            let Inst::Call { args: cargs, .. } = &n.inst else {
+                return Err("lane G21: the plan's call node is not a call".to_string());
+            };
+            if n.results.as_slice() != [res] {
+                return Err("lane G21: the plan's call result is not the call's".to_string());
+            }
+            if cargs.len() != args.len() || cargs.iter().zip(args).any(|(a, (v, _))| a != v) {
+                return Err("lane G21: the plan's arguments are not the call's".to_string());
+            }
+        }
+        // One argument run, written once and used at both call sites so the two cannot drift.
+        fn open_args(
+            b: &mut MfSeqBuild<MfSlot>,
+            tys: &mut Vec<(MfSlot, MfTy)>,
+            role: u8,
+            args: &[(ValueId, Ty)],
+        ) {
+            for (v, t) in args {
+                let s = MfSlot::BcArg(role, *v);
+                tys.push((s, ir_ty_token(t)));
+                b.mark(true, s);
+                b.assign();
+            }
+        }
+        fn retire_args(b: &mut MfSeqBuild<MfSlot>, role: u8, args: &[(ValueId, Ty)], fwd: bool) {
+            let order: Vec<&(ValueId, Ty)> =
+                if fwd { args.iter().collect() } else { args.iter().rev().collect() };
+            for (v, _) in order {
+                b.mark(false, MfSlot::BcArg(role, *v));
+            }
+        }
+        let rhs_succ = func.blocks.len() + 2;
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        let mut keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        let head_res = MfSlot::Res(plan.head_res);
+        let rhs_res = MfSlot::Res(plan.rhs_res);
+        // The walk is in MIR BLOCK ORDER, which is the order `observe_with` produces its own
+        // sequence in (`blocks.iter_enumerated()`).
+        for bi in 0..func.blocks.len() {
+            b.block(bi);
+            if bi == ih {
+                // The condition's own temp, opened before every argument temp (wave-MC's rule 1).
+                // Its type is `bool` by the producer's own `CondBr` grammar; the emitter declares
+                // the local at the callee's ABI return type, so a callee returning anything else
+                // fails the law CLOSED here rather than comparing equal.
+                tys.push((head_res, ir_ty_token(&Ty::Bool)));
+                b.mark(true, head_res);
+                open_args(&mut b, &mut tys, 0, &plan.head_args);
+            } else if bi == ir {
+                // The head call's argument temps die at the ENTRY of this arm, in reverse order,
+                // before anything this arm opens (lane K's rule 1).
+                retire_args(&mut b, 0, &plan.head_args, false);
+                if let Some(t) = &plan.rhs_post {
+                    tys.push((rhs_res, ir_ty_token(t)));
+                    b.mark(true, rhs_res);
+                }
+                open_args(&mut b, &mut tys, 1, &plan.rhs_args);
+            } else if bi == ic {
+                // The same run at the const arm's entry; the arm's own edge assign follows and
+                // carries no marker.
+                retire_args(&mut b, 0, &plan.head_args, false);
+                b.assign();
+            } else if bi == ij {
+                // The join: the condition temp, at position 0 (lane K's rule 2).
+                b.mark(false, head_res);
+                b.assign();
+            } else {
+                return Err("lane G21: a block outside the plan's four roles".to_string());
+            }
+        }
+        // The head call's successor (the `switchInt` alone) and lane K's trampoline carry no
+        // marker and no assign; they are enumerated so the block map is STATED, not assumed.
+        b.block(func.blocks.len());
+        b.block(func.blocks.len() + 1);
+        b.block(rhs_succ);
+        // Trust (lane G21): under [`super::SatPerturb::G21RetOrder`] this run goes FORWARD —
+        // from the one `ret_swap` bit the sealed plan carries, the same bit the emitter reads.
+        retire_args(&mut b, 1, &plan.rhs_args, plan.ret_swap);
+        if plan.rhs_post.is_some() {
+            // The post-op's own assign, then the destination temp — built retires it AFTER the
+            // assignment that consumes it (wave-MC's rule 4).
+            keys.push((rhs_res, Some((rhs_succ, b.at(), 0))));
+            b.assign();
+            b.mark(false, rhs_res);
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (wave-WB8, 2026-08-21): the CHAIN-FORWARD class's whole-body walk — the LIFO-region
+    /// model as a closed form of the sealed plan and the trust-ir, reading no emitted statement.
+    ///
+    /// The block map is derived, not assumed: the shim allocates one MIR block per trust-ir
+    /// block (this class has exactly one) and each `Inst::Call`'s `new_block` appends — so the
+    /// k-th call's successor is MIR block `k + 1`, in SSA order, which the plan has already
+    /// pinned equal to the final call's argument order for the chain slots.
+    ///
+    /// Every event is rule-derived from the measured model (`probes/em3.rs`, d1–d4):
+    ///
+    ///   * a Place slot: `live(t); t = <reborrow|copy>` at its evaluation point — one live, one
+    ///     assign, in whatever block the walk has reached;
+    ///   * a ByValue chain slot: `live(t)` (the inner call's own destination — no assign of its
+    ///     own), then the inner call's argument temps (`live(w); w = &(*_p)` each), then the
+    ///     terminator; at the successor's entry the inner temps retire in reverse order;
+    ///   * a Reborrow chain slot: `live(t); live(u)` (both before any inner argument temp), the
+    ///     inner argument temps, the terminator; at the successor: the bridge assign
+    ///     `t = &(*u)` at position 0, THEN the inner temps retire;
+    ///   * the FINAL retirement, at the final successor's entry: argument temps in reverse slot
+    ///     order, then in-transit locals in reverse creation order — swapped as two runs under
+    ///     [`super::SatPerturb::ChainRetOrder`], the bit read off the SAME sealed plan the
+    ///     emitter reads, so the law stays green and only the ORACLE can refuse.
+    ///
+    /// No use-site key is registered for the argument/inner temps (moved by call TERMINATORS,
+    /// which `observe_with` does not walk) nor for an in-transit local (read through a
+    /// `Rvalue::Ref`, which carries no operand sequence) — derived, not omitted, exactly as in
+    /// [`predict_call_fwd`].
+    ///
+    /// The slot TYPE tokens: a Place or inner-argument temp is typed from the producer's own
+    /// block-parameter annotation ([`ir_ty_token`]); a chain slot's two locals carry
+    /// [`MfTy::Opaque`], which [`chain_fwd_source_admits`] made a checked fact rather than a
+    /// guess — it REFUSES any chain argument whose typeck type is one of the sixteen body
+    /// scalars, so the emitter's rustc-typed locals can only tokenize Opaque too (a scalar
+    /// local here would fail the law CLOSED, never compare equal).
+    pub(super) fn predict_chain_fwd(
+        func: &trust_ir::Function,
+        plan: &MfChainFwdPlan,
+    ) -> Result<MfSeq, String> {
+        let [blk] = func.blocks.as_slice() else {
+            return Err("wave-WB8: the chain-forward class is a one-block class".to_string());
+        };
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "wave-WB8: empty block".to_string())?;
+        if !matches!(term.inst, Inst::Return { .. }) {
+            return Err("wave-WB8: the chain-forward class must end in a Return".to_string());
+        }
+        // RE-DERIVED from the trust-ir rather than inherited from the plan: nothing but calls,
+        // and the plan's node indices name what the block really holds.
+        if body.iter().any(|n| !matches!(n.inst, Inst::Call { .. })) {
+            return Err("wave-WB8: a non-call instruction in a chain-forward body".to_string());
+        }
+        if plan.final_node + 1 != body.len() || plan.inners.len() + 1 != body.len() {
+            return Err("wave-WB8: the plan does not name every call".to_string());
+        }
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        let keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        b.block(0);
+        let mut cur = 0usize;
+        let mut arg_run: Vec<MfSlot> = Vec::new();
+        let mut transit_run: Vec<MfSlot> = Vec::new();
+        let mut chain_k = 0usize;
+        for s in plan.slots.iter() {
+            match s {
+                ChainSlot::Place(v, t) => {
+                    let sl = MfSlot::Arg(*v);
+                    tys.push((sl, ir_ty_token(t)));
+                    b.mark(true, sl);
+                    b.assign();
+                    arg_run.push(sl);
+                }
+                ChainSlot::ByValue(v) | ChainSlot::Reborrow(v) => {
+                    let k = chain_k;
+                    chain_k += 1;
+                    let Some((node_i, iargs)) = plan.inners.get(k) else {
+                        return Err("wave-WB8: a chain slot without an inner call".to_string());
+                    };
+                    // The inner call's own arguments must BE the plan's, in order.
+                    let Inst::Call { args, .. } = &body[*node_i].inst else {
+                        return Err("wave-WB8: an inner node is not a call".to_string());
+                    };
+                    if args.len() != iargs.len()
+                        || args.iter().zip(iargs).any(|(a, (v2, _))| a != v2)
+                    {
+                        return Err(
+                            "wave-WB8: the plan's inner arguments are not the call's".to_string()
+                        );
+                    }
+                    let sl = MfSlot::Arg(*v);
+                    tys.push((sl, MfTy::Opaque));
+                    b.mark(true, sl);
+                    arg_run.push(sl);
+                    let reb = matches!(s, ChainSlot::Reborrow(_));
+                    if reb {
+                        let tr = MfSlot::Transit(*v);
+                        tys.push((tr, MfTy::Opaque));
+                        b.mark(true, tr);
+                        transit_run.push(tr);
+                    }
+                    let mut ideads: Vec<MfSlot> = Vec::new();
+                    for (a, t) in iargs {
+                        let ia = MfSlot::Arg(*a);
+                        tys.push((ia, ir_ty_token(t)));
+                        b.mark(true, ia);
+                        b.assign();
+                        ideads.push(ia);
+                    }
+                    cur += 1;
+                    b.block(cur);
+                    if reb {
+                        // The bridge `t = &(*u)` at position 0 of the successor.
+                        b.assign();
+                    }
+                    for d in ideads.iter().rev() {
+                        b.mark(false, *d);
+                    }
+                }
+            }
+        }
+        // The final call: its terminator mints no statement; the final successor holds the
+        // whole retirement at position 0 (the routed `_0` write is the call itself).
+        cur += 1;
+        b.block(cur);
+        let (first, second): (&[MfSlot], &[MfSlot]) =
+            if plan.ret_swap { (&transit_run, &arg_run) } else { (&arg_run, &transit_run) };
+        for d in first.iter().rev() {
+            b.mark(false, *d);
+        }
+        for d in second.iter().rev() {
+            b.mark(false, *d);
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (lane S3): the aggregate-of-call-results walk — one live per call destination at
+    /// the head of its own block, the aggregate assign's use-site keys, and the reverse-
+    /// creation-order retirement after it, from the sealed plan and the trust-ir alone. Under
+    /// [`super::SatPerturb::ChainRetOrder`] the retirement runs FORWARD instead — the bit read
+    /// off the same sealed plan the emitter reads, so the law stays green and only the ORACLE
+    /// can refuse.
+    ///
+    /// The slot TYPE tokens come from the plan's `field_tys` — the producer's own struct table,
+    /// tokenized exactly as a block parameter's annotation is ([`ir_ty_token`]) — so a
+    /// scalar-typed call result is spelled `Scalar(i)` here and the emitter's rustc-typed
+    /// destination must tokenize the same index, or the law fails CLOSED.
+    pub(super) fn predict_agg_call(
+        func: &trust_ir::Function,
+        plan: &MfAggCallPlan,
+    ) -> Result<MfSeq, String> {
+        let [blk] = func.blocks.as_slice() else {
+            return Err(
+                "lane S3: the aggregate-of-call-results class is a one-block class".to_string()
+            );
+        };
+        let (term, body) =
+            blk.body.split_last().ok_or_else(|| "lane S3: empty block".to_string())?;
+        if !matches!(term.inst, Inst::Return { .. }) {
+            return Err("lane S3: the class must end in a Return".to_string());
+        }
+        let n = plan.results.len();
+        if n == 0 || plan.call_nodes.len() != n || plan.field_tys.len() != n {
+            return Err("lane S3: a malformed plan".to_string());
+        }
+        // RE-DERIVED from the trust-ir rather than inherited from the plan: the plan's node
+        // indices name real nullary calls with the plan's results, they are the body's LEADING
+        // run, and no other call exists.
+        for (k, i) in plan.call_nodes.iter().enumerate() {
+            if *i != k {
+                return Err("lane S3: the planned calls are not the body's leading run".to_string());
+            }
+            let Some(node) = body.get(*i) else {
+                return Err("lane S3: a call node out of range".to_string());
+            };
+            let Inst::Call { args, .. } = &node.inst else {
+                return Err("lane S3: a planned node is not a call".to_string());
+            };
+            if !args.is_empty() || node.results.as_slice() != [plan.results[k]] {
+                return Err("lane S3: the plan's calls are not the body's".to_string());
+            }
+        }
+        if body[n..].iter().any(|node| matches!(node.inst, Inst::Call { .. })) {
+            return Err("lane S3: a call outside the plan's leading run".to_string());
+        }
+        let mut b: MfSeqBuild<MfSlot> = MfSeqBuild::new();
+        let mut keys: Vec<(MfSlot, MfKey)> = Vec::new();
+        let mut tys: Vec<(MfSlot, MfTy)> = Vec::new();
+        b.block(0);
+        for (k, r) in plan.results.iter().enumerate() {
+            let s = MfSlot::Res(*r);
+            tys.push((s, ir_ty_token(&plan.field_tys[k])));
+            b.mark(true, s);
+            // The aggregate assign is the FIRST assign of block `n` (the final call's
+            // successor), and slot k is its k-th bare operand.
+            keys.push((s, Some((n, 0, k))));
+            b.block(k + 1);
+        }
+        b.assign();
+        let run: Vec<MfSlot> = plan.results.iter().map(|r| MfSlot::Res(*r)).collect();
+        if plan.ret_swap {
+            for s in run.iter() {
+                b.mark(false, *s);
+            }
+        } else {
+            for s in run.iter().rev() {
+                b.mark(false, *s);
+            }
+        }
+        Ok(b.finish(&keys, &tys))
+    }
+
+    /// Trust (lane ROT): the rotation extension's emitter-facing coordinates. `Copy`, like
+    /// [`MfLoopSites`], so an arm can hold it across `&mut self` emission calls.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct MfRotSites {
+        /// The body's last result — written directly into `header.params[fused_pos]`'s local.
+        pub(super) fused: ValueId,
+        pub(super) fused_pos: usize,
+        /// The header param VALUE the `let` snapshots, and the back-edge position it feeds.
+        pub(super) pass: ValueId,
+        pub(super) pass_pos: usize,
+        /// The body starts with the unsigned [`super::div_idiom`] guard.
+        pub(super) guard: bool,
+    }
+
     /// Trust (lane L9): the loop plan's four MARKER SITES — the only part of it the emitter reads
     /// directly. `Copy`, so an arm can hold it across the `&mut self` calls that emit.
     #[derive(Clone, Copy, Debug)]
@@ -4536,6 +10445,75 @@ mod mf_gate {
         /// Trust (lane L9): the `if`-STATEMENT's `()` value — built's `_4`, opened in the header
         /// on every iteration and retired TWICE, once on each edge out of the `if`'s region.
         IfVal,
+        /// Trust (wave-CF): a CALL ARGUMENT temp, named by the argument value it holds. A variant
+        /// of its own rather than `Res` of that value: an argument is not an instruction result,
+        /// and its own constructor is what makes it impossible for an argument temp and a marked
+        /// result to alpha-rename onto one another through a `ValueId` collision.
+        Arg(ValueId),
+        /// Trust (wave-CF-STR): a `&str` LITERAL argument's own local — built's `_5` in
+        /// `_5 = const "lit"; _4 = &(*_5)`. Its own constructor for the same reason `Arg` has
+        /// one: it is a different slot of the same value and must not alpha-rename onto it.
+        ArgLit(ValueId),
+        /// Trust (lane S1F): the call-forward UNIT-STATEMENT class's `()` temp — the
+        /// statement's own value, opened before and retired after every argument temp.
+        CfUnit,
+        /// Trust (lane S1F): the explicit-borrow pair's INNER local — the field borrow's own
+        /// `u = &((*_p).0)` under the argument temp `t = &(*u)` (which is `Arg` of the same
+        /// value). Its own constructor for the same reason `ArgLit` has one.
+        ArgInner(ValueId),
+        /// Trust (lane S1F): the reborrowed-return class's DESTINATION temp `d = f(..)`,
+        /// reborrowed into `_0` at the successor head, opened first and retired last.
+        CfRet,
+        /// Trust (lane R53): the POST-OP class's destination temp `d = f(..)`, opened before
+        /// every argument temp and retired AFTER the post-op's own assign. Its own constructor
+        /// for the same reason `CfRet` has one: it is a different slot with a different
+        /// retirement position and must not alpha-rename onto an argument temp.
+        CfPost,
+        /// Trust (wave-WB8): a chain-forward IN-TRANSIT local — the inner call's destination
+        /// `u` in `live(t); live(u); …; u = f(..); t = &(*u)`. Its own constructor for the
+        /// same reason `ArgLit` has one: it is a different slot of the same value (the outer
+        /// argument temp `t` is `Arg` of that value) and must not alpha-rename onto it.
+        Transit(ValueId),
+        /// Trust (lane ROT): the rotation's `let` local — built's `_9`, opened at the body
+        /// block's top and retired dead last. It aliases a header param VALUE in the trust-ir
+        /// (a `let` of a loop-carried variable is pure SSA aliasing), so it can be neither
+        /// `Res` nor `Temp`: its own constructor keeps it from alpha-renaming onto the param's
+        /// operand temps.
+        RotLet,
+        /// Trust (lane ROT): the passthrough READ temp — built's `_13` in
+        /// `_13 = copy _9; _1 = move _13`.
+        RotRead,
+        /// Trust (lane SC): a STATEMENT-CALL SEQUENCE argument temp, named by `(group index,
+        /// argument value)`. The group index is load-bearing rather than decorative: every
+        /// corpus body in this class passes THE SAME value to all N calls (`self.a(); self.b();`
+        /// is `call @f(%0)` N times) and built mints a DIFFERENT temp for each, so a slot named
+        /// by the value alone would alpha-rename the N temps onto one another and the law would
+        /// compare EQUAL to a body that reused one temp.
+        SeqArg(u32, ValueId),
+        /// Trust (lane SC): a STATEMENT-CALL SEQUENCE group's `()` temp — the statement's own
+        /// value, opened before and retired after that group's argument temps. Its own
+        /// constructor for the same reason `SeqArg` carries the group: the N unit temps are N
+        /// distinct locals and must not alpha-rename onto one another, nor onto an argument temp.
+        SeqUnit(u32),
+        /// Trust (lane G21): a SHORT-CIRCUIT-OVER-CALLS argument temp, named by `(role, argument
+        /// value)`. The role is load-bearing rather than decorative: the corpus bodies of this
+        /// class pass THE SAME values to both calls (`f(a,b) || f(b,a)` is `call @f(%0,%1,%2,%3)`
+        /// then `call @f(%0,%1,%3,%2)`) and built mints a DIFFERENT temp for each call, so a slot
+        /// named by the value alone would alpha-rename the two runs onto one another and the law
+        /// would compare EQUAL to a body that reused one temp.
+        BcArg(u8, ValueId),
+        /// Trust (lane G17): a DEEP UNIT-CHAIN argument temp, named by `(call index, operand
+        /// index)`. Neither component is decorative: `|c| c.set(c.get() + 1)` passes THE SAME
+        /// parameter to two different calls and built mints a different temp for each, so a slot
+        /// named by the value alone would alpha-rename the two onto one another; and a chain
+        /// operand's temp IS the previous call's destination, so a slot named by the value alone
+        /// could not tell it from that call's own leading place temp either.
+        UcArg(u32, u32),
+        /// Trust (lane G17): the DEEP UNIT-CHAIN body's statement `()` temp — one per body, in
+        /// the `Semi` spelling only, opened before every argument temp and retired after every
+        /// one of them. Its own constructor for the reason [`MfSlot::CfUnit`] has one: it is not
+        /// an argument and must not alpha-rename onto one.
+        UcUnit,
     }
 
     /// **THE DECLARED TYPE OF A MARKER'S STORAGE SLOT** — the component round 7 did not carry,
@@ -4722,10 +10700,7 @@ mod mf_gate {
                 // A slot whose type neither side registered is `Unknown`, which `observe` never
                 // produces — so an unmodelled slot fails the body CLOSED rather than comparing
                 // equal to whatever the other side found.
-                let ty = tys
-                    .iter()
-                    .find(|(s, _)| *s == slot)
-                    .map_or(MfTy::Unknown, |(_, t)| *t);
+                let ty = tys.iter().find(|(s, _)| *s == slot).map_or(MfTy::Unknown, |(_, t)| *t);
                 out.push((blk, at, live, a as u32, ty, key));
             }
             MfSeq(out)
@@ -4736,11 +10711,14 @@ mod mf_gate {
     /// run must name. Outside the operand-temp class `mf_operand` IS `ShimCx::operand`: no temp, no
     /// marker, no assign — which is why `in_class` gates the whole thing rather than just the
     /// marker.
+    #[allow(clippy::too_many_arguments)]
     fn mint_operands(
         b: &mut MfSeqBuild<MfSlot>,
         temps: &mut u32,
         tys: &mut Vec<(MfSlot, MfTy)>,
         needs: &HashSet<ValueId>,
+        delayed: &HashSet<ValueId>,
+        hoist: bool,
         def_of: &HashMap<ValueId, &Inst>,
         ty_of: &HashMap<ValueId, MfTy>,
         ops: &[ValueId],
@@ -4750,10 +10728,38 @@ mod mf_gate {
         if !in_class {
             return deads;
         }
+        // Trust (lane G25): the MOVE control's predicted half — every delayed statement of this
+        // group emitted HERE, at the top, instead of at its own operand position. Read from the
+        // sealed plan, exactly as the emitter's `mf_hoist_delayed` reads it, so the two sides move
+        // together and the law stays green while the ORACLE sees a marker at the wrong place.
+        if hoist {
+            for o in ops {
+                if delayed.contains(o) {
+                    let s = MfSlot::Res(*o);
+                    tys.push((s, ty_at(ty_of, *o)));
+                    b.mark(true, s);
+                    b.assign();
+                }
+            }
+        }
         for o in ops {
             // A constant operand is folded in place: no temp, no assign, no marker — and it takes
             // no position in the consuming assignment's operand sequence either.
             if matches!(def_of.get(o), Some(Inst::Const { .. })) {
+                continue;
+            }
+            // Trust (lane G25): a DELAYED marked result materialises HERE — its `StorageLive` and
+            // its one assign, at the operand position built evaluates it at. The slot is the
+            // RESULT's, not a fresh operand temp's, because the emitter mints one temp for it and
+            // binds the value to it; the retirement then rides the ordinary reverse-operand run.
+            if delayed.contains(o) {
+                let s = MfSlot::Res(*o);
+                if !hoist {
+                    tys.push((s, ty_at(ty_of, *o)));
+                    b.mark(true, s);
+                    b.assign();
+                }
+                deads.push(s);
                 continue;
             }
             // An already-marked temp is MOVED out of — no new temp and no live, only the dead.
@@ -4896,9 +10902,7 @@ mod mf_gate {
                 match &st.kind {
                     StatementKind::Assign(assign) => {
                         let at = b.at();
-                        for (oi, l) in
-                            rvalue_operand_locals(&assign.1).into_iter().enumerate()
-                        {
+                        for (oi, l) in rvalue_operand_locals(&assign.1).into_iter().enumerate() {
                             // First use wins: this shim moves every marked temp out exactly once.
                             if !keys.iter().any(|(k, _)| *k == l) {
                                 keys.push((l, Some((bb.index(), at, oi))));
@@ -4996,6 +11000,54 @@ mod mf_gate {
             self.mf_plans.operand_class()
         }
 
+        /// Trust (lane G25): does the sealed plan say this producer block's `CondBr` condition is
+        /// the `||`/`&&` sugar the emitter must materialise? Asked ONCE, by the arm that lowers a
+        /// `CondBr`, before it reads the condition operand.
+        pub(super) fn mf_sugar_cond(&self, blk: BlockId) -> bool {
+            self.mf_plans.sugar_cond(blk)
+        }
+
+        /// Trust (lane G25): does the sealed plan DELAY `r`'s statement to its use site? Asked
+        /// ONCE, by the arm that lowers an `Inst::Cast`, before it mints the destination temp.
+        pub(super) fn mf_delays(&self, r: ValueId) -> bool {
+            self.mf_plans.delays(r)
+        }
+
+        /// Trust (lane G25): is the sealed MOVE control engaged for this body?
+        pub(super) fn mf_g25_hoist(&self) -> bool {
+            self.mf_plans.hoists()
+        }
+
+
+        /// Trust (wave-MC): does the call-chain plan own the `Inst::Call` at body-node index `i`?
+        /// Asked ONCE, by the arm that lowers a call, before it mints the destination temp. `false`
+        /// keeps that arm byte-identical to its pre-wave form.
+        pub(super) fn mf_call_site(&self, i: usize) -> bool {
+            self.mf_plans.call_site(i)
+        }
+
+        /// Trust (lane G21): the short-circuit-over-calls role of the call being lowered, if the
+        /// sealed plan owns it. `None` keeps the call arm byte-identical to its pre-lane form.
+        pub(super) fn mf_bc_role(&self, blk: BlockId, i: usize) -> Option<BcRole> {
+            self.mf_plans.bc_role(blk, i)
+        }
+
+        /// Trust (lane G21): the planned argument list of one role.
+        pub(super) fn mf_bc_args(&self, role: BcRole) -> Vec<(ValueId, Ty)> {
+            self.mf_plans.bc_args(role)
+        }
+
+        /// Trust (lane G21): does the plan mark the RHS call's result?
+        pub(super) fn mf_bc_rhs_marked(&self) -> bool {
+            self.mf_plans.bc_rhs_marked()
+        }
+
+        /// Trust (lane G21): is [`super::SatPerturb::G21RetOrder`] exchanging this body's RHS
+        /// argument retirement? Read from the sealed plan, exactly as `predict_bc` reads it.
+        pub(super) fn mf_bc_ret_swap(&self) -> bool {
+            self.mf_plans.bc_ret_swap()
+        }
+
         /// An operand temp's `StorageLive`.
         pub(super) fn mf_mark_operand(&mut self, bb: BasicBlock, local: Local) {
             if !self.mf_plans.operand_class() {
@@ -5055,6 +11107,37 @@ mod mf_gate {
                 body: lp.body,
                 exit: lp.exit,
             })
+        }
+
+        /// Trust (lane ROT): the rotation extension's coordinates, or `None` — in which case
+        /// every emission arm keeps its exact pre-ROT form.
+        pub(super) fn mf_rot(&self) -> Option<MfRotSites> {
+            let lp = self.mf_plans.loop_.as_ref()?;
+            let r = lp.rot.as_ref()?;
+            Some(MfRotSites {
+                fused: r.fused,
+                fused_pos: r.fused_pos,
+                pass: r.pass.0,
+                pass_pos: r.pass.1,
+                guard: r.guard,
+            })
+        }
+
+        /// Trust (lane ROT): the MIR place of the loop header's `k`-th param local — the fused
+        /// update's destination. `None` fails the caller closed.
+        pub(super) fn mf_rot_fused_dest(&self, k: usize) -> Option<Place<'tcx>> {
+            let lp = self.mf_plans.loop_.as_ref()?;
+            self.param_locals.get(&lp.header)?.get(k).copied()
+        }
+
+        /// Trust (lane ROT): one marker of the rotation's `let`/read-temp cluster. Asked of the
+        /// plan at the emission, like every other marker site; `false` fails the body CLOSED.
+        pub(super) fn mf_mark_rot(&mut self, bb: BasicBlock, local: Local, live: bool) -> bool {
+            if self.mf_plans.loop_.as_ref().and_then(|l| l.rot.as_ref()).is_none() {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
         }
 
         /// Trust (lane L9): one half of a LOOP-REGION local's pair — the loop's own `()` value and
@@ -5170,6 +11253,430 @@ mod mf_gate {
             true
         }
 
+        /// Trust (wave-CF, revived by wave-FR): the CALL-FORWARD plan's argument list — the
+        /// values built mints a marked temp for, in operand order. The `Inst::Call` arm can get
+        /// it nowhere else (the plan is private to this module), and OUTSIDE the class it is
+        /// EMPTY, so the arm keeps its pre-wave form — forward the parameter place, no temp, no
+        /// marker — for every body the plan declines.
+        pub(super) fn mf_call_fwd_args(&self) -> Vec<(ValueId, Ty)> {
+            self.mf_plans.call_fwd.as_ref().map(|p| p.args.clone()).unwrap_or_default()
+        }
+
+        /// Trust (wave-CF-STR): the plan's `&str` LITERAL argument set. Empty outside the class
+        /// and empty when the extension is not compiled in, so the arm keeps its pre-wave form.
+        pub(super) fn mf_call_fwd_lits(&self) -> Vec<ValueId> {
+            self.mf_plans.call_fwd.as_ref().map(|p| p.lits.clone()).unwrap_or_default()
+        }
+
+        /// Trust (lane EM): is [`super::SatPerturb::CfLitOrder`] swapping this body's literal
+        /// pairs? Read from the sealed plan — the SAME bit `predict_call_fwd` reads — so the
+        /// two sides of the law cannot disagree about the swap.
+        pub(super) fn mf_call_fwd_lit_swap(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.lit_swap)
+        }
+
+        /// Trust (lane S1F): the plan's FIELD-projection argument set — the forwarded `Ptr`
+        /// params whose source form is `p.f` at declared field 0. Empty outside the class, so
+        /// the wave-8a/wave-30 forward keeps its pre-lane form for every body the plan declines.
+        pub(super) fn mf_call_fwd_fields(&self) -> Vec<ValueId> {
+            self.mf_plans.call_fwd.as_ref().map(|p| p.fields.clone()).unwrap_or_default()
+        }
+
+        /// Trust (lane S1F): does the plan mint a MARKER PAIR for argument `v`? `false` for a
+        /// field argument under [`super::SatPerturb::CfFieldDrop`] — the SAME bit
+        /// `predict_call_fwd` reads, so the two sides of the law cannot disagree.
+        pub(super) fn mf_call_fwd_marks_pair(&self, v: ValueId) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.marks_pair(v))
+        }
+
+        /// Trust (lane S1F): is this body the call-forward UNIT-STATEMENT form — built's `()`
+        /// temp for the statement's value? `false` outside the class and for the tail form.
+        pub(super) fn mf_call_fwd_unit_stmt(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.unit_stmt)
+        }
+
+        /// Trust (lane S1F): is [`super::SatPerturb::CfUnitLate`] displacing this body's `()`
+        /// temp? The SAME bit `predict_call_fwd` reads.
+        pub(super) fn mf_call_fwd_unit_late(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.unit_late)
+        }
+
+        /// Trust (lane S1F): the plan's explicit-borrow PAIR argument set. Empty outside the
+        /// class.
+        pub(super) fn mf_call_fwd_pairs(&self) -> Vec<ValueId> {
+            self.mf_plans.call_fwd.as_ref().map(|p| p.pairs.clone()).unwrap_or_default()
+        }
+
+        /// Trust (lane S1F): is [`super::SatPerturb::CfPairOrder`] swapping this body's pair
+        /// retirement order? The SAME bit `predict_call_fwd` reads.
+        pub(super) fn mf_call_fwd_pair_swap(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.pair_swap)
+        }
+
+        /// One half of an explicit-borrow pair's INNER local's pair (`u = &((*_p).0)`). A
+        /// method of its own for the reason `mf_mark_call_fwd_lit` is one: it asks the plan a
+        /// DIFFERENT question (`is_pair`) than the argument temp's (`marks_arg`).
+        pub(super) fn mf_mark_call_fwd_inner(
+            &mut self,
+            bb: BasicBlock,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.is_pair(v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (lane S1F): is this body the reborrowed-return form — built's destination
+        /// temp reborrowed into `_0` at the successor head?
+        pub(super) fn mf_call_fwd_ret_reborrow(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.ret_reborrow)
+        }
+
+        /// Trust (lane S1F): is [`super::SatPerturb::CfRetLate`] displacing this body's
+        /// destination temp? The SAME bit `predict_call_fwd` reads.
+        pub(super) fn mf_call_fwd_ret_late(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.ret_late)
+        }
+
+        /// One half of the reborrowed-return destination temp's pair. Plan-gated.
+        pub(super) fn mf_mark_call_fwd_ret(
+            &mut self,
+            bb: BasicBlock,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.ret_reborrow) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (lane R53): is this body the POST-OP form — the call's result consumed by one
+        /// scalar operation whose result is returned?
+        pub(super) fn mf_call_fwd_post(&self) -> Option<CfPostOp> {
+            self.mf_plans.call_fwd.as_ref().and_then(|p| p.post)
+        }
+
+        /// Trust (lane R53): is [`super::SatPerturb::CfPostLate`] displacing this body's post-op
+        /// destination temp? The SAME bit `predict_call_fwd` reads.
+        pub(super) fn mf_call_fwd_post_late(&self) -> bool {
+            self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.post_late)
+        }
+
+        /// Trust (lane R53): does the sealed post-op plan route THIS instruction's result
+        /// straight into `_0`?
+        ///
+        /// Built writes the body's outermost expression into the return place with no temp of
+        /// its own — `bb1: dead t; _0 = Eq(move d, const 0); dead d` — and wave-J already
+        /// mirrors that for a directly-returned CALL result (`route_to_ret`). Every OTHER
+        /// instruction result in this shim goes through `mf_result_temp` and the `Return` arm
+        /// copies it, which puts a SECOND assign in the successor block. Measured: with the
+        /// temp, the marker law refused all five operand-form bodies at `b1.2` against the
+        /// predicted `b1.1` (`WhnfCache::is_empty`, `NameInterner::is_empty`, and the three
+        /// closures — whole-crate, this lane's own subject-vs-control run).
+        ///
+        /// Four conditions, all checked, and every one of them fail-closed:
+        ///
+        ///   * the sealed plan carries an OPERAND-form post-op (the FIELD form binds a place and
+        ///     the `Return` arm's own `_0 = copy (d.f)` is already the single assign);
+        ///   * the call has already run in this body — `cf_post_dead` holds its destination —
+        ///     so this really is the node the plan named and not an earlier lookalike;
+        ///   * the very next node is `Return([r])`, wave-J's own predicate, spelled the same way;
+        ///   * the return place's declared type is the instruction's result type, so the direct
+        ///     write is type-exact rather than assumed.
+        pub(super) fn mf_call_fwd_post_route(
+            &self,
+            r: ValueId,
+            rty: RustcTy<'tcx>,
+            nodes: &[InstrNode],
+            next: usize,
+        ) -> Option<Place<'tcx>> {
+            let p = self.mf_plans.call_fwd.as_ref()?;
+            if !matches!(p.post, Some(CfPostOp::BinLit | CfPostOp::NotUnary)) {
+                return None;
+            }
+            self.cf_post_dead?;
+            match nodes.get(next).map(|n| &n.inst) {
+                Some(Inst::Return { values }) if values.as_slice() == [r] => {}
+                _ => return None,
+            }
+            let ret = Place::from(rustc_middle::mir::RETURN_PLACE);
+            if self.local_decls[ret.local].ty != rty {
+                return None;
+            }
+            Some(ret)
+        }
+
+        /// One half of the POST-OP destination temp's pair. Plan-gated like every other marking
+        /// method here: an arm cannot mint the temp's markers unless the sealed plan says the
+        /// body carries a post-op.
+        pub(super) fn mf_mark_call_fwd_post(
+            &mut self,
+            bb: BasicBlock,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.post.is_some()) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of the unit-statement `()` temp's pair. Plan-gated like every other marking
+        /// method here: an arm cannot mint the temp's markers unless the sealed plan says the
+        /// body is the statement form.
+        pub(super) fn mf_mark_call_fwd_unit(
+            &mut self,
+            bb: BasicBlock,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.unit_stmt) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of a `&str` LITERAL argument's OWN local's pair. A method of its own, not a
+        /// second caller of [`Self::mf_mark_call_fwd`]: the two ask DIFFERENT questions of the
+        /// plan (`marks_arg` names the argument, `is_lit` names the two-local shape), and one
+        /// method taking either answer would let an argument temp be marked where a literal
+        /// local belongs.
+        pub(super) fn mf_mark_call_fwd_lit(
+            &mut self,
+            bb: BasicBlock,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.is_lit(v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of a call ARGUMENT temp's pair. As at every other emission site in this
+        /// module the plan's per-VALUE question and the push are ONE operation: an arm cannot
+        /// take the class's permission and then mark an argument the plan does not name.
+        pub(super) fn mf_mark_call_fwd(
+            &mut self,
+            bb: BasicBlock,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.call_fwd.as_ref().is_some_and(|p| p.marks_arg(v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (lane SC): the STATEMENT-CALL SEQUENCE plan, as a value. The `Inst::Call` arm
+        /// can get the sequence's structure nowhere else (the plan is private to this module),
+        /// and OUTSIDE the class it is `None`, so the arm keeps its pre-lane form for every body
+        /// the plan declines. Holding the plan value informs statement construction ONLY — a
+        /// marker still requires one of the two marking methods below, each of which re-asks the
+        /// sealed plan about its own group.
+        pub(super) fn mf_seq_call(&self) -> Option<MfSeqCallPlan> {
+            self.mf_plans.seq_call.clone()
+        }
+
+        /// Trust (lane SC): is [`super::SatPerturb::SeqUnitLate`] displacing this body's `()`
+        /// temps? The SAME bit `predict_seq_call` reads.
+        pub(super) fn mf_seq_unit_late(&self) -> bool {
+            self.mf_plans.seq_call.as_ref().is_some_and(|p| p.unit_late)
+        }
+
+        /// One half of a sequence ARGUMENT temp's pair. As at every other emission site in this
+        /// module the plan's question and the push are ONE operation — and here the question is
+        /// asked PER GROUP, so an arm cannot take one call's permission and mark another call's
+        /// temp.
+        pub(super) fn mf_mark_seq_arg(
+            &mut self,
+            bb: BasicBlock,
+            gi: usize,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.seq_call.as_ref().is_some_and(|p| p.marks_arg(gi, v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of a sequence group's `()` temp's pair. A method of its own, not a second
+        /// caller of [`Self::mf_mark_seq_arg`]: the two ask DIFFERENT questions of the plan
+        /// (`marks_arg` names an argument of the group, `marks_unit` names the group itself),
+        /// and one method taking either answer would let an argument temp be marked where a unit
+        /// temp belongs.
+        pub(super) fn mf_mark_seq_unit(
+            &mut self,
+            bb: BasicBlock,
+            gi: usize,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.seq_call.as_ref().is_some_and(|p| p.marks_unit(gi)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (lane G17): the DEEP UNIT-CHAIN plan, as a value. The `Inst::Call` arm can get
+        /// the chain's structure nowhere else (the plan is private to this module), and OUTSIDE
+        /// the class it is `None`, so the arm keeps its pre-lane form for every body the plan
+        /// declines. Holding the plan value informs statement construction ONLY — a marker still
+        /// requires one of the two marking methods below, each of which re-asks the sealed plan
+        /// about its own slot.
+        pub(super) fn mf_unit_chain(&self) -> Option<MfUnitChainPlan> {
+            self.mf_plans.unit_chain.clone()
+        }
+
+        /// Trust (lane G17): is [`super::SatPerturb::UcUnitLate`] displacing this body's `()`
+        /// temp? The SAME bit `predict_unit_chain` reads.
+        pub(super) fn mf_uc_unit_late(&self) -> bool {
+            self.mf_plans.unit_chain.as_ref().is_some_and(|p| p.unit_late)
+        }
+
+        /// One half of a deep unit-chain ARGUMENT temp's pair. As at every other emission site in
+        /// this module the plan's question and the push are ONE operation — and here the question
+        /// is asked PER (call, operand), so an arm cannot take one call's permission and mark
+        /// another call's temp, nor a literal's non-existent one.
+        pub(super) fn mf_mark_uc_arg(
+            &mut self,
+            bb: BasicBlock,
+            ci: usize,
+            pos: usize,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.unit_chain.as_ref().is_some_and(|p| p.marks_arg(ci, pos)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of the deep unit-chain body's `()` temp's pair. A method of its own, not a
+        /// second caller of [`Self::mf_mark_uc_arg`]: the two ask DIFFERENT questions of the plan
+        /// (`marks_arg` names an operand, `marks_unit` names the statement itself), and one
+        /// method taking either answer would let an argument temp be marked where a unit temp
+        /// belongs.
+        pub(super) fn mf_mark_uc_unit(&mut self, bb: BasicBlock, local: Local, live: bool) -> bool {
+            if !self.mf_plans.unit_chain.as_ref().is_some_and(|p| p.marks_unit()) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (wave-WB8): the CHAIN-FORWARD plan, as a value. The `Inst::Call` arm can get
+        /// the chain's structure nowhere else (the plan is private to this module), and
+        /// OUTSIDE the class it is `None`, so the arm keeps its pre-wave form for every body
+        /// the plan declines. Holding the plan value informs statement construction ONLY —
+        /// a marker still requires one of the three chain marking methods below, each of
+        /// which re-asks the sealed plan about its own value.
+        pub(super) fn mf_chain(&self) -> Option<MfChainFwdPlan> {
+            self.mf_plans.chain.clone()
+        }
+
+        /// One half of a chain-forward FINAL-argument temp's pair — a Place slot's temp or a
+        /// chain slot's outer temp (which for a ByValue slot IS the inner call's
+        /// destination). As at every other emission site the plan's per-VALUE question and
+        /// the push are ONE operation.
+        pub(super) fn mf_mark_chain_arg(
+            &mut self,
+            bb: BasicBlock,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.chain.as_ref().is_some_and(|p| p.marks_arg(v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of a chain-forward IN-TRANSIT local's pair — the inner call's destination
+        /// behind a Reborrow slot. A method of its own, not a second caller of
+        /// [`Self::mf_mark_chain_arg`]: the two ask DIFFERENT questions of the plan
+        /// (`marks_arg` names the outer temp, `marks_transit` names the two-local shape), and
+        /// one method taking either answer would let an argument temp be marked where a
+        /// transit local belongs.
+        pub(super) fn mf_mark_chain_transit(
+            &mut self,
+            bb: BasicBlock,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.chain.as_ref().is_some_and(|p| p.marks_transit(v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// One half of an INNER call's own argument temp's pair. Its own method for the same
+        /// reason: `marks_inner_arg` names the inner calls' parameter forwards and nothing
+        /// else.
+        pub(super) fn mf_mark_chain_inner(
+            &mut self,
+            bb: BasicBlock,
+            v: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.chain.as_ref().is_some_and(|p| p.marks_inner_arg(v)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (lane S3): does the aggregate-of-call-results plan own the `Inst::Call` at
+        /// body-node index `i`? Asked ONCE by the arm that lowers a call, before it mints the
+        /// destination temp. `false` keeps that arm byte-identical to its pre-lane form.
+        pub(super) fn mf_agg_site(&self, i: usize) -> bool {
+            self.mf_plans.agg_call.as_ref().is_some_and(|p| p.call_nodes.contains(&i))
+        }
+
+        /// One half of an aggregate-plan call-result temp's pair. As at every other emission
+        /// site the plan's per-VALUE question and the push are ONE operation.
+        pub(super) fn mf_mark_agg_res(
+            &mut self,
+            bb: BasicBlock,
+            r: ValueId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            if !self.mf_plans.agg_call.as_ref().is_some_and(|p| p.marks(r)) {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
+        }
+
+        /// Trust (lane S3): the retirement the `Return` arm owes after the aggregate assign —
+        /// the plan's results in SSA order, plus the one `ret_swap` bit. `None` outside the
+        /// class, so the `Return` arm keeps its exact pre-lane form.
+        pub(super) fn mf_agg_retire(&self) -> Option<(Vec<ValueId>, bool)> {
+            self.mf_plans.agg_call.as_ref().map(|p| (p.results.clone(), p.ret_swap))
+        }
+
         /// Trust (wave-DR): does the deref-recursion match plan own this body at all? Asked by the
         /// `Inst::Switch` arm before it mints a trampoline and by the reshape tripwire beside it.
         pub(super) fn mf_dr_owns(&self) -> bool {
@@ -5194,6 +11701,131 @@ mod mf_gate {
         /// trampoline on. Read by the `dr-tramp` SAT control and nothing else.
         pub(super) fn mf_dr_last_arm(&self) -> Option<BlockId> {
             self.mf_plans.dr.as_ref().map(|p| p.last_arm)
+        }
+
+        /// Trust (lane F8): does the switch-to-join plan own THIS block's `Inst::Switch`? Read by
+        /// the `Inst::Switch` arm before it schedules a retirement or mints a trampoline.
+        pub(super) fn mf_sw_head(&self, blk: BlockId) -> bool {
+            self.mf_plans.sw.as_ref().is_some_and(|p| p.head == blk)
+        }
+
+        /// Trust (lane F8): the scrutinee value and the join its temp is retired at.
+        pub(super) fn mf_sw_site(&self) -> Option<(ValueId, BlockId)> {
+            self.mf_plans.sw.as_ref().map(|p| (p.scrutinee, p.join))
+        }
+
+        /// Trust (lane F8): the plan's match-candidate trampoline table.
+        pub(super) fn mf_sw_tramps(&self) -> Vec<(BlockId, u8)> {
+            self.mf_plans.sw.as_ref().map(|p| p.tramps.clone()).unwrap_or_default()
+        }
+
+        /// Trust (lane F8): the LAST candidate's arm block — the one edge the plan never puts a
+        /// trampoline on. Read by the `sw-tramp` SAT control and nothing else.
+        pub(super) fn mf_sw_last_arm(&self) -> Option<BlockId> {
+            self.mf_plans.sw.as_ref().map(|p| p.last_arm)
+        }
+
+        /// Trust (lane F8B): does the discriminant-match plan own THIS block's `Inst::Switch`?
+        /// Read by the `Inst::Switch` arm before it mints a trampoline.
+        pub(super) fn mf_swr_head(&self, blk: BlockId) -> bool {
+            self.mf_plans.swr.as_ref().is_some_and(|p| p.head == blk)
+        }
+
+        /// Trust (lane F8B): the plan's match-candidate trampoline table.
+        pub(super) fn mf_swr_tramps(&self) -> Vec<(BlockId, u8)> {
+            self.mf_plans.swr.as_ref().map(|p| p.tramps.clone()).unwrap_or_default()
+        }
+
+        /// Trust (lane F8B): the DEFAULT edge's arm block — the one edge the plan never puts a
+        /// trampoline on. Read by the `swr-tramp` SAT control and nothing else.
+        pub(super) fn mf_swr_last_arm(&self) -> Option<BlockId> {
+            self.mf_plans.swr.as_ref().map(|p| p.last_arm)
+        }
+
+        /// Trust (lane F8B): which slot the plan marks, and the JOIN whose parameter local two of
+        /// the three shapes name.
+        pub(super) fn mf_swr_slot(&self) -> Option<(SwrSlot, BlockId)> {
+            self.mf_plans.swr.as_ref().map(|p| (p.slot, p.join))
+        }
+
+        /// Trust (lane F8B): does the plan OPEN its slot at the entry of this block?
+        pub(super) fn mf_swr_opens(&self, blk: BlockId) -> bool {
+            self.mf_plans.swr.as_ref().is_some_and(|p| p.open_at.contains(&blk))
+        }
+
+        /// Trust (lane F8B): does the plan RETIRE its slot in this block, and after how many of
+        /// that block's own assigns? The emitter re-counts what it actually pushed against this
+        /// number, so a wrong plan costs a flip rather than shipping a displaced marker.
+        pub(super) fn mf_swr_close(&self, blk: BlockId) -> Option<usize> {
+            self.mf_plans.swr.as_ref().filter(|p| p.close_at.0 == blk).map(|p| p.close_at.1)
+        }
+
+        /// Trust (lane F8B): does the sealed plan route THIS join's `!` straight into `_0`?
+        ///
+        /// Built writes the body's outermost expression into the return place with NO temp —
+        /// `bb21: _0 = Not(move _2); StorageDead(_2); return`, measured verbatim on
+        /// `probes/f8b.rs::p1` — and wave-J already mirrors that for a directly-returned CALL
+        /// result. Without it the shim spells the same expression in two assigns
+        /// (`_t = Not(copy _2); _0 = copy _t`), which puts the match value's retirement one
+        /// statement later than built's and is exactly what the join's own assign re-count
+        /// refused on the first subject driver.
+        ///
+        /// Three conditions, all checked and every one fail-closed:
+        ///
+        ///   * the sealed plan carries the MATCH-VALUE shape and names THIS block as its join;
+        ///   * the very next node is `Return([r])` — wave-J's own predicate, spelled the same
+        ///     way, so the `Return` arm then emits only the terminator (`_0` already holds the
+        ///     value) and the join really does carry ONE assign;
+        ///   * the return place's declared type is `bool`, the type the producer annotated the
+        ///     `Select` with, so the direct write is type-exact rather than assumed.
+        pub(super) fn mf_swr_not_route(
+            &self,
+            blk: BlockId,
+            r: ValueId,
+            nodes: &[InstrNode],
+            next: usize,
+        ) -> Option<Place<'tcx>> {
+            let p = self.mf_plans.swr.as_ref()?;
+            if p.slot != SwrSlot::MatchValue || p.join != blk {
+                return None;
+            }
+            match nodes.get(next).map(|n| &n.inst) {
+                Some(Inst::Return { values }) if values.as_slice() == [r] => {}
+                _ => return None,
+            }
+            let ret = Place::from(rustc_middle::mir::RETURN_PLACE);
+            if self.local_decls[ret.local].ty != self.tcx.types.bool {
+                return None;
+            }
+            Some(ret)
+        }
+
+        /// Trust (lane F8B): does this body need built's RETURN SPLIT — the join's `Return`
+        /// replaced by `Goto R` plus a bare `R: return`?
+        pub(super) fn mf_swr_ret_split(&self) -> bool {
+            self.mf_plans.swr.as_ref().is_some_and(|p| p.ret_split)
+        }
+
+        /// One half of the discriminant-match class's marker pair. Plan-gated like every other
+        /// marking method here, and gated on the BLOCK as well as on the class: an arm cannot
+        /// take the class's permission and then mark a slot in a block the plan does not open or
+        /// close.
+        pub(super) fn mf_mark_swr(
+            &mut self,
+            bb: BasicBlock,
+            blk: BlockId,
+            local: Local,
+            live: bool,
+        ) -> bool {
+            let ok =
+                self.mf_plans.swr.as_ref().is_some_and(|p| {
+                    if live { p.open_at.contains(&blk) } else { p.close_at.0 == blk }
+                });
+            if !ok {
+                return false;
+            }
+            self.push_marker(bb, local, live);
+            true
         }
 
         /// Trust (wave-DR): one storage marker of an admitted arm. Like every other emission
@@ -5277,6 +11909,33 @@ struct ShimCx<'tcx> {
     /// awaiting its `StorageDead`. Emptied by the consuming instruction; a non-empty map at body
     /// end is an unbalanced marker and fails the body CLOSED rather than shipping it.
     mf_live: HashMap<ValueId, Local>,
+    /// Trust (lane G25, 2026-08-23): DELAYED statements awaiting their USE SITE — the rvalue, the
+    /// destination temp's declared type, and the `SourceInfo` of the producer node that defined it
+    /// so the statement lands at the consumer carrying its OWN span, exactly as built's does.
+    /// Filled by the `Inst::Cast` arm for the plan's delay set and drained by
+    /// [`ShimCx::mf_operand`]; a non-empty map at body end is a statement the derived body never
+    /// emitted and fails the body CLOSED rather than shipping a program that is missing one.
+    mf_delayed: HashMap<ValueId, (Rvalue<'tcx>, RustcTy<'tcx>, SourceInfo)>,
+    /// Trust (wave-WB8): the chain-forward FINAL-argument temps, one per plan slot, in slot
+    /// order — filled as each slot's evaluation point is reached, consumed by the final
+    /// call's operand replacement and its retirement run. Empty outside the class.
+    chain_arg_temps: Vec<Option<Place<'tcx>>>,
+    /// Trust (wave-WB8): the chain-forward IN-TRANSIT locals `(inner result, its dest
+    /// local)`, in creation order — retired after the whole argument run.
+    chain_transits: Vec<(ValueId, Local)>,
+    /// Trust (wave-WB8): the first chain slot whose temp has not been minted yet — built's
+    /// left-to-right argument evaluation, as a cursor.
+    chain_next_slot: usize,
+    /// Trust (lane G17): the DEEP UNIT-CHAIN's argument temps, indexed by `[call index][operand
+    /// index]` — ALL of them minted at the FIRST call's node, because built opens every one of
+    /// them in block 0 before the innermost call's terminator splits it. A `Lit` operand's entry
+    /// stays `None`: built folds a scalar literal into the operand and mints no local. Empty
+    /// outside the class.
+    uc_temps: Vec<Vec<Option<Place<'tcx>>>>,
+    /// Trust (lane G17): the DEEP UNIT-CHAIN body's statement `()` temp — the FINAL call's
+    /// destination in the `Semi` spelling, opened before every argument temp and retired after
+    /// every one of them. `None` outside the class and in the tail-expression spelling.
+    uc_unit: Option<Place<'tcx>>,
     /// Trust (lane K): the producer block currently being lowered — the key into
     /// `mf_branch.branch`. `None` before the block walk starts.
     mf_cur_blk: Option<BlockId>,
@@ -5310,6 +11969,19 @@ struct ShimCx<'tcx> {
     /// Trust (wave-DR): the unit awaiting the retirement built puts in the block AFTER its
     /// recursive call, at position 0 — which is the arm's `Br` block.
     dr_ret: Option<DrUnit>,
+    /// Trust (lane R53, 2026-08-22): the POST-OP class's destination temp, awaiting the
+    /// retirement that must follow the post-op's OWN assign. The `Inst::Call` arm mints and
+    /// opens it; the post-op node's arm writes `_0` one node later; the `Inst::Return` arm
+    /// retires it. It is the only marker in this shim whose emission is deferred past its own
+    /// instruction, and it is a `LOCAL` rather than a flag so the retirement cannot name a
+    /// different one. `None` outside the class, so every other body keeps its pre-lane form.
+    cf_post_dead: Option<(BasicBlock, Local)>,
+    /// Trust (lane F8B, 2026-08-23): the `!param` arm's OPERAND temp, minted at the arm block's
+    /// entry (so its `StorageLive` precedes every assign of that block, which is where built puts
+    /// it) and consumed by the `bool_not_idiom` arm one node later. Carried as the producer block
+    /// it belongs to plus the place, so neither the idiom nor the retirement can name a different
+    /// one. `None` outside the class, so every other body keeps its pre-lane form.
+    swr_not: Option<(BlockId, Place<'tcx>)>,
     /// Trust (wave-DR): the `&&` head's slots, carried to the three blocks it dominates. The plan
     /// proves the head is lowered first, so a dominated arm always finds its own head here.
     dr_carry: Option<DrCarry>,
@@ -5323,6 +11995,9 @@ struct ShimCx<'tcx> {
     /// Trust (lane L9): the `if`-statement's `()` value local (built's `_4`), minted in the header
     /// immediately before the condition's own temp.
     mf_loop_ifval: Option<Local>,
+    /// Trust (lane ROT): the rotation's minted `let` local (built's `_9`), opened at the body
+    /// block's top and retired by the back edge's tail after the unit const.
+    rot_t: Option<Local>,
     /// Trust (enum discriminant-read FLIP): the MIR arg place of each
     /// `"EnumDisc"`-class by-value enum param (`param_rty`). Like `fwd_ptr_params`
     /// it is NOT in `env` (so a bare use of the enum value fails closed in `operand()`), but is
@@ -5702,6 +12377,333 @@ fn plan_operand_marker_temps(func: &trust_ir::Function) -> Option<HashSet<ValueI
     Some(needs)
 }
 
+/// Trust (wave-MC, 2026-08-20): **THE BY-VALUE CALL CHAIN** — what the ninth marker plan owns.
+///
+/// A `Inst::Call` is the one instruction that SPLITS the MIR chain inside a single trust-ir block,
+/// so the marker positions of a call-carrying body are not a function of the trust-ir block index
+/// alone. That is why the eight earlier plans all refuse one: `plan_operand_marker_temps`'
+/// `operands_of` has no `Call` arm, `plan_branch_markers`' instruction set has none either, and
+/// [`mf_gate::predict_from`]'s walk answers `no marker sequence model for Inst::Call`. The
+/// measured consequence, crate-wide on `clean-kernel` at `d1d465d45`: ELEVEN bodies reach
+/// `derived_mir: agreed` with `markers_exact: false` and the oracle's own diagnosis
+/// `markers differ: line 0: built ... vs derived <end>` — an EMPTY derived side. The comparator
+/// was never the problem; the producer emitted nothing to compare.
+///
+/// # What built does, measured
+///
+/// `-Zdump-mir=built` on `crates/trust-thir-lower/probes/mc_call.rs`, verbatim, for
+/// `fn a_call_operand(self) -> bool { self.range() > 0 }` (the shape of
+/// `clean_kernel::expr::meta::ExprMeta::has_loose_bvars`):
+///
+/// ```text
+/// bb0: StorageLive(_2);            // the call's RESULT temp, opened FIRST
+///      StorageLive(_3); _3 = copy _1;   // the argument temp, `as_operand` -> `as_temp`
+///      _2 = M::range(move _3) -> [return: bb1, unwind: bb2];
+/// bb1: StorageDead(_3);            // the argument temps, at the successor's HEAD
+///      _0 = Gt(move _2, const 0_u32);
+///      StorageDead(_2);            // the result temp, after its consuming assign
+///      return;
+/// ```
+///
+/// Four rules, each measured on its own probe body and none of them guessed:
+///
+///   1. **The RESULT temp is opened before any argument temp** (`q1`, `q5`) — `as_operand` on the
+///      call expression opens the destination and only then recurses into the arguments. A call
+///      whose result is the body's tail expression takes NO temp: built writes `_0` directly, and
+///      so does this shim (`route_to_ret`).
+///   2. **Each non-constant argument takes a temp, in ARGUMENT order, interleaved** — `q2` shows
+///      `StorageLive(_3); _3 = copy _1; StorageLive(_4); _4 = copy _2;`, so the second argument's
+///      `StorageLive` sits one assign later than the first's. A CONSTANT argument folds in place
+///      and takes none (`q3`); an argument that is ALREADY a temp — a prior call's result — takes
+///      no new one (`q1`, `q8`).
+///   3. **The argument temps are retired at the head of the call's SUCCESSOR block, in REVERSE
+///      argument order** (`q1`, `q2`).
+///   4. **The result temp is retired after the assign that consumes it** (`q5`), or, when its
+///      consumer is another CALL, at the head of THAT call's successor — after that call's own
+///      argument temps (`q1`: `bb2: StorageDead(_5); StorageDead(_3);`). Both are one rule: a
+///      REVERSE-CREATION-ORDER scope exit, which is exactly the order `mf_operand` records in
+///      `deads` and `mf_retire`/`mf_retire_at` replay.
+///
+/// # Why this needs no new emission machinery
+///
+/// Rules 2 and 4 are [`ShimCx::mf_operand`]'s existing behaviour verbatim — it folds a constant,
+/// moves out of an already-marked temp (recording its retirement), and mints `StorageLive(t);
+/// t = <operand>` for anything else. Rule 1 is [`ShimCx::mf_mark_result`]. Rule 3 is
+/// [`ShimCx::mf_retire_at`], lane K's cross-block retirement. So this plan does not add a marker
+/// CONSTRUCTOR: `mf_gate`'s emission methods remain the only way to reach a MIR block with one,
+/// and this class simply becomes a body they are willing to answer for.
+///
+/// # The admitted class, and why each clause is load-bearing
+///
+///   * **`func.scopes.is_none()`** — the `let` firewall, verbatim from
+///     [`plan_operand_marker_temps`]. `q7` (`let _ = 1u32; f1(x)`) measures what it excludes: a
+///     `FakeRead`, a `PlaceMention`, a named local and its own marker pair, none of which the
+///     trust-ir instruction stream distinguishes.
+///   * **exactly one trust-ir block** — the MIR block a marker lands in is then `0` for everything
+///     before the first call and `k + 1` after call `k`, a running allocation this side counts and
+///     [`mf_gate::predict_call`] counts identically. With two trust-ir blocks the shim's
+///     `new_block`s interleave with the block map and the count is a different derivation.
+///   * **at least one `Inst::Call`** — a call-free body belongs to `plan_operand_marker_temps`, and
+///     the two must not both claim one body (`MfPlans::seal` resolves it, and this clause makes
+///     the resolution a CHECKED disjointness rather than an ordering accident).
+///   * **the instruction set `{Const, Call, ICmp, BinOp, UnOp, Cast}`** — exactly the arms whose
+///     statement shape [`mf_gate::predict_call`] models. `Overflow`/`Assert`/`Select`/`GEP`/
+///     `Load`/`ExtractField`/`InsertField`/`Store` are OUT: the first two split the chain a second
+///     way, and the rest either mint no statement or mint one at a site this walk does not model.
+///     A shift is refused for [`plan_operand_marker_temps`]' own measured reason.
+///   * **every result used exactly once** — built spells an expression TREE. A value used twice is
+///     a producer CSE of something built spells (and marks) twice; a value used zero times is dead
+///     code built never materialised.
+///   * **every call argument is a `Const`, a prior in-body result, or a BLOCK PARAM of scalar or
+///     `Ty::Struct` type** — a `Ty::Ptr` parameter is REFUSED, and that refusal is the class
+///     boundary rather than an oversight. Built spells an autoref receiver `_2 = &(*_1)`
+///     (`Rvalue::Ref`), not `_2 = copy _1`, and `mf_operand` mints the copy; admitting a `Ptr`
+///     would offer a temp whose RVALUE is not built's. Five of the eleven residual bodies are in
+///     that shape and stay refused until a wave measures it.
+///   * **ordering rules (1) and (2)**, verbatim from [`plan_operand_marker_temps`] and for the same
+///     measured reasons — a marked result may not take a marked operand, and a marked operand may
+///     not be preceded by a place operand.
+///
+/// # Not a relaxation
+///
+/// Everything here only ADDS statements to the derived body. The comparator's exact marker channel
+/// (`mir_differential::canon_markers`) is untouched and still decides; a wrong plan yields a wrong
+/// sequence, `markers_exact: false` and no flip — precisely the state these bodies are in today.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct MfCallPlan {
+    /// The body-node INDEX of every admitted `Inst::Call`, in SSA order. The emitter asks by index
+    /// (it has `i` in hand) and a call this plan does not list gets no marker at any of its three
+    /// sites, so a plan/emitter disagreement ships marker-free rather than unbalanced.
+    call_nodes: Vec<usize>,
+}
+
+/// Trust (wave-MC): the classification of one operand, shared by the plan and by
+/// [`mf_gate::predict_call`] so the two sides read the trust-ir the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McOperand {
+    /// `Inst::Const` — folded in place by `as_constant`; no temp, no marker, and no position in
+    /// the consuming assignment's operand sequence.
+    Folded,
+    /// A prior in-body SSA result that already carries a marker temp — MOVED out of, no new temp.
+    Marked,
+    /// A block parameter (an argument local): built copies it into a fresh temp at the consumer.
+    Place,
+}
+
+/// Trust (wave-MC): classify one operand of an admitted instruction. `None` is a value this class
+/// has no model for (a prior in-body result that is NOT marked — dead-code or a CSE the
+/// exactly-once rule already refuses) and fails the body closed.
+fn mc_operand_class(
+    def_of: &HashMap<ValueId, &Inst>,
+    needs: &HashSet<ValueId>,
+    v: ValueId,
+) -> Option<McOperand> {
+    match def_of.get(&v) {
+        None => Some(McOperand::Place),
+        Some(Inst::Const { .. }) => Some(McOperand::Folded),
+        Some(_) if needs.contains(&v) => Some(McOperand::Marked),
+        Some(_) => None,
+    }
+}
+
+/// Trust (wave-MC): the operand positions of the admitted instruction set, in EVALUATION order.
+/// A shape outside the set is `None` and fails the body closed — the same discipline as
+/// [`plan_operand_marker_temps`]' `operands_of`, and deliberately a SECOND, narrower list rather
+/// than a widening of that one: widening it would move the eight existing classes.
+fn mc_operands_of(inst: &Inst) -> Option<Vec<ValueId>> {
+    Some(match inst {
+        Inst::Const { .. } => vec![],
+        Inst::Call { args, .. } => args.clone(),
+        Inst::BinOp { lhs, rhs, .. } | Inst::ICmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } => vec![*operand],
+        Inst::Return { values } => values.clone(),
+        _ => return None,
+    })
+}
+
+/// Trust (wave-MC): the plan itself. Returns `(the marked results, the admitted call sites)`, or
+/// `None` for any body outside the class — and `None` is always safe: it is today's behaviour,
+/// a derived body with no marker at all.
+fn plan_call_markers(func: &trust_ir::Function) -> Option<(HashSet<ValueId>, MfCallPlan)> {
+    // The firewall: any lexical `let` scope puts the body outside the plan.
+    if func.scopes.is_some() {
+        return None;
+    }
+    let [blk] = func.blocks.as_slice() else { return None };
+    let nodes = &blk.body;
+    let (term, body) = nodes.split_last()?;
+    let ret_vals: Vec<ValueId> = match &term.inst {
+        Inst::Return { values } => values.clone(),
+        _ => return None,
+    };
+    // A call-free body is `plan_operand_marker_temps`' business; a body with a call is not.
+    if !body.iter().any(|n| matches!(n.inst, Inst::Call { .. })) {
+        return None;
+    }
+    // The instruction set, and the shift refusal `plan_operand_marker_temps` derived.
+    for n in body {
+        if !matches!(
+            n.inst,
+            Inst::Const { .. }
+                | Inst::Call { .. }
+                | Inst::BinOp { .. }
+                | Inst::ICmp { .. }
+                | Inst::UnOp { .. }
+                | Inst::Cast { .. }
+        ) {
+            return None;
+        }
+        if matches!(n.inst, Inst::BinOp { op: BinOp::Shl | BinOp::LShr | BinOp::AShr, .. }) {
+            return None;
+        }
+        // An AGGREGATE constant seeds the `Return` arm's enum-constructor and `&str`-literal
+        // reconstructions (`enum_ctor`, `str_ret`), which emit a statement shape
+        // [`mf_gate::predict_call`] does not model — and, for the enum case, a `Rvalue::Aggregate`
+        // whose operand sequence would move a marker's position. Refused outright rather than
+        // modelled, because the class has no measured body of that shape.
+        if matches!(n.inst, Inst::Const { value: Constant::Aggregate(_), .. }) {
+            return None;
+        }
+    }
+    // Every node declares exactly one result, and `mc_operands_of` is asked about every node
+    // INCLUDING the terminator, so a `Br`/`CondBr`/`Switch` tail refuses here.
+    let mut uses: HashMap<ValueId, u32> = HashMap::new();
+    let mut def_of: HashMap<ValueId, &Inst> = HashMap::new();
+    let mut consumer: HashMap<ValueId, &Inst> = HashMap::new();
+    for node in nodes {
+        for r in &node.results {
+            def_of.insert(*r, &node.inst);
+        }
+        for v in mc_operands_of(&node.inst)? {
+            *uses.entry(v).or_insert(0) += 1;
+            consumer.insert(v, &node.inst);
+        }
+    }
+    for node in body {
+        let &[r] = node.results.as_slice() else { return None };
+        if uses.get(&r).copied() != Some(1) {
+            return None;
+        }
+    }
+    // THE MARKED SET. A call's result takes a temp unless the shim routes it straight into `_0`
+    // (`route_to_ret`: the result is the sole returned value AND the `Return` is the very next
+    // node). A non-call rvalue's result takes one unless it IS the returned value — built writes
+    // the outermost expression into `_0` with no temp. The two sides of `route_to_ret` are spelled
+    // here exactly as the emitter spells them; a body where they could disagree is refused below.
+    let mut needs: HashSet<ValueId> = HashSet::new();
+    let mut call_nodes: Vec<usize> = Vec::new();
+    for (i, node) in body.iter().enumerate() {
+        let &[r] = node.results.as_slice() else { return None };
+        let is_last_body_node = i + 1 == body.len();
+        let routed = ret_vals.as_slice() == [r] && is_last_body_node;
+        match &node.inst {
+            Inst::Call { .. } => {
+                call_nodes.push(i);
+                // A call whose result is RETURNED but which is not the last body node would be
+                // given a temp by the emitter and none by built. Refuse rather than model the
+                // disagreement.
+                if ret_vals.contains(&r) && !routed {
+                    return None;
+                }
+                if !routed {
+                    // `Inst::Call` carries NO result-type annotation, so the predicted side types
+                    // this temp from the OPERAND annotation of its single consumer. A consumer
+                    // that declares none — another `Call`, or the `Return` terminator — would
+                    // leave the slot `MfTy::Unknown`, a token `observe` never produces, and the
+                    // body would fail closed at the LAW instead of here. Refuse it HERE, where
+                    // the cost is a flip the class never had rather than an `agreed` verdict.
+                    if !matches!(
+                        consumer.get(&r),
+                        Some(
+                            Inst::ICmp { .. }
+                                | Inst::BinOp { .. }
+                                | Inst::UnOp { .. }
+                                | Inst::Cast { .. }
+                        )
+                    ) {
+                        return None;
+                    }
+                    needs.insert(r);
+                }
+            }
+            // The four arms that mint a statement of their own. Their result takes built's
+            // `as_temp` temp unless it IS the returned value, which built writes into `_0`.
+            Inst::ICmp { .. } | Inst::BinOp { .. } | Inst::UnOp { .. } | Inst::Cast { .. } => {
+                if !ret_vals.contains(&r) {
+                    needs.insert(r);
+                }
+            }
+            // A CONSTANT is folded in place by `as_constant`: it mints no statement, takes no
+            // temp and carries no marker. Marking one would put a `StorageLive` on this side that
+            // the emitter never emits.
+            Inst::Const { .. } => {}
+            _ => return None,
+        }
+    }
+    // OPERAND ADMISSION, with the class boundary at `Ty::Ptr`.
+    let param_ty: HashMap<ValueId, &Ty> = blk.params.iter().map(|(p, t)| (*p, t)).collect();
+    for node in body {
+        let call = matches!(node.inst, Inst::Call { .. });
+        for o in mc_operands_of(&node.inst)? {
+            match mc_operand_class(&def_of, &needs, o)? {
+                // A MARKED operand is moved out of an existing temp. In a CALL's argument list
+                // that is a shape this class has no measurement for — `probes/mc_call.rs::q1`
+                // shows built retiring the consumed temp at the successor block head AFTER this
+                // call's own argument temps, which the walk would have to order against an
+                // rvalue temp's own scope — so it is refused there and admitted only in an
+                // rvalue's operand list, where `mint_operands`/`close_group` already place it.
+                McOperand::Marked if call => return None,
+                McOperand::Folded | McOperand::Marked => {}
+                McOperand::Place => {
+                    // A block param. Built copies it whole into a fresh temp — which is what
+                    // `mf_operand` mints — and that is faithful only for a by-value type.
+                    let t: &Ty = *param_ty.get(&o)?;
+                    let by_value = SCALAR_CANDS.contains(t) || matches!(t, Ty::Struct(_));
+                    if !by_value {
+                        return None;
+                    }
+                    // A struct operand of a non-call rvalue would be an ill-typed bare `Copy` in a
+                    // binary/unary/cast position; only a CALL takes a whole struct.
+                    if !call && !SCALAR_CANDS.contains(t) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    // ORDERING RULE (1): A MARKED RESULT MAY NOT TAKE A MARKED OPERAND — `plan_operand_marker_temps`'
+    // rule, and it applies here for the same reason: built opens the OUTER temp first and this
+    // shim's linear SSA walk opens the inner one first, so the two orders can never coincide when
+    // both temps exist. The CALL-to-CALL chain is the one shape where they DO coincide and is
+    // exempted, measured on `q8`/`q1`: built opens the inner call's destination at the inner call
+    // (`bb0: StorageLive(_2)`) and the outer call's — when it has one — at the outer call, which is
+    // this shim's order exactly, because a call is a STATEMENT boundary and not a sub-expression
+    // built descends into.
+    for node in body {
+        let Some(r) = node.results.first() else { continue };
+        if !needs.contains(r) || matches!(node.inst, Inst::Call { .. }) {
+            continue;
+        }
+        if mc_operands_of(&node.inst)?.iter().any(|o| needs.contains(o)) {
+            return None;
+        }
+    }
+    // ORDERING RULE (2): A MARKED OPERAND MAY NOT BE PRECEDED BY A PLACE OPERAND, constant-tolerantly
+    // — again `plan_operand_marker_temps`' rule and its measured reason (`a == (b & c)` vs
+    // `(a & b) == c`). For a CALL the same argument applies to its argument list.
+    for node in body {
+        let mut seen_place = false;
+        for o in mc_operands_of(&node.inst)? {
+            match mc_operand_class(&def_of, &needs, o)? {
+                McOperand::Marked if seen_place => return None,
+                McOperand::Place => seen_place = true,
+                _ => {}
+            }
+        }
+    }
+    Some((needs, MfCallPlan { call_nodes }))
+}
+
 /// Trust (lane L, AGGREGATE CONSTRUCTION): does this body's constructor chain lower to built's
 /// marker sequence under the shim's LINEAR instruction walk?
 ///
@@ -5946,6 +12948,111 @@ struct MfBranch {
     join: BlockId,
 }
 
+/// Trust (lane G25, 2026-08-23): **THE `||` / `&&` DESUGAR WITNESS** — is this `CondBr`, whose
+/// condition is a bare block PARAMETER, the head of a short-circuit operator rather than of an
+/// `if` or a `match`?
+///
+/// Lane K's condition rule ("every `CondBr` condition is a MARKED RESULT of its own block") exists
+/// because of a real Module-indistinguishability that lane F8 reproduced at HEAD:
+/// `pc(a,x,y){ if a {x} else {y} }` and `mb(c,x,y){ match c { true=>x, false=>y } }` lower to
+/// trust-ir that is identical block for block, instruction for instruction and edge arg for edge
+/// arg, while built gives `pc` two markers plus an empty else-entry and gives `mb` ZERO markers
+/// plus a `falseEdge` candidate. Admitting a bare-parameter condition in general would therefore
+/// take `mb`'s EXISTING flip away — the rule is not conservatism.
+///
+/// `a || b` and `a && b` are not in that pair, and the separator is Module-visible. Built's
+/// `lower_logical_op` SYNTHESIZES the short-circuit arm's constant at the OPERATOR's own span
+/// (`ConstOperand { span: expr.span, .. }`, `rustc_mir_build/src/builder/expr/into.rs`), so the
+/// producer stamps that `Const` with the same `#loc` the `CondBr` carries; every written-out form
+/// — `if a { true } else { b }`, `match a { true => true, false => b }`, `if a { b } else { true }`
+/// — stamps the literal's own position instead. MEASURED by lane F8 on `probes/f8c.rs`:
+/// `or1`/`an1` at `8:39`/`8:39` and `10:39`/`10:39`, against `4:46`, `6:57` and `12:57`.
+///
+/// The shape admitted here is the one the corpus body
+/// `<inductive::MentionsNameVisitor<'_> as expr::visitor::ExprVisitor>::combine` (`a || b`) has,
+/// and no wider — both operands bare parameters of the head, the arms carrying nothing but the
+/// synthesized constant and the forwarding `Br`. Anything else keeps today's marker-free form.
+///
+///   * the head mints NO statement of its own (every non-terminator node is a folded `Inst::Const`),
+///     so the condition temp built opens at `bb0.0` is this block's first and only assign;
+///   * the condition is a PARAMETER of the head block, of type `bool`, USED EXACTLY ONCE — the
+///     `CondBr` itself. The single use is what keeps [`mint_operands`]' "an already-marked temp is
+///     MOVED out of" arm from ever meeting it at an operand position;
+///   * exactly one arm is `[Const{Bool}, Br(join, [k])]` — the short-circuit — and that `Const`
+///     carries the `CondBr`'s OWN span, both stamped;
+///   * the other arm is `[Br(join, [v])]`, a bare forward of a value no block defines (the second
+///     operand). Built writes each arm straight into the destination and mints no temp there, and
+///     so does this shim's `Br` arm — one assign, no marker, on both sides;
+///   * the ELSE arm's block precedes the THEN arm's in the producer's list, which is the other
+///     half of what lane F8 measured of the desugar (`or1`/`an1` emit the else-arm block first)
+///     and which no written-out form guarantees.
+#[allow(clippy::too_many_arguments)]
+fn logical_sugar_head(
+    func: &trust_ir::Function,
+    index: &HashMap<BlockId, usize>,
+    head: BlockId,
+    cond: ValueId,
+    then_target: BlockId,
+    else_target: BlockId,
+    uses: &HashMap<ValueId, u32>,
+) -> bool {
+    let Some(hi) = index.get(&head).copied() else { return false };
+    let hblk = &func.blocks[hi];
+    let Some((term, body)) = hblk.body.split_last() else { return false };
+    // The head mints nothing of its own.
+    if body.iter().any(|n| !matches!(n.inst, Inst::Const { .. })) {
+        return false;
+    }
+    // A `bool` PARAMETER of this very block, used exactly once.
+    if !hblk.params.iter().any(|(v, t)| *v == cond && matches!(t, Ty::Bool)) {
+        return false;
+    }
+    if uses.get(&cond).copied() != Some(1) {
+        return false;
+    }
+    let Some(term_span) = term.span else { return false };
+    // The else block is emitted FIRST — the desugar's own block order.
+    let (Some(ti), Some(ei)) = (index.get(&then_target).copied(), index.get(&else_target).copied())
+    else {
+        return false;
+    };
+    if ei >= ti {
+        return false;
+    }
+    // Exactly one arm is the synthesized short-circuit constant, at the operator's own location;
+    // the other is a bare forward of a value no instruction defines.
+    let defined: HashSet<ValueId> =
+        func.blocks.iter().flat_map(|b| b.body.iter()).flat_map(|n| n.results.iter().copied()).collect();
+    let sc_arm = |b: &trust_ir::Block| -> Option<BlockId> {
+        let [c, t] = b.body.as_slice() else { return None };
+        if !b.params.is_empty() || !matches!(c.inst, Inst::Const { ty: Ty::Bool, .. }) {
+            return None;
+        }
+        if c.span? != term_span {
+            return None;
+        }
+        let k = *c.results.first()?;
+        let Inst::Br { target, args } = &t.inst else { return None };
+        (args.as_slice() == [k]).then_some(*target)
+    };
+    let fwd_arm = |b: &trust_ir::Block| -> Option<BlockId> {
+        let [t] = b.body.as_slice() else { return None };
+        if !b.params.is_empty() {
+            return None;
+        }
+        let Inst::Br { target, args } = &t.inst else { return None };
+        let &[v] = args.as_slice() else { return None };
+        (!defined.contains(&v)).then_some(*target)
+    };
+    let (tb, eb) = (&func.blocks[ti], &func.blocks[ei]);
+    // `||` puts the constant on the THEN edge, `&&` on the ELSE edge; both are admitted, and both
+    // must land on the SAME join.
+    match (sc_arm(tb), fwd_arm(eb), sc_arm(eb), fwd_arm(tb)) {
+        (Some(j1), Some(j2), None, _) | (None, _, Some(j1), Some(j2)) => j1 == j2,
+        _ => false,
+    }
+}
+
 /// Trust (lane K): the MULTI-BLOCK marker plan — the marked-result set plus the per-`CondBr`
 /// branch table the emitter needs to place built's cross-block markers.
 #[derive(Debug, Clone)]
@@ -5955,6 +13062,19 @@ struct MfBranchPlan {
     /// Producer block -> its admitted `CondBr`. Every `CondBr` in the body is present, or the
     /// whole plan is `None`.
     branch: HashMap<BlockId, MfBranch>,
+    /// Trust (lane G25, 2026-08-23): the SUGAR-CONDITION heads — a `CondBr` whose condition is a
+    /// bare block PARAMETER, which built materialises into a temp of its own and the producer
+    /// switches on directly. Admitted ONLY on the `||`/`&&` desugar signature
+    /// ([`logical_sugar_head`]); empty for every body lane K already admitted, so the emitter's
+    /// pre-lane form is reached unchanged whenever this set is empty.
+    sugar: HashSet<BlockId>,
+    /// Trust (lane G25, 2026-08-23): the DELAY SET — marked results whose whole statement (and
+    /// therefore whose `StorageLive`) belongs at the CONSUMER's operand position rather than at
+    /// their own node, because built evaluates an expression tree's operands LEFT TO RIGHT while
+    /// this shim walks the producer's post-order instruction list. Empty for every body lane K
+    /// already admitted (a non-empty set requires a non-leftmost marked operand, which ordering
+    /// rule (2) refuses outright), so no body that flips today can acquire one.
+    delayed: HashSet<ValueId>,
 }
 
 /// Trust (lane K, MULTI-BLOCK OPERAND-TEMP MARKER FIDELITY): the per-body plan that decides
@@ -6097,6 +13217,9 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
     let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
     let mut use_block: HashMap<ValueId, BlockId> = HashMap::new();
     let mut consumer: HashMap<ValueId, Inst> = HashMap::new();
+    // Trust (lane G25): the DEFINING instruction of each result — the delay set asks whether a
+    // cast's operand is a folded constant, which `def_block` cannot answer.
+    let mut def_inst: HashMap<ValueId, Inst> = HashMap::new();
     let mut n_return = 0usize;
     for blk in &func.blocks {
         let (term, body) = blk.body.split_last()?;
@@ -6123,6 +13246,7 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
             if def_block.insert(r, blk.id).is_some() {
                 return None;
             }
+            def_inst.insert(r, node.inst.clone());
         }
     }
     if n_return != 1 {
@@ -6204,6 +13328,9 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
     // successor's `follow` is already known.
     let mut follow: HashMap<BlockId, Option<BlockId>> = HashMap::new();
     let mut branch: HashMap<BlockId, MfBranch> = HashMap::new();
+    // Trust (lane G25): heads whose condition is a bare block parameter on the `||`/`&&` desugar
+    // signature. Empty for every body lane K already admitted.
+    let mut sugar: HashSet<BlockId> = HashSet::new();
     let mut preds: HashMap<BlockId, u32> = HashMap::new();
     for blk in &func.blocks {
         for s in succs_of(term_of(blk.id)?) {
@@ -6238,17 +13365,37 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
                 // The condition must be a MARKED result of THIS block (the param_cond /
                 // match_bool tripwire), defined by the last node before the terminator modulo
                 // `Const` nodes, which mint no statement.
-                if def_block.get(cond) != Some(b) {
-                    return None;
-                }
-                let nodes = &func.blocks[*index.get(b)?].body;
-                let (_, body) = nodes.split_last()?;
-                let ci = body.iter().position(|n| n.results.first() == Some(cond))?;
-                if !mints_result_temp(&body[ci].inst) {
-                    return None;
-                }
-                if body[ci + 1..].iter().any(|n| !matches!(n.inst, Inst::Const { .. })) {
-                    return None;
+                //
+                // Trust (lane G25, 2026-08-23): OR the `||`/`&&` DESUGAR, which is the one
+                // bare-parameter condition the Module separates from the `if`/`match` pair the
+                // tripwire exists for. Lane F8 measured the pair at HEAD and it is real —
+                // `pc(a,x,y){ if a {x} else {y} }` and `mb(c,x,y){ match c {true=>x,false=>y} }`
+                // lower to trust-ir that is identical block for block, instruction for
+                // instruction, edge arg for edge arg, while built gives the first TWO markers and
+                // the second ZERO — so admitting a bare-param condition on its own would silently
+                // take `match_bool`'s existing flip away. It also measured that `a || b` / `a && b`
+                // are NOT in that pair: the desugar synthesizes its constant arm at the OPERATOR's
+                // own location, so the short-circuit `Const` carries the `CondBr`'s `#loc` where
+                // every written-out form carries the literal's. [`logical_sugar_head`] witnesses
+                // exactly that signature and refuses everything else; when it holds, the emitter
+                // materialises the condition temp built mints and this side predicts it.
+                let sugar_here = def_block.get(cond).is_none()
+                    && logical_sugar_head(func, &index, *b, *cond, *then_target, *else_target, &uses);
+                if !sugar_here {
+                    if def_block.get(cond) != Some(b) {
+                        return None;
+                    }
+                    let nodes = &func.blocks[*index.get(b)?].body;
+                    let (_, body) = nodes.split_last()?;
+                    let ci = body.iter().position(|n| n.results.first() == Some(cond))?;
+                    if !mints_result_temp(&body[ci].inst) {
+                        return None;
+                    }
+                    if body[ci + 1..].iter().any(|n| !matches!(n.inst, Inst::Const { .. })) {
+                        return None;
+                    }
+                } else {
+                    sugar.insert(*b);
                 }
                 // Reconvergence: the first block common to both arms' follow chains.
                 let mut chain: Vec<BlockId> = Vec::new();
@@ -6379,6 +13526,68 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
             }
         }
     }
+    // Trust (lane G25): a SUGAR condition is a marked slot too — built materialises `_t = copy
+    // <param>` for it and retires it at the join exactly as it retires a computed condition's
+    // temp — so it joins the set the emitter's `mf_mark_result`/`mf_live` machinery reads. It is
+    // a block PARAMETER, never an instruction result, so it cannot collide with the loop above.
+    // Its single use is the `CondBr` itself ([`logical_sugar_head`] checks that), which is what
+    // keeps `mint_operands`' "an already-marked temp is MOVED out of" arm from ever seeing it.
+    for h in &sugar {
+        let Some(br) = branch.get(h) else { return None };
+        needs.insert(br.cond);
+    }
+
+    // --- the DELAY set (lane G25, 2026-08-23) ------------------------------------------------
+    // Built evaluates an expression TREE left to right, minting each operand's temp in turn; this
+    // shim walks the producer's POST-ORDER instruction list, so a sub-expression whose result sits
+    // at a non-leftmost operand position has its statement — and its `StorageLive` — emitted too
+    // early. `clamp_u32` (`value > u32::MAX as u64`) is the corpus body: built's head is
+    // `live _2[result]; live _3[op0]; _3 = copy _1; live _4[op1]; _4 = const MAX as u64;
+    // _2 = Gt(move _3, move _4)` while this shim reaches the cast node first.
+    //
+    // The repair is to DELAY the defining statement to the use site, and it is admitted only for
+    // the one shape where delaying can reorder nothing observable: an integer `Cast` OF A
+    // CONSTANT, immediately followed by its single consumer. The cast reads no place, mints no
+    // operand temp of its own, and moves past nothing — so the emitted program is the same one,
+    // statement for statement, with two of them exchanged.
+    //
+    // A NON-EMPTY DELAY SET IS UNREACHABLE FOR ANY BODY THAT FLIPS TODAY, and that is the whole
+    // regression argument: every member is a marked operand at a NON-LEFTMOST position, which
+    // ordering rule (2) below refuses outright, so a body carrying one is refused at HEAD.
+    let mut delayed: HashSet<ValueId> = HashSet::new();
+    for blk in &func.blocks {
+        let (_, body) = blk.body.split_last()?;
+        for (k, node) in body.iter().enumerate() {
+            let Some(r) = node.results.first() else { continue };
+            if !needs.contains(r) {
+                continue;
+            }
+            // An integer cast, and of a CONSTANT: the emitter's own `Inst::Cast` arm admits
+            // exactly `Trunc|ZExt|SExt` plus the equal-width `Bitcast`, and this list is the
+            // subset whose admission is decidable from the trust-ir alone.
+            let Inst::Cast { op, operand, .. } = &node.inst else { continue };
+            if !matches!(op, CastOp::Trunc | CastOp::ZExt | CastOp::SExt) {
+                continue;
+            }
+            if !matches!(def_inst.get(operand), Some(Inst::Const { .. })) {
+                continue;
+            }
+            // The consumer is the IMMEDIATELY following node — nothing may be emitted between the
+            // two, so "delay to the use site" moves the statement past nothing at all.
+            let Some(next) = body.get(k + 1) else { continue };
+            if !mints_result_temp(&next.inst) {
+                continue;
+            }
+            let cops = operands_of(&next.inst)?;
+            // Leftmost already agrees with built's order; delaying it would MOVE a body that
+            // flips today, so it is left exactly where it is.
+            if cops.first() == Some(r) || !cops.contains(r) {
+                continue;
+            }
+            delayed.insert(*r);
+        }
+    }
+
     // Two ordering rules, both about WHERE a `StorageLive` lands, both measured.
     //
     // (1) A MARKED instruction may not take a MARKED operand. Built's `as_temp` pushes the
@@ -6393,7 +13602,10 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
     // (2) Marked results must be LEFTMOST in every operand list — wave-MF's right-nested
     //     boundary, made explicit. A marked operand's temp is minted at its own instruction,
     //     earlier; every other operand's temp is minted here, at the consumer; built mints both
-    //     in operand order. `clamp_u32` (`value > u32::MAX as u64`) is the body this refuses.
+    //     in operand order. `clamp_u32` (`value > u32::MAX as u64`) was the body this refused;
+    //     lane G25's DELAY SET above is the narrow exemption, and a delayed operand is treated
+    //     here as what it becomes — a temp minted AT this operand position — so a later
+    //     non-delayed marked operand still refuses the body.
     for blk in &func.blocks {
         for node in &blk.body {
             if !mints_result_temp(&node.inst) {
@@ -6403,7 +13615,9 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
             let marked_result = node.results.first().is_some_and(|r| needs.contains(r));
             let mut seen_unmarked = false;
             for o in ops {
-                if needs.contains(&o) {
+                if delayed.contains(&o) {
+                    seen_unmarked = true;
+                } else if needs.contains(&o) {
                     if marked_result || seen_unmarked {
                         return None;
                     }
@@ -6413,7 +13627,381 @@ fn plan_branch_markers(func: &trust_ir::Function) -> Option<MfBranchPlan> {
             }
         }
     }
-    Some(MfBranchPlan { needs, branch })
+    Some(MfBranchPlan { needs, branch, sugar, delayed })
+}
+
+/// Trust (lane G21, 2026-08-25): the two CALL ROLES of the short-circuit-over-calls class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BcRole {
+    /// The HEAD call — the short circuit's LEFT operand, whose result IS the `CondBr` condition.
+    /// Its argument temps are the CONDITION's operand temps, so built retires them at the ENTRY
+    /// of BOTH arms rather than at the call's own successor.
+    Head,
+    /// The RHS-ARM call — the right operand, reached only on the non-short-circuit edge. Its
+    /// argument temps retire at its own successor, in reverse order (wave-MC's rule 3).
+    Rhs,
+}
+
+/// Trust (lane G21, 2026-08-25): **THE SHORT-CIRCUIT-OVER-CALLS PLAN** — `f(..) || g(..)` and
+/// `!f() && g() == k`, the residual-gap family whose BLOCK arithmetic lane K already closes and
+/// whose only refusal was that no MULTI-BLOCK marker plan has an `Inst::Call` arm
+/// (`plan_operand_marker_temps`' and `plan_branch_markers`' `operands_of` both answer `None` at
+/// the first call node, and wave-MC's call class is a ONE-BLOCK class).
+///
+/// # What built does, measured
+///
+/// `-Zdump-mir=built` through the sealed control driver on
+/// `crates/trust-thir-lower/probes/g25.rs::V::a1`
+/// (`fn a1(&self, ctx, a, b) -> bool { self.core(ctx,a,b) || self.core(ctx,b,a) }`, the shape of
+/// `cert::def_eq::…::try_struct_eta_eq`), verbatim:
+///
+/// ```text
+/// bb0: StorageLive(_5);                       // the HEAD call's RESULT temp, opened FIRST
+///      StorageLive(_6); _6 = &(*_1);          // its argument temps, in order, interleaved
+///      StorageLive(_7); _7 = &mut (*_2);
+///      StorageLive(_8); _8 = &(*_3);
+///      StorageLive(_9); _9 = &(*_4);
+///      _5 = V::core(move _6, move _7, move _8, move _9) -> bb1;
+/// bb1: switchInt(move _5) -> [0: bb3, otherwise: bb2];
+/// bb2: StorageDead(_9); StorageDead(_8); StorageDead(_7); StorageDead(_6);
+///      _0 = const true; goto -> bb6;          // the CONST arm
+/// bb3: goto -> bb4;                           // lane K's EMPTY TRAMPOLINE, on the `0` edge
+/// bb4: StorageDead(_9); StorageDead(_8); StorageDead(_7); StorageDead(_6);
+///      StorageLive(_10); _10 = &(*_1); … StorageLive(_13); _13 = &(*_3);
+///      _0 = V::core(move _10, …) -> bb5;      // the RHS call, its result written into `_0`
+/// bb5: StorageDead(_13); StorageDead(_12); StorageDead(_11); StorageDead(_10);
+///      goto -> bb6;
+/// bb6: StorageDead(_5); return;               // the condition temp, at the JOIN
+/// ```
+///
+/// Five rules, each measured and none guessed:
+///
+///   1. **The head call's RESULT temp is opened before any argument temp** — wave-MC's rule 1,
+///      unchanged, and it is the temp the `CondBr` switches on.
+///   2. **Each argument takes a temp, in argument order, interleaved with its own assign** — the
+///      reborrow spelling `t = &[mut](*_p)` for a reference parameter, `t = copy _p` for a
+///      by-value one. This is lane SC's / wave-WB8's per-argument emission verbatim.
+///   3. **The head call's argument temps retire at the ENTRY of BOTH arms, in reverse argument
+///      order** — lane K's rule 1 for a condition's operand temps, reached here through the same
+///      `mf_defer_deads` path, so there is exactly one implementation of the split.
+///   4. **The head call's RESULT temp retires at the JOIN, at position 0** — lane K's rule 2,
+///      emitted by the `CondBr` arm that already does it.
+///   5. **The RHS arm's call is an ordinary call** — its argument temps retire at its own
+///      successor in reverse order (wave-MC's rule 3); its result takes a temp only when a
+///      POST-OP consumes it there (`probes/g25.rs::Summ::a3`, the shape of
+///      `env::sorry_summary::DeclarationTrustSummary::is_fully_verified`: `bb6: StorageDead(_5);
+///      _0 = Eq(move _4, const 0_u32); StorageDead(_4);`), and none when the result IS the arm's
+///      value — built writes it straight into the destination, exactly as lane K's `Br` arm does.
+///
+/// # The BLOCK arithmetic, and what it does NOT need
+///
+/// Lane K's empty false-edge trampoline is the whole block delta of the `||` shape (measured:
+/// built 7 reachable blocks against 6 derived, and the seven roles coincide element for element
+/// once the trampoline is minted). The `!f() && g() == k` shape carries ONE MORE built block —
+/// its const arm is SPLIT (`bb2: dead _3; goto bb5` / `bb5: _0 = const false; goto bb7`) — and
+/// this plan deliberately does NOT model it: that block carries no marker, and the oracle's DFS
+/// preorder reaches it LAST, after every marker-bearing block, so no marker's fine index moves.
+/// Modelling it would add an empty block to the derived body for no marker at all.
+///
+/// # The admitted class, and why each clause is load-bearing
+///
+///   * **`func.scopes.is_none()`** — wave-MF's firewall, consulted FIRST. A source `let` mints a
+///     named local plus a `FakeRead` the instruction stream cannot see.
+///   * **exactly four blocks, the entry first** — the class's block map is `head, arm, arm, join`
+///     plus the head call's successor, lane K's trampoline and the RHS call's successor, in that
+///     creation order. A fifth block would append a successor this plan has not measured, and
+///     every predicted position is derived from that map.
+///   * **the head is `[Call, CondBr]` and the `CondBr`'s condition is that call's own result** —
+///     lane K's condition rule, met by a call instead of by an rvalue. It is what keeps
+///     `param_cond`/`match_bool` (a BARE-PARAMETER condition, Module-identical to its twin)
+///     outside this class exactly as it is outside lane K's.
+///   * **one arm is `[Const{Bool}, Br(join,[k])]`, the other `[Call, Br(join,[r])]` or
+///     `[Call, Const, ICmp, Br(join,[r])]`** — the two measured shapes and no wider. A THIRD
+///     instruction in the const arm, or a second call in the RHS arm, is a body whose built
+///     marker discipline this plan has not measured (a call feeding another call's argument is
+///     wave-WB8's chain, with in-transit locals and a reborrow bridge — `expr::kind::arc_eq`,
+///     which this class therefore refuses).
+///   * **every call argument is a PARAMETER of the head block, no value twice in one call** —
+///     built copies a place into a fresh temp at the consumer, which is what the emission mints;
+///     a value passed twice to one call takes TWO built temps that this plan's `(role, value)`
+///     slot naming would alpha-rename onto one another.
+///   * **the join is the remaining block: one parameter, `Return` of exactly that parameter, no
+///     other instruction** — the join-parameter rule of lane K, in its narrowest form. A join
+///     parameter consumed by an INSTRUCTION would need built's hoisted `StorageLive` in the head,
+///     which this shim has no way to place.
+///   * **the two arms are distinct, neither is the join, and neither is the head** — each arm is
+///     entered only from the head, so its entry markers are this branch's and nobody else's.
+///
+/// **STILL NECESSARY-NOT-SUFFICIENT**, exactly as `plan_branch_markers` says of itself: nothing
+/// here establishes that an admitted body's derived marker sequence IS built's. The comparator
+/// remains the authority; a wrong plan yields `markers_exact: false` and no flip, which is
+/// precisely the state every body in this class is in today.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfBcPlan {
+    /// The head block, its call's result (always marked — it is the condition) and its argument
+    /// list with each argument's own trust-ir parameter type.
+    head: BlockId,
+    head_res: ValueId,
+    head_args: Vec<(ValueId, Ty)>,
+    /// The `CondBr`'s targets, verbatim, and its join — lane K's table for this one head.
+    then_target: BlockId,
+    else_target: BlockId,
+    join: BlockId,
+    /// The CONST (short-circuit) arm, and the arm carrying the RHS call.
+    const_arm: BlockId,
+    rhs_arm: BlockId,
+    rhs_res: ValueId,
+    rhs_args: Vec<(ValueId, Ty)>,
+    /// `Some(operand type)` when a POST-OP `ICmp` in the RHS call's SUCCESSOR consumes its result
+    /// — built mints a temp for it there, retired after the post-op's own assign. `None` when the
+    /// result IS the arm's value and built writes it straight into the destination.
+    rhs_post: Option<Ty>,
+    /// Trust (lane G21): the sealed bit of [`SatPerturb::G21RetOrder`] — retire the RHS call's
+    /// argument temps FORWARD instead of in reverse creation order. Read by the emitter and by
+    /// [`mf_gate::predict_bc`], from this one value, so both sides of the marker law move together.
+    ret_swap: bool,
+}
+
+impl MfBcPlan {
+    /// Lane K's table for this body: the head's `CondBr` and the marked-result set. When this
+    /// plan holds it OWNS `branch`, exactly as `MfLoopPlan::branch_plan` does — so the
+    /// trampoline, the condition temp's retirement at the join and the arm-entry deads are
+    /// placed by lane K's existing machinery and there is one implementation of each.
+    fn branch_plan(&self) -> MfBranchPlan {
+        let mut needs: HashSet<ValueId> = HashSet::new();
+        needs.insert(self.head_res);
+        if self.rhs_post.is_some() {
+            needs.insert(self.rhs_res);
+        }
+        let mut branch: HashMap<BlockId, MfBranch> = HashMap::new();
+        branch.insert(
+            self.head,
+            MfBranch {
+                cond: self.head_res,
+                then_target: self.then_target,
+                else_target: self.else_target,
+                join: self.join,
+            },
+        );
+        MfBranchPlan { needs, branch, sugar: HashSet::new(), delayed: HashSet::new() }
+    }
+
+    /// Does this plan own the `Inst::Call` at body-node index `i` of producer block `blk`, and in
+    /// which role? `None` keeps the call arm byte-identical to its pre-lane form.
+    fn call_role(&self, blk: BlockId, i: usize) -> Option<BcRole> {
+        if blk == self.head && i == 0 {
+            return Some(BcRole::Head);
+        }
+        if blk == self.rhs_arm && i == 0 {
+            return Some(BcRole::Rhs);
+        }
+        None
+    }
+
+    /// The planned argument list of one role — read by the emitter to cross-check the call's own
+    /// arguments before it mints a single temp.
+    fn args(&self, role: BcRole) -> &[(ValueId, Ty)] {
+        match role {
+            BcRole::Head => &self.head_args,
+            BcRole::Rhs => &self.rhs_args,
+        }
+    }
+}
+
+/// Trust (lane G21): one call's argument list, admitted only when every argument is a PARAMETER
+/// of the head block and no value appears twice. `None` refuses the body.
+fn bc_arg_list(args: &[ValueId], params: &HashMap<ValueId, Ty>) -> Option<Vec<(ValueId, Ty)>> {
+    // A NULLARY call mints its result temp and then the terminator with NO assign between them —
+    // a position this plan has not measured. Refused rather than modelled, for the same reason
+    // `plan_call_fwd_markers` refuses an empty argument plan.
+    if args.is_empty() {
+        return None;
+    }
+    let mut out: Vec<(ValueId, Ty)> = Vec::with_capacity(args.len());
+    for a in args {
+        if out.iter().any(|(v, _)| v == a) {
+            return None;
+        }
+        out.push((*a, params.get(a)?.clone()));
+    }
+    Some(out)
+}
+
+/// Trust (lane G21): is this block the SHORT-CIRCUIT arm — `[Const{Bool}, Br(join, [k])]`, the
+/// constant `lower_logical_op` synthesizes? Answers `(join, forwarded value)`.
+fn bc_const_arm(blk: &trust_ir::Block) -> Option<(BlockId, ValueId)> {
+    if !blk.params.is_empty() {
+        return None;
+    }
+    let [k, term] = blk.body.as_slice() else { return None };
+    if !matches!(k.inst, Inst::Const { value: Constant::Bool(_), .. }) {
+        return None;
+    }
+    let &[kr] = k.results.as_slice() else { return None };
+    let Inst::Br { target, args } = &term.inst else { return None };
+    match args.as_slice() {
+        [v] if *v == kr => Some((*target, kr)),
+        _ => None,
+    }
+}
+
+/// Trust (lane G21): is this block the RHS arm — a single `Inst::Call` whose result is either the
+/// forwarded arm value or the left operand of ONE post-op `ICmp` against a constant? Answers
+/// `(join, the call's args, the call's result, the post-op's operand type if there is one)`.
+fn bc_rhs_arm(blk: &trust_ir::Block) -> Option<(BlockId, &Vec<ValueId>, ValueId, Option<Ty>)> {
+    if !blk.params.is_empty() {
+        return None;
+    }
+    let (term, body) = blk.body.split_last()?;
+    let Inst::Br { target, args: eargs } = &term.inst else { return None };
+    let [fwd] = eargs.as_slice() else { return None };
+    let call = body.first()?;
+    let Inst::Call { args, .. } = &call.inst else { return None };
+    let &[cres] = call.results.as_slice() else { return None };
+    match body.len() {
+        // `[Call]` — the call's result IS the arm's value; built writes it into the destination
+        // and mints no temp, exactly as lane K's `Br` arm does.
+        1 if *fwd == cres => Some((*target, args, cres, None)),
+        // `[Call, Const, ICmp]` — the post-op. Built mints the call's destination temp and
+        // retires it AFTER the `ICmp`'s own assign, in the call's successor block.
+        3 => {
+            let kn = &body[1];
+            let &[kr] = kn.results.as_slice() else { return None };
+            if !matches!(kn.inst, Inst::Const { .. }) {
+                return None;
+            }
+            let cmp = &body[2];
+            let Inst::ICmp { ty, lhs, rhs, .. } = &cmp.inst else { return None };
+            let &[cr] = cmp.results.as_slice() else { return None };
+            // The call's result is the LEFT operand and the constant the right: the one order
+            // measured (`is_fully_verified`: `icmp eq usize %3, %4`). The other order is a
+            // different built operand sequence and is refused rather than assumed equal.
+            if *lhs != cres || *rhs != kr || *fwd != cr {
+                return None;
+            }
+            Some((*target, args, cres, Some(ty.clone())))
+        }
+        _ => None,
+    }
+}
+
+/// Trust (lane G21): the plan itself — a TOTAL FUNCTION of the instruction stream, so its
+/// refusals are exercised by unit tests rather than only by the corpus. `None` is always safe: it
+/// is today's behaviour, a derived body with no marker at all.
+fn plan_bc_markers(func: &trust_ir::Function) -> Option<MfBcPlan> {
+    // The wave-MF firewall, first and unchanged.
+    if func.scopes.is_some() {
+        return None;
+    }
+    // EXACTLY FOUR BLOCKS, the entry first. Every predicted position is derived from that map.
+    if func.blocks.len() != 4 {
+        return None;
+    }
+    let head = &func.blocks[0];
+    if head.id != func.entry {
+        return None;
+    }
+    let ix = |id: BlockId| func.blocks.iter().position(|b| b.id == id);
+    // --- the HEAD: one CALL, then the `CondBr` on its own result ----------------------------
+    let [hcall, hterm] = head.body.as_slice() else { return None };
+    let Inst::Call { args: hargs, .. } = &hcall.inst else { return None };
+    let &[head_res] = hcall.results.as_slice() else { return None };
+    let Inst::CondBr { cond, then_target, then_args, else_target, else_args } = &hterm.inst else {
+        return None;
+    };
+    if !then_args.is_empty() || !else_args.is_empty() {
+        return None;
+    }
+    if *cond != head_res || then_target == else_target {
+        return None;
+    }
+    let ti = ix(*then_target)?;
+    let ei = ix(*else_target)?;
+    // Lane K's emission-order rule: an arm lowered BEFORE its head would never see the entry
+    // markers the head schedules into it.
+    if ti == 0 || ei == 0 {
+        return None;
+    }
+    let hparams: HashMap<ValueId, Ty> = head.params.iter().cloned().collect();
+    let head_args = bc_arg_list(hargs, &hparams)?;
+    // --- the two arms: exactly one CONST arm and exactly one CALL arm ------------------------
+    let (const_ix, rhs_ix) = match (
+        bc_const_arm(&func.blocks[ti]).is_some(),
+        bc_const_arm(&func.blocks[ei]).is_some(),
+    ) {
+        (true, false) => (ti, ei),
+        (false, true) => (ei, ti),
+        _ => return None,
+    };
+    let (cjoin, _) = bc_const_arm(&func.blocks[const_ix])?;
+    let (rjoin, rargs, rhs_res, rhs_post) = bc_rhs_arm(&func.blocks[rhs_ix])?;
+    if cjoin != rjoin {
+        return None;
+    }
+    let rhs_args = bc_arg_list(rargs, &hparams)?;
+    // --- the JOIN: the remaining block, one parameter, `Return` of exactly it ----------------
+    let ji = ix(cjoin)?;
+    if ji == 0 || ji == const_ix || ji == rhs_ix {
+        return None;
+    }
+    let join = &func.blocks[ji];
+    let [(jp, _)] = join.params.as_slice() else { return None };
+    let [jterm] = join.body.as_slice() else { return None };
+    match &jterm.inst {
+        Inst::Return { values } if values.as_slice() == [*jp] => {}
+        _ => return None,
+    }
+    Some(MfBcPlan {
+        head: head.id,
+        head_res,
+        head_args,
+        then_target: *then_target,
+        else_target: *else_target,
+        join: cjoin,
+        const_arm: func.blocks[const_ix].id,
+        rhs_arm: func.blocks[rhs_ix].id,
+        rhs_res,
+        rhs_args,
+        rhs_post,
+        ret_swap: false,
+    })
+}
+
+/// Trust (lane ROT, 2026-08-21): **THE ROTATION EXTENSION** of the loop plan — Euclid's gcd
+/// spelled in the loop orientation (`loop { if b == 0 { break; } let t = b; b = a % b; a = t; }`;
+/// probes `r1_rot_let_and`/`r2_rot_let_rem`, the kernel's one true loop `nat_gcd` respelled).
+/// One extension carrying THREE measured clusters at once, because the measured built body
+/// (19 marker lines, 7 assigns — `reports/parallel-move-2026-08-21/built_walk_gshape.txt`,
+/// `g8_rot_let_and`/`g2_gcd_loop_let`) carries all three and a plan admitting fewer would
+/// predict a sequence that is not built's:
+///
+///   * **the `let` cluster** — built mints the named local at the body block's top
+///     (`StorageLive(_9); _9 = copy _2`), a READ temp for the passthrough after the update
+///     (`StorageLive(_13); _13 = copy _9; _1 = move _13; StorageDead(_13)`), the block-tail
+///     unit const, and retires the named local dead last (`bb8.7:dead _9`). The wave-MF scope
+///     firewall is NARROWED for exactly this shape: scope table `[root, one child]` plus the
+///     [`rot_let_source_admits`] source witness; every other scope table refuses as before.
+///   * **the div-guard cluster** — the producer's `Const 0; ICmp Ne; Assert; URem` idiom
+///     ([`div_idiom`], the emitter's own recognizer), admitted ONLY as the body block's whole
+///     instruction list and only UNSIGNED. The assert SPLITS the MIR chain; the update's
+///     operand temps retire AFTER the split (`bb9.1:dead _11; bb9.1:dead _10`), so the split
+///     block's markers are modelled at the APPENDED block's own index.
+///   * **the fused destination** — built writes the update DIRECTLY into the variable's local
+///     (`_2 = Rem(move _10, move _11)`, no result temp), so the emitter writes the body's last
+///     result into its back-edge param local and the edge's own assign disappears as an exact
+///     self-assignment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MfRot {
+    /// The body block's LAST instruction result — the back edge's non-passthrough argument,
+    /// written directly into `header.params[fused_pos]`'s local.
+    fused: ValueId,
+    /// The back-edge argument position `fused` occupies.
+    fused_pos: usize,
+    /// The `let` passthrough: the header param VALUE the `let` snapshots, the back-edge
+    /// position it feeds, and its trust-ir type (the named local's declared type).
+    pass: (ValueId, usize, Ty),
+    /// The body block starts with the unsigned [`div_idiom`] guard.
+    guard: bool,
 }
 
 /// Trust (lane L9): one admitted LOOP — the six producer blocks whose roles built's storage
@@ -6438,6 +14026,9 @@ struct MfLoopPlan {
     body: BlockId,
     /// The block after the loop; it carries the one `Return`.
     exit: BlockId,
+    /// Trust (lane ROT): the rotation extension, or `None` for the original scope-free class —
+    /// in which case every emission path is byte-identical to what it was.
+    rot: Option<MfRot>,
 }
 
 impl MfLoopPlan {
@@ -6460,7 +14051,15 @@ impl MfLoopPlan {
                 join: self.body,
             },
         );
-        MfBranchPlan { needs: self.needs.clone(), branch }
+        // Trust (lane G25): a loop head's condition is a MARKED RESULT by
+        // [`plan_loop_markers`]' own clause, and its body carries no delayed cast, so both of
+        // lane G25's sets are empty here — the loop class reaches the emitter's pre-lane form.
+        MfBranchPlan {
+            needs: self.needs.clone(),
+            branch,
+            sugar: HashSet::new(),
+            delayed: HashSet::new(),
+        }
     }
 }
 
@@ -6576,11 +14175,25 @@ impl MfLoopPlan {
 /// this repo is in today, so a wrong plan costs nothing that is held now. Everything here only
 /// ADDS statements and one empty `Goto` block (which the semantic channel threads away — LEDGER
 /// L3) to the derived body; `mir_differential::canon_markers` is untouched and still decides.
-fn plan_loop_markers(func: &trust_ir::Function) -> Option<MfLoopPlan> {
-    // Wave-MF's firewall, first and unchanged: any lexical `let` scope is out.
-    if func.scopes.is_some() {
-        return None;
-    }
+fn plan_loop_markers(func: &trust_ir::Function, rot_let_source: bool) -> Option<MfLoopPlan> {
+    // Trust (lane ROT): wave-MF's firewall, NARROWED by one measured shape. The firewall's
+    // justification is "a source `let` mints a named local plus a `FakeRead` the instruction
+    // stream cannot see" — for the ROTATION-`let` shape and no other this plan now models that
+    // named local, so the ONE scope table the shape can produce (`[root, one child]`; measured:
+    // `#scope: 0 root; #scope: 1 parent=0` on `r1_rot_let_and`/`r2_rot_let_rem` and on
+    // `nat_gcd` itself) is admitted, and ONLY together with [`rot_let_source_admits`]'s source
+    // witness that the `let` is the rotation's own single simple binding. Every other scope
+    // table refuses exactly as before, and a witnessed scope still refuses unless the back
+    // edge below is the measured rotation (fused result + one param passthrough).
+    let rot_scope = match func.scopes.as_deref() {
+        None => false,
+        Some([root, child])
+            if rot_let_source && root.parent.is_none() && child.parent == Some(0) =>
+        {
+            true
+        }
+        Some(_) => return None,
+    };
     // Six blocks, six roles. See the class notes above for why this is `!=` and not `<`.
     if func.blocks.len() != 6 {
         return None;
@@ -6608,6 +14221,10 @@ fn plan_loop_markers(func: &trust_ir::Function) -> Option<MfLoopPlan> {
                 v
             }
             Inst::Return { values } => values.clone(),
+            // Trust (lane ROT): admitted ONLY as the recognized div-guard idiom's assert — the
+            // rotation section below sweeps every assert in the body against [`div_idiom`]
+            // BEFORE this census runs, so an assert anywhere else has already refused the plan.
+            Inst::Assert { cond } => vec![*cond],
             _ => return None,
         })
     }
@@ -6693,6 +14310,71 @@ fn plan_loop_markers(func: &trust_ir::Function) -> Option<MfLoopPlan> {
         }
     }
 
+    // --- Trust (lane ROT): the rotation extension, recognized BEFORE the census --------------
+    // Any `Inst::Assert` in the body is admitted ONLY as the single unsigned div-guard idiom
+    // that IS the body block's instruction list ([`div_idiom`] — the same recognizer the
+    // emitter lowers the idiom with, so the two cannot disagree about its extent); any other
+    // assert refuses here, exactly as `operands_of`'s missing arm refused it before this lane.
+    let n_asserts = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.body.iter())
+        .filter(|n| matches!(n.inst, Inst::Assert { .. }))
+        .count();
+    let guard = if n_asserts > 0 {
+        if !rot_scope || n_asserts != 1 {
+            return None;
+        }
+        let idm = div_idiom(bd_body, 0)?;
+        // The idiom is the WHOLE body list (its `Div`/`Rem` is the fused update), UNSIGNED only
+        // — built's signed form carries a second assert and a second split this model does not
+        // carry — and both operands are HEADER PARAMS (the measured shape: `%3`/`%2` on
+        // `r2_rot_let_rem`); any other operand would take an operand temp whose built position
+        // has not been measured.
+        if idm.signed
+            || bd_body.len() != idm.len
+            || !hdr.params.iter().any(|(p, _)| *p == idm.dividend)
+            || !hdr.params.iter().any(|(p, _)| *p == idm.divisor)
+        {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+    // The rotation back edge: with the `let` scope admitted, the body's `Br` to the header must
+    // be EXACTLY (the body's own last result, one cross-param passthrough) — the two-argument
+    // shape whose built cluster is measured. Without the scope nothing here changes, and the
+    // update must be a `BinOp` (or the guard's `Div`/`Rem`): the emitter fuses exactly those
+    // two arms into the destination param local, so admitting any other producer would refuse
+    // the body at the edge and LOSE the `agreed` verdict it holds today.
+    let rot = if rot_scope {
+        let Inst::Br { args: bd_args, .. } = &bd_term.inst else { return None };
+        if bd_args.len() != 2 || hdr.params.len() != 2 {
+            return None;
+        }
+        let last = bd_body.last()?;
+        if !guard && !matches!(last.inst, Inst::BinOp { .. }) {
+            return None;
+        }
+        let last_res = *last.results.first()?;
+        if guard && div_idiom(bd_body, 0)?.result != last_res {
+            return None;
+        }
+        let fused_pos = bd_args.iter().position(|a| *a == last_res)?;
+        let pass_pos = 1 - fused_pos;
+        let pass_val = bd_args[pass_pos];
+        let (_, pass_ty) = hdr.params.iter().find(|(p, _)| *p == pass_val)?;
+        Some(MfRot {
+            fused: last_res,
+            fused_pos,
+            pass: (pass_val, pass_pos, pass_ty.clone()),
+            guard,
+        })
+    } else {
+        None
+    };
+
     // --- the CFG census: seven edges, every one of them named by a role ----------------------
     let mut preds: HashMap<BlockId, u32> = HashMap::new();
     let mut n_return = 0usize;
@@ -6757,6 +14439,11 @@ fn plan_loop_markers(func: &trust_ir::Function) -> Option<MfLoopPlan> {
         }
         let (_, rest) = blk.body.split_last()?;
         for node in rest {
+            // Trust (lane ROT): the admitted div-guard assert defines nothing; the rotation
+            // sweep above proved every assert in the body is that one idiom's.
+            if matches!(node.inst, Inst::Assert { .. }) {
+                continue;
+            }
             let &[r] = node.results.as_slice() else { return None };
             if def_block.insert(r, blk.id).is_some() {
                 return None;
@@ -6876,7 +14563,7 @@ fn plan_loop_markers(func: &trust_ir::Function) -> Option<MfLoopPlan> {
     if needs.len() != 1 || !needs.contains(&cond) {
         return None;
     }
-    Some(MfLoopPlan { needs, preheader, header, cond, break_arm, else_arm, body, exit })
+    Some(MfLoopPlan { needs, preheader, header, cond, break_arm, else_arm, body, exit, rot })
 }
 
 /// The scope table's structural invariant, as a pure check so it can be TESTED — the rest of
@@ -6902,6 +14589,45 @@ fn scope_topology_error(scopes: &[trust_ir::ScopeData]) -> Option<&'static str> 
         }
     }
     None
+}
+
+/// Trust (lane LOOP2, 2026-08-20): the pure schedule for a `Br` edge's PARALLEL move — which
+/// argument positions must snapshot their source into a fresh temp before any destination write.
+///
+/// `moves[j] = (dest_j, src_j)`, `src_j = None` for a constant argument. The edge's semantics
+/// read every source simultaneously (a phi row); the emitter writes destinations sequentially in
+/// `j` order. Position `j` is CLOBBERED — and must snapshot — exactly when its source place is
+/// some `dest_i` with `i < j` that is genuinely written: an exact self-assignment
+/// (`src_i == dest_i`) is OMITTED by the emitter and therefore never clobbers anything.
+///
+/// Reads of a destination written LATER (`i > j`) are safe: the read at position `j` happens
+/// before write `i`. A full swap `(p0, p1) <- (p1, p0)` therefore schedules exactly one snapshot
+/// (position 1), and the no-hazard edges every marker-plan body takes schedule none — the
+/// returned list being empty is what keeps their emission byte-identical to pre-LOOP2.
+///
+/// Returned positions are in ascending order; every scheduled position is a place read (never a
+/// constant).
+pub(crate) fn parallel_move_snapshots<P: PartialEq + Copy>(moves: &[(P, Option<P>)]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (j, (dest_j, src_j)) in moves.iter().enumerate() {
+        let Some(src) = src_j else { continue };
+        // An exact self-assignment at `j` is omitted by the emitter; it neither writes nor,
+        // consequently, needs its (identical) read protected.
+        if src == dest_j {
+            continue;
+        }
+        let clobbered = moves[..j].iter().any(|(dest_i, src_i)| {
+            let written = match src_i {
+                Some(s) => s != dest_i, // an omitted self-assignment does not write
+                None => true,
+            };
+            written && dest_i == src
+        });
+        if clobbered {
+            out.push(j);
+        }
+    }
+    out
 }
 
 fn build_source_scopes<'tcx>(
@@ -7062,12 +14788,61 @@ impl<'tcx> ShimCx<'tcx> {
         }
         let tmp = self.temp(ty);
         self.mf_mark_result(bb, r, tmp.local);
+        // Trust (lane G25): the sealed MOVE control. Unperturbed this is a no-op and every
+        // delayed statement lands at its operand position; under `-Ztrust-sat-perturb=g25-hoist`
+        // it lands HERE instead, right after the consumer's own result temp and before the
+        // leading operand temp. Same statements, same markers, two of them exchanged — so the
+        // marker law (which models the same move from the same sealed bit) stays green and only
+        // the frozen ORACLE can refuse. A failure here can only be the fail-closed
+        // `mf_emit_delayed` refusal, which is unreachable inside the class; swallowing it would
+        // leave the statement unemitted, and the body-end residue check then fails it CLOSED.
+        let _ = self.mf_hoist_delayed(bb);
         tmp
     }
 
     /// Trust (lane K): the admitted `CondBr` of the producer block being lowered, if any.
     fn mf_cur_branch(&self) -> Option<MfBranch> {
         self.mf_plans.branch_at(self.mf_cur_blk?)
+    }
+
+    /// Trust (lane G25, 2026-08-23): materialise the DELAYED statement for `v`, if the plan
+    /// stashed one — the destination temp, its `StorageLive` and its one assign, all carrying the
+    /// DEFINING node's own `SourceInfo` rather than the consumer's, so the statement lands where
+    /// built puts it and reads the span built reads. A no-op for every value the plan did not
+    /// delay, which is every value in every body outside lane G25's narrow class.
+    fn mf_emit_delayed(&mut self, bb: BasicBlock, v: ValueId) -> Result<(), Unsupported> {
+        let Some((rv, rty, si)) = self.mf_delayed.remove(&v) else {
+            return Ok(());
+        };
+        if !self.mf_operand_class() {
+            // Unreachable: the delay set lives on lane K's branch plan, which OWNS `operand`.
+            // Fail CLOSED rather than emit a statement no plan authorised.
+            return unsup("lane G25: a delayed statement outside the operand-temp class");
+        }
+        let save = self.source_info;
+        self.source_info = si;
+        let tmp = self.temp(rty);
+        self.mf_mark_result(bb, v, tmp.local);
+        self.assign(bb, tmp, rv);
+        self.source_info = save;
+        self.env.insert(v, VOp::Plc(tmp));
+        Ok(())
+    }
+
+    /// Trust (lane G25): the MOVE half of [`SatPerturb::G25Hoist`] — materialise every pending
+    /// DELAYED statement at the TOP of the consumer's group instead of at the operand position
+    /// built evaluates it at. The plan admits a delay only when the defining node is IMMEDIATELY
+    /// followed by its consumer, so at most one entry is ever pending and it belongs to the
+    /// instruction now being lowered.
+    fn mf_hoist_delayed(&mut self, bb: BasicBlock) -> Result<(), Unsupported> {
+        if !self.mf_g25_hoist() {
+            return Ok(());
+        }
+        let pending: Vec<ValueId> = self.mf_delayed.keys().copied().collect();
+        for v in pending {
+            self.mf_emit_delayed(bb, v)?;
+        }
+        Ok(())
     }
 
     /// Trust (wave-MF): the MIR operand for `v` in built's OPERAND-TEMP discipline.
@@ -7088,6 +14863,10 @@ impl<'tcx> ShimCx<'tcx> {
         v: ValueId,
         deads: &mut Vec<Local>,
     ) -> Result<Operand<'tcx>, Unsupported> {
+        // Trust (lane G25): a DELAYED statement materialises HERE, at the operand position built
+        // evaluates it at. After this the value is an ordinary live marked temp and the `mf_live`
+        // path below moves out of it, so there is exactly one implementation of the retirement.
+        self.mf_emit_delayed(bb, v)?;
         let op = self.operand(v)?;
         // Trust (lane MF-R5): ONE test, asked of the gate. Outside the operand-temp class this
         // method is exactly [`ShimCx::operand`] — no temp, no marker, no behaviour change — and
@@ -7757,6 +15536,18 @@ pub enum SigSource<'tcx> {
     /// two independent derivations, which is what makes that gate evidence instead of the
     /// tautology it was when `d` was constructed from `n`.
     Rederive,
+    /// Trust (wall A, the INSTANCE flip seam): re-derive from `tcx` at a CONCRETE instance's
+    /// `GenericArgs` ([`rederive_abi_sig_at_instance`]). Used by the per-`Instance` flip at the
+    /// `codegen_mir` seam, the one place rustc itself holds a fully monomorphised
+    /// `(DefId, GenericArgs)` pair with MIR demand.
+    ///
+    /// Same discipline as [`SigSource::Rederive`] and same fail-closed rule: the ABI anchors
+    /// come from `tcx` alone (never from any built or optimized body), and any residual
+    /// non-region parameter AFTER instantiation is REFUSED rather than guessed. The consumer's
+    /// ABI gate then compares this derivation against rustc's own instantiation of its own
+    /// body, so the two-independent-derivations property that makes the gate evidence is
+    /// preserved at the instance seam.
+    Instance(ty::GenericArgsRef<'tcx>),
 }
 
 /// Trust (C1/M1): compute the ABI-boundary rustc types from `tcx` alone — the same recipe
@@ -7832,6 +15623,77 @@ fn rederive_abi_sig<'tcx>(
     }
 }
 
+/// Trust (wall A, instance flip seam): [`rederive_abi_sig`] evaluated at a CONCRETE instance's
+/// `GenericArgs` instead of at identity args.
+///
+/// This is the whole of wall A's fix. `rederive_abi_sig` refuses every body whose identity
+/// signature `has_non_region_param()` — correctly, because `optimized_mir` compiles ONE body per
+/// `DefId`, pre-monomorphisation, and there is no single concrete ABI to name there. At the
+/// `codegen_mir` seam rustc holds a fully monomorphised `(DefId, GenericArgs)` pair, so the same
+/// recipe has a concrete answer.
+///
+/// Fail-closed exactly as its identity sibling is:
+///
+/// * the typing env is [`ty::TypingEnv::fully_monomorphized`] — the env codegen itself uses, not
+///   the body's post-analysis env (which still carries the definition's parameter environment);
+/// * any residual non-region parameter AFTER instantiation is an `Unsupported`, never a guess —
+///   so a partially-applied or ill-formed args list can only lose a flip, never mint a wrong ABI;
+/// * regions are erased, matching the runtime phases the flip's product exists at.
+///
+/// The value is never compared against built MIR HERE. The consumer
+/// (`trust_thir_lower::instance_flip`) checks it against rustc's own instantiation of rustc's own
+/// body, which is what keeps the ABI gate two INDEPENDENT derivations rather than a tautology.
+pub(crate) fn rederive_abi_sig_at_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    args: ty::GenericArgsRef<'tcx>,
+) -> Result<(Vec<RustcTy<'tcx>>, RustcTy<'tcx>), Unsupported> {
+    use rustc_hir::def::DefKind;
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    match tcx.def_kind(def) {
+        DefKind::Fn { .. } | DefKind::AssocFn { .. } => {
+            let sig = tcx.fn_sig(def).instantiate(tcx, args).skip_normalization();
+            if sig.skip_binder().has_non_region_param() {
+                return Err(Unsupported {
+                    reason: "abi rederive at instance: signature still generic after instantiation"
+                        .into(),
+                });
+            }
+            let sig = tcx.normalize_erasing_late_bound_regions(typing_env, sig);
+            Ok((sig.inputs().to_vec(), sig.output()))
+        }
+        DefKind::Closure { .. } => {
+            let closure_ty = tcx.type_of(def).instantiate(tcx, args).skip_normalization();
+            if closure_ty.has_non_region_param() {
+                return Err(Unsupported {
+                    reason: "abi rederive at instance: closure type still generic".into(),
+                });
+            }
+            let ty::Closure(_, cargs) = closure_ty.kind() else {
+                return Err(Unsupported {
+                    reason: "abi rederive at instance: non-plain-closure body (coroutine-closure)"
+                        .into(),
+                });
+            };
+            let closure_args = cargs.as_closure();
+            let env_ty =
+                tcx.closure_env_ty(closure_ty, closure_args.kind(), tcx.lifetimes.re_erased);
+            let sig = tcx.normalize_erasing_late_bound_regions(typing_env, closure_args.sig());
+            let ty::Tuple(arg_tys) = sig.inputs()[0].kind() else {
+                return Err(Unsupported {
+                    reason: "abi rederive at instance: untupled closure sig".into(),
+                });
+            };
+            let mut inputs = vec![env_ty];
+            inputs.extend(arg_tys.iter());
+            Ok((inputs, sig.output()))
+        }
+        other => Err(Unsupported {
+            reason: format!("abi rederive at instance: {other:?} body outside fragment"),
+        }),
+    }
+}
+
 /// A MIR body plus the translator-owned correspondence from each input
 /// TrustIR block identity to the first MIR block emitted for it.
 ///
@@ -7861,6 +15723,9 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
     let (built_arg_tys, built_ret_ty) = match sig_source {
         SigSource::Provided(arg_tys, ret_ty) => (arg_tys, ret_ty),
         SigSource::Rederive => rederive_abi_sig(tcx, def)?,
+        // Trust (wall A): the instance seam. Identical recipe to `Rederive`, evaluated at
+        // the instance's concrete args in the fully-monomorphized typing env.
+        SigSource::Instance(args) => rederive_abi_sig_at_instance(tcx, def, args)?,
     };
     let built_arg_tys = &built_arg_tys[..];
     let func = match module.function_by_id(FuncId::new(0)) {
@@ -8162,18 +16027,27 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
             .as_deref()
             .and_then(SatPerturb::from_flag),
         sat_perturb_count: 0,
-        mf_plans: MfPlans::seal(tcx, def, func),
+        mf_plans: MfPlans::seal(tcx, def, func, module, callees),
         mf_live: HashMap::new(),
+        mf_delayed: HashMap::new(),
+        chain_arg_temps: Vec::new(),
+        uc_temps: Vec::new(),
+        uc_unit: None,
+        chain_transits: Vec::new(),
+        chain_next_slot: 0,
         mf_cur_blk: None,
         mf_defer_deads: false,
         mf_entry_deads: HashMap::new(),
         mf_loop_hdr: None,
         mf_loop_val: None,
         mf_loop_ifval: None,
+        rot_t: None,
         mf_payload_dead: None,
         dr_binds: Vec::new(),
         dr_unit: None,
         dr_ret: None,
+        cf_post_dead: None,
+        swr_not: None,
         dr_carry: None,
     };
 
@@ -8723,6 +16597,56 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
         // Asked of the gate at every push, because the gate authorises the PUSH and not the
         // schedule: a schedule with no plan behind it is a body whose markers say something the
         // shim did not do.
+        // Trust (lane F8B, 2026-08-23): the DISCRIMINANT-MATCH class's slot OPENING, at
+        // built's own position — assign 0 of the block the plan names, which is why it is pushed
+        // HERE, before the block's first statement, rather than at any instruction's arm. The
+        // three shapes name three different blocks (the head, one arm, or every alternative arm);
+        // the plan decided which, and `mf_mark_swr` asks it again at the push, because the gate
+        // authorises the PUSH and not the schedule.
+        if cx.mf_swr_opens(blk.id) {
+            let Some((slot, sjoin)) = cx.mf_swr_slot() else {
+                return unsup("lane F8B: the switch plan vanished between test and use");
+            };
+            // The predicted side indexes a marked block by its TRUST-IR ordinal, which is exact
+            // only because this class admits no block-splitting instruction. Re-checked here
+            // rather than assumed: a disagreement is a body that ships marker-free.
+            let want = func.blocks.iter().position(|x| x.id == blk.id).map(BasicBlock::from_usize);
+            if want.is_none() || cx.block_map.get(&blk.id).copied() != want {
+                return unsup("lane F8B: a marked block is not at its trust-ir ordinal");
+            }
+            let local = match slot {
+                // The `!param` arm's operand temp: built opens it BEFORE the copy that fills it
+                // (`StorageLive(_4); _4 = copy _2; _0 = Not(move _4)`), so it is minted here and
+                // handed to the `bool_not_idiom` arm rather than minted there.
+                SwrSlot::ArmNot => {
+                    if cx.swr_not.is_some() {
+                        return unsup("lane F8B: a second `!param` temp in one body");
+                    }
+                    let t = cx.temp(tcx.types.bool);
+                    cx.swr_not = Some((blk.id, t));
+                    t.local
+                }
+                // The match VALUE and the payload BINDING are both the JOIN's own parameter
+                // local — the local every arm writes and the join reads — so the slot is that
+                // local and not a temp of this class's own.
+                SwrSlot::MatchValue | SwrSlot::Binding => {
+                    let Some(p) = cx.param_locals.get(&sjoin).and_then(|v| v.first()).copied()
+                    else {
+                        return unsup("lane F8B: the join's parameter local is unbound");
+                    };
+                    if !p.projection.is_empty()
+                        || p.local == rustc_middle::mir::RETURN_PLACE
+                        || Some(sjoin) == enum_join_block
+                    {
+                        return unsup("lane F8B: the join parameter is not a plain temp");
+                    }
+                    p.local
+                }
+            };
+            if !cx.mf_mark_swr(cur, blk.id, local, true) {
+                return unsup("lane F8B: a slot opening without a marker plan");
+            }
+        }
         match cx.mf_dr_arm(blk.id) {
             Some(DrArm::ShortCircuit | DrArm::Rhs) => {
                 let Some(c) = cx.dr_carry else {
@@ -8759,6 +16683,25 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                 return unsup("lane L9: a loop-region marker without a loop plan");
             }
             cx.mf_loop_val = Some(t.local);
+        }
+        // Trust (lane ROT): the rotation's `let` local — built's `StorageLive(_9); _9 = copy _2`
+        // — opens at the TOP of the body block, right after the join's entry deads
+        // (`bb8.0:dead _6; dead _5; live _9`, `built_walk_gshape.txt`). Its declared type is the
+        // passthrough param local's own; the back edge's tail retires it dead last.
+        if let Some(rot) = cx.mf_rot() {
+            if cx.mf_loop_sites().is_some_and(|sites| sites.body == blk.id) {
+                let src_op = cx.operand(rot.pass)?;
+                let (Operand::Copy(p) | Operand::Move(p)) = &src_op else {
+                    return unsup("lane ROT: the passthrough param has no place");
+                };
+                let ty = p.ty(&cx.local_decls, tcx).ty;
+                let t = cx.temp(ty);
+                if !cx.mf_mark_rot(cur, t.local, true) {
+                    return unsup("lane ROT: a rot marker without a rot plan");
+                }
+                cx.assign(cur, t, Rvalue::Use(src_op, WithRetag::Yes));
+                cx.rot_t = Some(t.local);
+            }
         }
         // Trust (B3-2c T2 slice 2): the wave-YD deferred-payload arm
         // materialization is DELETED (the defer site is gone).
@@ -9328,11 +17271,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     // Outside the class `checked_temps` is empty, `env` keeps the projected place,
                     // and this arm is bit-identical to what it was.
                     if let Some(t) = checked_temps.get(&res).copied() {
-                        cx.assign(
-                            cur,
-                            t,
-                            Rvalue::Use(Operand::Move(val_place), WithRetag::Yes),
-                        );
+                        cx.assign(cur, t, Rvalue::Use(Operand::Move(val_place), WithRetag::Yes));
                         cx.env.insert(res, VOp::Plc(t));
                         // The retirement of the PREVIOUS link, right after the assign just made —
                         // built's schedule, and the reason this class needed a plan of its own:
@@ -9362,7 +17301,8 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         // `bb1: { _3 = move (_6.0); StorageDead(_5); StorageDead(_4); … }`.
                         // Outside the class `checked_leaf_temps` is empty and this does nothing.
                         if cx.mf_checked_is_first(res) {
-                            for (v, lt) in checked_leaf_temps.iter().rev().copied().collect::<Vec<_>>()
+                            for (v, lt) in
+                                checked_leaf_temps.iter().rev().copied().collect::<Vec<_>>()
                             {
                                 if !cx.mf_mark_checked_leaf(cur, v, lt.local, false) {
                                     return unsup(
@@ -9512,6 +17452,30 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         Some(t) => t,
                         None => return unsup("Cast to non-scalar type"),
                     };
+                    // Trust (lane G25, 2026-08-23): a DELAYED cast emits NOTHING here. Built
+                    // evaluates an expression tree's operands LEFT TO RIGHT and this cast's result
+                    // sits at a non-leftmost operand position of the very next instruction, so its
+                    // `StorageLive` and its one assign belong THERE — `mf_operand` emits them when
+                    // it reaches this value, carrying this node's own `SourceInfo`. The plan
+                    // admits the delay only for an integer cast OF A CONSTANT, so nothing is read
+                    // here and the statement moves past nothing: the emitted program is the same
+                    // one with two statements exchanged. FAIL-CLOSED if the operand is not the
+                    // constant the plan measured — the two readers must agree or the body ships
+                    // marker-free rather than with a statement neither side placed.
+                    if cx.mf_delays(r) {
+                        let o = cx.operand(*operand)?;
+                        if !matches!(o, Operand::Constant(_)) {
+                            return unsup(
+                                "lane G25: a delayed cast whose operand is not a folded constant",
+                            );
+                        }
+                        cx.mf_delayed.insert(
+                            r,
+                            (Rvalue::Cast(CastKind::IntToInt, o, rty), rty, cx.source_info),
+                        );
+                        i += 1;
+                        continue;
+                    }
                     // Trust (wave-MF): see the `Inst::BinOp` arm. Built spells the cast's operand
                     // temp identically (`StorageLive(_2); _2 = copy (_1.0: u32);
                     // _0 = move _2 as usize (IntToInt); StorageDead(_2)`).
@@ -9529,7 +17493,27 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                 {
                     let (cond, result) = bool_not_idiom(nodes, i).expect("guard checked");
                     let c = cx.operand(cond)?;
-                    let tmp = cx.temp(tcx.types.bool);
+                    // Trust (lane R53): the idiom spans THREE nodes, so wave-J's
+                    // "the next node is the Return" predicate is asked at `i + 3`, not `i + 1`.
+                    // Trust (lane F8B): under the discriminant-match plan the arm's operand
+                    // temp was minted at this block's ENTRY, where built opens it; take it rather
+                    // than minting a second one. `None` outside the class, and the two plans are
+                    // disjoint by construction (one is a single-block call-forward body).
+                    let tmp = match cx.mf_swr_not_route(blk.id, result, nodes, i + 3) {
+                        Some(p) => p,
+                        None => match cx.swr_not.filter(|(b, _)| *b == blk.id) {
+                            Some((_, p)) => p,
+                            None => match cx.mf_call_fwd_post_route(
+                                result,
+                                tcx.types.bool,
+                                nodes,
+                                i + 3,
+                            ) {
+                                Some(p) => p,
+                                None => cx.temp(tcx.types.bool),
+                            },
+                        },
+                    };
                     cx.assign(cur, tmp, Rvalue::UnaryOp(MirUnOp::Not, c));
                     cx.env.insert(result, VOp::Plc(tmp));
                     i += 3;
@@ -9551,8 +17535,23 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         Some(t) => t,
                         None => return unsup("div/rem on non-scalar type"),
                     };
-                    let dividend = cx.operand(idm.dividend)?;
-                    let divisor = cx.operand(idm.divisor)?;
+                    // Trust (lane ROT): under the rotation plan the div's operands take built's
+                    // marked temps (`_10 = copy _1; _11 = copy _2`), minted BEFORE the guard so
+                    // the guard's `Eq` reads the divisor's TEMP exactly as built does
+                    // (`Eq(copy _11, const 0_u64)`), and retired together AFTER the split.
+                    // Outside the plan `mf_operand` IS `operand` for a body with no operand
+                    // class, and no operand-class plan admits an `Inst::Assert`, so every
+                    // non-rotation body through this arm is byte-identical to before.
+                    let rot_div = cx.mf_rot().filter(|ro| ro.guard && ro.fused == idm.result);
+                    let mut rot_deads = Vec::new();
+                    let (dividend, divisor) = if rot_div.is_some() {
+                        (
+                            cx.mf_operand(cur, idm.dividend, &mut rot_deads)?,
+                            cx.mf_operand(cur, idm.divisor, &mut rot_deads)?,
+                        )
+                    } else {
+                        (cx.operand(idm.dividend)?, cx.operand(idm.divisor)?)
+                    };
                     // ICE-guard ([[trust-ir-respell-lossy-for-isize-usize]]): the reconstructed
                     // const comparands below are built at `rty`; if a real operand's MIR type
                     // differs (an isize/usize respell this body did not vote), `Eq(op, const)`
@@ -9653,8 +17652,27 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         cur = succ2;
                     }
                     // The div/rem itself (MIR `Div`/`Rem`; signedness is carried by the operand type).
-                    let tmp = cx.temp(rty);
+                    // Trust (lane ROT): under the rotation plan the result is written DIRECTLY
+                    // into its back-edge param local — built's `_2 = Rem(move _10, move _11)` —
+                    // and the operand temps retire right after, in the SPLIT block
+                    // (`bb9.1:dead _11; bb9.1:dead _10`).
+                    let tmp = match rot_div {
+                        Some(ro) => {
+                            cx.mf_defer_deads = false;
+                            let Some(dest) = cx.mf_rot_fused_dest(ro.fused_pos) else {
+                                return unsup("lane ROT: the fused param local is absent");
+                            };
+                            if dest.ty(&cx.local_decls, tcx).ty != rty {
+                                return unsup("lane ROT: fused dest type != div type");
+                            }
+                            dest
+                        }
+                        None => cx.temp(rty),
+                    };
                     cx.assign(cur, tmp, Rvalue::BinaryOp(idm.op, Box::new((dividend, divisor))));
+                    if rot_div.is_some() {
+                        cx.mf_retire(cur, &rot_deads);
+                    }
                     cx.env.insert(idm.result, VOp::Plc(tmp));
                     i += idm.len;
                 }
@@ -9730,7 +17748,30 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     // Trust (wave-MF): result temp FIRST (built's `as_temp` pushes its
                     // `StorageLive` before evaluating the sub-expression), then the operand temps
                     // left-to-right, then the assign, then the deads in reverse.
-                    let tmp = cx.mf_result_temp(cur, r, rty);
+                    // Trust (lane ROT): the rotation's fused update takes NO result temp — built
+                    // writes the variable's local directly (`_2 = BitAnd(move _10, move _11)`),
+                    // so the destination is the back-edge param local and the edge's own assign
+                    // later disappears as an exact self-assignment. The fused result is never
+                    // marked (`needs` is the condition alone), so skipping `mf_result_temp`
+                    // skips no marker; the defer flag is cleared as that method would have.
+                    let tmp = match cx.mf_rot().filter(|ro| ro.fused == r) {
+                        Some(ro) => {
+                            cx.mf_defer_deads = false;
+                            let Some(dest) = cx.mf_rot_fused_dest(ro.fused_pos) else {
+                                return unsup("lane ROT: the fused param local is absent");
+                            };
+                            if dest.ty(&cx.local_decls, tcx).ty != rty {
+                                return unsup("lane ROT: fused dest type != BinOp type");
+                            }
+                            dest
+                        }
+                        // Trust (lane R53): the post-op plan's own direct write. See
+                        // [`ShimCx::mf_call_fwd_post_route`]; `None` outside the class.
+                        None => match cx.mf_call_fwd_post_route(r, rty, nodes, i + 1) {
+                            Some(p) => p,
+                            None => cx.mf_result_temp(cur, r, rty),
+                        },
+                    };
                     let mut deads = Vec::new();
                     let l = cx.mf_operand(cur, *lhs, &mut deads)?;
                     let rr = cx.mf_operand(cur, *rhs, &mut deads)?;
@@ -9764,7 +17805,13 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         return unsup("ICmp on non-scalar type");
                     }
                     // Trust (wave-MF): see the `Inst::BinOp` arm.
-                    let tmp = cx.mf_result_temp(cur, r, tcx.types.bool);
+                    // Trust (lane R53): under the sealed post-op plan the comparison IS the body's
+                    // outermost expression and built writes it straight into `_0`. Outside the
+                    // plan this is `None` and the line is wave-MF's verbatim.
+                    let tmp = match cx.mf_call_fwd_post_route(r, tcx.types.bool, nodes, i + 1) {
+                        Some(p) => p,
+                        None => cx.mf_result_temp(cur, r, tcx.types.bool),
+                    };
                     let mut deads = Vec::new();
                     let l = cx.mf_operand(cur, *lhs, &mut deads)?;
                     let rr = cx.mf_operand(cur, *rhs, &mut deads)?;
@@ -10051,6 +18098,45 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             // Trust (lane L): reverse field order, after the aggregate assign —
                             // `mf_retire` reverses what `mf_operand` pushed in field order.
                             cx.mf_retire(cur, &agg_deads);
+                            // Trust (lane S3): the call-result temps' retirement, after the
+                            // aggregate assign, in REVERSE creation order (measured,
+                            // probes/em3.rs d7: `_0 = Bd { info: move _1, mult: move _2 };
+                            // StorageDead(_2); StorageDead(_1)`) — FORWARD under the sealed
+                            // plan's one `ret_swap` bit ([`SatPerturb::ChainRetOrder`]).
+                            // Outside the plan `mf_agg_retire()` is `None` and this arm is
+                            // byte-identical to its pre-lane form. The plan's results are
+                            // re-checked against THIS arm's field values, and each must be
+                            // bound to a bare destination temp the `Call` arm minted — a
+                            // disagreement is unsup, never a half-marked body.
+                            if let Some((results, swap)) = cx.mf_agg_retire() {
+                                if results.as_slice() != field_vals.as_slice() {
+                                    return unsup(
+                                        "lane S3: the plan's results are not the aggregate's \
+                                         fields",
+                                    );
+                                }
+                                let mut locs: Vec<(ValueId, Local)> = Vec::new();
+                                for r in &results {
+                                    match cx.env.get(r) {
+                                        Some(VOp::Plc(p)) if p.projection.is_empty() => {
+                                            locs.push((*r, p.local));
+                                        }
+                                        _ => {
+                                            return unsup(
+                                                "lane S3: a planned result without a bare \
+                                                 destination temp",
+                                            );
+                                        }
+                                    }
+                                }
+                                let order: Vec<(ValueId, Local)> =
+                                    if swap { locs } else { locs.into_iter().rev().collect() };
+                                for (r, l) in order {
+                                    if !cx.mf_mark_agg_res(cur, r, l, false) {
+                                        return unsup("lane S3: retirement without a plan");
+                                    }
+                                }
+                            }
                         }
                         (&[v], 1) => {
                             // Trust (wave-15): a RETURNED ref param lives in `fwd_ptr_params`, not
@@ -10272,7 +18358,77 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             }
                         }
                     }
-                    cx.terminate(cur, TerminatorKind::Return)?;
+                    // Trust (lane R53): the POST-OP class's DEFERRED retirement, pushed here —
+                    // after the whole Return arm has written the returned value and before the
+                    // terminator. It cannot go at the arm's head: the three post-op forms do not
+                    // all write `_0` at the same place. `ICmp`/`BinOp`/`UnOp`/`Select` write it
+                    // in their own arm, one node earlier; `ExtractField` binds a PLACE and the
+                    // write is this arm's own `_0 = copy (d.f)`. Measured: pushing at the head
+                    // put the field form's retirement at `b1.0` while built's is at `b1.1`
+                    // (the marker law refused it, `expr::sorry::…::has_sorry`, line 3). Pushing
+                    // HERE is the one position after every form's write, and `predict_call_fwd`
+                    // states that one assign unconditionally.
+                    if let Some((bb, local)) = cx.cf_post_dead.take() {
+                        if bb != cur {
+                            return unsup(
+                                "lane-R53: the post-op retirement block is not the Return's",
+                            );
+                        }
+                        if !cx.mf_mark_call_fwd_post(bb, local, false) {
+                            return unsup("lane-R53: post retirement without a plan");
+                        }
+                    }
+                    // Trust (lane F8B, 2026-08-23): the DISCRIMINANT-MATCH class's slot
+                    // RETIREMENT at the JOIN — after the join's own write (built's
+                    // `bb21: _0 = Not(move _2); StorageDead(_2); return` and
+                    // `bb7: _0 = copy _3; StorageDead(_3); goto -> bb8`), so its position is the
+                    // join's own assign count, RE-COUNTED here against the plan.
+                    //
+                    // And built's RETURN SPLIT: when the match binds a payload, built exits the
+                    // binding's scope in the join and RETURNS from a block of its own, where this
+                    // shim emits one. `canon_markers` walks the RAW CFG with no goto threading,
+                    // so without the split every fine index after the join is one early and the
+                    // marker channel refuses whatever the markers say. The SEMANTIC channel
+                    // threads the `Goto` onto its incoming edge (LEDGER L3), so the extra block
+                    // is invisible there — it can cost no `agreed`.
+                    let swr_split = match cx.mf_swr_close(blk.id) {
+                        Some(want) => {
+                            let Some((_, sjoin)) = cx.mf_swr_slot() else {
+                                return unsup("lane F8B: the switch plan vanished at the join");
+                            };
+                            if blk.id != sjoin {
+                                return unsup("lane F8B: the retirement block is not the join");
+                            }
+                            let have = cx.blocks[cur]
+                                .statements
+                                .iter()
+                                .filter(|s| matches!(s.kind, StatementKind::Assign(_)))
+                                .count();
+                            if have != want {
+                                return unsup(format!(
+                                    "lane F8B: the join emitted {have} assign(s), the plan \
+                                     predicts {want}"
+                                ));
+                            }
+                            let Some(p) =
+                                cx.param_locals.get(&sjoin).and_then(|v| v.first()).copied()
+                            else {
+                                return unsup("lane F8B: the join's parameter local is unbound");
+                            };
+                            if !cx.mf_mark_swr(cur, blk.id, p.local, false) {
+                                return unsup("lane F8B: a join retirement without a marker plan");
+                            }
+                            cx.mf_swr_ret_split()
+                        }
+                        None => false,
+                    };
+                    if swr_split {
+                        let r = cx.new_block();
+                        cx.terminate(cur, TerminatorKind::Goto { target: r })?;
+                        cx.terminate(r, TerminatorKind::Return)?;
+                    } else {
+                        cx.terminate(cur, TerminatorKind::Return)?;
+                    }
                     i += 1;
                 }
                 Inst::Br { target, args } => {
@@ -10365,29 +18521,171 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             emit_enum_variant(tcx, &mut cx, cur, *place, ret_rty, disc, None)?;
                         }
                     } else {
-                        for (place, arg) in params.iter().zip(args.iter()) {
-                            // Trust (wave-YM): a deferred LEGACY shared-slot payload arg — re-materialize
-                            // as the arm-specific `((_e as V).k)` = `Downcast(block_variant[cur])+Field(k)`
-                            // (the payload read moved from the entry block into THIS variant arm, exactly
-                            // as built reads it). `block_variant[cur]` MUST be present — this `br` leaves
-                            // a variant arm; absent → fail closed. Scalar field only; a wrong variant/
-                            // field can only MISS the flip (comparator backstop).
-                            // Trust (B3-2c T2 slice 2): the wave-YM deferred-payload
-                            // re-materialization is DELETED (the defer site is gone;
-                            // the map is empty by construction).
-                            let o = cx.operand(*arg)?;
-                            // A source parameter/header place intentionally
-                            // reuses its ABI/local storage. The initial edge for
-                            // an unchanged binding is therefore `_n = copy _n`;
-                            // omit that exact self-assignment, which is semantic
-                            // noise absent from built MIR. Every changed backedge
-                            // still assigns its new operand normally.
-                            let exact_self_assignment = matches!(
-                                &o,
-                                Operand::Copy(source) | Operand::Move(source) if *source == *place
+                        // Trust (wave-YM): a deferred LEGACY shared-slot payload arg — re-materialize
+                        // as the arm-specific `((_e as V).k)` = `Downcast(block_variant[cur])+Field(k)`
+                        // (the payload read moved from the entry block into THIS variant arm, exactly
+                        // as built reads it). `block_variant[cur]` MUST be present — this `br` leaves
+                        // a variant arm; absent → fail closed. Scalar field only; a wrong variant/
+                        // field can only MISS the flip (comparator backstop).
+                        // Trust (B3-2c T2 slice 2): the wave-YM deferred-payload
+                        // re-materialization is DELETED (the defer site is gone;
+                        // the map is empty by construction).
+                        //
+                        // Trust (lane LOOP2, 2026-08-20): **A `Br` EDGE IS A PARALLEL MOVE, AND
+                        // SEQUENTIAL LOWERING CLOBBERS A CROSS-PARAM READ.** Every edge argument
+                        // denotes the source value AT THE EDGE — they are read simultaneously, as
+                        // a phi row. The old loop assigned them in param order, so an argument
+                        // that READS a target param local this same edge has ALREADY WRITTEN got
+                        // the NEW value instead of the old one. Only a loop BACK EDGE can reach
+                        // this: SSA dominance means an acyclic edge's args cannot mention the
+                        // target's own params, and the pre-header/break-arm edges write locals
+                        // disjoint from the ones they read. Measured on the rotation shape
+                        // `loop { if b == 0 { break; } let t = b; b = a & b; a = t; }`
+                        // (`g8_rot_let_and`): the back edge is `br header(%and, %b)` where `%b`
+                        // IS the header's first param; the old lowering emitted
+                        // `p0 = BitAnd(..); p1 = copy p0;` and the oracle refused the body —
+                        // built `loop@b0 h0: seed=a1 back=h1` vs derived
+                        // `back=bin(BitAnd,u64,h0,h1)`. The oracle was RIGHT: the derived body
+                        // computed `a = a & b`, not `a = t`. Fail-closed end to end (no flip ever
+                        // shipped from this defect), but the whole rotation class — Euclid's gcd,
+                        // the kernel's one true loop — was walled at `mismatch`.
+                        //
+                        // The repair is the textbook one: SNAPSHOT every clobbered source into a
+                        // fresh temp BEFORE the first destination write, then perform the writes
+                        // in param order from the snapshots. [`parallel_move_snapshots`] is the
+                        // pure schedule (unit-tested); an omitted exact self-assignment does not
+                        // write, so reading its place later is NOT a hazard and mints no temp.
+                        // Edges with no hazard — every edge the emitter admitted before this lane
+                        // — take the exact code path they took before, statement for statement.
+                        // Trust (lane ROT): the rotation back edge takes built's `let`-cluster
+                        // tail instead of the generic parallel move. The fused update was
+                        // written into its param local by the `BinOp`/div arm (its edge assign
+                        // disappears as an exact self-assignment — verified here, fail-closed),
+                        // and the passthrough rides the READ temp of the `let` local:
+                        // `StorageLive(_13); _13 = copy _9; _1 = move _13; StorageDead(_13);
+                        // _4 = const (); StorageDead(_9)` — built `g8` bb8.4–bb8.7 / `g2`
+                        // bb9.1–bb9.4 (`built_walk_gshape.txt`), assign for assign.
+                        let rot_edge = cx.mf_rot().filter(|_| {
+                            cx.mf_loop_sites()
+                                .is_some_and(|s| blk.id == s.body && *target == s.header)
+                        });
+                        if let Some(rot) = rot_edge {
+                            let params = match cx.param_locals.get(target) {
+                                Some(p) => p.clone(),
+                                None => return unsup("lane ROT: header params are unbound"),
+                            };
+                            if params.len() != 2 || args.len() != 2 {
+                                return unsup("lane ROT: the rotation edge is not two-argument");
+                            }
+                            let fused_op = cx.operand(args[rot.fused_pos])?;
+                            let fused_ok = matches!(
+                                &fused_op,
+                                Operand::Copy(p) | Operand::Move(p) if *p == params[rot.fused_pos]
                             );
-                            if !exact_self_assignment {
-                                cx.assign(cur, *place, Rvalue::Use(o, WithRetag::Yes));
+                            if !fused_ok {
+                                return unsup("lane ROT: the fused update missed its param local");
+                            }
+                            if args[rot.pass_pos] != rot.pass {
+                                return unsup("lane ROT: the passthrough arg moved");
+                            }
+                            let Some(t_local) = cx.rot_t.take() else {
+                                return unsup("lane ROT: the `let` local was never minted");
+                            };
+                            let t_place = Place::from(t_local);
+                            let rt_ty = t_place.ty(&cx.local_decls, tcx).ty;
+                            let rt = cx.temp(rt_ty);
+                            if !cx.mf_mark_rot(cur, rt.local, true) {
+                                return unsup("lane ROT: a rot marker without a rot plan");
+                            }
+                            cx.assign(cur, rt, Rvalue::Use(Operand::Copy(t_place), WithRetag::Yes));
+                            cx.assign(
+                                cur,
+                                params[rot.pass_pos],
+                                Rvalue::Use(Operand::Move(rt), WithRetag::Yes),
+                            );
+                            if !cx.mf_mark_rot(cur, rt.local, false) {
+                                return unsup("lane ROT: a rot marker without a rot plan");
+                            }
+                            // built's block-tail unit const (`_4 = const ()`): one assign to an
+                            // UNMARKED unit local — it advances the position of the `let`
+                            // local's retirement, which lands dead LAST.
+                            let u = cx.temp(tcx.types.unit);
+                            cx.assign(
+                                cur,
+                                u,
+                                Rvalue::Use(
+                                    Operand::Constant(Box::new(ConstOperand {
+                                        span: cx.span,
+                                        user_ty: None,
+                                        const_: MirConst::zero_sized(tcx.types.unit),
+                                    })),
+                                    WithRetag::Yes,
+                                ),
+                            );
+                            if !cx.mf_mark_rot(cur, t_local, false) {
+                                return unsup("lane ROT: a rot marker without a rot plan");
+                            }
+                        } else {
+                            let mut moves: Vec<(Place<'tcx>, Operand<'tcx>)> =
+                                Vec::with_capacity(args.len());
+                            for (place, arg) in params.iter().zip(args.iter()) {
+                                moves.push((*place, cx.operand(*arg)?));
+                            }
+                            let keyed: Vec<(Place<'tcx>, Option<Place<'tcx>>)> = moves
+                                .iter()
+                                .map(|(d, o)| {
+                                    (
+                                        *d,
+                                        match o {
+                                            Operand::Copy(s) | Operand::Move(s) => Some(*s),
+                                            // A constant or runtime-check operand reads no place.
+                                            Operand::Constant(_) | Operand::RuntimeChecks(_) => {
+                                                None
+                                            }
+                                        },
+                                    )
+                                })
+                                .collect();
+                            let snap = parallel_move_snapshots(&keyed);
+                            if !snap.is_empty() {
+                                // Trust (lane LOOP2): a snapshot is an ASSIGN the marker sequence
+                                // models do not carry. No admitted marker plan can reach one today
+                                // (the loop plan's class has no hazard body in any measured corpus),
+                                // so this is a tripwire, not a behaviour: if a future plan admits a
+                                // rotation back edge without modelling the snapshot, the body fails
+                                // CLOSED here instead of shipping markers the shim did not emit.
+                                if cx.mf_loop_sites().is_some() {
+                                    return unsup(
+                                        "parallel-move snapshot under an engaged loop marker plan \
+                                         is unmodeled",
+                                    );
+                                }
+                                for &j in &snap {
+                                    let src_op = moves[j].1.clone();
+                                    let (Operand::Copy(src) | Operand::Move(src)) = &src_op else {
+                                        // `parallel_move_snapshots` only schedules place reads.
+                                        return unsup("parallel-move snapshot of a constant");
+                                    };
+                                    let ty = src.ty(&cx.local_decls, tcx).ty;
+                                    let t = cx.temp(ty);
+                                    cx.assign(cur, t, Rvalue::Use(src_op, WithRetag::Yes));
+                                    moves[j].1 = Operand::Move(t);
+                                }
+                            }
+                            for (place, o) in moves {
+                                // A source parameter/header place intentionally
+                                // reuses its ABI/local storage. The initial edge for
+                                // an unchanged binding is therefore `_n = copy _n`;
+                                // omit that exact self-assignment, which is semantic
+                                // noise absent from built MIR. Every changed backedge
+                                // still assigns its new operand normally.
+                                let exact_self_assignment = matches!(
+                                    &o,
+                                    Operand::Copy(source) | Operand::Move(source) if *source == place
+                                );
+                                if !exact_self_assignment {
+                                    cx.assign(cur, place, Rvalue::Use(o, WithRetag::Yes));
+                                }
                             }
                         }
                     }
@@ -10399,6 +18697,31 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     if let Some(local) = cx.mf_payload_dead.take() {
                         if !cx.mf_mark_payload(cur, blk.id, local, false) {
                             return unsup("wave-EP: payload retirement without a marker plan");
+                        }
+                    }
+                    // Trust (lane F8B): the `!param` ARM's operand temp retires AFTER the edge
+                    // copy that consumes it — built's `bb17: StorageLive(_4); _4 = copy _2;
+                    // _0 = Not(move _4); StorageDead(_4); goto` — so its position is this block's
+                    // own assign count. RE-COUNTED here against the plan rather than assumed: a
+                    // disagreement is a body that ships marker-free, never a displaced marker.
+                    if let Some((sb, sp)) = cx.swr_not.filter(|(b, _)| *b == blk.id) {
+                        let Some(want) = cx.mf_swr_close(sb) else {
+                            return unsup("lane F8B: a `!param` temp the plan does not retire");
+                        };
+                        let have = cx.blocks[cur]
+                            .statements
+                            .iter()
+                            .filter(|s| matches!(s.kind, StatementKind::Assign(_)))
+                            .count();
+                        if have != want {
+                            return unsup(format!(
+                                "lane F8B: the `!param` arm emitted {have} assign(s), the plan \
+                                 predicts {want}"
+                            ));
+                        }
+                        cx.swr_not = None;
+                        if !cx.mf_mark_swr(cur, blk.id, sp.local, false) {
+                            return unsup("lane F8B: an arm retirement without a marker plan");
                         }
                     }
                     // Trust (lane L9): built routes BOTH edges into the loop header — the
@@ -10455,6 +18778,21 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         return unsup("CondBr target has block params");
                     }
                     let mut c = cx.operand(*cond)?;
+                    // Trust (lane G25, 2026-08-23): the `||`/`&&` SUGAR condition. The producer
+                    // switches on the bare block parameter; built opens a temp of its own, copies
+                    // the parameter into it and switches on THAT — `bb0: StorageLive(_4);
+                    // _4 = copy _2; switchInt(move _4)`, measured on the corpus body
+                    // `MentionsNameVisitor::combine` (`a || b`). The slot a marker would name did
+                    // not exist in the derived body; this emits it. Gated on the sealed plan's
+                    // `sugar` set, which [`logical_sugar_head`] fills ONLY for the desugar
+                    // signature — a written-out `if`/`match` on a bare bool is Module-identical to
+                    // its twin and stays refused, so `match_bool`'s existing flip is untouched.
+                    if cx.mf_sugar_cond(blk.id) {
+                        let bty = cx.tcx.types.bool;
+                        let tmp = cx.temp(bty);
+                        cx.mf_mark_result(cur, *cond, tmp.local);
+                        cx.assign(cur, tmp, Rvalue::Use(c.clone(), WithRetag::Yes));
+                    }
                     // Trust (lane K): multi-block marker fidelity, both halves at one site.
                     let mut false_edge = else_bb;
                     if let Some(br) = cx.mf_cur_branch() {
@@ -10466,7 +18804,15 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         let Some(local) = cx.mf_live.remove(cond) else {
                             return unsup("lane K: CondBr condition carries no marked temp");
                         };
-                        cx.mf_entry_deads.entry(br.join).or_default().push(local);
+                        // Trust (lane G25): the MOVE control's second half — see the predicted
+                        // side's own comment. Unperturbed this is `br.join`, which is where built
+                        // puts it.
+                        let dead_at = if cx.mf_g25_hoist() && cx.mf_sugar_cond(blk.id) {
+                            br.then_target
+                        } else {
+                            br.join
+                        };
+                        cx.mf_entry_deads.entry(dead_at).or_default().push(local);
                         // Trust (lane L9): a loop's condition region has TWO exits and no single
                         // join. `br.join` above is the loop BODY — built's `if`-join, the continue
                         // path — and it takes the `if`'s `()` value beside the condition; the
@@ -10896,6 +19242,130 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             }
                         }
                     }
+                    // Trust (lane F8, 2026-08-23): the SWITCH-TO-JOIN class's two halves at
+                    // one site.
+                    //
+                    // (a) The scrutinee's own temp dies at the JOIN, at position 0 — built's
+                    //     `bb15: StorageDead(_2); return`. Taking it out of `mf_live` here is also
+                    //     what keeps the body's marker balance provable: the `Switch` is the
+                    //     consumer, and it is the one consumer the four rvalue arms cannot reach.
+                    //     Absent => the plan and the emitter disagree; fail CLOSED.
+                    //
+                    // (b) Built's match lowering interposes ONE empty `falseEdge` candidate block
+                    //     per NON-LAST candidate. `canon_markers` walks the RAW CFG with no goto
+                    //     threading, so without them every fine block index after the first arm
+                    //     shifts — the join lands at derived fine 2 against built's fine 3 — and
+                    //     the marker channel refuses whatever the markers say. The SEMANTIC
+                    //     channel threads every `Goto` block onto its incoming edges (LEDGER L3),
+                    //     so the extra blocks are invisible there; this lane MEASURES that rather
+                    //     than citing it.
+                    //
+                    // Sited HERE — after `block_variant` recording, after the exhaustive-fold
+                    // reshape, after the wave-YM sort and after every other SAT perturbation — so
+                    // the redirect can neither hide a corrupted routing nor steal a variant
+                    // record.
+                    if cx.mf_sw_head(blk.id) {
+                        let Some((sv, sw_join)) = cx.mf_sw_site() else {
+                            return unsup("lane F8: the switch plan carries no scrutinee");
+                        };
+                        let Some(local) = cx.mf_live.remove(&sv) else {
+                            return unsup("lane F8: the switch scrutinee carries no marked temp");
+                        };
+                        cx.mf_entry_deads.entry(sw_join).or_default().push(local);
+                        let mut chains = cx.mf_sw_tramps();
+                        // SAT control (`sw-tramp`): MOVE one trampoline off the plan's first
+                        // non-last candidate and onto the LAST candidate's edge, which the plan
+                        // never puts one on. The TOTAL is unchanged, so the marker law stays
+                        // green and only the frozen ORACLE can refuse. See
+                        // [`SatPerturb::SwTramp`].
+                        if cx.sat_perturb == Some(SatPerturb::SwTramp) {
+                            if let Some(last) = cx.mf_sw_last_arm() {
+                                let moved = match chains.first_mut() {
+                                    Some(e) if e.1 > 0 => {
+                                        e.1 -= 1;
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if moved {
+                                    chains.push((last, 1));
+                                    cx.sat_perturb_count += 1;
+                                }
+                            }
+                        }
+                        for (b, k) in chains {
+                            let Some(&want) = cx.block_map.get(&b) else {
+                                return unsup("lane F8: a planned trampoline names no MIR block");
+                            };
+                            // The chain, minted ONCE per planned edge: `k` empty `Goto` blocks,
+                            // innermost first, then every reference to `want` on this switch is
+                            // redirected to the outermost of them. Wave-DR mints one chain per
+                            // matching target; this class has exactly one target per plan entry
+                            // (the edges are checked distinct), and minting once is what keeps
+                            // the appended-block count equal to the table's own sum.
+                            let mut redirect = want;
+                            for _ in 0..k {
+                                let nb = cx.new_block();
+                                cx.terminate(nb, TerminatorKind::Goto { target: redirect })?;
+                                redirect = nb;
+                            }
+                            for (_, tbb) in targets.iter_mut() {
+                                if *tbb == want {
+                                    *tbb = redirect;
+                                }
+                            }
+                            if default_bb == want {
+                                default_bb = redirect;
+                            }
+                        }
+                    }
+                    // Trust (lane F8B, 2026-08-23): the DISCRIMINANT-MATCH class's
+                    // match-candidate pre-blocks — the SAME empty-`Goto` device wave-DR and lane
+                    // F8 mint, with the OR-PATTERN table this class's candidates need (see
+                    // [`plan_switch_ref_markers`] for the per-edge derivation). Sited HERE, after
+                    // every reshape, sort and other perturbation, so the redirect can neither
+                    // hide a corrupted routing nor steal a variant record.
+                    if cx.mf_swr_head(blk.id) {
+                        let mut chains = cx.mf_swr_tramps();
+                        // SAT control (`swr-tramp`): MOVE one trampoline onto the DEFAULT edge's
+                        // arm block, which the plan never puts one on. The TOTAL is unchanged, so
+                        // the marker law stays green and only the frozen ORACLE can refuse. See
+                        // [`SatPerturb::SwrTramp`].
+                        if cx.sat_perturb == Some(SatPerturb::SwrTramp) {
+                            if let Some(last) = cx.mf_swr_last_arm() {
+                                let moved = match chains.first_mut() {
+                                    Some(e) if e.1 > 0 => {
+                                        e.1 -= 1;
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if moved {
+                                    chains.push((last, 1));
+                                    cx.sat_perturb_count += 1;
+                                }
+                            }
+                        }
+                        for (b, k) in chains {
+                            let Some(&want) = cx.block_map.get(&b) else {
+                                return unsup("lane F8B: a planned trampoline names no MIR block");
+                            };
+                            let mut redirect = want;
+                            for _ in 0..k {
+                                let nb = cx.new_block();
+                                cx.terminate(nb, TerminatorKind::Goto { target: redirect })?;
+                                redirect = nb;
+                            }
+                            for (_, tbb) in targets.iter_mut() {
+                                if *tbb == want {
+                                    *tbb = redirect;
+                                }
+                            }
+                            if default_bb == want {
+                                default_bb = redirect;
+                            }
+                        }
+                    }
                     if targets.is_empty() {
                         // An irrefutable-only match (`match k { n => .. }`) — built emits no switch.
                         cx.terminate(cur, TerminatorKind::Goto { target: default_bb })?;
@@ -11177,7 +19647,46 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             .flags
                             .contains(CodegenFnAttrFlags::TRACK_CALLER)
                     {
-                        return unsup("Call(track_caller callee: caller-Location fidelity)");
+                        // Trust (lane MKF, 2026-08-27): ADMIT when the span RECONSTRUCTS.
+                        //
+                        // The refusal this replaces was written by wave 6 (1adc705d1b,
+                        // 2026-07-02), when the shim had no per-node span at all and every
+                        // reconstructed call carried `tcx.def_span(def)` -- the fn HEAD. For a
+                        // `#[track_caller]` callee codegen turns the CALL span into the
+                        // `Location` the panic prints, so admitting one then would have reported
+                        // the wrong file and line: the miscompile the comment names, and a
+                        // correct refusal.
+                        //
+                        // Three later changes removed that hazard and nothing revisited the
+                        // guard: `span_from_source_span` + `set_span_from_node` (131841e55e,
+                        // 07-26) reconstruct the span PER NODE; #33 (38aa91097c, 08-03) points
+                        // the Call terminator's `fn_span` at the call site rather than the body
+                        // constant; #33 step 2 (a41baea710, 08-11) makes the PRODUCER stamp
+                        // THIR's `fn_span`, which for a method call is the callee sub-span.
+                        //
+                        // So the guard's own condition is now CHECKABLE rather than
+                        // unsatisfiable: admit exactly when this node's span reconstructs, and
+                        // fail closed when it does not -- `span_from_source_span` already
+                        // returns `None` for a missing file, line 0, a line past the file, or a
+                        // column overrun.
+                        //
+                        // MEASURED (lane MKE, sealed driver 925f19ad7f + wave-CRT, pinned corpus
+                        // f21d6336bf DIRT []): exactly TWO call sites in clean-kernel reach this
+                        // guard, both calling `Option::expect` --
+                        // `<LevelArc as Deref>::deref` (level/mod.rs:61) and
+                        // `PooledBuilder::resources` (cert/builder_pool.rs:231). Both spans
+                        // reconstruct to the `expect` identifier (`61:14`, `231:14`), which is
+                        // what built's `fn_span` is for a method call. Admitting them is
+                        // +2 agreed, 0 agreed lost, 0 markers_exact lost, 0 new mismatches.
+                        let reconstructs = node
+                            .span
+                            .and_then(|sp| span_from_source_span(tcx, &cx.files, sp))
+                            .is_some();
+                        if !reconstructs {
+                            return unsup(
+                                "Call(track_caller callee: span does not reconstruct)",
+                            );
+                        }
                     }
                     // `instantiate_bound_regions_with_erased`, not `skip_binder`: a callee param
                     // like `&i32` carries a LATE-bound lifetime, which `skip_binder` leaves as an
@@ -11408,11 +19917,246 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             }
                         }
                     }
+                    // Trust (wave-MC): the by-value CALL-CHAIN plan's three sites, and NOTHING
+                    // outside the plan. `mc_site` is false for every body the plan declines, and
+                    // then every line this wave adds is skipped and the arm is byte-identical to
+                    // what it was: no destination marker, `cx.operand` for every argument, and no
+                    // retirement at the successor.
+                    //
+                    // SITE 1 — the DESTINATION temp, opened BEFORE any argument temp. That order
+                    // is rule 1 of the class (`probes/mc_call.rs::q1`, `::q5`: built emits
+                    // `StorageLive(_2); StorageLive(_3); _3 = copy _1; _2 = M::range(move _3)`),
+                    // and it is the reason the temp is minted HERE rather than at the `dest`
+                    // expression below, where every pre-wave call mints it — by then the argument
+                    // temps already exist and their markers already went in.
+                    //
+                    // `route_to_ret` is re-derived here from the same two facts the `dest`
+                    // expression reads (this node's result and the next node being the `Return`
+                    // that returns it), and the plan refuses any body where the two spellings
+                    // could disagree — a call whose result is RETURNED but which is not the last
+                    // body node. A routed call writes `_0` and built gives it no temp either.
+                    let mc_site = cx.mf_call_site(i);
+                    let mut mc_dest: Option<Place<'tcx>> = None;
+                    let mut mc_deads: Vec<Local> = Vec::new();
+                    if mc_site {
+                        let mc_routed = match res {
+                            Some(r) => matches!(
+                                nodes.get(i + 1).map(|n| &n.inst),
+                                Some(Inst::Return { values })
+                                    if matches!(values.as_slice(), &[v] if v == r)
+                            ),
+                            None => false,
+                        };
+                        if let Some(r) = res.filter(|_| !mc_routed) {
+                            let t = cx.temp(ret_rty_callee);
+                            // The plan's per-VALUE question and the emission are ONE operation:
+                            // this pushes nothing for a value the plan does not mark.
+                            cx.mf_mark_result(cur, r, t.local);
+                            mc_dest = Some(t);
+                        }
+                    }
+                    // Trust (lane G21, 2026-08-25): **THE SHORT-CIRCUIT-OVER-CALLS SITE 1** — the
+                    // call's DESTINATION temp, opened BEFORE any argument temp, exactly as
+                    // wave-MC's is and for the same measured reason (`as_operand` on the call
+                    // expression opens the destination and only then recurses into the arguments).
+                    // For the HEAD call that temp IS the `CondBr` condition's, which lane K's own
+                    // arm then moves out of and retires at the join; for the RHS arm's call it
+                    // exists only when a POST-OP in the successor consumes the result, and
+                    // otherwise built writes the arm's value straight into the destination and
+                    // this arm mints nothing. Outside the plan `bc_role` is `None` and every line
+                    // this lane adds is skipped.
+                    let bc_role = cx.mf_bc_role(blk.id, i);
+                    let mut bc_dest: Option<Place<'tcx>> = None;
+                    let mut bc_temps: Vec<Local> = Vec::new();
+                    if let Some(role) = bc_role {
+                        // The class OWNS `operand` through its branch table, so this can only be
+                        // false if the two disagreed; fail CLOSED rather than emit a marker no
+                        // plan authorised.
+                        if !cx.mf_operand_class() {
+                            return unsup("lane G21: a planned call outside the operand class");
+                        }
+                        let marked = matches!(role, BcRole::Head) || cx.mf_bc_rhs_marked();
+                        if marked {
+                            let Some(r) = res else {
+                                return unsup("lane G21: a planned call declares no result");
+                            };
+                            let t = cx.temp(ret_rty_callee);
+                            cx.mf_mark_result(cur, r, t.local);
+                            bc_dest = Some(t);
+                        }
+                    }
+                    // Trust (wave-WB8, 2026-08-21): **THE CHAIN-FORWARD PRE-STEP** — built's
+                    // left-to-right argument evaluation of the FINAL call, replayed at each
+                    // call node the sealed plan owns. Outside the plan `mf_chain()` is `None`
+                    // and every line below is skipped, so the arm is byte-identical to what
+                    // it was.
+                    //
+                    // At an INNER node this opens (in built's measured order, probes/em3.rs):
+                    // every not-yet-minted Place slot BEFORE this chain slot (`live(t);
+                    // t = &[mut](*_p)` each), then the chain slot's own locals — for a
+                    // ByValue slot ONE temp that doubles as the call's destination, for a
+                    // Reborrow slot the outer temp then the in-transit destination, both
+                    // opened before any of this call's own argument temps. At the FINAL node
+                    // it opens the Place slots after the last chain slot.
+                    let chain_plan = cx.mf_chain();
+                    let mut chain_dest: Option<Place<'tcx>> = None;
+                    let mut chain_pos: Option<usize> = None;
+                    let mut chain_final = false;
+                    if let Some(cp) = &chain_plan {
+                        if cx.chain_arg_temps.len() != cp.slots.len() {
+                            cx.chain_arg_temps = vec![None; cp.slots.len()];
+                        }
+                        let inner_k = cp.inners.iter().position(|(n, _)| *n == i);
+                        let stop = match inner_k {
+                            Some(k) => {
+                                // The k-th chain slot's position among the final arguments.
+                                match cp
+                                    .slots
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, s)| !matches!(s, ChainSlot::Place(..)))
+                                    .nth(k)
+                                {
+                                    Some((p, _)) => p,
+                                    None => {
+                                        return unsup(
+                                            "wave-WB8: an inner call without a chain slot",
+                                        );
+                                    }
+                                }
+                            }
+                            None if cp.final_node == i => {
+                                chain_final = true;
+                                cp.slots.len()
+                            }
+                            None => {
+                                return unsup("wave-WB8: a call node the plan does not own");
+                            }
+                        };
+                        // The pending Place slots up to (exclusive) this chain slot — or all
+                        // of them, at the final node.
+                        while cx.chain_next_slot < stop {
+                            let j = cx.chain_next_slot;
+                            let ChainSlot::Place(v, _) = &cp.slots[j] else {
+                                return unsup("wave-WB8: an unminted chain slot before this one");
+                            };
+                            let Some(&place) = cx.fwd_ptr_params.get(v) else {
+                                return unsup(
+                                    "wave-WB8: a Place slot outside the forwarded params",
+                                );
+                            };
+                            let pty = cx.local_decls[place.local].ty;
+                            let ty::Ref(_, _, m) = pty.kind() else {
+                                return unsup("wave-WB8: a Place slot that is not a reference");
+                            };
+                            let t = cx.temp(pty);
+                            if !cx.mf_mark_chain_arg(cur, *v, t.local, true) {
+                                return unsup("wave-WB8: marker without a plan");
+                            }
+                            cx.assign(
+                                cur,
+                                t,
+                                Rvalue::Ref(
+                                    tcx.lifetimes.re_erased,
+                                    if m.is_mut() {
+                                        BorrowKind::Mut {
+                                            kind: rustc_middle::mir::MutBorrowKind::Default,
+                                        }
+                                    } else {
+                                        BorrowKind::Shared
+                                    },
+                                    tcx.mk_place_deref(place),
+                                ),
+                            );
+                            cx.chain_arg_temps[j] = Some(t);
+                            cx.chain_next_slot = j + 1;
+                        }
+                        if let Some(k) = inner_k {
+                            let pos = stop;
+                            chain_pos = Some(pos);
+                            match &cp.slots[pos] {
+                                ChainSlot::ByValue(v) => {
+                                    // The final argument temp IS this call's destination.
+                                    let t = cx.temp(ret_rty_callee);
+                                    if !cx.mf_mark_chain_arg(cur, *v, t.local, true) {
+                                        return unsup("wave-WB8: marker without a plan");
+                                    }
+                                    cx.chain_arg_temps[pos] = Some(t);
+                                    chain_dest = Some(t);
+                                }
+                                ChainSlot::Reborrow(v) => {
+                                    // A REFERENCE result: the callee must really return a
+                                    // shared reference — the source side promised the
+                                    // reborrow, and a disagreement here is a shape the model
+                                    // does not cover.
+                                    if !matches!(
+                                        ret_rty_callee.kind(),
+                                        ty::Ref(_, _, m) if m.is_not()
+                                    ) {
+                                        return unsup(
+                                            "wave-WB8: a Reborrow slot on a non-shared-ref \
+                                             callee return",
+                                        );
+                                    }
+                                    let t =
+                                        cx.temp(tcx.erase_and_anonymize_regions(ret_rty_callee));
+                                    if !cx.mf_mark_chain_arg(cur, *v, t.local, true) {
+                                        return unsup("wave-WB8: marker without a plan");
+                                    }
+                                    let u = cx.temp(ret_rty_callee);
+                                    if !cx.mf_mark_chain_transit(cur, *v, u.local, true) {
+                                        return unsup("wave-WB8: marker without a plan");
+                                    }
+                                    cx.chain_arg_temps[pos] = Some(t);
+                                    cx.chain_transits.push((*v, u.local));
+                                    chain_dest = Some(u);
+                                }
+                                ChainSlot::Place(..) => {
+                                    return unsup("wave-WB8: an inner call at a Place slot");
+                                }
+                            }
+                            cx.chain_next_slot = pos + 1;
+                            let _ = k;
+                        }
+                    }
+                    // Trust (lane S3, 2026-08-21): **THE AGGREGATE-OF-CALL-RESULTS PRE-STEP** —
+                    // the call's destination temp, `StorageLive`-marked at the head of the
+                    // call's own block (measured, probes/em3.rs d7: `bb0: StorageLive(_1);
+                    // _1 = <Bi as Default>::default() -> bb1; bb1: StorageLive(_2); …`). The
+                    // temp becomes a bare operand of the `Return` arm's aggregate assign and
+                    // retires after it. Outside the plan `mf_agg_site` is `false` and every
+                    // line below is skipped, so the arm is byte-identical to what it was.
+                    let agg_site = cx.mf_agg_site(i);
+                    let mut agg_dest: Option<Place<'tcx>> = None;
+                    if agg_site {
+                        let Some(r) = res else {
+                            return unsup("lane S3: a planned call without a result");
+                        };
+                        if !args.is_empty() {
+                            return unsup("lane S3: a planned call with arguments");
+                        }
+                        let t = cx.temp(ret_rty_callee);
+                        if !cx.mf_mark_agg_res(cur, r, t.local, true) {
+                            return unsup("lane S3: marker without a plan");
+                        }
+                        agg_dest = Some(t);
+                    }
                     // ARG fidelity: each lowered operand's rustc type must EXACTLY equal the
                     // callee's declared input type (covers respell drift and the producer's
                     // isize/usize collapse alike — fail closed, never a layout argument).
                     let mut mir_args: Vec<Spanned<Operand<'tcx>>> = Vec::with_capacity(args.len());
+                    // Trust (lane S1F): the call-forward plan's FIELD arguments. For one of these
+                    // the wave-30 reconstruction below is NOT performed here — it would mint an
+                    // UNMARKED temp before the plan's site could open the marker, and the site
+                    // would then reborrow that temp into a second one (two temps where built has
+                    // one). The raw forward is handed on instead and the exact arg-type check is
+                    // deferred to the CF site, which reconstructs the borrow INTO the marked temp
+                    // declared at the callee's input type and re-establishes the type there.
+                    // Empty outside the class, so every other body is byte-identical.
+                    let cf_fields_plan = cx.mf_call_fwd_fields();
+                    let cf_pairs_plan = cx.mf_call_fwd_pairs();
                     for (a, &want) in args.iter().zip(sig.inputs().iter()) {
+                        let cf_field = cf_fields_plan.contains(a) || cf_pairs_plan.contains(a);
                         // Trust (wave-8a): a forwarded opaque `"Ptr"` param (`g(r)`, `s.method()`
                         // receiver) — pass its arg place directly. Built spells this
                         // `_x = &(*_p); call(move _x)`; forwarding `_p` with `move` is congruent
@@ -11433,7 +20177,11 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                 // (clean-only preserved). A matching type (`g(self)`/`g(r)`) forwards
                                 // unchanged (wave-8a).
                                 let got = cx.local_decls[place.local].ty;
-                                if tcx.erase_and_anonymize_regions(got)
+                                if cf_field {
+                                    // Trust (lane S1F): reconstructed — and marked — at the
+                                    // CF site below, never here.
+                                    Operand::Move(place)
+                                } else if tcx.erase_and_anonymize_regions(got)
                                     != tcx.erase_and_anonymize_regions(want)
                                 {
                                     match cx.try_reconstruct_interior_arg(place, got, want) {
@@ -11491,6 +20239,14 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                         "str arg: recognized &str chain but callee param is not &str",
                                     );
                                 }
+                                // Trust (wave-MC): SITE 2 — the ARGUMENT temp. `mf_operand` IS
+                                // `ShimCx::operand` outside the operand class, and inside it does
+                                // exactly what built's `as_operand` -> `as_temp` does: it folds a
+                                // constant, MOVES out of an already-marked temp (recording its
+                                // retirement), and otherwise mints `StorageLive(t); t = <operand>`
+                                // and records `t`. One implementation of the argument-temp
+                                // discipline, shared with every rvalue arm.
+                                None if mc_site => cx.mf_operand(cur, *a, &mut mc_deads)?,
                                 None => cx.operand(*a)?,
                             },
                         };
@@ -11554,8 +20310,13 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         // late-bound regions erased above, the place type is MIR-erased) — the
                         // extra erase is defensive/idempotent. Referent types and the isize/usize
                         // respell fidelity this check guards are untouched by region erasure.
-                        if tcx.erase_and_anonymize_regions(got)
-                            != tcx.erase_and_anonymize_regions(want)
+                        // Trust (lane S1F): a planned FIELD argument is the one operand whose
+                        // type is allowed to differ HERE — it is the base pointer the producer
+                        // erased the field borrow to — and the CF site below refuses the body
+                        // unless the reconstruction lands it on exactly `want`.
+                        if !cf_field
+                            && tcx.erase_and_anonymize_regions(got)
+                                != tcx.erase_and_anonymize_regions(want)
                         {
                             return unsup(format!(
                                 "Call(arg type {got:?} != callee input {want:?})"
@@ -11752,16 +20513,927 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                 Some(Inst::Return { values }) if values.is_empty()
                             ),
                         };
+                    // Trust (wave-CF, revived by wave-FR 2026-08-21): **THE CALL'S ARGUMENT
+                    // TEMPS, IN BUILT'S OWN SPELLING.** Outside the plan `mf_call_fwd_args()` is
+                    // EMPTY and every line below is skipped, so the arm is byte-identical to
+                    // what it was.
+                    //
+                    // Under the plan this emits, per planned argument in operand order, built's
+                    // own `StorageLive(t); t = &(*_p)` (a reference argument) or
+                    // `StorageLive(t); t = copy _p` (a by-value scalar) and moves `t` in — which
+                    // is what the wave-8a forward deliberately skipped ("forwarding `_p` with
+                    // `move` is congruent under `ref-alias`/`move-as-copy`"). Congruent it was;
+                    // MARKER-EXACT it was not, and `record_green` refuses a flip at `-O` for
+                    // exactly that.
+                    //
+                    // The temp is declared at the callee's DECLARED input type, which the exact
+                    // arg-type check above has already proven equal to the forwarded place's own
+                    // type — so a mismatch is refused HERE rather than declared at a type built
+                    // does not use.
+                    let cf_plan = cx.mf_call_fwd_args();
+                    let cf_lits_plan = cx.mf_call_fwd_lits();
+                    let mut cf_temps: Vec<(ValueId, Local)> = Vec::new();
+                    let mut cf_lits: Vec<(ValueId, Local)> = Vec::new();
+                    // Trust (lane S1F): field temps minted WITHOUT a pair under the control.
+                    let mut cf_dropped: usize = 0;
+                    // Trust (lane S1F, unit statement): the statement's `()` temp — the call's
+                    // DESTINATION in the statement form, opened before every argument temp.
+                    let mut cf_unit: Option<Place<'tcx>> = None;
+                    // Trust (lane S1F, explicit-borrow pairs): the INNER locals, in operand
+                    // order, parallel to `cf_temps` for the pair arguments.
+                    let mut cf_inners: Vec<(ValueId, Local)> = Vec::new();
+                    // Trust (lane S1F, reborrowed return): the destination temp `d`, reborrowed
+                    // into `_0` at the successor head.
+                    let mut cf_ret: Option<Place<'tcx>> = None;
+                    // Trust (lane R53): the POST-OP destination temp `d`, opened before every
+                    // argument temp and retired after the post-op's own assign (which the
+                    // post-op node's own arm emits, one node later — hence the deferral).
+                    let mut cf_post: Option<Place<'tcx>> = None;
+                    if !cf_plan.is_empty() {
+                        // The plan's own grammar says the call writes the return place and its
+                        // successor holds nothing but the retirements. Re-checked here against the
+                        // EMITTER's decision rather than inherited from the plan: `route_to_ret`
+                        // is what puts every `StorageDead` at position 0 of that block, and
+                        // `predict_call_fwd` states that position unconditionally.
+                        //
+                        // Trust (lane R53): a POST-OP body is the ONE exception, and it is the
+                        // exact complement — the call writes a destination temp and the post-op
+                        // writes `_0`, which is why `predict_call_fwd` puts that one retirement
+                        // ONE assign in. The two are mutually exclusive by construction (the
+                        // plan sets `post` only when the call's result is NOT the returned
+                        // value) and the disjunction below is checked, not assumed.
+                        if !route_to_ret && cx.mf_call_fwd_post().is_none() {
+                            return unsup(
+                                "wave-CF: the planned call does not write the return place",
+                            );
+                        }
+                        if route_to_ret && cx.mf_call_fwd_post().is_some() {
+                            return unsup(
+                                "lane-R53: a post-op plan on a call the emitter routes to `_0`",
+                            );
+                        }
+                        // Trust (lane S1F, unit statement): built's `as_temp` for the
+                        // statement's value — `StorageLive(_2)` FIRST, at assign ordinal 0, and
+                        // the call writes `_2` rather than `_0`; the Return arm then spells the
+                        // unit body's own `_0 = const ()`. Under [`SatPerturb::CfUnitLate`] the
+                        // `StorageLive` is pushed AFTER the argument temps instead (below). The
+                        // callee must really return unit — the plan checked the trust-ir's
+                        // result arity; this re-checks the callee's rustc signature.
+                        if cx.mf_call_fwd_unit_stmt() {
+                            if !ret_rty_callee.is_unit() || !ret_rty.is_unit() {
+                                return unsup("lane-S1F: a unit-statement plan on a non-unit call");
+                            }
+                            let u = cx.temp(tcx.types.unit);
+                            if !cx.mf_call_fwd_unit_late()
+                                && !cx.mf_mark_call_fwd_unit(cur, u.local, true)
+                            {
+                                return unsup("lane-S1F: unit marker without a plan");
+                            }
+                            cf_unit = Some(u);
+                        }
+                        // Trust (lane S1F, reborrowed return): built's destination temp `d`,
+                        // declared at the callee's reference return — which the plan's grammar
+                        // and `route_to_ret` already proved is the body's own return type —
+                        // opened FIRST (measured, `probes/s1f.rs` {impl#6}::deref), or LAST
+                        // under [`SatPerturb::CfRetLate`] (below).
+                        if cx.mf_call_fwd_ret_reborrow() {
+                            if !matches!(ret_rty_callee.kind(), ty::Ref(_, _, m) if m.is_not())
+                                || ret_rty_callee != ret_rty
+                                || res.is_none()
+                            {
+                                return unsup(
+                                    "lane-S1F: a reborrowed-return plan on a call that does \
+                                     not return the body's shared reference",
+                                );
+                            }
+                            let d = cx.temp(ret_rty_callee);
+                            if !cx.mf_call_fwd_ret_late()
+                                && !cx.mf_mark_call_fwd_ret(cur, d.local, true)
+                            {
+                                return unsup("lane-S1F: ret marker without a plan");
+                            }
+                            cf_ret = Some(d);
+                        }
+                        // Trust (lane R53): built's post-op destination temp, declared at the
+                        // CALLEE's normalized return type — which is the type the post-op reads
+                        // and the type built declares the local at — opened FIRST (measured,
+                        // `probes/r53.rs` y1/y2/y6/y7), or LAST under
+                        // [`SatPerturb::CfPostLate`] (below). Three refusals keep it checked:
+                        // the call must declare a result (the post-op consumes it), the body
+                        // must NOT route that result to `_0` (routing is wave-CF's own grammar
+                        // and would leave the post-op with nothing to read), and the deferred
+                        // retirement slot must be free (one post-op per body, by the plan).
+                        if cx.mf_call_fwd_post().is_some() {
+                            if res.is_none() || route_to_ret || cx.cf_post_dead.is_some() {
+                                return unsup(
+                                    "lane-R53: a post-op plan on a call that does not leave a                                      consumable result",
+                                );
+                            }
+                            let d = cx.temp(ret_rty_callee);
+                            if !cx.mf_call_fwd_post_late()
+                                && !cx.mf_mark_call_fwd_post(cur, d.local, true)
+                            {
+                                return unsup("lane-R53: post marker without a plan");
+                            }
+                            cf_post = Some(d);
+                        }
+                        for (ai, a) in args.iter().enumerate() {
+                            if !cf_plan.iter().any(|(v, _)| v == a) {
+                                continue;
+                            }
+                            let Some(&want) = sig.inputs().get(ai) else {
+                                return unsup("wave-CF: a planned argument has no declared input");
+                            };
+                            // Trust (wave-CF-STR): a `&str` LITERAL argument. The wave-GH arm
+                            // above already folded the producer's chain into ONE
+                            // `Operand::Constant` typed at the callee's declared `&str`; built
+                            // instead spells TWO locals (`_5 = const "lit"; _4 = &(*_5)`), so
+                            // that constant is re-homed into the literal's own local and the
+                            // argument temp reborrows it — built's own two statements, in built's
+                            // order, on locals declared at built's own type.
+                            if cf_lits_plan.iter().any(|v| v == a) {
+                                if !matches!(want.kind(), ty::Ref(_, inner, _) if inner.is_str()) {
+                                    return unsup(
+                                        "wave-CF-STR: a planned `&str` argument's declared \
+                                         input is not `&str`",
+                                    );
+                                }
+                                let cst = match mir_args.get(ai).map(|s| &s.node) {
+                                    Some(Operand::Constant(c)) => c.clone(),
+                                    _ => {
+                                        return unsup(
+                                            "wave-CF-STR: a planned `&str` argument is not a \
+                                             constant operand",
+                                        );
+                                    }
+                                };
+                                let t = cx.temp(want);
+                                let u = cx.temp(want);
+                                // Trust (lane EM): the pair's LIVE order, swapped under
+                                // [`SatPerturb::CfLitOrder`] from the one `lit_swap` bit the
+                                // sealed plan carries — the same bit `predict_call_fwd` reads,
+                                // so the law stays green and only the ORACLE can refuse.
+                                let marked = if cx.mf_call_fwd_lit_swap() {
+                                    cx.mf_mark_call_fwd_lit(cur, *a, u.local, true)
+                                        && cx.mf_mark_call_fwd(cur, *a, t.local, true)
+                                } else {
+                                    cx.mf_mark_call_fwd(cur, *a, t.local, true)
+                                        && cx.mf_mark_call_fwd_lit(cur, *a, u.local, true)
+                                };
+                                if !marked {
+                                    return unsup("wave-CF: marker without a plan");
+                                }
+                                cx.assign(
+                                    cur,
+                                    u,
+                                    Rvalue::Use(Operand::Constant(cst), WithRetag::Yes),
+                                );
+                                cx.assign(
+                                    cur,
+                                    t,
+                                    Rvalue::Ref(
+                                        tcx.lifetimes.re_erased,
+                                        BorrowKind::Shared,
+                                        tcx.mk_place_deref(u),
+                                    ),
+                                );
+                                mir_args[ai].node = Operand::Move(t);
+                                cf_temps.push((*a, t.local));
+                                cf_lits.push((*a, u.local));
+                                continue;
+                            }
+                            let place = match mir_args.get(ai).map(|s| &s.node) {
+                                Some(Operand::Copy(p) | Operand::Move(p))
+                                    if p.projection.is_empty() =>
+                                {
+                                    *p
+                                }
+                                _ => {
+                                    return unsup(
+                                        "wave-CF: a planned argument is not a bare place",
+                                    );
+                                }
+                            };
+                            let got = cx.local_decls[place.local].ty;
+                            // Trust (lane S1F): a FIELD argument. The forwarded place is the
+                            // BASE pointer (`&S`), the callee wants the field's reference
+                            // (`&F`), and the borrow is rebuilt by wave-30's own reconstruction
+                            // — `&((*_p).k)` with `k` the unique offset-0 field of type `F` —
+                            // into a temp declared at `want`, exactly built's
+                            // `_2 = &((*_1).0: F)`. Three refusals keep it checked: a field
+                            // argument whose types already agree (the HIR said field, the MIR
+                            // says bare — a disagreement, not a shortcut); a reconstruction that
+                            // declines; and a reconstruction landing on any field but
+                            // DECLARED 0 (the HIR witnessed index 0 and the producer erases
+                            // only index 0, so anything else is a layout/declaration skew this
+                            // lane has not measured). Under [`SatPerturb::CfFieldDrop`] the
+                            // temp is minted and assigned WITHOUT its pair — the control's whole
+                            // content — and is then neither recorded for retirement nor counted
+                            // as marked.
+                            if cf_fields_plan.contains(a) || cf_pairs_plan.contains(a) {
+                                if tcx.erase_and_anonymize_regions(got)
+                                    == tcx.erase_and_anonymize_regions(want)
+                                {
+                                    return unsup(
+                                        "lane-S1F: a planned FIELD argument already has the \
+                                         callee's input type",
+                                    );
+                                }
+                                let Some(rv) = cx.try_reconstruct_interior_arg(place, got, want)
+                                else {
+                                    return unsup(
+                                        "lane-S1F: the planned field argument does not \
+                                         reconstruct as an offset-0 interior borrow",
+                                    );
+                                };
+                                let lands_on_field_zero = match &rv {
+                                    Rvalue::Ref(_, BorrowKind::Shared, fp) => matches!(
+                                        fp.projection.as_slice(),
+                                        [
+                                            rustc_middle::mir::ProjectionElem::Deref,
+                                            rustc_middle::mir::ProjectionElem::Field(k, _)
+                                        ] if *k == FieldIdx::ZERO && fp.local == place.local
+                                    ),
+                                    _ => false,
+                                };
+                                if !lands_on_field_zero {
+                                    return unsup(
+                                        "lane-S1F: the reconstructed field borrow is not \
+                                         `&((*_p).0)`",
+                                    );
+                                }
+                                // Trust (lane S1F, explicit-borrow pair): built's TWO locals
+                                // — `live t; live u; u = &((*_p).0: F); t = &(*u)` — the
+                                // reconstructed borrow into the INNER local and the argument
+                                // temp reborrowing it, both declared at the callee's input
+                                // type (measured verbatim, `probes/s1f.rs` {impl#16}::cmp).
+                                if cf_pairs_plan.contains(a) {
+                                    let t = cx.temp(want);
+                                    let u = cx.temp(want);
+                                    if !cx.mf_mark_call_fwd(cur, *a, t.local, true)
+                                        || !cx.mf_mark_call_fwd_inner(cur, *a, u.local, true)
+                                    {
+                                        return unsup("lane-S1F: pair marker without a plan");
+                                    }
+                                    cx.assign(cur, u, rv);
+                                    cx.assign(
+                                        cur,
+                                        t,
+                                        Rvalue::Ref(
+                                            tcx.lifetimes.re_erased,
+                                            BorrowKind::Shared,
+                                            tcx.mk_place_deref(u),
+                                        ),
+                                    );
+                                    mir_args[ai].node = Operand::Move(t);
+                                    cf_temps.push((*a, t.local));
+                                    cf_inners.push((*a, u.local));
+                                    continue;
+                                }
+                                let t = cx.temp(want);
+                                if cx.mf_call_fwd_marks_pair(*a) {
+                                    if !cx.mf_mark_call_fwd(cur, *a, t.local, true) {
+                                        return unsup("wave-CF: marker without a plan");
+                                    }
+                                    cf_temps.push((*a, t.local));
+                                } else {
+                                    cf_dropped += 1;
+                                }
+                                cx.assign(cur, t, rv);
+                                mir_args[ai].node = Operand::Move(t);
+                                continue;
+                            }
+                            if tcx.erase_and_anonymize_regions(got)
+                                != tcx.erase_and_anonymize_regions(want)
+                            {
+                                return unsup(
+                                    "wave-CF: a planned argument is not already the callee's \
+                                     input type",
+                                );
+                            }
+                            let rv = match want.kind() {
+                                ty::Ref(_, _, m) => Rvalue::Ref(
+                                    tcx.lifetimes.re_erased,
+                                    if m.is_mut() {
+                                        BorrowKind::Mut {
+                                            kind: rustc_middle::mir::MutBorrowKind::Default,
+                                        }
+                                    } else {
+                                        BorrowKind::Shared
+                                    },
+                                    tcx.mk_place_deref(place),
+                                ),
+                                _ => Rvalue::Use(Operand::Copy(place), WithRetag::Yes),
+                            };
+                            let t = cx.temp(want);
+                            if !cx.mf_mark_call_fwd(cur, *a, t.local, true) {
+                                return unsup("wave-CF: marker without a plan");
+                            }
+                            cx.assign(cur, t, rv);
+                            mir_args[ai].node = Operand::Move(t);
+                            cf_temps.push((*a, t.local));
+                        }
+                        if cf_temps.len() + cf_dropped != cf_plan.len() {
+                            return unsup(
+                                "wave-CF: the plan names an argument this call does not pass",
+                            );
+                        }
+                        if let Some(u) = cf_unit {
+                            if cx.mf_call_fwd_unit_late()
+                                && !cx.mf_mark_call_fwd_unit(cur, u.local, true)
+                            {
+                                return unsup("lane-S1F: unit marker without a plan");
+                            }
+                        }
+                        if let Some(d) = cf_ret {
+                            if cx.mf_call_fwd_ret_late()
+                                && !cx.mf_mark_call_fwd_ret(cur, d.local, true)
+                            {
+                                return unsup("lane-S1F: ret marker without a plan");
+                            }
+                        }
+                        // Trust (lane R53): under [`SatPerturb::CfPostLate`] the post-op
+                        // destination temp is opened HERE instead — after every argument temp —
+                        // from the one `post_late` bit the sealed plan carries, the same bit
+                        // `predict_call_fwd` reads.
+                        if let Some(d) = cf_post {
+                            if cx.mf_call_fwd_post_late()
+                                && !cx.mf_mark_call_fwd_post(cur, d.local, true)
+                            {
+                                return unsup("lane-R53: post marker without a plan");
+                            }
+                        }
+                    }
+                    // Trust (lane SC, 2026-08-24): **THE STATEMENT-CALL SEQUENCE'S OWN GROUP,
+                    // IN BUILT'S SPELLING.** Outside the plan `mf_seq_call()` is `None` and every
+                    // line below is skipped, so the arm is byte-identical to what it was.
+                    //
+                    // Under the plan this emits, for THIS call and only this call, built's own
+                    // `StorageLive(u)` for the statement's `()` value and then, per planned
+                    // argument in operand order, `StorageLive(t); t = &[mut](*_p)` (a reference
+                    // argument) or `StorageLive(t); t = copy _p` (a by-value scalar) — the same
+                    // per-argument spelling wave-CF emits, one group at a time. The `()` temp is
+                    // the call's DESTINATION, exactly as in lane S1F's one-call form: built writes
+                    // the call there and the unit body's own `_0 = const ()` follows at the end.
+                    let mut seq_unit: Option<Place<'tcx>> = None;
+                    let mut seq_temps: Vec<(ValueId, Local)> = Vec::new();
+                    let mut seq_gi: Option<usize> = None;
+                    if let Some(sp) = cx.mf_seq_call() {
+                        if let Some((gi, g)) = sp.group_at(i) {
+                            // The callee really returns unit and the body really returns unit —
+                            // the plan checked the trust-ir's result arity; this re-checks the
+                            // rustc signature, so the `()` destination is type-exact rather than
+                            // assumed. A result-bearing call cannot reach here (the plan refuses
+                            // one), and `res` is re-checked so a plan/emitter disagreement is
+                            // unsup rather than a half-marked body.
+                            if !ret_rty_callee.is_unit() || !ret_rty.is_unit() || res.is_some() {
+                                return unsup(
+                                    "lane-SC: a sequence plan on a call that is not a unit \
+                                     statement",
+                                );
+                            }
+                            let u = cx.temp(tcx.types.unit);
+                            if !cx.mf_seq_unit_late()
+                                && !cx.mf_mark_seq_unit(cur, gi, u.local, true)
+                            {
+                                return unsup("lane-SC: unit marker without a plan");
+                            }
+                            if args.len() != g.args.len()
+                                || args.iter().zip(g.args.iter()).any(|(a, (v, _))| a != v)
+                            {
+                                return unsup("lane-SC: the plan's arguments are not the call's");
+                            }
+                            for (ai, (a, _)) in g.args.iter().enumerate() {
+                                let Some(&want) = sig.inputs().get(ai) else {
+                                    return unsup(
+                                        "lane-SC: a planned argument has no declared input",
+                                    );
+                                };
+                                let place = match mir_args.get(ai).map(|s| &s.node) {
+                                    Some(Operand::Copy(p) | Operand::Move(p))
+                                        if p.projection.is_empty() =>
+                                    {
+                                        *p
+                                    }
+                                    _ => {
+                                        return unsup(
+                                            "lane-SC: a planned argument is not a bare place",
+                                        );
+                                    }
+                                };
+                                // The temp is declared at the callee's DECLARED input type, which
+                                // must already be the forwarded place's own type — the source
+                                // side witnessed a BARE place, so there is no coercion to
+                                // reconstruct and a mismatch is refused HERE rather than declared
+                                // at a type built does not use.
+                                let got = cx.local_decls[place.local].ty;
+                                if tcx.erase_and_anonymize_regions(got)
+                                    != tcx.erase_and_anonymize_regions(want)
+                                {
+                                    return unsup(
+                                        "lane-SC: a planned argument is not already the callee's \
+                                         input type",
+                                    );
+                                }
+                                let rv = match want.kind() {
+                                    ty::Ref(_, _, m) => Rvalue::Ref(
+                                        tcx.lifetimes.re_erased,
+                                        if m.is_mut() {
+                                            BorrowKind::Mut {
+                                                kind: rustc_middle::mir::MutBorrowKind::Default,
+                                            }
+                                        } else {
+                                            BorrowKind::Shared
+                                        },
+                                        tcx.mk_place_deref(place),
+                                    ),
+                                    _ => Rvalue::Use(Operand::Copy(place), WithRetag::Yes),
+                                };
+                                let t = cx.temp(want);
+                                if !cx.mf_mark_seq_arg(cur, gi, *a, t.local, true) {
+                                    return unsup("lane-SC: marker without a plan");
+                                }
+                                cx.assign(cur, t, rv);
+                                mir_args[ai].node = Operand::Move(t);
+                                seq_temps.push((*a, t.local));
+                            }
+                            // Trust (lane SC): under [`SatPerturb::SeqUnitLate`] the `()` temp is
+                            // opened HERE instead — after every argument temp — from the one
+                            // `unit_late` bit the sealed plan carries, the same bit
+                            // `predict_seq_call` reads.
+                            if cx.mf_seq_unit_late() && !cx.mf_mark_seq_unit(cur, gi, u.local, true)
+                            {
+                                return unsup("lane-SC: unit marker without a plan");
+                            }
+                            seq_unit = Some(u);
+                            seq_gi = Some(gi);
+                        }
+                    }
+                    // Trust (lane G17, 2026-08-25): **THE DEEP UNIT CHAIN'S WHOLE TEMP SET, IN
+                    // BUILT'S SPELLING.** Outside the plan `mf_unit_chain()` is `None` and every
+                    // line below is skipped, so the arm is byte-identical to what it was.
+                    //
+                    // Every temp of every call is minted HERE, at the FIRST call's node, because
+                    // built opens all of them in block 0 before the innermost call's terminator
+                    // splits it (measured verbatim, `probes/g17.rs::c9::{closure#0}` — see
+                    // [`MfUnitChainPlan`] for the dump). The opening run is the outermost call's
+                    // operands descending inward, and the per-argument spelling is wave-CF's
+                    // verbatim: `StorageLive(t); t = &[mut](*_p)` for a forwarded reference,
+                    // nothing at all for a folded literal, and for a chain operand ONE
+                    // `StorageLive` on a temp that the PRODUCING call then writes.
+                    let mut uc_ci: Option<usize> = None;
+                    if let Some(up) = cx.mf_unit_chain() {
+                        if let Some((ci, _)) = up.call_at(i) {
+                            if ci == 0 {
+                                if !cx.uc_temps.is_empty() || cx.uc_unit.is_some() {
+                                    return unsup("lane G17: a second deep unit chain in one body");
+                                }
+                                let mut temps: Vec<Vec<Option<Place<'tcx>>>> =
+                                    up.calls.iter().map(|c| vec![None; c.args.len()]).collect();
+                                // The statement's `()` temp, FIRST — or LAST under
+                                // [`SatPerturb::UcUnitLate`], from the one `unit_late` bit the
+                                // sealed plan carries, the same bit `predict_unit_chain` reads.
+                                let unit = if up.unit_stmt {
+                                    let u = cx.temp(tcx.types.unit);
+                                    if !cx.mf_uc_unit_late()
+                                        && !cx.mf_mark_uc_unit(cur, u.local, true)
+                                    {
+                                        return unsup("lane G17: unit marker without a plan");
+                                    }
+                                    Some(u)
+                                } else {
+                                    None
+                                };
+                                for (k, c) in up.calls.iter().enumerate().rev() {
+                                    for (pos, op) in c.args.iter().enumerate() {
+                                        match op {
+                                            UcOperand::Place(v, _) => {
+                                                let Some(&place) = cx.fwd_ptr_params.get(v) else {
+                                                    return unsup(
+                                                        "lane G17: a Place operand outside the \
+                                                         forwarded params",
+                                                    );
+                                                };
+                                                let pty = cx.local_decls[place.local].ty;
+                                                let ty::Ref(_, _, m) = pty.kind() else {
+                                                    return unsup(
+                                                        "lane G17: a Place operand that is not a \
+                                                         reference",
+                                                    );
+                                                };
+                                                let t = cx.temp(pty);
+                                                if !cx.mf_mark_uc_arg(cur, k, pos, t.local, true) {
+                                                    return unsup(
+                                                        "lane G17: marker without a plan",
+                                                    );
+                                                }
+                                                cx.assign(
+                                                    cur,
+                                                    t,
+                                                    Rvalue::Ref(
+                                                        tcx.lifetimes.re_erased,
+                                                        if m.is_mut() {
+                                                            BorrowKind::Mut {
+                                                                kind:
+                                                                    rustc_middle::mir::MutBorrowKind::Default,
+                                                            }
+                                                        } else {
+                                                            BorrowKind::Shared
+                                                        },
+                                                        tcx.mk_place_deref(place),
+                                                    ),
+                                                );
+                                                temps[k][pos] = Some(t);
+                                            }
+                                            // The temp IS the PRODUCING call's destination, so it
+                                            // is declared at that callee's DECLARED return type,
+                                            // read from the producer's own function-type table
+                                            // through the shim's own scalar denotation. The
+                                            // producing call re-checks it against `ret_rty_callee`
+                                            // below, so a producer/rustc disagreement is `unsup`
+                                            // rather than a local declared at a type built does
+                                            // not use.
+                                            UcOperand::Chain(_) => {
+                                                let Some(prev) =
+                                                    k.checked_sub(1).and_then(|j| up.calls.get(j))
+                                                else {
+                                                    return unsup(
+                                                        "lane G17: a chain operand at the first \
+                                                         call",
+                                                    );
+                                                };
+                                                let Some(rt) = prev.ret_ty.as_ref() else {
+                                                    return unsup(
+                                                        "lane G17: a chain operand without a \
+                                                         declared return type",
+                                                    );
+                                                };
+                                                let Some(rty) = scalar_rustc_ty(tcx, rt) else {
+                                                    return unsup(
+                                                        "lane G17: a chain operand's declared \
+                                                         return type is outside the denotation",
+                                                    );
+                                                };
+                                                let t = cx.temp(rty);
+                                                if !cx.mf_mark_uc_arg(cur, k, pos, t.local, true) {
+                                                    return unsup(
+                                                        "lane G17: marker without a plan",
+                                                    );
+                                                }
+                                                temps[k][pos] = Some(t);
+                                            }
+                                            // A folded scalar literal: built spells it inline and
+                                            // mints no local, so there is nothing to open and the
+                                            // slot stays `None` on both sides of the law.
+                                            UcOperand::Lit(_) => {}
+                                        }
+                                    }
+                                }
+                                if let Some(u) = unit {
+                                    if cx.mf_uc_unit_late()
+                                        && !cx.mf_mark_uc_unit(cur, u.local, true)
+                                    {
+                                        return unsup("lane G17: unit marker without a plan");
+                                    }
+                                }
+                                cx.uc_temps = temps;
+                                cx.uc_unit = unit;
+                            }
+                            uc_ci = Some(ci);
+                        }
+                    }
+                    // Trust (lane G17): THIS call's own operands. A `Place` operand is moved out
+                    // of its pre-minted temp (built's `move _4`); a `Chain` operand needs no
+                    // rewrite at all, because the PRODUCING call's destination IS that temp and
+                    // the shim's own `env` binding already resolves the value to it; a `Lit`
+                    // operand is already the inline constant the wave-GH arm folded.
+                    let mut uc_dest: Option<Place<'tcx>> = None;
+                    if let (Some(ci), Some(up)) = (uc_ci, cx.mf_unit_chain()) {
+                        let Some(c) = up.calls.get(ci) else {
+                            return unsup("lane G17: a planned call index outside the plan");
+                        };
+                        if args.len() != c.args.len() {
+                            return unsup("lane G17: the plan's arity is not the call's");
+                        }
+                        for (pos, op) in c.args.iter().enumerate() {
+                            let UcOperand::Place(..) = op else { continue };
+                            let Some(t) =
+                                cx.uc_temps.get(ci).and_then(|v| v.get(pos)).copied().flatten()
+                            else {
+                                return unsup("lane G17: a Place operand without a minted temp");
+                            };
+                            let Some(&want) = sig.inputs().get(pos) else {
+                                return unsup("lane G17: a planned argument has no declared input");
+                            };
+                            // The temp was declared at the forwarded parameter's own type; the
+                            // source side witnessed a BARE place, so there is no coercion to
+                            // reconstruct and a mismatch is refused HERE rather than moved into a
+                            // call whose input it is not.
+                            let got = cx.local_decls[t.local].ty;
+                            if tcx.erase_and_anonymize_regions(got)
+                                != tcx.erase_and_anonymize_regions(want)
+                            {
+                                return unsup(
+                                    "lane G17: a minted temp is not the callee's input type",
+                                );
+                            }
+                            let Some(slot) = mir_args.get_mut(pos) else {
+                                return unsup("lane G17: a planned argument has no operand");
+                            };
+                            slot.node = Operand::Move(t);
+                        }
+                        // The DESTINATION. A non-final call writes the NEXT call's chain temp —
+                        // built's own local, minted above — and the FINAL call writes the
+                        // statement's `()` temp in the `Semi` spelling, or `_0` in the tail
+                        // spelling (which `route_to_ret` already selects).
+                        match up.calls.get(ci + 1) {
+                            Some(next) => {
+                                let Some(pos) =
+                                    next.args.iter().position(|a| matches!(a, UcOperand::Chain(_)))
+                                else {
+                                    return unsup("lane G17: a non-final call with no consumer");
+                                };
+                                let Some(t) = cx
+                                    .uc_temps
+                                    .get(ci + 1)
+                                    .and_then(|v| v.get(pos))
+                                    .copied()
+                                    .flatten()
+                                else {
+                                    return unsup("lane G17: a chain operand without a temp");
+                                };
+                                // The temp was declared from the PRODUCER's annotation of this
+                                // callee's return; rustc's own answer must agree, or the local is
+                                // declared at a type built does not use.
+                                if tcx.erase_and_anonymize_regions(cx.local_decls[t.local].ty)
+                                    != tcx.erase_and_anonymize_regions(ret_rty_callee)
+                                {
+                                    return unsup(
+                                        "lane G17: a chain temp is not the callee's return type",
+                                    );
+                                }
+                                if res.is_none() {
+                                    return unsup(
+                                        "lane G17: a non-final chain call with no result",
+                                    );
+                                }
+                                uc_dest = Some(t);
+                            }
+                            None => {
+                                // The FINAL call really returns unit and really is the routed one
+                                // — the plan checked the trust-ir's result arity and its
+                                // value-less `Return`; this re-checks the rustc signature and the
+                                // emitter's own routing decision.
+                                if !ret_rty_callee.is_unit()
+                                    || !ret_rty.is_unit()
+                                    || res.is_some()
+                                    || !route_to_ret
+                                {
+                                    return unsup(
+                                        "lane G17: a deep unit chain whose final call is not a \
+                                         routed unit statement",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Trust (lane G21): **SITE 2 — THE ARGUMENT TEMPS, IN BUILT'S SPELLING.**
+                    // Each argument takes a temp, in argument order, interleaved with its own
+                    // assign: `live(t); t = &[mut](*_p)` for a reference parameter, `t = copy _p`
+                    // for a by-value one. That is the CF/lane-SC per-argument emission verbatim,
+                    // and it is what built spells (`bb0: StorageLive(_6); _6 = &(*_1); …`,
+                    // measured on `probes/g25.rs::V::a1`). A plan/emitter disagreement at any
+                    // point is `unsup` — the body ships built's MIR, never a half-marked one.
+                    if let Some(role) = bc_role {
+                        let want_args = cx.mf_bc_args(role);
+                        if args.len() != want_args.len()
+                            || args.iter().zip(want_args.iter()).any(|(a, (v, _))| a != v)
+                        {
+                            return unsup("lane G21: the plan's arguments are not the call's");
+                        }
+                        for ai in 0..want_args.len() {
+                            let Some(&want) = sig.inputs().get(ai) else {
+                                return unsup("lane G21: a planned argument has no declared input");
+                            };
+                            let place = match mir_args.get(ai).map(|s| &s.node) {
+                                Some(Operand::Copy(p) | Operand::Move(p))
+                                    if p.projection.is_empty() =>
+                                {
+                                    *p
+                                }
+                                _ => {
+                                    return unsup(
+                                        "lane G21: a planned argument is not a bare place",
+                                    );
+                                }
+                            };
+                            // The temp is declared at the callee's DECLARED input type, which must
+                            // already be the forwarded place's own type — the plan witnessed a
+                            // BARE block parameter, so there is no coercion to reconstruct and a
+                            // mismatch is refused HERE rather than declared at a type built does
+                            // not use.
+                            let got = cx.local_decls[place.local].ty;
+                            if tcx.erase_and_anonymize_regions(got)
+                                != tcx.erase_and_anonymize_regions(want)
+                            {
+                                return unsup(
+                                    "lane G21: a planned argument is not already the callee's \
+                                     input type",
+                                );
+                            }
+                            let rv = match want.kind() {
+                                ty::Ref(_, _, m) => Rvalue::Ref(
+                                    tcx.lifetimes.re_erased,
+                                    if m.is_mut() {
+                                        BorrowKind::Mut {
+                                            kind: rustc_middle::mir::MutBorrowKind::Default,
+                                        }
+                                    } else {
+                                        BorrowKind::Shared
+                                    },
+                                    tcx.mk_place_deref(place),
+                                ),
+                                _ => Rvalue::Use(Operand::Copy(place), WithRetag::Yes),
+                            };
+                            let t = cx.temp(want);
+                            cx.mf_mark_operand(cur, t.local);
+                            cx.assign(cur, t, rv);
+                            mir_args[ai].node = Operand::Move(t);
+                            bc_temps.push(t.local);
+                        }
+                    }
+                    // Trust (wave-WB8): **THE CHAIN CALL'S OWN OPERANDS, IN BUILT'S SPELLING.**
+                    // At an INNER node: this call's arguments are the plan's parameter
+                    // forwards — mint each one's temp (`live(w); w = &[mut](*_p)`) and move it
+                    // in, exactly the CF per-argument emission. At the FINAL node: every
+                    // argument temp already exists (minted at its evaluation point); replace
+                    // each operand with its temp's move. A plan/emitter disagreement at any
+                    // point is unsup — the body ships built's MIR, never a half-marked one.
+                    let mut chain_inner_deads: Vec<(ValueId, Local)> = Vec::new();
+                    if let Some(cp) = &chain_plan {
+                        if let Some(pos) = chain_pos {
+                            let Some(k) = cp.inners.iter().position(|(n, _)| *n == i) else {
+                                return unsup("wave-WB8: inner role lost its plan entry");
+                            };
+                            let (_, iargs) = &cp.inners[k];
+                            if args.len() != iargs.len()
+                                || args.iter().zip(iargs).any(|(a, (v, _))| a != v)
+                            {
+                                return unsup(
+                                    "wave-WB8: the plan's inner arguments are not the call's",
+                                );
+                            }
+                            for (ai, (v, _)) in iargs.iter().enumerate() {
+                                let place = match mir_args.get(ai).map(|s| &s.node) {
+                                    Some(Operand::Copy(p) | Operand::Move(p))
+                                        if p.projection.is_empty() =>
+                                    {
+                                        *p
+                                    }
+                                    _ => {
+                                        return unsup(
+                                            "wave-WB8: an inner argument is not a bare place",
+                                        );
+                                    }
+                                };
+                                let pty = cx.local_decls[place.local].ty;
+                                let ty::Ref(_, _, m) = pty.kind() else {
+                                    return unsup(
+                                        "wave-WB8: an inner argument that is not a reference",
+                                    );
+                                };
+                                let t = cx.temp(pty);
+                                if !cx.mf_mark_chain_inner(cur, *v, t.local, true) {
+                                    return unsup("wave-WB8: marker without a plan");
+                                }
+                                cx.assign(
+                                    cur,
+                                    t,
+                                    Rvalue::Ref(
+                                        tcx.lifetimes.re_erased,
+                                        if m.is_mut() {
+                                            BorrowKind::Mut {
+                                                kind: rustc_middle::mir::MutBorrowKind::Default,
+                                            }
+                                        } else {
+                                            BorrowKind::Shared
+                                        },
+                                        tcx.mk_place_deref(place),
+                                    ),
+                                );
+                                mir_args[ai].node = Operand::Move(t);
+                                chain_inner_deads.push((*v, t.local));
+                            }
+                            let _ = pos;
+                        } else if chain_final {
+                            if !route_to_ret {
+                                return unsup(
+                                    "wave-WB8: the planned final call does not write the \
+                                     return place",
+                                );
+                            }
+                            for (ai, s) in cp.slots.iter().enumerate() {
+                                let Some(t) = cx.chain_arg_temps[ai] else {
+                                    return unsup(
+                                        "wave-WB8: a final argument temp was never minted",
+                                    );
+                                };
+                                let v = match s {
+                                    ChainSlot::Place(v, _)
+                                    | ChainSlot::ByValue(v)
+                                    | ChainSlot::Reborrow(v) => *v,
+                                };
+                                match args.get(ai) {
+                                    Some(a) if *a == v => {}
+                                    _ => {
+                                        return unsup(
+                                            "wave-WB8: the plan's slots are not the final \
+                                             call's arguments",
+                                        );
+                                    }
+                                }
+                                let Some(&want) = sig.inputs().get(ai) else {
+                                    return unsup("wave-WB8: a planned slot has no declared input");
+                                };
+                                let got = cx.local_decls[t.local].ty;
+                                if tcx.erase_and_anonymize_regions(got)
+                                    != tcx.erase_and_anonymize_regions(want)
+                                {
+                                    return unsup(
+                                        "wave-WB8: a minted temp is not the callee's input \
+                                         type",
+                                    );
+                                }
+                                mir_args[ai].node = Operand::Move(t);
+                            }
+                        }
+                    }
                     // Trust (wave-DR): a unit's destinations are minted by the plan — the
                     // accessor writes the MARKED `dref` temp and the `&&` head's predicate writes
                     // the MARKED condition temp — so both the route-to-return shortcut and the
                     // fresh temp stand aside for it. Outside the plan `dr_dest` is `None` and this
                     // is the pre-wave expression verbatim.
-                    let dest = match dr_dest {
-                        Some(p) => p,
-                        None if route_to_ret => Place::from(rustc_middle::mir::RETURN_PLACE),
-                        None => cx.temp(ret_rty_callee),
+                    //
+                    // Trust (wave-WB8): an INNER chain call's destination was minted in the
+                    // pre-step (the ByValue argument temp, or the Reborrow in-transit local),
+                    // so it takes precedence exactly as `mc_dest` does; the plans are
+                    // mutually exclusive in `MfPlans::seal`, so at most one of the four is
+                    // ever `Some` (lane S3's aggregate-of-call-results destination is the
+                    // fourth, minted in its own pre-step above).
+                    let dest = match (dr_dest, mc_dest, chain_dest, agg_dest) {
+                        (Some(p), _, _, _) => p,
+                        // Trust (wave-MC): the class's destination temp was minted above, before
+                        // the argument temps, so that its `StorageLive` precedes theirs. It is
+                        // present exactly when the plan owns this call AND the result is not
+                        // routed; a routed one falls through to the RETURN_PLACE arm below, which
+                        // is what built writes too.
+                        (None, Some(p), _, _) => p,
+                        (None, None, Some(p), _) => p,
+                        (None, None, None, Some(p)) => p,
+                        (None, None, None, None) if route_to_ret => {
+                            Place::from(rustc_middle::mir::RETURN_PLACE)
+                        }
+                        // Trust (lane R53): the post-op class's destination was minted ABOVE,
+                        // before the argument temps, so that its `StorageLive` precedes theirs
+                        // — exactly as wave-MC's and lane S1F's are. Taking it here rather than
+                        // minting a second temp is what keeps the local set built's.
+                        // Trust (lane SC): a sequence call that is NOT the body's last has no
+                        // `Return` after it, so `route_to_ret` is false and the arm would mint a
+                        // destination temp built does not have. The group's own `()` temp — minted
+                        // above, before its argument temps — IS built's destination, so it is
+                        // taken here rather than a second temp being invented. Outside the class
+                        // `seq_unit` is `None` and this arm is byte-identical to its pre-lane form.
+                        // Trust (lane G21): the class's destination temp was minted ABOVE,
+                        // before the argument temps, so that its `StorageLive` precedes theirs —
+                        // exactly as wave-MC's and lane R53's are. Taking it here rather than
+                        // minting a second temp is what keeps the local set built's.
+                        // Trust (lane G17): a deep unit-chain call that is NOT the body's last
+                        // has no `Return` after it, so `route_to_ret` is false and the arm would
+                        // mint a destination temp built does not have. The NEXT call's chain
+                        // operand temp — minted above, in built's own opening run — IS built's
+                        // destination, so it is taken here rather than a second temp being
+                        // invented. Outside the class `uc_dest` is `None` and this arm is
+                        // byte-identical to its pre-lane form.
+                        (None, None, None, None) => {
+                            match cf_post.or(seq_unit).or(bc_dest).or(uc_dest) {
+                                Some(p) => p,
+                                None => cx.temp(ret_rty_callee),
+                            }
+                        }
                     };
+                    // Trust (lane S1F, unit statement): the statement's `()` temp IS the
+                    // destination — built writes the call there and `_0 = const ()` after.
+                    // Trust (lane SC): the same for every group of a statement-call SEQUENCE; the
+                    // body's LAST group is also a `route_to_ret` call, and its `()` temp must win
+                    // over the return place for the same reason lane S1F's does.
+                    // Trust (lane G17): the same for the deep unit chain's FINAL call in the
+                    // `Semi` spelling — its `()` temp, minted before every argument temp, must
+                    // win over the return place for the reason lane S1F's does. In the tail
+                    // spelling `uc_unit` is `None` and `route_to_ret` has already chosen `_0`.
+                    let uc_final_unit = uc_ci
+                        .filter(|ci| cx.mf_unit_chain().is_some_and(|p| ci + 1 == p.calls.len()))
+                        .and_then(|_| cx.uc_unit);
+                    let dest = cf_unit.or(cf_ret).or(seq_unit).or(uc_final_unit).unwrap_or(dest);
                     // Trust (wave-C): spell the SITE identity `FnDef(site_def_id, site_args)` — exactly
                     // what built MIR writes. For a zero-generic callee this is `FnDef(def_id, [])` (the
                     // wave-6 spelling, byte-identical). The comparator's `raw_call_channel` re-verifies
@@ -11806,8 +21478,262 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             fn_span: cx.source_info.span,
                         },
                     )?;
+                    // Trust (wave-MC): SITE 3 — the retirement run, at the HEAD of the call's
+                    // successor block, in REVERSE creation order. That is rule 3 of the class
+                    // (`probes/mc_call.rs::q1`, `::q2`) and it is the SAME scope-exit order
+                    // `mf_retire` uses after an ordinary consuming assign; the only difference is
+                    // where it lands, which is why it goes through lane K's cross-block
+                    // `mf_retire_at` rather than through a new emission method. `mf_retire_at`
+                    // answers `false` outside the operand class, and the plan sets that class, so
+                    // a call the plan does not own can never reach a marker here.
+                    if mc_site && !mc_deads.is_empty() {
+                        let order: Vec<Local> = mc_deads.iter().rev().copied().collect();
+                        if !cx.mf_retire_at(succ, &order) {
+                            return unsup("wave-MC: retirement without a plan");
+                        }
+                    }
+                    // Trust (lane G21): **SITE 3 — THE RETIREMENT RUNS, AT BUILT'S OWN POSITIONS.**
+                    // The HEAD call's argument temps are the CONDITION's operand temps: their
+                    // region scope is the condition expression, which built exits on EACH outgoing
+                    // edge, so built retires them at the ENTRY of BOTH arms and not at this call's
+                    // successor (measured verbatim: `bb2:`/`bb4:` each open with
+                    // `StorageDead(_9); StorageDead(_8); StorageDead(_7); StorageDead(_6);`). That
+                    // split is lane K's `mf_defer_deads` path, reached here so there is exactly
+                    // one implementation of it — and so `-Ztrust-sat-perturb=marker-arm` reaches
+                    // this class too. The RHS arm's call is an ordinary call and its temps retire
+                    // at its own successor in reverse order, which is wave-MC's rule 3.
+                    if let Some(role) = bc_role {
+                        match role {
+                            BcRole::Head => {
+                                cx.mf_defer_deads = true;
+                                cx.mf_retire(succ, &bc_temps);
+                            }
+                            BcRole::Rhs => {
+                                // Trust (lane G21): under [`SatPerturb::G21RetOrder`] this run
+                                // goes FORWARD instead — from the one `ret_swap` bit the sealed
+                                // plan carries, the same bit `predict_bc` reads, so the law stays
+                                // green and the frozen ORACLE is what must reject it.
+                                let order: Vec<Local> = if cx.mf_bc_ret_swap() {
+                                    bc_temps.clone()
+                                } else {
+                                    bc_temps.iter().rev().copied().collect()
+                                };
+                                if !order.is_empty() && !cx.mf_retire_at(succ, &order) {
+                                    return unsup("lane G21: retirement without a plan");
+                                }
+                            }
+                        }
+                    }
                     if let Some(res) = res {
                         cx.env.insert(res, VOp::Plc(dest));
+                    }
+                    // Trust (lane S1F, reborrowed return): `_0 = &(*d)` is the successor's
+                    // FIRST statement, before any retirement (measured verbatim,
+                    // `probes/s1f.rs` {impl#6}::deref: `bb1: _0 = &(*_2); dead _3; dead _2;
+                    // return`). The result is then re-bound to bare `_0`, so the Return arm
+                    // emits only the terminator — exactly as for a routed call.
+                    if let Some(d) = cf_ret {
+                        cx.assign(
+                            succ,
+                            Place::from(rustc_middle::mir::RETURN_PLACE),
+                            Rvalue::Ref(
+                                tcx.lifetimes.re_erased,
+                                BorrowKind::Shared,
+                                tcx.mk_place_deref(d),
+                            ),
+                        );
+                        match res {
+                            Some(r) => {
+                                cx.env.insert(
+                                    r,
+                                    VOp::Plc(Place::from(rustc_middle::mir::RETURN_PLACE)),
+                                );
+                            }
+                            None => return unsup("lane-S1F: a reborrowed return without a result"),
+                        }
+                    }
+                    // Trust (wave-CF): built retires the argument temps at the ENTRY of the
+                    // call's successor, in REVERSE operand order — the `as_temp` scope-exit
+                    // order (measured, `-Zdump-mir=built`: `bb1: StorageDead(_6);
+                    // StorageDead(_5); StorageDead(_4); return;`).
+                    // Trust (lane S1F, explicit-borrow pairs): under the edition-2024 rule the
+                    // pair retires INNER-then-OUTER per argument, in reverse argument order
+                    // (`dead u_2; dead t_2; dead u_1; dead t_1`, measured verbatim on the derived
+                    // `Ord::cmp`); under [`SatPerturb::CfPairOrder`] the measured 2021 order is
+                    // used instead — every argument temp, then every inner local — from the one
+                    // `pair_swap` bit the sealed plan carries.
+                    let cf_pair_swap = cx.mf_call_fwd_pair_swap();
+                    for (a, l) in cf_temps.iter().rev() {
+                        if !cf_pair_swap {
+                            if let Some((_, u)) = cf_inners.iter().find(|(x, _)| x == a) {
+                                if !cx.mf_mark_call_fwd_inner(succ, *a, *u, false) {
+                                    return unsup("lane-S1F: pair retirement without a plan");
+                                }
+                            }
+                        }
+                        if !cx.mf_mark_call_fwd(succ, *a, *l, false) {
+                            return unsup("wave-CF: retirement without a plan");
+                        }
+                    }
+                    if cf_pair_swap {
+                        for (a, u) in cf_inners.iter().rev() {
+                            if !cx.mf_mark_call_fwd_inner(succ, *a, *u, false) {
+                                return unsup("lane-S1F: pair retirement without a plan");
+                            }
+                        }
+                    }
+                    // Trust (lane SC): the sequence group's retirement, at the ENTRY of THIS
+                    // call's successor — the argument temps in REVERSE operand order, then the
+                    // `()` temp LAST (measured verbatim, `probes/sc.rs` n3_mut:
+                    // `bb1: StorageDead(_3); StorageDead(_2); StorageLive(_4); …`). The NEXT
+                    // group's opens then follow in the SAME block, which is the whole reason the
+                    // two runs share an assign ordinal on both sides of the law.
+                    if let (Some(gi), Some(u)) = (seq_gi, seq_unit) {
+                        for (a, l) in seq_temps.iter().rev() {
+                            if !cx.mf_mark_seq_arg(succ, gi, *a, *l, false) {
+                                return unsup("lane-SC: retirement without a plan");
+                            }
+                        }
+                        if !cx.mf_mark_seq_unit(succ, gi, u.local, false) {
+                            return unsup("lane-SC: unit retirement without a plan");
+                        }
+                    }
+                    // Trust (lane G17): the deep unit chain's retirement — THIS call's own
+                    // argument temps at the entry of ITS successor, in REVERSE operand order
+                    // (LIFO), a folded literal contributing nothing; and at the FINAL call's
+                    // successor the statement's `()` temp after all of them, with the unit body's
+                    // own `_0 = const ()` following one assign later. Measured verbatim,
+                    // `probes/g17.rs::c9::{closure#0}`: `bb1: dead _7`, `bb2: dead _6`,
+                    // `bb3: dead _5; dead _4; dead _3; _0 = const ()`.
+                    if let (Some(ci), Some(up)) = (uc_ci, cx.mf_unit_chain()) {
+                        let Some(c) = up.calls.get(ci) else {
+                            return unsup("lane G17: a planned call index outside the plan");
+                        };
+                        for (pos, op) in c.args.iter().enumerate().rev() {
+                            if matches!(op, UcOperand::Lit(_)) {
+                                continue;
+                            }
+                            let Some(t) =
+                                cx.uc_temps.get(ci).and_then(|v| v.get(pos)).copied().flatten()
+                            else {
+                                return unsup("lane G17: a slot retired before minting");
+                            };
+                            if !cx.mf_mark_uc_arg(succ, ci, pos, t.local, false) {
+                                return unsup("lane G17: retirement without a plan");
+                            }
+                        }
+                        if ci + 1 == up.calls.len() {
+                            if let Some(u) = cx.uc_unit {
+                                if !cx.mf_mark_uc_unit(succ, u.local, false) {
+                                    return unsup("lane G17: unit retirement without a plan");
+                                }
+                            }
+                        }
+                    }
+                    // Trust (wave-CF-STR): the literal locals outlive EVERY argument temp —
+                    // built retires them after the whole argument run (measured verbatim:
+                    // `bb1: StorageDead(_4); StorageDead(_3); StorageDead(_5); return;`).
+                    for (a, l) in cf_lits.iter().rev() {
+                        if !cx.mf_mark_call_fwd_lit(succ, *a, *l, false) {
+                            return unsup("wave-CF-STR: retirement without a plan");
+                        }
+                    }
+                    // Trust (lane S1F, unit statement): the `()` temp is retired LAST, and the
+                    // Return arm's `_0 = const ()` follows (measured, `probes/s1f.rs` b1/b2).
+                    if let Some(u) = cf_unit {
+                        if !cx.mf_mark_call_fwd_unit(succ, u.local, false) {
+                            return unsup("lane-S1F: unit retirement without a plan");
+                        }
+                    }
+                    // Trust (lane S1F, reborrowed return): the destination temp retires LAST.
+                    if let Some(d) = cf_ret {
+                        if !cx.mf_mark_call_fwd_ret(succ, d.local, false) {
+                            return unsup("lane-S1F: ret retirement without a plan");
+                        }
+                    }
+                    // Trust (lane R53): the POST-OP destination temp retires after the post-op's
+                    // OWN assign, which the next node's arm has not emitted yet — so the
+                    // retirement is DEFERRED here and pushed by the `Inst::Return` arm, into
+                    // this same successor block. Recording the block alongside the local is what
+                    // makes the deferred push unable to name a different one.
+                    if let Some(d) = cf_post {
+                        if cx.cf_post_dead.is_some() {
+                            return unsup("lane-R53: a second post-op destination in one body");
+                        }
+                        cx.cf_post_dead = Some((succ, d.local));
+                    }
+                    // Trust (wave-WB8): the chain-forward SUCCESSOR work. At an INNER node:
+                    // the Reborrow bridge `t = &(*u)` at position 0 (measured: the assign
+                    // precedes the inner argument retirement — probes/em3.rs d4:
+                    // `_4 = &(*_5); StorageDead(_6)`), then this call's own argument temps in
+                    // REVERSE order (LIFO). At the FINAL node: the whole retirement — the
+                    // argument temps in reverse slot order, then the in-transit locals in
+                    // reverse creation order, the two runs swapped under
+                    // [`SatPerturb::ChainRetOrder`] from the one bit the sealed plan carries.
+                    if let Some(cp) = &chain_plan {
+                        if let Some(pos) = chain_pos {
+                            if let ChainSlot::Reborrow(_) = &cp.slots[pos] {
+                                let Some(t) = cx.chain_arg_temps[pos] else {
+                                    return unsup("wave-WB8: a Reborrow slot without a temp");
+                                };
+                                let Some(u) = chain_dest else {
+                                    return unsup("wave-WB8: a Reborrow slot without a dest");
+                                };
+                                cx.assign(
+                                    succ,
+                                    t,
+                                    Rvalue::Ref(
+                                        tcx.lifetimes.re_erased,
+                                        BorrowKind::Shared,
+                                        tcx.mk_place_deref(u),
+                                    ),
+                                );
+                            }
+                            for (v, l) in chain_inner_deads.iter().rev() {
+                                if !cx.mf_mark_chain_inner(succ, *v, *l, false) {
+                                    return unsup("wave-WB8: retirement without a plan");
+                                }
+                            }
+                        } else if chain_final {
+                            let mut arg_run: Vec<(ValueId, Local)> = Vec::new();
+                            for (s, t) in cp.slots.iter().zip(cx.chain_arg_temps.clone()) {
+                                let Some(t) = t else {
+                                    return unsup("wave-WB8: a slot retired before minting");
+                                };
+                                let v = match s {
+                                    ChainSlot::Place(v, _)
+                                    | ChainSlot::ByValue(v)
+                                    | ChainSlot::Reborrow(v) => *v,
+                                };
+                                arg_run.push((v, t.local));
+                            }
+                            let transit_run = cx.chain_transits.clone();
+                            let (first, second) = if cp.ret_swap {
+                                (&transit_run, &arg_run)
+                            } else {
+                                (&arg_run, &transit_run)
+                            };
+                            for (v, l) in first.iter().rev() {
+                                let ok = if transit_run.iter().any(|(tv, tl)| tv == v && tl == l) {
+                                    cx.mf_mark_chain_transit(succ, *v, *l, false)
+                                } else {
+                                    cx.mf_mark_chain_arg(succ, *v, *l, false)
+                                };
+                                if !ok {
+                                    return unsup("wave-WB8: retirement without a plan");
+                                }
+                            }
+                            for (v, l) in second.iter().rev() {
+                                let ok = if transit_run.iter().any(|(tv, tl)| tv == v && tl == l) {
+                                    cx.mf_mark_chain_transit(succ, *v, *l, false)
+                                } else {
+                                    cx.mf_mark_chain_arg(succ, *v, *l, false)
+                                };
+                                if !ok {
+                                    return unsup("wave-WB8: retirement without a plan");
+                                }
+                            }
+                        }
                     }
                     cur = succ;
                     i += 1;
@@ -12067,7 +21993,88 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
     //     `clean-kernel` bodies carrying a marker sequence that was not built's, with every layer
     //     of round 6 green.
     // Neither replaces the other. Do not quote either as if it did.
-    let sealed = MfPlans::seal(tcx, def, func);
+    let sealed = MfPlans::seal(tcx, def, func, module, callees);
+    // Trust (wave-MC): the SAT control's application count, bumped exactly once per body and only
+    // when the plan really lost a marked result. See [`SatPerturb::McPlan`].
+    if sealed.mc_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane EM): the CF control's application count, bumped exactly once per body and only
+    // when the plan really carried a literal pair to swap. See [`SatPerturb::CfLitOrder`].
+    if sealed.cf_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane S1F): the field-drop control's application count, bumped exactly once per
+    // body and only when the plan really carried a field argument. See
+    // [`SatPerturb::CfFieldDrop`].
+    if sealed.cf_field_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane S1F): the unit-late control's application count. See
+    // [`SatPerturb::CfUnitLate`].
+    if sealed.cf_unit_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane S1F): the pair-order control's application count. See
+    // [`SatPerturb::CfPairOrder`].
+    if sealed.cf_pair_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane S1F): the ret-late control's application count. See
+    // [`SatPerturb::CfRetLate`].
+    if sealed.cf_ret_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane R53): the post-late control's application count. See
+    // [`SatPerturb::CfPostLate`].
+    if sealed.cf_post_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (wave-WB8): the chain control's application count, bumped exactly once per body
+    // and only when the plan really carried an in-transit local to displace. See
+    // [`SatPerturb::ChainRetOrder`].
+    if sealed.chain_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane S3): the same control's application count on the aggregate-of-call-results
+    // class, bumped exactly once per body and only when the plan really carried two or more
+    // temps to displace. See [`SatPerturb::ChainRetOrder`].
+    if sealed.agg_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane SC): the sequence class's control application count, bumped exactly once per
+    // body and only when a sequence plan really existed to perturb. See
+    // [`SatPerturb::SeqUnitLate`].
+    if sealed.seq_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane G25): the same control's application count, bumped exactly once per body and
+    // only when the sealed plan really carried one of this lane's two emissions to move. See
+    // [`SatPerturb::G25Hoist`].
+    if sealed.g25_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane G21): the short-circuit-over-calls control's application count, bumped exactly
+    // once per body and only when the sealed plan really carried two or more argument temps to
+    // exchange. See [`SatPerturb::G21RetOrder`].
+    if sealed.g21_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane G17): the deep unit-chain control's application count, bumped exactly once per
+    // body and only when the sealed plan really carried a `()` temp to displace. See
+    // [`SatPerturb::UcUnitLate`].
+    if sealed.uc_unit_perturb_applied() {
+        cx.sat_perturb_count += 1;
+    }
+    // Trust (lane G25): every DELAYED statement must have reached its use site. A residue here is
+    // a statement the plan authorised and the emitted body does NOT contain — a different program,
+    // not a marker discrepancy — so the body fails CLOSED rather than shipping without it.
+    if !cx.mf_delayed.is_empty() {
+        return unsup(format!(
+            "lane G25: {} delayed statement(s) never reached a use site",
+            cx.mf_delayed.len()
+        ));
+    }
     let observed_markers = match mf_gate::observe(tcx, &cx.blocks, &cx.local_decls) {
         Ok(seen) => seen,
         Err(why) => return unsup(format!("marker law: {why}")),
@@ -13135,6 +23142,106 @@ mod scope_topology_tests {
 }
 
 #[cfg(test)]
+mod parallel_move_tests {
+    use super::parallel_move_snapshots;
+
+    /// Execute the SCHEDULED move sequentially and return each destination's final value, where
+    /// a place's "value" starts as itself. This is the oracle the schedule must satisfy: after
+    /// execution, every non-self destination holds its source's ORIGINAL value — the phi-row
+    /// semantics of the edge — no matter the overlap between sources and destinations.
+    fn run(moves: &[(u32, Option<u32>)]) -> Vec<(u32, Option<u32>)> {
+        let snaps = parallel_move_snapshots(moves);
+        let mut env: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let read = |env: &std::collections::HashMap<u32, u32>, p: u32| *env.get(&p).unwrap_or(&p);
+        // Temps are minted before any destination write, in schedule order.
+        let mut temp_vals: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for &j in &snaps {
+            let src = moves[j].1.expect("schedule points at a place read");
+            temp_vals.insert(j, read(&env, src));
+        }
+        for (j, (dest, src)) in moves.iter().enumerate() {
+            let Some(src) = src else { continue }; // constants: out of this oracle's scope
+            if src == dest {
+                continue; // omitted exact self-assignment
+            }
+            let v = match temp_vals.get(&j) {
+                Some(&t) => t,
+                None => read(&env, *src),
+            };
+            env.insert(*dest, v);
+        }
+        moves.iter().map(|(d, _)| (*d, env.get(d).copied())).collect()
+    }
+
+    #[test]
+    fn test_snapshots_no_overlap_schedules_nothing() {
+        // The every-marker-plan-body case: sources are disjoint from destinations, the
+        // schedule is empty, and emission stays byte-identical to pre-LOOP2.
+        assert_eq!(
+            parallel_move_snapshots(&[(10u32, Some(1)), (11, Some(2))]),
+            Vec::<usize>::new()
+        );
+        assert_eq!(parallel_move_snapshots(&[(10u32, None), (11, Some(2))]), Vec::<usize>::new());
+        // A later destination read earlier is NOT a hazard: the read precedes the write.
+        assert_eq!(
+            parallel_move_snapshots(&[(10u32, Some(11)), (11, Some(1))]),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn test_snapshots_rotation_schedules_exactly_the_passthrough() {
+        // The g8/gcd back edge: `br header(%new, %p0)` — position 1 reads p0 after
+        // position 0 wrote it. The measured clobber this lane repairs.
+        assert_eq!(parallel_move_snapshots(&[(20u32, Some(1)), (21, Some(20))]), vec![1]);
+        let out = run(&[(20u32, Some(1)), (21, Some(20))]);
+        // Position 1 must receive p0's ORIGINAL value (20), not the new one (1).
+        assert_eq!(out, vec![(20, Some(1)), (21, Some(20))], "phi-row semantics");
+    }
+
+    #[test]
+    fn test_snapshots_full_swap_needs_one_temp() {
+        assert_eq!(parallel_move_snapshots(&[(20u32, Some(21)), (21, Some(20))]), vec![1]);
+        let out = run(&[(20u32, Some(21)), (21, Some(20))]);
+        assert_eq!(out, vec![(20, Some(21)), (21, Some(20))], "swap is exact");
+    }
+
+    #[test]
+    fn test_snapshots_omitted_self_assignment_is_not_a_write() {
+        // Position 0 is `p0 <- p0`, which the emitter omits: reading p0 later is safe.
+        assert_eq!(
+            parallel_move_snapshots(&[(20u32, Some(20)), (21, Some(20))]),
+            Vec::<usize>::new()
+        );
+        let out = run(&[(20u32, Some(20)), (21, Some(20))]);
+        assert_eq!(out, vec![(20, None), (21, Some(20))], "p0 untouched, p1 gets old p0");
+    }
+
+    #[test]
+    fn test_snapshots_three_cycle_snapshots_every_clobbered_read() {
+        // (p0, p1, p2) <- (p1, p2, p0): position 2 reads p0 (written at 0) — one snapshot;
+        // positions 0 and 1 read later-written places, which is safe.
+        assert_eq!(
+            parallel_move_snapshots(&[(20u32, Some(21)), (21, Some(22)), (22, Some(20))]),
+            vec![2]
+        );
+        let out = run(&[(20u32, Some(21)), (21, Some(22)), (22, Some(20))]);
+        assert_eq!(out, vec![(20, Some(21)), (21, Some(22)), (22, Some(20))], "3-rotation");
+    }
+
+    #[test]
+    fn test_snapshots_chain_reading_one_clobbered_source_twice() {
+        // Both later positions read p0; each schedules its own snapshot.
+        assert_eq!(
+            parallel_move_snapshots(&[(20u32, Some(1)), (21, Some(20)), (22, Some(20))]),
+            vec![1, 2]
+        );
+        let out = run(&[(20u32, Some(1)), (21, Some(20)), (22, Some(20))]);
+        assert_eq!(out, vec![(20, Some(1)), (21, Some(20)), (22, Some(20))]);
+    }
+}
+
+#[cfg(test)]
 mod emission_chokepoint_tests {
     /// Trust (C2 repair): `LowerCx::push_node` is documented as "the ONLY instruction-emission
     /// chokepoint" — it is where `cur_span` and `cur_scope` are stamped. That claim was FALSE
@@ -13744,7 +23851,7 @@ mod marker_gate_invariant_tests {
     fn every_seal_names_this_body_and_the_plan_is_never_assigned() {
         let code = mask(include_str!("to_mir.rs"));
         let seal = format!("MfPlans::{}", "seal");
-        let good = format!("MfPlans::{}(tcx, def, func)", "seal");
+        let good = format!("MfPlans::{}(tcx, def, func, module, callees)", "seal");
         let total = count_in_code(&code, &seal);
         let named = count_in_code(&code, &good);
         assert_eq!(
@@ -13759,7 +23866,10 @@ mod marker_gate_invariant_tests {
              any other identity hands this body another body's veto"
         );
         assert_eq!(
-            count_in_code(&code, &format!("mf_plans: MfPlans::{}(tcx, def, func)", "seal")),
+            count_in_code(
+                &code,
+                &format!("mf_plans: MfPlans::{}(tcx, def, func, module, callees)", "seal")
+            ),
             1,
             "the `ShimCx` field must have exactly one construction"
         );
@@ -13836,10 +23946,36 @@ mod marker_gate_invariant_tests {
             "the canonical-position rule must have exactly one implementation"
         );
         // The OBSERVED side is one walk and always has been; the PREDICTED side is the general
-        // walk plus wave-EP's payload walk plus wave-CK's checked-chain walk, and the clauses
-        // below are what keep any two of them from ever deciding the same body.
+        // walk plus wave-EP's payload walk, wave-CK's checked-chain walk, wave-MC's call-chain
+        // walk and wave-CF's call-forward walk, and the clauses below are what keep any two of
+        // them from ever deciding the same body. (Wave-MC raised the real count to 4 without
+        // raising this pin — the test was RED at its landing commit; wave-FR repairs the pin and
+        // brings the per-walk clauses the raise owed.)
+        //
+        // Trust (lane G21, 2026-08-25): the NINTH predicted walk — `predict_bc`, the
+        // short-circuit-over-calls class. The pin is raised deliberately and the raise carries
+        // its own exclusion evidence: `MfPlans::seal` resolves `bc` against every plan already
+        // answered, `source_form_ok` carries `bc.is_none()`, the loop overlap is resolved
+        // fail-closed one statement after `loop_`, and `predict_from` REFUSES at runtime, in
+        // every build, any body that reaches it carrying a `bc` plan.
+        //
+        // Trust (lane G17, 2026-08-25): the TENTH predicted walk — `predict_unit_chain`, the deep
+        // unit-chain class. The pin is raised deliberately and the raise carries its own exclusion
+        // evidence: `MfPlans::seal` resolves `unit_chain` against every plan already answered
+        // (including `seq_call`, the last one asked before it), `MfPlans::predict` dispatches to it
+        // only after all nine have declined, and the class's own grammar requires a `Const` node
+        // and a chain link consumed by another INNER call — two shapes `plan_chain_fwd_markers`
+        // and `plan_seq_call_markers` each refuse on their own lines.
+        //
+        // Trust (lane G17-FIX, 2026-08-25): both raises above — 8 -> 9 and 9 -> 10 — landed
+        // WITHOUT the three clauses each owed, which is the loosening the paragraph above
+        // forbids in as many words, and one of the six was not merely unpinned but ABSENT: the
+        // general walk carried a fail-closed refusal for nine of the ten classes and none for
+        // `unit_chain`, so the tenth walk's exclusivity was a reading of `MfPlans::predict`'s
+        // dispatch order rather than a checked runtime fact. `predict_from` refuses a
+        // `unit_chain` body now, in every build, and all six clauses are asserted below.
         for (side, want) in [
-            (format!("{build}<MfSlot> = {build}::new()"), 3usize),
+            (format!("{build}<MfSlot> = {build}::new()"), 10usize),
             (format!("{build}<Local> = {build}::new()"), 1),
         ] {
             assert_eq!(
@@ -13873,6 +24009,98 @@ mod marker_gate_invariant_tests {
             1,
             "and that dispatch must be the only caller of the checked-chain walk"
         );
+        // ... and the same three clauses for wave-MC's call-chain walk ...
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "call")),
+            1,
+            "the call-chain walk must be reached from exactly one plan-keyed dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p, self.operand.as_ref())", "predict_call")),
+            1,
+            "and that dispatch must be the only caller of the call-chain walk"
+        );
+        // ... and for wave-CF's call-forward walk.
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "call_fwd")),
+            1,
+            "the call-forward walk must be reached from exactly one plan-keyed dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p)", "predict_call_fwd")),
+            1,
+            "and that dispatch must be the only caller of the call-forward walk"
+        );
+        // ... and for wave-WB8's chain-forward walk — the raise to 6 above is a WIDENING
+        // (one more mutually exclusive class) and these are the clauses it owes.
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "chain")),
+            1,
+            "the chain-forward walk must be reached from exactly one plan-keyed dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p)", "predict_chain_fwd")),
+            1,
+            "and that dispatch must be the only caller of the chain-forward walk"
+        );
+        // ... and for lane S3's aggregate-of-call-results walk — the raise to 7 above is a
+        // WIDENING (one more mutually exclusive class) and these are the clauses it owes.
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "agg_call")),
+            1,
+            "the aggregate-of-call-results walk must be reached from exactly one plan-keyed \
+             dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p)", "predict_agg_call")),
+            1,
+            "and that dispatch must be the only caller of the aggregate-of-call-results walk"
+        );
+        // ... and for lane SC's statement-call sequence walk — the raise to 8 above is a
+        // WIDENING (one more mutually exclusive class) and these are the clauses it owes.
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "seq_call")),
+            1,
+            "the statement-call sequence walk must be reached from exactly one plan-keyed \
+             dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p)", "predict_seq_call")),
+            1,
+            "and that dispatch must be the only caller of the statement-call sequence walk"
+        );
+        // ... and for lane G21's short-circuit-over-calls walk — the raise to 9 above is a
+        // WIDENING (one more mutually exclusive class) and these are the clauses it owes. They
+        // were NOT brought with the raise: the count moved 8 -> 9 with the walk and nothing
+        // pinned the walk's dispatch, its single caller or its refusal, which is precisely the
+        // LOOSENING this test's own doc comment forbids.
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "bc")),
+            1,
+            "the short-circuit-over-calls walk must be reached from exactly one plan-keyed \
+             dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p)", "predict_bc")),
+            1,
+            "and that dispatch must be the only caller of the short-circuit-over-calls walk"
+        );
+        // ... and for lane G17's deep unit-chain walk — the raise to 10 above is a WIDENING
+        // (one more mutually exclusive class) and these are the clauses it owes. They were not
+        // brought with that raise either, and the missing one was not merely unpinned: the
+        // general walk had NO runtime refusal for this class at all, so the tenth walk's
+        // exclusivity rested on reading `MfPlans::predict`'s dispatch order. The refusal is in
+        // the general walk now, and it is pinned below with the other nine.
+        assert_eq!(
+            count_in_code(&code, &format!("if let Some(p) = &self.{} {{", "unit_chain")),
+            1,
+            "the deep unit-chain walk must be reached from exactly one plan-keyed dispatch"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("{}(func, p)", "predict_unit_chain")),
+            1,
+            "and that dispatch must be the only caller of the deep unit-chain walk"
+        );
         // (2) the general walk refuses a payload body at RUNTIME, in every build;
         assert_eq!(
             count_in_code(&code, &format!("if self.{}.is_some() {{", "payload")),
@@ -13883,6 +24111,44 @@ mod marker_gate_invariant_tests {
             count_in_code(&code, &format!("if self.{}.is_some() {{", "checked")),
             1,
             "the general walk must refuse a body the checked-chain plan owns, fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "call")),
+            1,
+            "the general walk must refuse a body the call-chain plan owns, fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "call_fwd")),
+            1,
+            "the general walk must refuse a body the call-forward plan owns, fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "chain")),
+            1,
+            "the general walk must refuse a body the chain-forward plan owns, fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "agg_call")),
+            1,
+            "the general walk must refuse a body the aggregate-of-call-results plan owns, \
+             fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "seq_call")),
+            1,
+            "the general walk must refuse a body the statement-call sequence plan owns, \
+             fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "bc")),
+            1,
+            "the general walk must refuse a body the short-circuit-over-calls plan owns, \
+             fail-closed"
+        );
+        assert_eq!(
+            count_in_code(&code, &format!("if self.{}.is_some() {{", "unit_chain")),
+            1,
+            "the general walk must refuse a body the deep unit-chain plan owns, fail-closed"
         );
         // (3) and the payload plan is resolved against the others in the one constructor
         //     (`plan_exclusivity_tests` pins that conjunction; this is its counterpart here).
@@ -14186,6 +24452,158 @@ mod marker_law_tests {
         ];
         f.blocks = vec![e];
         f
+    }
+
+    // ---- lane G25 (2026-08-23): the two corpus shapes, predicted against built's own sequence --
+
+    fn at(mut n: InstrNode, line: u32, col: u32) -> InstrNode {
+        n.span = Some(trust_ir::SourceSpan { file: 1, line, col });
+        n
+    }
+
+    /// `MentionsNameVisitor::combine` — `a || b`, the corpus trust-ir verbatim.
+    fn logical_or() -> Function {
+        let mut f = Function::new(FuncId::new(0), "combine", FuncTyId::new(0), b(0));
+        let mut e = trust_ir::Block::new(b(0));
+        e.params = vec![(v(0), Ty::Ptr), (v(1), Ty::Bool), (v(2), Ty::Bool)];
+        e.body = vec![at(
+            node(
+                Inst::CondBr {
+                    cond: v(1),
+                    then_target: b(2),
+                    then_args: vec![],
+                    else_target: b(1),
+                    else_args: vec![],
+                },
+                None,
+            ),
+            684,
+            8,
+        )];
+        let mut rhs = trust_ir::Block::new(b(1));
+        rhs.body = vec![at(node(Inst::Br { target: b(3), args: vec![v(2)] }, None), 684, 8)];
+        let mut sc = trust_ir::Block::new(b(2));
+        sc.body = vec![
+            at(node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(4)), 684, 8),
+            at(node(Inst::Br { target: b(3), args: vec![v(4)] }, None), 684, 8),
+        ];
+        let mut j = trust_ir::Block::new(b(3));
+        j.params = vec![(v(3), Ty::Bool)];
+        j.body = vec![at(node(Inst::Return { values: vec![v(3)] }, None), 685, 5)];
+        f.blocks = vec![e, rhs, sc, j];
+        f
+    }
+
+    #[test]
+    fn the_sugar_condition_predicts_builts_own_two_line_sequence() {
+        // Built, measured on the corpus body: `bb0: StorageLive(_4); _4 = copy _2;
+        // switchInt(move _4)` and `bb3: StorageDead(_4); return` — ONE `live` at assign 0 of the
+        // head and ONE `dead` at position 0 of the join, and nothing else in the body. The derived
+        // side spells the same two, one assign later in the join (its `Return` copies the join
+        // parameter into `_0`), which is AFTER the marker.
+        let f = logical_or();
+        let plan = plan_branch_markers(&f).expect("the `||` desugar is inside the class");
+        let needs = plan.needs.clone();
+        assert_eq!(
+            predict_of(&f, needs, Some(plan)),
+            seen(
+                &[
+                    &[St::L(9), St::A(&[2])],
+                    &[St::A(&[3])],
+                    &[St::A(&[])],
+                    &[St::D(9), St::A(&[])],
+                ],
+                &[(9, Ty::Bool)],
+            )
+        );
+    }
+
+    /// `tc::heartbeat_profiler::types::clamp_u32` — the corpus trust-ir verbatim.
+    fn clamp_u32() -> Function {
+        let mut f = Function::new(FuncId::new(0), "clamp_u32", FuncTyId::new(0), b(0));
+        let mut e = trust_ir::Block::new(b(0));
+        e.params = vec![(v(0), Ty::U64)];
+        e.body = vec![
+            node(Inst::Const { ty: Ty::U32, value: Constant::Int(4294967295) }, Some(2)),
+            node(
+                Inst::Cast {
+                    op: trust_ir::CastOp::ZExt,
+                    src_ty: Ty::U32,
+                    dst_ty: Ty::U64,
+                    operand: v(2),
+                },
+                Some(3),
+            ),
+            node(
+                Inst::ICmp { op: ICmpOp::Ugt, ty: Ty::U64, lhs: v(0), rhs: v(3) },
+                Some(4),
+            ),
+            node(
+                Inst::CondBr {
+                    cond: v(4),
+                    then_target: b(1),
+                    then_args: vec![],
+                    else_target: b(2),
+                    else_args: vec![],
+                },
+                None,
+            ),
+        ];
+        let mut t = trust_ir::Block::new(b(1));
+        t.body = vec![
+            node(Inst::Const { ty: Ty::U32, value: Constant::Int(4294967295) }, Some(5)),
+            node(Inst::Br { target: b(3), args: vec![v(5)] }, None),
+        ];
+        let mut el = trust_ir::Block::new(b(2));
+        el.body = vec![
+            node(
+                Inst::Cast {
+                    op: trust_ir::CastOp::Trunc,
+                    src_ty: Ty::U64,
+                    dst_ty: Ty::U32,
+                    operand: v(0),
+                },
+                Some(6),
+            ),
+            node(Inst::Br { target: b(3), args: vec![v(6)] }, None),
+        ];
+        let mut j = trust_ir::Block::new(b(3));
+        j.params = vec![(v(1), Ty::U32)];
+        j.body = vec![node(Inst::Return { values: vec![v(1)] }, None)];
+        f.blocks = vec![e, t, el, j];
+        f
+    }
+
+    #[test]
+    fn the_delayed_cast_predicts_builts_own_head_order() {
+        // Built's head, measured: `StorageLive(_2)[the Gt result]; StorageLive(_3)[operand 0];
+        // _3 = copy _1; StorageLive(_4)[operand 1]; _4 = const MAX as u64;
+        // _2 = Gt(move _3, move _4)` — markers at .0, .0, .1. The producer defines the CAST
+        // first, so without the delay this side opens the cast's temp at .0 and the comparison's
+        // at .1 — the two `StorageLive`s in the wrong order, with the same count.
+        let f = clamp_u32();
+        let plan = plan_branch_markers(&f).expect("the delayed-cast body is inside the class");
+        let needs = plan.needs.clone();
+        assert_eq!(
+            predict_of(&f, needs, Some(plan)),
+            seen(
+                &[
+                    &[St::L(9), St::L(10), St::A(&[1]), St::L(11), St::A(&[]), St::A(&[10, 11])],
+                    &[St::D(11), St::D(10), St::A(&[])],
+                    &[
+                        St::D(11),
+                        St::D(10),
+                        St::L(12),
+                        St::A(&[1]),
+                        St::A(&[12]),
+                        St::D(12),
+                        St::A(&[]),
+                    ],
+                    &[St::D(9), St::A(&[])],
+                ],
+                &[(9, Ty::Bool), (10, Ty::U64), (11, Ty::U64), (12, Ty::U64)],
+            )
+        );
     }
 
     fn predict_of(f: &Function, needs: HashSet<ValueId>, branch: Option<MfBranchPlan>) -> MfSeq {
@@ -14557,11 +24975,48 @@ mod plan_exclusivity_tests {
             "the payload plan must be refused when either specialized source-form plan owns the \
              body"
         );
-        // And the constructor is still the only place a plan is decided.
-        let field = format!(
-            "MfPlans {{ operand, branch, write, borrow, {}, checked, loop_, dr }}",
-            "payload"
-        );
+        // And the constructor is still the only place a plan is decided. The needle is BUILT
+        // FROM PARTS: written as one literal, a string-continuation backslash swallowed the
+        // sixteen-space indent before `loop_` and the needle matched NOTHING — wave-MC landed
+        // with this assertion red. Assembling per-field lines cannot lose the indent, and this
+        // test's own source still never contains the needle (`include_str!` reads this file).
+        let plan_fields = [
+            "operand",
+            "branch",
+            "write",
+            "borrow",
+            "payload",
+            "checked",
+            "loop_",
+            // Trust (lane G21): the SHORT-CIRCUIT-OVER-CALLS plan's field. Same pin, same reason
+            // — and it worked: this assertion was RED at the class's first build, because the
+            // literal had gained a field this list had not been told about.
+            "bc",
+            "dr",
+            "call",
+            "call_fwd",
+            // Trust (lane F8): the SWITCH-TO-JOIN plan's field. This list is the pin that forces
+            // a new whole-body plan to be acknowledged HERE, in the one constructor that decides
+            // one; a thirteenth plan that did not appear in it would leave the needle unmatched
+            // and this assertion red — which is exactly what it did until this line was added.
+            "sw",
+            // Trust (lane F8B): the DISCRIMINANT-MATCH plan's field. Same pin, same reason.
+            "swr",
+            "chain",
+            "agg_call",
+            // Trust (lane SC): the STATEMENT-CALL SEQUENCE plan's field. Same pin, same reason —
+            // and it worked: the first subject driver failed to compile at `MfPlans::seal`'s own
+            // `let none` because this list had not been told about the class yet.
+            "seq_call",
+            // Trust (lane G17): the DEEP UNIT-CHAIN plan's field. Same pin, same reason.
+            "unit_chain",
+            // Trust (lane G25): the sealed-plan control's bit. Not a plan, but it rides the same
+            // literal, and the pin's whole point is that nothing enters it unacknowledged.
+            "g25_hoist",
+            "mc_perturbed",
+        ];
+        let body: String = plan_fields.iter().map(|f| format!("                {f},\n")).collect();
+        let field = format!("MfPlans {{\n{body}            }}");
         assert_eq!(
             src.matches(field.as_str()).count(),
             1,
@@ -14606,7 +25061,12 @@ mod plan_exclusivity_tests {
             join: BlockId::new(0),
             last_arm: BlockId::new(0),
         };
-        let branch = MfBranchPlan { needs: HashSet::new(), branch: HashMap::new() };
+        let branch = MfBranchPlan {
+            needs: HashSet::new(),
+            branch: HashMap::new(),
+            sugar: HashSet::new(),
+            delayed: HashSet::new(),
+        };
         assert!(
             loop_plan_available(None, false, &None, &None, &None, &None),
             "with every other plan declined the loop plan is available"
@@ -14649,7 +25109,7 @@ mod plan_exclusivity_tests {
             "the loop plan must be gated on the relation, exactly once"
         );
         let sealed = format!(
-            "&& {}(tcx, def)\n            {{\n                {}(func)",
+            "&& {}(tcx, def)\n            {{\n                {}(func, rot_let_source_admits(tcx, def))",
             "loop_source_form_admits", "plan_loop_markers"
         );
         assert_eq!(
@@ -14755,6 +25215,301 @@ mod plan_exclusivity_tests {
 /// one-statement mutations of it. Each mutation is a thing an emitter edit could do — move the
 /// `StorageLive` past its own borrow, retire before the edge copy, drop the retirement — and each
 /// must move the observed side and not the predicted one.
+#[cfg(test)]
+mod rotation_marker_plan_tests {
+    //! Trust (lane ROT): the rotation class's plan admission and its sequence model, exercised
+    //! on the VERBATIM producer shapes of `probes/lr_parallel_move.rs` (`r1_rot_let_and` /
+    //! `r2_rot_let_rem`, dump-transcribed) against the emission this lane teaches the shim —
+    //! spelled here as a synthetic finished body, statement for statement. The expected marker
+    //! positions are the MEASURED built ones (`reports/parallel-move-2026-08-21/
+    //! built_walk_gshape.txt`, `g8`/`g2`), transposed onto derived block indices.
+    use std::collections::{HashMap, HashSet};
+
+    use rustc_abi::FieldIdx;
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{
+        BinOp, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, ScopeData,
+        Ty, ValueId,
+    };
+
+    use super::mf_gate::{MfPlans, MfTy, ir_ty_token, marker_kind, observe_with};
+    use super::plan_loop_markers;
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn b(i: u32) -> BlockId {
+        BlockId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn k64(r: u32, k: i128) -> InstrNode {
+        node(Inst::Const { ty: Ty::U64, value: Constant::Int(k) }, Some(r))
+    }
+    fn rot_scopes() -> Option<Vec<ScopeData>> {
+        Some(vec![
+            ScopeData { parent: None, span: None },
+            ScopeData { parent: Some(0), span: None },
+        ])
+    }
+
+    /// `r1_rot_let_and`, dump-verbatim: `loop { if b == 0 { break; } let t = b; b = a & b;
+    /// a = t; }` — six blocks, header params `(%2=b, %3=a)`, back edge `br bb1(%8, %2)`.
+    fn r1(op: BinOp) -> Function {
+        let mut f = Function::new(FuncId::new(0), "r1_rot_let_and", FuncTyId::new(0), b(0));
+        let mut pre = trust_ir::Block::new(b(0));
+        pre.params = vec![(v(0), Ty::U64), (v(1), Ty::U64)];
+        pre.body = vec![node(Inst::Br { target: b(1), args: vec![v(1), v(0)] }, None)];
+        let mut hdr = trust_ir::Block::new(b(1));
+        hdr.params = vec![(v(2), Ty::U64), (v(3), Ty::U64)];
+        hdr.body = vec![
+            k64(6, 0),
+            node(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::U64, lhs: v(2), rhs: v(6) }, Some(7)),
+            node(
+                Inst::CondBr {
+                    cond: v(7),
+                    then_target: b(3),
+                    then_args: vec![],
+                    else_target: b(4),
+                    else_args: vec![],
+                },
+                None,
+            ),
+        ];
+        let mut exit = trust_ir::Block::new(b(2));
+        exit.params = vec![(v(4), Ty::U64), (v(5), Ty::U64)];
+        exit.body = vec![node(Inst::Return { values: vec![v(5)] }, None)];
+        let mut brk = trust_ir::Block::new(b(3));
+        brk.body = vec![node(Inst::Br { target: b(2), args: vec![v(2), v(3)] }, None)];
+        let mut els = trust_ir::Block::new(b(4));
+        els.body = vec![node(Inst::Br { target: b(5), args: vec![] }, None)];
+        let mut bd = trust_ir::Block::new(b(5));
+        bd.body = vec![
+            node(Inst::BinOp { op, ty: Ty::U64, lhs: v(3), rhs: v(2) }, Some(8)),
+            node(Inst::Br { target: b(1), args: vec![v(8), v(2)] }, None),
+        ];
+        f.blocks = vec![pre, hdr, exit, brk, els, bd];
+        f.scopes = rot_scopes();
+        f
+    }
+
+    /// `r2_rot_let_rem`, dump-verbatim: the same rotation with the unsigned div-guard idiom —
+    /// `%8 = const 0; %9 = icmp ne %2, %8; assert %9; %10 = urem %3, %2; br bb1(%10, %2)`.
+    fn r2() -> Function {
+        let mut f = r1(BinOp::And);
+        let bd = f.blocks.last_mut().expect("six blocks");
+        bd.body = vec![
+            k64(8, 0),
+            node(Inst::ICmp { op: ICmpOp::Ne, ty: Ty::U64, lhs: v(2), rhs: v(8) }, Some(9)),
+            node(Inst::Assert { cond: v(9) }, None),
+            node(Inst::BinOp { op: BinOp::URem, ty: Ty::U64, lhs: v(3), rhs: v(2) }, Some(10)),
+            node(Inst::Br { target: b(1), args: vec![v(10), v(2)] }, None),
+        ];
+        f
+    }
+
+    #[test]
+    fn the_rotation_shape_is_admitted_with_its_witness_and_refused_without() {
+        let lp = plan_loop_markers(&r1(BinOp::And), true).expect("r1 admits with the witness");
+        let rot = lp.rot.expect("r1 carries the rotation extension");
+        assert_eq!(rot.fused, v(8), "the fused update is the body's `and`");
+        assert_eq!(rot.fused_pos, 0, "`%8` rides arg 0 of `br bb1(%8, %2)`");
+        assert_eq!(rot.pass, (v(2), 1, Ty::U64), "`%2` is the passthrough at arg 1");
+        assert!(!rot.guard, "r1 has no div guard");
+        assert!(
+            plan_loop_markers(&r1(BinOp::And), false).is_none(),
+            "the same body without the source witness keeps today's refusal"
+        );
+        let mut three = r1(BinOp::And);
+        three.scopes.as_mut().expect("scoped").push(ScopeData { parent: Some(1), span: None });
+        assert!(
+            plan_loop_markers(&three, true).is_none(),
+            "a deeper scope table is outside the measured shape"
+        );
+    }
+
+    #[test]
+    fn the_div_guard_is_admitted_only_as_the_rotation_body() {
+        let lp = plan_loop_markers(&r2(), true).expect("r2 admits with the witness");
+        let rot = lp.rot.expect("r2 carries the rotation extension");
+        assert!(rot.guard, "r2's body is the unsigned div-guard idiom");
+        assert_eq!(rot.fused, v(10), "the fused update is the `urem`");
+        let mut noscope = r2();
+        noscope.scopes = None;
+        assert!(
+            plan_loop_markers(&noscope, true).is_none(),
+            "an assert outside the rotation class keeps today's refusal"
+        );
+        let mut broken = r2();
+        {
+            let bd = broken.blocks.last_mut().expect("six blocks");
+            bd.body[1] =
+                node(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::U64, lhs: v(2), rhs: v(8) }, Some(9));
+        }
+        assert!(
+            plan_loop_markers(&broken, true).is_none(),
+            "an assert that is not the div idiom refuses the plan"
+        );
+    }
+
+    #[test]
+    fn the_scope_free_class_is_unmoved() {
+        let mut plain = r1(BinOp::And);
+        plain.scopes = None;
+        // Without the scope the rotation two-arg back edge is still admitted structurally —
+        // but carries NO rotation extension, so every emission path keeps its pre-ROT form.
+        let lp = plan_loop_markers(&plain, true);
+        if let Some(lp) = &lp {
+            assert!(lp.rot.is_none(), "no scope, no rotation extension");
+        }
+    }
+
+    /// One statement of the expected finished body (same spelling as `marker_law_tests`).
+    #[derive(Clone, Copy)]
+    enum St<'a> {
+        A(&'a [u32]),
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St<'_>]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        St::A(ops) => {
+                            let fields: IndexVec<FieldIdx, Operand<'static>> = ops
+                                .iter()
+                                .map(|l| Operand::Move(Place::from(Local::from_u32(*l))))
+                                .collect();
+                            StatementKind::Assign(Box::new((
+                                Place::from(Local::from_u32(0)),
+                                Rvalue::Aggregate(Box::new(AggregateKind::Tuple), fields),
+                            )))
+                        }
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    /// Locals 10/11 are the loop's and the `if`'s `()` values (Opaque), 12 is the condition
+    /// (`bool`); every other marked local is `u64` — the fixture's one value type.
+    fn seen(blocks: &[&[St<'_>]]) -> super::mf_gate::MfSeq {
+        observe_with(&body(blocks), |l| match l.as_u32() {
+            10 | 11 => MfTy::Opaque,
+            12 => ir_ty_token(&Ty::Bool),
+            _ => ir_ty_token(&Ty::U64),
+        })
+        .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// The finished body this lane's emitter produces for `r1`, statement for statement, and
+    /// the MEASURED built positions beside each marker (`g8_rot_let_and`, 19 lines):
+    /// locals — 10 loopval, 11 ifval, 12 cond, 13 cond-operand temp, 14 the `let` local T,
+    /// 15/16 the update's operand temps, 17 the read temp RT; 20/21 header params (b, a),
+    /// 22/23 exit params.
+    #[test]
+    fn the_r1_model_is_the_intended_emission() {
+        let f = r1(BinOp::And);
+        let lp = plan_loop_markers(&f, true).expect("admitted");
+        let predicted = MfPlans::loop_for_test(lp)
+            .predict_from(&f, &HashSet::new(), &HashMap::new())
+            .expect("the rotation body is inside the sequence model");
+        let expected = seen(&[
+            &[St::L(10), St::A(&[2]), St::A(&[1])], // bb0.0:live _3
+            &[St::L(11), St::L(12), St::L(13), St::A(&[20]), St::A(&[13])], // bb2.0 x3
+            &[St::D(12), St::D(11), St::D(10), St::A(&[23])], // exit: bb9.0 x3
+            &[St::D(13), St::A(&[20]), St::A(&[21])], // break arm: bb3.0
+            &[St::D(13)],                           // else arm: bb7.0
+            &[
+                St::D(12),
+                St::D(11), // bb8.0: dead _6, _5
+                St::L(14),
+                St::A(&[20]), // bb8.0:live _9
+                St::L(15),
+                St::A(&[21]), // bb8.1:live _10
+                St::L(16),
+                St::A(&[20]),     // bb8.2:live _11
+                St::A(&[15, 16]), // _2 = And(move,move)
+                St::D(16),
+                St::D(15), // bb8.4: dead _11, _10
+                St::L(17),
+                St::A(&[14]), // bb8.4:live _12
+                St::A(&[17]), // _1 = move _12
+                St::D(17),    // bb8.6:dead _12
+                St::A(&[]),   // _4 = const ()
+                St::D(14),    // bb8.7:dead _9
+            ],
+            &[], // the loop-header trampoline (appended)
+            &[], // lane K's false-edge trampoline (appended)
+        ]);
+        assert_eq!(predicted, expected, "first diff: {}", predicted.first_diff(&expected));
+    }
+
+    /// The finished body for `r2` — the div guard splits the chain: the update, its
+    /// retirements and the whole `let`-cluster tail land in the APPENDED block (index 8),
+    /// walked LAST (`g2_gcd_loop_let` bb9.1–bb9.4).
+    #[test]
+    fn the_r2_model_is_the_intended_emission_across_the_split() {
+        let f = r2();
+        let lp = plan_loop_markers(&f, true).expect("admitted");
+        let predicted = MfPlans::loop_for_test(lp)
+            .predict_from(&f, &HashSet::new(), &HashMap::new())
+            .expect("the guarded rotation body is inside the sequence model");
+        let expected = seen(&[
+            &[St::L(10), St::A(&[2]), St::A(&[1])],
+            &[St::L(11), St::L(12), St::L(13), St::A(&[20]), St::A(&[13])],
+            &[St::D(12), St::D(11), St::D(10), St::A(&[23])],
+            &[St::D(13), St::A(&[20]), St::A(&[21])],
+            &[St::D(13)],
+            &[
+                St::D(12),
+                St::D(11),
+                St::L(14),
+                St::A(&[20]), // bb8.0:live _9
+                St::L(15),
+                St::A(&[21]), // bb8.1:live _10
+                St::L(16),
+                St::A(&[20]), // bb8.2:live _11
+                St::A(&[16]), // z = Eq(copy _11, 0)
+            ],
+            &[], // the loop-header trampoline (appended, index 6)
+            &[], // the false-edge trampoline (appended, index 7)
+            &[
+                St::A(&[15, 16]), // _2 = Rem(move, move)
+                St::D(16),
+                St::D(15), // bb9.1: dead _11, _10
+                St::L(17),
+                St::A(&[14]), // bb9.1:live _13
+                St::A(&[17]), // _1 = move _13
+                St::D(17),    // bb9.3:dead _13
+                St::A(&[]),   // _4 = const ()
+                St::D(14),    // bb9.4:dead _9
+            ],
+        ]);
+        assert_eq!(predicted, expected, "first diff: {}", predicted.first_diff(&expected));
+    }
+}
+
 #[cfg(test)]
 mod payload_marker_plan_tests {
     use rustc_abi::FieldIdx;
@@ -15338,7 +26093,7 @@ mod dr_marker_plan_tests {
     #[test]
     fn a_body_with_a_producer_scope_is_refused() {
         let mut f = is_zero();
-        f.scopes = Some(vec![]);
+        f.scopes = Some(Vec::new());
         assert_eq!(plan_deref_match_markers(&f), None, "wave-MF's firewall runs first");
     }
 
@@ -15872,6 +26627,244 @@ mod branch_marker_plan_tests {
         assert!(plan_branch_markers(&f).is_none());
     }
 
+    // ---- lane G25 (2026-08-23): the `||`/`&&` desugar, and the delayed cast -----------------
+
+    fn at(mut n: InstrNode, line: u32, col: u32) -> InstrNode {
+        n.span = Some(trust_ir::SourceSpan { file: 1, line, col });
+        n
+    }
+    fn bool_true(r: u32) -> InstrNode {
+        node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(r))
+    }
+
+    /// `<inductive::MentionsNameVisitor<'_> as expr::visitor::ExprVisitor>::combine` — `a || b`,
+    /// the corpus body, verbatim from the whole-crate trust-ir dump:
+    ///
+    /// ```text
+    /// bb0(%0: ptr, %1: bool, %2: bool):  condbr %1, bb2, bb1   ; #loc: 391 684 8
+    /// bb1:                               br bb3(%2)            ; #loc: 391 684 8
+    /// bb2:  %4 = const bool true         ; #loc: 391 684 8
+    ///       br bb3(%4)                   ; #loc: 391 684 8
+    /// bb3(%3: bool):                     ret %3                ; #loc: 391 685 5
+    /// ```
+    ///
+    /// `const_col` moves the synthesized constant OFF the operator's own column, which is what a
+    /// written-out `if a { true } else { b }` / `match a { true => true, false => b }` does; and
+    /// `else_first` puts the else arm after the then arm in the block list, which the desugar
+    /// never does. Everything else — block count, edges, params, uses — is byte-identical between
+    /// the variants, so a verdict that moves between them moved on that one token.
+    fn logical_or(const_col: u32, else_first: bool) -> Function {
+        let mut f = Function::new(FuncId::new(0), "combine", FuncTyId::new(0), b(0));
+        let mut e = trust_ir::Block::new(b(0));
+        e.params = vec![(v(0), Ty::Ptr), (v(1), Ty::Bool), (v(2), Ty::Bool)];
+        e.body = vec![at(condbr(1, 2, 1), 684, 8)];
+        let mut rhs = trust_ir::Block::new(b(1));
+        rhs.body = vec![at(br(3, &[2]), 684, 8)];
+        let mut sc = trust_ir::Block::new(b(2));
+        sc.body = vec![at(bool_true(4), 684, const_col), at(br(3, &[4]), 684, 8)];
+        let mut j = trust_ir::Block::new(b(3));
+        j.params = vec![(v(3), Ty::Bool)];
+        j.body = vec![at(ret(&[3]), 685, 5)];
+        f.blocks = if else_first { vec![e, rhs, sc, j] } else { vec![e, sc, rhs, j] };
+        f
+    }
+
+    #[test]
+    fn the_logical_or_desugar_is_admitted_and_names_its_head() {
+        let f = logical_or(8, true);
+        let plan = accepted(&f);
+        assert_eq!(plan.sugar, HashSet::from([b(0)]), "the head is the sugar head");
+        // The condition PARAMETER is a marked slot: built opens a temp for it and copies the
+        // parameter in (`StorageLive(_4); _4 = copy _2; switchInt(move _4)`).
+        assert!(plan.needs.contains(&v(1)), "the sugar condition takes a marker-carrying temp");
+        let br0 = plan.branch.get(&b(0)).copied().expect("the head's CondBr is planned");
+        assert_eq!((br0.cond, br0.join), (v(1), b(3)));
+        assert!(plan.delayed.is_empty(), "no cast, no delay");
+    }
+
+    #[test]
+    fn a_written_out_bool_branch_over_a_bare_param_is_still_refused() {
+        // THE LANE'S LOAD-BEARING CLAUSE. `if a { true } else { b }` and
+        // `match a { true => true, false => b }` are byte-indistinguishable from EACH OTHER in the
+        // Module and one of them (`match_bool`) is `markers_exact: true` and flipping TODAY, so
+        // both must stay refused. What separates them from `a || b` is that the desugar
+        // SYNTHESIZES its constant at the operator's own location while a written-out form stamps
+        // the literal's — measured by lane F8 on `probes/f8c.rs` (`8:39`/`8:39` for `or1` against
+        // `4:46`, `6:57`, `12:57`). Move the constant one column and the plan must decline.
+        assert!(plan_branch_markers(&logical_or(46, true)).is_none());
+    }
+
+    #[test]
+    fn the_desugar_signature_needs_the_else_block_first() {
+        // The second half of what lane F8 measured of `lower_logical_op`: the continuation arm is
+        // emitted before the short-circuit arm. A conjunct can only narrow, and narrowing here
+        // costs nothing — but it is what keeps a hypothetical producer that stamps the same span
+        // on a written-out form from walking in on the span clause alone.
+        assert!(plan_branch_markers(&logical_or(8, false)).is_none());
+    }
+
+    /// `tc::heartbeat_profiler::types::clamp_u32`, verbatim from the whole-crate trust-ir dump:
+    ///
+    /// ```text
+    /// bb0(%0: u64):  %2 = const u32 4294967295 ; %3 = zext u32 %2 to u64
+    ///                %4 = icmp ugt u64 %0, %3  ; condbr %4, bb1, bb2
+    /// bb1: %5 = const u32 4294967295 ; br bb3(%5)
+    /// bb2: %6 = trunc u64 %0 to u32  ; br bb3(%6)
+    /// bb3(%1: u32): ret %1
+    /// ```
+    ///
+    /// `swap` exchanges the comparison's operands, which puts the CAST leftmost — the position
+    /// wave-MF's linear walk already agrees with built at, and therefore the position the delay
+    /// must NOT be taken at.
+    fn clamp_u32(swap: bool) -> Function {
+        let mut f = Function::new(FuncId::new(0), "clamp_u32", FuncTyId::new(0), b(0));
+        let cast = |r: u32, o: u32| {
+            node(
+                Inst::Cast {
+                    op: trust_ir::CastOp::ZExt,
+                    src_ty: Ty::U32,
+                    dst_ty: Ty::U64,
+                    operand: v(o),
+                },
+                Some(r),
+            )
+        };
+        let gt = |r: u32, lhs: u32, rhs: u32| {
+            node(Inst::ICmp { op: ICmpOp::Ugt, ty: Ty::U64, lhs: v(lhs), rhs: v(rhs) }, Some(r))
+        };
+        let mut e = trust_ir::Block::new(b(0));
+        e.params = vec![(v(0), Ty::U64)];
+        e.body = vec![
+            node(Inst::Const { ty: Ty::U32, value: Constant::Int(4294967295) }, Some(2)),
+            cast(3, 2),
+            if swap { gt(4, 3, 0) } else { gt(4, 0, 3) },
+            condbr(4, 1, 2),
+        ];
+        let mut t = trust_ir::Block::new(b(1));
+        t.body = vec![konst(5, 4294967295), br(3, &[5])];
+        let mut el = trust_ir::Block::new(b(2));
+        el.body = vec![
+            node(
+                Inst::Cast {
+                    op: trust_ir::CastOp::Trunc,
+                    src_ty: Ty::U64,
+                    dst_ty: Ty::U32,
+                    operand: v(0),
+                },
+                Some(6),
+            ),
+            br(3, &[6]),
+        ];
+        let mut j = trust_ir::Block::new(b(3));
+        j.params = vec![(v(1), Ty::U32)];
+        j.body = vec![ret(&[1])];
+        f.blocks = vec![e, t, el, j];
+        f
+    }
+
+    #[test]
+    fn the_non_leftmost_cast_of_a_constant_is_delayed_and_the_body_is_admitted() {
+        let f = clamp_u32(false);
+        let plan = accepted(&f);
+        assert_eq!(plan.delayed, HashSet::from([v(3)]), "the cast is the delayed statement");
+        assert!(plan.needs.contains(&v(3)) && plan.needs.contains(&v(4)));
+        assert!(plan.sugar.is_empty(), "the condition is a computed result, not the sugar");
+    }
+
+    /// Trust (lane G25, 2026-08-24): the `arm_cast` shape — the fixture the leftmost-position
+    /// claim actually needs, and the repair of a test that asserted something FALSE.
+    ///
+    /// The first spelling of that test asked `clamp_u32(true)` — the corpus body with the
+    /// comparison's operands exchanged — to be ADMITTED with an empty delay set, and it is not:
+    /// its comparison's result IS the `CondBr` condition and therefore MARKED, so ordering rule
+    /// (1) (a marked result may not take a marked operand) refuses the whole body. That refusal
+    /// is lane K's, unchanged by this lane, and it fires at HEAD too. The claim the test meant to
+    /// pin — *the delay is taken at a non-leftmost operand position and nowhere else* — needs a
+    /// body the plan ACCEPTS in both orders, which is this one:
+    ///
+    /// ```text
+    /// bb0(%0: u32, %1: u64): %2 = const u32 0 ; %3 = icmp eq u32 %0, %2 ; condbr %3, bb1, bb2
+    /// bb1:                   %4 = const u32 7 ; %9 = icmp eq u32 %0, %4 ; br bb3(%9)
+    /// bb2:                   %5 = const u32 9 ; %6 = zext u32 %5 -> u64
+    ///                        %7 = icmp ugt u64 <%6,%1 | %1,%6> ; br bb3(%7)
+    /// bb3(%8: bool):         ret %8
+    /// ```
+    ///
+    /// The comparison's result flows into a `Br` EDGE ARGUMENT, so it is unmarked (built writes
+    /// an arm's tail expression straight into the destination) and ordering rule (1) is not in
+    /// play. `swap` exchanges its operands and changes nothing else — same instructions, same
+    /// block graph, same marked set — so a delay-set difference between the two is that operand
+    /// position and nothing else.
+    fn arm_cast(swap: bool) -> Function {
+        let mut f = Function::new(FuncId::new(0), "arm_cast", FuncTyId::new(0), b(0));
+        let zext = |r: u32, o: u32| {
+            node(
+                Inst::Cast {
+                    op: trust_ir::CastOp::ZExt,
+                    src_ty: Ty::U32,
+                    dst_ty: Ty::U64,
+                    operand: v(o),
+                },
+                Some(r),
+            )
+        };
+        let gt = |r: u32, lhs: u32, rhs: u32| {
+            node(Inst::ICmp { op: ICmpOp::Ugt, ty: Ty::U64, lhs: v(lhs), rhs: v(rhs) }, Some(r))
+        };
+        let mut e = trust_ir::Block::new(b(0));
+        e.params = vec![(v(0), Ty::U32), (v(1), Ty::U64)];
+        e.body = vec![konst(2, 0), icmp(3, 0, 2), condbr(3, 1, 2)];
+        // Both arms COMPUTE, exactly as `min_if`'s do — this fixture is `min_if` with one arm's
+        // comparison fed by a cast, and nothing else.
+        let mut t = trust_ir::Block::new(b(1));
+        t.body = vec![konst(4, 7), icmp(9, 0, 4), br(3, &[9])];
+        let mut el = trust_ir::Block::new(b(2));
+        el.body = vec![
+            konst(5, 9),
+            zext(6, 5),
+            if swap { gt(7, 6, 1) } else { gt(7, 1, 6) },
+            br(3, &[7]),
+        ];
+        let mut j = trust_ir::Block::new(b(3));
+        j.params = vec![(v(8), Ty::Bool)];
+        j.body = vec![ret(&[8])];
+        f.blocks = vec![e, t, el, j];
+        f
+    }
+
+    #[test]
+    fn a_leftmost_cast_in_an_admitted_body_is_not_delayed() {
+        // THE POSITIVE CONTROL for the delay set's one condition. The body is ADMITTED and the
+        // delay set is EMPTY: a leftmost marked operand is the position wave-MF's linear walk
+        // already agrees with built at, so delaying one would move a body that flips today.
+        let plan = accepted(&arm_cast(true));
+        assert!(plan.delayed.is_empty(), "a leftmost marked operand is left exactly where it is");
+        assert!(plan.needs.contains(&v(6)), "the cast still takes built's own operand temp");
+        assert!(plan.sugar.is_empty(), "the condition is a computed result, not the sugar");
+    }
+
+    #[test]
+    fn the_same_admitted_body_with_the_cast_non_leftmost_is_delayed() {
+        // THE TWIN, one operand apart. Both bodies are admitted, so the difference cannot be a
+        // refusal; the only thing that moved is the delay set.
+        let plan = accepted(&arm_cast(false));
+        assert_eq!(plan.delayed, HashSet::from([v(6)]), "the cast is the delayed statement");
+        assert!(plan.needs.contains(&v(6)));
+    }
+
+    #[test]
+    fn a_leftmost_cast_under_a_marked_consumer_is_refused_by_ordering_rule_one() {
+        // `clamp_u32` with the comparison's operands exchanged. The delay is NOT taken (the cast
+        // is leftmost) and the body is then refused OUTRIGHT — by lane K's ordering rule (1), a
+        // marked result taking a marked operand, which this lane did not touch and which already
+        // refuses this shape at HEAD. So there is no flip here for the delay to have moved.
+        assert!(
+            plan_branch_markers(&clamp_u32(true)).is_none(),
+            "a marked result taking a marked operand is ordering rule (1)'s refusal, and it is \
+             not something the delay set may reach around",
+        );
+    }
+
     /// `join_is_head`, verbatim from `probes/mb_joinhead.rs`:
     /// `if (if a == 0 { b } else { c }) == 0 { 1 } else { 2 }`.
     ///
@@ -16050,7 +27043,16 @@ mod checked_plan_tests {
     /// One checked-multiply unit, exactly as the producer emits it: the `Overflow` (two results:
     /// the product and the overflow bit), `Const false`, `Const true`, the `Select` that turns the
     /// bit into an `ok` flag, and the `Assert`.
-    fn mul_unit(res: u32, of: u32, ty: Ty, lhs: u32, rhs: u32, fc: u32, tc: u32, ok: u32) -> Vec<InstrNode> {
+    fn mul_unit(
+        res: u32,
+        of: u32,
+        ty: Ty,
+        lhs: u32,
+        rhs: u32,
+        fc: u32,
+        tc: u32,
+        ok: u32,
+    ) -> Vec<InstrNode> {
         vec![
             InstrNode::new(Inst::Overflow {
                 op: OverflowOp::MulOverflow,
@@ -16107,7 +27109,10 @@ mod checked_plan_tests {
     fn test_plan_two_unit_chain_marks_the_inner_product() {
         assert_eq!(
             plan_checked_markers(&two_unit()),
-            Some(MfCheckedPlan { chain: vec![(v(2), Ty::Usize), (v(8), Ty::Usize)], leaves: vec![] }),
+            Some(MfCheckedPlan {
+                chain: vec![(v(2), Ty::Usize), (v(8), Ty::Usize)],
+                leaves: vec![]
+            }),
             "`256 * 1024` is built's operand temp; `* 1024` is the outermost expression and \
              goes straight into `_0`",
         );
@@ -16150,7 +27155,10 @@ mod checked_plan_tests {
         n.push(ret(&[8]));
         assert_eq!(
             plan_checked_markers(&body(vec![(v(20), Ty::Usize)], n)),
-            Some(MfCheckedPlan { chain: vec![(v(2), Ty::Usize), (v(8), Ty::Usize)], leaves: vec![] }),
+            Some(MfCheckedPlan {
+                chain: vec![(v(2), Ty::Usize), (v(8), Ty::Usize)],
+                leaves: vec![]
+            }),
             "no chain leaf can read a parameter, so a parameter alone is not a marker hazard",
         );
     }
@@ -16171,7 +27179,9 @@ mod checked_plan_tests {
         );
         let defn = format!(
             "fn {}(tcx: TyCtxt<'_>, def: LocalDefId) -> bool {{\n    tcx.{}(def).is_some_and({})\n}}",
-            "checked_params_mint_no_local", "hir_maybe_body_owned_by", "hir_params_are_simple_bindings"
+            "checked_params_mint_no_local",
+            "hir_maybe_body_owned_by",
+            "hir_params_are_simple_bindings"
         );
         assert_eq!(
             src.matches(defn.as_str()).count(),
@@ -16215,10 +27225,7 @@ mod checked_plan_tests {
     fn test_plan_one_unit_with_a_param_leaf_is_admitted() {
         assert_eq!(
             plan_checked_markers(&one_unit_param_leaf()),
-            Some(MfCheckedPlan {
-                chain: vec![(v(2), Ty::U64)],
-                leaves: vec![(v(0), Ty::U64)],
-            }),
+            Some(MfCheckedPlan { chain: vec![(v(2), Ty::U64)], leaves: vec![(v(0), Ty::U64)] }),
             "a parameter read is a `Category::Place` expression, so `as_operand` sends it \
              through `as_temp` and built mints `StorageLive(_2); _2 = copy _1`",
         );
@@ -16257,11 +27264,8 @@ mod checked_plan_tests {
         n.extend(mul_unit(8, 9, Ty::U64, 3, 2, 10, 11, 12));
         n.push(ret(&[8]));
         assert!(
-            plan_checked_markers(&body(
-                vec![(v(0), Ty::U64), (v(1), Ty::U64), (v(2), Ty::U64)],
-                n
-            ))
-            .is_none(),
+            plan_checked_markers(&body(vec![(v(0), Ty::U64), (v(1), Ty::U64), (v(2), Ty::U64)], n))
+                .is_none(),
             "only unit ZERO's leaves are modelled",
         );
     }
@@ -16350,10 +27354,7 @@ mod checked_plan_tests {
         n.extend(mul_unit(2, 3, Ty::Usize, 0, 1, 4, 5, 6));
         n.push(konst(7, Ty::Usize, 1024));
         n.extend(mul_unit(8, 9, Ty::Usize, 2, 7, 10, 11, 12));
-        n.push(node(
-            Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Usize, lhs: v(8), rhs: v(0) },
-            Some(13),
-        ));
+        n.push(node(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Usize, lhs: v(8), rhs: v(0) }, Some(13)));
         n.push(ret(&[8]));
         assert!(
             plan_checked_markers(&body(vec![], n)).is_none(),
@@ -16475,14 +27476,7 @@ mod checked_plan_tests {
     fn test_predict_two_unit_chain_matches_builts_shape() {
         let plan = plan_checked_markers(&two_unit()).expect("in class");
         let got = predict_checked(&two_unit(), &plan).expect("modelled");
-        let want = seen(
-            &[
-                &[St::L(1), St::A],
-                &[St::A, St::Aop(1)],
-                &[St::A, St::D(1)],
-            ],
-            Ty::Usize,
-        );
+        let want = seen(&[&[St::L(1), St::A], &[St::A, St::Aop(1)], &[St::A, St::D(1)]], Ty::Usize);
         assert_eq!(got, want, "first difference: {}", got.first_diff(&want));
     }
 
@@ -17268,12 +28262,7 @@ mod wave_gs_tests {
         let nodes = vec![
             node(Inst::Const { ty: Ty::I64, value: Constant::Int(8) }, Some(1)),
             node(
-                Inst::GEP {
-                    pointee_ty: Ty::U32,
-                    base: v(0),
-                    indices: vec![v(1)],
-                    inbounds: true,
-                },
+                Inst::GEP { pointee_ty: Ty::U32, base: v(0), indices: vec![v(1)], inbounds: true },
                 Some(2),
             ),
             ret(2),
@@ -17337,5 +28326,3295 @@ mod wave_gs_tests {
             err.contains("GEP"),
             "the refusal must name the instruction it has no model for, got {err:?}",
         );
+    }
+}
+
+/// Trust (wave-MC, 2026-08-20): **THE BY-VALUE CALL-CHAIN PLAN AND ITS HALF OF THE LAW.**
+///
+/// The fixture is `clean_kernel::expr::meta::ExprMeta::has_loose_bvars`, transcribed instruction
+/// for instruction from the shipped `clean-kernel` trust-ir dump rather than invented:
+///
+/// ```text
+/// rustcc fn @expr::meta::ExprMeta::has_loose_bvars(functy.432) {
+/// bb0(%0: struct.29):
+///     %1 = call @func.3649(%0)
+///     %2 = const u32 0
+///     %3 = icmp ugt u32 %1, %2
+///     ret %3
+/// }
+/// ```
+///
+/// Before this wave the oracle's verdict on that body was, verbatim from
+/// `clean_kernel.coverage.json`:
+///
+/// ```text
+/// "derived_mir": { "verdict": "agreed", "detail": "5 canonical line(s) identical",
+///                  "markers_exact": false,
+///                  "markers_detail": "markers differ: line 0: built `mk b0.0:live s0:u32` vs
+///                                     derived `<end>`" }
+/// ```
+///
+/// — an EMPTY derived side, which is what 462 of the 463 residual rows crate-wide look like. The
+/// comparator was never the problem; the producer emitted nothing to compare.
+///
+/// The BUILT sequence these tests measure against is `-Zdump-mir=built` on
+/// `crates/trust-thir-lower/probes/mc_call.rs::M::a_call_operand`, which reproduces the fixture's
+/// source shape exactly (a by-value `Copy` struct receiver, a scalar-returning callee, the result
+/// in an `icmp` operand position):
+///
+/// ```text
+/// bb0: StorageLive(_2); StorageLive(_3); _3 = copy _1;
+///      _2 = M::range(move _3) -> [return: bb1, unwind: bb2];
+/// bb1: StorageDead(_3); _0 = Gt(move _2, const 0_u32); StorageDead(_2); return;
+/// ```
+///
+/// So four markers: `mk b0.0:live s0:u32`, `mk b0.0:live s1:<struct>`, `mk b1.0:dead s1`,
+/// `mk b1.1:dead s0`. Every test below is against THAT, never against the emitter.
+#[cfg(test)]
+mod mc_call_tests {
+    use std::collections::HashSet;
+
+    use rustc_abi::FieldIdx;
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{
+        BinOp, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, StructId,
+        Ty, ValueId,
+    };
+
+    use super::mf_gate::{MfSeq, ir_ty_token, marker_kind, observe_with, predict_call};
+    use super::{MfCallPlan, plan_call_markers};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn b(i: u32) -> BlockId {
+        BlockId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn call(r: Option<u32>, args: &[u32]) -> InstrNode {
+        node(
+            Inst::Call { callee: FuncId::new(3649), args: args.iter().map(|a| v(*a)).collect() },
+            r,
+        )
+    }
+
+    /// The receiver type: a one-field `Copy` struct, which is what `ExprMeta` is. Any non-scalar
+    /// token would do — the comparison only needs the two sides to spell the SAME one — but the
+    /// fixture stays faithful to the shipped body.
+    fn recv() -> Ty {
+        Ty::Struct(StructId::new(29))
+    }
+
+    /// `has_loose_bvars`, verbatim from the dump.
+    fn has_loose_bvars() -> Function {
+        let mut f = Function::new(FuncId::new(3650), "has_loose_bvars", FuncTyId::new(432), b(0));
+        let mut e = trust_ir::Block::new(b(0));
+        e.params = vec![(v(0), recv())];
+        e.body = vec![
+            call(Some(1), &[0]),
+            node(Inst::Const { ty: Ty::U32, value: Constant::Int(0) }, Some(2)),
+            node(Inst::ICmp { op: ICmpOp::Ugt, ty: Ty::U32, lhs: v(1), rhs: v(2) }, Some(3)),
+            node(Inst::Return { values: vec![v(3)] }, None),
+        ];
+        f.blocks = vec![e];
+        f
+    }
+
+    #[derive(Clone, Copy)]
+    enum St<'a> {
+        A(&'a [u32]),
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St<'_>]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        St::A(ops) => {
+                            let fields: IndexVec<FieldIdx, Operand<'static>> = ops
+                                .iter()
+                                .map(|l| Operand::Move(Place::from(Local::from_u32(*l))))
+                                .collect();
+                            StatementKind::Assign(Box::new((
+                                Place::from(Local::from_u32(0)),
+                                Rvalue::Aggregate(Box::new(AggregateKind::Tuple), fields),
+                            )))
+                        }
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    fn seen(blocks: &[&[St<'_>]], tys: &[(u32, Ty)]) -> MfSeq {
+        observe_with(&body(blocks), |l| {
+            let t = tys
+                .iter()
+                .find(|(k, _)| Local::from_u32(*k) == l)
+                .map_or(Ty::U32, |(_, t)| t.clone());
+            ir_ty_token(&t)
+        })
+        .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// **BUILT's own sequence**, spelled from the `-Zdump-mir=built` dump quoted on this module.
+    /// `_2` is the call's u32 result temp, `_3` the receiver's struct temp. The `_0 = Gt(move _2,
+    /// const 0)` assign names `_2` as its only bare operand (a constant takes no position), which
+    /// is what fixes `_2`'s use site on this side; `_3` is moved out by the CALL TERMINATOR, which
+    /// `observe` does not walk, so it has none.
+    fn built_sequence() -> MfSeq {
+        seen(
+            &[&[St::L(2), St::L(3), St::A(&[1])], &[St::D(3), St::A(&[2]), St::D(2), St::A(&[4])]],
+            &[(3, recv())],
+        )
+    }
+
+    #[test]
+    fn test_plan_admits_has_loose_bvars_and_marks_only_the_call_result() {
+        let f = has_loose_bvars();
+        let (needs, plan) =
+            plan_call_markers(&f).expect("`self.range() > 0` is inside the call-chain class");
+        assert_eq!(
+            needs,
+            HashSet::from([v(1)]),
+            "only the CALL result takes a temp: the icmp result is the body's tail expression, \
+             which built writes straight into `_0`"
+        );
+        assert_eq!(
+            plan,
+            MfCallPlan { call_nodes: vec![0] },
+            "the one call is at body-node 0, which is the index the emitter asks by"
+        );
+    }
+
+    #[test]
+    fn test_predicted_sequence_is_builts_own() {
+        let f = has_loose_bvars();
+        let (needs, plan) = plan_call_markers(&f).expect("inside the class");
+        let got = predict_call(&f, &plan, Some(&needs)).expect("inside the sequence model");
+        assert_eq!(
+            got,
+            built_sequence(),
+            "the predicted sequence must be BUILT's, block for block and assign for assign"
+        );
+    }
+
+    /// The mutation proof for [`super::SatPerturb::McPlan`], at the level the control acts on.
+    /// Dropping the marked call result from the plan is what `-Ztrust-sat-perturb=mc-plan` does at
+    /// `MfPlans::seal`; here it is done directly, and the predicted sequence — which is also what
+    /// the emitter produces, since both read the plan — stops being built's.
+    #[test]
+    fn test_dropping_the_marked_result_stops_the_sequence_being_builts() {
+        let f = has_loose_bvars();
+        let (_, plan) = plan_call_markers(&f).expect("inside the class");
+        let corrupted: HashSet<ValueId> = HashSet::new();
+        let got = predict_call(&f, &plan, Some(&corrupted)).expect("still inside the model");
+        assert_ne!(
+            got,
+            built_sequence(),
+            "a plan that does not mark the call result must not predict built's sequence — if it \
+             does, the plan is not load-bearing and `markers_exact` is vacuous on this class"
+        );
+    }
+
+    /// A `let` puts the body outside the class. Measured on `probes/mc_call.rs::q7`: built mints a
+    /// named local, a `FakeRead` and a `PlaceMention`, none of which the instruction stream shows.
+    #[test]
+    fn test_a_let_bearing_body_is_refused() {
+        let mut f = has_loose_bvars();
+        f.scopes = Some(Vec::new());
+        assert!(plan_call_markers(&f).is_none(), "the `let` firewall must refuse the body");
+    }
+
+    /// A `Ty::Ptr` receiver is the CLASS BOUNDARY, not an oversight: built spells an autoref
+    /// argument `_2 = &(*_1)` (an `Rvalue::Ref`) and `mf_operand` mints `_2 = copy _1`, so
+    /// admitting it would offer a temp whose rvalue is not built's.
+    #[test]
+    fn test_a_ptr_argument_is_refused() {
+        let mut f = has_loose_bvars();
+        f.blocks[0].params = vec![(v(0), Ty::Ptr)];
+        assert!(
+            plan_call_markers(&f).is_none(),
+            "a by-ref argument is outside the by-VALUE call chain"
+        );
+    }
+
+    /// A call result consumed by another CALL carries no type on either instruction, so the
+    /// predicted side could only spell it `MfTy::Unknown` — a token `observe` never produces, which
+    /// would fail the body closed at the LAW rather than at the plan. It is refused HERE, where the
+    /// refusal costs nothing but a flip the class never had.
+    #[test]
+    fn test_a_call_result_consumed_by_a_call_is_refused() {
+        let mut f = has_loose_bvars();
+        f.blocks[0].body = vec![
+            call(Some(1), &[0]),
+            call(Some(2), &[1]),
+            node(Inst::Return { values: vec![v(2)] }, None),
+        ];
+        assert!(
+            plan_call_markers(&f).is_none(),
+            "an untypable marked result must be refused by the plan"
+        );
+    }
+
+    /// A call-FREE body belongs to `plan_operand_marker_temps`, and the two classes must not both
+    /// claim one body. This is the checked half of the disjointness `MfPlans::seal` asserts.
+    #[test]
+    fn test_a_call_free_body_is_not_this_class() {
+        let mut f = has_loose_bvars();
+        f.blocks[0].body = vec![
+            node(Inst::BinOp { op: BinOp::And, ty: Ty::U32, lhs: v(0), rhs: v(0) }, Some(1)),
+            node(Inst::Const { ty: Ty::U32, value: Constant::Int(0) }, Some(2)),
+            node(Inst::ICmp { op: ICmpOp::Ugt, ty: Ty::U32, lhs: v(1), rhs: v(2) }, Some(3)),
+            node(Inst::Return { values: vec![v(3)] }, None),
+        ];
+        f.blocks[0].params = vec![(v(0), Ty::U32)];
+        assert!(
+            plan_call_markers(&f).is_none(),
+            "a call-free body is the operand plan's, and this one must decline it"
+        );
+    }
+
+    /// A second trust-ir block puts the MIR block indices outside this walk's running count.
+    #[test]
+    fn test_a_multi_block_body_is_refused() {
+        let mut f = has_loose_bvars();
+        f.blocks.push(trust_ir::Block::new(b(1)));
+        assert!(plan_call_markers(&f).is_none(), "the class is one trust-ir block");
+    }
+
+    /// Trust (wave-MC): the NINTH whole-body claim is resolved against the other eight in the ONE
+    /// place that resolves them, and it takes `operand` only after every other plan has declined.
+    /// Without these conjuncts a body could carry two whole-body marker claims at once, which is
+    /// the defect class lane MF-ZERO-3 exists to close.
+    #[test]
+    fn the_call_plan_is_resolved_against_every_other_plan() {
+        let src = include_str!("to_mir.rs");
+        let sealed = format!(
+            "let call = if write.is_none()\n                && !borrow\n                && \
+             payload.is_none()\n                && checked.is_none()\n                && \
+             dr.is_none()\n                && branch.is_none()\n                && \
+             loop_.is_none()\n                && {}(tcx, def)\n            {{\n                \
+             {}(func)",
+            "source_form_admits", "plan_call_markers"
+        );
+        assert_eq!(
+            src.matches(sealed.as_str()).count(),
+            1,
+            "the call-chain plan must be refused when any other plan owns the body"
+        );
+        let owns = format!("Some(({}, plan, hit)) => {{", "needs");
+        assert_eq!(
+            src.matches(owns.as_str()).count(),
+            1,
+            "and when it holds it must OWN `operand`, exactly once"
+        );
+    }
+}
+
+/// Trust (lane EM, 2026-08-21): the call-forward `&str`-LITERAL pair — the CF_STR leg's own
+/// tests, at the level `mc_call_tests` pins wave-MC. The fixture is `probes/em1.rs::e1`
+/// (`fn e1(f: &mut Fmt) -> bool { f.ws("hello") }`), trust-ir verbatim from the laneEM dump and
+/// built MIR verbatim from `-Zdump-mir=built`:
+///
+/// ```text
+/// bb0: StorageLive(_2); _2 = &mut (*_1);
+///      StorageLive(_3); StorageLive(_4); _4 = const "hello"; _3 = &(*_4);
+///      _0 = Fmt::ws(move _2, move _3) -> bb1;
+/// bb1: StorageDead(_3); StorageDead(_2); StorageDead(_4);
+/// ```
+#[cfg(test)]
+mod cf_lit_tests {
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::value::GlobalId;
+    use trust_ir::{
+        BlockId, Constant, FatPtrKind, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId,
+    };
+
+    use super::MfCallFwdPlan;
+    use super::mf_gate::{MfSeq, ir_ty_token, marker_kind, observe_with, predict_call_fwd};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+
+    /// `e1`'s trust-ir, verbatim from the laneEM dump: the `&str` literal spelled as the B2-2
+    /// three-node chain, the receiver forwarded bare, the call result returned.
+    fn e1() -> Function {
+        let mut f = Function::new(FuncId::new(0), "e1", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = vec![(v(0), Ty::Ptr)];
+        e.body = vec![
+            node(Inst::GlobalAddr { global: GlobalId::new(0) }, Some(1)),
+            node(Inst::Const { ty: Ty::U64, value: Constant::Int(5) }, Some(2)),
+            node(
+                Inst::PtrFromParts {
+                    ptr_ty: Ty::FatPtr(FatPtrKind::Str),
+                    metadata_ty: Ty::U64,
+                    data: v(1),
+                    metadata: v(2),
+                },
+                Some(3),
+            ),
+            node(Inst::Call { callee: FuncId::new(7), args: vec![v(0), v(3)] }, Some(4)),
+            node(Inst::Return { values: vec![v(4)] }, None),
+        ];
+        f.blocks = vec![e];
+        f
+    }
+
+    fn plan(lit_swap: bool) -> MfCallFwdPlan {
+        MfCallFwdPlan {
+            args: vec![(v(0), Ty::Ptr), (v(3), Ty::FatPtr(FatPtrKind::Str))],
+            lits: vec![v(3)],
+            lit_swap,
+            fields: vec![],
+            field_drop: false,
+            unit_stmt: false,
+            unit_late: false,
+            pairs: vec![],
+            pair_swap: false,
+            ret_reborrow: false,
+            ret_late: false,
+            post: None,
+            post_ty: Ty::Unit,
+            post_late: false,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum St {
+        A,
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        // Every real assign of this class carries no BARE operand local (the
+                        // reborrows read through projections, the const reads none), so the
+                        // observed keys are all `None`, exactly as the predicted side spells
+                        // them.
+                        St::A => StatementKind::Assign(Box::new((
+                            Place::from(Local::from_u32(0)),
+                            Rvalue::Aggregate(
+                                Box::new(AggregateKind::Tuple),
+                                IndexVec::from_raw(Vec::<Operand<'static>>::new()),
+                            ),
+                        ))),
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    /// **BUILT's own sequence**, spelled from the `-Zdump-mir=built` dump quoted on this module.
+    /// `_2` is the receiver's reborrow temp, `_3` the literal's argument temp, `_4` the
+    /// literal's own local.
+    fn built_sequence() -> MfSeq {
+        let tys =
+            [(2, Ty::Ptr), (3, Ty::FatPtr(FatPtrKind::Str)), (4, Ty::FatPtr(FatPtrKind::Str))];
+        observe_with(
+            &body(&[
+                &[St::L(2), St::A, St::L(3), St::L(4), St::A, St::A],
+                &[St::D(3), St::D(2), St::D(4)],
+            ]),
+            |l| {
+                let t = tys
+                    .iter()
+                    .find(|(k, _)| Local::from_u32(*k) == l)
+                    .map_or(Ty::U64, |(_, t)| t.clone());
+                ir_ty_token(&t)
+            },
+        )
+        .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    #[test]
+    fn test_predicted_lit_sequence_is_builts_own() {
+        let got = predict_call_fwd(&e1(), &plan(false)).expect("inside the sequence model");
+        assert_eq!(
+            got,
+            built_sequence(),
+            "the predicted sequence must be BUILT's — receiver temp live first, then the \
+             lit pair's two lives at one assign ordinal, then dead args reversed, then the \
+             literal local dead LAST"
+        );
+    }
+
+    /// The mutation proof for [`super::SatPerturb::CfLitOrder`], at the level the control acts
+    /// on: with the pair's LIVE order swapped the predicted sequence — which is also what the
+    /// emitter produces, since both read the plan's one `lit_swap` bit — stops being built's.
+    /// The retirement run is what betrays it: the alpha indices assigned at first appearance no
+    /// longer match built's, even though the two locals are same-typed and same-positioned.
+    #[test]
+    fn test_swapping_the_lit_live_order_stops_the_sequence_being_builts() {
+        let got = predict_call_fwd(&e1(), &plan(true)).expect("still inside the model");
+        assert_ne!(
+            got,
+            built_sequence(),
+            "a swapped live order must not predict built's sequence — if it does, the \
+             cf-lit-order control is inert and `markers_exact` is vacuous on this class"
+        );
+    }
+}
+
+/// Trust (wave-WB8, 2026-08-21): the chain-forward plan's own tests, at the level
+/// `cf_lit_tests` pins lane EM. The fixtures are `probes/em3.rs`'s d1/d4 and laneEM's c3,
+/// trust-ir verbatim from the dumps and built MIR verbatim from `-Zdump-mir=built` (quoted
+/// per fixture below).
+#[cfg(test)]
+mod chain_fwd_tests {
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId};
+
+    use super::mf_gate::{MfSeq, ir_ty_token, marker_kind, observe_with, predict_chain_fwd};
+    use super::{ChainSlot, MfChainFwdPlan};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn func(params: &[u32], body: Vec<InstrNode>) -> Function {
+        let mut f = Function::new(FuncId::new(0), "chain", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = params.iter().map(|p| (v(*p), Ty::Ptr)).collect();
+        e.body = body;
+        f.blocks = vec![e];
+        f
+    }
+
+    #[derive(Clone, Copy)]
+    enum St {
+        A,
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        // Every real assign of this class carries no BARE operand local (the
+                        // reborrows read through projections, the bridge reads through a
+                        // projection, the calls move through terminators), so the observed
+                        // keys are all `None`, exactly as the predicted side spells them.
+                        St::A => StatementKind::Assign(Box::new((
+                            Place::from(Local::from_u32(0)),
+                            Rvalue::Aggregate(
+                                Box::new(AggregateKind::Tuple),
+                                IndexVec::from_raw(Vec::<Operand<'static>>::new()),
+                            ),
+                        ))),
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    /// Every local of these fixtures is a reference or an ADT — `Opaque` on the observed
+    /// side, exactly as the predicted side spells a chain slot.
+    fn seq(blocks: &[&[St]]) -> MfSeq {
+        observe_with(&body(blocks), |_| ir_ty_token(&Ty::Ptr))
+            .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// `Ax::fmt` (`f.write_str(self.name())`) — probes/em3.rs d4, built MIR verbatim:
+    ///
+    /// ```text
+    /// bb0: StorageLive(_3); _3 = &mut (*_2);
+    ///      StorageLive(_4); StorageLive(_5); StorageLive(_6); _6 = &(*_1);
+    ///      _5 = Ax::name(move _6) -> bb1;
+    /// bb1: _4 = &(*_5); StorageDead(_6);
+    ///      _0 = Formatter::write_str(move _3, move _4) -> bb2;
+    /// bb2: StorageDead(_4); StorageDead(_3); StorageDead(_5); return;
+    /// ```
+    fn d4() -> Function {
+        func(
+            &[0, 1],
+            vec![
+                node(Inst::Call { callee: FuncId::new(9), args: vec![v(0)] }, Some(2)),
+                node(Inst::Call { callee: FuncId::new(17), args: vec![v(1), v(2)] }, Some(3)),
+                node(Inst::Return { values: vec![v(3)] }, None),
+            ],
+        )
+    }
+    fn d4_plan(ret_swap: bool) -> MfChainFwdPlan {
+        MfChainFwdPlan {
+            slots: vec![ChainSlot::Place(v(1), Ty::Ptr), ChainSlot::Reborrow(v(2))],
+            inners: vec![(0, vec![(v(0), Ty::Ptr)])],
+            final_node: 1,
+            ret_swap,
+        }
+    }
+    fn d4_built() -> MfSeq {
+        seq(&[
+            &[St::L(3), St::A, St::L(4), St::L(5), St::L(6), St::A],
+            &[St::A, St::D(6)],
+            &[St::D(4), St::D(3), St::D(5)],
+        ])
+    }
+
+    #[test]
+    fn test_predicted_reborrow_chain_sequence_is_builts_own() {
+        let got = predict_chain_fwd(&d4(), &d4_plan(false)).expect("inside the sequence model");
+        assert_eq!(
+            got,
+            d4_built(),
+            "the predicted sequence must be BUILT's — the Place temp live-then-assigned \
+             first, the chain pair's two lives before the inner argument temp, the bridge \
+             assign at the successor's position 0, and the final retirement args-reversed \
+             then transit"
+        );
+    }
+
+    /// `Co::needs_recheck` (`self.trust().needs_recheck()`) — probes/em3.rs d1 / laneEM c1,
+    /// built MIR verbatim:
+    ///
+    /// ```text
+    /// bb0: StorageLive(_2); StorageLive(_3); _3 = &(*_1);
+    ///      _2 = Co::trust(move _3) -> bb1;
+    /// bb1: StorageDead(_3); _0 = Ot::needs_recheck(move _2) -> bb2;
+    /// bb2: StorageDead(_2); return;
+    /// ```
+    #[test]
+    fn test_predicted_byvalue_chain_sequence_is_builts_own() {
+        let f = func(
+            &[0],
+            vec![
+                node(Inst::Call { callee: FuncId::new(7), args: vec![v(0)] }, Some(1)),
+                node(Inst::Call { callee: FuncId::new(18), args: vec![v(1)] }, Some(2)),
+                node(Inst::Return { values: vec![v(2)] }, None),
+            ],
+        );
+        let plan = MfChainFwdPlan {
+            slots: vec![ChainSlot::ByValue(v(1))],
+            inners: vec![(0, vec![(v(0), Ty::Ptr)])],
+            final_node: 1,
+            ret_swap: false,
+        };
+        let built = seq(&[&[St::L(2), St::L(3), St::A], &[St::D(3)], &[St::D(2)]]);
+        let got = predict_chain_fwd(&f, &plan).expect("inside the sequence model");
+        assert_eq!(
+            got, built,
+            "a by-value chain slot's temp IS the inner call's destination — one live, no \
+             bridge assign, retired alone in the final run"
+        );
+    }
+
+    /// `c3` (`leq(x.d(), y.d())`) — laneEM's probe, built MIR verbatim:
+    ///
+    /// ```text
+    /// bb0: StorageLive(_3); StorageLive(_4); StorageLive(_5); _5 = &(*_1);
+    ///      _4 = LA::d(move _5) -> bb1;
+    /// bb1: _3 = &(*_4); StorageDead(_5);
+    ///      StorageLive(_6); StorageLive(_7); StorageLive(_8); _8 = &(*_2);
+    ///      _7 = LA::d(move _8) -> bb2;
+    /// bb2: _6 = &(*_7); StorageDead(_8); _0 = leq(move _3, move _6) -> bb3;
+    /// bb3: StorageDead(_6); StorageDead(_3); StorageDead(_7); StorageDead(_4); return;
+    /// ```
+    fn c3() -> Function {
+        func(
+            &[0, 1],
+            vec![
+                node(Inst::Call { callee: FuncId::new(19), args: vec![v(0)] }, Some(2)),
+                node(Inst::Call { callee: FuncId::new(19), args: vec![v(1)] }, Some(3)),
+                node(Inst::Call { callee: FuncId::new(11), args: vec![v(2), v(3)] }, Some(4)),
+                node(Inst::Return { values: vec![v(4)] }, None),
+            ],
+        )
+    }
+    fn c3_plan(ret_swap: bool) -> MfChainFwdPlan {
+        MfChainFwdPlan {
+            slots: vec![ChainSlot::Reborrow(v(2)), ChainSlot::Reborrow(v(3))],
+            inners: vec![(0, vec![(v(0), Ty::Ptr)]), (1, vec![(v(1), Ty::Ptr)])],
+            final_node: 2,
+            ret_swap,
+        }
+    }
+    fn c3_built() -> MfSeq {
+        seq(&[
+            &[St::L(3), St::L(4), St::L(5), St::A],
+            &[St::A, St::D(5), St::L(6), St::L(7), St::L(8), St::A],
+            &[St::A, St::D(8)],
+            &[St::D(6), St::D(3), St::D(7), St::D(4)],
+        ])
+    }
+
+    #[test]
+    fn test_predicted_two_chain_sequence_is_builts_own() {
+        let got = predict_chain_fwd(&c3(), &c3_plan(false)).expect("inside the sequence model");
+        assert_eq!(
+            got,
+            c3_built(),
+            "two Reborrow slots must predict built's LIFO regions — each inner call's temps \
+             retired at its own successor, the final retirement args-reversed THEN transits \
+             reversed"
+        );
+    }
+
+    /// The mutation proof for [`super::SatPerturb::ChainRetOrder`], at the level the control
+    /// acts on: with the final retirement's two runs swapped the predicted sequence — which
+    /// is also what the emitter produces, since both read the plan's one `ret_swap` bit —
+    /// stops being built's. The first-appearance alpha numbering of the swapped run is what
+    /// betrays it.
+    #[test]
+    fn test_swapping_the_final_retirement_runs_stops_the_sequence_being_builts() {
+        for (f, plan, built) in
+            [(d4(), d4_plan(true), d4_built()), (c3(), c3_plan(true), c3_built())]
+        {
+            let got = predict_chain_fwd(&f, &plan).expect("still inside the model");
+            assert_ne!(
+                got, built,
+                "a swapped retirement order must not predict built's sequence — if it does, \
+                 the chain-ret-order control is inert and `markers_exact` is vacuous on this \
+                 class"
+            );
+        }
+    }
+
+    /// A plan whose node indices do not name every call — the trust-ir moved under the plan —
+    /// fails CLOSED rather than predicting a partial sequence.
+    #[test]
+    fn test_a_plan_that_does_not_name_every_call_is_refused() {
+        let f = c3();
+        let mut plan = c3_plan(false);
+        plan.inners.pop();
+        assert!(
+            predict_chain_fwd(&f, &plan).is_err(),
+            "a plan/trust-ir disagreement must fail closed, not walk a partial chain"
+        );
+    }
+
+    /// Trust (wave-WB8): the ELEVENTH whole-body claim is resolved against the other ten in
+    /// the ONE place that resolves them, and it is asked LAST of all. The needle is BUILT
+    /// FROM PARTS so this test's own source never contains it.
+    #[test]
+    fn the_chain_plan_is_resolved_against_every_other_plan() {
+        let src = include_str!("to_mir.rs");
+        let sealed = format!(
+            "let chain = if write.is_none()\n                && !borrow\n                && \
+             payload.is_none()\n                && checked.is_none()\n                && \
+             dr.is_none()\n                && branch.is_none()\n                && \
+             loop_.is_none()\n                && call.is_none()\n                && \
+             operand.is_none()\n                && {}.is_none()",
+            "call_fwd"
+        );
+        assert_eq!(
+            src.matches(sealed.as_str()).count(),
+            1,
+            "the chain-forward plan must be refused when any other plan owns the body"
+        );
+    }
+}
+
+/// Trust (lane S1F, 2026-08-22): the FIELD-projection extension of the call-forward plan — the
+/// model side, and the discipline that ties the model to the emitter.
+#[cfg(test)]
+mod s1f_field_tests {
+    use trust_ir::{
+        BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, Ty, ValueId,
+    };
+
+    use super::mf_gate::predict_call_fwd;
+    use super::{CfPostOp, MfCallFwdPlan, SatPerturb};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+
+    /// `cache::TypeCheckCache::len`'s trust-ir, verbatim from the GAP2 dump: one forwarded
+    /// `Ptr` param, one call, the result returned. The producer cannot tell `self.results.len()`
+    /// from `self.len_inner()` here — both are `%1 = call f(%0); ret %1`.
+    fn a1_len() -> Function {
+        let mut f = Function::new(FuncId::new(0), "a1_len", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = vec![(v(0), Ty::Ptr)];
+        e.body = vec![
+            node(Inst::Call { callee: FuncId::new(7), args: vec![v(0)] }, Some(1)),
+            node(Inst::Return { values: vec![v(1)] }, None),
+        ];
+        f.blocks = vec![e];
+        f
+    }
+
+    /// `env::ext_simp::SimpExtState::contains`: a field receiver AND a bare reference argument,
+    /// `%2 = call f(%0, %1); ret %2`.
+    fn a3_contains() -> Function {
+        let mut f = Function::new(FuncId::new(0), "a3_contains", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = vec![(v(0), Ty::Ptr), (v(1), Ty::Ptr)];
+        e.body = vec![
+            node(Inst::Call { callee: FuncId::new(7), args: vec![v(0), v(1)] }, Some(2)),
+            node(Inst::Return { values: vec![v(2)] }, None),
+        ];
+        f.blocks = vec![e];
+        f
+    }
+
+    fn bare(args: &[u32]) -> MfCallFwdPlan {
+        MfCallFwdPlan {
+            args: args.iter().map(|a| (v(*a), Ty::Ptr)).collect(),
+            lits: vec![],
+            lit_swap: false,
+            fields: vec![],
+            field_drop: false,
+            unit_stmt: false,
+            unit_late: false,
+            pairs: vec![],
+            pair_swap: false,
+            ret_reborrow: false,
+            ret_late: false,
+            post: None,
+            post_ty: Ty::Unit,
+            post_late: false,
+        }
+    }
+
+    /// Trust (lane R53): the POST-OP form, as a plan mutation of the bare forwarder's.
+    fn with_post(mut p: MfCallFwdPlan, k: CfPostOp, ty: Ty, late: bool) -> MfCallFwdPlan {
+        p.post = Some(k);
+        p.post_ty = ty;
+        p.post_late = late;
+        p
+    }
+
+    fn ret_reborrow(mut p: MfCallFwdPlan, late: bool) -> MfCallFwdPlan {
+        p.ret_reborrow = true;
+        p.ret_late = late;
+        p
+    }
+
+    /// The reborrowed-return form wraps the argument pair in the destination temp's pair and
+    /// puts one assign (`_0 = &(*d)`) ahead of every retirement; `<PooledBuilder as
+    /// Deref>::deref`'s trust-ir is `a1_len`'s.
+    #[test]
+    fn the_reborrowed_return_form_wraps_the_argument_pair() {
+        let f = a1_len();
+        let tail = predict_call_fwd(&f, &bare(&[0])).expect("inside the model");
+        let ret = predict_call_fwd(&f, &ret_reborrow(bare(&[0]), false)).expect("inside the model");
+        assert_ne!(tail, ret);
+    }
+
+    /// The mutation proof for [`SatPerturb::CfRetLate`].
+    #[test]
+    fn the_ret_late_control_moves_the_predicted_sequence() {
+        let f = a1_len();
+        let ret = predict_call_fwd(&f, &ret_reborrow(bare(&[0]), false)).expect("inside the model");
+        let late = predict_call_fwd(&f, &ret_reborrow(bare(&[0]), true)).expect("still inside");
+        assert_ne!(ret, late);
+        let src = include_str!("to_mir.rs");
+        let emitted = format!("cx.{}()", "mf_call_fwd_ret_late");
+        assert_eq!(src.matches(emitted.as_str()).count(), 2, "the live site, both branches");
+        assert_eq!(SatPerturb::from_flag("cf-ret-late"), Some(SatPerturb::CfRetLate));
+    }
+
+    /// Trust (lane R53): `WhnfCache::is_empty`'s trust-ir, verbatim from the GAP2 dump —
+    /// `call f(%0); const 0; icmp eq %1, %2; ret %3`. The call's result is NOT the returned
+    /// value, which is what puts the body outside wave-CF's original grammar.
+    fn y1_is_empty() -> Function {
+        let mut f = Function::new(FuncId::new(0), "y1_is_empty", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = vec![(v(0), Ty::Ptr)];
+        e.body = vec![
+            node(Inst::Call { callee: FuncId::new(7), args: vec![v(0)] }, Some(1)),
+            node(Inst::Const { ty: Ty::Usize, value: Constant::Int(0) }, Some(2)),
+            node(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Usize, lhs: v(1), rhs: v(2) }, Some(3)),
+            node(Inst::Return { values: vec![v(3)] }, None),
+        ];
+        f.blocks = vec![e];
+        f
+    }
+
+    /// The POST-OP form is neither the bare forwarder's sequence nor the reborrowed return's:
+    /// it opens ONE more slot before every argument temp and retires it ONE ASSIGN into the
+    /// successor — the only retirement in this whole class that is not at position 0.
+    /// Measured on `probes/r53.rs` y1/y2/y6/y7/y9/y10 and both closure forms.
+    #[test]
+    fn the_post_op_form_is_neither_the_bare_nor_the_reborrowed_sequence() {
+        let f = y1_is_empty();
+        // A POST-FREE plan on a body that HAS a post region fails CLOSED: the two derivations
+        // of the region — the plan's and `predict_call_fwd`'s own re-count — must agree, and a
+        // disagreement costs a flip the class never had rather than shipping a wrong sequence.
+        assert!(predict_call_fwd(&f, &bare(&[0])).is_err(), "post-free plan, post-bearing body");
+        // And the mirror: a post-op plan on wave-CF's own post-free grammar.
+        let bare_body = a1_len();
+        assert!(
+            predict_call_fwd(
+                &bare_body,
+                &with_post(bare(&[0]), CfPostOp::BinLit, Ty::Usize, false)
+            )
+            .is_err(),
+            "post-bearing plan, post-free body"
+        );
+        let post = predict_call_fwd(&f, &with_post(bare(&[0]), CfPostOp::BinLit, Ty::Usize, false))
+            .expect("inside the model");
+        let ret = predict_call_fwd(&bare_body, &ret_reborrow(bare(&[0]), false))
+            .expect("inside the model");
+        let tail = predict_call_fwd(&bare_body, &bare(&[0])).expect("inside the model");
+        assert_ne!(tail, post, "the post-op adds a slot the bare forwarder does not have");
+        assert_ne!(post, ret, "the reborrowed return's assign precedes its retirements");
+    }
+
+    /// The post-op slot's TYPE is part of the sequence: the field form's aggregate is Opaque and
+    /// a scalar return is not, so two bodies that differ only there predict differently. This is
+    /// what makes `call_fwd_source_admits`' non-scalar check for [`CfPostOp::Field`] load-bearing
+    /// rather than decorative.
+    #[test]
+    fn the_post_op_slot_type_is_part_of_the_sequence() {
+        let f = y1_is_empty();
+        let scalar =
+            predict_call_fwd(&f, &with_post(bare(&[0]), CfPostOp::BinLit, Ty::Usize, false))
+                .expect("inside the model");
+        let opaque = predict_call_fwd(&f, &with_post(bare(&[0]), CfPostOp::Field, Ty::Unit, false))
+            .expect("inside the model");
+        assert_ne!(scalar, opaque);
+    }
+
+    /// The mutation proof for [`SatPerturb::CfPostLate`]: opening the destination temp after the
+    /// argument temps moves the predicted sequence, and the emitter reads the SAME bit.
+    #[test]
+    fn the_post_late_control_moves_the_predicted_sequence() {
+        let f = y1_is_empty();
+        let early =
+            predict_call_fwd(&f, &with_post(bare(&[0]), CfPostOp::BinLit, Ty::Usize, false))
+                .expect("inside the model");
+        let late = predict_call_fwd(&f, &with_post(bare(&[0]), CfPostOp::BinLit, Ty::Usize, true))
+            .expect("still inside the model");
+        assert_ne!(early, late);
+        let src = include_str!("to_mir.rs");
+        let emitted = format!("cx.{}()", "mf_call_fwd_post_late");
+        assert_eq!(src.matches(emitted.as_str()).count(), 2, "the live site, both branches");
+        assert_eq!(SatPerturb::from_flag("cf-post-late"), Some(SatPerturb::CfPostLate));
+    }
+
+    fn with_pairs(mut p: MfCallFwdPlan, pairs: &[u32], swap: bool) -> MfCallFwdPlan {
+        p.pairs = pairs.iter().map(|a| v(*a)).collect();
+        p.pair_swap = swap;
+        p
+    }
+
+    /// The explicit-borrow pair adds a second pair per argument and two assigns where the field
+    /// form has one; `<FVarId as Ord>::cmp`'s trust-ir is `a3_contains`'s (two forwarded
+    /// `Ptr` params, one call, the result returned).
+    #[test]
+    fn the_pair_form_is_neither_the_bare_nor_the_field_sequence() {
+        let f = a3_contains();
+        let bare2 = predict_call_fwd(&f, &bare(&[0, 1])).expect("inside the model");
+        let pairs = predict_call_fwd(&f, &with_pairs(bare(&[0, 1]), &[0, 1], false))
+            .expect("inside the model");
+        assert_ne!(bare2, pairs);
+        let one_pair = predict_call_fwd(&f, &with_pairs(bare(&[0, 1]), &[0], false))
+            .expect("inside the model");
+        assert_ne!(one_pair, pairs, "each pair argument contributes its own inner pair");
+    }
+
+    /// The mutation proof for [`SatPerturb::CfPairOrder`]: the 2021 retirement order moves the
+    /// predicted sequence, and the emitter reads the same bit.
+    #[test]
+    fn the_pair_order_control_moves_the_predicted_sequence() {
+        let f = a3_contains();
+        let e2024 = predict_call_fwd(&f, &with_pairs(bare(&[0, 1]), &[0, 1], false))
+            .expect("inside the model");
+        let e2021 = predict_call_fwd(&f, &with_pairs(bare(&[0, 1]), &[0, 1], true))
+            .expect("still inside the model");
+        assert_ne!(e2024, e2021);
+        let src = include_str!("to_mir.rs");
+        let emitted = format!("let cf_pair_swap = cx.{}();", "mf_call_fwd_pair_swap");
+        assert_eq!(src.matches(emitted.as_str()).count(), 1);
+        assert_eq!(SatPerturb::from_flag("cf-pair-order"), Some(SatPerturb::CfPairOrder));
+    }
+
+    /// `<Environment as TrustedEnvExt>::init_quot`'s trust-ir, verbatim from the GAP2 dump:
+    /// `call f(%0); ret` — the unit convention, and the same stream for `{ f(self) }` and
+    /// `{ f(self); }`.
+    fn b1_init_quot() -> Function {
+        let mut f =
+            Function::new(FuncId::new(0), "b1_init_quot", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = vec![(v(0), Ty::Ptr)];
+        e.body = vec![
+            node(Inst::Call { callee: FuncId::new(7), args: vec![v(0)] }, None),
+            node(Inst::Return { values: vec![] }, None),
+        ];
+        f.blocks = vec![e];
+        f
+    }
+
+    fn unit_stmt(mut p: MfCallFwdPlan, late: bool) -> MfCallFwdPlan {
+        p.unit_stmt = true;
+        p.unit_late = late;
+        p
+    }
+
+    /// The statement form adds the `()` temp's pair around the argument pair — first opened,
+    /// last retired (measured `probes/s1f.rs` b1: `live _2; live _3; _3 = &mut (*_1);
+    /// _2 = f(move _3); bb1: dead _3; dead _2; _0 = const ()`) — and the tail form does not.
+    #[test]
+    fn the_unit_statement_form_wraps_the_argument_pair() {
+        let f = b1_init_quot();
+        let tail = predict_call_fwd(&f, &bare(&[0])).expect("inside the model");
+        let stmt = predict_call_fwd(&f, &unit_stmt(bare(&[0]), false)).expect("inside the model");
+        assert_ne!(tail, stmt, "the `()` temp's pair is part of the sequence");
+    }
+
+    /// The mutation proof for [`SatPerturb::CfUnitLate`]: the displaced `StorageLive` moves the
+    /// predicted sequence, and the emitter reads the same bit.
+    #[test]
+    fn the_unit_late_control_moves_the_predicted_sequence() {
+        let f = b1_init_quot();
+        let stmt = predict_call_fwd(&f, &unit_stmt(bare(&[0]), false)).expect("inside the model");
+        let late = predict_call_fwd(&f, &unit_stmt(bare(&[0]), true)).expect("still inside");
+        assert_ne!(stmt, late);
+        let src = include_str!("to_mir.rs");
+        let emitted = format!("cx.{}()", "mf_call_fwd_unit_late");
+        assert_eq!(src.matches(emitted.as_str()).count(), 2, "the live site, both branches");
+        assert_eq!(SatPerturb::from_flag("cf-unit-late"), Some(SatPerturb::CfUnitLate));
+    }
+
+    fn with_fields(mut p: MfCallFwdPlan, fields: &[u32], drop: bool) -> MfCallFwdPlan {
+        p.fields = fields.iter().map(|a| v(*a)).collect();
+        p.field_drop = drop;
+        p
+    }
+
+    /// The field class changes the temp's RVALUE, never its marker SEQUENCE: the predicted walk
+    /// for `self.results.len()` is exactly the bare forward's (`live _2; _2 = ..; call; dead _2`,
+    /// measured `probes/s1f.rs` a1 against `mc_call.rs` b_tail_call).
+    #[test]
+    fn a_field_receiver_predicts_the_bare_forward_sequence() {
+        let f = a1_len();
+        let plain = predict_call_fwd(&f, &bare(&[0])).expect("inside the model");
+        let field = predict_call_fwd(&f, &with_fields(bare(&[0]), &[0], false))
+            .expect("a field plan is inside the model");
+        assert_eq!(plain, field, "a field argument's pair sits exactly where a bare one's does");
+    }
+
+    /// Mixed: field receiver + bare reference argument — two pairs, operand order, reverse
+    /// retirement (measured `probes/s1f.rs` a3: `live _3; _3 = &((*_1).0); live _4;
+    /// _4 = &(*_2); call; dead _4; dead _3`).
+    #[test]
+    fn a_mixed_field_and_bare_body_predicts_two_pairs_in_operand_order() {
+        let f = a3_contains();
+        let plain = predict_call_fwd(&f, &bare(&[0, 1])).expect("inside the model");
+        let mixed = predict_call_fwd(&f, &with_fields(bare(&[0, 1]), &[0], false))
+            .expect("inside the model");
+        assert_eq!(plain, mixed);
+        assert_ne!(
+            predict_call_fwd(&f, &bare(&[0])).expect("inside the model"),
+            mixed,
+            "the second argument's pair is part of the sequence"
+        );
+    }
+
+    /// The mutation proof for [`SatPerturb::CfFieldDrop`], at the level the control acts: with
+    /// the bit set the FIELD slot loses its pair on the predicted side, and a bare slot in the
+    /// same body keeps its own. The emitter reads the same bit (`mf_call_fwd_marks_pair`), so
+    /// the law stays green and the ORACLE is what must refuse.
+    #[test]
+    fn the_field_drop_control_strips_exactly_the_field_pairs() {
+        let f = a3_contains();
+        let dropped = predict_call_fwd(&f, &with_fields(bare(&[0, 1]), &[0], true))
+            .expect("still inside the model");
+        let full = predict_call_fwd(&f, &with_fields(bare(&[0, 1]), &[0], false))
+            .expect("inside the model");
+        assert_ne!(full, dropped, "the control must move the predicted sequence");
+        // The dropped field temp is still MINTED and ASSIGNED (unmarked — today's wave-30
+        // spelling), so the bare argument's pair is the only pair left and its `StorageLive`
+        // sits ONE assign in, not zero: `(block 0, assign 1, live, slot 0)` then
+        // `(block 1, assign 0, dead, slot 0)`. A plan naming only the bare argument would put
+        // the live at assign 0 — a different sequence, and not the one the emitter produces
+        // (measured: the 19 field bodies under `cf-field-drop` stay `agreed`, i.e. the law is
+        // green, and lose exactly their `-O` flip to the oracle).
+        let shown = format!("{dropped:?}");
+        assert_eq!(shown.matches(", true, ").count(), 1, "one live: {shown}");
+        assert_eq!(shown.matches(", false, ").count(), 1, "one dead: {shown}");
+        assert!(shown.contains("(0, 1, true, 0, "), "the live sits one assign in: {shown}");
+        assert!(shown.contains("(1, 0, false, 0, "), "the dead at the successor head: {shown}");
+        let only_bare_arg = predict_call_fwd(&f, &bare(&[1])).expect("inside the model");
+        assert_ne!(dropped, only_bare_arg, "the unmarked field temp still costs an assign");
+    }
+
+    /// The bit is inert on a plan that names no field — `marks_pair` stays total.
+    #[test]
+    fn the_field_drop_bit_is_inert_without_a_field_argument() {
+        let f = a3_contains();
+        let p = with_fields(bare(&[0, 1]), &[], true);
+        assert!(p.marks_pair(v(0)) && p.marks_pair(v(1)));
+        assert_eq!(
+            predict_call_fwd(&f, &p).expect("inside the model"),
+            predict_call_fwd(&f, &bare(&[0, 1])).expect("inside the model")
+        );
+    }
+
+    #[test]
+    fn the_control_has_a_flag() {
+        assert_eq!(SatPerturb::from_flag("cf-field-drop"), Some(SatPerturb::CfFieldDrop));
+    }
+
+    /// Both sides of the marker law read `marks_pair` — the predicted walk and the emitter's
+    /// own marking decision — and neither side reads `field_drop` on its own. The needles are
+    /// BUILT FROM PARTS so this test's own source never contains them.
+    #[test]
+    fn both_sides_of_the_law_read_one_marks_pair_decision() {
+        let src = include_str!("to_mir.rs");
+        let predicted = format!("if !plan.{}(*v) {{", "marks_pair");
+        let emitted = format!("if cx.{}(*a) {{", "mf_call_fwd_marks_pair");
+        assert_eq!(src.matches(predicted.as_str()).count(), 2, "live and dead, once each");
+        assert_eq!(src.matches(emitted.as_str()).count(), 1);
+        let raw = format!("self.{} && self.is_field(v)", "field_drop");
+        assert_eq!(
+            src.matches(raw.as_str()).count(),
+            1,
+            "the bit is consulted in exactly one place — `marks_pair` itself"
+        );
+    }
+}
+
+/// Trust (lane S3, 2026-08-21): the aggregate-of-call-results plan and its walk, as pure
+/// functions over trust-ir — the measured models as fixtures, every refusal beside a
+/// minimally-different admitted sibling, the retirement-order control's mutation proof, and
+/// the M-COR kill (the `field_vals == results` wall).
+#[cfg(test)]
+mod seq_call_tests {
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{BlockId, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId};
+
+    use super::mf_gate::{MfSeq, MfTy, ir_ty_token, marker_kind, observe_with, predict_seq_call};
+    use super::{MfSeqCallPlan, SatPerturb, SeqCallGroup, seq_call_groups};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn call(callee: u32, args: &[u32]) -> InstrNode {
+        InstrNode::new(Inst::Call {
+            callee: FuncId::new(callee),
+            args: args.iter().map(|a| v(*a)).collect(),
+        })
+    }
+    fn ret() -> InstrNode {
+        InstrNode::new(Inst::Return { values: vec![] })
+    }
+    fn func(params: &[(u32, Ty)], body: Vec<InstrNode>) -> Function {
+        let mut f = Function::new(FuncId::new(0), "seq", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = params.iter().map(|(p, t)| (v(*p), t.clone())).collect();
+        e.body = body;
+        f.blocks = vec![e];
+        f
+    }
+    fn plan(groups: &[&[(u32, Ty)]], unit_late: bool) -> MfSeqCallPlan {
+        MfSeqCallPlan {
+            groups: groups
+                .iter()
+                .enumerate()
+                .map(|(k, g)| SeqCallGroup {
+                    node: k,
+                    args: g.iter().map(|(a, t)| (v(*a), t.clone())).collect(),
+                })
+                .collect(),
+            unit_late,
+        }
+    }
+    /// N groups that all take the SAME argument list — the corpus shape. Spelled as a helper
+    /// because `[&[..]; N]` is an array of ARRAY references and does not coerce to a slice of
+    /// SLICE references inside an array repeat.
+    fn plan_n(n: usize, args: &[(u32, Ty)], unit_late: bool) -> MfSeqCallPlan {
+        let g: Vec<&[(u32, Ty)]> = (0..n).map(|_| args).collect();
+        plan(&g, unit_late)
+    }
+
+    /// One statement of a fixture BUILT body. `A` is an assignment with the bare operand locals
+    /// it consumes — a reborrow assign (`_3 = &mut (*_1)`) and the unit body's own
+    /// `_0 = const ()` both consume none, and neither carries a use-site key on either side of
+    /// the law, so `A(&[])` is their faithful stand-in.
+    #[derive(Clone, Copy)]
+    enum St {
+        A(&'static [u32]),
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        St::A(ops) => StatementKind::Assign(Box::new((
+                            Place::from(Local::from_u32(0)),
+                            Rvalue::Aggregate(
+                                Box::new(AggregateKind::Tuple),
+                                ops.iter()
+                                    .map(|l| Operand::Move(Place::from(Local::from_u32(*l))))
+                                    .collect(),
+                            ),
+                        ))),
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    /// The observed side, with each local's declared type spelled by the caller.
+    fn seq(blocks: &[&[St]], ty_of: impl Fn(Local) -> MfTy) -> MfSeq {
+        observe_with(&body(blocks), ty_of)
+            .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// `probes/sc.rs::Env::n3_mut` — `{ self.s1(); self.s2(); self.s3(); }` — the trust-ir the
+    /// producer emits for it, which is `init_bitvec_native_reducers`' shape with one call fewer.
+    fn n3() -> Function {
+        func(&[(0, Ty::Ptr)], vec![call(6974, &[0]), call(6975, &[0]), call(6976, &[0]), ret()])
+    }
+
+    /// BUILT's own MIR for `n3_mut`, verbatim from `-Zdump-mir=built` (2026-08-24, stage0
+    /// rustc, `probes/sc.rs`):
+    ///
+    /// ```text
+    /// bb0: StorageLive(_2); StorageLive(_3); _3 = &mut (*_1);
+    ///      _2 = Env::s1(move _3) -> bb1;
+    /// bb1: StorageDead(_3); StorageDead(_2);
+    ///      StorageLive(_4); StorageLive(_5); _5 = &mut (*_1); _4 = Env::s2(move _5) -> bb2;
+    /// bb2: StorageDead(_5); StorageDead(_4);
+    ///      StorageLive(_6); StorageLive(_7); _7 = &mut (*_1); _6 = Env::s3(move _7) -> bb3;
+    /// bb3: StorageDead(_7); StorageDead(_6); _0 = const (); return;
+    /// ```
+    fn n3_built() -> MfSeq {
+        seq(
+            &[
+                &[St::L(2), St::L(3), St::A(&[])],
+                &[St::D(3), St::D(2), St::L(4), St::L(5), St::A(&[])],
+                &[St::D(5), St::D(4), St::L(6), St::L(7), St::A(&[])],
+                &[St::D(7), St::D(6), St::A(&[])],
+            ],
+            |_| MfTy::Opaque,
+        )
+    }
+
+    /// **THE CLASS'S WHOLE CLAIM**: the predicted sequence is BUILT's, event for event —
+    /// four marker lines per call, the `()` temp opened first and retired last within its group,
+    /// and both the previous group's retirement and the next group's opens at assign ordinal 0
+    /// of the block between them.
+    #[test]
+    fn test_predicted_three_call_sequence_is_builts_own() {
+        let got = predict_seq_call(&n3(), &plan_n(3, &[(0, Ty::Ptr)], false))
+            .expect("inside the sequence model");
+        assert_eq!(
+            got,
+            n3_built(),
+            "the predicted sequence must be BUILT's — per call: live(unit), live(arg), one \
+             assign, then at the successor dead(arg), dead(unit)"
+        );
+    }
+
+    /// The two-call form is the same law with one group fewer — `probes/sc.rs::Env::n2_mut`,
+    /// built verbatim.
+    #[test]
+    fn test_predicted_two_call_sequence_is_builts_own() {
+        let f = func(&[(0, Ty::Ptr)], vec![call(1, &[0]), call(2, &[0]), ret()]);
+        let built = seq(
+            &[
+                &[St::L(2), St::L(3), St::A(&[])],
+                &[St::D(3), St::D(2), St::L(4), St::L(5), St::A(&[])],
+                &[St::D(5), St::D(4), St::A(&[])],
+            ],
+            |_| MfTy::Opaque,
+        );
+        let got = predict_seq_call(&f, &plan_n(2, &[(0, Ty::Ptr)], false))
+            .expect("inside the sequence model");
+        assert_eq!(got, built, "a two-call body is the law with one group fewer");
+    }
+
+    /// **THE GROUP INDEX IS LOAD-BEARING.** Every call in this class passes the SAME value, and
+    /// built mints a DIFFERENT temp for each. A slot named by the value alone would alpha-rename
+    /// the three temps onto one another; this asserts the predicted sequence really carries SIX
+    /// distinct slots (three units, three arguments) by comparing it against built's, whose six
+    /// locals are distinct by construction.
+    #[test]
+    fn test_each_call_gets_its_own_slots() {
+        let got = predict_seq_call(&n3(), &plan_n(3, &[(0, Ty::Ptr)], false))
+            .expect("inside the sequence model");
+        // Six locals, twelve marker lines: one open and one close each.
+        assert_eq!(got.len(), 12, "four marker lines per call, three calls");
+        // If the slots collapsed by value, the observed side (whose locals are distinct) could
+        // not equal the predicted side.
+        assert_eq!(got, n3_built());
+    }
+
+    /// Groups of DIFFERENT arity in one sequence: the retirement run length is per GROUP, not per
+    /// body. Measured verbatim (`probes/sc.rs::n2_mixed_arity`, `{ g2(a, b); g1(b); }`):
+    ///
+    /// ```text
+    /// bb0: StorageLive(_3); StorageLive(_4); _4 = &(*_1); StorageLive(_5); _5 = &(*_2);
+    ///      _3 = g2(move _4, move _5) -> bb1;
+    /// bb1: StorageDead(_5); StorageDead(_4); StorageDead(_3);
+    ///      StorageLive(_6); StorageLive(_7); _7 = &(*_2); _6 = g1(move _7) -> bb2;
+    /// bb2: StorageDead(_7); StorageDead(_6); _0 = const (); return;
+    /// ```
+    #[test]
+    fn test_groups_of_different_arity_keep_their_own_run_lengths() {
+        let f = func(&[(0, Ty::Ptr), (1, Ty::Ptr)], vec![call(1, &[0, 1]), call(2, &[1]), ret()]);
+        let built = seq(
+            &[
+                &[St::L(3), St::L(4), St::A(&[]), St::L(5), St::A(&[])],
+                &[St::D(5), St::D(4), St::D(3), St::L(6), St::L(7), St::A(&[])],
+                &[St::D(7), St::D(6), St::A(&[])],
+            ],
+            |_| MfTy::Opaque,
+        );
+        let p = plan(&[&[(0, Ty::Ptr), (1, Ty::Ptr)], &[(1, Ty::Ptr)]], false);
+        let got = predict_seq_call(&f, &p).expect("inside the sequence model");
+        assert_eq!(got.len(), 10, "3 + 3 marker lines for the two-arg group, 2 + 2 for the one");
+        assert_eq!(got, built, "the run length is the GROUP's arity, not the body's");
+    }
+
+    /// A by-value SCALAR argument takes built's `copy` rather than a reborrow, and its slot is
+    /// typed from the producer's own annotation — so the type component discriminates here where
+    /// the all-pointer corpus shape cannot. Measured verbatim (`probes/sc.rs::Env::n2_scalar`,
+    /// `-Zdump-mir=built`, 2026-08-24):
+    ///
+    /// ```text
+    /// bb0: StorageLive(_3); StorageLive(_4); _4 = &mut (*_1);
+    ///      StorageLive(_5); _5 = copy _2; _3 = Env::t1(move _4, move _5) -> bb1;
+    /// bb1: StorageDead(_5); StorageDead(_4); StorageDead(_3);
+    ///      StorageLive(_6); StorageLive(_7); _7 = &mut (*_1);
+    ///      StorageLive(_8); _8 = copy _2; _6 = Env::t2(move _7, move _8) -> bb2;
+    /// bb2: StorageDead(_8); StorageDead(_7); StorageDead(_6); _0 = const (); return;
+    /// ```
+    #[test]
+    fn test_scalar_argument_slots_carry_the_producers_type() {
+        let f =
+            func(&[(0, Ty::Ptr), (1, Ty::U64)], vec![call(1, &[0, 1]), call(2, &[0, 1]), ret()]);
+        let built = seq(
+            &[
+                &[St::L(3), St::L(4), St::A(&[]), St::L(5), St::A(&[])],
+                &[
+                    St::D(5),
+                    St::D(4),
+                    St::D(3),
+                    St::L(6),
+                    St::L(7),
+                    St::A(&[]),
+                    St::L(8),
+                    St::A(&[]),
+                ],
+                &[St::D(8), St::D(7), St::D(6), St::A(&[])],
+            ],
+            |l| {
+                if l == Local::from_u32(5) || l == Local::from_u32(8) {
+                    ir_ty_token(&Ty::U64)
+                } else {
+                    MfTy::Opaque
+                }
+            },
+        );
+        let p = plan(&[&[(0, Ty::Ptr), (1, Ty::U64)], &[(0, Ty::Ptr), (1, Ty::U64)]], false);
+        let got = predict_seq_call(&f, &p).expect("inside the sequence model");
+        assert_eq!(got, built, "the scalar argument's slot must carry the producer's own type");
+    }
+
+    /// The mutation proof for [`SatPerturb::SeqUnitLate`]: the control really moves the predicted
+    /// sequence, so it is not an inert control. Both components move at once — the first-appearance
+    /// slot in block 0 becomes the argument temp, so the alpha index AND the declared type change.
+    #[test]
+    fn test_the_seq_unit_late_control_moves_the_predicted_sequence() {
+        let early = predict_seq_call(&n3(), &plan_n(3, &[(0, Ty::Ptr)], false))
+            .expect("inside the sequence model");
+        let late = predict_seq_call(&n3(), &plan_n(3, &[(0, Ty::Ptr)], true))
+            .expect("still inside the sequence model");
+        assert_ne!(early, late, "{:?}", SatPerturb::SeqUnitLate);
+        assert_eq!(early.len(), late.len(), "the control moves markers, it does not drop them");
+        assert_eq!(early, n3_built(), "the UNPERTURBED sequence is still built's");
+        assert_ne!(late, n3_built(), "and the perturbed one is not");
+    }
+
+    /// **THE GRAMMAR, AS A TOTAL FUNCTION OF THE INSTRUCTION STREAM.** `seq_call_groups` is the
+    /// trust-ir half of the plan and reads no `TyCtxt`, so every one of its refusals is exercised
+    /// here rather than only by whatever the corpus happens to contain.
+    #[test]
+    fn test_the_trust_ir_grammar_admits_exactly_its_class() {
+        // The class: N >= 2 result-less calls, every argument a block parameter, a value-less
+        // `Return`, no scope table.
+        let ok = seq_call_groups(&n3()).expect("the corpus shape is inside the grammar");
+        assert_eq!(ok.len(), 3);
+        assert_eq!(ok[0].node, 0);
+        assert_eq!(ok[2].args, vec![(v(0), Ty::Ptr)]);
+
+        // N == 1 is lane S1F's class and must NEVER reach this one.
+        let one = func(&[(0, Ty::Ptr)], vec![call(1, &[0]), ret()]);
+        assert!(seq_call_groups(&one).is_none(), "N == 1 is lane S1F's `unit_stmt` class");
+
+        // A lexical `let` scope — the wave-MF firewall.
+        let mut scoped = n3();
+        scoped.scopes = Some(Default::default());
+        assert!(seq_call_groups(&scoped).is_none(), "a scope table refuses every stream plan");
+
+        // A call that DECLARES a result: built binds it and this plan has no model for the read.
+        let with_res = func(
+            &[(0, Ty::Ptr)],
+            vec![
+                call(1, &[0]),
+                InstrNode::new(Inst::Call { callee: FuncId::new(2), args: vec![v(0)] })
+                    .with_result(v(9)),
+                ret(),
+            ],
+        );
+        assert!(seq_call_groups(&with_res).is_none(), "a result-declaring call is refused");
+
+        // A VALUE-BEARING return: a tail expression, not a statement sequence.
+        let mut valued = n3();
+        valued.blocks[0].body.pop();
+        valued.blocks[0].body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
+        assert!(seq_call_groups(&valued).is_none(), "a value-bearing Return is refused");
+
+        // A NULLARY call: the `()` temp with no assign after it, a position never measured.
+        let nullary = func(&[(0, Ty::Ptr)], vec![call(1, &[0]), call(2, &[]), ret()]);
+        assert!(seq_call_groups(&nullary).is_none(), "a nullary call is refused");
+
+        // An argument that is NOT a block parameter — here an instruction result.
+        let not_param = func(
+            &[(0, Ty::Ptr)],
+            vec![
+                InstrNode::new(Inst::Const { ty: Ty::U64, value: trust_ir::Constant::Int(0) })
+                    .with_result(v(7)),
+                call(1, &[7]),
+                call(2, &[7]),
+                ret(),
+            ],
+        );
+        assert!(seq_call_groups(&not_param).is_none(), "a non-parameter argument is refused");
+
+        // The SAME value twice in ONE call: built mints two temps for it and a `(group, value)`
+        // slot cannot name both.
+        let repeated = func(&[(0, Ty::Ptr)], vec![call(1, &[0, 0]), call(2, &[0]), ret()]);
+        assert!(seq_call_groups(&repeated).is_none(), "a repeated argument within one call");
+
+        // ... but the same value ACROSS groups is the NORMAL case and must be admitted: it is
+        // exactly what both corpus bodies do.
+        let across = seq_call_groups(&n3()).expect("the same value across groups is the class");
+        assert!(across.iter().all(|g| g.args == vec![(v(0), Ty::Ptr)]));
+
+        // A body node that is not a call at all.
+        let mixed = func(
+            &[(0, Ty::Ptr)],
+            vec![
+                call(1, &[0]),
+                InstrNode::new(Inst::Const { ty: Ty::U64, value: trust_ir::Constant::Int(0) })
+                    .with_result(v(9)),
+                ret(),
+            ],
+        );
+        assert!(seq_call_groups(&mixed).is_none(), "a non-call body node is refused");
+    }
+
+    /// The perturbation class parses, and it is the one this lane registered.
+    #[test]
+    fn the_seq_unit_late_control_is_a_registered_class() {
+        assert_eq!(super::SatPerturb::from_flag("seq-unit-late"), Some(SatPerturb::SeqUnitLate));
+    }
+
+    /// **THE M-COR CLAUSE.** `predict_seq_call` re-derives the plan's arguments against the
+    /// trust-ir instead of trusting them. `plan_seq_call_markers` builds those arguments FROM the
+    /// trust-ir, so no body this shim can compile reaches the disagreement — the clause is
+    /// vacuous on any corpus and can only be killed here.
+    #[test]
+    fn test_a_plan_whose_arguments_are_not_the_calls_fails_closed() {
+        let f = func(&[(0, Ty::Ptr), (1, Ty::Ptr)], vec![call(1, &[0]), call(2, &[0]), ret()]);
+        // The plan names `%1` where the call passes `%0`.
+        let wrong = plan(&[&[(1, Ty::Ptr)], &[(0, Ty::Ptr)]], false);
+        assert!(
+            predict_seq_call(&f, &wrong).is_err(),
+            "a plan naming an argument the call does not pass must fail closed"
+        );
+        // ... and an ARITY disagreement, the other half of the same clause.
+        let short = plan(&[&[(0, Ty::Ptr), (1, Ty::Ptr)], &[(0, Ty::Ptr)]], false);
+        assert!(
+            predict_seq_call(&f, &short).is_err(),
+            "a plan naming more arguments than the call passes must fail closed"
+        );
+    }
+
+    /// The remaining re-derivation guards, each fail-closed for a shape the plan cannot produce.
+    #[test]
+    fn test_the_re_derivation_guards_fail_closed() {
+        // A group count that is not the body's call count.
+        assert!(predict_seq_call(&n3(), &plan_n(2, &[(0, Ty::Ptr)], false)).is_err());
+        // Groups out of body order.
+        let mut shuffled = plan_n(3, &[(0, Ty::Ptr)], false);
+        shuffled.groups[0].node = 2;
+        shuffled.groups[2].node = 0;
+        assert!(predict_seq_call(&n3(), &shuffled).is_err());
+        // A body node that is not a call.
+        let not_a_call = func(
+            &[(0, Ty::Ptr)],
+            vec![
+                call(1, &[0]),
+                InstrNode::new(Inst::Const { ty: Ty::U64, value: trust_ir::Constant::Int(0) })
+                    .with_result(v(9)),
+                ret(),
+            ],
+        );
+        assert!(predict_seq_call(&not_a_call, &plan_n(2, &[(0, Ty::Ptr)], false)).is_err());
+        // A VALUE-BEARING return: the statement discipline is a unit body's.
+        let mut valued = n3();
+        valued.blocks[0].body.pop();
+        valued.blocks[0].body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
+        assert!(predict_seq_call(&valued, &plan_n(3, &[(0, Ty::Ptr)], false)).is_err());
+        // A single call is lane S1F's class and must never reach this one.
+        let one = func(&[(0, Ty::Ptr)], vec![call(1, &[0]), ret()]);
+        assert!(predict_seq_call(&one, &plan_n(1, &[(0, Ty::Ptr)], false)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod agg_call_tests {
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{
+        BlockId, Constant, EnumId, FuncId, FuncTyId, Function, Inst, InstrNode, StructId, Ty,
+        ValueId,
+    };
+
+    use super::mf_gate::{MfSeq, MfTy, ir_ty_token, marker_kind, observe_with, predict_agg_call};
+    use super::{MfAggCallPlan, agg_call_skeleton};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn call(r: u32, callee: u32, args: &[u32]) -> InstrNode {
+        node(
+            Inst::Call { callee: FuncId::new(callee), args: args.iter().map(|a| v(*a)).collect() },
+            Some(r),
+        )
+    }
+    fn seed(r: u32, sid: u32, n: usize) -> InstrNode {
+        node(
+            Inst::Const {
+                ty: Ty::Struct(StructId::new(sid)),
+                value: Constant::Aggregate(vec![Constant::Int(0); n]),
+            },
+            Some(r),
+        )
+    }
+    fn insert(r: u32, sid: u32, agg: u32, field: u32, value: u32) -> InstrNode {
+        node(
+            Inst::InsertField {
+                ty: Ty::Struct(StructId::new(sid)),
+                aggregate: v(agg),
+                field,
+                value: v(value),
+            },
+            Some(r),
+        )
+    }
+    fn ret(value: u32) -> InstrNode {
+        node(Inst::Return { values: vec![v(value)] }, None)
+    }
+    fn func(params: &[(u32, Ty)], body: Vec<InstrNode>) -> Function {
+        let mut f = Function::new(FuncId::new(0), "agg", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = params.iter().map(|(p, t)| (v(*p), t.clone())).collect();
+        e.body = body;
+        f.blocks = vec![e];
+        f
+    }
+
+    /// The producer's struct table, as the plan reads it: 7 is `Bd { info: Bi, mult: Mu }`
+    /// (two fieldless enums, probes/em3.rs d7), 8 is a three-scalar stats struct
+    /// (`usize, u64, bool`), 9 is a one-field newtype over `usize`, 10 carries a STRUCT-typed
+    /// field, and 11 declares more fields than the body fills.
+    fn fields(sid: StructId) -> Option<Vec<Ty>> {
+        if sid == StructId::new(7) {
+            Some(vec![Ty::Enum(EnumId::new(1)), Ty::Enum(EnumId::new(2))])
+        } else if sid == StructId::new(8) {
+            Some(vec![Ty::Usize, Ty::U64, Ty::Bool])
+        } else if sid == StructId::new(9) {
+            Some(vec![Ty::Usize])
+        } else if sid == StructId::new(10) {
+            Some(vec![Ty::Usize, Ty::Struct(StructId::new(9))])
+        } else if sid == StructId::new(11) {
+            Some(vec![Ty::Usize, Ty::Usize, Ty::Usize])
+        } else {
+            None
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum St {
+        /// The aggregate assign, with its bare operand locals in field order.
+        A(&'static [u32]),
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        St::A(ops) => StatementKind::Assign(Box::new((
+                            Place::from(Local::from_u32(0)),
+                            Rvalue::Aggregate(
+                                Box::new(AggregateKind::Tuple),
+                                ops.iter()
+                                    .map(|l| Operand::Move(Place::from(Local::from_u32(*l))))
+                                    .collect(),
+                            ),
+                        ))),
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    /// The observed side, with each local's declared type spelled by the caller — the finished
+    /// body's `local_decls`, as `observe` reads them.
+    fn seq(blocks: &[&[St]], ty_of: impl Fn(Local) -> MfTy) -> MfSeq {
+        observe_with(&body(blocks), ty_of)
+            .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// `<Bd as Default>::default` — probes/em3.rs d7, built MIR verbatim:
+    ///
+    /// ```text
+    /// bb0: StorageLive(_1); _1 = <Bi as Default>::default() -> bb1;
+    /// bb1: StorageLive(_2); _2 = <Mu as Default>::default() -> bb2;
+    /// bb2: _0 = Bd { info: move _1, mult: move _2 }; StorageDead(_2); StorageDead(_1); return;
+    /// ```
+    fn d7() -> Function {
+        func(
+            &[],
+            vec![
+                call(0, 21, &[]),
+                call(1, 22, &[]),
+                seed(2, 7, 2),
+                insert(3, 7, 2, 0, 0),
+                insert(4, 7, 3, 1, 1),
+                ret(4),
+            ],
+        )
+    }
+    fn d7_plan(ret_swap: bool) -> MfAggCallPlan {
+        MfAggCallPlan {
+            results: vec![v(0), v(1)],
+            call_nodes: vec![0, 1],
+            field_tys: vec![Ty::Enum(EnumId::new(1)), Ty::Enum(EnumId::new(2))],
+            ret_swap,
+        }
+    }
+    fn d7_built() -> MfSeq {
+        seq(&[&[St::L(1)], &[St::L(2)], &[St::A(&[1, 2]), St::D(2), St::D(1)]], |_| MfTy::Opaque)
+    }
+
+    #[test]
+    fn test_predicted_two_field_sequence_is_builts_own() {
+        let got = predict_agg_call(&d7(), &d7_plan(false)).expect("inside the sequence model");
+        assert_eq!(
+            got,
+            d7_built(),
+            "the predicted sequence must be BUILT's — one live at the head of each call's own \
+             block, the aggregate assign consuming both temps in field order, then the \
+             reverse-creation-order retirement"
+        );
+    }
+
+    /// A one-field newtype (`FlatFlags`, `AllocationId`): the same law with one run of length
+    /// one — `bb0: StorageLive(_1); _1 = default() -> bb1; bb1: _0 = S(move _1);
+    /// StorageDead(_1); return` (probes/s3.rs, this lane's dump).
+    #[test]
+    fn test_predicted_one_field_sequence_is_builts_own() {
+        let f = func(&[], vec![call(0, 21, &[]), seed(1, 9, 1), insert(2, 9, 1, 0, 0), ret(2)]);
+        let plan = MfAggCallPlan {
+            results: vec![v(0)],
+            call_nodes: vec![0],
+            field_tys: vec![Ty::Usize],
+            ret_swap: false,
+        };
+        let built = seq(&[&[St::L(1)], &[St::A(&[1]), St::D(1)]], |_| ir_ty_token(&Ty::Usize));
+        let got = predict_agg_call(&f, &plan).expect("inside the sequence model");
+        assert_eq!(got, built, "a one-field body is the law with one run of length one");
+    }
+
+    /// Three scalar fields (`usize, u64, bool` — the stats-struct shape): the slot tokens are
+    /// the producer's field types, so an observed local declared at ANY other scalar — the
+    /// `ptype` attack, a destination minted at the wrong width or signedness — is refused.
+    fn stats() -> Function {
+        func(
+            &[],
+            vec![
+                call(0, 31, &[]),
+                call(1, 31, &[]),
+                call(2, 32, &[]),
+                seed(3, 8, 3),
+                insert(4, 8, 3, 0, 0),
+                insert(5, 8, 4, 1, 1),
+                insert(6, 8, 5, 2, 2),
+                ret(6),
+            ],
+        )
+    }
+    fn stats_plan(ret_swap: bool) -> MfAggCallPlan {
+        MfAggCallPlan {
+            results: vec![v(0), v(1), v(2)],
+            call_nodes: vec![0, 1, 2],
+            field_tys: vec![Ty::Usize, Ty::U64, Ty::Bool],
+            ret_swap,
+        }
+    }
+    fn stats_blocks() -> [&'static [St]; 4] {
+        [&[St::L(1)], &[St::L(2)], &[St::L(3)], &[St::A(&[1, 2, 3]), St::D(3), St::D(2), St::D(1)]]
+    }
+    fn stats_ty(l: Local) -> MfTy {
+        match l.as_u32() {
+            1 => ir_ty_token(&Ty::Usize),
+            2 => ir_ty_token(&Ty::U64),
+            3 => ir_ty_token(&Ty::Bool),
+            _ => MfTy::Opaque,
+        }
+    }
+
+    #[test]
+    fn test_predicted_scalar_fields_carry_the_producers_types() {
+        let got = predict_agg_call(&stats(), &stats_plan(false)).expect("inside the model");
+        assert_eq!(got, seq(&stats_blocks(), stats_ty), "three scalar slots, each at its type");
+        // The same body with the second destination declared `usize` instead of `u64`.
+        let wrong = seq(&stats_blocks(), |l| {
+            if l.as_u32() == 2 { ir_ty_token(&Ty::Usize) } else { stats_ty(l) }
+        });
+        assert_ne!(got, wrong, "a destination minted at another scalar must not compare equal");
+    }
+
+    /// The mutation proof for [`super::SatPerturb::ChainRetOrder`] on this class: with the
+    /// retirement run FORWARD the predicted sequence — which is also what the emitter produces,
+    /// since both read the plan's one `ret_swap` bit — stops being built's. A one-field body
+    /// has one run of length one, where the swap is inert; `MfPlans::seal` therefore never sets
+    /// the bit there, and that is what keeps the control's application count honest.
+    #[test]
+    fn test_swapping_the_retirement_run_stops_the_sequence_being_builts() {
+        let got = predict_agg_call(&d7(), &d7_plan(true)).expect("still inside the model");
+        assert_ne!(got, d7_built(), "a forward retirement must not predict built's sequence");
+        let got = predict_agg_call(&stats(), &stats_plan(true)).expect("still inside the model");
+        assert_ne!(got, seq(&stats_blocks(), stats_ty), "three temps retired forward differ");
+    }
+
+    /// A plan whose node indices do not name every call — the trust-ir moved under the plan —
+    /// fails CLOSED rather than predicting a partial sequence; so does a plan whose calls are
+    /// not the body's leading run.
+    #[test]
+    fn test_a_plan_that_does_not_name_every_call_is_refused() {
+        let mut plan = stats_plan(false);
+        plan.results.pop();
+        plan.call_nodes.pop();
+        plan.field_tys.pop();
+        assert!(predict_agg_call(&stats(), &plan).is_err(), "a partial plan must fail closed");
+        let mut plan = stats_plan(false);
+        plan.call_nodes = vec![0, 2, 1];
+        assert!(predict_agg_call(&stats(), &plan).is_err(), "a reordered plan must fail closed");
+    }
+
+    // ---- the skeleton: every refusal beside its minimally-different admitted sibling ----
+
+    #[test]
+    fn test_skeleton_admits_the_measured_shapes() {
+        let (results, nodes, tys) = agg_call_skeleton(&d7(), &fields).expect("d7 is the class");
+        assert_eq!((results, nodes, tys), (vec![v(0), v(1)], vec![0, 1], d7_plan(false).field_tys));
+        let (results, nodes, tys) = agg_call_skeleton(&stats(), &fields).expect("stats too");
+        assert_eq!(
+            (results, nodes, tys),
+            (vec![v(0), v(1), v(2)], vec![0, 1, 2], vec![Ty::Usize, Ty::U64, Ty::Bool])
+        );
+        let one = func(&[], vec![call(0, 21, &[]), seed(1, 9, 1), insert(2, 9, 1, 0, 0), ret(2)]);
+        assert!(agg_call_skeleton(&one, &fields).is_some(), "one field is the class");
+    }
+
+    /// THE M-COR WALL: the k-th call's result must be field k. A body whose insert chain writes
+    /// the results into the fields PERMUTED (`S { b: g(), a: f() }` written out of order) is
+    /// refused — delete the `field_vals != results` wall and this test is red.
+    #[test]
+    fn test_skeleton_refuses_a_permuted_field_order() {
+        let permuted = func(
+            &[],
+            vec![
+                call(0, 21, &[]),
+                call(1, 22, &[]),
+                seed(2, 7, 2),
+                insert(3, 7, 2, 1, 0),
+                insert(4, 7, 3, 0, 1),
+                ret(4),
+            ],
+        );
+        assert!(
+            agg_call_skeleton(&permuted, &fields).is_none(),
+            "a permuted field order must be refused — the k-th destination is the k-th field"
+        );
+    }
+
+    #[test]
+    fn test_skeleton_refuses_a_call_with_arguments() {
+        let f = func(
+            &[(9, Ty::Ptr)],
+            vec![
+                call(0, 21, &[9]),
+                call(1, 22, &[]),
+                seed(2, 7, 2),
+                insert(3, 7, 2, 0, 0),
+                insert(4, 7, 3, 1, 1),
+                ret(4),
+            ],
+        );
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "an argument is outside the class");
+        assert!(agg_call_skeleton(&d7(), &fields).is_some(), "the sibling without it is admitted");
+    }
+
+    #[test]
+    fn test_skeleton_refuses_a_block_parameter_and_a_non_leading_call() {
+        let f = func(
+            &[(9, Ty::Ptr)],
+            vec![call(0, 21, &[]), seed(1, 9, 1), insert(2, 9, 1, 0, 0), ret(2)],
+        );
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "a parameter is outside the class");
+        // The seed before the call: the call is not the leading run.
+        let f = func(&[], vec![seed(1, 9, 1), call(0, 21, &[]), insert(2, 9, 1, 0, 0), ret(2)]);
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "a call after a non-call is refused");
+    }
+
+    #[test]
+    fn test_skeleton_refuses_a_result_outside_the_chain_and_a_chain_outside_the_calls() {
+        // A third call whose result the chain never consumes.
+        let f = func(
+            &[],
+            vec![
+                call(0, 21, &[]),
+                call(1, 22, &[]),
+                call(5, 23, &[]),
+                seed(2, 7, 2),
+                insert(3, 7, 2, 0, 0),
+                insert(4, 7, 3, 1, 1),
+                ret(4),
+            ],
+        );
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "an unconsumed result is refused");
+        // A field written from a constant rather than a call.
+        let f = func(
+            &[],
+            vec![
+                call(0, 21, &[]),
+                node(Inst::Const { ty: Ty::Usize, value: Constant::Int(0) }, Some(1)),
+                seed(2, 8, 3),
+                insert(3, 8, 2, 0, 0),
+                insert(4, 8, 3, 1, 1),
+                ret(4),
+            ],
+        );
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "a non-call field value is refused");
+    }
+
+    #[test]
+    fn test_skeleton_refuses_a_struct_typed_field_and_an_unknown_struct() {
+        let f = func(
+            &[],
+            vec![
+                call(0, 21, &[]),
+                call(1, 22, &[]),
+                seed(2, 10, 2),
+                insert(3, 10, 2, 0, 0),
+                insert(4, 10, 3, 1, 1),
+                ret(4),
+            ],
+        );
+        assert!(
+            agg_call_skeleton(&f, &fields).is_none(),
+            "a struct-typed marked call destination is an unmeasured admission — refused"
+        );
+        let f = func(&[], vec![call(0, 21, &[]), seed(1, 99, 1), insert(2, 99, 1, 0, 0), ret(2)]);
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "a struct the table lacks is refused");
+        let f = func(&[], vec![call(0, 21, &[]), seed(1, 11, 1), insert(2, 11, 1, 0, 0), ret(2)]);
+        assert!(agg_call_skeleton(&f, &fields).is_none(), "a field-count mismatch is refused");
+    }
+
+    /// Trust (lane S3): the TWELFTH whole-body claim is resolved against the other eleven in
+    /// the ONE place that resolves them, and it is asked LAST of all. The needle is BUILT FROM
+    /// PARTS so this test's own source never contains it.
+    #[test]
+    fn the_agg_call_plan_is_resolved_against_every_other_plan() {
+        let src = include_str!("to_mir.rs");
+        let sealed = format!(
+            "let agg_call = if write.is_none()\n                && !borrow\n                && \
+             payload.is_none()\n                && checked.is_none()\n                && \
+             dr.is_none()\n                && branch.is_none()\n                && \
+             loop_.is_none()\n                && call.is_none()\n                && \
+             operand.is_none()\n                && call_fwd.is_none()\n                && \
+             {}.is_none()",
+            "chain"
+        );
+        assert_eq!(
+            src.matches(sealed.as_str()).count(),
+            1,
+            "the aggregate-of-call-results plan must be refused when any other plan owns the body"
+        );
+    }
+}
+
+/// Trust (lane F8B, 2026-08-23): the DISCRIMINANT-MATCH plan's own unit tests. Each fixture is
+/// built verbatim from the producer's own text dump of the corpus body it stands for, so a
+/// widened grammar or a wrong trampoline table fails a test rather than shipping a body the
+/// oracle then has to catch.
+#[cfg(test)]
+mod switch_ref_marker_plan_tests {
+    use trust_ir::{
+        BlockId, Constant, FuncId, FuncTyId, Function, Inst, InstrNode, SourceSpan, SwitchCase, Ty,
+        ValueId,
+    };
+
+    use super::mf_gate::predict_swr;
+    use super::{SwrArm, SwrSlot, plan_switch_ref_markers};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn b(i: u32) -> BlockId {
+        BlockId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn at(mut n: InstrNode, line: u32, col: u32) -> InstrNode {
+        n.span = Some(SourceSpan { file: 0, line, col });
+        n
+    }
+
+    /// `%k = const bool K; br join(%k)`, stamped at one source position.
+    fn const_arm(
+        id: BlockId,
+        k: u32,
+        val: bool,
+        join: u32,
+        line: u32,
+        col: u32,
+    ) -> trust_ir::Block {
+        let mut a = trust_ir::Block::new(id);
+        a.body = vec![
+            at(node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(val) }, Some(k)), line, col),
+            node(Inst::Br { target: b(join), args: vec![v(k)] }, None),
+        ];
+        a
+    }
+
+    /// The producer's `!%p`: `const false; const true; select %p, f, t; br join(%r)`.
+    fn not_arm(id: BlockId, base: u32, p: u32, join: u32, line: u32, col: u32) -> trust_ir::Block {
+        let (f, t, r) = (base, base + 1, base + 2);
+        let mut a = trust_ir::Block::new(id);
+        a.body = vec![
+            at(
+                node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) }, Some(f)),
+                line,
+                col,
+            ),
+            at(node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(t)), line, col),
+            at(
+                node(
+                    Inst::Select { ty: Ty::Bool, cond: v(p), then_val: v(f), else_val: v(t) },
+                    Some(r),
+                ),
+                line,
+                col,
+            ),
+            node(Inst::Br { target: b(join), args: vec![v(r)] }, None),
+        ];
+        a
+    }
+
+    /// The by-REFERENCE discriminant head: `%a = load enum, ptr %0; %d = extractfield %a, 0;
+    /// switch %d [..]`.
+    fn ref_head(disc: u32, agg: u32, cases: Vec<SwitchCase>, default: u32) -> trust_ir::Block {
+        let mut h = trust_ir::Block::new(b(0));
+        h.params = vec![(v(0), Ty::Ptr)];
+        h.body = vec![
+            at(
+                node(
+                    Inst::Load {
+                        ty: Ty::Enum(trust_ir::EnumId::new(0)),
+                        ptr: v(0),
+                        volatile: false,
+                        align: None,
+                    },
+                    Some(agg),
+                ),
+                1,
+                1,
+            ),
+            at(
+                node(Inst::ExtractField { ty: Ty::U8, aggregate: v(agg), field: 0 }, Some(disc)),
+                1,
+                1,
+            ),
+            at(
+                node(
+                    Inst::Switch {
+                        value: v(disc),
+                        default: b(default),
+                        default_args: vec![],
+                        cases,
+                        exhaustive_enum_unreachable: false,
+                    },
+                    None,
+                ),
+                1,
+                1,
+            ),
+        ];
+        h
+    }
+
+    fn case(value: i128, target: u32) -> SwitchCase {
+        SwitchCase { value: Constant::Int(value), target: b(target), args: vec![] }
+    }
+
+    /// P1 — `cert::types::proof_cert_has_recursive_children`: `!matches!(x, A|B|C)`. THREE
+    /// alternatives of ONE or-pattern candidate plus the wildcard, EVERY arm stamped with the
+    /// macro call's own location, and a JOIN carrying the `!`.
+    fn p1() -> Function {
+        let mut f = Function::new(FuncId::new(0), "p1", FuncTyId::new(1), b(0));
+        let head = ref_head(3, 2, vec![case(0, 1), case(1, 2), case(2, 3)], 4);
+        let mut join = trust_ir::Block::new(b(5));
+        join.params = vec![(v(1), Ty::Bool)];
+        join.body = vec![
+            at(node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) }, Some(20)), 45, 4),
+            at(node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(21)), 45, 4),
+            at(
+                node(
+                    Inst::Select { ty: Ty::Bool, cond: v(1), then_val: v(20), else_val: v(21) },
+                    Some(22),
+                ),
+                45,
+                4,
+            ),
+            node(Inst::Return { values: vec![v(22)] }, None),
+        ];
+        f.blocks = vec![
+            head,
+            const_arm(b(1), 10, true, 5, 45, 5),
+            const_arm(b(2), 11, true, 5, 45, 5),
+            const_arm(b(3), 12, true, 5, 45, 5),
+            const_arm(b(4), 13, false, 5, 45, 5),
+            join,
+        ];
+        f
+    }
+
+    /// P2 — `mode::CleanMode::allows_large_elimination`: four candidates, the SECOND an
+    /// or-pattern whose two alternatives each carry `!from_prop`, the last folded onto the
+    /// default edge, and a bare forwarding join.
+    fn p2() -> Function {
+        let mut f = Function::new(FuncId::new(0), "p2", FuncTyId::new(1), b(0));
+        let mut head = ref_head(4, 3, vec![case(0, 1), case(1, 2), case(4, 3)], 6);
+        head.params = vec![(v(0), Ty::Ptr), (v(1), Ty::Bool)];
+        let mut join = trust_ir::Block::new(b(7));
+        join.params = vec![(v(2), Ty::Bool)];
+        join.body = vec![node(Inst::Return { values: vec![v(2)] }, None)];
+        f.blocks = vec![
+            head,
+            const_arm(b(1), 10, true, 7, 73, 17),
+            not_arm(b(2), 30, 1, 7, 74, 25),
+            not_arm(b(3), 40, 1, 7, 74, 25),
+            const_arm(b(6), 13, true, 7, 77, 17),
+            join,
+        ];
+        f
+    }
+
+    #[test]
+    fn p1_is_admitted_with_two_trampolines_on_the_lowest_alternative() {
+        let p = plan_switch_ref_markers(&p1()).expect("the p1 shape must be admitted");
+        assert_eq!(p.head, b(0));
+        assert_eq!(p.join, b(5));
+        assert_eq!(p.slot, SwrSlot::MatchValue);
+        assert_eq!(p.open_at, vec![b(0)]);
+        assert_eq!(p.close_at, (b(5), 1));
+        assert!(!p.ret_split);
+        // The DEFAULT edge is its own LAST candidate and takes none; the or-pattern's LOWEST
+        // discriminant carries the `goto` AND the shared `falseEdge`, the others nothing.
+        assert_eq!(p.last_arm, b(4));
+        let k = |blk| p.tramps.iter().find(|(x, _)| *x == blk).map_or(0u8, |(_, n)| *n);
+        assert_eq!(k(b(1)), 2);
+        assert_eq!(k(b(2)), 0);
+        assert_eq!(k(b(3)), 0);
+        assert_eq!(k(b(4)), 0);
+        assert_eq!(p.tramps.iter().map(|(_, n)| u32::from(*n)).sum::<u32>(), 2);
+    }
+
+    #[test]
+    fn p2_is_admitted_and_marks_only_the_lowest_or_pattern_alternative() {
+        let p = plan_switch_ref_markers(&p2()).expect("the p2 shape must be admitted");
+        assert_eq!(p.slot, SwrSlot::ArmNot);
+        // Discriminant 1 (block 2) is lower than 4 (block 3), so block 2 stands where built's
+        // real arm body stands and is the ONLY marked one.
+        assert_eq!(p.open_at, vec![b(2)]);
+        assert_eq!(p.close_at, (b(2), 2));
+        let k = |blk| p.tramps.iter().find(|(x, _)| *x == blk).map_or(0u8, |(_, n)| *n);
+        assert_eq!(k(b(1)), 1);
+        assert_eq!(k(b(2)), 2);
+        assert_eq!(k(b(3)), 0);
+        assert_eq!(k(b(6)), 0);
+        assert_eq!(p.arms.iter().filter(|(_, r)| *r == SwrArm::NotParam).count(), 2);
+    }
+
+    /// The two shapes predict DIFFERENT sequences — the hoisted match value opens in the HEAD and
+    /// retires at the join; the `!param` operand temp opens and retires inside ONE arm.
+    #[test]
+    fn the_two_bool_shapes_do_not_predict_the_same_sequence() {
+        let (f1, f2) = (p1(), p2());
+        let s1 = predict_swr(&f1, &plan_switch_ref_markers(&f1).expect("p1")).expect("inside");
+        let s2 = predict_swr(&f2, &plan_switch_ref_markers(&f2).expect("p2")).expect("inside");
+        assert_ne!(s1, s2);
+        assert_eq!(s1.len(), 2);
+        assert_eq!(s2.len(), 2);
+    }
+
+    /// An arm whose `Br` does not carry the arm's own value is a different program.
+    #[test]
+    fn an_arm_that_does_not_forward_its_own_value_is_refused() {
+        let mut f = p1();
+        let Some(Inst::Br { args, .. }) = f.blocks[1].body.last_mut().map(|n| &mut n.inst) else {
+            panic!("the arm's terminator is a br");
+        };
+        *args = vec![v(11)];
+        assert!(plan_switch_ref_markers(&f).is_none());
+    }
+
+    /// The `!` join's `Select` must read the JOIN's own parameter: anything else is not the
+    /// match value and built would not hoist a temp for it.
+    #[test]
+    fn a_not_join_over_something_other_than_the_join_parameter_is_refused() {
+        let mut f = p1();
+        let Some(Inst::Select { cond, .. }) = f.blocks[5].body.get_mut(2).map(|n| &mut n.inst)
+        else {
+            panic!("the join carries the not idiom");
+        };
+        *cond = v(99);
+        assert!(plan_switch_ref_markers(&f).is_none());
+    }
+
+    /// A COMPUTING arm beside a `!` JOIN would mint a SECOND temp, in a block the match-value
+    /// shape does not model — its whole claim is that built materialises exactly one temp for the
+    /// body and hoists it to the head. The fixture is built so that the ONLY thing refusing it is
+    /// that wall: the head really binds the `bool` the arm negates (so the arm grammar admits it),
+    /// and the arm sits at its own source position (so it is its own candidate and the last-group
+    /// rule is not what refuses it either).
+    #[test]
+    fn a_computing_arm_beside_a_not_join_is_refused() {
+        let mut f = p1();
+        f.blocks[0].params.push((v(50), Ty::Bool));
+        f.blocks[2] = not_arm(b(2), 60, 50, 5, 46, 5);
+        assert!(plan_switch_ref_markers(&f).is_none());
+        // and the fixture really is one clause away from admitted: with the arm folded back to a
+        // constant AT THAT SAME POSITION, every other rule passes and the plan holds.
+        f.blocks[2] = const_arm(b(2), 60, true, 5, 46, 5);
+        assert!(plan_switch_ref_markers(&f).is_some());
+    }
+
+    /// TWO non-default candidates at ONE source position make "which is first" undecidable, and
+    /// the table is ordered. Refused rather than guessed.
+    #[test]
+    fn two_non_default_candidates_at_one_source_position_are_refused() {
+        let mut f = p2();
+        // give the first candidate the or-pattern's location, with a DIFFERENT instruction so it
+        // does not merge into that group.
+        f.blocks[1] = const_arm(b(1), 10, false, 7, 74, 25);
+        assert!(plan_switch_ref_markers(&f).is_none());
+    }
+
+    /// A body with no modelled slot keeps today's behaviour byte for byte: no plan, no marker,
+    /// no trampoline.
+    #[test]
+    fn a_body_with_no_marked_slot_is_refused() {
+        let mut f = p2();
+        f.blocks[2] = const_arm(b(2), 30, true, 7, 74, 25);
+        f.blocks[3] = const_arm(b(3), 40, true, 7, 74, 25);
+        assert!(plan_switch_ref_markers(&f).is_none());
+    }
+
+    /// Wave-MF's firewall, consulted first and unchanged.
+    #[test]
+    fn a_body_with_a_lexical_scope_table_is_refused() {
+        let mut f = p1();
+        f.scopes = Some(Default::default());
+        assert!(plan_switch_ref_markers(&f).is_none());
+    }
+
+    /// The perturbation class parses, and it is the one this lane registered.
+    #[test]
+    fn the_swr_tramp_control_is_a_registered_class() {
+        assert_eq!(super::SatPerturb::from_flag("swr-tramp"), Some(super::SatPerturb::SwrTramp));
+    }
+}
+
+/// Trust (lane F8, 2026-08-23): the SWITCH-TO-JOIN plan's own unit tests. The shape is
+/// `probes/f8.rs::c1` — the `cert::cross_project::hex_digit` body at five arms — built verbatim
+/// from the producer's own text dump, so a widened grammar or a wrong trampoline table fails a
+/// test rather than shipping a body the oracle then has to catch.
+#[cfg(test)]
+mod switch_join_marker_plan_tests {
+    use trust_ir::{
+        BinOp, BlockId, Constant, FuncId, FuncTyId, Function, Inst, InstrNode, SourceSpan,
+        SwitchCase, Ty, ValueId,
+    };
+
+    use super::plan_switch_join_markers;
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn b(i: u32) -> BlockId {
+        BlockId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn at(mut n: InstrNode, line: u32, col: u32) -> InstrNode {
+        n.span = Some(SourceSpan { file: 0, line, col });
+        n
+    }
+
+    /// `%k = const char N; br bb2(%k)`, stamped at one source position.
+    fn arm(id: BlockId, k: u32, n: i128, line: u32, col: u32) -> trust_ir::Block {
+        let mut a = trust_ir::Block::new(id);
+        a.body = vec![
+            at(node(Inst::Const { ty: Ty::Char, value: Constant::Int(n) }, Some(k)), line, col),
+            node(Inst::Br { target: b(2), args: vec![v(k)] }, None),
+        ];
+        a
+    }
+
+    /// `bb0(%0: u8): %4 = const u8 15; %3 = and u8 %0, %4; switch %3 [..]`, then five const arms
+    /// and the join — the producer's own `c1` text dump, block for block.
+    fn c1() -> Function {
+        let mut f = Function::new(FuncId::new(0), "c1", FuncTyId::new(1), b(0));
+        let mut head = trust_ir::Block::new(b(0));
+        head.params = vec![(v(0), Ty::U8)];
+        head.body = vec![
+            at(node(Inst::Const { ty: Ty::U8, value: Constant::Int(15) }, Some(4)), 49, 14),
+            at(
+                node(Inst::BinOp { op: BinOp::And, ty: Ty::U8, lhs: v(0), rhs: v(4) }, Some(3)),
+                49,
+                10,
+            ),
+            at(
+                node(
+                    Inst::Switch {
+                        value: v(3),
+                        default: b(1),
+                        default_args: vec![],
+                        cases: vec![
+                            SwitchCase { value: Constant::Int(0), target: b(3), args: vec![] },
+                            SwitchCase { value: Constant::Int(1), target: b(4), args: vec![] },
+                            SwitchCase { value: Constant::Int(2), target: b(5), args: vec![] },
+                            SwitchCase { value: Constant::Int(3), target: b(6), args: vec![] },
+                        ],
+                        exhaustive_enum_unreachable: false,
+                    },
+                    None,
+                ),
+                49,
+                4,
+            ),
+        ];
+        let mut join = trust_ir::Block::new(b(2));
+        join.params = vec![(v(1), Ty::Char)];
+        join.body = vec![node(Inst::Return { values: vec![v(1)] }, None)];
+        f.blocks = vec![
+            head,
+            arm(b(1), 4 + 1, 102, 54, 13),
+            join,
+            arm(b(3), 5 + 1, 48, 50, 13),
+            arm(b(4), 6 + 1, 49, 51, 13),
+            arm(b(5), 7 + 1, 50, 52, 13),
+            arm(b(6), 8 + 1, 51, 53, 13),
+        ];
+        f
+    }
+
+    #[test]
+    fn the_plan_admits_c1_with_one_trampoline_per_non_last_candidate() {
+        let p = plan_switch_join_markers(&c1()).expect("the c1 shape must be admitted");
+        assert_eq!(p.head, b(0));
+        assert_eq!(p.join, b(2));
+        assert_eq!(p.scrutinee, v(3));
+        // The DEFAULT edge is the LAST source candidate (`_ => 'f'`, line 54) and takes none.
+        assert_eq!(p.last_arm, b(1));
+        let k = |blk| p.tramps.iter().find(|(x, _)| *x == blk).map_or(0u8, |(_, n)| *n);
+        assert_eq!(k(b(3)), 1);
+        assert_eq!(k(b(4)), 1);
+        assert_eq!(k(b(5)), 1);
+        assert_eq!(k(b(6)), 1);
+        assert_eq!(k(b(1)), 0);
+        assert_eq!(p.tramps.iter().map(|(_, n)| u32::from(*n)).sum::<u32>(), 4);
+    }
+
+    /// An OR-PATTERN candidate — two arm blocks stamped with ONE arm-expression location — needs
+    /// a `goto` + shared `falseEdge` table this class has not measured. Refused, not grouped.
+    #[test]
+    fn two_arms_at_one_source_position_are_refused() {
+        let mut f = c1();
+        f.blocks[4] = arm(b(4), 7, 48, 50, 13); // same (line, col) as bb3
+        assert!(plan_switch_join_markers(&f).is_none());
+    }
+
+    /// A wildcard that is NOT the last source candidate would put built's missing `falseEdge`
+    /// block somewhere this walk has not modelled.
+    #[test]
+    fn a_default_edge_that_is_not_the_last_candidate_is_refused() {
+        let mut f = c1();
+        f.blocks[1] = arm(b(1), 5, 102, 1, 1); // the default arm now sorts FIRST
+        assert!(plan_switch_join_markers(&f).is_none());
+    }
+
+    /// A BARE-PLACE scrutinee (`match m { .. }` on a param) is the `param_cond`/`match_bool`
+    /// indistinguishability: built marks it with NOTHING. The head must carry exactly one
+    /// result-minting computation.
+    #[test]
+    fn a_head_with_no_computation_is_refused() {
+        let mut f = c1();
+        let Some(Inst::Switch { value, .. }) = f.blocks[0].body.last_mut().map(|n| &mut n.inst)
+        else {
+            panic!("the head's terminator is a switch");
+        };
+        *value = v(0);
+        f.blocks[0].body.remove(1);
+        f.blocks[0].body.remove(0);
+        assert!(plan_switch_join_markers(&f).is_none());
+    }
+
+    /// A COMPUTING arm carries its own temps at positions this walk has not measured.
+    #[test]
+    fn an_arm_that_is_not_one_folded_constant_is_refused() {
+        let mut f = c1();
+        f.blocks[3]
+            .body
+            .insert(0, node(Inst::Const { ty: Ty::U8, value: Constant::Int(1) }, Some(20)));
+        assert!(plan_switch_join_markers(&f).is_none());
+    }
+
+    /// Wave-MF's firewall, consulted first and unchanged.
+    #[test]
+    fn a_body_with_a_lexical_scope_table_is_refused() {
+        let mut f = c1();
+        f.scopes = Some(Default::default());
+        assert!(plan_switch_join_markers(&f).is_none());
+    }
+}
+
+/// Trust (lane G21, 2026-08-25): the SHORT-CIRCUIT-OVER-CALLS class, both halves.
+///
+/// The plan's grammar is exercised by refusal — one named test per clause — and the sequence
+/// model is pinned against a FIXTURE of the derived body whose statement layout is transcribed
+/// from the MEASURED `-Zdump-mir=built` dumps of `probes/g25.rs::V::a1` and `::Summ::a3`
+/// (`scratchpad/laneG21/mirdump-A1/mir/`), block for block. That is what makes these tests a
+/// check on the MODEL rather than a restatement of it: the fixture is built's own discipline, so
+/// a wrong `predict_bc` fails here and not only at the corpus.
+#[cfg(test)]
+mod bc_marker_plan_tests {
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{
+        BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, Ty, ValueId,
+    };
+
+    use super::mf_gate::{MfSeq, MfTy, marker_kind, observe_with, predict_bc};
+    use super::{BcRole, plan_bc_markers};
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn b(i: u32) -> BlockId {
+        BlockId::new(i)
+    }
+    fn node(inst: Inst, result: Option<u32>) -> InstrNode {
+        let n = InstrNode::new(inst);
+        match result {
+            Some(r) => n.with_result(v(r)),
+            None => n,
+        }
+    }
+    fn call(callee: u32, args: &[u32], res: u32) -> InstrNode {
+        node(
+            Inst::Call { callee: FuncId::new(callee), args: args.iter().map(|a| v(*a)).collect() },
+            Some(res),
+        )
+    }
+
+    /// `probes/g25.rs::V::a1` — `self.core(ctx,a,b) || self.core(ctx,b,a)`, the trust-ir the
+    /// producer emits for it, verbatim from `mirdump-A1/ir/g25.trust-ir.txt`; also
+    /// `cert::def_eq::…::try_struct_eta_eq`'s own body, block for block.
+    fn a1() -> Function {
+        let mut f = Function::new(FuncId::new(0), "a1", FuncTyId::new(0), b(0));
+        let mut head = trust_ir::Block::new(b(0));
+        head.params = (0..4).map(|i| (v(i), Ty::Ptr)).collect();
+        head.body = vec![
+            call(1, &[0, 1, 2, 3], 5),
+            node(
+                Inst::CondBr {
+                    cond: v(5),
+                    then_target: b(2),
+                    then_args: vec![],
+                    else_target: b(1),
+                    else_args: vec![],
+                },
+                None,
+            ),
+        ];
+        let mut rhs = trust_ir::Block::new(b(1));
+        rhs.body = vec![
+            call(1, &[0, 1, 3, 2], 6),
+            node(Inst::Br { target: b(3), args: vec![v(6)] }, None),
+        ];
+        let mut konst = trust_ir::Block::new(b(2));
+        konst.body = vec![
+            node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(7)),
+            node(Inst::Br { target: b(3), args: vec![v(7)] }, None),
+        ];
+        let mut join = trust_ir::Block::new(b(3));
+        join.params = vec![(v(4), Ty::Bool)];
+        join.body = vec![node(Inst::Return { values: vec![v(4)] }, None)];
+        f.blocks = vec![head, rhs, konst, join];
+        f
+    }
+
+    /// `probes/g25.rs::Summ::a3` — `!self.has_sorry() && self.trusted_axiom_count() == 0`, the
+    /// POST-OP shape; also `env::sorry_summary::DeclarationTrustSummary::is_fully_verified`'s own
+    /// body (which compares at `usize`; the probe at `u32` — the token is `Scalar` either way and
+    /// the fixture below spells the one the trust-ir here declares).
+    fn a3() -> Function {
+        let mut f = Function::new(FuncId::new(0), "a3", FuncTyId::new(0), b(0));
+        let mut head = trust_ir::Block::new(b(0));
+        head.params = vec![(v(0), Ty::Ptr)];
+        head.body = vec![
+            call(1, &[0], 2),
+            node(
+                Inst::CondBr {
+                    cond: v(2),
+                    then_target: b(2),
+                    then_args: vec![],
+                    else_target: b(1),
+                    else_args: vec![],
+                },
+                None,
+            ),
+        ];
+        let mut rhs = trust_ir::Block::new(b(1));
+        rhs.body = vec![
+            call(2, &[0], 3),
+            node(Inst::Const { ty: Ty::U32, value: Constant::Int(0) }, Some(4)),
+            node(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::U32, lhs: v(3), rhs: v(4) }, Some(5)),
+            node(Inst::Br { target: b(3), args: vec![v(5)] }, None),
+        ];
+        let mut konst = trust_ir::Block::new(b(2));
+        konst.body = vec![
+            node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) }, Some(6)),
+            node(Inst::Br { target: b(3), args: vec![v(6)] }, None),
+        ];
+        let mut join = trust_ir::Block::new(b(3));
+        join.params = vec![(v(1), Ty::Bool)];
+        join.body = vec![node(Inst::Return { values: vec![v(1)] }, None)];
+        f.blocks = vec![head, rhs, konst, join];
+        f
+    }
+
+    /// One statement of a fixture DERIVED body. `A` is an assignment with the bare operand locals
+    /// it consumes — a reborrow assign (`_6 = &(*_1)`) and an edge assign consume none that carry
+    /// a use-site key, so `A(&[])` is their faithful stand-in.
+    #[derive(Clone, Copy)]
+    enum St {
+        A(&'static [u32]),
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        St::A(ops) => StatementKind::Assign(Box::new((
+                            Place::from(Local::from_u32(0)),
+                            Rvalue::Aggregate(
+                                Box::new(AggregateKind::Tuple),
+                                ops.iter()
+                                    .map(|l| Operand::Move(Place::from(Local::from_u32(*l))))
+                                    .collect(),
+                            ),
+                        ))),
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    fn seq(blocks: &[&[St]], ty_of: impl Fn(Local) -> MfTy) -> MfSeq {
+        observe_with(&body(blocks), ty_of)
+            .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    // ---- the plan's grammar, one refusal per clause --------------------------------------
+
+    #[test]
+    fn test_plan_bc_the_measured_or_shape_is_admitted() {
+        let p = plan_bc_markers(&a1()).expect("the `||`-over-calls shape is the class");
+        assert_eq!(p.head, b(0));
+        assert_eq!(p.head_res, v(5));
+        assert_eq!(p.rhs_arm, b(1));
+        assert_eq!(p.const_arm, b(2));
+        assert_eq!(p.join, b(3));
+        assert_eq!(p.head_args.len(), 4);
+        assert_eq!(
+            p.rhs_args.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![v(0), v(1), v(3), v(2)]
+        );
+        assert!(p.rhs_post.is_none());
+        assert_eq!(p.call_role(b(0), 0), Some(BcRole::Head));
+        assert_eq!(p.call_role(b(1), 0), Some(BcRole::Rhs));
+        assert_eq!(p.call_role(b(2), 0), None);
+        assert_eq!(p.call_role(b(1), 1), None);
+    }
+
+    #[test]
+    fn test_plan_bc_the_measured_postop_shape_is_admitted() {
+        let p = plan_bc_markers(&a3()).expect("the `&&`-with-post-op shape is the class");
+        assert_eq!(p.rhs_post, Some(Ty::U32));
+        assert_eq!(p.rhs_res, v(3));
+        // The post-op'd result joins the marked set; the un-post-op'd one does not.
+        assert!(p.branch_plan().needs.contains(&v(3)));
+        assert!(!plan_bc_markers(&a1()).unwrap().branch_plan().needs.contains(&v(6)));
+    }
+
+    #[test]
+    fn test_plan_bc_a_lexical_scope_table_is_refused() {
+        let mut f = a1();
+        f.scopes = Some(Default::default());
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_fifth_block_is_refused() {
+        let mut f = a1();
+        f.blocks.push(trust_ir::Block::new(b(4)));
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_head_that_is_not_a_call_is_refused() {
+        let mut f = a1();
+        f.blocks[0].body[0] =
+            node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(5));
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_condition_that_is_not_the_head_calls_result_is_refused() {
+        let mut f = a1();
+        let Inst::CondBr { cond, .. } = &mut f.blocks[0].body[1].inst else { unreachable!() };
+        *cond = v(0);
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_two_const_arms_are_refused() {
+        let mut f = a1();
+        f.blocks[1].body = vec![
+            node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) }, Some(6)),
+            node(Inst::Br { target: b(3), args: vec![v(6)] }, None),
+        ];
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    /// `expr::kind::arc_eq`'s shape — an arm whose calls FEED one another. That is wave-WB8's
+    /// chain, with in-transit locals and a reborrow bridge this plan has not measured.
+    #[test]
+    fn test_plan_bc_a_second_call_in_the_rhs_arm_is_refused() {
+        let mut f = a1();
+        f.blocks[1].body = vec![
+            call(1, &[0, 1], 6),
+            call(2, &[0], 8),
+            call(3, &[6, 8], 9),
+            node(Inst::Br { target: b(3), args: vec![v(9)] }, None),
+        ];
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_value_passed_twice_to_one_call_is_refused() {
+        let mut f = a1();
+        f.blocks[0].body[0] = call(1, &[0, 0, 2, 3], 5);
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_an_argument_that_is_not_a_head_parameter_is_refused() {
+        let mut f = a1();
+        f.blocks[1].body[0] = call(1, &[0, 1, 3, 5], 6);
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_nullary_call_is_refused() {
+        let mut f = a1();
+        f.blocks[0].body[0] = call(1, &[], 5);
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_join_that_does_more_than_return_its_parameter_is_refused() {
+        let mut f = a1();
+        f.blocks[3]
+            .body
+            .insert(0, node(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }, Some(9)));
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_a_postop_whose_left_operand_is_the_constant_is_refused() {
+        let mut f = a3();
+        let Inst::ICmp { lhs, rhs, .. } = &mut f.blocks[1].body[2].inst else { unreachable!() };
+        std::mem::swap(lhs, rhs);
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    #[test]
+    fn test_plan_bc_an_arm_that_is_also_the_join_is_refused() {
+        let mut f = a1();
+        // `if c { true } else { rhs }` with the JOIN as the const arm's own target: a degenerate
+        // shape whose built block layout this plan has not measured.
+        f.blocks[2].body = vec![node(Inst::Br { target: b(3), args: vec![v(0)] }, None)];
+        assert!(plan_bc_markers(&f).is_none());
+    }
+
+    // ---- the sequence model, against a fixture of BUILT's measured discipline --------------
+
+    /// `V::a1`, verbatim from `-Zdump-mir=built` (`mirdump-A1/mir/g25.{impl#0}-a1…built.after.mir`)
+    /// re-laid onto the DERIVED block map: `0` head, `1` rhs arm, `2` const arm, `3` join, `4` the
+    /// head call's successor (the `switchInt` alone), `5` lane K's trampoline, `6` the rhs call's
+    /// successor. Built's own `_5,_6.._9,_10.._13` are the slots; every marker position is built's.
+    #[test]
+    fn test_predict_bc_reproduces_builts_or_shape_marker_sequence() {
+        use St::{A, D, L};
+        let f = a1();
+        let p = plan_bc_markers(&f).expect("the class");
+        let want = seq(
+            &[
+                &[L(5), L(6), A(&[]), L(7), A(&[]), L(8), A(&[]), L(9), A(&[])],
+                &[
+                    D(9),
+                    D(8),
+                    D(7),
+                    D(6),
+                    L(10),
+                    A(&[]),
+                    L(11),
+                    A(&[]),
+                    L(12),
+                    A(&[]),
+                    L(13),
+                    A(&[]),
+                ],
+                &[D(9), D(8), D(7), D(6), A(&[])],
+                &[D(5), A(&[])],
+                &[],
+                &[],
+                &[D(13), D(12), D(11), D(10), A(&[])],
+            ],
+            |l| if l == Local::from_u32(5) { MfTy::Scalar(0) } else { MfTy::Opaque },
+        );
+        let got = predict_bc(&f, &p).expect("the class predicts its own body");
+        assert_eq!(got, want, "{}", want.first_diff(&got));
+        // Twenty-two markers: five opens in the head, four deads at EACH arm entry, four opens
+        // and four deads for the rhs call, one dead at the join.
+        assert_eq!(got.len(), 22);
+    }
+
+    /// `Summ::a3`, the same way — the POST-OP shape, whose rhs call takes a destination temp that
+    /// retires AFTER the post-op's own assign (built `bb6: StorageDead(_5); _0 = Eq(move _4,
+    /// const 0_u32); StorageDead(_4);`).
+    #[test]
+    fn test_predict_bc_reproduces_builts_postop_marker_sequence() {
+        use St::{A, D, L};
+        let f = a3();
+        let p = plan_bc_markers(&f).expect("the class");
+        let want = seq(
+            &[
+                &[L(2), L(3), A(&[])],
+                &[D(3), L(4), L(5), A(&[])],
+                &[D(3), A(&[])],
+                &[D(2), A(&[])],
+                &[],
+                &[],
+                &[D(5), A(&[4]), D(4)],
+            ],
+            |l| match l.as_u32() {
+                2 => MfTy::Scalar(0),
+                4 => MfTy::Scalar(8),
+                _ => MfTy::Opaque,
+            },
+        );
+        let got = predict_bc(&f, &p).expect("the class predicts its own body");
+        assert_eq!(got, want, "{}", want.first_diff(&got));
+        assert_eq!(got.len(), 9);
+    }
+
+    /// The mutation proof for [`super::SatPerturb::G21RetOrder`]: the control really moves the
+    /// PREDICTED side. A control the model does not move is inert — it would be a flag that
+    /// changes nothing and a report that counts nothing.
+    #[test]
+    fn test_predict_bc_the_sealed_ret_order_control_moves_the_model() {
+        let f = a1();
+        let p = plan_bc_markers(&f).expect("the class");
+        let mut q = p.clone();
+        q.ret_swap = true;
+        let straight = predict_bc(&f, &p).expect("the class predicts its own body");
+        let swapped = predict_bc(&f, &q).expect("the class predicts its own body");
+        assert_ne!(straight, swapped, "{:?}", super::SatPerturb::G21RetOrder);
+        // Same length: a MOVE control exchanges markers, it does not add or drop one.
+        assert_eq!(straight.len(), swapped.len());
+    }
+
+    /// The control is INERT where there is nothing to exchange — a one-argument RHS call. The
+    /// plan therefore never sets the bit there, and `g21_perturb_applied` never counts it.
+    #[test]
+    fn test_predict_bc_the_sealed_ret_order_control_is_inert_at_one_argument() {
+        let f = a3();
+        let p = plan_bc_markers(&f).expect("the class");
+        assert_eq!(p.rhs_args.len(), 1);
+        let mut q = p.clone();
+        q.ret_swap = true;
+        assert_eq!(predict_bc(&f, &p).expect("the class"), predict_bc(&f, &q).expect("the class"));
+    }
+
+    #[test]
+    fn test_the_g21_control_is_a_registered_flag() {
+        assert_eq!(
+            super::SatPerturb::from_flag("g21-ret-order"),
+            Some(super::SatPerturb::G21RetOrder)
+        );
+    }
+
+    /// The two roles' argument temps must not ALPHA-RENAME onto one another: both calls of
+    /// `f(a,b) || f(b,a)` pass the SAME values, and built mints EIGHT distinct locals. A slot
+    /// named by the value alone would make a body that reused four temps compare EQUAL — this
+    /// pins that it does not.
+    #[test]
+    fn test_predict_bc_a_body_that_reused_the_head_temps_is_not_equal() {
+        use St::{A, D, L};
+        let f = a1();
+        let p = plan_bc_markers(&f).expect("the class");
+        let got = predict_bc(&f, &p).expect("the class predicts its own body");
+        let reused = seq(
+            &[
+                &[L(5), L(6), A(&[]), L(7), A(&[]), L(8), A(&[]), L(9), A(&[])],
+                &[D(9), D(8), D(7), D(6), L(6), A(&[]), L(7), A(&[]), L(8), A(&[]), L(9), A(&[])],
+                &[D(9), D(8), D(7), D(6), A(&[])],
+                &[D(5), A(&[])],
+                &[],
+                &[],
+                &[D(9), D(8), D(7), D(6), A(&[])],
+            ],
+            |l| if l == Local::from_u32(5) { MfTy::Scalar(0) } else { MfTy::Opaque },
+        );
+        assert_ne!(got, reused);
+    }
+}
+
+/// Trust (lane G17, 2026-08-25): **THE DEEP UNIT-CHAIN CLASS'S OWN UNIT SUITE** — the grammar's
+/// refusals on synthetic trust-ir, the predicted sequence against BUILT's own dump for both
+/// spellings, and the mutation proof for the class's SAT control.
+///
+/// Every fixture is `probes/g17.rs::c9::{closure#0}`'s shape — which is
+/// `sorry::accounting::record_ay_reconstruction_success::{closure#0}`'s trust-ir node for node,
+/// and `env::decl_add::MmAxiomOnlyGuard::enter::{closure#0}`'s modulo `u32`/`u64` and the
+/// semicolon.
+#[cfg(test)]
+mod unit_chain_tests {
+    use rustc_index::IndexVec;
+    use rustc_middle::mir::{
+        AggregateKind, BasicBlock, BasicBlockData, Local, Operand, Place, Rvalue, SourceInfo,
+        Statement, StatementKind,
+    };
+    use rustc_span::DUMMY_SP;
+    use trust_ir::{BlockId, Constant, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId};
+
+    use super::mf_gate::{MfSeq, MfTy, ir_ty_token, marker_kind, observe_with, predict_unit_chain};
+    use super::{
+        MfUnitChainPlan, SatPerturb, UcCall, UcOperand, unit_chain_callee_ret, unit_chain_calls,
+    };
+
+    /// The corpus body's own callee result annotation, as the producer's ledger records it.
+    fn u64_ledger() -> Vec<crate::CalleeRef> {
+        [10u32, 11].iter().map(|id| ledger_entry(*id, Some(Ty::U64))).collect()
+    }
+
+    fn ledger_entry(id: u32, ret: Option<Ty>) -> crate::CalleeRef {
+        let did = rustc_span::def_id::DefId {
+            krate: rustc_span::def_id::CrateNum::from_u32(1),
+            index: rustc_span::def_id::DefIndex::from_u32(id),
+        };
+        crate::CalleeRef {
+            func_id: FuncId::new(id),
+            is_local: false,
+            def_index: id,
+            def_id: did,
+            def_path: format!("decl{id}"),
+            force_havoc: false,
+            site_def_id: did,
+            site_args: None,
+            ret_ty: ret,
+            ret_ty_conflict: false,
+            is_rust_abi: true,
+        }
+    }
+
+    fn v(i: u32) -> ValueId {
+        ValueId::new(i)
+    }
+    fn call(callee: u32, args: &[u32], res: Option<u32>) -> InstrNode {
+        let mut n = InstrNode::new(Inst::Call {
+            callee: FuncId::new(callee),
+            args: args.iter().map(|a| v(*a)).collect(),
+        });
+        n.results = res.into_iter().map(v).collect();
+        n
+    }
+    fn konst(res: u32, ty: Ty) -> InstrNode {
+        let mut n = InstrNode::new(Inst::Const { ty, value: Constant::Int(1) });
+        n.results = vec![v(res)];
+        n
+    }
+    fn ret(values: &[u32]) -> InstrNode {
+        InstrNode::new(Inst::Return { values: values.iter().map(|x| v(*x)).collect() })
+    }
+    fn func(params: &[(u32, Ty)], body: Vec<InstrNode>) -> Function {
+        let mut f = Function::new(FuncId::new(0), "uc", FuncTyId::new(1), BlockId::new(0));
+        let mut e = trust_ir::Block::new(BlockId::new(0));
+        e.params = params.iter().map(|(p, t)| (v(*p), t.clone())).collect();
+        e.body = body;
+        f.blocks = vec![e];
+        f
+    }
+    /// Every callee records `-> u64`, which is the producer's own annotation for `Cell::get` and
+    /// `saturating_add` in the corpus bodies. The final call's return is never asked for.
+    fn u64_ret(_: FuncId) -> Option<Ty> {
+        Some(Ty::U64)
+    }
+
+    /// `probes/g17.rs::c9::{closure#0}` — `|c| { c.set(c.get().saturating_add(1)); }` — the
+    /// trust-ir the producer emits for it, which is `record_ay_reconstruction_success`'s verbatim:
+    ///
+    /// ```text
+    /// bb0(%0: (), %1: ptr):
+    ///   %2 = call @get(%1)
+    ///   %3 = const u64 1
+    ///   %4 = call @sat_add(%2, %3)
+    ///   call @set(%1, %4)
+    ///   ret
+    /// ```
+    fn corpus() -> Function {
+        func(
+            &[(0, Ty::Unit), (1, Ty::Ptr)],
+            vec![
+                call(10, &[1], Some(2)),
+                konst(3, Ty::U64),
+                call(11, &[2, 3], Some(4)),
+                call(12, &[1, 4], None),
+                ret(&[]),
+            ],
+        )
+    }
+
+    fn plan(unit_stmt: bool, unit_late: bool) -> MfUnitChainPlan {
+        MfUnitChainPlan {
+            calls: unit_chain_calls(&corpus(), &u64_ret).expect("the corpus shape is admitted"),
+            unit_stmt,
+            unit_late,
+        }
+    }
+
+    /// One statement of a fixture BUILT body. `A` is an assignment with the bare operand locals
+    /// it consumes — a reborrow assign (`_4 = &(*_2)`) and the unit body's own `_0 = const ()`
+    /// both consume none, and neither carries a use-site key on either side of the law, so
+    /// `A(&[])` is their faithful stand-in.
+    #[derive(Clone, Copy)]
+    enum St {
+        A(&'static [u32]),
+        L(u32),
+        D(u32),
+    }
+
+    fn body(blocks: &[&[St]]) -> IndexVec<BasicBlock, BasicBlockData<'static>> {
+        let si = SourceInfo::outermost(DUMMY_SP);
+        let mut out: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::new();
+        for blk in blocks {
+            let stmts: Vec<Statement<'static>> = blk
+                .iter()
+                .map(|st| {
+                    let kind = match st {
+                        St::A(ops) => StatementKind::Assign(Box::new((
+                            Place::from(Local::from_u32(0)),
+                            Rvalue::Aggregate(
+                                Box::new(AggregateKind::Tuple),
+                                ops.iter()
+                                    .map(|l| Operand::Move(Place::from(Local::from_u32(*l))))
+                                    .collect(),
+                            ),
+                        ))),
+                        St::L(l) => marker_kind(Local::from_u32(*l), true),
+                        St::D(l) => marker_kind(Local::from_u32(*l), false),
+                    };
+                    Statement::new(si, kind)
+                })
+                .collect();
+            out.push(BasicBlockData::new_stmts(stmts, None, false));
+        }
+        out
+    }
+
+    /// The observed side. `_5` and `_6` are the two `u64` chain temps; every other local here is
+    /// a reference or the statement's `()`, both outside the scalar denotation.
+    fn seq(blocks: &[&[St]]) -> MfSeq {
+        observe_with(&body(blocks), |l: Local| {
+            if l == Local::from_u32(5) || l == Local::from_u32(6) {
+                ir_ty_token(&Ty::U64)
+            } else {
+                MfTy::Opaque
+            }
+        })
+        .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// BUILT's own MIR for `c9::{closure#0}`, verbatim from `-Zdump-mir=built` (2026-08-25,
+    /// through the SEALED CONTROL driver, `probes/g17.rs`):
+    ///
+    /// ```text
+    /// bb0: StorageLive(_3); StorageLive(_4); _4 = &(*_2);
+    ///      StorageLive(_5); StorageLive(_6); StorageLive(_7); _7 = &(*_2);
+    ///      _6 = Cell::<u64>::get(move _7) -> bb1;
+    /// bb1: StorageDead(_7); _5 = saturating_add(move _6, const 1_u64) -> bb2;
+    /// bb2: StorageDead(_6); _3 = Cell::<u64>::set(move _4, move _5) -> bb3;
+    /// bb3: StorageDead(_5); StorageDead(_4); StorageDead(_3); _0 = const (); return;
+    /// ```
+    fn semi_built() -> MfSeq {
+        seq(&[
+            &[St::L(3), St::L(4), St::A(&[]), St::L(5), St::L(6), St::L(7), St::A(&[])],
+            &[St::D(7)],
+            &[St::D(6)],
+            &[St::D(5), St::D(4), St::D(3), St::A(&[])],
+        ])
+    }
+
+    /// BUILT's own MIR for `c8::{closure#0}` — the TAIL-EXPRESSION spelling, verbatim. It differs
+    /// in exactly one thing: no statement `()` temp, and the final call writes `_0`.
+    ///
+    /// ```text
+    /// bb0: StorageLive(_3); _3 = &(*_2);
+    ///      StorageLive(_4); StorageLive(_5); StorageLive(_6); _6 = &(*_2);
+    ///      _5 = Cell::<u32>::get(move _6) -> bb1;
+    /// bb1: StorageDead(_6); _4 = saturating_add(move _5, const 1_u32) -> bb2;
+    /// bb2: StorageDead(_5); _0 = Cell::<u32>::set(move _3, move _4) -> bb3;
+    /// bb3: StorageDead(_4); StorageDead(_3); return;
+    /// ```
+    fn tail_built() -> MfSeq {
+        observe_with(
+            &body(&[
+                &[St::L(3), St::A(&[]), St::L(4), St::L(5), St::L(6), St::A(&[])],
+                &[St::D(6)],
+                &[St::D(5)],
+                &[St::D(4), St::D(3)],
+            ]),
+            |l: Local| {
+                if l == Local::from_u32(4) || l == Local::from_u32(5) {
+                    ir_ty_token(&Ty::U64)
+                } else {
+                    MfTy::Opaque
+                }
+            },
+        )
+        .expect("the fixture body is inside the marker channel's fragment")
+    }
+
+    /// **THE CLASS'S WHOLE CLAIM, `Semi` SPELLING**: the predicted sequence is BUILT's, event for
+    /// event — the `()` temp first, the outermost call's operands then each inner call's
+    /// descending, the folded literal minting nothing, and each call's own temps retired at its
+    /// successor in reverse operand order with the `()` temp last.
+    #[test]
+    fn test_predicted_deep_unit_chain_is_builts_own_semi() {
+        let got = predict_unit_chain(&corpus(), &plan(true, false)).expect("inside the model");
+        assert_eq!(got, semi_built());
+        assert_eq!(got.len(), 10, "five temps, ten marker lines");
+    }
+
+    /// **THE SAME CLAIM, TAIL-EXPRESSION SPELLING** — eight marker lines, and the ONE bit that
+    /// separates the two is `unit_stmt`, which only the SOURCE side can see.
+    #[test]
+    fn test_predicted_deep_unit_chain_is_builts_own_tail() {
+        let got = predict_unit_chain(&corpus(), &plan(false, false)).expect("inside the model");
+        assert_eq!(got, tail_built());
+        assert_eq!(got.len(), 8, "four temps, eight marker lines");
+    }
+
+    /// The mutation proof for [`SatPerturb::UcUnitLate`]: the control really moves the predicted
+    /// sequence, so a class that ships it green is a class the ORACLE had to reject.
+    #[test]
+    fn test_the_uc_unit_late_control_moves_the_predicted_sequence() {
+        let early = predict_unit_chain(&corpus(), &plan(true, false)).expect("inside the model");
+        let late = predict_unit_chain(&corpus(), &plan(true, true)).expect("inside the model");
+        assert_ne!(early, late, "{:?}", SatPerturb::UcUnitLate);
+        assert_eq!(early.len(), late.len(), "a MOVE, not a drop");
+    }
+
+    /// The control is a REGISTERED class — a perturbation the flag cannot select is inert.
+    #[test]
+    fn the_uc_unit_late_control_is_a_registered_class() {
+        assert_eq!(SatPerturb::from_flag("uc-unit-late"), Some(SatPerturb::UcUnitLate));
+    }
+
+    /// The corpus shape is INSIDE the grammar, and the plan it yields is the one the two sides
+    /// of the law read: three calls, one folded literal, the repeated parameter kept apart by
+    /// the `(call, operand)` key.
+    #[test]
+    fn test_the_corpus_shape_is_inside_the_grammar() {
+        let calls = unit_chain_calls(&corpus(), &u64_ret).expect("inside the grammar");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].args, vec![UcOperand::Place(v(1), Ty::Ptr)]);
+        assert_eq!(calls[1].args, vec![UcOperand::Chain(v(2)), UcOperand::Lit(v(3))]);
+        assert_eq!(calls[2].args, vec![UcOperand::Place(v(1), Ty::Ptr), UcOperand::Chain(v(4))]);
+        assert_eq!(calls[2].result, None, "the final call declares no result");
+        assert_eq!(calls[0].ret_ty, Some(Ty::U64), "typed from the producer's own functy table");
+        assert_eq!(calls[2].ret_ty, None, "the final call's return is never asked for");
+    }
+
+    /// A folded literal mints NO slot, on the plan's own answer — the one fact that keeps the
+    /// predicted opening run one event shorter than the operand count.
+    #[test]
+    fn test_a_folded_literal_carries_no_slot() {
+        let p = plan(true, false);
+        assert!(p.marks_arg(1, 0), "the chain operand is marked");
+        assert!(!p.marks_arg(1, 1), "the folded literal is not");
+        assert!(p.marks_arg(2, 0) && p.marks_arg(2, 1));
+        assert!(!p.marks_arg(3, 0), "there is no fourth call");
+    }
+
+    /// The wave-MF firewall, unchanged: a lexical `let` scope puts the body outside every
+    /// instruction-stream plan.
+    #[test]
+    fn test_a_scope_table_refuses_the_class() {
+        let mut f = corpus();
+        f.scopes = Some(Vec::new());
+        assert!(unit_chain_calls(&f, &u64_ret).is_none());
+    }
+
+    /// A VALUE-BEARING return is a tail-expression destination discipline this plan has not
+    /// measured — wave-CF's and wave-WB8's grammar, not this one.
+    #[test]
+    fn test_a_value_bearing_return_refuses_the_class() {
+        let f = func(
+            &[(0, Ty::Unit), (1, Ty::Ptr)],
+            vec![call(10, &[1], Some(2)), konst(3, Ty::U64), call(11, &[2, 3], Some(4)), ret(&[4])],
+        );
+        assert!(unit_chain_calls(&f, &u64_ret).is_none());
+    }
+
+    /// ONE call is wave-CF's `unit_stmt` class, which already flips. The gate is the whole reason
+    /// nothing currently flipping can move.
+    #[test]
+    fn test_one_call_is_wave_cfs_class_and_is_refused() {
+        let f = func(&[(1, Ty::Ptr)], vec![call(12, &[1], None), ret(&[])]);
+        assert!(unit_chain_calls(&f, &u64_ret).is_none());
+    }
+
+    /// A RESULT-LESS interior call is lane SC's statement-sequence class; a RESULT-DECLARING
+    /// final call is a bound value this plan has no marker model for.
+    #[test]
+    fn test_the_result_arities_are_both_refused_the_other_way_round() {
+        let seq_shape =
+            func(&[(1, Ty::Ptr)], vec![call(10, &[1], None), call(12, &[1], None), ret(&[])]);
+        assert!(unit_chain_calls(&seq_shape, &u64_ret).is_none(), "lane SC's class");
+        let bound = func(
+            &[(1, Ty::Ptr)],
+            vec![call(10, &[1], Some(2)), call(12, &[1, 2], Some(5)), ret(&[])],
+        );
+        assert!(unit_chain_calls(&bound, &u64_ret).is_none(), "a result-declaring final call");
+    }
+
+    /// The chain must be STRICTLY LINEAR: a link consumed by a call that is not the immediately
+    /// following one has an opening run this walk does not model.
+    #[test]
+    fn test_a_non_adjacent_chain_link_refuses_the_class() {
+        let f = func(
+            &[(1, Ty::Ptr)],
+            vec![
+                call(10, &[1], Some(2)),
+                call(11, &[1], Some(4)),
+                call(12, &[2, 4], None),
+                ret(&[]),
+            ],
+        );
+        assert!(unit_chain_calls(&f, &u64_ret).is_none(), "%2 skips the next call");
+    }
+
+    /// A `Place` operand AFTER the chain operand would open its temp in a LATER MIR block —
+    /// the delayed discipline this plan has not measured.
+    #[test]
+    fn test_a_place_after_the_chain_operand_refuses_the_class() {
+        let f = func(
+            &[(1, Ty::Ptr), (5, Ty::Ptr)],
+            vec![call(10, &[1], Some(2)), call(12, &[2, 5], None), ret(&[])],
+        );
+        assert!(unit_chain_calls(&f, &u64_ret).is_none());
+    }
+
+    /// A parameter repeated WITHIN one call is two temps the SOURCE side cannot tell apart;
+    /// ACROSS calls is the corpus's own shape and is exactly what the call index keeps apart.
+    #[test]
+    fn test_a_parameter_repeated_within_one_call_refuses_the_class() {
+        let f = func(
+            &[(1, Ty::Ptr)],
+            vec![call(10, &[1], Some(2)), call(12, &[1, 1, 2], None), ret(&[])],
+        );
+        assert!(unit_chain_calls(&f, &u64_ret).is_none());
+        assert!(
+            unit_chain_calls(&corpus(), &u64_ret).is_some(),
+            "the SAME parameter across two calls is admitted"
+        );
+    }
+
+    /// Every non-chain, non-literal argument is a REFERENCE block parameter: the emitter's
+    /// per-argument model is the reborrow `t = &[mut](*_p)`.
+    #[test]
+    fn test_a_by_value_or_non_parameter_argument_refuses_the_class() {
+        let byval =
+            func(&[(1, Ty::U64)], vec![call(10, &[1], Some(2)), call(12, &[1, 2], None), ret(&[])]);
+        assert!(unit_chain_calls(&byval, &u64_ret).is_none(), "a by-value parameter");
+        let stray =
+            func(&[(1, Ty::Ptr)], vec![call(10, &[1], Some(2)), call(12, &[9, 2], None), ret(&[])]);
+        assert!(unit_chain_calls(&stray, &u64_ret).is_none(), "a non-parameter argument");
+    }
+
+    /// A literal nothing consumes is a node the walk emits nothing for; a NON-scalar constant is
+    /// wave-CF-STR's two-local shape or lane S3's aggregate, neither of them modelled here.
+    #[test]
+    fn test_the_literal_refusals() {
+        let unused = func(
+            &[(1, Ty::Ptr)],
+            vec![call(10, &[1], Some(2)), konst(3, Ty::U64), call(12, &[1, 2], None), ret(&[])],
+        );
+        assert!(unit_chain_calls(&unused, &u64_ret).is_none(), "an unconsumed literal");
+        let nonscalar = func(
+            &[(1, Ty::Ptr)],
+            vec![
+                call(10, &[1], Some(2)),
+                konst(3, Ty::Ptr),
+                call(11, &[2, 3], Some(4)),
+                call(12, &[1, 4], None),
+                ret(&[]),
+            ],
+        );
+        assert!(unit_chain_calls(&nonscalar, &u64_ret).is_none(), "a non-scalar literal");
+    }
+
+    /// The chain temp's declared type comes from the producer's own function-type table. A
+    /// callee with no single declared return, or one outside the scalar denotation, refuses the
+    /// plan rather than leaving the predicted side to guess.
+    #[test]
+    fn test_a_callee_without_a_scalar_declared_return_refuses_the_class() {
+        assert!(unit_chain_calls(&corpus(), &|_| None).is_none(), "no declared return");
+        assert!(
+            unit_chain_calls(&corpus(), &|_| Some(Ty::Ptr)).is_none(),
+            "a declared return outside the scalar denotation"
+        );
+    }
+
+    /// The predicted side RE-DERIVES the plan against the instruction stream: a plan whose calls
+    /// do not name the body's own nodes places markers the emitter never emits, and fails CLOSED.
+    #[test]
+    fn test_the_predicted_side_refuses_a_plan_that_is_not_the_bodys() {
+        let mut p = plan(true, false);
+        p.calls[1] = UcCall { node: 9, ..p.calls[1].clone() };
+        assert!(predict_unit_chain(&corpus(), &p).is_err(), "a node outside the body");
+        let mut q = plan(true, false);
+        q.calls[0].args = vec![UcOperand::Place(v(9), Ty::Ptr)];
+        assert!(predict_unit_chain(&corpus(), &q).is_err(), "an argument that is not the call's");
+        let mut r = plan(true, false);
+        r.calls.truncate(1);
+        assert!(predict_unit_chain(&corpus(), &r).is_err(), "fewer than two calls");
+    }
+
+    /// **THE TWO NULL DRIVERS, PINNED.** The chain temp's type is the one thing this class needs
+    /// that the trust-ir instruction stream does not carry, and the obvious source — the callee's
+    /// declared `FuncTy` in the body's own module — DOES NOT EXIST there: a per-body module's
+    /// callee declarations get their signature at CRATE ASSEMBLY, so the lookup answers `None`
+    /// both by position and through `Module::function_by_id`. This lane sealed and whole-crate
+    /// measured TWO drivers on that route, each a NULL result (+0 at either level, `coverage_O3`
+    /// sha256 byte-identical to the control) with every unit test green, before the producer's own
+    /// callee ledger was found. This is the test that would have said so in one second.
+    #[test]
+    fn test_the_callee_result_type_comes_from_the_PRODUCER_LEDGER() {
+        let led = |id: u32, ret: Option<Ty>, conflict: bool| crate::CalleeRef {
+            ret_ty_conflict: conflict,
+            ..ledger_entry(id, ret)
+        };
+        let mut good = u64_ledger();
+        good.push(led(12, None, false));
+        assert_eq!(unit_chain_callee_ret(&good, FuncId::new(10)), Some(Ty::U64));
+        assert_eq!(
+            unit_chain_callee_ret(&good, FuncId::new(12)),
+            None,
+            "a callee no site bound a result from refuses the plan rather than guessing"
+        );
+        assert_eq!(
+            unit_chain_callee_ret(&good, FuncId::new(9999)),
+            None,
+            "a callee with no ledger entry refuses the plan"
+        );
+        assert_eq!(
+            unit_chain_callee_ret(&[led(10, Some(Ty::U64), true)], FuncId::new(10)),
+            None,
+            "a POISONED entry refuses the plan — two sites already contradicted each other"
+        );
+        assert_eq!(
+            unit_chain_callee_ret(
+                &[led(10, Some(Ty::U64), false), led(10, Some(Ty::U32), false)],
+                FuncId::new(10)
+            ),
+            None,
+            "two entries for one FuncId that disagree refuse the plan"
+        );
+        // And the whole grammar goes green through it, on the corpus body's own trust-ir — whose
+        // callees are exactly ids 10, 11 and 12.
+        assert!(unit_chain_calls(&corpus(), &|id| unit_chain_callee_ret(&good, id)).is_some());
+        // The FINAL call's callee (12) has no recorded type and the plan never asks for one: the
+        // final call declares no result, so its `ret_ty` is `None` BY THE GRAMMAR, not by the
+        // ledger's silence.
+        let calls = unit_chain_calls(&corpus(), &|id| unit_chain_callee_ret(&good, id)).unwrap();
+        assert_eq!(calls[2].ret_ty, None);
+        assert_eq!(calls[0].ret_ty, Some(Ty::U64));
     }
 }

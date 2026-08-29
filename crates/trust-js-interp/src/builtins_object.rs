@@ -7,10 +7,12 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_value::{JsValue, ObjId, PropKey, PropValue, Property};
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::props::PartialDesc;
-use std::rc::Rc;
-use trust_js_value::{JsValue, ObjId, PropKey, PropValue, Property};
 
 impl Interp {
     /// Own keys for full-list reflection; refuses on unmodeled/order-opaque
@@ -74,14 +76,11 @@ impl Interp {
                 v
             } else {
                 let pair = self.new_array(2)?;
-                self.heap.obj_mut(pair).props.insert(
-                    PropKey::from_str("0"),
-                    Property::data(JsValue::Str(Rc::new(u))),
-                );
                 self.heap
                     .obj_mut(pair)
                     .props
-                    .insert(PropKey::from_str("1"), Property::data(v));
+                    .insert(PropKey::from_str("0"), Property::data(JsValue::Str(Rc::new(u))));
+                self.heap.obj_mut(pair).props.insert(PropKey::from_str("1"), Property::data(v));
                 JsValue::Obj(pair)
             };
             self.create_data_property_or_throw(out, &n.to_string(), entry)?;
@@ -136,7 +135,8 @@ impl Interp {
                 continue;
             };
             let desc_obj = self.from_property_descriptor(&d)?;
-            let ok = self.define_own(out, &key, PartialDesc::full_data(desc_obj, true, true, true))?;
+            let ok =
+                self.define_own(out, &key, PartialDesc::full_data(desc_obj, true, true, true))?;
             if !ok {
                 return Err(self.throw_type_error());
             }
@@ -164,7 +164,11 @@ impl Interp {
 
     /// ObjectDefineProperties (20.1.2.3.1): two-phase (collect all
     /// descriptors, then apply).
-    pub(crate) fn object_define_properties(&mut self, oid: ObjId, props_v: &JsValue) -> Result<(), Abrupt> {
+    pub(crate) fn object_define_properties(
+        &mut self,
+        oid: ObjId,
+        props_v: &JsValue,
+    ) -> Result<(), Abrupt> {
         if props_v.is_nullish() {
             return Err(self.throw_type_error());
         }
@@ -221,10 +225,7 @@ impl Interp {
                     ..Default::default()
                 }
             } else {
-                PartialDesc {
-                    configurable: Some(false),
-                    ..Default::default()
-                }
+                PartialDesc { configurable: Some(false), ..Default::default() }
             };
             let ok = self.define_own(oid, &key, desc)?;
             if !ok {
@@ -265,7 +266,11 @@ impl Interp {
 
     /// [[SetPrototypeOf]] (ordinary 10.1.2.1 + %Object.prototype% immutable
     /// exotic). Returns spec true/false.
-    pub(crate) fn set_prototype_of(&mut self, oid: ObjId, proto: Option<ObjId>) -> Result<bool, Abrupt> {
+    pub(crate) fn set_prototype_of(
+        &mut self,
+        oid: ObjId,
+        proto: Option<ObjId>,
+    ) -> Result<bool, Abrupt> {
         if oid == self.global {
             return Err(Abrupt::Fatal(
                 "setPrototypeOf on the global object (unmodeled)".to_string(),
@@ -465,12 +470,7 @@ impl Interp {
                     self.to_property_key(&k)?
                 };
                 let receiver = if args.len() > 3 { arg(3) } else { target };
-                Ok(JsValue::Bool(self.set_obj_with_receiver(
-                    t,
-                    &key,
-                    arg(2),
-                    &receiver,
-                )?))
+                Ok(JsValue::Bool(self.set_obj_with_receiver(t, &key, arg(2), &receiver)?))
             }
             N::ReflectSetPrototypeOf => {
                 let t = {

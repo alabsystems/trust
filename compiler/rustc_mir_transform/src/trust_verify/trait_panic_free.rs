@@ -198,10 +198,7 @@ fn obligation_is_safety(kind: TrustObligationKind) -> bool {
 // `pub(crate)` for `dyn_dispatch_reliance`: C-FLOW's case split needs the SAME
 // evidence bar as Φ's per-impl discharge. Re-deriving it there would let the
 // two lanes drift.
-pub(crate) fn body_discharges_panic_freedom(
-    tcx: TyCtxt<'_>,
-    def_id: DefId,
-) -> Result<(), String> {
+pub(crate) fn body_discharges_panic_freedom(tcx: TyCtxt<'_>, def_id: DefId) -> Result<(), String> {
     instance_discharges_panic_freedom(tcx, ty::InstanceKind::Item(def_id))
 }
 
@@ -286,7 +283,8 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
         for (vc, _) in artifacts.results.iter() {
             if matches!(
                 vc.kind,
-                trust_types::VcKind::HardenedBoundary { .. } | trust_types::VcKind::UnsupportedMir { .. }
+                trust_types::VcKind::HardenedBoundary { .. }
+                    | trust_types::VcKind::UnsupportedMir { .. }
             ) {
                 let d: String = format!("{:?}", vc.kind).chars().take(120).collect();
                 if !detail.contains(&d) {
@@ -298,7 +296,11 @@ pub(crate) fn instance_discharges_panic_freedom<'tcx>(
             "the body's panic freedom is not fully discharged: {undischarged} of {safety_rows} \
              safety obligation(s) were refuted, left unknown, or kept a runtime check [{}]{}",
             blockers.join(", "),
-            if detail.is_empty() { String::new() } else { format!(" detail: {}", detail.join(" | ")) }
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" detail: {}", detail.join(" | "))
+            }
         ));
     }
     if safety_rows == 0
@@ -502,7 +504,8 @@ pub(crate) fn discharge_trait_panic_free_contracts(tcx: TyCtxt<'_>) {
             item_span(tcx, def_id),
             "Trust: `#[trust::panic_free]` must be declared on a trait method DEFINITION",
         );
-        if let Some(trait_method) = tcx.opt_associated_item(def_id).and_then(|i| i.trait_item_def_id())
+        if let Some(trait_method) =
+            tcx.opt_associated_item(def_id).and_then(|i| i.trait_item_def_id())
         {
             diag.note(format!(
                 "found on an implementation of `{}`; declare the contract there instead",
@@ -551,7 +554,8 @@ pub(crate) fn discharge_trait_panic_free_contracts(tcx: TyCtxt<'_>) {
     let mut default_bodies: Vec<DefId> = Vec::new();
     let mut impl_counts: FxHashMap<DefId, usize> = FxHashMap::default();
     for &trait_method in &contracted_methods {
-        let Some(trait_def_id) = tcx.opt_associated_item(trait_method).and_then(|i| i.trait_container(tcx))
+        let Some(trait_def_id) =
+            tcx.opt_associated_item(trait_method).and_then(|i| i.trait_container(tcx))
         else {
             continue;
         };
@@ -636,8 +640,7 @@ pub(crate) fn generic_call_relies_on_panic_free_contract(
     // every contract. Only the impl side carries the specialization meaning.
     for impl_local in tcx.local_trait_impls(trait_def_id) {
         let impl_def_id = impl_local.to_def_id();
-        if let Some(&impl_method) =
-            tcx.impl_item_implementor_ids(impl_def_id).get(&callee_def_id)
+        if let Some(&impl_method) = tcx.impl_item_implementor_ids(impl_def_id).get(&callee_def_id)
             && tcx.defaultness(impl_method).is_default()
         {
             return false;

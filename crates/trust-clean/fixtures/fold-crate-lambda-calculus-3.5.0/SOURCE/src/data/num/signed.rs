@@ -132,12 +132,7 @@ pub fn modulus(encoding: Encoding) -> Term {
     };
 
     abs(app(
-        abs(app!(
-            is_zero,
-            app(fst(), Var(1)),
-            app(snd(), Var(1)),
-            app(fst(), Var(1))
-        )),
+        abs(app!(is_zero, app(fst(), Var(1)), app(snd(), Var(1)), app(fst(), Var(1)))),
         app(simplify(encoding), Var(1)),
     ))
 }

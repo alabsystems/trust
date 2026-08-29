@@ -65,6 +65,59 @@ pub struct TestProofBundle<'a> {
     pub release: bool,
 }
 
+/// The path portion of a proof test id, with any `upstream.` prefix and any
+/// index field removed.
+///
+/// `upstream.00000000.tests.ui.foo.rs` and `upstream.tests.ui.foo.rs` both yield
+/// `tests.ui.foo.rs`, which is what lets a hand-authored ledger row name a test
+/// the inventory numbered.
+fn proof_id_path_suffix(id: &str) -> &str {
+    let rest = id.strip_prefix("upstream.").unwrap_or(id);
+    match rest.split_once('.') {
+        // An all-digit first field is the inventory ordinal, never a path
+        // component: a real path segment here is `tests`.
+        Some((head, tail)) if !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit()) => tail,
+        _ => rest,
+    }
+}
+
+#[cfg(test)]
+mod proof_id_suffix_tests {
+    use super::proof_id_path_suffix;
+
+    /// Trust: the ledger could never match the inventory, and this pins why.
+    ///
+    /// `proof_upstream_test_id` builds `upstream.{index:08}.{path}`; the
+    /// hand-authored ledger in `tests/upstream-rust/test-exceptions.toml` writes
+    /// `upstream.{path}`. A ledger cannot know an inventory ordinal, so a
+    /// whole-id comparison ALWAYS failed and every ledger row was reported as
+    /// referencing an unknown test — the per-test exception lane was inert in the
+    /// proof bundle. It went unnoticed because the scorecard's own netting path
+    /// keys on (suite, path) instead and never consults `test_id`.
+    #[test]
+    fn indexed_and_bare_ids_agree_on_the_path() {
+        let indexed = "upstream.00000000.tests.ui.lexer.lex-bad-str-literal-as-char-4.rs";
+        let bare = "upstream.tests.ui.lexer.lex-bad-str-literal-as-char-4.rs";
+        assert_eq!(proof_id_path_suffix(indexed), proof_id_path_suffix(bare));
+        assert_eq!(proof_id_path_suffix(bare), "tests.ui.lexer.lex-bad-str-literal-as-char-4.rs");
+    }
+
+    /// Only an ALL-DIGIT first field is an ordinal. A real path segment there is
+    /// `tests`, and stripping it would make two different tests compare equal.
+    #[test]
+    fn a_path_segment_is_never_mistaken_for_an_ordinal() {
+        assert_eq!(proof_id_path_suffix("upstream.tests.ui.a.rs"), "tests.ui.a.rs");
+        assert_eq!(proof_id_path_suffix("upstream.12345678.tests.ui.a.rs"), "tests.ui.a.rs");
+        // Distinct tests must stay distinct.
+        assert_ne!(
+            proof_id_path_suffix("upstream.00000001.tests.ui.a.rs"),
+            proof_id_path_suffix("upstream.00000001.tests.ui.b.rs")
+        );
+        // A non-upstream id is returned unchanged rather than silently trimmed.
+        assert_eq!(proof_id_path_suffix("trust.added.quick"), "trust.added.quick");
+    }
+}
+
 /// Validate one compatibility baseline document.
 pub fn validate_baseline(baseline: &CompatibilityBaseline) -> ValidationResult {
     let mut findings = Vec::new();
@@ -646,8 +699,26 @@ pub fn validate_test_proof_bundle(
 
     let result_exception_ids: BTreeSet<&str> =
         bundle.results.results.iter().filter_map(|result| result.exception_id.as_deref()).collect();
+    // Trust: match a ledger `test_id` against the inventory by PATH, not by the
+    // whole id.
+    //
+    // Proof inventory ids are index-prefixed — `proof_upstream_test_id` builds
+    // `upstream.{index:08}.{path}` — while `tests/upstream-rust/
+    // test-exceptions.toml` is authored by hand as `upstream.{path}`. A ledger
+    // cannot know an inventory ordinal, so a whole-id comparison could NEVER
+    // match, and every ledger row was reported as referencing an unknown test.
+    // The ledger has therefore been inert in the proof bundle since the ids were
+    // prefixed; the scorecard's own netting path never noticed because
+    // `failure_covering_exception` keys on (suite, path) instead.
+    //
+    // Keyed on the path SUFFIX rather than by stripping a fixed-width field, so
+    // an id whose shape changes again does not silently start mismatching.
+    let inventory_paths: BTreeSet<&str> =
+        inventory.keys().map(|id| proof_id_path_suffix(id)).collect();
     for exception in &bundle.exceptions.exceptions {
-        if !inventory.contains_key(exception.test_id.as_str()) {
+        if !inventory.contains_key(exception.test_id.as_str())
+            && !inventory_paths.contains(proof_id_path_suffix(exception.test_id.as_str()))
+        {
             findings.push(ValidationFinding::new(
                 "test_exceptions.test_id",
                 format!(

@@ -15,4 +15,6 @@ clean {
 }
 pub fn keep(x: u64) -> u64
     ensures le_isl(result, x) by le_isl_refl
-{ x }
+{
+    x
+}

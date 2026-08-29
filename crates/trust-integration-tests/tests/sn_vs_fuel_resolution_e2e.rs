@@ -44,10 +44,12 @@ use trust_certify::threaded_budget_functional::{
 };
 use trust_ir::ProofEvidence;
 use trust_types::{Formula, VcKind, VerificationCondition};
-use trust_vcgen::fuel_outcome_functional::fixtures as outcome_fixtures;
-use trust_vcgen::fuel_outcome_functional::{fuel_outcome_functional_vcs, loop_fuel_sim_vcs};
-use trust_vcgen::threaded_budget_functional::fixtures as threaded_fixtures;
-use trust_vcgen::threaded_budget_functional::threaded_budget_functional_vcs;
+use trust_vcgen::fuel_outcome_functional::{
+    fixtures as outcome_fixtures, fuel_outcome_functional_vcs, loop_fuel_sim_vcs,
+};
+use trust_vcgen::threaded_budget_functional::{
+    fixtures as threaded_fixtures, threaded_budget_functional_vcs,
+};
 
 fn property(vc: &VerificationCondition) -> &str {
     match &vc.kind {

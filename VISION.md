@@ -43,15 +43,25 @@ companion language-design paper) is one sentence:
 Two drop-in invariants hold it up. **Vanilla Rust is valid input** — trustc
 compiles all valid Rust identically, and unannotated code gets the default safety
 obligations. **Vanilla Lean is valid input** — Clean accepts Lean 4 and
-machine-imports real `.olean` artifacts.
+machine-imports real `.olean` artifacts. That second invariant is Clean's, not
+yet Trust's: both surfaces Trust exposes (`clean { … }` islands and
+`targo trust check <file.lean>`) call `disable_external_import_search`
+(`crates/trust-certify/src/clean_island.rs`), so only the built-in prelude and
+crate-local Clean are in scope and Mathlib is not reachable.
 
 Everything that follows from that sentence is a consequence, not a separate
 feature:
 
 - **Contracts are grammar.** `fn f(..) requires P ensures Q decreases e` is
-  signature syntax, sitting where the type sits. Not an attribute, not a macro,
-  not a comment convention. There is exactly one place a clause can be written,
-  so there is exactly one thing it can mean.
+  signature syntax, sitting where the type sits. The `#[trust::…]` attribute
+  spellings are a compat surface over that grammar, not a second lane:
+  `expand_trust_native_clause_tts` (`rustc_builtin_macros/src/contracts.rs`)
+  injects the native clause tokens verbatim, so `#[trust::decreases(e)]` and
+  `fn f(..) decreases e` reach the parser as the same token stream. The one
+  attribute with no clause position to desugar into,
+  `#[trust::invariant(..)]` on an item, is refused with a named blocker rather
+  than erased. There is exactly one lane a clause can reach, so there is
+  exactly one thing it can mean.
 - **Lean enters through a parser island.** `clean { … }` at item position is a
   grammar form vanilla Rust rejects, so no valid program changes meaning. The
   island body is Clean source: rustc keeps only its span and never
@@ -147,6 +157,11 @@ semantics over straight-line integer scalar shapes.
 
 ## What is built, what is not
 
+Rows that quote a number quote the date it was measured on. Those figures
+are snapshots, not a live status: nothing re-runs them, so a row dated in the
+past has not been re-measured since. Re-run the named script or probe before
+citing one.
+
 | Capability | State |
 |---|---|
 | Rust contract clauses (`requires` / `ensures` / `decreases`) | live: parsed into `ast::FnContract`, lowered, and read back through the typed `trust_contracts` query |
@@ -155,16 +170,16 @@ semantics over straight-line integer scalar shapes.
 | Rust ↔ Clean shared namespace | live for the E6/E9 lanes: a Rust function's defining equation can be imported into the kernel environment, and an uncited `ensures` calling an island definition can discharge by kernel definitional equality |
 | Clean kernel recheck of engine output | live for the covered obligation classes; `Certified` is the grade that means it happened |
 | A pure `.lean` front door | live in `targo trust check <file.lean>`, which kernel-checks the file in process through the same CIC kernel the islands use, and fails closed on an `axiom`, a `sorry`, or a parse error. `targo trust build` refuses a `.lean` operand rather than let a successful compile read as a discharged proof. **`trustc` still has no Lean input path** — hand it a `.lean` file and it parses it as Rust |
-| The Lean → trust-ir producer inside a trustc build | **not built here.** `clean-compiler::emit_trust_ir` exists in the Clean repo; nothing in the Trust compile path calls it, so the shared module currently has one live producer |
-| Arbitrary Lean inside an island | **not built.** The island is delimited by a Rust token tree, so it is the Rust-lexable Clean subset: ASCII only, no external `.olean` import, and a `}` inside a Lean comment or string fails closed |
+| The Lean → trust-ir producer inside a trustc build | live, and claim-free. Under verification `rustc_mir_transform::clean_origin_ir::collect_clean_origin_ir` re-earns a per-def kernel faithfulness verdict and `trust_thir_lower::clean_origin_join` appends the Clean-authored functions to the same per-crate trust-ir Module the direct THIR producer assembles, then re-points the Rust→Clean declaration edges onto them under an executable remap-shape certificate. The appended rows carry ZERO claim channels — no summary, proofs, obligations, or certificates in the published module — and stay `body_gate: ungated`, so no codegen consumes them and obligations are still proved on the authenticated MIR-derived lane. `clean-compiler::emit_trust_ir` in the Clean repo remains uncalled from the Trust compile path |
+| Arbitrary Lean inside an island | **not built.** The island is delimited by a Rust token tree, so it is the Rust-lexable Clean subset: ASCII only, no external `.olean` import, and a `}` inside a Lean comment fails closed. A `}` inside a Lean *string* is safe — Rust token trees keep a braced quote opaque (`tests/ui/trust/clean_island_lexical_string.rs`, check-pass) |
 | PROOF / CALL proof-only visibility | **not built.** Specified in the design; no compiler surface yet |
-| Direct trust-ir proof authority | **not built.** The direct producer is structural-parity-only; proving still runs through the authenticated MIR-derived lane. The distance is measurable rather than rhetorical: re-measured 2026-07-25 with `scripts/trust_ir_producer_scorecard.py` on a seeded 600-file `tests/ui` sample (default seed, stage2 built from the range-fold miscompilation fix audited internally on 2026-07-25), the direct lane reached 1972 bodies, lowered 1204 (61.1%) with zero unsupported shapes, and the sampled-interpretation differential adjudicated 633 — **632 agreed, 1 diverged**. The earlier figures for this row (2442 bodies, 1406 lowered, 779 agreed / **0** diverged) were taken on `d8a9eb292`, the binary later proven to miscompile, and are superseded: on a correct compiler the lane is *not* divergence-free. The one divergence is `tests/ui/issues/issue-43806.rs::bar` — `fn bar() -> !`, where the THIR producer types the signature `[]->[Never]` and the MIR oracle types it `[]->[]`. That is a seam-modelling disagreement about the uninhabited return rather than a value disagreement, but it is exactly what the differential exists to catch, so the row no longer claims the lane is never wrong where the oracle can look — it claims the lane is less complete (69% of bodies get no equivalence verdict at all) and has one known signature-shape disagreement |
+| Direct trust-ir proof authority | **not built.** The direct producer is structural-parity-only; proving still runs through the authenticated MIR-derived lane. The distance is measurable rather than rhetorical: re-measured 2026-07-25 with `scripts/trust_ir_producer_scorecard.py` on a seeded 600-file `tests/ui` sample (default seed, stage2 built from the range-fold miscompilation fix audited internally on 2026-07-25), the direct lane reached 1972 bodies, lowered 1204 (61.1%) with zero unsupported shapes, and the sampled-interpretation differential adjudicated 633 — **632 agreed, 1 diverged**. The earlier figures for this row (2442 bodies, 1406 lowered, 779 agreed / **0** diverged) were taken on `d8a9eb292`, the binary later proven to miscompile, and are superseded: on a correct compiler the lane is *not* divergence-free. The one divergence is `tests/ui/issues/issue-43806.rs::bar` — `fn bar() -> !`, where the THIR producer types the signature `[]->[Never]` and the MIR oracle types it `[]->[]`. That is a seam-modelling disagreement about the uninhabited return rather than a value disagreement, but it is exactly what the differential exists to catch, so the row no longer claims the lane is never wrong where the oracle can look — it claims the lane is less complete (in that sample 69% of bodies got no equivalence verdict at all) and had, on that date, one known signature-shape disagreement |
 | Direct trust-ir codegen authority (the flip) | live, and narrower than its name. A body whose derived MIR was proven identical to the built MIR is re-derived from trust-ir on the codegen seam. `flip_session_enabled` requires `debuginfo == None` because the Module carries no spans or `var_debug_info`, and targo emits `-C debuginfo=2` for the `dev` profile and no debuginfo flag at all for `release`. Measured on a five-body scalar probe (2026-07-25): **5 flips with no `-C debuginfo` flag and at `=0`, 0 at `=1` and `=2`; 3 at `-C opt-level=3`** — identical before and after the `MatchBranchSimplification` fix, so this row does not inherit that defect. "Compiled from trust-ir" therefore describes a release-shaped build and **never the default `targo trust build`**. The gate is now pinned by `session_gates_allow_flip`'s unit tests rather than by its comment |
 | Whole-crate verification with cross-function summaries | partial |
 | `trust-strengthen` end-to-end spec inference | partial |
 | `trust-backprop` end-to-end source rewriting | partial |
 | prove → strengthen → backpropagate convergence on real programs | not yet |
-| `trust-cg` verified codegen backend | experimental, and **not present in a default-built toolchain** — the builtin is `#[cfg(feature = "trust-cg")]`-gated (`rustc_interface/src/util.rs`) and `bootstrap.toml` declares no `codegen-backends`, so `-Zcodegen-backend=trust-cg` on a normal `./x.py build` fails with "failed to find a 'codegen-backends' folder in the sysroot". It is also `CrateType::Rlib`-only (`rustc_codegen_trust_cg/src/lib.rs`), so it cannot link an executable. When it *is* built, its emitted objects are gated on a byte-level output-preservation proof over the fragment described above. Measured 2026-07-25: it has never emitted a byte in this checkout |
+| `trust-cg` verified codegen backend | experimental, and **not present in a default-built toolchain** — the builtin is `#[cfg(feature = "trust-cg")]`-gated (`rustc_interface/src/util.rs`) and `bootstrap.toml` declares no `codegen-backends`, so `-Zcodegen-backend=trust-cg` on a normal `./x.py build` fails with "failed to find a 'codegen-backends' folder in the sysroot". It is also `CrateType::Rlib`-only (`rustc_codegen_trust_cg/src/lib.rs`), so it cannot link an executable. When it *is* built, its emitted objects are gated on a byte-level output-preservation proof over the fragment described above. Measured 2026-07-25: as of that date it had never emitted a byte in this checkout |
 | `#[trust::verified_codegen]` on the default LLVM lane | live: reports whether trust-cg's emission for this target is proved equal to the function's IR semantics, or that only the structural round-trip check held. It says nothing about the LLVM bytes the build actually ships |
 | TrustJS / TrustPy / TrustZig frontends | design/BUILD only; nothing shipped |
 | Self-proof (the compiler proving itself) | **not built.** Bootstrap runs with verification explicitly disabled |
@@ -277,7 +292,7 @@ stay tractable.
 
 ## The crates
 
-57 Trust-owned packages live under `crates/`. Verification backends are separate
+70 Trust-owned packages live under `crates/`. Verification backends are separate
 repos, pinned as submodules under `first-party/`.
 
 **Foundation** — `trust-types` (core IR + formula arena), `trust-cache`,
@@ -361,7 +376,7 @@ Ordered by dependency.
 | Decision | Why |
 |---|---|
 | Put verification in the compiler, not around it | A proc-macro wrapper can never reach MIR-level invariants or the kernel. |
-| Contracts as grammar, not attributes | One place to write a clause is one thing it can mean. Parallel contract systems are how a program and its spec drift apart. |
+| Contracts as grammar, with the attribute spellings desugaring into it | One lane a clause can reach is one thing it can mean. `#[trust::…]` injects the native clause tokens verbatim instead of implementing a second contract system, because parallel contract systems are how a program and its spec drift apart. |
 | Lean as a parser island, not a macro | The body must never be name-resolved or type-checked by rustc. A macro cannot promise that. |
 | The Clean kernel as sole trust root | Engines are fast and wrong sometimes. A CIC kernel re-checking the reconstructed term is what `Certified` has to mean. |
 | trust-ir as the one module both languages produce | Two producers, one semantics. It is also what makes trust-cg and a Rust-free toolchain reachable. |

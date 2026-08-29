@@ -1,14 +1,21 @@
 // trust-router/src/trust_wp_backend.rs: trust-wp deductive backend for the
 // per-VC router.
 //
-// Registers trust-wp (weakest-precondition / strongest-postcondition deductive
-// verification, layered on ay) as a first-class `VerificationBackend` so the
-// compiler's router dispatches contract/assertion obligations to it instead of
-// approximating deductive reasoning in the SMT layer alone. Ported from the
-// proven `trust-strengthen/src/trust_wp_oracle.rs` template (which already
-// drives trust-wp through the CEGIS loop), with arithmetic lowering added so
-// bounds obligations carrying `+`/`-`/`*` (e.g. the byte-extent slice/copy
-// obligations) translate.
+// R4 driver flip (2026-08-20, design gate in
+// docs/design/2026-07-09-two-language-spec-surface.md, audit
+// docs/audits/2026-08-20-r-phase-reaudit.md): this backend is NATIVE-BACKED.
+// It routes every non-constant contract VC through trust-wp's typed in-process
+// `TrustWpVerificationEngine` (`trust_wp::verifier_api`) — the same adapter the
+// full-verification engine registry ships in trustc — and NEVER spawns the
+// `trust_wp` subprocess. The retired lane parsed a text protocol
+// (`TRUST_WP_RESULT:v1` on stderr) into per-VC verdicts; a compiler verdict
+// must not be minted from parsed subprocess text. The subprocess `CliBackend`
+// remains in `crates/trust-wp` solely for standalone (non-compiler) callers.
+//
+// Seal against reintroduction: nothing in this module imports `CliBackend`,
+// `verify_with_contracts`, or `TrustWpConfig`, and the `route_is_invariant_to_
+// trust_wp_path_env` test pins that verdicts do not change when `TRUST_WP_PATH`
+// points at a binary that would have satisfied the old text protocol.
 //
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
@@ -16,34 +23,52 @@
 use trust_types::{
     ContractMetadata, Formula, ProofStrength, VcKind, VerificationCondition, VerificationResult,
 };
-use trust_wp::{Contract, ContractSet, TrustWpConfig, TrustWpLibError, verify_with_contracts};
+use trust_verifier_api::{
+    BundleSubject, ContractKind, ContractPredicate, EvidenceStatus, ObligationKind, SourceLocation,
+    TrustContract, TrustContractBundle, TrustObligation, VerificationEngine as _,
+};
+use trust_wp::TrustWpVerificationEngine;
 
 use crate::{BackendRole, VerificationBackend, unsupported_mir_unknown};
 
-/// Router backend delegating to trust-wp's deductive engine.
+/// Default per-obligation budget when the compiler does not supply one
+/// (matches the previous `TrustWpConfig` default).
+const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+/// Router backend delegating to trust-wp's typed in-process engine.
 ///
 /// trust-wp understands Rust ownership and contracts natively, and its
 /// strongest-postcondition reasoning discharges obligations that need an
 /// invariant the pure-SMT path cannot synthesize (e.g. a struct invariant
 /// relating a pointer field to a length field). It is the right home for
 /// contract/assertion VCs; non-contract VCs fall through to other backends.
+///
+/// Verdict discipline (fail-closed): a `Proved` can only come from the native
+/// engine's evidence with publication-grade deductive strength — today that
+/// requires the full native replay metadata the compiler's API-obligation lane
+/// attaches (`trust.trust-wp.native-*.v1`), which this bare per-VC carrier does
+/// not fabricate, so non-constant VCs report `Unknown` with the exact missing
+/// step named in the reason (v7/D3). No subprocess, no `TRUST_WP_PATH`, no
+/// text-protocol parsing anywhere on this route.
 pub struct TrustWpRouterBackend {
-    config: TrustWpConfig,
+    timeout_ms: u64,
 }
 
 impl TrustWpRouterBackend {
     const NAME: &'static str = "trust-wp";
 
-    /// Create a backend with trust-wp's default configuration.
+    /// Create a backend with the default per-obligation budget.
     #[must_use]
     pub fn new() -> Self {
-        Self { config: TrustWpConfig::new() }
+        Self { timeout_ms: DEFAULT_TIMEOUT_MS }
     }
 
-    /// Create a backend with a per-obligation timeout (milliseconds).
+    /// Create a backend with a per-obligation timeout (milliseconds). The
+    /// native engine is in-process; the budget is reported on `Timeout`
+    /// evidence and reserved for deadline plumbing into the native lane.
     #[must_use]
     pub fn with_timeout(timeout_ms: u64) -> Self {
-        Self { config: TrustWpConfig::new().with_timeout(timeout_ms) }
+        Self { timeout_ms }
     }
 }
 
@@ -121,121 +146,231 @@ impl VerificationBackend for TrustWpRouterBackend {
             _ => {}
         }
 
-        let Some(contracts) = vc_to_trust_wp_contracts(vc) else {
-            return VerificationResult::Unknown {
-                solver: self.name().into(),
-                time_ms: 0,
-                reason: "trust-wp cannot translate this VC formula to contracts".into(),
-            };
-        };
-
-        match verify_with_contracts(vc.function.as_ref(), &contracts, &self.config) {
-            Ok(result) => result.to_verification_result(),
-            Err(TrustWpLibError::Timeout { timeout_ms }) => {
-                VerificationResult::Timeout { solver: self.name().into(), timeout_ms }
-            }
-            Err(err) => VerificationResult::Unknown {
-                solver: self.name().into(),
-                time_ms: 0,
-                reason: format!("trust-wp unavailable or inconclusive: {err}"),
-            },
-        }
+        verify_vc_via_native_trust_wp_engine(self.name(), vc, self.timeout_ms)
     }
 }
 
-/// Build a trust-wp contract set from a VC, mapping the obligation's kind to the
-/// appropriate clause (requires / ensures / invariant).
-fn vc_to_trust_wp_contracts(vc: &VerificationCondition) -> Option<ContractSet> {
-    // `vc.formula` is the VIOLATION; the contract clause must assert the PROPERTY
-    // (`¬violation`), so it stays consistent with the constant short-circuit above
-    // and the violation convention. Lowering the raw violation would ask trust-wp
-    // to prove the violation HOLDS — the inverted polarity.
+/// Verify one router VC through trust-wp's typed in-process engine.
+///
+/// Shared by [`TrustWpRouterBackend`] and trust-strengthen's CEGIS oracle so
+/// there is exactly one compiler-reachable trust-wp lane and it is native.
+///
+/// The VC's violation formula is negated into the PROPERTY goal and carried as
+/// a typed `trust-types.Formula@1` contract predicate inside a synthetic
+/// single-obligation `TrustContractBundle`; the engine's own fail-closed
+/// lowering (`trust_wp.trust-formula.v1` envelope: int/bool fragment only,
+/// arithmetic refused per the #29 amendment) decides whether the claim is even
+/// representable. Every outcome that is not checked native evidence maps to
+/// `Unknown` with the engine's own diagnostics as the actionable reason.
+///
+/// SOUNDNESS — why every routed goal is encoded as `Postcondition`/`Ensures`:
+/// the per-VC route asks exactly one question, "is `¬violation` VALID"
+/// (violation UNSAT ⇔ property holds — the same convention ay answers on the
+/// same formula). A bare Ensures claim is that question. Deliberately NOT
+/// `ObligationKind::Precondition`: trust-wp-core's native replay discharges a
+/// contract-linked Precondition as the definition-site requires ECHO
+/// (`assume(P) ⊢ P`, see `trust_wp_obligation_kind` in trust-wp's
+/// verifier_api) — reflexively, without proving P. That is correct for a
+/// definition-site echo and a FALSE ACCEPT for the router's call-site
+/// precondition VCs, so this carrier makes the echo unreachable by
+/// construction. Likewise NOT `LoopInvariant`: the native loop lane assumes
+/// compiler-supplied initiation/consecution context this carrier does not
+/// provide.
+#[must_use]
+pub fn verify_vc_via_native_trust_wp_engine(
+    solver_name: &str,
+    vc: &VerificationCondition,
+    timeout_ms: u64,
+) -> VerificationResult {
+    // `vc.formula` is the VIOLATION; the claim asserts the PROPERTY
+    // (`¬violation`), consistent with the constant short-circuit above and the
+    // violation convention. Lowering the raw violation would ask trust-wp to
+    // prove the violation HOLDS — the inverted polarity.
     let goal = Formula::Not(Box::new(vc.formula.clone()));
-    let expr = formula_to_trust_wp_expr(&goal)?;
-    let contracts = match &vc.kind {
-        VcKind::Precondition { .. } => ContractSet::new().with_requires(Contract::requires(expr)),
-        VcKind::Postcondition => ContractSet::new().with_ensures(Contract::ensures(expr)),
-        VcKind::Assertion { message } if message.contains("[loop:invariant]") => {
-            ContractSet::new().with_invariant(Contract::invariant(expr))
+    let goal_value = match serde_json::to_value(&goal) {
+        Ok(value) => value,
+        Err(error) => {
+            return VerificationResult::Unknown {
+                solver: solver_name.into(),
+                time_ms: 0,
+                reason: format!(
+                    "trust-wp native route could not serialize the goal formula as \
+                     `trust-types.Formula@1` (fail-closed): {error}"
+                ),
+            };
         }
-        VcKind::Assertion { .. } => ContractSet::new().with_ensures(Contract::ensures(expr)),
-        _ => return None,
     };
-    Some(contracts)
+
+    let kind_tag = match &vc.kind {
+        VcKind::Precondition { .. } => "precondition",
+        VcKind::Postcondition => "postcondition",
+        VcKind::Assertion { message } if message.contains("[loop:invariant]") => "loop-invariant",
+        VcKind::Assertion { .. } => "assertion",
+        other => {
+            // Defensive: `can_handle` filters these before dispatch; a direct
+            // caller still gets a closed refusal, never a verdict.
+            return VerificationResult::Unknown {
+                solver: solver_name.into(),
+                time_ms: 0,
+                reason: format!("trust-wp cannot handle VC kind {other:?}"),
+            };
+        }
+    };
+
+    let function: &str = vc.function.as_ref();
+    let function = if function.trim().is_empty() { "unknown-function" } else { function };
+    let function_component = trust_types::canonical_artifact_id_component(function);
+    let obligation_id = format!("trust-wp-router:{kind_tag}:{function_component}");
+    let contract_id = format!("{obligation_id}:contract");
+    let source = source_location_from_span(&vc.location);
+
+    let mut bundle = TrustContractBundle::empty(
+        format!("trust-wp-router:{function_component}"),
+        BundleSubject::Function {
+            crate_name: "trust-router-vc".to_string(),
+            path: function.to_string(),
+        },
+    );
+    bundle.contracts.push(TrustContract {
+        contract_id: contract_id.clone(),
+        kind: ContractKind::Ensures,
+        predicate: ContractPredicate::CanonicalJson {
+            schema: trust_types::TRUST_SYMBOLIC_FORMULA_SCHEMA.to_string(),
+            value: goal_value,
+        },
+        source: source.clone(),
+        metadata: Vec::new(),
+    });
+    bundle.obligations.push(TrustObligation {
+        obligation_id: obligation_id.clone(),
+        kind: ObligationKind::Postcondition,
+        contract_id: Some(contract_id),
+        proof_item_id: None,
+        source,
+        description: format!(
+            "per-VC router goal ({kind_tag}): property = negated violation formula"
+        ),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: Vec::new(),
+    });
+
+    // The public `VerificationEngine::verify` wrapper re-validates the bundle
+    // and the requested subset; an invalid synthetic carrier yields no
+    // evidence, which maps to `Unknown` below (fail-closed, never a verdict).
+    let engine = TrustWpVerificationEngine::new();
+    let evidence = engine.verify(&bundle, &bundle.obligations);
+    let Some(row) = evidence.into_iter().find(|row| row.obligation_id == obligation_id) else {
+        return VerificationResult::Unknown {
+            solver: solver_name.into(),
+            time_ms: 0,
+            reason: "trust-wp native engine returned no evidence row for the routed VC \
+                     (synthetic carrier failed bundle validation); fail-closed"
+                .to_string(),
+        };
+    };
+
+    match row.status {
+        EvidenceStatus::Proved => {
+            // Only checked native replay evidence with publication-grade
+            // deductive strength may become a router `Proved`. Anything weaker
+            // is DOWNGRADED — a Proved row without that grade would be exactly
+            // the unaudited-claim channel this flip retired.
+            if row.proof_strength.as_ref() == Some(&trust_verifier_api::ProofStrength::deductive())
+                && row.is_unbounded_proof()
+            {
+                VerificationResult::Proved {
+                    solver: solver_name.into(),
+                    time_ms: 0,
+                    strength: ProofStrength::deductive(),
+                    proof_certificate: None,
+                    solver_warnings: None,
+                    native_proof_envelope: None,
+                }
+            } else {
+                VerificationResult::Unknown {
+                    solver: solver_name.into(),
+                    time_ms: 0,
+                    reason: format!(
+                        "trust-wp native evidence reported Proved without publication-grade \
+                         deductive strength and checked replay artifacts; downgraded fail-closed \
+                         (strength: {:?})",
+                        row.proof_strength
+                    ),
+                }
+            }
+        }
+        // A refutation from the native lane is a real bug report: the typed
+        // claim (¬violation) was refuted, i.e. the violation is satisfiable —
+        // the same SAT-of-violation meaning every backend on this route uses.
+        // The API counterexample payload has no lossless representation in
+        // `trust_types::Counterexample` assignments, so it is omitted rather
+        // than approximated (the retired subprocess lane also carried `None`).
+        EvidenceStatus::Failed => VerificationResult::Failed {
+            solver: solver_name.into(),
+            time_ms: 0,
+            counterexample: None,
+        },
+        EvidenceStatus::Timeout => {
+            VerificationResult::Timeout { solver: solver_name.into(), timeout_ms }
+        }
+        EvidenceStatus::Unsupported | EvidenceStatus::Unknown | EvidenceStatus::Canceled => {
+            VerificationResult::Unknown {
+                solver: solver_name.into(),
+                time_ms: 0,
+                reason: summarize_native_diagnostics(&row.diagnostics),
+            }
+        }
+        // `EvidenceStatus` is #[non_exhaustive] for dependents: any future
+        // status stays fail-closed here.
+        _ => VerificationResult::Unknown {
+            solver: solver_name.into(),
+            time_ms: 0,
+            reason: "trust-wp native engine returned an unrecognized evidence status; fail-closed"
+                .to_string(),
+        },
+    }
 }
 
-/// Lower a `Formula` to trust-wp's contract expression syntax. Returns `None`
-/// for any construct trust-wp's surface cannot express, so the caller stays
-/// fail-closed (`Unknown`) rather than asserting a wrong contract.
-fn formula_to_trust_wp_expr(formula: &Formula) -> Option<String> {
-    match formula {
-        Formula::Bool(true) => Some("true".to_string()),
-        Formula::Bool(false) => Some("false".to_string()),
-        // A variable name is valid both as a boolean atom and inside an
-        // arithmetic subexpression.
-        Formula::Var(name, _) => Some(name.clone()),
-        Formula::Not(inner) => Some(format!("!({})", formula_to_trust_wp_expr(inner)?)),
-        Formula::And(terms) => terms
-            .iter()
-            .map(formula_to_trust_wp_expr)
-            .collect::<Option<Vec<_>>>()
-            .map(|terms| terms.join(" && ")),
-        Formula::Or(terms) => terms
-            .iter()
-            .map(formula_to_trust_wp_expr)
-            .collect::<Option<Vec<_>>>()
-            .map(|terms| terms.join(" || ")),
-        Formula::Implies(lhs, rhs) => Some(format!(
-            "({}) ==> ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Eq(lhs, rhs) => Some(format!(
-            "({}) == ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Lt(lhs, rhs) => Some(format!(
-            "({}) < ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Le(lhs, rhs) => Some(format!(
-            "({}) <= ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Gt(lhs, rhs) => Some(format!(
-            "({}) > ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Ge(lhs, rhs) => Some(format!(
-            "({}) >= ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        // Arithmetic — needed so byte-extent bounds obligations (`stride * len`,
-        // `offset + len`) translate, not just pure-boolean contracts.
-        Formula::Add(lhs, rhs) => Some(format!(
-            "({}) + ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Sub(lhs, rhs) => Some(format!(
-            "({}) - ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Mul(lhs, rhs) => Some(format!(
-            "({}) * ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Int(value) => Some(value.to_string()),
-        Formula::UInt(value) => Some(value.to_string()),
-        _ => None,
+fn source_location_from_span(span: &trust_types::SourceSpan) -> SourceLocation {
+    SourceLocation {
+        file: (!span.file.trim().is_empty()).then(|| span.file.clone()),
+        line: (span.line_start > 0).then_some(span.line_start),
+        column: (span.col_start > 0).then_some(span.col_start),
+        end_line: (span.line_end > 0).then_some(span.line_end),
+        end_column: (span.col_end > 0).then_some(span.col_end),
     }
+}
+
+/// Compress the native engine's diagnostics into one bounded `Unknown` reason,
+/// keeping the leading (most specific) lines — the engine puts the actionable
+/// blocker first, per v7/D3.
+fn summarize_native_diagnostics(diagnostics: &[String]) -> String {
+    const MAX_LINES: usize = 3;
+    const MAX_BYTES: usize = 1200;
+    if diagnostics.is_empty() {
+        return "trust-wp native engine returned no diagnostics; fail-closed".to_string();
+    }
+    let mut reason = String::from("trust-wp native lane fail-closed: ");
+    for (index, diagnostic) in diagnostics.iter().take(MAX_LINES).enumerate() {
+        if index > 0 {
+            reason.push_str(" | ");
+        }
+        reason.push_str(diagnostic);
+        if reason.len() >= MAX_BYTES {
+            break;
+        }
+    }
+    if reason.len() > MAX_BYTES {
+        // Truncate on a char boundary.
+        let mut cut = MAX_BYTES;
+        while !reason.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        reason.truncate(cut);
+        reason.push_str(" …");
+    }
+    reason
 }
 
 #[cfg(test)]
@@ -343,9 +478,32 @@ mod tests {
     }
 
     #[test]
-    fn lowers_arithmetic_byte_extent() {
-        // `4 * len > 64` (a byte-extent bounds obligation) must translate, not
-        // fall to None.
+    fn native_lane_is_fail_closed_for_symbolic_goals() {
+        // A symbolic (non-constant) contract VC must go to the native engine
+        // and come back Unknown until real native replay evidence exists —
+        // never Proved from a synthetic carrier, never a subprocess verdict.
+        let b = TrustWpRouterBackend::new();
+        let r = b.verify(&contract_vc(
+            VcKind::Postcondition,
+            Formula::Not(Box::new(Formula::Var("ok".into(), Sort::Bool))),
+        ));
+        let VerificationResult::Unknown { reason, .. } = &r else {
+            panic!("symbolic goal must be Unknown on the bare per-VC carrier, got {r:?}");
+        };
+        // v7/D3: the refusal carries the engine's actionable blocker, not a
+        // bare "unsupported".
+        assert!(
+            reason.contains("trust-wp native lane fail-closed"),
+            "reason must carry the native engine diagnostics: {reason}"
+        );
+    }
+
+    #[test]
+    fn lowers_arithmetic_goals_fail_closed_not_false_proved() {
+        // `4 * len > 64` (a byte-extent bounds obligation): the retired string
+        // lane lowered this for the subprocess; the native lane REFUSES
+        // arithmetic (#29 amendment — unbounded-Int would false-prove
+        // `(x+1) > x` at u64::MAX) and must land on Unknown, never Proved.
         let f = Formula::Gt(
             Box::new(Formula::Mul(
                 Box::new(Formula::Int(4)),
@@ -353,7 +511,8 @@ mod tests {
             )),
             Box::new(Formula::Int(64)),
         );
-        let s = formula_to_trust_wp_expr(&f).expect("arithmetic must lower");
-        assert!(s.contains('*') && s.contains('>') && s.contains("len") && s.contains("64"));
+        let b = TrustWpRouterBackend::new();
+        let r = b.verify(&contract_vc(VcKind::Postcondition, f));
+        assert!(matches!(r, VerificationResult::Unknown { .. }), "got {r:?}");
     }
 }

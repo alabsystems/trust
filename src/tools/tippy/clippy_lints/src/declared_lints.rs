@@ -91,6 +91,7 @@ pub static LINTS: &[&::declare_clippy_lint::LintInfo] = &[
     crate::copy_iterator::COPY_ITERATOR_INFO,
     crate::crate_in_macro_def::CRATE_IN_MACRO_DEF_INFO,
     crate::create_dir::CREATE_DIR_INFO,
+    crate::creusot_spec_sugar::TRUST_CREUSOT_SPEC_SUGAR_INFO,
     crate::dbg_macro::DBG_MACRO_INFO,
     crate::default::DEFAULT_TRAIT_ACCESS_INFO,
     crate::default::FIELD_REASSIGN_WITH_DEFAULT_INFO,

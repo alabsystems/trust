@@ -12,7 +12,6 @@
 // for this module are in `super::tests::shared_helpers_tests`.
 
 #![allow(dead_code)]
-
 // Blessed env_mutation (2026-07-20): pre-existing code that predates the
 // toolchain's deny-by-default ENV_MUTATION lint. Mutates process-global env
 // under local save/restore, an RAII guard, or single-threaded harness/CLI

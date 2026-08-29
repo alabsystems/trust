@@ -4,4 +4,6 @@ fn walk(a: &[u32; 4], n: usize, i: usize) -> u32 {
     let x = a[i];
     if n > 0 { walk(a, n - 1, i) } else { x }
 }
-pub fn go() -> u32 { walk(&[1, 2, 3, 4], 3, 2) }
+pub fn go() -> u32 {
+    walk(&[1, 2, 3, 4], 3, 2)
+}

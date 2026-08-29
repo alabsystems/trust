@@ -7,7 +7,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use trust_types::{Formula, Sort};
 
@@ -519,8 +520,9 @@ impl From<super::composition::Property> for SemanticProperty {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::{Formula, Sort};
+
+    use super::*;
 
     fn var(name: &str) -> Formula {
         Formula::Var(name.into(), Sort::Int)

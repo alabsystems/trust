@@ -24,8 +24,9 @@
 //! `trusted_external`; otherwise the caller fails closed. So both closures are
 //! sound: an unknown external callee never silently confers a facet.
 
-use crate::call_graph::CallGraph;
 use std::collections::{HashMap, HashSet};
+
+use crate::call_graph::CallGraph;
 
 /// A resolved callee: an in-graph function (by def-path) or an external name.
 enum Callee {

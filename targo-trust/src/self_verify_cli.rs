@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -3003,7 +3004,9 @@ fn cargo_target_identity_from_json(value: &Value) -> Result<CargoTargetIdentity,
     let compile_target_spec_sha256 =
         match object.get("compile_target_spec_sha256") {
             Some(Value::Null) => None,
-            Some(Value::String(digest)) if trust_types::digest::is_stable_sha256_hex(digest) => Some(digest.clone()),
+            Some(Value::String(digest)) if trust_types::digest::is_stable_sha256_hex(digest) => {
+                Some(digest.clone())
+            }
             None => {
                 return Err("Cargo target identity omitted explicit `compile_target_spec_sha256`"
                     .to_string());
@@ -3571,7 +3574,9 @@ fn typed_artifact_binding(
     let declared_digest = artifact
         .digest
         .as_ref()
-        .filter(|digest| digest.algorithm == "sha256" && trust_types::digest::is_stable_sha256_hex(&digest.value))
+        .filter(|digest| {
+            digest.algorithm == "sha256" && trust_types::digest::is_stable_sha256_hex(&digest.value)
+        })
         .map(|digest| digest.value.as_str());
     let canonical_sha256_digest = declared_digest.is_some();
 
@@ -3735,7 +3740,6 @@ fn sha256_reader_bounded(reader: impl Read, max_bytes: usize) -> io::Result<Stri
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
-
 
 fn add_totals(totals: &mut BTreeMap<String, SolverTotals>, key: &str, outcome: &str, time_ms: u64) {
     let entry = totals.entry(key.to_string()).or_default();
@@ -6607,7 +6611,10 @@ mod tests {
             ("RUSTFLAGS", vec!["@policy.args".to_string()]),
             ("RUSTDOCFLAGS", vec!["@shell:policy.args".to_string()]),
             ("CARGO_ENCODED_RUSTFLAGS", vec!["-Copt-level=2".to_string(), "--".to_string()]),
-            ("CARGO_ENCODED_RUSTDOCFLAGS", vec!["--".to_string(), "-Ztrust-verify=off".to_string()]),
+            (
+                "CARGO_ENCODED_RUSTDOCFLAGS",
+                vec!["--".to_string(), "-Ztrust-verify=off".to_string()],
+            ),
         ] {
             let error = reject_uninspectable_inherited_flags(variable, &words)
                 .expect_err("uninspectable inherited compiler vector must reject");
@@ -6654,7 +6661,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create proof root");
         let root = root.canonicalize().expect("canonical proof root");
         let owner = "obligation:test:0";
-        let native_id = "trust_ir-native-trust-wp-request-1-proof-1";
+        let native_id = "trust_ir-native-trust-mc-request-1-proof-1";
         let input = bound_transport_artifact(
             "NormalizedObligation",
             b"normalized obligation\n",
@@ -6696,24 +6703,24 @@ mod tests {
             description: "native proof".to_string(),
             location: None,
             outcome: trust_types::Outcome::Proved,
-            solver: "trust-wp".to_string(),
+            solver: "trust-mc".to_string(),
             time_ms: 1,
             counterexample: None,
             counterexample_model: None,
             reason: None,
             design_mandate: false,
             native_trust_ir: Some(trust_types::TransportNativeTrustIrEvidence {
-                suite: "trust-wp".to_string(),
-                backend: "trust-wp".to_string(),
+                suite: "trust-mc".to_string(),
+                backend: "trust-mc".to_string(),
                 request_id: Some("1".to_string()),
                 native_id: Some(native_id.to_string()),
                 present: true,
-                artifacts: native_shape_artifacts("trust-wp", "1", "1"),
+                artifacts: native_shape_artifacts("trust-mc", "1", "1"),
                 diagnostics: Vec::new(),
             }),
             proof_evidence: Some(trust_types::TransportProofEvidence {
-                suite: "trust-wp".to_string(),
-                backend: "trust-wp".to_string(),
+                suite: "trust-mc".to_string(),
+                backend: "trust-mc".to_string(),
                 request_id: Some("1".to_string()),
                 proof_id: Some("1".to_string()),
                 native_id: Some(native_id.to_string()),
@@ -6785,7 +6792,7 @@ mod tests {
                     Sha256::digest(serde_json::to_vec(&metadata).expect("serialize metadata"))
                 ),
             }),
-            uri: Some(format!("artifact://trust-wp/{kind}")),
+            uri: Some(format!("artifact://trust-mc/{kind}")),
             materialization: None,
             metadata: Some(metadata),
         })
@@ -7496,7 +7503,6 @@ mod tests {
             .expect_err("symlinked output ancestor must reject");
         assert!(error.contains("non-symlink directory"), "{error}");
     }
-
 
     /// Daemon-backed stage2 validation needs a non-zero machine memory budget:
     /// `daemon_budget_is_acceptable` carries `client_budget != 0` as a hard

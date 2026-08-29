@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, Sort,
-    SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan,
+    Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::{build_semantic_guard_map, is_int_try_from_callee, is_std_unwrap_or_call};
@@ -73,6 +72,7 @@ fn try_from_unwrap_or_fn(
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -82,15 +82,13 @@ fn try_from_unwrap_or_fn(
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         func: unwrap_callee.into(),
-                        args: vec![
-                            Operand::Move(Place::local(recv)),
-                            Operand::Constant(default),
-                        ],
+                        args: vec![Operand::Move(Place::local(recv)), Operand::Constant(default)],
                         dest: Place::local(4),
                         target: Some(BlockId(2)),
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -168,10 +166,7 @@ fn u32_try_from_i64_unwrap_or_emits_both_conditional_payload_facts() {
     );
     let guards = successor_guards(&func);
     let max = u32::MAX as i128;
-    assert!(
-        guards.contains(&ok_fact(0, max)),
-        "in-range -> d == x fact missing; got {guards:?}"
-    );
+    assert!(guards.contains(&ok_fact(0, max)), "in-range -> d == x fact missing; got {guards:?}");
     assert!(
         guards.contains(&err_fact(0, max, 7)),
         "out-of-range -> d == default fact missing; got {guards:?}"
@@ -459,12 +454,8 @@ fn recognizer_matches_std_spellings_only() {
     assert!(!is_int_try_from_callee("mycrate::convert::try_from"));
     assert!(!is_int_try_from_callee("<X as mycrate::TryFrom<Y>>::try_from"));
     assert!(!is_int_try_from_callee("mycrate::core::convert::TryFrom::try_from"));
-    assert!(!is_int_try_from_callee(
-        "<u32 as mycrate::convert::TryFrom<i64>>::try_from"
-    ));
-    assert!(!is_int_try_from_callee(
-        "<u32 as mycrate::convert::TryInto<i64>>::try_into"
-    ));
+    assert!(!is_int_try_from_callee("<u32 as mycrate::convert::TryFrom<i64>>::try_from"));
+    assert!(!is_int_try_from_callee("<u32 as mycrate::convert::TryInto<i64>>::try_into"));
     // EXACT method tail.
     assert!(!is_int_try_from_callee("core::convert::TryFrom::try_from_exact"));
 
@@ -474,7 +465,5 @@ fn recognizer_matches_std_spellings_only() {
     assert!(!is_std_unwrap_or_call("core::result::Result::<T, E>::unwrap_or_else"));
     assert!(!is_std_unwrap_or_call("core::result::Result::<T, E>::unwrap_or_default"));
     assert!(!is_std_unwrap_or_call("mycrate::Thing::unwrap_or"));
-    assert!(!is_std_unwrap_or_call(
-        "mycrate::core::result::Result::<T, E>::unwrap_or"
-    ));
+    assert!(!is_std_unwrap_or_call("mycrate::core::result::Result::<T, E>::unwrap_or"));
 }

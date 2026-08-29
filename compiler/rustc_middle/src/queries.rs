@@ -653,6 +653,23 @@ rustc_queries! {
         desc { "caching MIR of `{}` for Trust verification", tcx.def_path_str(key) }
     }
 
+    /// Trust (wall A, the INSTANCE flip seam): the codegen body derived from a green GENERIC
+    /// body's recorded trust-ir Module AT ONE CONCRETE INSTANTIATION, or `None`.
+    ///
+    /// The key shape is the one `resolve_instance` already uses — a `(DefId, GenericArgs)` pair —
+    /// because this is the first point in the compiler that holds a concrete instantiation WITH
+    /// MIR demand. The query exists because `rustc_codegen_ssa` (which owns the `codegen_mir`
+    /// consumption point) cannot link `rustc_mir_transform` (which owns the pass manager and the
+    /// derivation): the query system is the sanctioned edge between them.
+    ///
+    /// `None` for every body outside the wall-A population, for every session with the lane off,
+    /// and — fail-closed — for every instance whose derived body does not reach a per-instance
+    /// `DerivedAgreed` against rustc's own instantiation of rustc's own MIR.
+    query trust_instance_flip_body(key: (DefId, GenericArgsRef<'tcx>)) -> Option<&'tcx mir::Body<'tcx>> {
+        no_hash
+        desc { "deriving per-instance Trust-IR MIR for `{}`", tcx.def_path_str(key.0) }
+    }
+
     /// Compact direct-local-callee adjacency used by Trust's query-cycle oracle.
     /// Unlike `mir_for_trust_verification`, this retains no full MIR body.
     query trust_mir_direct_local_callees(key: LocalDefId) -> &'tcx [LocalDefId] {

@@ -12,7 +12,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_interp::{evaluate_case, InterpOutcome};
+use trust_js_interp::{InterpOutcome, evaluate_case};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 fn main() {
@@ -28,8 +28,8 @@ fn main() {
         .map(|p| std::fs::read_to_string(p.as_str().expect("path")).expect("read include"))
         .collect();
     let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
-    let body = std::fs::read_to_string(manifest["source"].as_str().expect("source"))
-        .expect("read body");
+    let body =
+        std::fs::read_to_string(manifest["source"].as_str().expect("source")).expect("read body");
     let strict = manifest["mode"].as_str() == Some("strict");
 
     let outcome = evaluate_case(&include_refs, &body, strict);

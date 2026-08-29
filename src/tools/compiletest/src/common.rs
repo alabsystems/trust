@@ -1304,11 +1304,7 @@ fn supported_crate_types(config: &Config) -> HashSet<String> {
     crate_types
 }
 
-fn rustc_query_command(
-    config: &Config,
-    args: &[&str],
-    envs: HashMap<String, String>,
-) -> Command {
+fn rustc_query_command(config: &Config, args: &[&str], envs: HashMap<String, String>) -> Command {
     let mut command = config.query_rustc_command();
     add_dylib_path(&mut command, iter::once(&config.host_compile_lib_path));
     config.add_rustcflags(&mut command, &config.target_rustcflags);

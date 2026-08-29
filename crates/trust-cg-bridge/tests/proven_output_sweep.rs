@@ -337,9 +337,9 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
     match f {
         Formula::Var(name, sort) => var_term(solver, name, sort),
         Formula::Bool(b) => solver.bool_const(*b),
-        Formula::BitVec { value, width } => solver
-            .try_bv_const_bigint(&BigInt::from(*value), *width)
-            .expect("bv const"),
+        Formula::BitVec { value, width } => {
+            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
+        }
         Formula::BvAdd(a, b, _) => bin2(solver, a, b, Solver::try_bvadd),
         Formula::BvSub(a, b, _) => bin2(solver, a, b, Solver::try_bvsub),
         Formula::BvMul(a, b, _) => bin2(solver, a, b, Solver::try_bvmul),
@@ -539,12 +539,40 @@ macro_rules! cmp_cert {
 }
 
 // ---- Lt ----
-cmp_cert!(cmp_i32_slt, "i32_slt", BinOp::Lt, Ty::i32(), cmp(Formula::BvSLt, wn(0), wn(1)), cmp(Formula::BvULt, wn(0), wn(1)));
-cmp_cert!(cmp_u32_ult, "u32_ult", BinOp::Lt, Ty::u32(), cmp(Formula::BvULt, wn(0), wn(1)), cmp(Formula::BvSLt, wn(0), wn(1)));
+cmp_cert!(
+    cmp_i32_slt,
+    "i32_slt",
+    BinOp::Lt,
+    Ty::i32(),
+    cmp(Formula::BvSLt, wn(0), wn(1)),
+    cmp(Formula::BvULt, wn(0), wn(1))
+);
+cmp_cert!(
+    cmp_u32_ult,
+    "u32_ult",
+    BinOp::Lt,
+    Ty::u32(),
+    cmp(Formula::BvULt, wn(0), wn(1)),
+    cmp(Formula::BvSLt, wn(0), wn(1))
+);
 
 // ---- Le ----
-cmp_cert!(cmp_i32_sle, "i32_sle", BinOp::Le, Ty::i32(), cmp(Formula::BvSLe, wn(0), wn(1)), cmp(Formula::BvULe, wn(0), wn(1)));
-cmp_cert!(cmp_u32_ule, "u32_ule", BinOp::Le, Ty::u32(), cmp(Formula::BvULe, wn(0), wn(1)), cmp(Formula::BvSLe, wn(0), wn(1)));
+cmp_cert!(
+    cmp_i32_sle,
+    "i32_sle",
+    BinOp::Le,
+    Ty::i32(),
+    cmp(Formula::BvSLe, wn(0), wn(1)),
+    cmp(Formula::BvULe, wn(0), wn(1))
+);
+cmp_cert!(
+    cmp_u32_ule,
+    "u32_ule",
+    BinOp::Le,
+    Ty::u32(),
+    cmp(Formula::BvULe, wn(0), wn(1)),
+    cmp(Formula::BvSLe, wn(0), wn(1))
+);
 
 // ---- Gt ----
 cmp_cert!(cmp_i32_sgt, "i32_sgt", BinOp::Gt, Ty::i32(), sgt(wn(0), wn(1)), ugt(wn(0), wn(1)));
@@ -563,7 +591,11 @@ fn cmp_i32_eq() {
     let spec = cmp_eq(wn(0), wn(1));
     assert_eq!(prove(&f, &pred_to_i32(spec), 32), Verdict::Proven, "i32 eq not proven");
     let wrong = Formula::Not(b(cmp_eq(wn(0), wn(1))));
-    assert_eq!(prove(&f, &pred_to_i32(wrong), 32), Verdict::CounterExample, "VACUITY: i32 eq == ne");
+    assert_eq!(
+        prove(&f, &pred_to_i32(wrong), 32),
+        Verdict::CounterExample,
+        "VACUITY: i32 eq == ne"
+    );
 }
 #[test]
 fn cmp_u32_eq() {
@@ -571,7 +603,11 @@ fn cmp_u32_eq() {
     let spec = cmp_eq(wn(0), wn(1));
     assert_eq!(prove(&f, &pred_to_i32(spec), 32), Verdict::Proven, "u32 eq not proven");
     let wrong = Formula::Not(b(cmp_eq(wn(0), wn(1))));
-    assert_eq!(prove(&f, &pred_to_i32(wrong), 32), Verdict::CounterExample, "VACUITY: u32 eq == ne");
+    assert_eq!(
+        prove(&f, &pred_to_i32(wrong), 32),
+        Verdict::CounterExample,
+        "VACUITY: u32 eq == ne"
+    );
 }
 #[test]
 fn cmp_i32_ne() {
@@ -579,7 +615,11 @@ fn cmp_i32_ne() {
     let spec = Formula::Not(b(cmp_eq(wn(0), wn(1))));
     assert_eq!(prove(&f, &pred_to_i32(spec), 32), Verdict::Proven, "i32 ne not proven");
     let wrong = cmp_eq(wn(0), wn(1));
-    assert_eq!(prove(&f, &pred_to_i32(wrong), 32), Verdict::CounterExample, "VACUITY: i32 ne == eq");
+    assert_eq!(
+        prove(&f, &pred_to_i32(wrong), 32),
+        Verdict::CounterExample,
+        "VACUITY: i32 ne == eq"
+    );
 }
 #[test]
 fn cmp_u32_ne() {
@@ -587,7 +627,11 @@ fn cmp_u32_ne() {
     let spec = Formula::Not(b(cmp_eq(wn(0), wn(1))));
     assert_eq!(prove(&f, &pred_to_i32(spec), 32), Verdict::Proven, "u32 ne not proven");
     let wrong = cmp_eq(wn(0), wn(1));
-    assert_eq!(prove(&f, &pred_to_i32(wrong), 32), Verdict::CounterExample, "VACUITY: u32 ne == eq");
+    assert_eq!(
+        prove(&f, &pred_to_i32(wrong), 32),
+        Verdict::CounterExample,
+        "VACUITY: u32 ne == eq"
+    );
 }
 
 fn cmp_eq(a: Formula, c: Formula) -> Formula {

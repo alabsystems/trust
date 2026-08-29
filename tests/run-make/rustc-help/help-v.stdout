@@ -40,6 +40,7 @@ Options:
                         * mir - CRATE_NAME.mir
                         * obj - CRATE_NAME.o
                         * thin-link-bitcode - CRATE_NAME.indexing.o
+                        * trust-ir - CRATE_NAME.trust-ir.bin
         --print <INFO>[=<FILE>]
                         Compiler information to print on stdout (or to a file)
                         INFO may be one of

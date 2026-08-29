@@ -54,6 +54,22 @@
 //! that ever stops being true, this module's guarantee stops covering pass 2 and the
 //! certificate must be re-sited.
 //!
+//! # Pass 3 (IR-5, `clean_origin_join::link_clean_origin_edges`) — covered by CHECK
+//!
+//! The Clean-origin link pass is a SECOND callee writer, added by
+//! `docs/design/2026-08-27-two-language-direct-to-trust-ir.md` §6.5. Its write
+//! discipline is pass 2's exactly — only `*callee` (`Inst::Call`) and `*id`
+//! (`Constant::FnDef`) bindings, never `node.inst`, never a `Vec` — but unlike
+//! pass 2 it does not ride on the argument alone: it clones each function it
+//! touches and requires [`certify_remap_shape`] over the (before, after) pair,
+//! restoring the clone and disclosing on any refusal. `certify_remap_shape`
+//! deliberately ignores callee ids and compares everything else, which is
+//! precisely the "only callee ids may move" property — so pass 3's coverage is
+//! EXECUTABLE where pass 2's is argued. The "pass 2 is the only callee writer"
+//! sentence above is therefore superseded in the narrow form: pass 2 is the
+//! only UNCHECKED callee writer, and every later writer must carry this
+//! per-function certificate.
+//!
 //! # What it does NOT establish
 //!
 //! * **Semantic equality.** Preserved shape plus remapped ids is not a proof that the

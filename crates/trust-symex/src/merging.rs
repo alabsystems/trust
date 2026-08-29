@@ -15,7 +15,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-
 use trust_types::Formula;
 
 use crate::engine::ExecutionFork;

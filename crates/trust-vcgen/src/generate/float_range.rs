@@ -69,7 +69,11 @@ pub(super) fn v2_float_result_only_feeds_int_cast(func: &VerifiableFunction, des
 /// least as strong as before — and the old UNSOUND last-def-wins def scan is
 /// gone (see `float_range`'s multi-def HULL).
 #[cfg(test)]
-pub(super) fn float_exp_bound(func: &VerifiableFunction, operand: &Operand, fuel: u32) -> Option<u32> {
+pub(super) fn float_exp_bound(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    fuel: u32,
+) -> Option<u32> {
     let ctx = FloatRangeCtx::new(func, None);
     let (lo, hi) =
         float_range(&ctx, FloatNanMode::NanOrBounded, None, operand, &mut Vec::new(), fuel)?;
@@ -223,7 +227,10 @@ pub(super) fn contract_exp_bound(func: &VerifiableFunction, place: &Place) -> Op
 /// `name` in this function's GATED preconditions, or `None` when either side is
 /// missing, non-finite, or contradictory (`l > u` means the precondition is
 /// unsatisfiable — decline rather than mint an empty-interval claim).
-pub(super) fn contract_two_sided_range(func: &VerifiableFunction, name: &str) -> Option<(f64, f64)> {
+pub(super) fn contract_two_sided_range(
+    func: &VerifiableFunction,
+    name: &str,
+) -> Option<(f64, f64)> {
     let mut upper: Option<f64> = None;
     let mut lower: Option<f64> = None;
     for pre in &func.preconditions {
@@ -1164,26 +1171,26 @@ pub(super) fn float_callee_trace_range(
     // any non-const / conflicting / `&mut`-borrowed index), so the fixed element
     // read can reattach to the callee's return aggregate. The resulting suffix
     // carries only namespace-INDEPENDENT tokens. A runtime index still refuses.
-    let resolved_suffix: Vec<Projection> = if suffix.iter().any(|p| matches!(p, Projection::Index(_)))
-    {
-        let mut out = Vec::with_capacity(suffix.len());
-        for proj in suffix {
-            match proj {
-                Projection::Index(local) => {
-                    let offset = crate::index_local_const(ctx.func, *local)?;
-                    out.push(Projection::ConstantIndex {
-                        offset,
-                        min_length: offset.checked_add(1)?,
-                        from_end: false,
-                    });
+    let resolved_suffix: Vec<Projection> =
+        if suffix.iter().any(|p| matches!(p, Projection::Index(_))) {
+            let mut out = Vec::with_capacity(suffix.len());
+            for proj in suffix {
+                match proj {
+                    Projection::Index(local) => {
+                        let offset = crate::index_local_const(ctx.func, *local)?;
+                        out.push(Projection::ConstantIndex {
+                            offset,
+                            min_length: offset.checked_add(1)?,
+                            from_end: false,
+                        });
+                    }
+                    other => out.push(other.clone()),
                 }
-                other => out.push(other.clone()),
             }
-        }
-        out
-    } else {
-        suffix.to_vec()
-    };
+            out
+        } else {
+            suffix.to_vec()
+        };
     let suffix: &[Projection] = &resolved_suffix;
     let summary = ctx.summaries?.get(callee)?;
     let body = summary.extracted_body.as_deref()?;
@@ -1192,8 +1199,7 @@ pub(super) fn float_callee_trace_range(
         return None;
     }
     // Trace memo (successful results only — see the field doc).
-    let memo_key =
-        (call_block, callee.to_string(), format!("{args:?}"), format!("{suffix:?}"));
+    let memo_key = (call_block, callee.to_string(), format!("{args:?}"), format!("{suffix:?}"));
     if let Some(hit) = ctx.trace_memo.borrow().get(&memo_key) {
         return Some(*hit);
     }
@@ -1383,8 +1389,8 @@ pub(super) fn float_masked_init_call_element_range<'a>(
         for stmt in &block.stmts {
             match stmt {
                 Statement::Assign { place: dest, rvalue, .. } => {
-                    if let Rvalue::Ref { mutable: true, place: b }
-                    | Rvalue::AddressOf(true, b) = rvalue
+                    if let Rvalue::Ref { mutable: true, place: b } | Rvalue::AddressOf(true, b) =
+                        rvalue
                         && b.local == m
                     {
                         return None; // `&mut m.*` — an invisible write channel
@@ -2339,8 +2345,11 @@ pub fn all_callsites_precondition_dominated(
     let float_ctx = FloatRangeCtx::new(func, Some(summaries));
     let mut saw_site = false;
     for block in &func.body.blocks {
-        let Terminator::Call { func: callee_name, args, .. } = &block.terminator else {
-            continue;
+        let (callee_name, args) = match &block.terminator {
+            Terminator::Call { func, args, .. } | Terminator::TailCall { func, args, .. } => {
+                (func, args)
+            }
+            _ => continue,
         };
         if callee_name != callee {
             continue;
@@ -2496,6 +2505,12 @@ pub(super) fn dominance_actual_range(
 /// evaluated under ITS OWN block's dominating guards. Recursion is the
 /// CALLER's concern (`compute_summary` passes `is_recursive` and skips this).
 pub fn derive_float_result_range(func: &VerifiableFunction) -> Option<(f64, f64)> {
+    // This public summary producer is also invoked directly by the compiler.
+    // A TailCall overwrites the implicit return place; project it before the
+    // return-def trace so an earlier `_0` assignment cannot masquerade as the
+    // function's returned range.
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let func = tail_call_expanded.as_ref();
     if !matches!(func.body.return_ty, Ty::Float { width: 64 }) {
         return None;
     }

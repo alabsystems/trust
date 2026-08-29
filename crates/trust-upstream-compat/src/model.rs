@@ -666,6 +666,28 @@ pub struct TrustAddedTestCommand {
     pub covers: Vec<String>,
     /// Whether a release proof requires this command.
     pub required: bool,
+    /// Trust: the weaker, RUNNABLE spelling used when the bundle is not
+    /// release-grade.
+    ///
+    /// The canonical `command` above always carries `--release`, and every one
+    /// of them refuses today: six native modes refuse the release request
+    /// outright, and six canonical modes refuse unconditionally because the
+    /// evidence they attest to — authenticated distribution roots, signed
+    /// artifacts, fresh receipt transactions — does not exist yet
+    /// (`targo-trust/src/rust_vs_trust.rs`, `blocked_canonical_diagnostic`).
+    ///
+    /// Those refusals each NAME a weaker mode that IS runnable "for local
+    /// diagnostics", and this field is where that name goes. A non-release
+    /// bundle then attests what actually ran, at the strength it actually has,
+    /// instead of citing a canonical command that refused.
+    ///
+    /// This is deliberately NOT a way to make a release bundle pass. A release
+    /// run uses `command` and nothing else; `bundle.release` records which was
+    /// used, and the validator's release-only rules key on it. Absent means
+    /// this command has no local substitute — a non-release bundle then simply
+    /// does not cover it, rather than pretending otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_command: Option<String>,
 }
 
 /// Computed proof totals for per-test compatibility evidence.

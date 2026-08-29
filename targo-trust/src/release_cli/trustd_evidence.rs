@@ -9,19 +9,17 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use trust_version::{BoundToolIdentity, TrustVersionIdentity};
 
-use crate::bounded_process;
-use crate::controlled_git;
-use crate::durable_io::atomic_write_private;
-use crate::pipeline::probe::{
-    TrustdRuntimeClosure, apply_trustd_runtime_closure, inspect_trustd_runtime_closure,
-};
-
 use super::identity::{
     bound_file_sha256, build_version_identity, discover_repo_root, generated_at_unix_seconds,
     is_executable_file, option_value, trustd_version_output_is_bound,
 };
 use super::product_proof::PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS;
 use super::types::CANDIDATE_COMMAND_VERSION;
+use crate::durable_io::atomic_write_private;
+use crate::pipeline::probe::{
+    TrustdRuntimeClosure, apply_trustd_runtime_closure, inspect_trustd_runtime_closure,
+};
+use crate::{bounded_process, controlled_git};
 
 const COMMAND: &str = "targo trust release collect-trustd-evidence";
 const EVIDENCE_SCHEMA: &str = "trust.product-proof.v1";
@@ -929,12 +927,10 @@ fn controlled_git_identity(root: &Path) -> Result<Value, String> {
     }))
 }
 
-
 fn canonical_commit(value: &str) -> bool {
     value.len() == 40
         && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
-
 
 fn argument_error(error: impl AsRef<str>) -> ExitCode {
     eprintln!("{COMMAND}: {}", error.as_ref());

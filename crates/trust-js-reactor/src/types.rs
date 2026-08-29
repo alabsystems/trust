@@ -46,10 +46,7 @@ pub struct Capability {
 
 impl Capability {
     pub(crate) fn new(promise: PromiseId) -> Self {
-        Self {
-            promise,
-            guard: Rc::new(Cell::new(false)),
-        }
+        Self { promise, guard: Rc::new(Cell::new(false)) }
     }
 
     /// Claim the capability (`alreadyResolved`). Returns true on the first call,
@@ -122,8 +119,12 @@ pub(crate) enum Internal<V> {
     },
     /// Race/any element fulfilled, or race element rejected: settle the shared
     /// capability directly (first settle wins via the capability guard).
-    ResolveMain { cap: Capability },
-    RejectMain { cap: Capability },
+    ResolveMain {
+        cap: Capability,
+    },
+    RejectMain {
+        cap: Capability,
+    },
 }
 
 /// Shared aggregation state for the collecting combinators (all / allSettled /
@@ -143,18 +144,10 @@ pub(crate) enum Job<V, F> {
     /// A `queueMicrotask` / host job: invoke `f` with no argument.
     HostMicrotask(F),
     /// A PromiseReactionJob: run `handler` with `arg`, settle `cap`.
-    Reaction {
-        handler: Handler<V, F>,
-        arg: V,
-        cap: Option<Capability>,
-    },
+    Reaction { handler: Handler<V, F>, arg: V, cap: Option<Capability> },
     /// A PromiseResolveThenableJob: assimilate `thenable` into `promise` by
     /// invoking its `then` with a fresh capability's resolve/reject.
-    ResolveThenable {
-        promise: PromiseId,
-        thenable: V,
-        then: F,
-    },
+    ResolveThenable { promise: PromiseId, thenable: V, then: F },
 }
 
 /// Timer ordering key: `(deadline, order_seq)`. `BTreeMap` over this yields the

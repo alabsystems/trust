@@ -5,7 +5,10 @@
 
 use super::*;
 
-pub(super) fn v2_block_span(func: &VerifiableFunction, block: &trust_types::BasicBlock) -> SourceSpan {
+pub(super) fn v2_block_span(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+) -> SourceSpan {
     block
         .stmts
         .iter()
@@ -34,77 +37,14 @@ pub(super) fn v2_divisor_is_nonzero_constant(divisor: &Operand) -> bool {
     }
 }
 
-/// Ungated mirror of [`v2_divisor_is_nonzero_constant`]'s constant test, callable
-/// from the hardened-profile pass. Kept separate so the hardened pass can share
-/// the same classification without duplicating the main safety-lane walk.
-pub(super) fn divrem_divisor_const_is_nonzero(divisor: &Operand) -> bool {
-    match divisor {
-        Operand::Constant(ConstValue::Int(v)) => *v != 0,
-        Operand::Constant(ConstValue::Uint(v, _)) => *v != 0,
-        Operand::Constant(ConstValue::Float(v)) => *v != 0.0,
-        Operand::Constant(ConstValue::FloatBits { bits, width }) => {
-            !crate::float_bits_magnitude_is_zero(*bits, *width)
-        }
-        _ => false,
-    }
-}
-
-/// For a `Div`/`Rem`-by-zero `Assert` terminator at `assert_block`, decide whether
-/// the divisor of the guarded `Div`/`Rem` operation is a NONZERO CONSTANT — the
-/// exact condition under which the per-statement Div/Rem safety VC is (soundly)
-/// suppressed (`v2_divisor_is_nonzero_constant`). The actual `Rvalue::BinaryOp(Div
-/// |Rem, _, divisor)` lives in the assert's SUCCESS-TARGET block (the standard
-/// `bbN: assert(d != 0) -> bbM; bbM: _x = Div(a, d)` MIR shape), so we scan the
-/// target block first, then the assert block itself as a fallback.
-///
-/// FAIL-CLOSED: if no in-scope `Div`/`Rem` rvalue with a nonzero-constant divisor
-/// is found (symbolic divisor, divisor not locatable, or zero constant), returns
-/// `false` so the caller KEEPS the hardened twin — a real or unknown
-/// division-by-zero stays refutable. Returning `true` only for a provably-nonzero
-/// constant divisor can never mask a reachable panic.
-pub(crate) fn v2_block_divrem_divisor_is_nonzero_constant(
-    func: &VerifiableFunction,
-    assert_block: &trust_types::BasicBlock,
-) -> bool {
-    let Terminator::Assert { target, .. } = &assert_block.terminator else {
-        return false;
-    };
-
-    let block_has_nonzero_const_divrem = |block: &trust_types::BasicBlock| -> bool {
-        block.stmts.iter().any(|stmt| {
-            matches!(
-                stmt,
-                Statement::Assign {
-                    rvalue: Rvalue::BinaryOp(BinOp::Div | BinOp::Rem, _, divisor),
-                    ..
-                } if divrem_divisor_const_is_nonzero(divisor)
-            )
-        })
-    };
-
-    // The divisor must additionally NOT be a nonzero constant in ANY in-scope
-    // Div/Rem whose divisor is symbolic — but a symbolic Div/Rem simply yields
-    // `false` from the const test, so a block carrying BOTH a const-divisor and a
-    // symbolic-divisor div/rem would still be suppressed. That cannot happen here:
-    // one assert guards exactly one div/rem operation. We require the located
-    // div/rem to have a nonzero-constant divisor.
-    if let Some(tb) = func.body.blocks.iter().find(|b| b.id == *target)
-        && block_has_nonzero_const_divrem(tb)
-    {
-        return true;
-    }
-    block_has_nonzero_const_divrem(assert_block)
-}
-
 /// The set of `BoundsCheck` `Assert` blocks whose checked index is PROVABLY in
 /// range via a loop-yield bound — a `for i in 0..s.len()` exclusive-range yield
 /// ([`build_range_yield_guard_map`]) or a `for (i, _) in s.iter().enumerate()`
 /// index yield ([`build_enumerate_yield_guard_map`]) that establishes
 /// `index < len` for the SAME length the assert checks. The hardened
 /// panic-boundary lane SKIPS emitting its `BoundsCheck` twin for these blocks,
-/// mirroring the Div/Rem nonzero-constant skip
-/// (`v2_block_divrem_divisor_is_nonzero_constant`): the per-statement bounds VC
-/// already PROVES the access via the SAME yield fact — a fact the per-statement
+/// the per-statement bounds VC already PROVES the access via the SAME yield fact
+/// — a fact the per-statement
 /// lane conjoins onto the bounds VC but the hardened twin does NOT — so without
 /// the skip the twin over-refutes a provably-safe guarded index (per-statement
 /// PROVED while the hardened twin FAILS).
@@ -157,7 +97,8 @@ pub(super) fn v2_boundscheck_index_provably_in_range(
     };
     // The bounds assert is `assert(Lt(index, len))`; recover the index/len operands
     // from the `_c = Lt(index, len)` definition in this block.
-    let Some((BinOp::Lt, index_op, len_op)) = v2_find_condition_binary_operands(assert_block, cond)
+    let Some((_, BinOp::Lt, index_op, len_op)) =
+        v2_find_condition_binary_operands(func, assert_block, cond)
     else {
         return false;
     };
@@ -289,6 +230,7 @@ pub(super) fn v2_zero_formula_for_formula(formula: &Formula) -> Formula {
     }
 }
 
+#[cfg(test)]
 pub(super) fn v2_guard_targets_matching(
     func: &VerifiableFunction,
     pred: impl Fn(&AssertMessage) -> bool,
@@ -303,18 +245,360 @@ pub(super) fn v2_guard_targets_matching(
         .collect()
 }
 
-pub(super) fn v2_overflow_guard_targets(func: &VerifiableFunction) -> std::collections::HashSet<BlockId> {
+#[cfg(test)]
+pub(crate) fn v2_overflow_guard_targets(
+    func: &VerifiableFunction,
+) -> std::collections::HashSet<BlockId> {
     v2_guard_targets_matching(func, |msg| {
         matches!(msg, AssertMessage::Overflow(BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr))
     })
 }
 
-pub(super) fn v2_bounds_guard_targets(func: &VerifiableFunction) -> std::collections::HashSet<BlockId> {
-    v2_guard_targets_matching(func, |msg| matches!(msg, AssertMessage::BoundsCheck))
+/// The sole `BoundsCheck` assert per normal-success target, as an index into
+/// `func.body.blocks`. A target with TWO OR MORE candidate `BoundsCheck`
+/// asserts is ABSENT: among multiple candidates, target identity cannot say
+/// which (if either) guarded a given row, and ambiguity is never suppression
+/// authority — the rows emit, and a dominating path guard may still discharge
+/// them downstream (over-report is the fail-closed direction).
+pub(super) fn v2_sole_bounds_assert_by_target(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, usize> {
+    let mut candidates: FxHashMap<BlockId, Option<usize>> = FxHashMap::default();
+    for (block_index, bb) in func.body.blocks.iter().enumerate() {
+        if let Terminator::Assert { msg: AssertMessage::BoundsCheck, target, .. } = &bb.terminator {
+            candidates.entry(*target).and_modify(|slot| *slot = None).or_insert(Some(block_index));
+        }
+    }
+    candidates.into_iter().filter_map(|(target, slot)| slot.map(|i| (target, i))).collect()
 }
 
-pub(super) fn v2_negation_guard_targets(func: &VerifiableFunction) -> std::collections::HashSet<BlockId> {
-    v2_guard_targets_matching(func, |msg| matches!(msg, AssertMessage::OverflowNeg))
+/// Whether the `BoundsCheck` assert at `assert_block` is EXACTLY BOUND to every
+/// index-bounds row the rvalue lane would emit for `place` at
+/// `use_block.stmts[use_stmt_index]` — the only condition under which that lane
+/// may suppress those rows.
+///
+/// This replaces the deleted `v2_bounds_guard_targets` bare-target set. Target
+/// identity alone ("some `BoundsCheck` assert jumps here") never proved that
+/// the assert guarded THIS operation and THESE operands: a `Lt(_i, len_A)`
+/// assert whose success edge enters a block that also indexes a DIFFERENT
+/// collection `B` (with index `_j`, or even the same `_i` against a different
+/// length) suppressed B's rows on A's authority — the same identity weakness
+/// the Overflow/OverflowNeg and Div/Rem lanes already had removed (see
+/// `v2_divrem_overflow_assert_exactly_bound` and the plain-arm comment in
+/// `safety.rs`). The binding demanded here, per row:
+///
+///  * SOLE ENTRY: the assert's normal success edge is the only way into
+///    `use_block` — no other predecessor edge (cleanup edges included), not the
+///    assert's own unwind edge, and not the entry block. A row reachable around
+///    the assert is a row the assert does not cover on some execution;
+///  * the assert cond's live definition, in the assert's OWN block, is the
+///    canonical `Lt(index, bound)` with `expected: true` and both operands
+///    projection-free, alias-stable, and un-rewritten through the terminator
+///    (`v2_find_condition_binary_operands`);
+///  * the compared index IS the row's index local — an UNSIGNED one (a signed
+///    row carries an `index < 0` disjunct the assert never checked) — and
+///    reaches the indexed statement un-rewritten;
+///  * the compared bound IS the row's collection length
+///    ([`v2_assert_len_binding_holds`]).
+///
+/// `ConstantIndex`/`Subslice` rows are never suppressible here: a runtime
+/// `Lt(index, len)` check is not authority over a constant-offset obligation.
+/// Any other shape — ambiguity, rewrite, aliasing, non-canonical polarity,
+/// multiple candidate asserts ([`v2_sole_bounds_assert_by_target`]) — keeps the
+/// row.
+pub(super) fn v2_bounds_assert_exactly_covers_place(
+    func: &VerifiableFunction,
+    assert_block: &trust_types::BasicBlock,
+    use_block: &trust_types::BasicBlock,
+    use_stmt_index: usize,
+    place: &Place,
+) -> bool {
+    use std::borrow::Cow;
+    // The entry block also executes with NO predecessor edge at all; the assert
+    // cannot cover that execution's rows.
+    if use_block.id.0 == 0 {
+        return false;
+    }
+    // The assert's FAILURE/cleanup edge runs exactly when the index is out of
+    // bounds — it must not re-enter the block whose rows it would suppress.
+    if assert_block.terminator.unwind_cleanup_target() == Some(use_block.id) {
+        return false;
+    }
+    // Sole-entry: no OTHER block's terminator may reach `use_block`
+    // (`exit_targets` lists cleanup edges too).
+    let bypassed = func.body.blocks.iter().any(|b| {
+        b.id != assert_block.id
+            && b.terminator.exit_targets().iter().any(
+                |t| matches!(t, trust_types::ClauseTarget::Block(succ) if *succ == use_block.id),
+            )
+    });
+    if bypassed {
+        return false;
+    }
+
+    // Walk the projections exactly as `check_direct_projection_load` does, so
+    // "every row" here is byte-for-byte the set of rows the builder would emit.
+    let Some(mut ty) = crate::local_ty_ref(func, place.local).map(Cow::Borrowed) else {
+        return false;
+    };
+    let mut prefix = Place::local(place.local);
+    let mut any_row_bound = false;
+    for projection in &place.projections {
+        match projection {
+            Projection::Index(index_local) => {
+                if rvalue_safety::collection_len_formula(func, &prefix, ty.as_ref()).is_some() {
+                    if !v2_bounds_assert_binds_index_row(
+                        func,
+                        assert_block,
+                        use_block,
+                        use_stmt_index,
+                        *index_local,
+                        &prefix,
+                        ty.as_ref(),
+                    ) {
+                        return false;
+                    }
+                    any_row_bound = true;
+                }
+            }
+            Projection::ConstantIndex { .. } | Projection::Subslice { .. } => {
+                if rvalue_safety::collection_len_formula(func, &prefix, ty.as_ref()).is_some() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        let Some(next_ty) = crate::step_place_ty_cow(ty, projection) else {
+            // The row builder stops at an unresolvable step too: no further rows.
+            break;
+        };
+        prefix.projections.push(projection.clone());
+        ty = next_ty;
+    }
+    any_row_bound
+}
+
+/// One index-bounds row's exact binding to the assert: canonical `Lt` cond,
+/// index identity, and length correspondence. See
+/// [`v2_bounds_assert_exactly_covers_place`].
+fn v2_bounds_assert_binds_index_row(
+    func: &VerifiableFunction,
+    assert_block: &trust_types::BasicBlock,
+    use_block: &trust_types::BasicBlock,
+    use_stmt_index: usize,
+    index_local: usize,
+    collection: &Place,
+    collection_ty: &Ty,
+) -> bool {
+    // Canonical polarity ONLY. An `expected: false` BoundsCheck succeeds when
+    // its condition is FALSE — its success edge carries no `index < len`
+    // evidence whatsoever.
+    let Terminator::Assert {
+        cond, expected: true, msg: AssertMessage::BoundsCheck, target, ..
+    } = &assert_block.terminator
+    else {
+        return false;
+    };
+    if *target != use_block.id {
+        return false;
+    }
+    let Some((cmp_index, BinOp::Lt, index_op, bound_op)) =
+        v2_find_condition_binary_operands(func, assert_block, cond)
+    else {
+        return false;
+    };
+    // Index identity: the compared operand IS the row's index local...
+    let (Operand::Copy(index_place) | Operand::Move(index_place)) = index_op else {
+        return false;
+    };
+    if !index_place.projections.is_empty() || index_place.local != index_local {
+        return false;
+    }
+    // ...an UNSIGNED one (`Lt(i, len)` says nothing about a signed row's
+    // `i < 0` disjunct)...
+    if crate::operand_ty_cow(func, index_op).as_deref().is_some_and(Ty::is_signed) {
+        return false;
+    }
+    // ...that reaches the indexed statement un-rewritten. The success edge
+    // enters `use_block` directly (sole-entry, checked by the caller), so the
+    // only statements between the comparison and the read are the assert
+    // block's tail (`v2_find_condition_binary_operands` refuses rewrites
+    // there) and the use block's prefix, scanned here.
+    let index_name = place_to_var_name(func, index_place);
+    if (0..use_stmt_index.min(use_block.stmts.len()))
+        .any(|k| stmt_writes_name(func, use_block, k, &index_name))
+    {
+        return false;
+    }
+    v2_assert_len_binding_holds(func, assert_block, cmp_index, bound_op, collection, collection_ty)
+}
+
+/// Whether the assert cond's BOUND operand is exactly this row's collection
+/// length. Three canonical shapes, all resolved in the assert's OWN block:
+///
+///  * `bound = Len(<collection>)` — the length of the EXACT place the row
+///    indexes;
+///  * `bound = PtrMetadata(p)` where `p` is the fat pointer whose pointee the
+///    row indexes — read directly (`PtrMetadata(copy s)` for a `(*s)[i]` row;
+///    `slice_metadata_place` pops the deref) or through the canonical rustc
+///    reborrow chain `_p = &raw (*s); bound = PtrMetadata(_p)` (the reborrow's
+///    metadata IS the metadata of the exact place it reborrows);
+///  * a constant (bare, or a constant-defined temp) equal to the TYPE-derived
+///    array length (`Formula::Int(N)` / the const-generic param symbol).
+///
+/// A type-carried length (`[T; N]` / `[T; const N]`) cannot change with the
+/// collection's value. A slice/str length is VALUE metadata, so the binding
+/// additionally demands the fat-pointer root REBIND-FREE
+/// ([`v2_slice_metadata_root_can_rebind`]) — element stores through the
+/// pointer never move its length, but a rebind of the pointer itself would
+/// decouple the checked length from the indexed access. Everything else — a
+/// chained copy, a foreign local, a bound defined in another block — is NOT a
+/// length binding: fail closed.
+fn v2_assert_len_binding_holds(
+    func: &VerifiableFunction,
+    assert_block: &trust_types::BasicBlock,
+    cmp_index: usize,
+    bound_op: &Operand,
+    collection: &Place,
+    collection_ty: &Ty,
+) -> bool {
+    let Some(row_len) = rvalue_safety::collection_len_formula(func, collection, collection_ty)
+    else {
+        return false;
+    };
+    let bound_place = match bound_op {
+        // A literal bound is exact only against a type-derived length.
+        Operand::Constant(_) => return v2_const_matches_len(func, bound_op, &row_len),
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p,
+        _ => return false,
+    };
+    let bound_name = place_to_var_name(func, bound_place);
+    for k in (0..cmp_index.min(assert_block.stmts.len())).rev() {
+        if !stmt_writes_name(func, assert_block, k, &bound_name) {
+            continue;
+        }
+        let Statement::Assign { place, rvalue, .. } = &assert_block.stmts[k] else {
+            return false;
+        };
+        if place != bound_place {
+            return false;
+        }
+        match rvalue {
+            Rvalue::Len(p) if p == collection => {}
+            Rvalue::UnaryOp(
+                trust_types::UnOp::PtrMetadata,
+                Operand::Copy(p) | Operand::Move(p),
+            ) if *p == rvalue_safety::slice_metadata_place(func, collection)
+                || v2_is_reborrow_of(func, assert_block, k, p, collection) => {}
+            Rvalue::Use(op @ Operand::Constant(_)) => {
+                return v2_const_matches_len(func, op, &row_len);
+            }
+            _ => return false,
+        }
+        if matches!(collection_ty, Ty::Array { .. } | Ty::SymArray { .. }) {
+            return true;
+        }
+        // VALUE metadata: the length read and the indexed access must see the
+        // same fat pointer.
+        return !v2_slice_metadata_root_can_rebind(func, collection.local);
+    }
+    false
+}
+
+/// Whether `pointer`'s live definition before `assert_block.stmts[before]` is
+/// exactly the canonical reborrow `pointer = &<collection>` /
+/// `&raw <collection>` of the EXACT place the row indexes — the shape rustc
+/// emits for slice indexing (`_p = &raw const (*s); _len = PtrMetadata(_p)`).
+/// The reborrow's fat-pointer metadata is by construction the metadata of the
+/// place it reborrows, so `PtrMetadata(pointer)` reads the collection's length.
+/// The reverse scan finds the LATEST write, so an interposed rewrite of the
+/// temp is itself the found statement and fails the shape check; a mut-borrowed
+/// or multi-written temp is refused outright (`value_local_is_unstable`).
+fn v2_is_reborrow_of(
+    func: &VerifiableFunction,
+    assert_block: &trust_types::BasicBlock,
+    before: usize,
+    pointer: &Place,
+    collection: &Place,
+) -> bool {
+    if !pointer.projections.is_empty() || guards::value_local_is_unstable(func, pointer.local) {
+        return false;
+    }
+    let pointer_name = place_to_var_name(func, pointer);
+    for k in (0..before.min(assert_block.stmts.len())).rev() {
+        if !stmt_writes_name(func, assert_block, k, &pointer_name) {
+            continue;
+        }
+        let Statement::Assign { place, rvalue, .. } = &assert_block.stmts[k] else {
+            return false;
+        };
+        if place != pointer {
+            return false;
+        }
+        return matches!(
+            rvalue,
+            Rvalue::Ref { place: reborrowed, .. } | Rvalue::AddressOf(_, reborrowed)
+                if reborrowed == collection
+        );
+    }
+    false
+}
+
+/// Whether the fat-pointer/slice METADATA of root `local` can be rebound
+/// anywhere in the function. Pointee writes — any place whose projections start
+/// with `Deref` (`(*s)[i] = v`, `*s = ..`) — copy element data through the
+/// pointer and can NEVER move its length metadata; likewise a reborrow of the
+/// pointee (`&mut (*s)`, `&raw (*s)`) hands out element access only. What CAN
+/// rebind the metadata is a write to the pointer local itself: a non-`Deref`
+/// `Assign`/`SetDiscriminant`/`Deinit` dest, a `Call` destination, or a
+/// mutable/raw borrow OF THE POINTER LOCAL (a channel through which `s = other`
+/// can happen invisibly). This is deliberately narrower than
+/// `value_local_is_unstable`, whose whole-VALUE staleness question also counts
+/// element stores — correct for value facts, needlessly fail-closed for a
+/// length that element stores cannot touch.
+fn v2_slice_metadata_root_can_rebind(func: &VerifiableFunction, local: usize) -> bool {
+    let names_pointer_itself = |place: &Place| {
+        place.local == local && place.projections.first() != Some(&Projection::Deref)
+    };
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Statement::Assign { place, rvalue, .. } => {
+                    if names_pointer_itself(place) {
+                        return true;
+                    }
+                    match rvalue {
+                        Rvalue::Ref { mutable: true, place: bp } | Rvalue::AddressOf(_, bp)
+                            if names_pointer_itself(bp) =>
+                        {
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if names_pointer_itself(place) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Call { dest, .. } = &block.terminator
+            && names_pointer_itself(dest)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A constant bound equals the row's length only when it renders to the EXACT
+/// length term — the concrete `Int(N)` of a `[T; N]` or the per-param symbol of
+/// a `[T; const N]`. Value metadata (a slice length) has no constant identity.
+fn v2_const_matches_len(func: &VerifiableFunction, bound: &Operand, row_len: &Formula) -> bool {
+    const_int_value(bound).map(Formula::Int).as_ref() == Some(row_len)
+        || &operand_to_formula(func, bound) == row_len
 }
 
 pub(super) fn v2_formula_with_block_defs(
@@ -854,69 +1138,244 @@ pub(super) fn v2_formula_with_block_defs_at(
     }
 }
 
-pub(super) fn v2_find_target_binary_operands(
-    func: &VerifiableFunction,
+pub(super) fn v2_find_target_binary_operands<'a>(
+    func: &'a VerifiableFunction,
     target: BlockId,
     op: BinOp,
-) -> Option<(&Operand, &Operand)> {
+) -> Option<(&'a trust_types::BasicBlock, usize, &'a Operand, &'a Operand)> {
     let block = func.body.blocks.get(target.0)?;
     v2_find_block_binary_operands(block, op)
+        .map(|(stmt_index, lhs, rhs)| (block, stmt_index, lhs, rhs))
 }
 
 pub(crate) fn v2_find_block_binary_operands(
     block: &trust_types::BasicBlock,
     op: BinOp,
-) -> Option<(&Operand, &Operand)> {
-    block.stmts.iter().find_map(|stmt| {
+) -> Option<(usize, &Operand, &Operand)> {
+    let mut found = None;
+    for (stmt_index, stmt) in block.stmts.iter().enumerate() {
         let Statement::Assign { rvalue, .. } = stmt else {
-            return None;
+            continue;
         };
-        match rvalue {
+        let candidate = match rvalue {
             Rvalue::BinaryOp(stmt_op, lhs, rhs) | Rvalue::CheckedBinaryOp(stmt_op, lhs, rhs)
                 if *stmt_op == op =>
             {
-                Some((lhs, rhs))
+                Some((stmt_index, lhs, rhs))
             }
             _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if found.is_some() {
+                // A block id plus operation is not enough identity to select
+                // among multiple candidates. The assert caller converts this
+                // ambiguity into an explicit proof-gap row.
+                return None;
+            }
+            found = Some(candidate);
         }
-    })
+    }
+    found
 }
 
+/// `cond`'s live definition in `block` as a comparison `(stmt_index, op, lhs,
+/// rhs)` — the SHIPPED rule, which admits only PROJECTION-FREE comparison
+/// inputs. [`v2_find_projected_condition_binary_operands`] is the sibling that
+/// admits a field-projected input; see it for why the two are separate rather
+/// than one loosened rule.
 pub(super) fn v2_find_condition_binary_operands<'a>(
+    func: &VerifiableFunction,
     block: &'a trust_types::BasicBlock,
     cond: &Operand,
-) -> Option<(BinOp, &'a Operand, &'a Operand)> {
-    let cond_local = match cond {
-        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place.local,
+) -> Option<(usize, BinOp, &'a Operand, &'a Operand)> {
+    v2_condition_binary_operands(func, block, cond, false)
+}
+
+/// As [`v2_find_condition_binary_operands`], but a comparison INPUT may carry
+/// FIELD projections (`_3 = Lt(_2.0, const 32)`). Everything else — the
+/// projection-free stable flag place, the live whole-local definition, const
+/// identity, and the no-later-rewrite scan — is the same rule.
+///
+/// THE PROJECTION IS THE REAL LOWERING, not a hypothetical. `1u32 << t` with
+/// `let t = (x | 64) + 1` extracts (`-Ztrust-dump=mir`, stage2 @ 17abbefc3) as
+///
+/// ```text
+/// bb0: _3 = CheckedBinaryOp(Add, _2, const 1u32); assert(!_3.1, Overflow(Add)) -> bb1
+/// bb1: _4 = BinaryOp(Lt, Copy _3.0, const 32u32); assert(_4, Overflow(Shl))    -> bb2
+/// bb2: _0 = BinaryOp(Shl, const 1u32, Copy _3.0)
+/// ```
+///
+/// so the comparison input is `_3.0`, the value field of the `CheckedAdd` tuple
+/// — exactly the shape that already forced [`v2_eq_def_binds_projected_operand`]
+/// to exist for the zero-divisor chain. The shipped rule's comment ("faithful
+/// rustc MIR materializes comparison inputs in projection-free temporaries") is
+/// a false premise, and it cost a real obligation: with the finder returning
+/// `None`, `v2_shift_assert_binds_statement` refuses, so the assert lane drops
+/// to a generic `VcKind::ArithmeticOverflow` row while the per-statement
+/// `ShiftOverflow` row — the VACUOUS one, sitting under the assert's own
+/// `AssertHolds` guard — survives as the ONLY `shift:left` row at the span, and
+/// reads `proved` on a genuinely-UB shift. (Pretty-printed `--emit=mir` renders
+/// `_3.0` as a plain local and hides this; the extracted verification input does
+/// not.)
+///
+/// A SIBLING, NOT A LOOSENING, for the reason c67021cd0d gave for the shift
+/// suppression itself: this finder is shared by the bounds, div/rem and
+/// arithmetic lanes, each of which uses it to decide an EXACT binding that can
+/// delete an obligation. Relaxing it in place would move all of them at once on
+/// one unmeasured edit. Callers opt in by name, so the projection dimension
+/// stays visible at the call site.
+///
+/// ITS CALLER is `checked_vcs::v2_shift_assert_binds_statement`, the ONE
+/// predicate `c67021cd0d` made serve both shift lanes so they cannot drift
+/// apart. Until that call site selects this rule the projected shape stays
+/// broken in exactly the way described above.
+///
+/// FAIL-CLOSED ON EVERYTHING THE PROJECTION ADDS:
+///  * FIELD projections only — the one shape rustc emits here. `Deref` is a read
+///    through a pointer whose stores are opaque to a def scan; `Index` reads a
+///    SEPARATE index local that nothing in this rule covers; the rest are
+///    refused because they were not measured, not because they were judged
+///    unsafe. This is deliberately STRICTER than `checked_vcs`'s sibling concept
+///    `v2_place_is_statically_addressed` (which also admits
+///    `Downcast`/`ConstantIndex`/`Subslice`/`OpaqueCast`/`UnwrapUnsafeBinder`).
+///    If the two are ever unified, THIS is the one to widen — and
+///    `tests/projected_shift_canary_real_mir.rs`'s
+///    `a_downcast_projected_amount_does_not_suppress` is the arm that must then
+///    be re-pointed at a projection the widened rule still refuses.
+///  * Stability is enforced the way [`guards::value_local_is_unstable`]'s own
+///    contract prescribes for a projected value: on the BASE local, which counts
+///    field stores AND mutable borrows of the aggregate, so a single-assigned
+///    base is stable function-wide — strictly stronger than a same-block scan.
+///    (That call is already keyed on `input.local`; for `_3.0` it asks about
+///    `_3`.)
+///  * The comparison must not read the flag it defines. The shipped rule spells
+///    that `input == cond_place`, which a projected input can never equal;
+///    `place_names_overlap` is the projection-aware form of the same test and
+///    also catches a forged `_4 = Lt(_4.0, ..)`.
+pub(super) fn v2_find_projected_condition_binary_operands<'a>(
+    func: &VerifiableFunction,
+    block: &'a trust_types::BasicBlock,
+    cond: &Operand,
+) -> Option<(usize, BinOp, &'a Operand, &'a Operand)> {
+    v2_condition_binary_operands(func, block, cond, true)
+}
+
+/// The body of both condition finders. `projected_inputs` is the ONLY dimension
+/// they differ in: with it `false` the behavior is the shipped rule, byte for
+/// byte.
+fn v2_condition_binary_operands<'a>(
+    func: &VerifiableFunction,
+    block: &'a trust_types::BasicBlock,
+    cond: &Operand,
+    projected_inputs: bool,
+) -> Option<(usize, BinOp, &'a Operand, &'a Operand)> {
+    let cond_place = match cond {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => place,
         _ => return None,
     };
+    if guards::value_local_is_unstable(func, cond_place.local) {
+        return None;
+    }
+    let cond_name = place_to_var_name(func, cond_place);
 
-    block.stmts.iter().find_map(|stmt| {
+    // Public TrustIR is not SSA, and a write through an alias can redefine the
+    // condition just as surely as a direct assignment.  Reverse-scan the same
+    // canonical write relation used by the statement-version oracle; the first
+    // live write must itself be the exact whole-local comparison definition.
+    for (stmt_index, stmt) in block.stmts.iter().enumerate().rev() {
+        if !stmt_writes_name(func, block, stmt_index, &cond_name) {
+            continue;
+        }
         let Statement::Assign { place, rvalue, .. } = stmt else {
             return None;
         };
-        if place.local != cond_local || !place.projections.is_empty() {
+        if place != cond_place {
             return None;
         }
-        match rvalue {
-            Rvalue::BinaryOp(op, lhs, rhs) => Some((*op, lhs, rhs)),
-            _ => None,
+        let Rvalue::BinaryOp(op, lhs, rhs) = rvalue else {
+            return None;
+        };
+
+        // Public TrustIR is not SSA.  The terminator reads the boolean produced
+        // here, so substituting the *later* value of either comparison operand
+        // would prove a different assertion.  Reject a carrier whose input is
+        // rewritten afterwards, and — unless the caller asked for the
+        // projection-tolerant rule — keep the projection-free-temporary boundary
+        // the shipped callers were measured against.
+        let mut operand_names = Vec::new();
+        for operand in [lhs, rhs] {
+            if let Operand::Copy(input) | Operand::Move(input) = operand {
+                let projection_admissible = if projected_inputs {
+                    input.projections.iter().all(|p| matches!(p, trust_types::Projection::Field(_)))
+                } else {
+                    input.projections.is_empty()
+                };
+                if !projection_admissible || guards::value_local_is_unstable(func, input.local) {
+                    return None;
+                }
+                let name = place_to_var_name(func, input);
+                // The comparison must not read the flag it defines.
+                let reads_its_own_flag = if projected_inputs {
+                    place_names_overlap(&name, &cond_name)
+                } else {
+                    input == cond_place
+                };
+                if reads_its_own_flag {
+                    return None;
+                }
+                if !operand_names.contains(&name) {
+                    operand_names.push(name);
+                }
+            }
         }
-    })
+        let writes_comparison_input = (stmt_index + 1..block.stmts.len()).any(|later_index| {
+            operand_names.iter().any(|name| stmt_writes_name(func, block, later_index, name))
+        });
+        if writes_comparison_input {
+            return None;
+        }
+        return Some((stmt_index, *op, lhs, rhs));
+    }
+    None
 }
 
+/// The UNIQUE `Neg` operand of `target`, or `None` when `target` holds no `Neg`,
+/// holds more than one, or negates a value that is projected, reassigned
+/// elsewhere in the function, or rewritten earlier in `target` itself.
+///
+/// UNIQUENESS IS AN IDENTITY GUARANTEE, and the per-statement suppression
+/// (`v2_negation_assert_exactly_bound`) leans on it: `Some` means `target` has
+/// exactly one Neg statement, so a caller holding a Neg statement OF `target`
+/// knows the assert bound to that very statement — not merely to the block.
 pub(crate) fn v2_find_target_neg_operand(
     func: &VerifiableFunction,
     target: BlockId,
 ) -> Option<&Operand> {
     let block = func.body.blocks.get(target.0)?;
-    block.stmts.iter().find_map(|stmt| {
+    let mut found: Option<(usize, &Operand)> = None;
+    for (stmt_index, stmt) in block.stmts.iter().enumerate() {
         let Statement::Assign { rvalue, .. } = stmt else {
-            return None;
+            continue;
         };
-        match rvalue {
-            Rvalue::UnaryOp(trust_types::UnOp::Neg, operand) => Some(operand),
-            _ => None,
+        if let Rvalue::UnaryOp(trust_types::UnOp::Neg, operand) = rvalue {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((stmt_index, operand));
         }
-    })
+    }
+    let (stmt_index, operand) = found?;
+    // The source-block overflow condition compares the value that reaches the
+    // normal target. If that target rewrites the negated local first, the
+    // condition no longer authenticates this operation.
+    if let Operand::Copy(place) | Operand::Move(place) = operand {
+        if !place.projections.is_empty() || guards::value_local_is_unstable(func, place.local) {
+            return None;
+        }
+        let name = crate::place_to_var_name(func, place);
+        if (0..stmt_index).any(|index| stmt_writes_name(func, block, index, &name)) {
+            return None;
+        }
+    }
+    Some(operand)
 }

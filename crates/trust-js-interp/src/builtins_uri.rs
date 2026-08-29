@@ -7,9 +7,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
 use std::rc::Rc;
+
 use trust_js_value::{ErrKind, JsValue, Units};
+
+use crate::interp::{Abrupt, ERes, Interp};
 
 /// uriUnescaped: ASCII alphanumeric + - _ . ! ~ * ' ( )
 fn is_unescaped(c: u16) -> bool {
@@ -152,16 +154,17 @@ fn read_byte(s: &Units, i: &mut usize) -> Result<u8, ()> {
 }
 
 impl Interp {
-    pub(crate) fn dispatch_uri(&mut self, encode_op: bool, component: bool, arg0: &JsValue) -> ERes {
+    pub(crate) fn dispatch_uri(
+        &mut self,
+        encode_op: bool,
+        component: bool,
+        arg0: &JsValue,
+    ) -> ERes {
         let s = self.to_string_units(arg0)?;
         if s.len() > crate::interp::MAX_STRING_UNITS / 4 {
             return Err(Abrupt::Fatal("URI input cap exceeded".to_string()));
         }
-        let r = if encode_op {
-            encode(&s, !component)
-        } else {
-            decode(&s, !component)
-        };
+        let r = if encode_op { encode(&s, !component) } else { decode(&s, !component) };
         match r {
             Ok(u) => Ok(JsValue::Str(Rc::new(u))),
             Err(()) => Err(self.throw_native(ErrKind::Uri)),
@@ -171,8 +174,9 @@ impl Interp {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_value::{units_from_str as u, units_to_lossy};
+
+    use super::*;
 
     #[test]
     fn encode_vectors() {

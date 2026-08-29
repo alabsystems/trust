@@ -19,11 +19,10 @@ workspace = true
 
 [features]
 default = []
-trust-wp = ["dep:trust-router", "dep:trust-vcgen"]
+trust-wp = ["dep:trust-vcgen"]
 
 [dependencies]
 trust-types = { workspace = true }
-trust-router = { workspace = true, optional = true }
 trust-vcgen = { workspace = true, optional = true }
 trust-wp = { workspace = true }
 serde = { workspace = true }

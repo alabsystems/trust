@@ -648,10 +648,7 @@ fn assert_non_evidence_diagnostic_report(report: &Value) {
     assert_eq!(report["release_evidence"], false);
     assert_eq!(report["source_provenance_authenticated"], false);
     assert_eq!(report["tool_provenance_authenticated"], false);
-    assert_eq!(
-        report["fail_closed_scope"],
-        "declared-expected-row-regression-matching-only"
-    );
+    assert_eq!(report["fail_closed_scope"], "declared-expected-row-regression-matching-only");
     assert!(
         report["provenance_limit"]
             .as_str()

@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -90,13 +91,29 @@ const MINIS: &[(&str, Expect, &str)] = &[
     ("div-trunc", Cover, "if (-7n / 2n !== -3n) throw 0;"),
     ("rem-sign", Cover, "if (-7n % 2n !== -1n) throw 0;"),
     ("pow", Cover, "if (2n ** 10n !== 1024n) throw 0;"),
-    ("div-zero", Cover, "try { 5n / 0n; throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }"),
-    ("rem-zero", Cover, "try { 5n % 0n; throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }"),
-    ("pow-neg", Cover, "try { 2n ** -1n; throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }"),
+    (
+        "div-zero",
+        Cover,
+        "try { 5n / 0n; throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }",
+    ),
+    (
+        "rem-zero",
+        Cover,
+        "try { 5n % 0n; throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }",
+    ),
+    (
+        "pow-neg",
+        Cover,
+        "try { 2n ** -1n; throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }",
+    ),
     // Unary.
     ("neg", Cover, "if (-5n !== 0n - 5n) throw 0;"),
     ("bitnot", Cover, "if (~5n !== -6n) throw 0;"),
-    ("unary-plus-throws", Cover, "try { +5n; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "unary-plus-throws",
+        Cover,
+        "try { +5n; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     ("increment", Cover, "let x = 5n; x++; if (x !== 6n) throw 0;"),
     ("decrement-pre", Cover, "let x = 5n; if (--x !== 4n) throw 0;"),
     // Bitwise / shift.
@@ -105,11 +122,27 @@ const MINIS: &[(&str, Expect, &str)] = &[
     ("xor", Cover, "if ((-5n ^ 3n) !== -8n) throw 0;"),
     ("shl", Cover, "if ((-5n << 1n) !== -10n) throw 0;"),
     ("shr", Cover, "if ((-5n >> 1n) !== -3n) throw 0;"),
-    ("ushr-throws", Cover, "try { 5n >>> 1n; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "ushr-throws",
+        Cover,
+        "try { 5n >>> 1n; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // Mixed-type TypeErrors.
-    ("mixed-add", Cover, "try { 1n + 1; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
-    ("mixed-and", Cover, "try { 1n & 1; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
-    ("mixed-ushr", Cover, "try { 1n >>> 1; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "mixed-add",
+        Cover,
+        "try { 1n + 1; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
+    (
+        "mixed-and",
+        Cover,
+        "try { 1n & 1; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
+    (
+        "mixed-ushr",
+        Cover,
+        "try { 1n >>> 1; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // Comparison / equality (mixed real ordering).
     ("cmp-lt", Cover, "if (!(1n < 2)) throw 0;"),
     ("cmp-gt", Cover, "if (!(2n > 1.5)) throw 0;"),
@@ -129,50 +162,122 @@ const MINIS: &[(&str, Expect, &str)] = &[
     ("string", Cover, "if (String(10n) !== '10') throw 0;"),
     ("template", Cover, "if (`${5n}` !== '5') throw 0;"),
     ("concat", Cover, "if ('x' + 0n !== 'x0') throw 0;"),
-    ("tostring-tag", Cover, "if (Object.prototype.toString.call(5n) !== '[object BigInt]') throw 0;"),
+    (
+        "tostring-tag",
+        Cover,
+        "if (Object.prototype.toString.call(5n) !== '[object BigInt]') throw 0;",
+    ),
     // BigInt() function + coercions.
     ("bigint-str", Cover, "if (BigInt('123') !== 123n) throw 0;"),
     ("bigint-hex", Cover, "if (BigInt('0x10') !== 16n) throw 0;"),
     ("bigint-bool", Cover, "if (BigInt(true) !== 1n) throw 0;"),
     ("bigint-num", Cover, "if (BigInt(1.0) !== 1n) throw 0;"),
-    ("bigint-num-frac", Cover, "try { BigInt(1.5); throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }"),
-    ("bigint-nan", Cover, "try { BigInt(NaN); throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }"),
-    ("bigint-null", Cover, "try { BigInt(null); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
-    ("bigint-sym", Cover, "try { BigInt(Symbol()); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
-    ("bigint-bad-str", Cover, "try { BigInt('1.5'); throw 1; } catch (e) { if (!(e instanceof SyntaxError)) throw 2; }"),
+    (
+        "bigint-num-frac",
+        Cover,
+        "try { BigInt(1.5); throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }",
+    ),
+    (
+        "bigint-nan",
+        Cover,
+        "try { BigInt(NaN); throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }",
+    ),
+    (
+        "bigint-null",
+        Cover,
+        "try { BigInt(null); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
+    (
+        "bigint-sym",
+        Cover,
+        "try { BigInt(Symbol()); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
+    (
+        "bigint-bad-str",
+        Cover,
+        "try { BigInt('1.5'); throw 1; } catch (e) { if (!(e instanceof SyntaxError)) throw 2; }",
+    ),
     ("bigint-arr", Cover, "if (BigInt([5]) !== 5n) throw 0;"),
-    ("new-bigint", Cover, "try { new BigInt(1); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "new-bigint",
+        Cover,
+        "try { new BigInt(1); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // Number(bigint) + prototype methods.
     ("number-of-bigint", Cover, "if (Number(10n) !== 10) throw 0;"),
     ("number-huge", Cover, "if (Number(2n ** 1024n) !== Infinity) throw 0;"),
     ("proto-tostring-radix", Cover, "if ((255n).toString(16) !== 'ff') throw 0;"),
     ("proto-tostring-neg", Cover, "if ((-255n).toString(2) !== '-11111111') throw 0;"),
-    ("proto-tostring-bad-radix", Cover, "try { (10n).toString(1); throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }"),
+    (
+        "proto-tostring-bad-radix",
+        Cover,
+        "try { (10n).toString(1); throw 1; } catch (e) { if (!(e instanceof RangeError)) throw 2; }",
+    ),
     ("proto-valueof", Cover, "if ((5n).valueOf() !== 5n) throw 0;"),
-    ("proto-on-prototype-throws", Cover, "try { BigInt.prototype.valueOf.call(BigInt.prototype); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "proto-on-prototype-throws",
+        Cover,
+        "try { BigInt.prototype.valueOf.call(BigInt.prototype); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // asIntN / asUintN.
     ("asintn", Cover, "if (BigInt.asIntN(8, 256n) !== 0n) throw 0;"),
     ("asintn-neg", Cover, "if (BigInt.asIntN(8, 255n) !== -1n) throw 0;"),
     ("asuintn", Cover, "if (BigInt.asUintN(8, -1n) !== 255n) throw 0;"),
     ("asintn-zero", Cover, "if (BigInt.asIntN(0, 123n) !== 0n) throw 0;"),
     // JSON.stringify throws.
-    ("json-throws", Cover, "try { JSON.stringify(10n); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "json-throws",
+        Cover,
+        "try { JSON.stringify(10n); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // ToNumber(bigint) throws (Math).
-    ("math-throws", Cover, "try { Math.abs(1n); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "math-throws",
+        Cover,
+        "try { Math.abs(1n); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // Property keys.
     ("bigint-key", Cover, "var o = {}; o[1n] = 'a'; if (o['1'] !== 'a') throw 0;"),
     ("obj-lit-key", Cover, "if (Object.keys({1n: 5})[0] !== '1') throw 0;"),
     // BigInt typed arrays.
-    ("bi64-construct", Cover, "var a = new BigInt64Array(3); if (a.length !== 3 || a[0] !== 0n) throw 0;"),
+    (
+        "bi64-construct",
+        Cover,
+        "var a = new BigInt64Array(3); if (a.length !== 3 || a[0] !== 0n) throw 0;",
+    ),
     ("bi64-from-arr", Cover, "var a = new BigInt64Array([1n, 2n]); if (a[1] !== 2n) throw 0;"),
     ("bi64-set-get", Cover, "var a = new BigInt64Array(1); a[0] = 5n; if (a[0] !== 5n) throw 0;"),
-    ("bi64-wrap", Cover, "var a = new BigInt64Array(1); a[0] = (2n ** 63n); if (a[0] !== -(2n ** 63n)) throw 0;"),
-    ("bu64-wrap", Cover, "var a = new BigUint64Array(1); a[0] = -1n; if (a[0] !== (2n ** 64n) - 1n) throw 0;"),
-    ("bi64-set-num-throws", Cover, "var a = new BigInt64Array(1); try { a[0] = 5; if (a[0] !== 0n) throw 3; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
-    ("bi64-from-num-throws", Cover, "try { new BigInt64Array([1]); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "bi64-wrap",
+        Cover,
+        "var a = new BigInt64Array(1); a[0] = (2n ** 63n); if (a[0] !== -(2n ** 63n)) throw 0;",
+    ),
+    (
+        "bu64-wrap",
+        Cover,
+        "var a = new BigUint64Array(1); a[0] = -1n; if (a[0] !== (2n ** 64n) - 1n) throw 0;",
+    ),
+    (
+        "bi64-set-num-throws",
+        Cover,
+        "var a = new BigInt64Array(1); try { a[0] = 5; if (a[0] !== 0n) throw 3; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
+    (
+        "bi64-from-num-throws",
+        Cover,
+        "try { new BigInt64Array([1]); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     ("bi64-fill", Cover, "var a = new BigInt64Array(3); a.fill(7n); if (a[2] !== 7n) throw 0;"),
-    ("bi64-reverse", Cover, "var a = new BigInt64Array([1n, 2n, 3n]); a.reverse(); if (a[0] !== 3n) throw 0;"),
-    ("bi64-cross-type-throws", Cover, "try { new Int32Array(new BigInt64Array([1n])); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
+    (
+        "bi64-reverse",
+        Cover,
+        "var a = new BigInt64Array([1n, 2n, 3n]); a.reverse(); if (a[0] !== 3n) throw 0;",
+    ),
+    (
+        "bi64-cross-type-throws",
+        Cover,
+        "try { new Int32Array(new BigInt64Array([1n])); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
     // Number bitwise/shift/exp (the new non-BigInt lanes) vs Node.
     ("num-and", Cover, "if ((3 & 1) !== 1) throw 0;"),
     ("num-or", Cover, "if ((5 | 2) !== 7) throw 0;"),
@@ -184,7 +289,11 @@ const MINIS: &[(&str, Expect, &str)] = &[
     ("num-shl-wrap", Cover, "if ((1 << 32) !== 1) throw 0;"),
     ("num-pow", Cover, "if (2 ** 10 !== 1024) throw 0;"),
     ("num-pow-right-assoc", Cover, "if (2 ** 3 ** 2 !== 512) throw 0;"),
-    ("num-pow-unary-syntax", Cover, "eval; try { eval('-2 ** 2'); throw 1; } catch (e) { if (!(e instanceof SyntaxError)) throw 2; }"),
+    (
+        "num-pow-unary-syntax",
+        Cover,
+        "eval; try { eval('-2 ** 2'); throw 1; } catch (e) { if (!(e instanceof SyntaxError)) throw 2; }",
+    ),
     ("compound-bitand", Cover, "let x = 6; x &= 3; if (x !== 2) throw 0;"),
     ("compound-shl", Cover, "let x = 1; x <<= 4; if (x !== 16) throw 0;"),
     ("compound-bigint-add", Cover, "let x = 5n; x += 2n; if (x !== 7n) throw 0;"),
@@ -209,9 +318,21 @@ const MINIS: &[(&str, Expect, &str)] = &[
     ("sep-valid-hex", Cover, "if (0xFF_FF !== 65535) throw 0;"),
     ("sep-valid-bigint", Cover, "if (1_0n !== 10n) throw 0;"),
     // JSON.stringify(BigInt): toJSON is consulted first; a still-BigInt throws.
-    ("json-bigint-tojson", Cover, "BigInt.prototype.toJSON = function () { return this.toString(); }; if (JSON.stringify(0n) !== '\"0\"') throw 0;"),
-    ("json-bigint-no-tojson", Cover, "try { JSON.stringify(1n); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }"),
-    ("json-bigint-tojson-receiver", Cover, "Object.defineProperty(BigInt.prototype, 'toJSON', { get() { 'use strict'; return () => typeof this; } }); if (JSON.stringify(1n) !== '\"bigint\"') throw 0;"),
+    (
+        "json-bigint-tojson",
+        Cover,
+        "BigInt.prototype.toJSON = function () { return this.toString(); }; if (JSON.stringify(0n) !== '\"0\"') throw 0;",
+    ),
+    (
+        "json-bigint-no-tojson",
+        Cover,
+        "try { JSON.stringify(1n); throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    ),
+    (
+        "json-bigint-tojson-receiver",
+        Cover,
+        "Object.defineProperty(BigInt.prototype, 'toJSON', { get() { 'use strict'; return () => typeof this; } }); if (JSON.stringify(1n) !== '\"bigint\"') throw 0;",
+    ),
 ];
 
 #[test]
@@ -300,11 +421,7 @@ fn bigint_corpus_vs_node() {
                 continue;
             };
             let fm = parse_frontmatter(&body);
-            if fm
-                .flags
-                .iter()
-                .any(|f| f == "async" || f == "module" || f == "CanBlockIsRequired")
-            {
+            if fm.flags.iter().any(|f| f == "async" || f == "module" || f == "CanBlockIsRequired") {
                 continue;
             }
             let raw = fm.flags.iter().any(|f| f == "raw");
@@ -315,11 +432,8 @@ fn bigint_corpus_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".to_string(), "sta.js".to_string()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".to_string(), "sta.js".to_string()] };
             include_names.extend(fm.includes.iter().cloned());
             let mut include_srcs: Vec<String> = Vec::new();
             let mut include_paths: Vec<String> = Vec::new();
@@ -343,11 +457,8 @@ fn bigint_corpus_vs_node() {
 
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict {
-                    format!("\"use strict\";\n{body}")
-                } else {
-                    body.clone()
-                };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let inc_refs: Vec<&str> = include_srcs.iter().map(String::as_str).collect();
                 let sem = evaluate_case_opts(&inc_refs, &sem_body, false);
                 let sem_trace = match sem {
@@ -355,10 +466,7 @@ fn bigint_corpus_vs_node() {
                     SemOutcome::NoCoverage { reason } => {
                         refused += 1;
                         per_dir.entry(dir).or_default().1 += 1;
-                        refusal_reasons
-                            .entry(reason)
-                            .or_insert_with(|| (0, rel.clone()))
-                            .0 += 1;
+                        refusal_reasons.entry(reason).or_insert_with(|| (0, rel.clone())).0 += 1;
                         continue;
                     }
                 };
@@ -398,10 +506,8 @@ fn bigint_corpus_vs_node() {
     for (dir, (c, r)) in &per_dir {
         eprintln!("  {dir}: covered {c} refused {r}");
     }
-    let mut reasons: Vec<(u64, String, String)> = refusal_reasons
-        .into_iter()
-        .map(|(k, (n, sample))| (n, k, sample))
-        .collect();
+    let mut reasons: Vec<(u64, String, String)> =
+        refusal_reasons.into_iter().map(|(k, (n, sample))| (n, k, sample)).collect();
     reasons.sort_by(|a, b| b.0.cmp(&a.0));
     eprintln!("== top refusal reasons ==");
     for (n, reason, sample) in reasons.iter().take(40) {
@@ -460,8 +566,7 @@ fn run_node_inc(
     });
     let manifest_path = tmp.path().join(format!("bi-{i}.manifest.json"));
     let mut mf = std::fs::File::create(&manifest_path).map_err(|e| e.to_string())?;
-    mf.write_all(manifest.to_string().as_bytes())
-        .map_err(|e| e.to_string())?;
+    mf.write_all(manifest.to_string().as_bytes()).map_err(|e| e.to_string())?;
     drop(mf);
     let out = Command::new(node)
         .arg(driver)
@@ -471,12 +576,8 @@ fn run_node_inc(
         .env("LC_ALL", "C")
         .output()
         .map_err(|e| e.to_string())?;
-    extract_trace(&out.stdout).map_err(|e| {
-        format!(
-            "{e} (stderr: {})",
-            String::from_utf8_lossy(&out.stderr)
-        )
-    })
+    extract_trace(&out.stdout)
+        .map_err(|e| format!("{e} (stderr: {})", String::from_utf8_lossy(&out.stderr)))
 }
 
 struct Frontmatter {
@@ -543,9 +644,7 @@ fn collect_js_files(dir: &Path, cap: usize) -> Vec<PathBuf> {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|e| e == "js")
-                && !p
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().ends_with("_FIXTURE.js"))
+                && !p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_FIXTURE.js"))
             {
                 files.push(p);
             }

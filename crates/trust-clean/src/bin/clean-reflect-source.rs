@@ -107,15 +107,24 @@ fn main() -> ExitCode {
                     GroundOutcome::Modulo3 => {
                         reflected += 1;
                         kernel_modulo3 += 1;
-                        println!("  \u{2713} {} : grounded in REAL kernel, modulo 3 axioms", func.name);
+                        println!(
+                            "  \u{2713} {} : grounded in REAL kernel, modulo 3 axioms",
+                            func.name
+                        );
                     }
                     GroundOutcome::Residue(r) => {
                         failed += 1;
-                        println!("  \u{2717} {} : grounded but rests on non-foundational axioms: {r:?}", func.name);
+                        println!(
+                            "  \u{2717} {} : grounded but rests on non-foundational axioms: {r:?}",
+                            func.name
+                        );
                     }
                     GroundOutcome::NotGrounded => {
                         failed += 1;
-                        println!("  - {} : not yet groundable in real kernel (non-integer type / unsupported predicate)", func.name);
+                        println!(
+                            "  - {} : not yet groundable in real kernel (non-integer type / unsupported predicate)",
+                            func.name
+                        );
                     }
                     GroundOutcome::KernelRejected(e) => {
                         failed += 1;
@@ -179,7 +188,10 @@ fn main() -> ExitCode {
     if let Some(n) = require_axioms {
         let residue: Vec<&String> = vocabulary.iter().filter(|a| !is_foundational(a)).collect();
         if residue.is_empty() && vocabulary.len() <= n {
-            println!("\n\u{2713} reflected types proven modulo {} foundational axioms.", vocabulary.len());
+            println!(
+                "\n\u{2713} reflected types proven modulo {} foundational axioms.",
+                vocabulary.len()
+            );
             return ExitCode::SUCCESS;
         }
         println!(
@@ -212,7 +224,10 @@ fn report_axioms(vocabulary: &BTreeSet<String>) {
         carriers.len()
     );
     if !carriers.is_empty() {
-        println!("    {{ {} }}", carriers.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        println!(
+            "    {{ {} }}",
+            carriers.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
     }
 }
 

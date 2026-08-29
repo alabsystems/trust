@@ -119,9 +119,8 @@ pub fn check(root_path: &Path, tidy_ctx: TidyCtx) {
             continue;
         }
         if !opts_into_workspace_lints(&contents) {
-            outstanding.push(
-                manifest.strip_prefix(root_path).unwrap_or(&manifest).display().to_string(),
-            );
+            outstanding
+                .push(manifest.strip_prefix(root_path).unwrap_or(&manifest).display().to_string());
         }
     }
 

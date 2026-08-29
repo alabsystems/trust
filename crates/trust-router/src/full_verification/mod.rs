@@ -33,12 +33,15 @@ pub use policy::{
     TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
     TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY,
 };
+// Make `TRUST_VC_HARDENED_NAMESPACE` / `_WILDCARD` reachable from the tests
+// module via `use super::*;` without changing the module's public surface.
+#[cfg(test)]
+pub(crate) use policy::{TRUST_VC_HARDENED_NAMESPACE, TRUST_VC_HARDENED_WILDCARD};
 pub use run_result_ext::{
     FullVerificationEvidenceBlocker, FullVerificationEvidenceDecision,
     FullVerificationNativeTrustIrEvidence, FullVerificationObligationEvidence,
     FullVerificationRunResultExt,
 };
-
 // Re-export the typed trust_wp metadata-key constants and helpers used by both
 // the public API and the in-tree integration tests.
 pub use trust_wp::{
@@ -49,11 +52,6 @@ pub use trust_wp::{
     TRUST_TRUST_WP_TRUST_IR_OBLIGATION_SOURCE_METADATA_KEY,
     TRUST_TRUST_WP_TRUST_IR_SOURCE_SPAN_METADATA_KEY,
 };
-
-// Make `TRUST_VC_HARDENED_NAMESPACE` / `_WILDCARD` reachable from the tests
-// module via `use super::*;` without changing the module's public surface.
-#[cfg(test)]
-pub(crate) use policy::{TRUST_VC_HARDENED_NAMESPACE, TRUST_VC_HARDENED_WILDCARD};
 
 #[cfg(test)]
 mod tests;

@@ -238,12 +238,7 @@ fn body_has_unsupported(func: &VerifiableFunction) -> bool {
 fn call_abi_is_modeled(terminator: &Terminator) -> bool {
     matches!(
         terminator,
-        Terminator::Call {
-            atomic: None,
-            is_foreign: false,
-            is_unsafe_sig: false,
-            ..
-        }
+        Terminator::Call { atomic: None, is_foreign: false, is_unsafe_sig: false, .. }
     )
 }
 
@@ -554,9 +549,7 @@ pub fn sem_fold_launch_wrapper_of(
             return Err(FoldWrapDecline::GuardShape("clone arm terminator".into()));
         };
         if !call_abi_is_modeled(&cb.terminator) {
-            return Err(FoldWrapDecline::GuardShape(
-                "clone arm uses an unsupported ABI".into(),
-            ));
+            return Err(FoldWrapDecline::GuardShape("clone arm uses an unsupported ABI".into()));
         }
         if cc != CLONE_CLONE && cc != EXPR_CLONE {
             return Err(FoldWrapDecline::GuardShape(format!("clone arm calls {cc}")));

@@ -1225,12 +1225,12 @@ fn non_parity_conditions_still_decode_correctly() {
     let decoder = X86_64Decoder::new();
     // (opcode, expected condition) for the rel8 Jcc forms.
     for (op, expected) in [
-        (0x74u8, Condition::Eq),  // JE
-        (0x75, Condition::Ne),    // JNE
-        (0x72, Condition::Cs),    // JB
-        (0x77, Condition::Hi),    // JA
-        (0x7C, Condition::Lt),    // JL
-        (0x7F, Condition::Gt),    // JG
+        (0x74u8, Condition::Eq), // JE
+        (0x75, Condition::Ne),   // JNE
+        (0x72, Condition::Cs),   // JB
+        (0x77, Condition::Hi),   // JA
+        (0x7C, Condition::Lt),   // JL
+        (0x7F, Condition::Gt),   // JG
     ] {
         let insn = decoder.decode(&[op, 0x05], 0x1000).expect("Jcc rel8 should decode");
         assert!(

@@ -242,18 +242,43 @@ fn positive_guard_uses_exact_wrapping_wider_decrement() {
 
 #[test]
 fn checked_shift_accepts_an_independently_typed_integer_rhs() {
+    // The canonical rustc spelling of an overflow-checked shift: a
+    // `CheckedBinaryOp(Shl)` tuple does NOT exist (admission outlaws it —
+    // only Add/Sub/Mul produce the audited `(value, bool)` carrier). rustc
+    // guards the shift with a `Lt(amount, BITS)` assert of `expected: true`
+    // polarity, then performs the plain shift in the assert's target block:
+    //
+    //   bb2: _3 = Lt(const 1_u16, const 32_u16);
+    //        assert(move _3, expected: true, Overflow(Shl)) -> bb3;
+    //   bb3: n = Shl(copy n, const 1_u16);
     let mut func = checked_countdown(BinOp::Gt, 1);
-    let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(op, _, rhs), .. } =
-        &mut func.body.blocks[2].stmts[0]
-    else {
-        unreachable!()
+    func.body.locals[3].ty = Ty::Bool;
+    func.body.blocks[2].stmts[0] = Statement::Assign {
+        place: Place::local(3),
+        rvalue: Rvalue::BinaryOp(
+            BinOp::Lt,
+            Operand::Constant(ConstValue::Uint(1, 16)),
+            Operand::Constant(ConstValue::Uint(32, 16)),
+        ),
+        span: span(12),
     };
-    *op = BinOp::Shl;
-    *rhs = Operand::Constant(ConstValue::Uint(1, 16));
-    let Terminator::Assert { msg, .. } = &mut func.body.blocks[2].terminator else {
-        unreachable!()
+    func.body.blocks[2].terminator = Terminator::Assert {
+        cond: Operand::Move(Place::local(3)),
+        expected: true,
+        msg: AssertMessage::Overflow(BinOp::Shl),
+        target: BlockId(3),
+        unwind: trust_types::UnwindEdge::Unreachable,
+        span: span(12),
     };
-    *msg = AssertMessage::Overflow(BinOp::Shl);
+    func.body.blocks[3].stmts[0] = Statement::Assign {
+        place: Place::local(1),
+        rvalue: Rvalue::BinaryOp(
+            BinOp::Shl,
+            Operand::Copy(Place::local(1)),
+            Operand::Constant(ConstValue::Uint(1, 16)),
+        ),
+        span: span(12),
+    };
 
     assert!(
         bind_compiler_loop_contracts(&mut func, &[loop_spec(LoopContractKind::Invariant, "true")],)
@@ -262,12 +287,16 @@ fn checked_shift_accepts_an_independently_typed_integer_rhs() {
     let (all, unsupported) = loop_unknowns(&func);
     assert!(
         unsupported.is_empty(),
-        "MIR permits a checked u32 shift with a u16 count; its exact type must not fail-close: \
+        "MIR permits a u32 shift with a u16 count; its exact type must not fail-close: \
          {unsupported:#?}",
     );
     assert!(
         all.iter().any(|vc| matches!(vc.kind, VcKind::LoopInvariantConsecution { .. })),
         "the authenticated checked shift must retain its exact E4 transition: {all:#?}",
+    );
+    assert!(
+        all.iter().any(|vc| matches!(vc.kind, VcKind::ShiftOverflow { op: BinOp::Shl, .. })),
+        "the guarded shift must still mint its shift-overflow obligation: {all:#?}",
     );
 }
 
@@ -291,42 +320,85 @@ fn assert_checked_shape_declines(mut func: VerifiableFunction, case: &str) {
     );
 }
 
+/// A TYPE-inconsistent checked update is not merely an unsupported loop
+/// shape: it is malformed TrustIR, and the admission audit collapses the
+/// whole function to one visible `MalformedTrustIr` marker before any
+/// loop-contract row can exist. The mismatch still never verifies — the
+/// collapse marker replaces the row-level refusal.
+fn assert_checked_type_mismatch_collapses(mut func: VerifiableFunction, case: &str) {
+    assert!(
+        bind_compiler_loop_contracts(&mut func, &[loop_spec(LoopContractKind::Invariant, "true")],)
+            .is_empty()
+    );
+    let (all, _) = loop_unknowns(&func);
+    assert!(
+        !all.iter().any(|vc| matches!(
+            vc.kind,
+            VcKind::LoopInvariantInitiation { .. } | VcKind::LoopInvariantConsecution { .. }
+        )),
+        "type-mismatched checked update `{case}` must mint no E4 row: {all:#?}"
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|vc| matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+            ))
+            .count(),
+        1,
+        "type-mismatched checked update `{case}` must retain one visible MalformedTrustIr \
+         marker: {all:#?}"
+    );
+    assert!(
+        all.iter().all(|vc| matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+        "no proof-bearing row may survive the `{case}` collapse: {all:#?}"
+    );
+}
+
 #[test]
 fn checked_update_shape_mismatches_fail_closed() {
-    let mut cases = Vec::new();
+    // Two decline lanes, one per kind of mismatch. `shape_cases` are
+    // TYPE-VALID TrustIR whose checked-update SHAPE the loop lane refuses:
+    // admission passes and the refusal stays a row-level
+    // `UserLoopContractUnsupported`. `type_cases` are TYPE-INCONSISTENT
+    // operations: genuinely malformed TrustIR, which the admission audit
+    // collapses whole-function to `MalformedTrustIr` before the loop lane
+    // runs. Either way the mismatch never verifies.
+    let mut shape_cases = Vec::new();
+    let mut type_cases = Vec::new();
 
     let mut missing_assert = checked_countdown(BinOp::Gt, 1);
     missing_assert.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
-    cases.push(("missing-assert", missing_assert));
+    shape_cases.push(("missing-assert", missing_assert));
 
     let mut wrong_cond_field = checked_countdown(BinOp::Gt, 1);
     let Terminator::Assert { cond, .. } = &mut wrong_cond_field.body.blocks[2].terminator else {
         unreachable!()
     };
     *cond = Operand::Move(Place::field(3, 0));
-    cases.push(("wrong-assert-field", wrong_cond_field));
+    shape_cases.push(("wrong-assert-field", wrong_cond_field));
 
     let mut wrong_expected = checked_countdown(BinOp::Gt, 1);
     let Terminator::Assert { expected, .. } = &mut wrong_expected.body.blocks[2].terminator else {
         unreachable!()
     };
     *expected = true;
-    cases.push(("wrong-assert-expected", wrong_expected));
+    shape_cases.push(("wrong-assert-expected", wrong_expected));
 
     let mut wrong_message = checked_countdown(BinOp::Gt, 1);
     let Terminator::Assert { msg, .. } = &mut wrong_message.body.blocks[2].terminator else {
         unreachable!()
     };
     *msg = AssertMessage::Overflow(BinOp::Add);
-    cases.push(("wrong-assert-operation", wrong_message));
+    shape_cases.push(("wrong-assert-operation", wrong_message));
 
     let mut wrong_value_type = checked_countdown(BinOp::Gt, 1);
     wrong_value_type.body.locals[3].ty = Ty::Tuple(vec![Ty::u16(), Ty::Bool]);
-    cases.push(("wrong-tuple-value-type", wrong_value_type));
+    type_cases.push(("wrong-tuple-value-type", wrong_value_type));
 
     let mut wrong_flag_type = checked_countdown(BinOp::Gt, 1);
     wrong_flag_type.body.locals[3].ty = Ty::Tuple(vec![Ty::u32(), Ty::u8()]);
-    cases.push(("wrong-tuple-flag-type", wrong_flag_type));
+    type_cases.push(("wrong-tuple-flag-type", wrong_flag_type));
 
     let mut mismatched_operand_types = checked_countdown(BinOp::Gt, 1);
     let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(_, _, rhs), .. } =
@@ -335,7 +407,7 @@ fn checked_update_shape_mismatches_fail_closed() {
         unreachable!()
     };
     *rhs = Operand::Constant(ConstValue::Uint(1, 16));
-    cases.push(("mismatched-operand-types", mismatched_operand_types));
+    type_cases.push(("mismatched-operand-types", mismatched_operand_types));
 
     let mut out_of_range_contextual_literal = checked_countdown(BinOp::Gt, 1);
     out_of_range_contextual_literal.body.locals[1].ty = Ty::i8();
@@ -352,7 +424,7 @@ fn checked_update_shape_mismatches_fail_closed() {
         unreachable!()
     };
     *update_rhs = Operand::Constant(ConstValue::Int(128));
-    cases.push(("out-of-range-contextual-literal", out_of_range_contextual_literal));
+    type_cases.push(("out-of-range-contextual-literal", out_of_range_contextual_literal));
 
     let mut negative_contextual_unsigned_literal = checked_countdown(BinOp::Gt, 1);
     negative_contextual_unsigned_literal.body.locals[1].ty = Ty::u8();
@@ -369,7 +441,7 @@ fn checked_update_shape_mismatches_fail_closed() {
         unreachable!()
     };
     *update_rhs = Operand::Constant(ConstValue::Int(-1));
-    cases.push(("negative-contextual-unsigned-literal", negative_contextual_unsigned_literal));
+    type_cases.push(("negative-contextual-unsigned-literal", negative_contextual_unsigned_literal));
 
     let mut wrong_width_u128_literal = checked_countdown(BinOp::Gt, 1);
     wrong_width_u128_literal.body.locals[1].ty = Ty::u128();
@@ -386,7 +458,7 @@ fn checked_update_shape_mismatches_fail_closed() {
         unreachable!()
     };
     *update_rhs = Operand::Constant(ConstValue::Uint(1, 64));
-    cases.push(("wrong-width-u128-literal", wrong_width_u128_literal));
+    type_cases.push(("wrong-width-u128-literal", wrong_width_u128_literal));
 
     let mut typed_i64_rhs_for_i128 = checked_countdown(BinOp::Gt, 1);
     typed_i64_rhs_for_i128.body.locals[1].ty = Ty::i128();
@@ -408,28 +480,28 @@ fn checked_update_shape_mismatches_fail_closed() {
         unreachable!()
     };
     *update_rhs = Operand::Copy(Place::local(4));
-    cases.push(("typed-i64-rhs-for-i128", typed_i64_rhs_for_i128));
+    type_cases.push(("typed-i64-rhs-for-i128", typed_i64_rhs_for_i128));
 
     let mut second_checked_definition = checked_countdown(BinOp::Gt, 1);
     let duplicate_checked = second_checked_definition.body.blocks[2].stmts[0].clone();
     second_checked_definition.body.blocks[2].stmts.push(duplicate_checked);
-    cases.push(("second-checked-definition", second_checked_definition));
+    shape_cases.push(("second-checked-definition", second_checked_definition));
 
     let mut missing_copy_back = checked_countdown(BinOp::Gt, 1);
     missing_copy_back.body.blocks[3].stmts.clear();
-    cases.push(("missing-copy-back", missing_copy_back));
+    shape_cases.push(("missing-copy-back", missing_copy_back));
 
     let mut wrong_copy_back = checked_countdown(BinOp::Gt, 1);
     let Statement::Assign { rvalue, .. } = &mut wrong_copy_back.body.blocks[3].stmts[0] else {
         unreachable!()
     };
     *rvalue = Rvalue::Use(Operand::Move(Place::field(3, 1)));
-    cases.push(("wrong-copy-back-field", wrong_copy_back));
+    shape_cases.push(("wrong-copy-back-field", wrong_copy_back));
 
     let mut duplicate_subject_write = checked_countdown(BinOp::Gt, 1);
     let duplicate_write = duplicate_subject_write.body.blocks[3].stmts[0].clone();
     duplicate_subject_write.body.blocks[3].stmts.push(duplicate_write);
-    cases.push(("duplicate-subject-write", duplicate_subject_write));
+    shape_cases.push(("duplicate-subject-write", duplicate_subject_write));
 
     // The checked tuple is authenticated over the complete successful loop
     // path, not just its defining block and immediate assert target. Before the
@@ -461,7 +533,7 @@ fn checked_update_shape_mismatches_fail_closed() {
         ],
         terminator: Terminator::Goto(BlockId(1)),
     });
-    cases.push(("later-whole-tuple-rewrite-and-read", later_tuple_rewrite));
+    shape_cases.push(("later-whole-tuple-rewrite-and-read", later_tuple_rewrite));
 
     let mut later_duplicate_copy_back = checked_countdown(BinOp::Gt, 1);
     later_duplicate_copy_back.body.blocks[3].terminator = Terminator::Goto(BlockId(5));
@@ -474,9 +546,12 @@ fn checked_update_shape_mismatches_fail_closed() {
         }],
         terminator: Terminator::Goto(BlockId(1)),
     });
-    cases.push(("later-duplicate-copy-back", later_duplicate_copy_back));
+    shape_cases.push(("later-duplicate-copy-back", later_duplicate_copy_back));
 
-    for (case, func) in cases {
+    for (case, func) in shape_cases {
         assert_checked_shape_declines(func, case);
+    }
+    for (case, func) in type_cases {
+        assert_checked_type_mismatch_collapses(func, case);
     }
 }

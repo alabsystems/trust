@@ -286,11 +286,8 @@ pub(super) fn bswap_bits(x: &Formula, width: u32) -> Option<Formula> {
         return None;
     }
     let xb = as_bits(x, width);
-    let byte = |k: u32| Formula::BvExtract {
-        inner: Box::new(xb.clone()),
-        high: 8 * k + 7,
-        low: 8 * k,
-    };
+    let byte =
+        |k: u32| Formula::BvExtract { inner: Box::new(xb.clone()), high: 8 * k + 7, low: 8 * k };
     Some(balanced_fold((0..width / 8).map(byte).collect(), |hi, lo| {
         Formula::BvConcat(Box::new(hi), Box::new(lo))
     }))
@@ -327,7 +324,10 @@ pub(super) fn bitreverse_bits(x: &Formula, width: u32) -> Formula {
 /// handles everywhere.
 ///
 /// Panics on an empty input; every caller passes `width >= 1` leaves.
-fn balanced_fold(mut items: Vec<Formula>, combine: impl Fn(Formula, Formula) -> Formula) -> Formula {
+fn balanced_fold(
+    mut items: Vec<Formula>,
+    combine: impl Fn(Formula, Formula) -> Formula,
+) -> Formula {
     assert!(!items.is_empty(), "balanced_fold needs at least one leaf");
     while items.len() > 1 {
         let mut next = Vec::with_capacity(items.len().div_ceil(2));
@@ -410,12 +410,8 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
     //   `bswap`/`bitreverse`  : `fn(T) -> T`    — the dest must be EXACTLY `T`,
     //                           because the emitted `BvToInt(_, width, signed)`
     //                           reads the result under `T`'s width/signedness.
-    let dest_shape = func
-        .body
-        .locals
-        .iter()
-        .find(|d| d.index == dest.local)
-        .and_then(|d| match &d.ty {
+    let dest_shape =
+        func.body.locals.iter().find(|d| d.index == dest.local).and_then(|d| match &d.ty {
             Ty::Int { width, signed } => Some((*width, *signed)),
             _ => None,
         })?;
@@ -444,10 +440,7 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
     }
     match kind {
         ValueModeledIntrinsic::Ctpop if width <= MAX_EXACT_INTRINSIC_WIDTH => {
-            facts.push(Formula::Eq(
-                Box::new(subject.clone()),
-                Box::new(ctpop_value(&x, width)),
-            ));
+            facts.push(Formula::Eq(Box::new(subject.clone()), Box::new(ctpop_value(&x, width))));
         }
         // `ctlz(x) == W  <->  x == 0`, and the same for `cttz`. Both directions
         // are definitional: a zero word has W leading (and W trailing) zeros,
@@ -457,13 +450,9 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
         // which is what makes a shift by `W - 1 - r` defined.
         ValueModeledIntrinsic::Ctlz | ValueModeledIntrinsic::Cttz => {
             let is_w = || {
-                Formula::Eq(
-                    Box::new(subject.clone()),
-                    Box::new(Formula::Int(i128::from(width))),
-                )
+                Formula::Eq(Box::new(subject.clone()), Box::new(Formula::Int(i128::from(width))))
             };
-            let is_zero =
-                || Formula::Eq(Box::new(x.clone()), Box::new(Formula::Int(0)));
+            let is_zero = || Formula::Eq(Box::new(x.clone()), Box::new(Formula::Int(0)));
             facts.push(Formula::Implies(Box::new(is_w()), Box::new(is_zero())));
             facts.push(Formula::Implies(Box::new(is_zero()), Box::new(is_w())));
         }
@@ -478,11 +467,7 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
         ValueModeledIntrinsic::Bitreverse if width <= MAX_EXACT_INTRINSIC_WIDTH => {
             facts.push(Formula::Eq(
                 Box::new(subject.clone()),
-                Box::new(Formula::BvToInt(
-                    Box::new(bitreverse_bits(&x, width)),
-                    width,
-                    signed,
-                )),
+                Box::new(Formula::BvToInt(Box::new(bitreverse_bits(&x, width)), width, signed)),
             ));
         }
         // Past the width cap: `bswap`/`bitreverse` have no bound to fall back on
@@ -543,9 +528,10 @@ fn is_abi_written_parameter(func: &VerifiableFunction, local: usize) -> bool {
         return false;
     }
     func.body.blocks.iter().all(|block| {
-        block.stmts.iter().all(|stmt| {
-            !matches!(stmt, Statement::Assign { place, .. } if place.local == local)
-        }) && !matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local)
+        block
+            .stmts
+            .iter()
+            .all(|stmt| !matches!(stmt, Statement::Assign { place, .. } if place.local == local))
+            && !matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local)
     })
 }
-

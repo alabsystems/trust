@@ -38,9 +38,7 @@ fn needs_trust_verify_requires_an_explicit_opt_in() {
     ]));
     assert!(validate_trust_verification_opt_in(false, &[]).is_ok());
     assert!(validate_trust_verification_opt_in(true, &[]).is_err());
-    assert!(
-        validate_trust_verification_opt_in(true, &["-Ztrust-verify=on".to_string()]).is_ok()
-    );
+    assert!(validate_trust_verification_opt_in(true, &["-Ztrust-verify=on".to_string()]).is_ok());
     // Explicit OPT-OUT (machinery present, verification deliberately off — the
     // island/check-phase gate shape) is also explicit configuration.
     assert!(has_explicit_trust_verification_config(&["-Ztrust-verify=off".to_string()]));

@@ -28,10 +28,7 @@ fn parser_still_handles_method_calls_alongside_fields() {
     let f = trust_types::parse_spec_expr("xs.len > 0").expect("field projection on len parses");
     assert_eq!(
         f,
-        Formula::Gt(
-            Box::new(Formula::Var("xs.len".into(), Sort::Int)),
-            Box::new(Formula::Int(0)),
-        )
+        Formula::Gt(Box::new(Formula::Var("xs.len".into(), Sort::Int)), Box::new(Formula::Int(0)),)
     );
 }
 
@@ -49,8 +46,16 @@ fn struct_accessor_contract_proven_inhabited_modulo_3() {
         Ty, VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
-    let wrapper = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "Wrapper".into(), fields: vec![("value".into(), i())],
-        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, };
+    let wrapper = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "Wrapper".into(),
+        fields: vec![("value".into(), i())],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "get".into(),
         def_path: "crate::get".into(),
@@ -105,8 +110,16 @@ fn field_comparison_contract_proven_from_field_precondition_modulo_3() {
         Ty, VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
-    let w = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "W".into(), fields: vec![("v".into(), i())],
-        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, };
+    let w = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "W".into(),
+        fields: vec![("v".into(), i())],
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let pv = || Formula::Var("p.v".into(), Sort::Int);
     let func = VerifiableFunction {
         name: "floor".into(),

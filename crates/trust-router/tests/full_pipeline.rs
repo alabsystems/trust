@@ -150,6 +150,7 @@ fn recursive_countdown_function() -> VerifiableFunction {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         // E5 recursion rows require the compiler-owned exact
                         // definition identity; a bare same-name callee is not
@@ -548,9 +549,5 @@ fn test_full_pipeline_multi_backend_routing_by_proof_level() {
     // legitimate, so the pin asserts the invariant (never a third
     // classification, never a proof) and the exact legal pair.
     let pair = (report.summary.total_unknown, report.summary.total_runtime_checked);
-    assert!(
-        pair == (4, 1) || pair == (5, 0),
-        "unexpected classification split: {pair:?}"
-    );
+    assert!(pair == (4, 1) || pair == (5, 0), "unexpected classification split: {pair:?}");
 }
-

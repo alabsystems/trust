@@ -227,7 +227,11 @@ pub fn generate_vcs_with_discharge_and_summaries_with_box_deref_spans<S: std::ha
 ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
     let context = crate::VcgenContext::for_function(func.def_path.clone());
     generate_vcs_with_discharge_and_summaries_configured_with_context_and_box_deref_spans(
-        func, summaries, false, &context, box_deref_spans,
+        func,
+        summaries,
+        false,
+        &context,
+        box_deref_spans,
     )
 }
 
@@ -365,11 +369,7 @@ pub fn generate_vcs_capturing_raw_body_with_context<S: std::hash::BuildHasher>(
             let (s, d) = gen_work_degraded_discharge(func);
             return (s, d, None);
         }
-        let raw = if raw_capture.is_empty() || !callsite_empty {
-            None
-        } else {
-            Some(raw_capture)
-        };
+        let raw = if raw_capture.is_empty() || !callsite_empty { None } else { Some(raw_capture) };
         (solver_vcs, discharged, raw)
     })
 }
@@ -444,7 +444,11 @@ pub(super) fn preclassify_unsupported_mir_vcs(
 /// alias. Strictly weaker than the truth, never falsely proves; concrete actuals (ints, bools,
 /// strings — already injective) are untouched, so genuine discharges (e.g. a constant divisor)
 /// are unaffected.
-pub(super) fn sigma_actual_formula(func: &VerifiableFunction, formal: &str, actual: &Operand) -> Formula {
+pub(super) fn sigma_actual_formula(
+    func: &VerifiableFunction,
+    formal: &str,
+    actual: &Operand,
+) -> Formula {
     if let Operand::Constant(c) = actual
         && const_lowers_to_aliasing_opaque(c)
     {
@@ -499,7 +503,10 @@ pub(super) fn sigma_actual_formula(func: &VerifiableFunction, formal: &str, actu
 /// different-variable guard leaves the obligation SAT). A reseated temp, an unstable
 /// root, or a nameless root returns `None`, so σ falls back to the opaque temp name
 /// and the caller obligation fails closed.
-pub(super) fn sigma_actual_stable_copy_root(func: &VerifiableFunction, actual: &Operand) -> Option<Place> {
+pub(super) fn sigma_actual_stable_copy_root(
+    func: &VerifiableFunction,
+    actual: &Operand,
+) -> Option<Place> {
     let (Operand::Copy(place) | Operand::Move(place)) = actual else {
         return None;
     };
@@ -649,7 +656,10 @@ pub(super) fn local_has_call_dest_write(func: &VerifiableFunction, local: usize)
 /// parameter-slice reborrow. There is NO path that renders a DIFFERENT slice's
 /// length. A non-slice actual, a non-parameter runtime slice, an untraceable cast,
 /// or an array whose source type is lost all return `None` (fail-closed).
-pub(super) fn sigma_actual_slice_len(func: &VerifiableFunction, actual: &Operand) -> Option<Formula> {
+pub(super) fn sigma_actual_slice_len(
+    func: &VerifiableFunction,
+    actual: &Operand,
+) -> Option<Formula> {
     const TRACE_FUEL: u32 = 16;
     // (c) A parameter-slice reborrow → the caller's own `<param>__slice_len`.
     if let Some(len) = param_slice_len(func, actual, TRACE_FUEL) {
@@ -858,11 +868,15 @@ pub fn call_arg_fact_token(func: &VerifiableFunction, arg: &Operand) -> Option<S
 /// for SSA bases is an identity on the fact's meaning. Non-SSA versioned vars
 /// are left untouched (identity on the rest keeps the fact true); returns
 /// `None` when no rename fires.
-pub(super) fn bare_ssa_guard_variant(func: &VerifiableFunction, guard: &Formula) -> Option<Formula> {
+pub(super) fn bare_ssa_guard_variant(
+    func: &VerifiableFunction,
+    guard: &Formula,
+) -> Option<Formula> {
     let mut renames: Vec<(String, Formula)> = Vec::new();
     guard.visit(&mut |f| {
         if let Formula::Var(name, sort) = f
             && let Some((base, _tok)) = name.split_once('#')
+            && !crate::version_token_is_loop_transition_havoc(name)
             && !renames.iter().any(|(n, _)| n == name)
         {
             let base_local = (0..func.body.locals.len()).find(|&l| {
@@ -892,11 +906,19 @@ pub(super) fn bare_ssa_guard_variant(func: &VerifiableFunction, guard: &Formula)
 /// locals keep their tokens untouched: their disjointness is load-bearing
 /// (the staleness kill works by name-disjointness). Field-projected bases
 /// (`_14.0#s5_0`) do not resolve to a whole local and are left alone.
-pub(super) fn normalize_ssa_version_tokens(func: &VerifiableFunction, formula: &Formula) -> Formula {
+pub(super) fn normalize_ssa_version_tokens(
+    func: &VerifiableFunction,
+    formula: &Formula,
+) -> Formula {
     let mut renames: Vec<(String, Formula)> = Vec::new();
     formula.visit(&mut |f| {
         if let Formula::Var(name, sort) = f
             && let Some((base, _tok)) = name.split_once('#')
+            // A loop-transition HAVOC is not a second spelling of the bare
+            // local; collapsing it would assert the iteration left the local
+            // unchanged. See `LOOP_TRANSITION_HAVOC_TOKEN_PREFIX` for the
+            // measured false proof this excludes.
+            && !crate::version_token_is_loop_transition_havoc(name)
             && !renames.iter().any(|(n, _)| n == name)
         {
             let base_local = (0..func.body.locals.len()).find(|&l| {
@@ -1079,7 +1101,10 @@ pub(super) fn stable_caller_preconditions(func: &VerifiableFunction) -> Vec<Form
 ///         channels `local_is_never_written`'s whole-local scan cannot see);
 ///   * no Call terminator writes the formal (`lo = f(..)` is neither an `Assign`
 ///     statement nor >1 whole assign, so it slips BOTH predicates above).
-pub(super) fn caller_precondition_var_is_entry_stable(func: &VerifiableFunction, name: &str) -> bool {
+pub(super) fn caller_precondition_var_is_entry_stable(
+    func: &VerifiableFunction,
+    name: &str,
+) -> bool {
     // A FIELD-projected caller precondition (`self.0`, `self*.2`): admit it as a
     // stable hypothesis when its BASE parameter is entry-stable, reusing the exact
     // `param_place_is_entry_stable` discipline the overflow discharge uses. This

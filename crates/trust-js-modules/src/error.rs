@@ -68,7 +68,9 @@ pub enum GraphError<E> {
     /// bindings — the ambiguous-export SyntaxError (§16.2.1.6.3 step 8 /
     /// InitializeEnvironment step 6.c.ii). `module` and `name` display the
     /// offending re-export site.
-    #[error("ambiguous star export {name:?} in module {module:?} (resolves to two different bindings)")]
+    #[error(
+        "ambiguous star export {name:?} in module {module:?} (resolves to two different bindings)"
+    )]
     AmbiguousExport {
         /// Display form of the importing/re-exporting module's key.
         module: String,
@@ -78,7 +80,9 @@ pub enum GraphError<E> {
 
     /// ResolveExport for an imported (or re-exported) name found no binding — the
     /// unresolved-import SyntaxError (InitializeEnvironment steps 1.b / 6.c.ii).
-    #[error("module {module:?} has no exported member {name:?} (imported/re-exported but never provided)")]
+    #[error(
+        "module {module:?} has no exported member {name:?} (imported/re-exported but never provided)"
+    )]
     UnresolvedImport {
         /// Display form of the module whose export was requested.
         module: String,

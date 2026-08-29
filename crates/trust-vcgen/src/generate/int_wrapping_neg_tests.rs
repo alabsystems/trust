@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Sort, SourceSpan, Terminator, Ty,
-    VerifiableBody, VerifiableFunction,
+    UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::build_semantic_guard_map;
@@ -31,6 +30,7 @@ fn wrapping_neg_fn(ty: Ty, callee: &str) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },

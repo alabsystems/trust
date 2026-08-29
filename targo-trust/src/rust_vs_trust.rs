@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Rust-vs-Trust comparison gate for hostile public review.
 //
 // This module deliberately treats superiority as a proof obligation, not a
@@ -5963,7 +5964,6 @@ fn text_contains_full_git_sha(value: &str) -> bool {
     value.split(|ch: char| !ch.is_ascii_hexdigit()).any(is_full_git_sha)
 }
 
-
 fn program_index_runtime_row_key(row: &Value) -> Option<String> {
     let program = value_at(row, "program_id")?;
     let suite = value_at(row, "suite").unwrap_or("<unknown-suite>");
@@ -7249,7 +7249,6 @@ fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
     let bytes = read_bounded_file(path, MAX_BINARY_ARTIFACT_BYTES)?;
     Ok(trust_types::digest::stable_sha256_hex(&bytes))
 }
-
 
 fn product_proof_evidence_declares_kind(value: &Value, expected: &str) -> bool {
     value_at(value, "evidence_kind") == Some(expected)
@@ -13556,13 +13555,17 @@ mod tests {
             build_upstream_tests_command(vec!["targo".to_string()], Path::new("/repo"), &port_args);
 
         assert_eq!(command[0], "targo");
-        assert_eq!(command[1], "run");
-        assert_eq!(command[2], "--manifest-path");
-        assert_eq!(command[3], "/repo/crates/trust-upstream-compat/Cargo.toml");
-        assert_eq!(command[4], "--locked");
-        assert_eq!(command[5], "--");
-        assert_eq!(command[6], "port");
-        assert_eq!(&command[7..], port_args.as_slice());
+        // Trust: a targo driver gets the explicit `--unverified` lane injected
+        // at the run dispatch (and ONLY there — the metadata preflight above
+        // must stay flag-free); see build_upstream_tests_command's comment.
+        assert_eq!(command[1], "--unverified");
+        assert_eq!(command[2], "run");
+        assert_eq!(command[3], "--manifest-path");
+        assert_eq!(command[4], "/repo/crates/trust-upstream-compat/Cargo.toml");
+        assert_eq!(command[5], "--locked");
+        assert_eq!(command[6], "--");
+        assert_eq!(command[7], "port");
+        assert_eq!(&command[8..], port_args.as_slice());
         assert!(command.iter().all(|part| !part.to_ascii_lowercase().contains("python")));
         assert!(preflight.iter().all(|part| !part.to_ascii_lowercase().contains("python")));
     }

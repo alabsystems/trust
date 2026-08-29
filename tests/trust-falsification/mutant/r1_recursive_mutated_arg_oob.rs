@@ -10,4 +10,6 @@ fn creep(a: &[u32; 4], n: usize, mut i: usize) -> u32 {
     i += 3;
     if n > 0 { creep(a, n - 1, i) } else { x }
 }
-pub fn go() -> u32 { creep(&[1, 2, 3, 4], 2, 0) }
+pub fn go() -> u32 {
+    creep(&[1, 2, 3, 4], 2, 0)
+}

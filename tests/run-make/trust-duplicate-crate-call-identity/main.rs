@@ -13,8 +13,7 @@ pub fn call_both_generic(x: i32) -> i32 {
 
 #[inline(never)]
 pub fn call_distinct_rendered_args(x: i32) -> i32 {
-    shared_a::arg_identity(shared_a::Marker(x)).0
-        + shared_a::arg_identity(shared_b::Marker(x)).0
+    shared_a::arg_identity(shared_a::Marker(x)).0 + shared_a::arg_identity(shared_b::Marker(x)).0
 }
 
 #[inline(never)]

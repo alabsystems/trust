@@ -68,3 +68,24 @@ use_std = ["std"]
 version = "1.0.0"
 optional = true
 package = "rustc-std-workspace-core"
+
+# NO `[lints] workspace = true` HERE — REVERTED 2026-08-23 after it broke the
+# dep-of-std build.
+#
+# It was added to satisfy `src/tools/tidy/src/workspace_lints.rs`, whose ratchet
+# sits at zero, and it was justified by `cargo metadata --locked` succeeding from
+# all four consuming roots. **That was the wrong test.** Metadata resolving is
+# not the same as the build being correct: with the table present, the domination
+# gate's `x.py test` failed this crate with 156 errors, all of the shape
+# `cannot find ... `Some` in this scope` — i.e. the `rustc-dep-of-std` build lost
+# its prelude, because the crate resolved against `crates/Cargo.toml` as its
+# workspace root while being consumed as a `[patch]` from `library/`.
+#
+# The header above already said this would happen: "`*.workspace` inheritance
+# resolving against the wrong root is a documented failure mode of this repo."
+# The warning was there and the metadata check talked me past it.
+#
+# The tidy ratchet is raised to 1 with this crate named, which is exactly the
+# case its own doc comment anticipates: "a future split of the policy (a
+# workspace whose members legitimately opt out) can be recorded and then walked
+# back down."

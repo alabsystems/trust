@@ -121,7 +121,7 @@ pub fn w10_repr_c_swap(s: Cs) -> Cs {
 
 #[inline(never)]
 pub fn w11_repr_c_wide_ctor(n: u8, w: u64, m: u16) -> Cw {
-    Cw { n: n, w: w, m: m }
+    Cw { n, w, m }
 }
 
 #[inline(never)]
@@ -158,7 +158,7 @@ pub fn w17_unit_struct_ctor() -> Zu {
 
 #[inline(never)]
 pub fn w18_phantom_ctor(a: u32) -> Ph {
-    Ph { a: a, p: PhantomData }
+    Ph { a, p: PhantomData }
 }
 
 #[inline(never)]
@@ -173,7 +173,7 @@ pub fn w20_phantom_read(p: Ph) -> u32 {
 
 #[inline(never)]
 pub fn w21_unit_field_ctor(a: u32) -> Unit2 {
-    Unit2 { a: a, u: () }
+    Unit2 { a, u: () }
 }
 
 #[inline(never)]

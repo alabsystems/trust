@@ -13,8 +13,8 @@ They are *Trust's* soundness proofs. Keeping the canonical copy here makes them:
   (`crates/trust-integration-tests/tests/trust_soundness_ouroboros_gate.rs`), which shells out to the
   `clean` binary Trust builds from the **pinned** `first-party/clean` submodule.
 
-The corpus currently contains 34 proof files. The ouroboros gate must
-kernel-check all 34 with the pinned `clean` before a current-checkout pass is
+The corpus currently contains 35 proof files. The ouroboros gate must
+kernel-check all 35 with the pinned `clean` before a current-checkout pass is
 cited; the file count alone is not proof evidence. This decouples the proofs
 from clean's fast-moving math-library churn — no submodule bump is required to
 keep a passing gate green. (Advancing the `first-party/clean` pin is a separate,

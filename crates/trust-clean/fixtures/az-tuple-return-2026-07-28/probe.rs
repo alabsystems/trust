@@ -16,13 +16,6 @@ fn main() {
     let f4 = az::wrapping_cast::<i32, i16> as fn(i32) -> i16;
     let f5 = az::checked_cast::<u16, u8> as fn(u16) -> Option<u8>;
     let f6 = az::checked_cast::<i32, i16> as fn(i32) -> Option<i16>;
-    let v = (
-        f1(1),
-        f2(70_000),
-        f3(2),
-        f4(3),
-        f5(4),
-        f6(5),
-    );
+    let v = (f1(1), f2(70_000), f3(2), f4(3), f5(4), f6(5));
     core::hint::black_box(v);
 }

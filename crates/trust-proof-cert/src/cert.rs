@@ -345,8 +345,7 @@ mod vc_hash_domain_tripwire {
             Box::new(Formula::Bool(true)),
         );
         let raw = serde_json::to_vec(&formula).expect("raw serde");
-        let canonical =
-            trust_types::stable_model_json_bytes(&formula).expect("canonical serde");
+        let canonical = trust_types::stable_model_json_bytes(&formula).expect("canonical serde");
         assert_eq!(
             raw, canonical,
             "raw and canonical Formula bytes diverged: an additive model field is \

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -10,16 +11,6 @@ use sha2::{Digest as _, Sha256};
 use trust_release::{GateFinding, GateReport, GateStatus};
 use trust_version::BoundToolIdentity;
 
-use crate::bounded_process;
-use crate::durable_io::atomic_write_private;
-use crate::input_limits::{
-    MAX_RELEASE_METADATA_BYTES, MAX_RELEASE_TRANSCRIPT_REPORT_BYTES, read_bounded_file,
-    read_bounded_utf8_file,
-};
-use crate::pipeline::probe::{
-    TrustdRuntimeClosure, apply_trustd_runtime_closure, inspect_trustd_runtime_closure,
-};
-
 use super::identity::{
     bound_file_sha256, discover_repo_root, exact_file_sha256_with_prefix, file_sha256,
     generated_at_unix_seconds, is_executable_file, option_value, repo_dirty, repo_dirty_metadata,
@@ -31,6 +22,15 @@ pub(super) use super::product_proof_catalog::{
 use super::types::{
     CANDIDATE_COMMAND_VERSION, ProductProofComponent, ProductProofEvidenceClass,
     ProductProofManifest, ProductProofManifestComponent,
+};
+use crate::bounded_process;
+use crate::durable_io::atomic_write_private;
+use crate::input_limits::{
+    MAX_RELEASE_METADATA_BYTES, MAX_RELEASE_TRANSCRIPT_REPORT_BYTES, read_bounded_file,
+    read_bounded_utf8_file,
+};
+use crate::pipeline::probe::{
+    TrustdRuntimeClosure, apply_trustd_runtime_closure, inspect_trustd_runtime_closure,
 };
 
 const PRODUCT_PROOF_EVIDENCE_SCHEMA: &str = "trust.product-proof.v1";

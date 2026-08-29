@@ -329,9 +329,17 @@ pub(super) const LINKED_TRUST_SURFACE_TOOLS: &[LinkedTrustSurfaceToolSpec] = &[
         required_compatibility_aliases: &[],
     },
     LinkedTrustSurfaceToolSpec {
+        // `rustdoc` is a load-bearing compatibility entrypoint, not a retired
+        // spelling: cargo drives its doctest phase by spawning a binary named
+        // `rustdoc`, and rustup's proxy refuses a linked toolchain without it.
+        // Bootstrap therefore installs both names at every stage >= 1
+        // (76d408e1cd; tool.rs:1676 `rustdoc_sysroot_bins`) and dist packages
+        // both. Requiring it as a same-surface alias is what keeps the name
+        // honest now that it is no longer forbidden below: a stock rustdoc that
+        // is not byte-identical to this root's `trustdoc` still fails.
         name: "trustdoc",
         required: true,
-        required_compatibility_aliases: &[],
+        required_compatibility_aliases: &["rustdoc"],
     },
     LinkedTrustSurfaceToolSpec {
         name: "trustfmt",
@@ -378,12 +386,19 @@ pub(super) const LINKED_TRUST_SURFACE_TOOLS: &[LinkedTrustSurfaceToolSpec] = &[
 // Public secondary names are intentionally Trust-only. These leaves are
 // admitted solely as legacy stage0 archive inputs and must be translated away
 // before a selected sysroot can count as linked Trust release evidence.
+//
+// `rustdoc` is deliberately absent from this list, unlike bootstrap.py's
+// STAGE0_FORBIDDEN_BINS: a complete root ships it as a same-surface alias of
+// `trustdoc` (76d408e1cd), so it is enforced above as a required compatibility
+// alias instead of by absence. `trust-miri`/`targo-miri` are absent for the
+// other reason -- they are optional canonical Trust tools.
+// scripts/check_toolchain_coherence.py derives exactly those carve-outs and
+// fails if this list and the shell mirror drift apart.
 pub(crate) const FORBIDDEN_TRUST_PUBLIC_BIN_NAMES: &[&str] = &[
     "cargo-trust",
     "tcargo",
     "tcargo-trust",
     "tcargo-fmt",
-    "rustdoc",
     "rustfmt",
     "cargo-fmt",
     "cargo-clippy",

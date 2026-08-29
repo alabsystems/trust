@@ -1,15 +1,13 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 use serde::{Deserialize, Serialize};
 
-use crate::controlled_git;
-use crate::durable_io;
 use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_file};
+use crate::{controlled_git, durable_io};
 
 /// This command currently has no Trust-owned concurrency validator.  Its two
 /// report modes are therefore deliberately outside the proof-report namespace.
@@ -1295,7 +1293,6 @@ fn canonical_expected_sha256(
     }
 }
 
-
 fn concrete_solver_identity(obligation_id: &str, value: &str) -> Result<String, String> {
     let value = value.trim();
     let lowered = value.to_ascii_lowercase();
@@ -1316,8 +1313,6 @@ fn concrete_solver_identity(obligation_id: &str, value: &str) -> Result<String, 
     }
     Ok(value.to_string())
 }
-
-
 
 #[cfg(test)]
 mod tests {

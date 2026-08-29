@@ -5,16 +5,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 //
-// WHY THIS EXISTS. `generate::safety` deliberately emits NO obligation for the
-// three `ResumedAfter*` assert messages, and `generate_full_assert_refutation_vcs`
-// walks only `Terminator::Call` panic sites — but rustc lowers a sentinel as a
-// `Terminator::Assert`, never a call. So NOTHING in the pipeline ever asked the
-// solver about a sentinel: the coroutine body's whole-function panic-freedom
-// row was stamped `Proved` by the INTERPROCEDURAL discharge, whose stated
-// soundness premise enumerates panic sites as "(a) an obligation in `results`,
-// (b) a `Terminator::Call`" — and a sentinel is NEITHER. For a zero-await
-// resume body (no calls at all) that rule is VACUOUSLY true, so the row was a
-// proof that never looked at the sentinel.
+// WHY THIS EXISTS. `generate::safety` now preserves every public
+// `ResumedAfter*` Assert as its exact runtime-failure obligation; the message
+// itself has no protocol authority. This separate lane proves the stronger,
+// compiler-shaped resume-state claim when its selector/live-state structure is
+// locally recovered. It is not a replacement for the public safety row and
+// cannot erase it.
 //
 // WHAT THIS PROVES, EXACTLY. One candidate per sentinel:
 //
@@ -191,8 +187,7 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
     let constrained: FxHashSet<String> = precondition.free_variables().into_iter().collect();
     // Sentinel blocks that are DIRECT targets of the recognized entry dispatch
     // (see the direct-successor rationale on this function's doc comment).
-    let entry_arm_targets: FxHashSet<BlockId> =
-        targets.iter().map(|(_, target)| *target).collect();
+    let entry_arm_targets: FxHashSet<BlockId> = targets.iter().map(|(_, target)| *target).collect();
 
     let mut out = Vec::new();
     for block in &func.body.blocks {

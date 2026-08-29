@@ -23,23 +23,20 @@
 //! in the message text.
 
 use std::collections::BTreeSet;
-use std::env;
 use std::ffi::OsStr;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+use std::{env, fs, io};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use trust_types::TransportMessage;
 
-use crate::bounded_process;
-
 use super::{
     GatePolicy, find_stage2_tool, line_has_unexpected_skip, scrub_gate_process_environment, section,
 };
+use crate::bounded_process;
 
 pub(super) fn run(root: &Path, policy: GatePolicy) -> Result<()> {
     section("trustc native verification transport");
@@ -496,8 +493,11 @@ fn authenticated_transport(
                     result.results.iter().filter(|row| row.outcome.is_skipped()).count();
                 let row_runtime =
                     result.results.iter().filter(|row| row.outcome.is_runtime_checked()).count();
-                let row_plain_unknown =
-                    result.results.iter().filter(|row| row.outcome == trust_types::Outcome::Unknown).count();
+                let row_plain_unknown = result
+                    .results
+                    .iter()
+                    .filter(|row| row.outcome == trust_types::Outcome::Unknown)
+                    .count();
                 if result.proved != row_proved
                     || result.failed != row_failed
                     || result.timed_out != row_timed_out
@@ -1251,7 +1251,7 @@ fn assert_doctor_report(report: &Value, expected_trustc: &Path) -> Result<()> {
     // in-process detail; the shell-era default_enabled/route-scope/proof_grade
     // fields were removed (routing behavior is pinned by the trust-router
     // formula_compat_gate test instead).
-    for name in ["trust-mc", "trust-wp", "trust-vc"] {
+    for name in ["trust-mc", "trust-vc"] {
         let Some(suite) = suites.get(name) else {
             bail!("doctor missing verifier suite: {name}");
         };
@@ -1262,6 +1262,17 @@ fn assert_doctor_report(report: &Value, expected_trustc: &Path) -> Result<()> {
             bail!("SETUP: doctor reports {name} capability is not available");
         }
     }
+    if let Some(trust_wp) = suites.get("trust-wp") {
+        if trust_wp.get("capability_available").and_then(Value::as_bool) != Some(false)
+            || trust_wp
+                .get("manifest")
+                .and_then(|manifest| manifest.get("capabilities"))
+                .and_then(Value::as_array)
+                .is_none_or(|capabilities| !capabilities.is_empty())
+        {
+            bail!("retired trust-wp diagnostic inventory must remain zero-capability");
+        }
+    }
 
     if report.get("ready").and_then(Value::as_bool) != Some(true) {
         bail!("SETUP: doctor reports status {} instead of ready", field_str(report, "status"));
@@ -1270,9 +1281,11 @@ fn assert_doctor_report(report: &Value, expected_trustc: &Path) -> Result<()> {
 }
 
 fn assert_version_report(report: &Value) -> Result<()> {
-    // Trust: the version identity subsystem now emits trust.version.v2 (the
-    // audit-wave schema bump); this gate tracks the current schema exactly.
-    if field_str(report, "schema_version") != "trust.version.v2" {
+    // Trust: pin the schema by the constant that DEFINES it. A literal copied
+    // into this gate is what let it keep asserting `trust.version.v2` for a
+    // month after the schema was bumped to v3 — a stale copy of a contract is
+    // not a check of it.
+    if field_str(report, "schema_version") != trust_version::VERSION_SCHEMA {
         bail!("unexpected Trust version schema");
     }
     if field_str(report, "candidate_command") != "targo trust version --json" {
@@ -1474,10 +1487,7 @@ pub(super) fn root_resolution(root: &Path, policy: GatePolicy) -> Result<()> {
     // redirection"), collapsing every `targo trust check` here to a
     // setup-failure exit 2. `scratch` still owns the same directory (same
     // inode) for cleanup on drop.
-    let tmp = scratch
-        .path()
-        .canonicalize()
-        .context("failed to canonicalize scratch dir")?;
+    let tmp = scratch.path().canonicalize().context("failed to canonicalize scratch dir")?;
     let tmp = tmp.as_path();
 
     let crate_dir = tmp.join("rooted-crate");

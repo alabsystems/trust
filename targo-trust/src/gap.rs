@@ -94,11 +94,8 @@ impl OrderedTally {
 
     /// Descending by count, ties in first-seen order.
     fn ranked(&self) -> Vec<(&str, usize)> {
-        let mut ranked = self
-            .order
-            .iter()
-            .map(|key| (key.as_str(), self.get(key)))
-            .collect::<Vec<_>>();
+        let mut ranked =
+            self.order.iter().map(|key| (key.as_str(), self.get(key))).collect::<Vec<_>>();
         ranked.sort_by(|left, right| right.1.cmp(&left.1));
         ranked
     }
@@ -443,15 +440,10 @@ mod tests {
     fn a_survey_without_a_functions_array_is_refused_rather_than_reported_as_clean() {
         // Printing "0 obligations" for a document that is not a survey would
         // read as a crate with nothing left to prove.
-        for document in [
-            serde_json::json!({}),
-            serde_json::json!({ "functions": {} }),
-            serde_json::json!([]),
-        ] {
-            assert!(
-                document.get("functions").and_then(Value::as_array).is_none(),
-                "{document}"
-            );
+        for document in
+            [serde_json::json!({}), serde_json::json!({ "functions": {} }), serde_json::json!([])]
+        {
+            assert!(document.get("functions").and_then(Value::as_array).is_none(), "{document}");
         }
         assert!(
             serde_json::json!({ "functions": [] })

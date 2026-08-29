@@ -9,20 +9,19 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_disasm::{
-    ControlFlow, Instruction, Opcode,
-    operand::{
-        BarrierDomain, BarrierType, Condition, ExtendType, MemoryOperand as DisasmMemoryOperand,
-        Operand as DisasmOperand, RegKind, Register,
-    },
+use trust_disasm::operand::{
+    BarrierDomain, BarrierType, Condition, ExtendType, MemoryOperand as DisasmMemoryOperand,
+    Operand as DisasmOperand, RegKind, Register,
 };
+use trust_disasm::{ControlFlow, Instruction, Opcode};
 use trust_machine_sem::{
     Aarch64Semantics, Effect, MachineState, SemError, Semantics, X86_64Semantics,
 };
 use trust_types::{
-    AssertMessage, BasicBlock as TrustIrBlock, BinaryOrigin, BlockId, ConstValue, Endianness, Formula,
-    LocalDecl, MemoryAccessFact, MemoryAccessKind, MemoryRegionKind, Operand, Place, Rvalue,
-    SourceSpan, Statement, Terminator, Ty, UnsupportedLedger, UnsupportedRecord, stable_sha256_hex,
+    AssertMessage, BasicBlock as TrustIrBlock, BinaryOrigin, BlockId, ConstValue, Endianness,
+    Formula, LocalDecl, MemoryAccessFact, MemoryAccessKind, MemoryRegionKind, Operand, Place,
+    Rvalue, SourceSpan, Statement, Terminator, Ty, UnsupportedLedger, UnsupportedRecord,
+    stable_sha256_hex,
 };
 
 use crate::cfg::{Cfg, CfgEdge, CfgEdgeKind, CfgEdgeTarget, LiftedBlock};
@@ -2983,8 +2982,7 @@ mod tests {
         let address = Formula::Var("X1".to_string(), trust_types::Sort::BitVec(64));
 
         for width_bytes in [1u32, 2, 4, 8] {
-            let value =
-                Formula::Var("V".to_string(), trust_types::Sort::BitVec(width_bytes * 8));
+            let value = Formula::Var("V".to_string(), trust_types::Sort::BitVec(width_bytes * 8));
             let stored = byte_store_formula(memory.clone(), &address, &value, width_bytes);
             assert_eq!(
                 trust_types::check_formula_sort(&stored),
@@ -8027,18 +8025,12 @@ mod apply_effect_totality_tests {
             /// so the bridge's analysis never sees it.
             Refused,
         }
-        use StatementVisibility::{
-            AssignsGprLocal, AssignsNonGprLocals, NoStatement, Refused,
-        };
+        use StatementVisibility::{AssignsGprLocal, AssignsNonGprLocals, NoStatement, Refused};
 
         let layout = LocalLayout::aarch64();
         let flag = Formula::Bool(false);
         let rows: Vec<(&str, Effect, StatementVisibility)> = vec![
-            (
-                "RegWrite",
-                Effect::RegWrite { index: 0, width: 64, value: bv(1) },
-                AssignsGprLocal,
-            ),
+            ("RegWrite", Effect::RegWrite { index: 0, width: 64, value: bv(1) }, AssignsGprLocal),
             ("SpWrite", Effect::SpWrite { value: bv(1) }, AssignsNonGprLocals),
             (
                 "MemWrite",
@@ -8066,17 +8058,9 @@ mod apply_effect_totality_tests {
                 },
                 NoStatement,
             ),
-            (
-                "Call",
-                Effect::Call { target: bv(0x2000), return_addr: bv(0x1004) },
-                Refused,
-            ),
+            ("Call", Effect::Call { target: bv(0x2000), return_addr: bv(0x1004) }, Refused),
             ("Return", Effect::Return { target: bv(0x2000) }, NoStatement),
-            (
-                "FpRegWrite",
-                Effect::FpRegWrite { index: 0, width: 64, value: bv(1) },
-                Refused,
-            ),
+            ("FpRegWrite", Effect::FpRegWrite { index: 0, width: 64, value: bv(1) }, Refused),
             (
                 "Aarch64SyncBoundary",
                 Effect::Aarch64SyncBoundary {
@@ -8106,7 +8090,8 @@ mod apply_effect_totality_tests {
         let covered: BTreeSet<&str> = rows.iter().map(|row| row.0).collect();
         let declared: BTreeSet<&str> = Effect::VARIANT_NAMES.iter().copied().collect();
         assert_eq!(
-            covered, declared,
+            covered,
+            declared,
             "the statement-visibility table must cover every Effect variant; an \
              uncovered variant is one whose GPR-kill visibility was never measured. \
              Missing: {:?}; unknown: {:?}",

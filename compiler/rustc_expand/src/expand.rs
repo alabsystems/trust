@@ -27,13 +27,14 @@ use rustc_hir::def::MacroKinds;
 use rustc_hir::limit::Limit;
 use rustc_parse::parser::{
     AllowConstBlockItems, AttemptLocalParseRecovery, CommaRecoveryMode, ForceCollect, Parser,
-    RecoverColon, RecoverComma, Recovery, token_descr,
+    RecoverColon, RecoverComma, Recovery, parse_trust_loop_clause_attr, token_descr,
 };
 use rustc_session::errors::feature_err;
 use rustc_session::lint::builtin::{UNUSED_ATTRIBUTES, UNUSED_DOC_COMMENTS};
 use rustc_span::hygiene::SyntaxContext;
 use rustc_span::{ErrorGuaranteed, FileName, Ident, LocalExpnId, Span, Symbol, sym};
 use smallvec::SmallVec;
+use thin_vec::ThinVec;
 
 use crate::base::*;
 use crate::config::{StripUnconfigured, attr_into_trace};
@@ -1253,6 +1254,19 @@ trait InvocationCollectorNode: HasAttrs + HasNodeId + Sized {
     fn flatten_outputs(_outputs: impl Iterator<Item = Self::OutputTy>) -> Self::OutputTy {
         unreachable!()
     }
+    /// Trust: the expression whose `LoopContract` a `trust::loop_invariant` /
+    /// `trust::decreases` attribute on THIS node would belong to, if any.
+    ///
+    /// A statement and its expression SHARE one attribute vector
+    /// (`Stmt::visit_attrs` delegates to the expression for `Expr`/`Semi`), and
+    /// the statement is collected FIRST. Without this hook the transported
+    /// attribute is taken as a statement-position attribute-macro invocation
+    /// before `visit_expr` ever runs, and dies at name resolution — the
+    /// statement position being exactly the one that survives stock rustc, so
+    /// the whole surface would be unreachable.
+    fn trust_loop_clause_expr(&mut self) -> Option<&mut ast::Expr> {
+        None
+    }
     fn pre_flat_map_node_collect_attr(_cfg: &StripUnconfigured<'_>, _attr: &ast::Attribute) {}
     fn post_flat_map_node_collect_bang(_output: &mut Self::OutputTy, _add_semicolon: AddSemicolon) {
     }
@@ -1342,8 +1356,7 @@ impl InvocationCollectorNode for Box<ast::Item> {
         // a non-root fragment: it mints nothing and fails closed, exactly
         // like a macro-introduced inline island. Its declarations are still
         // elaborated and kernel-checked by the verify pass, also identically.
-        if matches!(&node.kind, ItemKind::CleanIsland(island) if island.unloaded_unit.is_some())
-        {
+        if matches!(&node.kind, ItemKind::CleanIsland(island) if island.unloaded_unit.is_some()) {
             let (span, attrs) = (node.span, mem::take(&mut node.attrs));
             let ItemKind::CleanIsland(ref mut island) = node.kind else { unreachable!() };
             let unit_ident = island.unloaded_unit.take().expect("checked `is_some` just above");
@@ -1786,6 +1799,20 @@ impl InvocationCollectorNode for ast::Arm {
 
 impl InvocationCollectorNode for ast::Stmt {
     const KIND: AstFragmentKind = AstFragmentKind::Stmts;
+    fn trust_loop_clause_expr(&mut self) -> Option<&mut ast::Expr> {
+        // A `let` statement's attributes belong to the `let`, not to any loop
+        // in its initialiser, so only the expression-statement forms qualify.
+        // (`let r = #[..] loop { .. };` puts the attribute in a genuine
+        // sub-expression position, which stock rustc rejects with E0658 on the
+        // `cfg_attr` itself — so that spelling is not part of the transport and
+        // is left to fail identically here.)
+        match &mut self.kind {
+            StmtKind::Expr(expr) | StmtKind::Semi(expr) => Some(expr),
+            StmtKind::Let(..) | StmtKind::Item(..) | StmtKind::MacCall(..) | StmtKind::Empty => {
+                None
+            }
+        }
+    }
     fn to_annotatable(self) -> Annotatable {
         Annotatable::Stmt(Box::new(self))
     }
@@ -1953,6 +1980,9 @@ impl InvocationCollectorNode for ast::Pat {
 }
 
 impl InvocationCollectorNode for ast::Expr {
+    fn trust_loop_clause_expr(&mut self) -> Option<&mut ast::Expr> {
+        Some(self)
+    }
     type OutputTy = Box<ast::Expr>;
     const KIND: AstFragmentKind = AstFragmentKind::Expr;
     fn to_annotatable(self) -> Annotatable {
@@ -1983,6 +2013,9 @@ impl InvocationCollectorNode for ast::Expr {
 
 struct OptExprTag;
 impl InvocationCollectorNode for AstNodeWrapper<Box<ast::Expr>, OptExprTag> {
+    fn trust_loop_clause_expr(&mut self) -> Option<&mut ast::Expr> {
+        Some(&mut self.wrapped)
+    }
     type OutputTy = Option<Box<ast::Expr>>;
     const KIND: AstFragmentKind = AstFragmentKind::OptExpr;
     fn to_annotatable(self) -> Annotatable {
@@ -2018,6 +2051,9 @@ impl InvocationCollectorNode for AstNodeWrapper<Box<ast::Expr>, OptExprTag> {
 struct MethodReceiverTag;
 
 impl InvocationCollectorNode for AstNodeWrapper<ast::Expr, MethodReceiverTag> {
+    fn trust_loop_clause_expr(&mut self) -> Option<&mut ast::Expr> {
+        Some(&mut self.wrapped)
+    }
     type OutputTy = AstNodeWrapper<Box<ast::Expr>, MethodReceiverTag>;
     const KIND: AstFragmentKind = AstFragmentKind::MethodReceiverExpr;
     fn descr() -> &'static str {
@@ -2207,6 +2243,254 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
     /// If `item` is an attribute invocation, remove the attribute and return it together with
     /// its position and derives following it. We have to collect the derives in order to resolve
     /// legacy derive helpers (helpers written before derives that introduce them).
+    /// Trust: desugar the STOCK-SURVIVING loop-clause transport
+    /// (`#[cfg_attr(trust_verify, trust::loop_invariant(P))]`,
+    /// `#[cfg_attr(trust_verify, trust::decreases(e))]`) into the SAME
+    /// `ast::LoopContract` the native `loop`/`while` clause position produces,
+    /// and remove the attributes.
+    ///
+    /// WHY HERE. This runs after `cfg`/`cfg_attr` normalization (the enclosing
+    /// statement's `visit_node` loop has already expanded them) and before the
+    /// attribute can be gated as an experimental expression attribute or
+    /// collected as an attribute-macro invocation. Consumption IS the
+    /// exemption: there is no standalone E0658 or name-resolution carve-out
+    /// that could survive a failure to consume. Anything this function does not
+    /// consume and does not diagnose continues down the ordinary attribute path
+    /// and dies as an unresolved `trust::…` attribute — loudly, never silently.
+    ///
+    /// ASSOCIATION IS EXACT. The attribute is ON the loop expression, so the
+    /// clause binds to that loop's header with no statement-index fiction and
+    /// no program-point guessing. This is the whole reason a statement-position
+    /// macro (`trust::loop_invariant!(P);` inside the body) was rejected: in
+    /// `loop { n = 0; loop_invariant!(n == 0); n = 1; continue; }` a
+    /// macro-point capture stamped on the header "proves" a predicate that is
+    /// false at every header after the first.
+    ///
+    /// ONE LOWERING PATH. The clause is appended to the loop's `LoopContract`
+    /// — the same field, the same lowering (`collect_trust_loop_clauses`), the
+    /// same VC generator. Nothing downstream can tell which surface wrote it,
+    /// which is the point: two implementations are exactly the drift that let
+    /// native `decreases` prove while attribute `decreases` stayed inert.
+    ///
+    /// WHAT IT REFUSES, and why each refusal is a correct outcome:
+    ///
+    ///   * any expression that is not `while` / `loop`. `for` in particular is
+    ///     refused with the SAME measured reason the native position gives it
+    ///     (`e45.transition.entry-not-straight-line`: a `for` is entered
+    ///     through the `IntoIterator::into_iter` call, so vcgen has no exact
+    ///     initiation model for its header). A transport that accepted clause
+    ///     positions the native grammar rejects would widen the accepted
+    ///     surface behind the native refusal's back.
+    ///   * a loop that ALSO carries native header clauses. Mixing raises an
+    ///     ordering question with no authored answer and a second place to get
+    ///     "at most one `decreases`" wrong; it cannot occur in genuinely
+    ///     stock-compatible source, because a file containing the native
+    ///     grammar does not parse on stock rustc at all.
+    ///   * a second `decreases`, matching the native parser's rule exactly.
+    ///   * a malformed payload — no parentheses, `= "…"`, empty, or one the
+    ///     clause walk does not consume to the end. The attribute is left in
+    ///     place on the error path, so a bug in this function degrades to the
+    ///     pre-existing hard error rather than to an erased clause.
+    ///
+    /// Verification-disabled builds are left completely alone: `cfg(trust_verify)`
+    /// is injected from the same `Session` predicate tested here
+    /// (`config/cfg.rs`), so with verification off the transport spelling
+    /// produces no attribute at all, and a directly-written one keeps today's
+    /// E0658 rather than being accepted by a compiler that will not check it.
+    fn consume_trust_loop_clause_attrs(&mut self, expr: &mut ast::Expr) {
+        // Fast path: vanilla Rust pays one `is_empty` and one predicate.
+        if expr.attrs.is_empty() || !self.cx.sess.trust_verification_enabled() {
+            return;
+        }
+        if !expr.attrs.iter().any(|a| ast::trust_loop_clause_attr_kind(a).is_some()) {
+            return;
+        }
+        // WAIT until cfg normalization is COMPLETE, not merely started.
+        // `expand_cfg_attr` expands ONE `cfg_attr` per turn of the enclosing
+        // `visit_node`/`flat_map_node` loop, and this hook runs at the top of
+        // every turn. Consuming eagerly therefore installs the first clause,
+        // and the SECOND turn then finds a loop that already has a contract and
+        // reports the author's ordinary
+        //
+        //     #[cfg_attr(trust_verify, trust::loop_invariant(P))]
+        //     #[cfg_attr(trust_verify, trust::decreases(e))]
+        //     loop { .. }
+        //
+        // as "clauses on BOTH surfaces". MEASURED: that is exactly what the
+        // first build of this change did. Deferring until no `cfg`/`cfg_attr`
+        // remains makes consumption a single pass over the final attribute
+        // list, which is also what keeps authored clause ORDER meaningful.
+        //
+        // A `cfg_attr` that never expands (malformed, or its own expansion
+        // errored) means the trust attributes are never consumed here — they
+        // reach attribute-macro collection and die unresolved. Fail-closed.
+        if expr.attrs.iter().any(|a| a.has_name(sym::cfg) || a.has_name(sym::cfg_attr)) {
+            return;
+        }
+
+        // The loop's existing contract slot, or the reason there is no clause
+        // position here. `Some(None)` = a clause position with nothing in it.
+        let native: Option<&Option<Box<ast::LoopContract>>> = match &expr.kind {
+            ExprKind::While(_, _, _, contract) | ExprKind::Loop(_, _, _, contract) => {
+                Some(contract)
+            }
+            _ => None,
+        };
+
+        let Some(native) = native else {
+            for attr in expr.attrs.iter() {
+                let Some(kind) = ast::trust_loop_clause_attr_kind(attr) else { continue };
+                let name = match kind {
+                    ast::LoopClauseKind::Invariant => "trust::loop_invariant",
+                    ast::LoopClauseKind::Decreases => "trust::decreases",
+                };
+                let mut err = self.cx.dcx().struct_span_err(
+                    attr.span,
+                    format!("`{name}` is a loop clause, and this is not a loop"),
+                );
+                err.span_label(expr.span, format!("this is {}", trust_expr_descr(expr)));
+                if matches!(expr.kind, ExprKind::ForLoop { .. }) {
+                    // Keep this reason byte-aligned with the native refusal in
+                    // `Parser::reject_trust_for_loop_contract`: one decision,
+                    // stated once, not two surfaces that could drift apart.
+                    err.note(
+                        "a `for` loop is entered through the `IntoIterator::into_iter` call, so \
+                         its header is not reached by a straight-line path and the verifier has \
+                         no exact initiation model for it (e45.transition.entry-not-straight-line)",
+                    );
+                    err.help(
+                        "rewrite the loop as a `while` or `loop` and put the clause on that",
+                    );
+                } else {
+                    err.help(
+                        "a loop clause may only be attached to a `while` or `loop` expression",
+                    );
+                }
+                err.emit();
+            }
+            // Removed only AFTER the error is emitted. An emitted error means
+            // no artifact is produced, so there is no silent acceptance to
+            // worry about — and leaving them would add an unresolved-attribute
+            // cascade on top of the diagnostic that already said the useful
+            // thing.
+            expr.attrs.retain(|a| ast::trust_loop_clause_attr_kind(a).is_none());
+            return;
+        };
+
+        if let Some(contract) = native
+            && !contract.clauses.is_empty()
+        {
+            let attr_span = expr
+                .attrs
+                .iter()
+                .find(|a| ast::trust_loop_clause_attr_kind(a).is_some())
+                .map(|a| a.span)
+                .unwrap_or(expr.span);
+            self.cx
+                .dcx()
+                .struct_span_err(
+                    attr_span,
+                    "this loop has clauses on BOTH the attribute and the native surface",
+                )
+                .with_span_label(
+                    contract.clauses[0].keyword_span,
+                    "native clause position used here",
+                )
+                .with_note(
+                    "the two surfaces desugar to one `LoopContract`, so mixing them leaves the \
+                     authored clause order and the `decreases` uniqueness rule with no answer",
+                )
+                .with_help(
+                    "use one surface: the native position for a tRustc-only crate, or \
+                     `#[cfg_attr(trust_verify, trust::loop_invariant(..))]` for a crate that \
+                     must also build on stock rustc",
+                )
+                .emit();
+            expr.attrs.retain(|a| ast::trust_loop_clause_attr_kind(a).is_none());
+            return;
+        }
+
+        // Parse every recognized attribute BEFORE mutating anything, so no
+        // half-populated `LoopContract` can be observed.
+        let mut clauses = ThinVec::new();
+        let mut decreases_at: Option<Span> = None;
+        let mut failed = false;
+        for attr in expr.attrs.iter() {
+            let Some(kind) = ast::trust_loop_clause_attr_kind(attr) else { continue };
+            let name = match kind {
+                ast::LoopClauseKind::Invariant => "trust::loop_invariant",
+                ast::LoopClauseKind::Decreases => "trust::decreases",
+            };
+            let Some(args) = ast::trust_loop_clause_attr_payload(attr) else {
+                self.cx
+                    .dcx()
+                    .struct_span_err(
+                        attr.span,
+                        format!("`{name}` needs a parenthesized predicate"),
+                    )
+                    .with_help(format!("write `#[{name}(<predicate>)]`"))
+                    .emit();
+                failed = true;
+                continue;
+            };
+            if args.delim != token::Delimiter::Parenthesis {
+                self.cx
+                    .dcx()
+                    .struct_span_err(
+                        args.dspan.entire(),
+                        format!("`{name}` takes its predicate in parentheses"),
+                    )
+                    .with_help(format!("write `#[{name}(<predicate>)]`"))
+                    .emit();
+                failed = true;
+                continue;
+            }
+            if kind == ast::LoopClauseKind::Decreases {
+                if let Some(first) = decreases_at {
+                    // E5: one termination surface per loop. Identical to the
+                    // native parser's `duplicate `decreases` clause` rule.
+                    self.cx
+                        .dcx()
+                        .struct_span_err(attr.span, "duplicate `decreases` clause on this loop")
+                        .with_span_label(first, "first one here")
+                        .emit();
+                    failed = true;
+                    continue;
+                }
+                decreases_at = Some(attr.span);
+            }
+            match parse_trust_loop_clause_attr(
+                &self.cx.sess.psess,
+                kind,
+                attr.span,
+                args,
+            ) {
+                Ok(clause) => clauses.push(clause),
+                Err(err) => {
+                    err.emit();
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            // A diagnosed clause is NOT installed: a partially captured
+            // predicate must never become a contract. The attributes go, for
+            // the cascade reason above; the build is already failing.
+            expr.attrs.retain(|a| ast::trust_loop_clause_attr_kind(a).is_none());
+            return;
+        }
+
+        // Authored order is top-to-bottom, exactly as written above the loop,
+        // and is preserved: tooling and verifier metadata must not rewrite
+        // `decreases e` / `invariant P` into the other order.
+        expr.attrs.retain(|a| ast::trust_loop_clause_attr_kind(a).is_none());
+        let contract = match &mut expr.kind {
+            ExprKind::While(_, _, _, contract) | ExprKind::Loop(_, _, _, contract) => contract,
+            _ => unreachable!("the clause position was established above"),
+        };
+        *contract = Some(Box::new(ast::LoopContract { clauses }));
+    }
+
     fn take_first_attr(
         &self,
         item: &mut impl HasAttrs,
@@ -2361,6 +2645,12 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
         mut node: Node,
     ) -> Node::OutputTy {
         loop {
+            // Trust: after cfg/cfg_attr normalization (the `continue` arms
+            // below re-enter here once each cfg_attr is expanded) and BEFORE
+            // the attribute can be taken as a macro invocation.
+            if let Some(expr) = node.trust_loop_clause_expr() {
+                self.consume_trust_loop_clause_attrs(expr);
+            }
             return match self.take_first_attr(&mut node) {
                 Some((attr, pos, derives)) => match attr.name() {
                     Some(sym::cfg) => {
@@ -2458,6 +2748,12 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
         node: &mut Node,
     ) {
         loop {
+            // Trust: after cfg/cfg_attr normalization (the `continue` arms
+            // below re-enter here once each cfg_attr is expanded) and BEFORE
+            // the attribute can be taken as a macro invocation.
+            if let Some(expr) = node.trust_loop_clause_expr() {
+                self.consume_trust_loop_clause_attrs(expr);
+            }
             return match self.take_first_attr(node) {
                 Some((attr, pos, derives)) => match attr.name() {
                     Some(sym::cfg) => {
@@ -2605,6 +2901,11 @@ impl<'a, 'b> MutVisitor for InvocationCollector<'a, 'b> {
     }
 
     fn visit_expr(&mut self, node: &mut ast::Expr) {
+        // Trust: BEFORE the expression-attribute feature gate, because being
+        // consumed here IS the exemption. See
+        // `consume_trust_loop_clause_attrs`; there is deliberately no separate
+        // E0658 carve-out that could outlive a failure to consume.
+        self.consume_trust_loop_clause_attrs(node);
         // FIXME: Feature gating is performed inconsistently between `Expr` and `OptExpr`.
         if let Some(attr) = node.attrs.first() {
             self.cfg().maybe_emit_expr_attr_err(attr);
@@ -2617,6 +2918,10 @@ impl<'a, 'b> MutVisitor for InvocationCollector<'a, 'b> {
     }
 
     fn filter_map_expr(&mut self, node: Box<ast::Expr>) -> Option<Box<ast::Expr>> {
+        // Trust: consumption for this route happens inside `flat_map_node`,
+        // through `InvocationCollectorNode::trust_loop_clause_expr` — before
+        // `take_first_attr` and therefore before
+        // `pre_flat_map_node_collect_attr` reaches the E0658 gate.
         self.flat_map_node(AstNodeWrapper::new(node, OptExprTag))
     }
 
@@ -2663,5 +2968,20 @@ impl ExpansionConfig<'_> {
             span_debug: false,
             proc_macro_backtrace: false,
         }
+    }
+}
+
+/// Trust: a short noun phrase for the construct a misplaced loop clause landed
+/// on, so the diagnostic names what the author actually wrote.
+fn trust_expr_descr(expr: &ast::Expr) -> &'static str {
+    match &expr.kind {
+        ExprKind::ForLoop { .. } => "a `for` loop",
+        ExprKind::MacCall(..) => "a macro invocation, not the loop it may expand to",
+        ExprKind::Block(..) => "a block",
+        ExprKind::If(..) => "an `if` expression",
+        ExprKind::Match(..) => "a `match` expression",
+        ExprKind::Call(..) | ExprKind::MethodCall(..) => "a call",
+        ExprKind::Closure(..) => "a closure",
+        _ => "not a loop expression",
     }
 }

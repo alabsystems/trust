@@ -1,5 +1,27 @@
 # tRust-added proof manifest for `trust-upstream-compat prove`.
 #
+# TWO SPELLINGS PER ENTRY, and the difference is the strength of the claim.
+#
+#   `command`        the canonical RELEASE spelling. Always carries `--release`.
+#                    Every one of these refuses today: six native modes refuse
+#                    the release request outright, and six canonical modes refuse
+#                    unconditionally because the evidence they attest to —
+#                    authenticated distribution roots, signed artifacts, fresh
+#                    receipt transactions, an independently authenticated native
+#                    verifier — does not exist yet. See `blocked_canonical_
+#                    diagnostic` in targo-trust/src/rust_vs_trust.rs.
+#
+#   `local_command`  the weaker mode that refusal explicitly names as "runnable
+#                    for local diagnostics". A NON-release bundle runs this and
+#                    records `release = false`, so it attests what actually ran
+#                    at the strength it actually has.
+#
+# This is NOT a way to make a release bundle pass. A release run uses `command`
+# and only `command`; the shape check requires `--release` there and REJECTS it
+# in `local_command`, so a bundle can never cite a command at a strength it did
+# not execute. `bundle.release` records which lane ran, and the validator's
+# release-only rules key on it.
+#
 # This file names the canonical tRust-specific test commands that must be
 # covered by the per-test inventory/results artifact. The `covers` ids are
 # stable inventory ids; the proof validator rejects tRust-added inventory rows
@@ -10,71 +32,83 @@ schema_version = "0.1.0"
 [[commands]]
 id = "trust.added.quick"
 command = "targo trust domination trust-added --release quick"
+local_command = "targo trust domination trust-added quick"
 covers = ["trust.added.quick"]
 required = true
 
 [[commands]]
 id = "trust.added.native"
 command = "targo trust domination trust-added --release trustc-native"
+local_command = "targo trust domination trust-added trustc-native"
 covers = ["trust.added.native"]
 required = true
 
 [[commands]]
 id = "trust.added.compiletest"
 command = "targo trust domination trust-added --release trust-added-compiletest"
+local_command = "targo trust domination trust-added trust-added-compiletest"
 covers = ["trust.added.compiletest"]
 required = true
 
 [[commands]]
 id = "trust.added.extra"
 command = "targo trust domination trust-added --release trust-extra"
+local_command = "targo trust domination trust-added trust-extra-smoke"
 covers = ["trust.added.extra"]
 required = true
 
 [[commands]]
 id = "trust.added.binary-decompilation-golden"
 command = "targo trust domination trust-added --release binary-decompilation-golden"
+local_command = "targo trust domination trust-added binary-decompilation-golden"
 covers = ["trust.added.binary-decompilation-golden"]
 required = true
 
 [[commands]]
 id = "trust.added.native-contracts-pipeline-v2"
 command = "targo trust domination trust-added --release native-contracts-pipeline-v2"
+local_command = "targo trust domination trust-added native-contracts-pipeline-v2"
 covers = ["trust.added.native-contracts-pipeline-v2"]
 required = true
 
 [[commands]]
 id = "trust.added.launch"
 command = "targo trust domination trust-added --release launch"
+local_command = "targo trust domination trust-added launch"
 covers = ["trust.added.launch"]
 required = true
 
 [[commands]]
 id = "trust.added.public-distribution"
 command = "targo trust domination trust-added --release public-distribution"
+local_command = "targo trust domination trust-added public-distribution-cull-smoke"
 covers = ["trust.added.public-distribution"]
 required = true
 
 [[commands]]
 id = "trust.added.prepublish"
 command = "targo trust domination trust-added --release prepublish"
+local_command = "targo trust domination trust-added prepublish-local-surface-smoke"
 covers = ["trust.added.prepublish"]
 required = true
 
 [[commands]]
 id = "trust.added.installed"
 command = "targo trust domination trust-added --release installed"
+local_command = "targo trust domination trust-added local-stage2-surface-smoke"
 covers = ["trust.added.installed"]
 required = true
 
 [[commands]]
 id = "trust.added.installed-default"
 command = "targo trust domination trust-added --release installed-default"
+local_command = "targo trust domination trust-added local-stage2-surface-smoke"
 covers = ["trust.added.installed-default"]
 required = true
 
 [[commands]]
 id = "trust.added.stage0-lineage"
 command = "targo trust domination trust-added --release stage0-lineage"
+local_command = "targo trust domination trust-added stage0-metadata-coherence-smoke"
 covers = ["trust.added.stage0-lineage"]
 required = true

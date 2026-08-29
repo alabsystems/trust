@@ -1,7 +1,7 @@
 use std::path::Path;
 
 #[test]
-fn trust_build_feature_wires_native_three_suite_libraries() {
+fn trust_build_feature_wires_two_authority_suites_and_historical_wp_conformance() {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("trust-router manifest should be readable");
@@ -22,7 +22,7 @@ fn trust_build_feature_wires_native_three_suite_libraries() {
     );
     assert!(
         feature_edges.contains(&"trust-wp/trust-build"),
-        "trust-router/trust-build must enable the native trust_wp bridge"
+        "trust-router/trust-build must compile historical trust_wp inspection/conformance support without adding a capability"
     );
     assert!(
         feature_edges.contains(&"trust-vc-native"),

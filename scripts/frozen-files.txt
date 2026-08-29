@@ -56,6 +56,18 @@
 # deleting their waivers, and that remains a decision for the owner, not for the
 # lane that found them.
 #
+# RATIFIED 2026-08-27 (second, same day) — crate_module.rs re-pinned
+# (a05d9b54 -> 135ad7b0, one movement: the IR-5 link-call plumbing), its
+# waiver deleted per step 3. Owner-directed ("almost certainly unfreeze")
+# after reviewing the movement's content in-session; the adjudication text
+# travels in git history on the deleted waiver row. BASELINE UPDATE only.
+# RATIFIED 2026-08-27 — crate_module.rs re-pinned (266c373c -> a05d9b54, four
+# adjudicated movements) and differential.rs re-pinned (2149e954 -> 3652c58c,
+# six adjudicated movements), their waivers deleted per step 3 above. The owner
+# surfaced-and-directed on 2026-08-27 ("go address these things") after the
+# pending stack was reported; the adjudication texts travel in git history on
+# the deleted waiver rows (scripts/frozen-waivers.txt at 1a85766a548 and
+# earlier). BASELINE UPDATE, not a rule change: both rules stand unchanged.
 # RATIFIED 2026-08-20 — mir_differential.rs re-pinned (461ab7af -> 83f63d04),
 # and its waiver deleted per step 3 above. This is a BASELINE UPDATE, not an
 # exception: the row still reads BYTE-IDENTICAL and the next edit still needs a
@@ -80,6 +92,13 @@
 #       (tests/ui/trust/trust_ir_unsize_dyn_data_lane.rs).
 
 #
+# RATIFIED 2026-08-27 — crate_module.rs re-pinned (266c373c -> a05d9b54, four
+# adjudicated movements) and differential.rs re-pinned (2149e954 -> 3652c58c,
+# six adjudicated movements), their waivers deleted per step 3 above. The owner
+# surfaced-and-directed on 2026-08-27 ("go address these things") after the
+# pending stack was reported; the adjudication texts travel in git history on
+# the deleted waiver rows (scripts/frozen-waivers.txt at 1a85766a548 and
+# earlier). BASELINE UPDATE, not a rule change: both rules stand unchanged.
 # RATIFIED 2026-08-20 (second re-pin) — mir_differential.rs re-pinned
 # (83f63d04 -> 709a7794), and its waiver deleted per step 3 above. The row
 # still reads BYTE-IDENTICAL and the next edit still needs a waiver. Three
@@ -131,7 +150,18 @@
 #       codegen flip LOST — the exemption path can fail and does, so the kinds
 #       map is genuinely consulted and the wrong-grant direction fails closed.
 
-crates/trust-thir-lower/src/mir_differential.rs|709a7794d01a7b3cecd5122e85f003143de8df5e|BYTE-IDENTICAL|differential B: producer trust-ir -> to_mir derived MIR vs rustc-built MIR; the SOLE writer path to record_green -> try_flip
+# RATIFIED 2026-08-21 (third re-pin) — mir_differential.rs re-pinned
+# (709a7794 -> 13cd4f25), and only its exact matching waiver deleted. The f904
+# movement adds four explicit TailCall refusals to independent oracle walks and
+# classifies TailCall's implicit return-place write as local 0 only. The former
+# wildcard arms already rejected TailCall, so no agreement path widened; the
+# dedicated diagnostic and local-write invariant are independently mutation-
+# pinned by mir_differential_tailcall_ratification_tests (2/2), with the complete
+# trust-thir-lower library suite at 717/717. Full adjudication, including the
+# strict proof-checker boundary and absence of a corpus-output claim, is in
+# reports/freeze-adjudication-2026-08-21-tailcall.md.
+
+crates/trust-thir-lower/src/mir_differential.rs|13cd4f258683fdede1877d194d674910fb6366a9|BYTE-IDENTICAL|differential B: producer trust-ir -> to_mir derived MIR vs rustc-built MIR; the SOLE writer path to record_green -> try_flip
 crates/trust-thir-lower/src/flip_registry.rs|771cd9ec0b53cb98c342f16beb5fd35cdb015cc9|BYTE-IDENTICAL|the flip gate itself (markers_exact + DerivedAgreed); a relaxation here ships wrong code
-crates/trust-thir-lower/src/crate_module.rs|266c373cbbfcc09a1235d9e4870da9511a4965b0|BYTE-IDENTICAL|hosts run_seam_differentials, the crate-finalize comparison site, and splice_ok
-crates/trust-thir-lower/src/differential.rs|2149e954076c01d6657d84efc9496cbe7eb0543b|SAMPLE-MORE-OR-REFUSE-MORE|the interpretation differential: sampled THIR-trust-ir vs MIR-trust-ir equivalence
+crates/trust-thir-lower/src/crate_module.rs|135ad7b0131242ee1067160ddd4dfa314603dd07|BYTE-IDENTICAL|hosts run_seam_differentials, the crate-finalize comparison site, and splice_ok
+crates/trust-thir-lower/src/differential.rs|3652c58c420ab065a071ee64f8f93ef81f09901a|SAMPLE-MORE-OR-REFUSE-MORE|the interpretation differential: sampled THIR-trust-ir vs MIR-trust-ir equivalence

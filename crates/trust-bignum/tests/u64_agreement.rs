@@ -104,11 +104,7 @@ fn div_and_rem_agree_with_hardware_for_nonzero_divisors() {
 fn comparison_and_equality_agree_with_u64() {
     for &a in &interesting_u64s() {
         for &b in &interesting_u64s() {
-            assert_eq!(
-                Nat::from_u64(a).cmp(&Nat::from_u64(b)),
-                a.cmp(&b),
-                "cmp({a}, {b})"
-            );
+            assert_eq!(Nat::from_u64(a).cmp(&Nat::from_u64(b)), a.cmp(&b), "cmp({a}, {b})");
             assert_eq!(Nat::from_u64(a) == Nat::from_u64(b), a == b, "eq({a}, {b})");
         }
     }

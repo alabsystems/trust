@@ -4,11 +4,7 @@
 // floating-point proof surface without std I/O noise.
 
 fn float_divide_guarded(x: f64, y: f64) -> f64 {
-    if y == 0.0 {
-        0.0
-    } else {
-        x / y
-    }
+    if y == 0.0 { 0.0 } else { x / y }
 }
 
 fn main() {

@@ -1,0 +1,586 @@
+#!/bin/sh
+# THE BUILD-TREE MUTUAL EXCLUSION LOCK — one exclusive resource, both sides check.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
+#
+# WHY THIS EXISTS
+# ---------------
+# `build/` is a single exclusive resource that every lane shares, and until this
+# script it had no lock. Measured cost in ONE session, 2026-08-20:
+#
+#   * a sweep died at 4m27s when a build started under it;
+#   * another lost `stage1/bin/rustc` 37 seconds in (x.py deletes it at start);
+#   * a third was voided by its own binary-invariance gate after a mid-run rebuild;
+#   * a fourth was misdiagnosed as contaminated when it was actually fine.
+#
+# THE ASYMMETRY THAT CAUSED ALL FOUR. Every lane was told to check for a running
+# BUILD before building. Nobody checked for a running MEASUREMENT before building.
+# A wait is not a lock: a predicate stops you starting on top of somebody else and
+# does nothing to stop somebody else starting on top of you. So the contract here
+# is mutual — the same lock is taken by the sweep (`scripts/run_measurement_sweep.sh`)
+# AND by the build (`x.py`), and either kind excludes the other.
+#
+# A PUSH IS A BUILD. `scripts/hooks/pre-push` runs `x.py check --stage 1`, which
+# compiles into the same tree. It is covered because the lock lives in `x.py`, not
+# in the hook, so there is no second place to remember.
+#
+# WHY `mkdir`, AND WHY NOT THE ALTERNATIVES
+# -----------------------------------------
+#   flock(1)   DOES NOT EXIST ON macOS. Verified 2026-08-20 on this machine:
+#              no /usr/bin/flock, no /usr/local/bin/flock, `command -v flock`
+#              finds nothing. Any design that reaches for it is dead on arrival.
+#   shlock(1)  exists (/usr/bin/shlock) and is PID-aware, but it stores a bare pid
+#              and nothing else — no purpose, no start time, no kind. Honest
+#              diagnostics are requirement 3, so a bare pid is not enough.
+#   lockf(1)   exists but wraps a COMMAND. It cannot express "hold this across a
+#              37-minute python sweep whose exit code I still need", and it leaves
+#              nothing readable behind for a second lane to inspect.
+#   test-then-create
+#              `[ -d "$D" ] || mkdir "$D"` is the race this file exists to avoid.
+#              Two acquirers both see "absent" and both proceed. Never do this.
+#
+#   mkdir(2) is atomic on POSIX and its failure is observable: exactly one of N
+#   concurrent `mkdir "$LOCKDIR"` calls returns 0 and the rest return EEXIST. That
+#   single syscall IS the claim. Proven here by test T5, 400 contended acquisitions.
+#
+# STALENESS IS ALSO RACE-FREE. A crashed holder must not lock the tree forever, so
+# a lock whose pid is gone is reclaimable — but two lanes can decide "stale" at the
+# same instant, and if reclaiming were `rm -rf` + `mkdir` they would BOTH win. The
+# reclaim is therefore a rename to a unique name (`mv LOCKDIR LOCKDIR.stale.<nonce>`,
+# target guaranteed not to exist), which is rename(2): exactly one mv finds the
+# source and the losers get ENOENT and go round the loop again.
+#
+# PID REUSE. A recorded pid alone is not identity — the OS recycles pids and a
+# recycled one would read as "holder still alive" forever. The lock records the
+# holder's process START TIME as well and requires BOTH to match. See T7.
+#
+# USAGE
+#   trust_build_lock.sh acquire --kind build|measurement --purpose TEXT \
+#                               [--pid N] [--wait SECONDS] [--break --reason TEXT]
+#        -> prints the TOKEN on stdout; 0 acquired, 3 refused, 2 usage.
+#           All diagnostics go to stderr so the token can be captured cleanly.
+#   trust_build_lock.sh release TOKEN     -> 0 released/not-ours-so-nothing-done,
+#                                            4 held by somebody else (untouched)
+#   trust_build_lock.sh status            -> 0 free, 3 held (prints the holder)
+#   trust_build_lock.sh break --reason TEXT
+#        -> the loud human override. Prints a banner naming who is being displaced
+#           and appends to .trust-build-lock.breaks. A reason is MANDATORY.
+#   trust_build_lock.sh --selftest        -> see scripts/tests/trust_build_lock_test.sh
+#
+# ENVIRONMENT
+#   TRUST_REPO              repo root (default: this script's parent)
+#   TRUST_BUILD_LOCK_TOKEN  set by an acquirer and inherited by its children, so a
+#                           nested x.py does not deadlock against its own parent.
+#                           This is NOT an override: it names a lock already held.
+#   TRUST_BUILD_LOCK_WAIT   seconds to block before refusing (default 0 = refuse now)
+#   TRUST_BUILD_LOCK_BREAK  the reason text for a non-interactive break. Empty or
+#                           unset means no break. There is deliberately no `=1`
+#                           form and no config-file route: an override that can be
+#                           set without typing a sentence is an override that gets
+#                           set once and left on.
+set -u
+
+# --------------------------------------------------------------------------
+# Locations
+# --------------------------------------------------------------------------
+# Resolved PHYSICALLY. `lsof` reports a process cwd as its physical path, so a
+# root carrying a symlink (`/var/...` vs `/private/var/...` on macOS, or any
+# clone reached through one) would silently scope every cwd check to nothing.
+_self_dir=$(cd -P "$(dirname "$0")" && pwd -P)
+ROOT=$(cd -P "${TRUST_REPO:-$_self_dir/..}" 2>/dev/null && pwd -P) || ROOT=${TRUST_REPO:-$_self_dir/..}
+
+LOCKDIR="$ROOT/.trust-build-lock"
+INFO="$LOCKDIR/info"
+BREAKS="$ROOT/.trust-build-lock.breaks"
+# The pre-lock advisory artifact. Other lanes are reading this RIGHT NOW, and
+# `run_measurement_sweep.sh` still publishes it, so the lock must understand it:
+# an old copy of the sweep script publishes ONLY this and never takes the lock.
+LEGACY_SENTINEL="$ROOT/.trust-measurement-in-flight"
+
+err() { printf '%s\n' "$*" >&2; }
+
+nonce() {
+  if [ -r /dev/urandom ]; then
+    od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' && return 0
+  fi
+  printf '%s%s' "$$" "$(date '+%s')"
+}
+
+# --------------------------------------------------------------------------
+# Process identity
+#
+# `ps -o lstart=` is the holder's wall-clock start time. Together with the pid it
+# is a usable process identity: a pid can be recycled, but the recycled process
+# starts LATER, so the pair does not collide. Both `ps` fields are best-effort —
+# if `ps` cannot answer we record the empty string and skip the comparison, which
+# degrades to plain pid liveness rather than to a false "stale".
+# --------------------------------------------------------------------------
+pid_start() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr -d '\n'
+}
+
+pid_cmd() {
+  ps -o command= -p "$1" 2>/dev/null | tr -d '\n' | cut -c1-200
+}
+
+pid_elapsed() {
+  ps -o etime= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr -d '\n'
+}
+
+# 0 = the process named by (pid, start) is still running.
+#
+# `kill -0` on a live process owned by ANOTHER user fails with EPERM. That is
+# reported as ALIVE on purpose: over-refusing is the safe direction for a guard
+# whose failure mode is a destroyed 37-minute measurement.
+pid_is_live() {
+  _p=${1:-}
+  _want_start=${2:-}
+  case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+  if kill -0 "$_p" 2>/dev/null; then
+    :
+  else
+    # EPERM (foreign owner) vs ESRCH (gone). `ps` distinguishes them.
+    ps -p "$_p" >/dev/null 2>&1 || return 1
+  fi
+  if [ -n "$_want_start" ]; then
+    _now_start=$(pid_start "$_p")
+    # An empty answer means `ps` would not say; do not manufacture a verdict.
+    if [ -n "$_now_start" ] && [ "$_now_start" != "$_want_start" ]; then
+      return 1   # pid recycled: same number, different process
+    fi
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Reading the holder
+#
+# There is one narrow window in which the lockdir exists and `info` does not: the
+# winner has returned from mkdir(2) and has not yet completed the rename(2) that
+# puts `info` in place. It is a single syscall wide because the info file is
+# written to a temp path BEFORE the claim and only moved afterwards. A reader that
+# lands in it retries briefly rather than declaring the lock malformed.
+# --------------------------------------------------------------------------
+read_info() {
+  _tries=0
+  while [ "$_tries" -lt 30 ]; do
+    [ -f "$INFO" ] && { cat "$INFO" 2>/dev/null; return 0; }
+    [ -d "$LOCKDIR" ] || return 1        # released while we looked
+    _tries=$((_tries + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+info_field() {
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1
+}
+
+# Render a holder for a human. This is requirement 3 — a refusal that does not say
+# WHO, SINCE WHEN and FOR WHAT is a refusal people learn to override reflexively.
+describe_holder() {
+  _info=$1
+  _k=$(info_field "$_info" kind)
+  _p=$(info_field "$_info" pid)
+  _s=$(info_field "$_info" started)
+  _u=$(info_field "$_info" purpose)
+  _c=$(info_field "$_info" cmd)
+  _n=$(info_field "$_info" contract)
+  _e=$(pid_elapsed "$_p")
+  _live=dead
+  pid_is_live "$_p" "$(info_field "$_info" pstart)" && _live=alive
+  err "    holder      ${_k:-?}  pid ${_p:-?}  ($_live)"
+  err "    since       ${_s:-?}${_e:+   (running $_e)}"
+  err "    purpose     ${_u:-unspecified}"
+  [ -n "$_c" ] && err "    command     $_c"
+  [ -n "$_n" ] && err "    contract    $_n"
+}
+
+# --------------------------------------------------------------------------
+# Reclaim — rename to a unique name, then delete.
+#
+# `mv "$LOCKDIR" "$dest"` with a dest that provably does not exist is rename(2),
+# so exactly one of N simultaneous reclaimers succeeds. It is NOT `rm -rf` + retry:
+# that would let two lanes both conclude "stale" and both go on to claim.
+# --------------------------------------------------------------------------
+reclaim() {
+  _dest="$ROOT/.trust-build-lock.stale.$$.$(nonce)"
+  mv "$LOCKDIR" "$_dest" 2>/dev/null || return 1
+  rm -rf "$_dest" 2>/dev/null
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# Unwrapped conflicts — the belt-and-braces half.
+#
+# The lock only binds processes that take it. A raw `build/bootstrap/debug/bootstrap`
+# or a hand-run `trust_ir_producer_scorecard.py` takes nothing, so after winning the
+# claim we look for those directly. We already hold the lock at that point, so this
+# scan cannot race another lock user; it only sees the ones that never played.
+#
+# TWO READINESS PATTERNS USED HERE WERE PREVIOUSLY WRITTEN WRONG, and each silently
+# reported "clear" against a live process. Both root causes are recorded because the
+# corrected forms look arbitrary without them:
+#
+#  (1) `pgrep -f "bootstrap (build|check)"`  matched NOTHING during a live build.
+#      The alternation is NOT the problem — measured 2026-08-20, macOS pgrep(1)
+#      compiles an EXTENDED regex and `pgrep -f 'bootstrap (25|check)'` matches a
+#      process whose args are `bootstrap 25`. The defect is the ADJACENCY the
+#      pattern assumes. `x.py --stage 1 build` is ordinary usage — x.py's own
+#      preflight says so in a comment — and bootstrap.py builds its child argv as
+#      `[bootstrap_binary] + sys.argv[1:]`, so the command line is
+#      `build/bootstrap/debug/bootstrap --stage 1 build` and the words `bootstrap`
+#      and `build` are NEVER adjacent. The pattern is a coin flip on argument order.
+#      Correct form: `pgrep -x bootstrap`, which matches the executable NAME and
+#      assumes nothing about arguments at all.
+#
+#  (2) `pgrep -f "python.*trust_ir_producer_scorecard"` matched NOTHING during a
+#      live sweep at 400/2000. macOS CommandLineTools python3 is a symlink into a
+#      framework and execs as
+#        /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/
+#        Versions/3.9/Resources/Python.app/Contents/MacOS/Python <script>
+#      — capital `P`. The lowercase string `python` never appears in the resolved
+#      command line (`Python3.framework` and `Python.app` are both capitalised) and
+#      `pgrep -f` is case-sensitive, so `python.*` cannot match. Verified by
+#      `ps -eo args` on a live process, 2026-08-20.
+#      Correct form: `pgrep -f 'trust_ir_producer_scorecar[d]\.py'` — it keys on the
+#      lowercase SCRIPT name instead of the interpreter, and the `[d]` character
+#      class makes it self-match-safe: the poller's own command line contains the
+#      literal text `[d]`, which the regex (which requires the single char `d`
+#      there) does not match.
+#
+# SCOPED TO THIS ROOT. There can be several trust clones on one machine, and a
+# guard that fires for somebody else's build is a guard everyone learns to break.
+# A pid counts only if its command line names $ROOT or its cwd is inside it.
+# --------------------------------------------------------------------------
+pids_scoped_to_root() {
+  _cands=$1
+  [ -n "$_cands" ] || return 0
+  _by_cmd=$(ps -o pid=,command= -p $(printf '%s' "$_cands" | tr '\n' ' ') 2>/dev/null \
+            | grep -F "$ROOT" | awk '{print $1}')
+  _by_cwd=''
+  if command -v lsof >/dev/null 2>&1; then
+    _csv=$(printf '%s' "$_cands" | tr '\n' ',' | sed 's/,$//')
+    _by_cwd=$(lsof -a -d cwd -p "$_csv" -Fpn 2>/dev/null \
+              | awk -v root="$ROOT" '
+                  /^p/ { pid = substr($0, 2) }
+                  /^n/ { path = substr($0, 2)
+                         if (path == root || index(path, root "/") == 1) print pid }')
+  else
+    # No way to read cwd. Over-refuse rather than under-refuse.
+    _by_cwd=$_cands
+  fi
+  printf '%s\n%s\n' "$_by_cmd" "$_by_cwd" | grep -E '^[0-9]+$' | sort -un
+}
+
+# Prints one human line per unwrapped conflicting process, or nothing.
+unwrapped_conflict() {
+  _kind=$1
+
+  # A build in flight — the process that deletes stage1/bin/rustc.
+  _boot=$(pgrep -x bootstrap 2>/dev/null | grep -v "^$$\$")
+  for _p in $(pids_scoped_to_root "$_boot"); do
+    printf 'a bootstrap BUILD is running outside the lock: pid %s  %s\n' \
+      "$_p" "$(pid_cmd "$_p")"
+  done
+
+  # A measurement in flight, run directly instead of through run_measurement_sweep.sh.
+  _sc=$(pgrep -f 'trust_ir_producer_scorecar[d]\.py' 2>/dev/null | grep -v "^$$\$")
+  for _p in $(pids_scoped_to_root "$_sc"); do
+    printf 'a producer SCORECARD sweep is running outside the lock: pid %s  %s\n' \
+      "$_p" "$(pid_cmd "$_p")"
+  done
+
+  # The pre-lock advisory sentinel, published by a copy of run_measurement_sweep.sh
+  # that predates this lock. A LIVE one is a real conflict. A dead one is reported
+  # and stepped over — it is another lane's artifact and `run_measurement_sweep.sh
+  # --force` is its documented deleter, so this script does not delete it.
+  if [ -e "$LEGACY_SENTINEL" ]; then
+    _lp=$(sed -n 's/^pid=//p' "$LEGACY_SENTINEL" 2>/dev/null | head -1)
+    if pid_is_live "$_lp" ""; then
+      printf 'a legacy measurement sentinel is LIVE: %s pid %s\n' "$LEGACY_SENTINEL" "$_lp"
+    else
+      err "  note: a stale $LEGACY_SENTINEL (pid ${_lp:-?}, gone) is present and ignored;"
+      err "        scripts/run_measurement_sweep.sh --force removes it."
+    fi
+  fi
+  : "$_kind"
+}
+
+# --------------------------------------------------------------------------
+# The loud override
+# --------------------------------------------------------------------------
+loud_break() {
+  _reason=$1
+  _info=${2:-}
+  err ""
+  err "  ####################################################################"
+  err "  ##  BUILD-TREE LOCK BROKEN BY HAND                                ##"
+  err "  ####################################################################"
+  if [ -n "$_info" ]; then
+    err "  displacing:"
+    describe_holder "$_info"
+  else
+    err "  displacing: (no readable holder info)"
+  fi
+  err "  broken by : pid $$  $(id -un 2>/dev/null)@$(hostname 2>/dev/null)"
+  err "  reason    : $_reason"
+  err "  recorded  : $BREAKS"
+  err "  ####################################################################"
+  err ""
+  {
+    printf 'when=%s pid=%s user=%s reason=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$(id -un 2>/dev/null)" "$_reason"
+    [ -n "$_info" ] && printf '%s\n' "$_info" | sed 's/^/    displaced: /'
+    printf '\n'
+  } >> "$BREAKS" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# acquire
+# --------------------------------------------------------------------------
+cmd_acquire() {
+  KIND=''; PURPOSE='unspecified'; HOLD_PID=$$; WAIT=${TRUST_BUILD_LOCK_WAIT:-0}
+  BREAK_REASON=${TRUST_BUILD_LOCK_BREAK:-}
+  CONTRACT='the build tree is exclusive: do not run x.py or a sweep against it'
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kind)    KIND=${2:?--kind needs a value}; shift 2 ;;
+      --purpose) PURPOSE=${2:?--purpose needs a value}; shift 2 ;;
+      --pid)     HOLD_PID=${2:?--pid needs a value}; shift 2 ;;
+      --wait)    WAIT=${2:?--wait needs a value}; shift 2 ;;
+      --contract) CONTRACT=${2:?--contract needs a value}; shift 2 ;;
+      --break)   shift ;;
+      --reason)  BREAK_REASON=${2:?--reason needs a value}; shift 2 ;;
+      *) err "acquire: unknown argument '$1'"; return 2 ;;
+    esac
+  done
+  case "$KIND" in
+    build|measurement) ;;
+    *) err "acquire: --kind must be build or measurement (got '${KIND}')"; return 2 ;;
+  esac
+  case "$WAIT" in ''|*[!0-9]*) err "acquire: --wait must be a whole number of seconds"; return 2 ;; esac
+
+  # Re-entrancy. A nested x.py (bootstrap's own test suite shells out to one)
+  # inherits TRUST_BUILD_LOCK_TOKEN and must NOT block on its own parent. This is
+  # not an override — it names a lock that is genuinely held, and it is verified
+  # against the lock on disk rather than believed.
+  if [ -n "${TRUST_BUILD_LOCK_TOKEN:-}" ] && [ -f "$INFO" ]; then
+    _held=$(sed -n 's/^token=//p' "$INFO" 2>/dev/null | head -1)
+    if [ "$_held" = "$TRUST_BUILD_LOCK_TOKEN" ]; then
+      printf '%s\n' "$TRUST_BUILD_LOCK_TOKEN"
+      err "trust-build-lock: already held by this process tree (nested; not re-acquired)"
+      return 0
+    fi
+  fi
+
+  TOKEN=$(nonce)
+  HOLD_START=$(pid_start "$HOLD_PID")
+  _deadline=$(( $(date '+%s') + WAIT ))
+  _rounds=0
+  _said_waiting=0
+
+  while :; do
+    _rounds=$((_rounds + 1))
+    if [ "$_rounds" -gt 10000 ]; then
+      err "trust-build-lock: gave up after $_rounds acquire rounds (contended or looping)"
+      return 3
+    fi
+
+    # Stage the metadata BEFORE the claim so the post-claim publish is one
+    # rename(2), which is what keeps the reader window a single syscall wide.
+    _tmp=$(mktemp "$ROOT/.trust-build-lock.tmp.XXXXXX" 2>/dev/null) || {
+      err "trust-build-lock: cannot write to $ROOT"; return 2; }
+    {
+      printf 'token=%s\n' "$TOKEN"
+      printf 'kind=%s\n' "$KIND"
+      printf 'pid=%s\n' "$HOLD_PID"
+      printf 'pstart=%s\n' "$HOLD_START"
+      printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      printf 'purpose=%s\n' "$(printf '%s' "$PURPOSE" | tr '\n' ' ')"
+      printf 'cmd=%s\n' "$(pid_cmd "$HOLD_PID")"
+      printf 'host=%s\n' "$(hostname 2>/dev/null)"
+      printf 'contract=%s\n' "$(printf '%s' "$CONTRACT" | tr '\n' ' ')"
+    } > "$_tmp"
+
+    # ---- THE CLAIM. One atomic syscall; exactly one winner. ----
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      mv "$_tmp" "$INFO" 2>/dev/null || { rm -f "$_tmp"; rmdir "$LOCKDIR" 2>/dev/null; \
+        err "trust-build-lock: could not publish holder info"; return 2; }
+
+      _conf=$(unwrapped_conflict "$KIND")
+      if [ -n "$_conf" ]; then
+        if [ -n "$BREAK_REASON" ]; then
+          err "trust-build-lock: proceeding past an unwrapped conflict because --reason was given:"
+          printf '%s\n' "$_conf" | sed 's/^/    /' >&2
+          loud_break "$BREAK_REASON" ""
+        else
+          rm -f "$INFO"; rmdir "$LOCKDIR" 2>/dev/null
+          err ""
+          err "  TRUST-BUILD-LOCK: REFUSING to start a $KIND — the tree is busy."
+          err ""
+          printf '%s\n' "$_conf" | sed 's/^/    /' >&2
+          err ""
+          err "  That process never took the lock, so it cannot be waited on safely."
+          err "  Options:"
+          err "    watch    scripts/trust_build_lock.sh status"
+          err "    wait     re-run when it exits (pgrep -x bootstrap;"
+          err "             pgrep -f 'trust_ir_producer_scorecar[d]\\.py')"
+          err "    break    re-run with --break --reason \"...\"  (LOUD; logged to"
+          err "             .trust-build-lock.breaks)"
+          err ""
+          return 3
+        fi
+      fi
+
+      err "trust-build-lock: acquired ($KIND, pid $HOLD_PID) — $PURPOSE"
+      printf '%s\n' "$TOKEN"
+      return 0
+    fi
+    rm -f "$_tmp"
+
+    # ---- Contended. Decide whether the holder is real. ----
+    _info=$(read_info) || {
+      # The lockdir exists but has no info even after retrying. Either the winner
+      # died inside the one-syscall publish window, or somebody hand-made the
+      # directory. Both are reclaimable; say so rather than deadlocking on it.
+      if [ -d "$LOCKDIR" ]; then
+        err "trust-build-lock: RECLAIMING a lock with no holder info (malformed or"
+        err "                  killed inside the publish window)"
+        reclaim || :
+      fi
+      continue
+    }
+
+    _hp=$(info_field "$_info" pid)
+    _hs=$(info_field "$_info" pstart)
+    if ! pid_is_live "$_hp" "$_hs"; then
+      err "trust-build-lock: RECLAIMING a stale lock — holder pid $_hp is gone"
+      err "                  (kind=$(info_field "$_info" kind), purpose=$(info_field "$_info" purpose))"
+      reclaim || err "trust-build-lock: another lane reclaimed it first; retrying"
+      continue
+    fi
+
+    if [ -n "$BREAK_REASON" ]; then
+      loud_break "$BREAK_REASON" "$_info"
+      reclaim || :
+      continue
+    fi
+
+    _now=$(date '+%s')
+    if [ "$_now" -lt "$_deadline" ]; then
+      if [ "$_said_waiting" -eq 0 ]; then
+        _said_waiting=1
+        err "trust-build-lock: held; waiting up to ${WAIT}s —"
+        describe_holder "$_info"
+      fi
+      sleep 5
+      continue
+    fi
+
+    # ---- Refuse, with the fix and the options (design ruling v7/D3). ----
+    err ""
+    err "  TRUST-BUILD-LOCK: REFUSING to start a $KIND — the build tree is held."
+    err ""
+    describe_holder "$_info"
+    err ""
+    err "  The build tree is one exclusive resource. Starting a $KIND now would"
+    if [ "$(info_field "$_info" kind)" = measurement ]; then
+      err "  delete stage1/bin/rustc under a running measurement and destroy it."
+    else
+      err "  race a compiler that is being rewritten underneath you."
+    fi
+    err ""
+    err "  Options:"
+    err "    wait     TRUST_BUILD_LOCK_WAIT=3600 <your command>   (blocks, then runs)"
+    err "    watch    scripts/trust_build_lock.sh status"
+    err "    break    scripts/trust_build_lock.sh break --reason \"...\""
+    err "             (LOUD banner + a line in .trust-build-lock.breaks; use it only"
+    err "              when you know the holder is wedged)"
+    if [ "$KIND" = build ]; then
+      err "    push     git push --no-verify   — the pre-push hook runs 'x.py check',"
+      err "             which IS a build for interlock purposes."
+    fi
+    err ""
+    return 3
+  done
+}
+
+# --------------------------------------------------------------------------
+# release — only the holder may release. Removing somebody else's lock is the
+# same bug as not having one.
+# --------------------------------------------------------------------------
+cmd_release() {
+  _tok=${1:-}
+  [ -n "$_tok" ] || { err "release: needs the token returned by acquire"; return 2; }
+  [ -d "$LOCKDIR" ] || return 0                        # already gone; idempotent
+  _info=$(read_info) || { reclaim || :; return 0; }     # malformed: clear it
+  _held=$(info_field "$_info" token)
+  if [ "$_held" != "$_tok" ]; then
+    err "trust-build-lock: NOT releasing — the lock is held by somebody else"
+    describe_holder "$_info"
+    return 4
+  fi
+  reclaim || :
+  err "trust-build-lock: released ($(info_field "$_info" kind))"
+  return 0
+}
+
+cmd_status() {
+  if [ ! -d "$LOCKDIR" ]; then
+    _conf=$(unwrapped_conflict any)
+    if [ -n "$_conf" ]; then
+      err "trust-build-lock: FREE, but something is running outside the lock:"
+      printf '%s\n' "$_conf" | sed 's/^/    /' >&2
+      return 3
+    fi
+    printf 'trust-build-lock: free\n'
+    return 0
+  fi
+  _info=$(read_info) || { err "trust-build-lock: held, holder info unreadable (reclaimable)"; return 3; }
+  err "trust-build-lock: HELD"
+  describe_holder "$_info"
+  return 3
+}
+
+cmd_break() {
+  _reason=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) _reason=${2:?--reason needs a value}; shift 2 ;;
+      *) err "break: unknown argument '$1'"; return 2 ;;
+    esac
+  done
+  [ -n "$_reason" ] || {
+    err "break: --reason \"...\" is MANDATORY."
+    err "       An override you can trigger without typing a sentence is an override"
+    err "       that gets left on. Say what is wedged and why you are displacing it."
+    return 2; }
+  if [ ! -d "$LOCKDIR" ]; then
+    err "trust-build-lock: nothing to break; the lock is free"
+    return 0
+  fi
+  _info=$(read_info) || _info=''
+  loud_break "$_reason" "$_info"
+  reclaim || :
+  return 0
+}
+
+# --------------------------------------------------------------------------
+usage() {
+  sed -n '/^# USAGE/,/^# ENVIRONMENT/p' "$0" | sed 's/^# \{0,1\}//' >&2
+}
+
+case "${1:-}" in
+  acquire) shift; cmd_acquire "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  break)   shift; cmd_break "$@" ;;
+  --selftest)
+    err "the mutation proof lives in scripts/tests/trust_build_lock_test.sh"
+    err "run:  bash scripts/tests/trust_build_lock_test.sh"
+    exit 2 ;;
+  -h|--help|'') usage; exit 2 ;;
+  *) err "unknown subcommand '${1:-}'"; usage; exit 2 ;;
+esac

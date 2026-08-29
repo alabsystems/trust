@@ -8,7 +8,6 @@ use std::path::Path;
 
 use self::constants::DW_AT_STMT_LIST;
 use self::line::parse_line_program_with_size;
-
 use crate::error::DwarfError;
 
 pub(crate) mod abbrev;

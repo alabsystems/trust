@@ -1,25 +1,44 @@
 // trust-integration-tests/tests/vckind_exhaustiveness.rs: VcKind exhaustiveness guard
 //
-// Runtime inventory ensuring every current VcKind variant has documented test
-// coverage. Because VcKind is #[non_exhaustive] from this crate, Rust cannot
-// make this external table compile-time exhaustive; additions must update this
-// inventory alongside trust-types' genuinely exhaustive internal matches.
+// THE ENUM IS THE SOURCE OF TRUTH, AND IT IS ENFORCED AT COMPILE TIME.
+// Adding a variant to `VcKind` is a compile ERROR in this file until the census
+// below names it. There is no variant count to keep in sync, because there is
+// no count: `vckind_census!` expands ONE token list into both the constructed
+// inventory and a `match` over `VcKind`, and that match is checked against the
+// real enum by the compiler.
 //
-// The _internal_ match statements in trust-types (VcKind::description,
-// VcKind::proof_level, VcKind::has_runtime_check) provide true compile-time
-// enforcement. This test complements those by tracking _test coverage_ per variant.
+// Why a lint and not a bare `match`: `VcKind` is `#[non_exhaustive]`, so an
+// external match is REQUIRED to carry a wildcard arm, and a wildcard silently
+// absorbs every future variant. `non_exhaustive_omitted_patterns` closes exactly
+// that hole -- the wildcard stays (the language demands it) but the lint reports
+// every variant the arms did not name explicitly, and `deny` makes that fatal.
+//
+// This replaces two hardcoded counts (`EXPECTED_VARIANT_COUNT` and a
+// `variants.len()` assertion) that counted the test's OWN hand-written lists
+// rather than the enum. Both read 53 while `VcKind` had 56 variants and BOTH
+// STILL PASSED: the guard measured itself, so it could not fail for the one
+// thing it existed to catch. Do not reintroduce a count -- a count here is
+// self-referential by construction.
+//
+// The unstable lint gate is affordable HERE specifically: this is a `tests/`
+// target of a leaf crate that nothing depends on, so unlike trust-machine-sem
+// (reachable from `rustc_codegen_trust_cg`) it is not in the compiler's own
+// build graph and cannot propagate a feature requirement to it.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![allow(rustc::default_hash_types, rustc::potential_query_instability)]
+#![feature(non_exhaustive_omitted_patterns_lint)]
 
 use trust_types::*;
 
 /// Entry mapping a VcKind variant to its test coverage location.
 struct VcKindCoverage {
-    /// Human-readable variant name.
+    /// Human-readable variant name, from the same token as the constructor.
     variant_name: &'static str,
+    /// A representative instance, so every variant reaches the real
+    /// `description()` / `proof_level()` matches in trust-types.
+    kind: VcKind,
     /// Test file(s) that exercise this variant, or justification if untested.
     coverage: Coverage,
 }
@@ -31,579 +50,287 @@ enum Coverage {
     Documented(&'static str),
 }
 
-/// Build a representative instance of each VcKind variant and return its
-/// coverage mapping. Because VcKind is `#[non_exhaustive]`, we must include
-/// a wildcard arm — but we panic there so new variants are caught at test time.
-fn all_vckind_coverage() -> Vec<VcKindCoverage> {
-    // Helper types for constructing variants with fields.
-    let dummy_ty = Ty::u32();
-    let dummy_op = BinOp::Add;
-
-    // Construct one instance of every known VcKind variant.
-    let variants: Vec<(VcKind, &'static str, Coverage)> = vec![
-        (
-            VcKind::ArithmeticOverflow {
-                op: dummy_op,
-                operand_tys: (dummy_ty.clone(), dummy_ty.clone()),
-            },
-            "ArithmeticOverflow",
-            Coverage::Tested(
-                "error_detection.rs, pipeline.rs, self_verify.rs, ay_phase2_models.rs",
-            ),
-        ),
-        (
-            VcKind::ShiftOverflow {
-                op: BinOp::Shl,
-                operand_ty: dummy_ty.clone(),
-                shift_ty: dummy_ty.clone(),
-            },
-            "ShiftOverflow",
-            Coverage::Tested("ay_phase2_models.rs"),
-        ),
-        (
-            VcKind::DivisionByZero,
-            "DivisionByZero",
-            Coverage::Tested("error_detection.rs, pipeline.rs, real_ay_verification.rs"),
-        ),
-        (
-            VcKind::RemainderByZero,
-            "RemainderByZero",
-            Coverage::Tested("error_detection.rs, self_verify.rs"),
-        ),
-        (
-            VcKind::IndexOutOfBounds,
-            "IndexOutOfBounds",
-            Coverage::Tested("error_detection.rs, pipeline.rs, self_verify.rs, self_verify_ay.rs"),
-        ),
-        (
-            VcKind::SliceBoundsCheck,
-            "SliceBoundsCheck",
-            Coverage::Tested("trust-strengthen/cex_guided.rs (unit), trust-vcgen/tests/slice_bounds_guard_linkage.rs"),
-        ),
-        (
-            VcKind::Assertion { message: String::new() },
-            "Assertion",
-            Coverage::Tested("self_verify_ay.rs, e2e_loop.rs, pipeline.rs, m5_acceptance.rs"),
-        ),
-        (
-            VcKind::Precondition { callee: String::new() },
-            "Precondition",
-            Coverage::Tested("m4_precondition.rs"),
-        ),
-        (
-            VcKind::Postcondition,
-            "Postcondition",
-            Coverage::Tested("pipeline.rs, m3_acceptance.rs, m3_real_crate.rs"),
-        ),
-        (
-            VcKind::CastOverflow { from_ty: dummy_ty.clone(), to_ty: dummy_ty.clone() },
-            "CastOverflow",
-            Coverage::Tested("trust-strengthen/cex_guided.rs, trust-strengthen/counterexample.rs"),
-        ),
-        (
-            VcKind::NegationOverflow { ty: dummy_ty.clone() },
-            "NegationOverflow",
-            Coverage::Tested("trust-strengthen/cex_guided.rs, trust-strengthen/proposer.rs"),
-        ),
-        (
-            VcKind::Unreachable,
-            "Unreachable",
-            Coverage::Tested("trust-convergence/integration.rs, trust-strengthen/proposer.rs"),
-        ),
-        (
-            VcKind::UnsupportedMir { kind: String::new(), detail: String::new() },
-            "UnsupportedMir",
-            Coverage::Tested("trust-report canonical tags, compiler transport fail-closed tests"),
-        ),
-        (
-            VcKind::DeadState { state: String::new() },
-            "DeadState",
-            Coverage::Documented("State machine property; exercised via TLA+ backend, not ay e2e"),
-        ),
-        (
-            VcKind::Deadlock,
-            "Deadlock",
-            Coverage::Tested(
-                "trust-strengthen/cex_guided.rs, trust-strengthen/proposer.rs",
-            ),
-        ),
-        (VcKind::Temporal { machine: None, property: String::new() }, "Temporal", Coverage::Tested("pipeline.rs")),
-        (
-            VcKind::Liveness {
-                property: LivenessProperty {
-                    name: String::new(),
-                    operator: TemporalOperator::Eventually,
-                    predicate: String::new(),
-                    consequent: None,
-                    fairness: vec![],
-                },
-                machine: None,
-            },
-            "Liveness",
-            Coverage::Tested("trust-router/ty_backend.rs (ty_handles_liveness_vcs)"),
-        ),
-        (
-            VcKind::Fairness {
-                constraint: FairnessConstraint::Weak { action: String::new(), vars: vec![] },
-            },
-            "Fairness",
-            Coverage::Tested(
-                "trust-router/ty_backend.rs (ty_handles_fairness_vcs), \
-                 trust-router/termination_dispatch.rs",
-            ),
-        ),
-        (
-            VcKind::TaintViolation {
-                source_label: String::new(),
-                sink_kind: String::new(),
-                path_length: 0,
-            },
-            "TaintViolation",
-            Coverage::Tested("trust-vcgen/tests/infoflow_leak.rs"),
-        ),
-        (
-            VcKind::RefinementViolation { spec_file: String::new(), action: String::new() },
-            "RefinementViolation",
-            Coverage::Documented("Refinement checking; tested at trust-types description() level"),
-        ),
-        (
-            VcKind::ResilienceViolation {
-                service: String::new(),
-                failure_mode: String::new(),
-                reason: String::new(),
-            },
-            "ResilienceViolation",
-            Coverage::Tested("misc_vc_pipeline.rs (VC construction + Report)"),
-        ),
-        (
-            VcKind::ProtocolViolation { protocol: String::new(), violation: String::new() },
-            "ProtocolViolation",
-            Coverage::Documented(
-                "Protocol composition; tested at trust-types description() level",
-            ),
-        ),
-        (
-            VcKind::NonTermination { context: String::new(), measure: String::new() },
-            "NonTermination",
-            Coverage::Tested(
-                "trust-router/tests/full_pipeline.rs, trust-clean/tests/termination_u32_bound.rs, \
-                 trust-vcgen/tests/checked_loop_contracts.rs",
-            ),
-        ),
-        (
-            VcKind::DataRace {
-                variable: String::new(),
-                thread_a: String::new(),
-                thread_b: String::new(),
-            },
-            "DataRace",
-            Coverage::Tested("concurrency_e2e.rs"),
-        ),
-        (
-            VcKind::InsufficientOrdering {
-                variable: String::new(),
-                actual: String::new(),
-                required: String::new(),
-            },
-            "InsufficientOrdering",
-            Coverage::Tested("concurrency_e2e.rs"),
-        ),
-        (
-            VcKind::TranslationValidation { pass: String::new(), check: String::new() },
-            "TranslationValidation",
-            Coverage::Tested("misc_vc_pipeline.rs (VC construction + Report)"),
-        ),
-        (
-            VcKind::FloatDivisionByZero,
-            "FloatDivisionByZero",
-            Coverage::Tested("float_unsafe_e2e.rs (vcgen pipeline)"),
-        ),
-        (
-            VcKind::FloatOverflowToInfinity { op: dummy_op, operand_ty: dummy_ty.clone() },
-            "FloatOverflowToInfinity",
-            Coverage::Tested("ay_phase2_models.rs"),
-        ),
-        (
-            VcKind::InvalidDiscriminant { place_name: String::new() },
-            "InvalidDiscriminant",
-            Coverage::Tested("error_detection.rs (vcgen pipeline)"),
-        ),
-        (
-            VcKind::AggregateArrayLengthMismatch { expected: 0, actual: 0 },
-            "AggregateArrayLengthMismatch",
-            Coverage::Documented("Rvalue safety; L2 domain, backend-dependent"),
-        ),
-        (
-            VcKind::UnsafeOperation { desc: String::new() },
-            "UnsafeOperation",
-            Coverage::Tested("float_unsafe_e2e.rs (direct VC + solver, no vcgen)"),
-        ),
-        (
-            VcKind::SavedReturnAddressOverwrite {
-                access_width_bytes: 8,
-                slot: String::new(),
-            },
-            "SavedReturnAddressOverwrite",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::FormatStringViolation { callee: String::new(), evidence: String::new() },
-            "FormatStringViolation",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::TaintedIndirectBranch {
-                sink_kind: String::new(),
-                target: String::new(),
-                evidence: String::new(),
-            },
-            "TaintedIndirectBranch",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::BinaryAbiContradiction { fact: String::new(), evidence: String::new() },
-            "BinaryAbiContradiction",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::BinaryCopySinkLengthViolation {
-                callee: String::new(),
-                desc: String::new(),
-            },
-            "BinaryCopySinkLengthViolation",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::FfiBoundaryViolation { callee: String::new(), desc: String::new() },
-            "FfiBoundaryViolation",
-            Coverage::Tested("float_unsafe_e2e.rs (vcgen pipeline)"),
-        ),
-        (
-            VcKind::CopyBoundsViolation {
-                callee: String::new(),
-                direction: String::new(),
-                detail: String::new(),
-            },
-            "CopyBoundsViolation",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::ExternallyMutableAllocationBounds {
-                allocation_kind: String::new(),
-                live_size: String::new(),
-                detail: String::new(),
-            },
-            "ExternallyMutableAllocationBounds",
-            Coverage::Tested("trust-report canonical tag inventory"),
-        ),
-        (
-            VcKind::UnboundedAllocation {
-                callee: String::new(),
-                count: String::new(),
-                detail: String::new(),
-            },
-            "UnboundedAllocation",
-            Coverage::Tested("trust-report canonical tag inventory, vcgen allocation tests"),
-        ),
-        (
-            VcKind::UseAfterFree,
-            "UseAfterFree",
-            Coverage::Tested("ownership_e2e.rs (provenance tracker + MIR)"),
-        ),
-        (
-            VcKind::DoubleFree,
-            "DoubleFree",
-            Coverage::Tested("ownership_e2e.rs (provenance tracker + MIR)"),
-        ),
-        (
-            VcKind::AliasingViolation { mutable: false },
-            "AliasingViolation",
-            Coverage::Tested("ownership_e2e.rs (ownership scan + MIR)"),
-        ),
-        (
-            VcKind::LifetimeViolation,
-            "LifetimeViolation",
-            Coverage::Tested("ownership_e2e.rs (VC construction + properties)"),
-        ),
-        (
-            VcKind::SendViolation,
-            "SendViolation",
-            Coverage::Tested("ownership_e2e.rs (VC construction + properties)"),
-        ),
-        (
-            VcKind::SyncViolation,
-            "SyncViolation",
-            Coverage::Tested("ownership_e2e.rs (VC construction + properties)"),
-        ),
-        (
-            VcKind::FunctionalCorrectness { property: String::new(), context: String::new() },
-            "FunctionalCorrectness",
-            Coverage::Tested(
-                "contract_e2e.rs, misc_vc_pipeline.rs (vcgen pipeline, partial Router bypass)",
-            ),
-        ),
-        (
-            VcKind::HardenedBoundary {
-                category: HardenedVcCategory::ByteLoss,
-                callee: String::new(),
-                detail: String::new(),
-            },
-            "HardenedBoundary",
-            Coverage::Tested("trust-report hardened category and canonical tag tests"),
-        ),
-        (
-            VcKind::LoopInvariantInitiation { invariant: String::new(), header_block: 0 },
-            "LoopInvariantInitiation",
-            Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
-        ),
-        (
-            VcKind::LoopInvariantConsecution { invariant: String::new(), header_block: 0 },
-            "LoopInvariantConsecution",
-            Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
-        ),
-        (
-            VcKind::LoopInvariantSufficiency { invariant: String::new(), header_block: 0 },
-            "LoopInvariantSufficiency",
-            Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
-        ),
-        (
-            VcKind::TypeRefinementViolation { variable: String::new(), predicate: String::new() },
-            "TypeRefinementViolation",
-            Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
-        ),
-        (
-            VcKind::FrameConditionViolation { variable: String::new(), function: String::new() },
-            "FrameConditionViolation",
-            Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
-        ),
-    ];
-
-    // Convert to coverage entries, using the match to verify each variant's
-    // description() method works (exercises the internal exhaustive match).
-    variants
-        .into_iter()
-        .map(|(kind, name, coverage)| {
-            // Call description() to exercise the exhaustive internal match.
-            // This catches any variant whose description() panics or is missing.
-            let _desc = kind.description();
-            VcKindCoverage { variant_name: name, coverage }
-        })
-        .collect()
+impl Coverage {
+    fn detail(&self) -> &'static str {
+        match self {
+            Coverage::Tested(files) => files,
+            Coverage::Documented(reason) => reason,
+        }
+    }
 }
 
-/// Verify that every VcKind variant returned by `all_vckind_coverage` produces
-/// a non-empty description (exercising trust-types internal exhaustive match).
-/// Also verify the variant count matches expectations so additions are noticed.
+/// Emits the census and its completeness proof from a single token list.
+///
+/// The constructed inventory and the `match` that certifies it are expanded from
+/// the SAME `$variant` tokens, so "the inventory says one thing and the match
+/// says another" is not a mistake that can be written down. The match is what
+/// the compiler checks against `VcKind`; the inventory is what the tests read.
+macro_rules! vckind_census {
+    ($( $variant:ident { $($field:tt)* } => $coverage:expr ),+ $(,)?) => {
+        fn census() -> Vec<VcKindCoverage> {
+            vec![$(
+                VcKindCoverage {
+                    variant_name: stringify!($variant),
+                    kind: VcKind::$variant { $($field)* },
+                    coverage: $coverage,
+                }
+            ),+]
+        }
+
+        /// THE GUARD. A `VcKind` variant absent from the census above is not
+        /// matched explicitly here, and `deny` turns the lint's report into a
+        /// build failure. The wildcard is mandatory (`#[non_exhaustive]`) and is
+        /// unreachable in practice precisely because the lint is denied.
+        fn census_name_of(kind: &VcKind) -> &'static str {
+            #[deny(non_exhaustive_omitted_patterns)]
+            match kind {
+                $( VcKind::$variant { .. } => stringify!($variant), )+
+                _ => unreachable!(
+                    "unreachable while non_exhaustive_omitted_patterns is denied: \
+                     an unlisted VcKind variant fails to compile above"
+                ),
+            }
+        }
+    };
+}
+
+/// Representative operand type for variants that carry one.
+fn ty() -> Ty {
+    Ty::u32()
+}
+
+// Listed in `VcKind` declaration order so this census diffs cleanly against the
+// enum. Order is a review convenience only -- completeness is the compiler's job.
+vckind_census! {
+    ArithmeticOverflow { op: BinOp::Add, operand_tys: (ty(), ty()) }
+        => Coverage::Tested("error_detection.rs, pipeline.rs, self_verify.rs, ay_phase2_models.rs"),
+    ShiftOverflow { op: BinOp::Shl, operand_ty: ty(), shift_ty: ty() }
+        => Coverage::Tested("ay_phase2_models.rs"),
+    UncheckedArithmeticOverflow { op: BinOp::Add, operand_tys: (ty(), ty()) }
+        => Coverage::Tested("overflow_call_tests.rs (unchecked_add/sub/mul)"),
+    DivisionByZero {}
+        => Coverage::Tested("error_detection.rs, pipeline.rs, real_ay_verification.rs"),
+    RemainderByZero {}
+        => Coverage::Tested("error_detection.rs, self_verify.rs"),
+    IndexOutOfBounds {}
+        => Coverage::Tested("error_detection.rs, pipeline.rs, self_verify.rs, self_verify_ay.rs"),
+    SliceBoundsCheck {}
+        => Coverage::Tested(
+            "trust-strengthen/cex_guided.rs (unit), trust-vcgen/tests/slice_bounds_guard_linkage.rs",
+        ),
+    UncheckedIndexBounds { callee: String::new(), detail: String::new() }
+        => Coverage::Tested("sep_engine get_unchecked lane"),
+    Assertion { message: String::new() }
+        => Coverage::Tested("self_verify_ay.rs, e2e_loop.rs, pipeline.rs, m5_acceptance.rs"),
+    ContractInvariant { expression: String::new() }
+        => Coverage::Tested("contracts.rs / spec_parser.rs invariant clause"),
+    Precondition { callee: String::new() }
+        => Coverage::Tested("m4_precondition.rs"),
+    Postcondition {}
+        => Coverage::Tested("pipeline.rs, m3_acceptance.rs, m3_real_crate.rs"),
+    CastOverflow { from_ty: ty(), to_ty: ty() }
+        => Coverage::Tested("trust-strengthen/cex_guided.rs, trust-strengthen/counterexample.rs"),
+    NegationOverflow { ty: ty() }
+        => Coverage::Tested("trust-strengthen/cex_guided.rs, trust-strengthen/proposer.rs"),
+    Unreachable {}
+        => Coverage::Tested("trust-convergence/integration.rs, trust-strengthen/proposer.rs"),
+    UnsupportedMir { kind: String::new(), detail: String::new() }
+        => Coverage::Tested("trust-report canonical tags, compiler transport fail-closed tests"),
+    DeadState { state: String::new() }
+        => Coverage::Documented("State machine property; exercised via TLA+ backend, not ay e2e"),
+    Deadlock {}
+        => Coverage::Tested("trust-strengthen/cex_guided.rs, trust-strengthen/proposer.rs"),
+    Temporal { property: String::new(), machine: None }
+        => Coverage::Tested("pipeline.rs"),
+    Liveness {
+        property: LivenessProperty {
+            name: String::new(),
+            operator: TemporalOperator::Eventually,
+            predicate: String::new(),
+            consequent: None,
+            fairness: vec![],
+        },
+        machine: None,
+    }
+        => Coverage::Tested("trust-router/ty_backend.rs (ty_handles_liveness_vcs)"),
+    Fairness { constraint: FairnessConstraint::Weak { action: String::new(), vars: vec![] } }
+        => Coverage::Tested(
+            "trust-router/ty_backend.rs (ty_handles_fairness_vcs), \
+             trust-router/termination_dispatch.rs",
+        ),
+    TaintViolation { source_label: String::new(), sink_kind: String::new(), path_length: 0 }
+        => Coverage::Tested("trust-vcgen/tests/infoflow_leak.rs"),
+    RefinementViolation { spec_file: String::new(), action: String::new() }
+        => Coverage::Documented("Refinement checking; tested at trust-types description() level"),
+    ResilienceViolation {
+        service: String::new(),
+        failure_mode: String::new(),
+        reason: String::new(),
+    }
+        => Coverage::Tested("misc_vc_pipeline.rs (VC construction + Report)"),
+    ProtocolViolation { protocol: String::new(), violation: String::new() }
+        => Coverage::Documented("Protocol composition; tested at trust-types description() level"),
+    NonTermination { context: String::new(), measure: String::new() }
+        => Coverage::Tested(
+            "trust-router/tests/full_pipeline.rs, trust-clean/tests/termination_u32_bound.rs, \
+             trust-vcgen/tests/checked_loop_contracts.rs",
+        ),
+    DataRace { variable: String::new(), thread_a: String::new(), thread_b: String::new() }
+        => Coverage::Tested("concurrency_e2e.rs"),
+    InsufficientOrdering { variable: String::new(), actual: String::new(), required: String::new() }
+        => Coverage::Tested("concurrency_e2e.rs"),
+    TranslationValidation { pass: String::new(), check: String::new() }
+        => Coverage::Tested("misc_vc_pipeline.rs (VC construction + Report)"),
+    FloatDivisionByZero {}
+        => Coverage::Tested("float_unsafe_e2e.rs (vcgen pipeline)"),
+    FloatOverflowToInfinity { op: BinOp::Add, operand_ty: ty() }
+        => Coverage::Tested("ay_phase2_models.rs"),
+    InvalidDiscriminant { place_name: String::new() }
+        => Coverage::Tested("error_detection.rs (vcgen pipeline)"),
+    AggregateArrayLengthMismatch { expected: 0, actual: 0 }
+        => Coverage::Documented("Rvalue safety; L2 domain, backend-dependent"),
+    UnsafeOperation { desc: String::new() }
+        => Coverage::Tested("float_unsafe_e2e.rs (direct VC + solver, no vcgen)"),
+    SavedReturnAddressOverwrite { access_width_bytes: 8, slot: String::new() }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    FormatStringViolation { callee: String::new(), evidence: String::new() }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    TaintedIndirectBranch {
+        sink_kind: String::new(),
+        target: String::new(),
+        evidence: String::new(),
+    }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    BinaryAbiContradiction { fact: String::new(), evidence: String::new() }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    BinaryCopySinkLengthViolation { callee: String::new(), desc: String::new() }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    FfiBoundaryViolation { callee: String::new(), desc: String::new() }
+        => Coverage::Tested("float_unsafe_e2e.rs (vcgen pipeline)"),
+    CopyBoundsViolation {
+        callee: String::new(),
+        direction: String::new(),
+        detail: String::new(),
+    }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    ExternallyMutableAllocationBounds {
+        allocation_kind: String::new(),
+        live_size: String::new(),
+        detail: String::new(),
+    }
+        => Coverage::Tested("trust-report canonical tag inventory"),
+    UnboundedAllocation { callee: String::new(), count: String::new(), detail: String::new() }
+        => Coverage::Tested("trust-report canonical tag inventory, vcgen allocation tests"),
+    UseAfterFree {}
+        => Coverage::Tested("ownership_e2e.rs (provenance tracker + MIR)"),
+    DoubleFree {}
+        => Coverage::Tested("ownership_e2e.rs (provenance tracker + MIR)"),
+    AliasingViolation { mutable: false }
+        => Coverage::Tested("ownership_e2e.rs (ownership scan + MIR)"),
+    LifetimeViolation {}
+        => Coverage::Tested("ownership_e2e.rs (VC construction + properties)"),
+    SendViolation {}
+        => Coverage::Tested("ownership_e2e.rs (VC construction + properties)"),
+    SyncViolation {}
+        => Coverage::Tested("ownership_e2e.rs (VC construction + properties)"),
+    FunctionalCorrectness { property: String::new(), context: String::new() }
+        => Coverage::Tested(
+            "contract_e2e.rs, misc_vc_pipeline.rs (vcgen pipeline, partial Router bypass)",
+        ),
+    HardenedBoundary {
+        category: HardenedVcCategory::ByteLoss,
+        callee: String::new(),
+        detail: String::new(),
+    }
+        => Coverage::Tested("trust-report hardened category and canonical tag tests"),
+    LoopInvariantInitiation { invariant: String::new(), header_block: 0 }
+        => Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
+    LoopInvariantConsecution { invariant: String::new(), header_block: 0 }
+        => Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
+    // Trust: this said `Tested("contract_e2e.rs (vcgen pipeline + ay)")`, which
+    // overstated it in the specific way this census exists to prevent. No
+    // production path CONSTRUCTS a sufficiency VC: every occurrence in the tree
+    // is a test building one by hand (contract_e2e, model_roundtrip,
+    // proptest_roundtrip) or a match arm in serialization/reporting. vcgen emits
+    // the E4 PAIR -- initiation and consecution -- and nothing else, so no
+    // pipeline test could have exercised this variant.
+    LoopInvariantSufficiency { invariant: String::new(), header_block: 0 }
+        => Coverage::Documented(
+            "NOT EMITTED BY vcgen. The wire/serialization shape is round-tripped by \
+             model_roundtrip.rs and proptest_roundtrip.rs, so the variant is exercised as \
+             DATA. Nothing generates it as an obligation: the 'invariant too weak for the \
+             postcondition' check has no producer. Wiring one is the work; until then this \
+             row must not read as pipeline coverage.",
+        ),
+    TypeRefinementViolation { variable: String::new(), predicate: String::new() }
+        => Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
+    FrameConditionViolation { variable: String::new(), function: String::new() }
+        => Coverage::Tested("contract_e2e.rs (vcgen pipeline + ay)"),
+}
+
+/// Exercises the compile-time guard and rejects a census that lists a variant
+/// twice (which the lint permits: a duplicate arm is merely unreachable).
 #[test]
 fn test_vckind_exhaustiveness_guard() {
-    let coverage = all_vckind_coverage();
+    let coverage = census();
 
-    // --- 1. Count check: update this when adding new VcKind variants. ---
-    // If this fails, a new VcKind variant was added. Update `all_vckind_coverage()`
-    // above with the new variant and its test coverage status.
-    const EXPECTED_VARIANT_COUNT: usize = 53;
-    assert_eq!(
-        coverage.len(),
-        EXPECTED_VARIANT_COUNT,
-        "VcKind variant count changed! Update all_vckind_coverage() in \
-         vckind_exhaustiveness.rs to include the new variant(s). \
-         Expected {EXPECTED_VARIANT_COUNT}, got {}.",
-        coverage.len()
-    );
-
-    // --- 2. Every variant has a non-empty description. ---
+    // Keeps `census_name_of` live and confirms each instance really is the
+    // variant its entry names.
     for entry in &coverage {
-        match &entry.coverage {
-            Coverage::Tested(files) => {
-                assert!(
-                    !files.is_empty(),
-                    "VcKind::{} is marked Tested but has empty file list",
-                    entry.variant_name
-                );
-            }
-            Coverage::Documented(reason) => {
-                assert!(
-                    !reason.is_empty(),
-                    "VcKind::{} is marked Documented but has empty justification",
-                    entry.variant_name
-                );
-            }
-        }
+        assert_eq!(
+            census_name_of(&entry.kind),
+            entry.variant_name,
+            "census entry constructs a different variant than it names"
+        );
     }
 
-    // --- 3. Summary report. ---
-    let tested_count =
-        coverage.iter().filter(|e| matches!(e.coverage, Coverage::Tested(_))).count();
-    let documented_count =
-        coverage.iter().filter(|e| matches!(e.coverage, Coverage::Documented(_))).count();
+    let mut names: Vec<&str> = coverage.iter().map(|e| e.variant_name).collect();
+    names.sort_unstable();
+    for pair in names.windows(2) {
+        assert_ne!(
+            pair[0], pair[1],
+            "VcKind::{} is listed twice in the census; its coverage is double-counted",
+            pair[0]
+        );
+    }
 
-    eprintln!("VcKind exhaustiveness guard: {EXPECTED_VARIANT_COUNT} variants");
-    eprintln!("  Tested:     {tested_count}");
-    eprintln!("  Documented: {documented_count}");
-
-    // --- 4. Print uncovered variants for visibility. ---
-    let documented: Vec<_> =
-        coverage.iter().filter(|e| matches!(e.coverage, Coverage::Documented(_))).collect();
-    if !documented.is_empty() {
-        eprintln!("\nVariants with documented justification (no direct e2e test):");
-        for entry in &documented {
-            if let Coverage::Documented(reason) = &entry.coverage {
-                eprintln!("  VcKind::{}: {}", entry.variant_name, reason);
-            }
-        }
+    let tested = coverage.iter().filter(|e| matches!(e.coverage, Coverage::Tested(_))).count();
+    eprintln!("VcKind exhaustiveness guard: {} variants", coverage.len());
+    eprintln!("  Tested:     {tested}");
+    eprintln!("  Documented: {}", coverage.len() - tested);
+    for entry in coverage.iter().filter(|e| matches!(e.coverage, Coverage::Documented(_))) {
+        eprintln!("  VcKind::{}: {}", entry.variant_name, entry.coverage.detail());
     }
 }
 
-/// Verify that `VcKind::description()` returns a non-empty string for every variant.
-/// This is a secondary guard: if the internal exhaustive match in trust-types is broken,
-/// this test catches it.
+/// Every variant reaches `VcKind::description()` -- the genuinely exhaustive
+/// internal match in trust-types -- and yields a non-empty description.
 #[test]
 fn test_vckind_description_completeness() {
-    let coverage = all_vckind_coverage();
-    for entry in &coverage {
-        // description() was already called during construction in all_vckind_coverage(),
-        // but we verify the name is non-empty as a sanity check.
+    for entry in &census() {
         assert!(
-            !entry.variant_name.is_empty(),
-            "Found VcKind variant with empty name in coverage table"
+            !entry.kind.description().is_empty(),
+            "VcKind::{} has an empty description()",
+            entry.variant_name
+        );
+        assert!(
+            !entry.coverage.detail().is_empty(),
+            "VcKind::{} has an empty coverage justification",
+            entry.variant_name
         );
     }
 }
 
-/// Verify that `VcKind::proof_level()` returns a valid level for every variant.
-/// Exercises the second internal exhaustive match in trust-types.
+/// Every variant reaches `VcKind::proof_level()` -- the second exhaustive
+/// internal match -- and lands in one of the documented tiers.
 #[test]
 fn test_vckind_proof_level_completeness() {
-    let dummy_ty = Ty::u32();
-    let dummy_op = BinOp::Add;
-
-    // Reconstruct a representative of each variant and call proof_level().
-    let variants: Vec<VcKind> = vec![
-        VcKind::ArithmeticOverflow {
-            op: dummy_op,
-            operand_tys: (dummy_ty.clone(), dummy_ty.clone()),
-        },
-        VcKind::ShiftOverflow {
-            op: BinOp::Shl,
-            operand_ty: dummy_ty.clone(),
-            shift_ty: dummy_ty.clone(),
-        },
-        VcKind::DivisionByZero,
-        VcKind::RemainderByZero,
-        VcKind::IndexOutOfBounds,
-        VcKind::SliceBoundsCheck,
-        VcKind::Assertion { message: "test".into() },
-        VcKind::Precondition { callee: "test".into() },
-        VcKind::Postcondition,
-        VcKind::CastOverflow { from_ty: dummy_ty.clone(), to_ty: dummy_ty.clone() },
-        VcKind::NegationOverflow { ty: dummy_ty.clone() },
-        VcKind::Unreachable,
-        VcKind::UnsupportedMir { kind: "test".into(), detail: "unsupported".into() },
-        VcKind::DeadState { state: "test".into() },
-        VcKind::Deadlock,
-        VcKind::Temporal { machine: None, property: "test".into() },
-        VcKind::Liveness {
-            property: LivenessProperty {
-                name: "test".into(),
-                operator: TemporalOperator::Eventually,
-                predicate: "P".into(),
-                consequent: None,
-                fairness: vec![],
-            },
-            machine: None,
-        },
-        VcKind::Fairness {
-            constraint: FairnessConstraint::Weak { action: "test".into(), vars: vec![] },
-        },
-        VcKind::TaintViolation {
-            source_label: "user".into(),
-            sink_kind: "sql".into(),
-            path_length: 1,
-        },
-        VcKind::RefinementViolation { spec_file: "spec.tla".into(), action: "Next".into() },
-        VcKind::ResilienceViolation {
-            service: "db".into(),
-            failure_mode: "timeout".into(),
-            reason: "no retry".into(),
-        },
-        VcKind::ProtocolViolation { protocol: "2pc".into(), violation: "abort".into() },
-        VcKind::NonTermination { context: "loop".into(), measure: "n".into() },
-        VcKind::DataRace { variable: "x".into(), thread_a: "t0".into(), thread_b: "t1".into() },
-        VcKind::InsufficientOrdering {
-            variable: "x".into(),
-            actual: "Relaxed".into(),
-            required: "Acquire".into(),
-        },
-        VcKind::TranslationValidation { pass: "dce".into(), check: "output_equiv".into() },
-        VcKind::FloatDivisionByZero,
-        VcKind::FloatOverflowToInfinity { op: dummy_op, operand_ty: dummy_ty.clone() },
-        VcKind::InvalidDiscriminant { place_name: "x".into() },
-        VcKind::AggregateArrayLengthMismatch { expected: 3, actual: 2 },
-        VcKind::UnsafeOperation { desc: "raw ptr deref".into() },
-        VcKind::SavedReturnAddressOverwrite {
-            access_width_bytes: 8,
-            slot: "saved return address".into(),
-        },
-        VcKind::FormatStringViolation { callee: "printf".into(), evidence: "tainted".into() },
-        VcKind::TaintedIndirectBranch {
-            sink_kind: "indirect_call".into(),
-            target: "rax".into(),
-            evidence: "unresolved".into(),
-        },
-        VcKind::BinaryAbiContradiction { fact: "stack slot".into(), evidence: "conflict".into() },
-        VcKind::BinaryCopySinkLengthViolation { callee: "memcpy".into(), desc: "length".into() },
-        VcKind::FfiBoundaryViolation { callee: "malloc".into(), desc: "null return".into() },
-        VcKind::CopyBoundsViolation {
-            callee: "copy_nonoverlapping".into(),
-            direction: "dst".into(),
-            detail: "unbounded count".into(),
-        },
-        VcKind::ExternallyMutableAllocationBounds {
-            allocation_kind: "mmap_file".into(),
-            live_size: "file_len".into(),
-            detail: "not revalidated".into(),
-        },
-        VcKind::UnboundedAllocation {
-            callee: "Vec::reserve".into(),
-            count: "n".into(),
-            detail: "no budget".into(),
-        },
-        VcKind::UseAfterFree,
-        VcKind::DoubleFree,
-        VcKind::AliasingViolation { mutable: true },
-        VcKind::LifetimeViolation,
-        VcKind::SendViolation,
-        VcKind::SyncViolation,
-        VcKind::FunctionalCorrectness {
-            property: "result_correctness".into(),
-            context: "sorted input".into(),
-        },
-        VcKind::HardenedBoundary {
-            category: HardenedVcCategory::ByteLoss,
-            callee: "to_string_lossy".into(),
-            detail: "lossy conversion".into(),
-        },
-        VcKind::LoopInvariantInitiation { invariant: "i >= 0".into(), header_block: 0 },
-        VcKind::LoopInvariantConsecution { invariant: "i >= 0".into(), header_block: 0 },
-        VcKind::LoopInvariantSufficiency { invariant: "i >= 0".into(), header_block: 0 },
-        VcKind::TypeRefinementViolation { variable: "x".into(), predicate: "x > 0".into() },
-        VcKind::FrameConditionViolation { variable: "y".into(), function: "foo".into() },
-    ];
-
-    assert_eq!(
-        variants.len(),
-        53,
-        "proof_level variant list out of sync — update when adding VcKind variants"
-    );
-
-    for kind in &variants {
-        let level = kind.proof_level();
-        // Verify it returns a valid ProofLevel (L0, L1, or L2).
-        let desc = format!("{level:?}");
+    for entry in &census() {
+        let level = entry.kind.proof_level();
         assert!(
-            desc.contains("L0") || desc.contains("L1") || desc.contains("L2"),
-            "VcKind::{:?} returned unexpected proof level: {desc}",
-            kind
+            matches!(level, ProofLevel::L0Safety | ProofLevel::L1Functional | ProofLevel::L2Domain),
+            "VcKind::{} returned an untiered proof level: {level:?}",
+            entry.variant_name
         );
     }
 }

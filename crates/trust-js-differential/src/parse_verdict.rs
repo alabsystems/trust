@@ -26,20 +26,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use trust_js_parse::{parse_module, parse_script, ParseOutcome};
+use trust_js_parse::{ParseOutcome, parse_module, parse_script};
 
-use crate::cases::{prepare_case, PreparedCase};
-use crate::heads::{spawn_engine, RunMode, SpawnOutput};
+use crate::cases::{PreparedCase, prepare_case};
+use crate::heads::{RunMode, SpawnOutput, spawn_engine};
 use crate::model::{
-    Js262AuditEntry, Js262AuditHead, Js262Classification, ParseDivergenceRow, ParseGate,
-    ParseScorecard, ParseTotals, ScorecardEngine, PARSE_SCORECARD_SCHEMA,
+    Js262AuditEntry, Js262AuditHead, Js262Classification, PARSE_SCORECARD_SCHEMA,
+    ParseDivergenceRow, ParseGate, ParseScorecard, ParseTotals, ScorecardEngine,
 };
-use crate::slice::{derive, load_slice, verify_derived, SliceKind};
+use crate::slice::{SliceKind, derive, load_slice, verify_derived};
 
 /// The mode label for a module-goal run (modules are always strict — a single
 /// run per case, no bare/strict split).
 const MODULE_MODE: &str = "module";
-use crate::util::{contains_subslice, git_head, now_utc_iso, probe_engine, validation_date, Engine};
+use crate::util::{
+    Engine, contains_subslice, git_head, now_utc_iso, probe_engine, validation_date,
+};
 use crate::validate::{audit_entry_is_active, load_audit};
 
 /// Per-oracle-spawn timeout. `node --check` parses without executing, so a
@@ -108,11 +110,18 @@ pub fn classify_oracle_output(out: &SpawnOutput) -> OracleVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerdictComparison {
     Agree,
-    Disagree { direction: &'static str, parser_reason: Option<String> },
+    Disagree {
+        direction: &'static str,
+        parser_reason: Option<String>,
+    },
     /// Sound parser refusal — counted, never a disagreement.
-    NoCoverage { reason: String },
+    NoCoverage {
+        reason: String,
+    },
     /// Oracle tool failure — takes precedence over everything (fail-closed).
-    OracleError { detail: String },
+    OracleError {
+        detail: String,
+    },
 }
 
 /// The verdict comparison matrix. Verdict level ONLY: reasons are carried for
@@ -129,10 +138,9 @@ pub fn compare_verdicts(parse: &ParseOutcome, oracle: &OracleVerdict) -> Verdict
         }
         (ParseOutcome::Script(_), OracleVerdict::Accept) => VerdictComparison::Agree,
         (ParseOutcome::EarlyError { .. }, OracleVerdict::Reject) => VerdictComparison::Agree,
-        (ParseOutcome::Script(_), OracleVerdict::Reject) => VerdictComparison::Disagree {
-            direction: DIR_PARSER_ACCEPTS,
-            parser_reason: None,
-        },
+        (ParseOutcome::Script(_), OracleVerdict::Reject) => {
+            VerdictComparison::Disagree { direction: DIR_PARSER_ACCEPTS, parser_reason: None }
+        }
         (ParseOutcome::EarlyError { reason }, OracleVerdict::Accept) => {
             VerdictComparison::Disagree {
                 direction: DIR_PARSER_REJECTS,
@@ -323,16 +331,15 @@ pub fn run_parse_verdict(opts: &ParseVerdictOpts) -> anyhow::Result<i32> {
                             let source = mode_source(&case.body, mode);
                             let parse = parse_script(&source, mode == RunMode::Strict);
                             let oracle = run_oracle(&node, &slot_file, &source);
-                            runs.push((mode.as_str().to_string(), compare_verdicts(&parse, &oracle)));
+                            runs.push((
+                                mode.as_str().to_string(),
+                                compare_verdicts(&parse, &oracle),
+                            ));
                         }
                     }
                     let mut guard = records.lock().map_err(|_| "records poisoned")?;
                     for (mode, cmp) in runs {
-                        guard.push(ParseRunRecord {
-                            path: case.rel_path.clone(),
-                            mode,
-                            cmp,
-                        });
+                        guard.push(ParseRunRecord { path: case.rel_path.clone(), mode, cmp });
                     }
                 }
                 Ok(())
@@ -392,18 +399,13 @@ pub fn run_parse_verdict(opts: &ParseVerdictOpts) -> anyhow::Result<i32> {
                     continue;
                 }
                 totals.oracle_errors += 1;
-                oracle_error_notes.push(format!(
-                    "{} [{}]: {detail}",
-                    rec.path,
-                    rec.mode.as_str()
-                ));
+                oracle_error_notes.push(format!("{} [{}]: {detail}", rec.path, rec.mode.as_str()));
             }
             VerdictComparison::Disagree { direction, parser_reason } => {
                 totals.disagree += 1;
                 let fingerprint = parse_fingerprint(&rec.path, rec.mode.as_str(), direction);
-                let waiver = waivers
-                    .iter()
-                    .find(|e| e.path == rec.path && e.fingerprint == fingerprint);
+                let waiver =
+                    waivers.iter().find(|e| e.path == rec.path && e.fingerprint == fingerprint);
                 if waiver.is_none() {
                     unwaived_disagree += 1;
                 }
@@ -494,11 +496,7 @@ pub fn run_parse_verdict(opts: &ParseVerdictOpts) -> anyhow::Result<i32> {
 /// Exit 1 on any oracle_error or unwaived disagreement (and only those: a
 /// clean partial run exits 0 without claiming the gate).
 pub fn parse_scorecard_exit_code(s: &ParseScorecard) -> i32 {
-    if s.totals.oracle_errors != 0 || s.gate.unwaived_disagree != 0 {
-        1
-    } else {
-        0
-    }
+    if s.totals.oracle_errors != 0 || s.gate.unwaived_disagree != 0 { 1 } else { 0 }
 }
 
 fn render_dashboard(
@@ -555,7 +553,10 @@ fn render_dashboard(
     if !unwaived.is_empty() {
         out.push_str("\nTop unwaived disagreements:\n\n");
         for d in unwaived.iter().take(25) {
-            out.push_str(&format!("- `{}` [{}] fp `{}`: {}\n", d.path, d.mode, d.fingerprint, d.direction));
+            out.push_str(&format!(
+                "- `{}` [{}] fp `{}`: {}\n",
+                d.path, d.mode, d.fingerprint, d.direction
+            ));
         }
     }
     if !oracle_errors.is_empty() {
@@ -569,8 +570,9 @@ fn render_dashboard(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_parse::Program;
+
+    use super::*;
 
     fn spawn_out(success: bool, stderr: &[u8], timed_out: bool) -> SpawnOutput {
         SpawnOutput {
@@ -639,20 +641,11 @@ mod tests {
         );
         // Unsupported is no-coverage against either verdict — never a
         // disagreement.
-        assert!(matches!(
-            compare_verdicts(&unsup, &accept),
-            VerdictComparison::NoCoverage { .. }
-        ));
-        assert!(matches!(
-            compare_verdicts(&unsup, &reject),
-            VerdictComparison::NoCoverage { .. }
-        ));
+        assert!(matches!(compare_verdicts(&unsup, &accept), VerdictComparison::NoCoverage { .. }));
+        assert!(matches!(compare_verdicts(&unsup, &reject), VerdictComparison::NoCoverage { .. }));
         // An oracle failure wins over every parser outcome (fail-closed).
         for parse in [&script, &early, &unsup] {
-            assert!(matches!(
-                compare_verdicts(parse, &err),
-                VerdictComparison::OracleError { .. }
-            ));
+            assert!(matches!(compare_verdicts(parse, &err), VerdictComparison::OracleError { .. }));
         }
     }
 
@@ -680,7 +673,8 @@ mod tests {
     }
 
     fn audit_entry(head: &str, status: &str, expires: &str, fp: &str) -> Js262AuditEntry {
-        let head_line = if head.is_empty() { String::new() } else { format!("head = \"{head}\"\n") };
+        let head_line =
+            if head.is_empty() { String::new() } else { format!("head = \"{head}\"\n") };
         let toml = format!(
             r#"
 schema_version = "1"
@@ -800,10 +794,7 @@ expires_on = "{expires}"
         assert_eq!(t.oracle_errors, 0);
         // Every executed run is judged or soundly refused, never lost.
         assert_eq!(t.agree + t.disagree + t.unsupported + t.oracle_errors, t.runs);
-        assert_eq!(
-            scorecard.gate.coverage_ratio,
-            (t.agree + t.disagree) as f64 / t.runs as f64
-        );
+        assert_eq!(scorecard.gate.coverage_ratio, (t.agree + t.disagree) as f64 / t.runs as f64);
         assert_eq!(scorecard.gate.unwaived_disagree, 0);
         assert!(scorecard.gate.disagree_ok);
         assert_eq!(scorecard.partial, Some(true));

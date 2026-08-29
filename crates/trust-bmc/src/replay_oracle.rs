@@ -50,7 +50,7 @@
 //! re-derived problem (reject-only correlation; the fingerprint grants
 //! nothing).
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ay_chc::{ChcProblem, InvariantModel, PdrConfig};
 use sha2::{Digest, Sha256};
@@ -158,17 +158,11 @@ impl ChcReplayVerdict {
     // private to this module so holding an accepted verdict implies this
     // process ran the check.
     fn accepted(problem_fingerprint: String) -> Self {
-        Self {
-            inner: VerdictInner::Accepted {
-                problem_fingerprint,
-            },
-        }
+        Self { inner: VerdictInner::Accepted { problem_fingerprint } }
     }
 
     fn rejected(rejection: ChcReplayRejection) -> Self {
-        Self {
-            inner: VerdictInner::Rejected(rejection),
-        }
+        Self { inner: VerdictInner::Rejected(rejection) }
     }
 
     /// True iff the full clause discharge ran in this process and accepted
@@ -180,9 +174,7 @@ impl ChcReplayVerdict {
     /// The domain-separated problem fingerprint, present only on acceptance.
     pub fn problem_fingerprint(&self) -> Option<&str> {
         match &self.inner {
-            VerdictInner::Accepted {
-                problem_fingerprint,
-            } => Some(problem_fingerprint),
+            VerdictInner::Accepted { problem_fingerprint } => Some(problem_fingerprint),
             VerdictInner::Rejected(_) => None,
         }
     }
@@ -276,17 +268,16 @@ pub fn replay_chc_invariant(
         Ok((_, Err(error))) => {
             ChcReplayVerdict::rejected(ChcReplayRejection::ValidatorErrored(error.to_string()))
         }
-        Ok((_, Ok(false))) => {
-            ChcReplayVerdict::rejected(ChcReplayRejection::InvariantNotInductive)
-        }
+        Ok((_, Ok(false))) => ChcReplayVerdict::rejected(ChcReplayRejection::InvariantNotInductive),
         Ok((fingerprint, Ok(true))) => ChcReplayVerdict::accepted(fingerprint),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ay_chc::ChcParser;
+
+    use super::*;
 
     /// A trivially-safe monotone counter: `Inv(0)`, `Inv(x) -> Inv(x+1)`,
     /// `Inv(x) /\ x < 0 -> false`. PDR proves it with e.g. `Inv(x) == x >= 0`.
@@ -368,16 +359,17 @@ mod tests {
         let problem = ChcParser::parse(SAFE_COUNTER_SMT2).expect("fixture parses");
         let run = ay_chc::engines::solve_pdr_proof_from_str(SAFE_COUNTER_SMT2, pdr_config())
             .expect("PDR proof run should not error on the safe counter");
+        // Trust: `ChcPdrProofRun::result` became private behind an accessor when
+        // the `ay` pin moved forward (ay-chc `proof_metadata/proof_run.rs`);
+        // `result()` returns `&VerifiedChcResult`, the same value borrowed, and
+        // this site only reads through it.
         let model = run
-            .result
+            .result()
             .safe_invariant()
             .unwrap_or_else(|| panic!("expected PDR to prove the counter safe, got {run:?}"))
             .model()
             .clone();
-        assert!(
-            !model.is_empty(),
-            "the safe counter needs a real (non-empty) invariant model"
-        );
+        assert!(!model.is_empty(), "the safe counter needs a real (non-empty) invariant model");
         (problem, model)
     }
 
@@ -403,15 +395,8 @@ mod tests {
     fn query_free_problem_is_rejected() {
         let (_safe_problem, model) = genuine_safe_counter_model();
         let query_free = ChcParser::parse(QUERY_FREE_SMT2).expect("fixture parses");
-        assert!(
-            !query_free.clauses().is_empty(),
-            "fixture must keep its init/transition clauses"
-        );
-        assert_eq!(
-            query_free.queries().count(),
-            0,
-            "fixture must have no query clause"
-        );
+        assert!(!query_free.clauses().is_empty(), "fixture must keep its init/transition clauses");
+        assert_eq!(query_free.queries().count(), 0, "fixture must have no query clause");
         let verdict = replay_chc_invariant(&query_free, &model, &pdr_config());
         assert!(!verdict.is_accepted());
         assert_eq!(verdict.problem_fingerprint(), None);
@@ -427,11 +412,7 @@ mod tests {
     fn pruned_query_problem_is_rejected() {
         let (_safe_problem, model) = genuine_safe_counter_model();
         let pruned = ChcParser::parse(PRUNED_QUERY_SMT2).expect("fixture parses");
-        assert_eq!(
-            pruned.queries().count(),
-            0,
-            "fixture's query must have been parser-pruned"
-        );
+        assert_eq!(pruned.queries().count(), 0, "fixture's query must have been parser-pruned");
         assert!(
             pruned.validate().is_ok(),
             "ay's own validate credits the pruned query — the oracle must be stricter"
@@ -488,9 +469,8 @@ mod tests {
         assert!(verdict.is_accepted(), "got {verdict:?}");
         assert_eq!(verdict.rejection(), None);
 
-        let fingerprint = verdict
-            .problem_fingerprint()
-            .expect("accepted verdict carries the fingerprint");
+        let fingerprint =
+            verdict.problem_fingerprint().expect("accepted verdict carries the fingerprint");
         assert_eq!(fingerprint.len(), 64, "sha256 lowercase hex");
         assert_eq!(fingerprint, problem_fingerprint(&problem));
         // Domain separation: NOT ay's own un-prefixed hash of the same text.
@@ -514,10 +494,7 @@ mod tests {
         let verdict = replay_chc_invariant(&bad_problem, &model, &pdr_config());
         assert!(!verdict.is_accepted());
         assert_eq!(verdict.problem_fingerprint(), None);
-        assert_eq!(
-            verdict.rejection(),
-            Some(&ChcReplayRejection::InvariantNotInductive)
-        );
+        assert_eq!(verdict.rejection(), Some(&ChcReplayRejection::InvariantNotInductive));
     }
 
     /// The fingerprint binds the verdict to THE problem: two different

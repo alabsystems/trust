@@ -25,20 +25,51 @@
 //!     `-Z trust-verify=off` is not a gate, it is a lint.
 //!
 //! ============================================================================
-//! **GREEN AS OF 2026-08-19.** Was RED BY DESIGN; the tilde-ERROR annotation is
-//! DELETED and `-Z trust-verify=off` is RETAINED, which is the whole point of
-//! the file. It is now `run-pass`, so the const is not merely accepted — it is
-//! evaluated at compile time and its value observed at runtime.
+//! THIS FIXTURE IS GREEN AND ASSERTS THE CTFE **VALUE**, not merely that the
+//! crate compiles — hence `run-pass` and the `assert_eq!` below.
 //!
-//! The load-bearing measurement: `X` is `6`, the FIRST argument of `f(6, 7)`.
-//! A gate that had admitted the wrong projection would produce `7` and this
-//! file would still compile, so the assertion below — not the exit code — is
-//! what pins CTFE to the declaration's meaning.
+//! MEASURED 2026-08-22 on stage2 ec4783d80: the crate builds under
+//! `-Z trust-verify=off`, and the produced binary exits 0 with `X == 6`. The
+//! const reaches `inner_mir_for_ctfe`, the body is constructed and gated by
+//! `clean_origin_mir`, and the gated value is baked into the binary. The gate
+//! does NOT vanish under `-Z trust-verify=off`, which is the property this file
+//! was written to hold.
 //!
-//! The gate ran with verification OFF. That is the claim this fixture owns: the
-//! faithfulness gate is a compilation-correctness check on emitted code, not an
-//! obligation, so no verification switch can disable it. A gate that vanished
-//! under `-Z trust-verify=off` would be a lint.
+//! THE VISIBILITY DECISION IS SETTLED, AND THE EXPECTATION IT BLOCKED IS GONE.
+//! This file used to pin `E0603` on the call below, on the strength of a mint
+//! that planted `Visibility::Restricted`. The mint now plants
+//! `Visibility::Public` (`rustc_resolve/src/build_reduced_graph.rs`,
+//! `trust_mint_clean_island_decls`), so `crate::m::f` is nameable from crate
+//! root exactly as `Crate.m.f` already was. MEASURED 2026-08-22: no `E0603` is
+//! emitted here. **DO NOT MAKE THIS FILE GREEN BY MOVING THE CONST INTO `m`**
+//! — the crate-root/`m` boundary is the whole point of the shape — and do not
+//! drop `-Z trust-verify=off` to get a green.
+//!
+//! Never spell the annotation sigil literally in this prose: compiletest scans
+//! EVERY line with a bare regex (`src/tools/compiletest/src/errors.rs:141`), so a
+//! quoted sigil in a comment becomes a real, unsatisfiable expectation.
+//!
+//! THE TWO THINGS THAT WOULD HAVE BROKEN HERE FIRST — **BOTH ARE NOW FIXED**:
+//!
+//!   1. `hir_body_const_context` is called unconditionally on both provider
+//!      arms (`rustc_mir_transform/src/lib.rs`), and it reads HIR. In
+//!      `inner_mir_for_ctfe` its `None` arm is a hard
+//!      `bug!("mir_for_ctfe called on non-const {def:?}")`. FIXED: the
+//!      `clean_origin_mir` gate call is now the VERY FIRST statement of
+//!      `inner_mir_for_ctfe` — before `is_constructor` and before
+//!      `hir_body_const_context` — so a Clean-origin def returns its gated body
+//!      and never reaches the `bug!`. The sibling call is at the top of
+//!      `optimized_mir`, and `promoted_mir` (which the metadata encoder demands
+//!      once a def is in `mir_keys`, and whose ordinary path reaches
+//!      `mir_borrowck` -> `typeck` -> HIR) has its own early return.
+//!   2. `mir_keys` seeds from `tcx.hir_body_owners()`, which a Clean-origin def
+//!      is not. FIXED: `mir_keys` now also inserts every def the
+//!      `clean_origin_mir::is_clean_origin` predicate accepts.
+//!
+//! BOTH OF THOSE ARE NOW REACHED RATHER THAN MERELY FIXED: the mint landed in
+//! 7b5c5535b3, so `is_clean_origin` is true for `m::f` here, `mir_keys` carries
+//! it, and the CTFE arm answers for it — which is what the `assert_eq!` below
+//! observes end to end.
 //!
 //! THE SHAPE HERE IS NOT ARBITRARY — it was RETARGETED (2026-08-19) after the
 //! fragment was measured. This fixture used to read `def f : UInt64 := 6` with
@@ -61,15 +92,12 @@ mod m {
 }
 
 // MUST traverse the faithfulness gate at CTFE time, with verification OFF.
-// Trust (#65, R2/C4 housekeeping): a DIRECT const call, restored — the mint
-// plants `Visibility::Public` and feeds constness `Const`, so the earlier
-// same-module `const fn` wrapper (added against a then-measured E0603) is
-// gone; see clean_origin_call_parity.rs for the parity rationale.
 const X: u64 = crate::m::f(6, 7);
 
 fn main() {
-    println!("{X}");
-    // `6`, not `7`: the first projection argument. See the header — a gate that
-    // admitted the wrong projection would still compile this file.
-    assert_eq!(X, 6, "CTFE must evaluate the projection the Clean `def` denotes");
+    assert_eq!(
+        X, 6,
+        "the CTFE-evaluated Clean-origin body must be the projection the Clean \
+         `def` denotes (parameter 0), not the second argument"
+    );
 }

@@ -103,9 +103,12 @@ impl fmt::Display for ReportedAssurance {
 /// Trust (dep-TCB ledger, Stage 0): `trust_levels` is populated by a real
 /// producer — [`AssumptionSet::from_scoped_out_deps`] — which classifies every
 /// dependency that verification was *scoped out of* into an explicit
-/// [`TrustAssumption`] row. Crucially, the `core`/`alloc`/`std` hard-skip is the
-/// largest silent TCB surface, so it always appears as explicit `Trusted`/
-/// `Conditional` rows rather than being assumed away invisibly. Before this
+/// [`TrustAssumption`] row. Crucially, `core`/`alloc`/`std` remain foundational,
+/// incompletely covered TCB surfaces, so they always appear as explicit
+/// `Trusted`/`Conditional` rows rather than being assumed away invisibly. A
+/// local stdlib verification subject now emits selected behavioral obligations;
+/// that does not establish the crates' complete compiler, intrinsic, allocator,
+/// OS, or FFI semantics, and therefore does not remove these rows. Before this
 /// producer existed the set was only ever `::default()`-constructed, which
 /// rendered the crate's trust base as empty — an honesty bug, not a soundness
 /// one (it under-reported the TCB).
@@ -125,13 +128,13 @@ pub struct AssumptionSet {
     pub solver_versions: Vec<SolverVersion>,
 }
 
-/// The `core`/`alloc`/`std` crates the verifier hard-skips. Verification never
-/// produces obligations for these (the compiler self-gates on the crate under
-/// check), so every property a verified crate proves is *conditional* on the
-/// standard library behaving as its types/contracts claim. This is the largest
-/// single chunk of the trust base, and the dep-TCB ledger surfaces it
-/// explicitly rather than letting it sit silent.
-const STD_HARD_SKIP_CRATES: &[&str] = &["core", "alloc", "std"];
+/// The `core`/`alloc`/`std` crates that remain foundational TCB components.
+/// Verification can produce behavioral obligations when one is the local
+/// subject, but it does not yet close every compiler/intrinsic/runtime boundary;
+/// every proof therefore remains conditional on the uncovered stdlib surface.
+/// The ledger records that residual explicitly rather than equating a nonempty
+/// obligation inventory with whole-crate verification.
+const STD_FOUNDATIONAL_TCB_CRATES: &[&str] = &["core", "alloc", "std"];
 
 impl AssumptionSet {
     /// Trust (dep-TCB ledger, Stage 0): build the trust-level assumption rows
@@ -143,10 +146,11 @@ impl AssumptionSet {
     /// becomes an explicit [`TrustAssumption`] so the proof report can state the
     /// crate's full trust base instead of silently assuming its dependencies.
     ///
-    /// The `core`/`alloc`/`std` hard-skip is emitted unconditionally as
-    /// `Trusted`/`Conditional` rows — it is never present in `scoped_out_deps`
-    /// (the compiler skips it before the dep graph is even consulted), yet it is
-    /// the dominant TCB surface, so it must appear in the ledger regardless.
+    /// The foundational `core`/`alloc`/`std` rows are emitted unconditionally as
+    /// `Trusted`/`Conditional`. They are not ordinary `scoped_out_deps`, and they
+    /// remain when one of those crates is itself `verify_target`: checking the
+    /// local subject's behavioral obligations does not establish the still-
+    /// uncovered compiler, intrinsic, allocator, OS, and FFI boundaries.
     ///
     /// Classification is deliberately conservative: a scoped-out dependency is
     /// `Conditional` (its correctness is an unverified premise of the proof),
@@ -162,11 +166,11 @@ impl AssumptionSet {
     {
         let mut trust_levels = Vec::new();
 
-        // The std hard-skip is always part of the TCB, even when the dep graph
-        // is empty. core = type-system/intrinsics (Trusted); alloc/std =
-        // allocator/OS/FFI surface (Conditional — a heavier, more reviewable
-        // assumption).
-        for &name in STD_HARD_SKIP_CRATES {
+        // The foundational std surface is always part of the TCB, even when the
+        // dependency graph is empty or stdlib is the local verification subject.
+        // core = type-system/intrinsics (Trusted); alloc/std = allocator/OS/FFI
+        // surface (Conditional — a heavier, more reviewable assumption).
+        for &name in STD_FOUNDATIONAL_TCB_CRATES {
             let level = if name == "core" {
                 TrustAssumptionLevel::Trusted
             } else {
@@ -176,8 +180,9 @@ impl AssumptionSet {
                 path: name.to_string(),
                 level,
                 reason: format!(
-                    "standard-library crate `{name}` is hard-skipped by the verifier; \
-                     all proofs are conditional on its correctness"
+                    "standard-library crate `{name}` remains a foundational TCB component; \
+                     local-subject verification checks selected obligations, but all proofs \
+                     remain conditional on uncovered std/compiler/runtime semantics"
                 ),
             });
         }
@@ -192,7 +197,7 @@ impl AssumptionSet {
             if dep.is_empty()
                 || dep == target
                 || target.split(',').any(|t| t == dep)
-                || STD_HARD_SKIP_CRATES.contains(&dep)
+                || STD_FOUNDATIONAL_TCB_CRATES.contains(&dep)
             {
                 continue;
             }
@@ -1724,9 +1729,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_from_scoped_out_deps_always_emits_std_hard_skip() {
-        // Even with no dependency graph, the core/alloc/std hard-skip must
-        // appear as explicit rows — it is the dominant silent TCB surface.
+    fn test_from_scoped_out_deps_always_emits_foundational_std_tcb() {
+        // Even with no dependency graph, the residual core/alloc/std TCB must
+        // appear as explicit rows. A local-subject obligation inventory does
+        // not make the still-uncovered foundational surface disappear.
         let set = AssumptionSet::from_scoped_out_deps(Some("mycrate"), Vec::<String>::new());
         let paths: Vec<&str> = set.trust_levels.iter().map(|a| a.path.as_str()).collect();
         assert!(paths.contains(&"core"), "core must be an explicit TCB row");
@@ -1737,6 +1743,14 @@ mod tests {
         assert_eq!(core.level, TrustAssumptionLevel::Trusted);
         let std_row = set.trust_levels.iter().find(|a| a.path == "std").unwrap();
         assert_eq!(std_row.level, TrustAssumptionLevel::Conditional);
+
+        // Being the local verification subject no longer means zero stdlib
+        // obligations, but selected behavioral rows still do not close the
+        // foundational TCB. Keep the row and describe that distinction.
+        let core_subject = AssumptionSet::from_scoped_out_deps(Some("core"), Vec::<String>::new());
+        let core = core_subject.trust_levels.iter().find(|a| a.path == "core").unwrap();
+        assert!(core.reason.contains("local-subject verification checks selected obligations"));
+        assert!(!core.reason.contains("hard-skipped"));
     }
 
     #[test]
@@ -1753,8 +1767,8 @@ mod tests {
             !set.trust_levels.iter().any(|a| a.path == "mycrate"),
             "the verify target is not a scoped-out dependency"
         );
-        // `core` appears exactly once (from the std hard-skip), not duplicated
-        // by the dep list.
+        // `core` appears exactly once (from the foundational std TCB), not
+        // duplicated by the dependency list.
         assert_eq!(set.trust_levels.iter().filter(|a| a.path == "core").count(), 1);
     }
 

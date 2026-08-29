@@ -97,8 +97,7 @@ where
     match serde_json::from_str::<T>(json) {
         Ok(value) => Ok(value),
         Err(error)
-            if is_recursion_limit_error(&error)
-                && json_nesting_depth(json) <= MAX_DEEP_NESTING =>
+            if is_recursion_limit_error(&error) && json_nesting_depth(json) <= MAX_DEEP_NESTING =>
         {
             deep_parse_on_dedicated_stack::<T>(json)
                 .map_err(|deep_error| deep_error.unwrap_or(error))

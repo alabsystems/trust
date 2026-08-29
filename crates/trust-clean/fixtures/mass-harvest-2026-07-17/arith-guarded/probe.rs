@@ -1,34 +1,62 @@
 // arith-guarded family probe: wrapping/saturating/checked arithmetic on i32/u8.
 
 #[inline(never)]
-pub fn w_i32_wrapping_add(a: i32, b: i32) -> i32 { a.wrapping_add(b) }
+pub fn w_i32_wrapping_add(a: i32, b: i32) -> i32 {
+    a.wrapping_add(b)
+}
 #[inline(never)]
-pub fn w_i32_wrapping_sub(a: i32, b: i32) -> i32 { a.wrapping_sub(b) }
+pub fn w_i32_wrapping_sub(a: i32, b: i32) -> i32 {
+    a.wrapping_sub(b)
+}
 #[inline(never)]
-pub fn w_i32_wrapping_mul(a: i32, b: i32) -> i32 { a.wrapping_mul(b) }
+pub fn w_i32_wrapping_mul(a: i32, b: i32) -> i32 {
+    a.wrapping_mul(b)
+}
 #[inline(never)]
-pub fn w_i32_saturating_add(a: i32, b: i32) -> i32 { a.saturating_add(b) }
+pub fn w_i32_saturating_add(a: i32, b: i32) -> i32 {
+    a.saturating_add(b)
+}
 #[inline(never)]
-pub fn w_i32_saturating_sub(a: i32, b: i32) -> i32 { a.saturating_sub(b) }
+pub fn w_i32_saturating_sub(a: i32, b: i32) -> i32 {
+    a.saturating_sub(b)
+}
 #[inline(never)]
-pub fn w_i32_checked_add_is_some(a: i32, b: i32) -> bool { a.checked_add(b).is_some() }
+pub fn w_i32_checked_add_is_some(a: i32, b: i32) -> bool {
+    a.checked_add(b).is_some()
+}
 #[inline(never)]
-pub fn w_i32_overflowing_add_0(a: i32, b: i32) -> i32 { a.overflowing_add(b).0 }
+pub fn w_i32_overflowing_add_0(a: i32, b: i32) -> i32 {
+    a.overflowing_add(b).0
+}
 
 #[inline(never)]
-pub fn w_u8_wrapping_add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }
+pub fn w_u8_wrapping_add(a: u8, b: u8) -> u8 {
+    a.wrapping_add(b)
+}
 #[inline(never)]
-pub fn w_u8_wrapping_sub(a: u8, b: u8) -> u8 { a.wrapping_sub(b) }
+pub fn w_u8_wrapping_sub(a: u8, b: u8) -> u8 {
+    a.wrapping_sub(b)
+}
 #[inline(never)]
-pub fn w_u8_wrapping_mul(a: u8, b: u8) -> u8 { a.wrapping_mul(b) }
+pub fn w_u8_wrapping_mul(a: u8, b: u8) -> u8 {
+    a.wrapping_mul(b)
+}
 #[inline(never)]
-pub fn w_u8_saturating_add(a: u8, b: u8) -> u8 { a.saturating_add(b) }
+pub fn w_u8_saturating_add(a: u8, b: u8) -> u8 {
+    a.saturating_add(b)
+}
 #[inline(never)]
-pub fn w_u8_saturating_sub(a: u8, b: u8) -> u8 { a.saturating_sub(b) }
+pub fn w_u8_saturating_sub(a: u8, b: u8) -> u8 {
+    a.saturating_sub(b)
+}
 #[inline(never)]
-pub fn w_u8_checked_add_is_some(a: u8, b: u8) -> bool { a.checked_add(b).is_some() }
+pub fn w_u8_checked_add_is_some(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
 #[inline(never)]
-pub fn w_u8_overflowing_add_0(a: u8, b: u8) -> u8 { a.overflowing_add(b).0 }
+pub fn w_u8_overflowing_add_0(a: u8, b: u8) -> u8 {
+    a.overflowing_add(b).0
+}
 
 fn main() {
     let n = std::env::args().count() as i32;

@@ -740,11 +740,36 @@ fn elab_term(e: &SynExpr, vars: &[String], offset: u32, dom: &Domain) -> Result<
                 .get_ident()
                 .ok_or_else(|| "only bare identifiers are supported".to_string())?
                 .to_string();
-            let pos = vars
-                .iter()
-                .position(|v| *v == id)
-                .ok_or_else(|| format!("unbound variable `{id}`"))?;
-            Ok(Expr::bvar((vars.len() - 1 - pos) as u32 + offset))
+            // A clause BINDING always wins: `x` names the Rust parameter even
+            // when an admitted constant of the same name exists (params shadow
+            // admissions — the same precedence `parse_exact_typed_clause`
+            // applies at the bijection gate).
+            if let Some(pos) = vars.iter().position(|v| *v == id) {
+                return Ok(Expr::bvar((vars.len() - 1 - pos) as u32 + offset));
+            }
+            // E6 bare citation (e6 probe f04's spelling): an admitted
+            // ZERO-ARITY constant referenced with NO argument list elaborates
+            // to its kernel constant — the same admission, the same I3
+            // firewall, and the same constant the call arm resolves for
+            // `id()`; only the surface spelling differs. A parametered
+            // admission must be applied: its bare name is a function value,
+            // which the term fragment does not speak, so it keeps failing
+            // closed — with the fix named (v7/D3).
+            if let Some(admission) = ambient_admission(&id) {
+                if admission.arity != 0 {
+                    return Err(format!(
+                        "admitted `{id}` has arity {} and must be applied \
+                         (`{id}(…)`); a bare reference to a parametered \
+                         definition is outside the term fragment",
+                        admission.arity
+                    ));
+                }
+                if let Err(refusal) = admission.require_at(ambient_use_site(), &id) {
+                    return Err(refusal.to_string());
+                }
+                return Ok(Expr::const_(Name::from_string(&admission.kernel_const), vec![]));
+            }
+            Err(format!("unbound variable `{id}`"))
         }
         SynExpr::Lit(l) => match &l.lit {
             Lit::Int(i) => {
@@ -1798,6 +1823,18 @@ pub struct Admission {
     /// The proof-only symbol that bound the capability down, when
     /// [`Admission::restrict`] carried one. Diagnostics only.
     proof_only_via: Option<String>,
+    /// The callee's RETURN domain, when the minting site recorded one (the
+    /// compiler-side import reads it off the typed signature; the island
+    /// admitter reads it off the kernel type's codomain). This is elaboration
+    /// STEERING, never authority: [`atom_domain`] uses it to type a
+    /// VARIABLE-FREE atom (`answer() == c42(0)`) at the callee's machine
+    /// domain instead of the `Nat` default, and a wrongly recorded domain can
+    /// only produce an ill-typed proposition the kernel then rejects — it can
+    /// never make a false claim check. Private like the other
+    /// evidence-bearing fields; the minting caller attaches it through
+    /// [`Admission::with_return_domain`], and an absent domain simply leaves
+    /// the pre-existing fail-closed default in force.
+    return_domain: Option<Domain>,
 }
 
 impl Admission {
@@ -1828,6 +1865,7 @@ impl Admission {
                 trust_symbols::Capability::Call,
             ),
             proof_only_via: None,
+            return_domain: None,
         }
     }
 
@@ -1861,7 +1899,27 @@ impl Admission {
                 trust_symbols::Capability::Proof,
             ),
             proof_only_via: None,
+            return_domain: None,
         }
+    }
+
+    /// Record the callee's declared RETURN domain (see the field docs). The
+    /// four `admit_*` mints deliberately do not attach one — their caller is
+    /// the party holding the typed signature or the kernel type, so the
+    /// attachment happens where the evidence lives. Steering only: this
+    /// grants no authority and widens no fragment; it only lets a
+    /// variable-free clause atom be typed at the domain the constant already
+    /// has.
+    #[must_use]
+    pub fn with_return_domain(mut self, domain: Domain) -> Self {
+        self.return_domain = Some(domain);
+        self
+    }
+
+    /// The recorded return domain, if the minting site attached one.
+    #[must_use]
+    pub fn return_domain(&self) -> Option<&Domain> {
+        self.return_domain.as_ref()
     }
 
     /// How this constant entered the environment, and on whose authority.
@@ -1925,10 +1983,9 @@ impl Admission {
             return Ok(());
         }
         Err(match (self.capability, self.proof_only_via.as_deref()) {
-            (EffectiveCapability::Determined(_), Some(via)) => ProofOnlyRefusal::Transitive {
-                symbol: spelled.to_string(),
-                via: via.to_string(),
-            },
+            (EffectiveCapability::Determined(_), Some(via)) => {
+                ProofOnlyRefusal::Transitive { symbol: spelled.to_string(), via: via.to_string() }
+            }
             (EffectiveCapability::Determined(_), None) => {
                 ProofOnlyRefusal::Declared { symbol: spelled.to_string() }
             }
@@ -2366,6 +2423,685 @@ pub fn admit_select_function(
     Ok(Admission::reflected(kernel_const, n))
 }
 
+/// Mint an E6 [`Admission`] for a SELECT-vs-LITERAL function (R2/C9) — an
+/// n-ary function that compares one of its parameters against a
+/// machine-integer LITERAL and returns one of its parameters, i.e. the
+/// `if p_cmp ⊲ LIT { p_then } else { p_else }` shape, of which the threshold
+/// select `fn min10(a, b) { if a < 10 { a } else { b } }` and gcd's guard
+/// `if b == 0 { a } else { … }` are the canonical cases.
+///
+/// A **NEW admit route**, deliberately: `fragment_widening_probes.rs`
+/// (probe_i, 2026-08-21) measured that NO existing producer could mint this
+/// side B — [`admit_select_function`] compares two PARAMETERS by signature
+/// (a literal operand is unrepresentable in its input vocabulary, not merely
+/// refused), and [`admit_expr_function`]'s term fragment has no
+/// `if`/comparison. Rather than widen a frozen producer, this function is
+/// added BESIDE the four existing `admit_*`, which are untouched.
+///
+/// The term construction mirrors [`admit_select_function`]'s exactly — the
+/// `ite` tree Clean's own `elab_if` mints (the 2026-07-25 Option-B ruling),
+/// so a user writing `if a < 10 then a else b` produces the same tree shape
+/// and definitional equality closes with nothing clever — with ONE
+/// difference: the comparison's RIGHT operand is the literal's numeral term
+/// ([`Domain::numeral`], range-checked, fails closed) instead of a bound
+/// parameter. The literal is STRICTLY the right operand: a literal on the
+/// left (`if 10 < a`) is unrepresentable in this signature, the same
+/// fail-closed-by-vocabulary rule the parameter version applies to literals.
+/// The numeral is minted in the CARRIER spelling (`{C}.ofNat n`); the kernel
+/// identifying it with the surface `OfNat.ofNat` spelling a real island
+/// elaborates is a MEASURED fact (the a4–a6 arithmetic probes first, and
+/// probe_i's own both-spelling ADMIT for this shape), never an assumption.
+///
+/// Single machine domain over ALL parameters, as for every arithmetic
+/// reflection; `add_decl` FULL-KERNEL-CHECKS the result, and a wrong
+/// construction is caught by the caller's definitional-reduction
+/// (`is_def_eq`) test.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_select_literal_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    cmp: SelectCmp,
+    cmp_param: usize,
+    literal: u128,
+    then_param: usize,
+    else_param: usize,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    for &i in &[cmp_param, then_param, else_param] {
+        if i >= n {
+            return Err(format!("select index {i} out of range for a {n}-parameter function"));
+        }
+    }
+    let d = param_domains.first().ok_or("select needs at least one parameter")?;
+    if !param_domains.iter().all(|x| x == d) {
+        return Err("select over mixed parameter domains is unsupported".into());
+    }
+    let carrier = match d {
+        Domain::Machine(w) => w.carrier(),
+        _ => return Err("select currently requires a machine-integer domain".into()),
+    };
+    // Under n binders the source parameter i is de Bruijn index n-1-i.
+    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    let ty = d.ty();
+    let zero = Level::zero();
+    let one = Level::succ(Level::zero());
+    // The comparison's operands: the parameter on the LEFT, the range-checked
+    // numeral on the RIGHT. `Domain::numeral` fails closed on an out-of-range
+    // literal BEFORE the kernel, exactly as in `admit_constant_function`.
+    let (l, r) = (bvar(cmp_param), d.numeral(literal)?);
+    let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
+    let (prop, inst) = match cmp {
+        SelectCmp::Lt => (
+            Expr::apps(
+                Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
+                [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
+            ),
+            // R2/C9 SPELLING-GAP FIX (measured 2026-08-21): the REAL island
+            // elaborator resolves a literal comparison's decidability by
+            // REDUCTION TO NAT — `instDecidableNatLt` over the parameter's
+            // `toNat` projection chain (`Proj Fin 0 (Proj BitVec 0 (Proj {C}
+            // 0 x))`) and the BARE Nat literal — never the carrier instance
+            // this arm used to mint. Kernel defeq is INTENSIONAL on the
+            // stuck `ite` (the C5.0 finding), so the two instance spellings
+            // can never identify; minting what `elab_if` elaborates is the
+            // same Option-B ruling `admit_select_function` was built on
+            // (2026-07-25), now applied where the measurement demanded it.
+            {
+                let bare_nat = u64::try_from(literal)
+                    .map_err(|_| format!("select literal {literal} exceeds u64"))?;
+                Expr::apps(
+                    inst_c("instDecidableNatLt"),
+                    [
+                        Expr::proj(
+                            Name::from_string("Fin"),
+                            0,
+                            Expr::proj(
+                                Name::from_string("BitVec"),
+                                0,
+                                Expr::proj(Name::from_string(carrier), 0, bvar(cmp_param)),
+                            ),
+                        ),
+                        Expr::nat_lit(bare_nat),
+                    ],
+                )
+            },
+        ),
+        SelectCmp::Le => (
+            Expr::apps(
+                Expr::const_(Name::from_string("LE.le"), vec![zero.clone()]),
+                [ty.clone(), inst_c(&format!("instLE{carrier}")), l.clone(), r.clone()],
+            ),
+            Expr::apps(inst_c(&format!("instDecidable{carrier}Le")), [l, r]),
+        ),
+        SelectCmp::Eq => (
+            Expr::apps(
+                Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
+                [ty.clone(), l.clone(), r.clone()],
+            ),
+            Expr::apps(inst_c(&format!("instDecidableEq{carrier}")), [l, r]),
+        ),
+    };
+    // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth — the
+    // same polarity trap `admit_select_function` documents; the paired
+    // mutation probes are the net here too.
+    let body = Expr::apps(
+        Expr::const_(Name::from_string("ite"), vec![one]),
+        [ty.clone(), prop, inst, bvar(then_param), bvar(else_param)],
+    );
+    let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, d.ty(), acc));
+    let arrow_ty = (0..n).fold(d.ty(), |acc, _| Expr::arrow(d.ty(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the select-literal defining equation: {e:?}"))?;
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
+}
+
+/// One operand position of a [`admit_select_operands_function`] select: a
+/// source parameter, or an in-range machine numeral.
+///
+/// **The vocabulary is the position's, not the shape's** — the same operand
+/// type serves the comparison's right-hand side and BOTH arms, so "a numeral
+/// may stand where a parameter may stand" is one statement in one place rather
+/// than a per-position rule. That is what makes the route GENERAL: it was not
+/// widened to admit a particular body, it was stated over the operand
+/// vocabulary the `ite` tree already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectOperand {
+    /// A 0-based source parameter.
+    Param(usize),
+    /// An in-range machine numeral, minted in the CARRIER spelling
+    /// (`{C}.ofNat n`) by [`Domain::numeral`], which range-checks it and fails
+    /// closed BEFORE the kernel.
+    Literal(u128),
+}
+
+/// Mint an E6 [`Admission`] for a GENERAL SELECT function (§6f landing 3) —
+/// an n-ary function that compares a parameter against a parameter or a
+/// numeral and returns, in each arm, a parameter **or a numeral**:
+/// `if p_l ⊲ <rhs> then <then> else <else>`, of which `fn clampz(a, b) { if a
+/// < b { a } else { 0 } }` and `fn nz(a) { if a < 1 { 0 } else { a } }` are
+/// canonical.
+///
+/// A **NEW admit route**, added BESIDE [`admit_select_function`] and
+/// [`admit_select_literal_function`], which are untouched — the same
+/// discipline R2/C9 applied when the literal comparison operand turned out to
+/// be unrepresentable in a frozen producer's signature. The two frozen routes
+/// are the special case "every arm is a parameter", and
+/// `trust-clean-origin/tests/landing3_selection_probes.rs::l3_p4` is the
+/// standing control that this route reproduces BOTH of their terms EXACTLY on
+/// that overlap, at every comparison, every width and every index assignment
+/// it measures. That control is why generalizing here does not silently become
+/// a second, drifting builder of one term: the two constructions stay separate
+/// and are measured equal.
+///
+/// # What is deliberately NOT generalized, and why it is a measurement
+///
+/// * **The comparison's LEFT operand stays a parameter.** Not out of caution:
+///   `if 10 < a then …` does not ELABORATE in the real Clean island at all
+///   (measured, `l3_p6` — the bare numeral is typed `Nat` and the comparison
+///   is a type mismatch), so a producer able to spell it would be capability
+///   nothing can reach.
+/// * **A COMPUTED operand (`a + 1 < b`) stays out.** It elaborates, but the
+///   real elaborator resolves its decidability by NORMALIZING the modular
+///   reduction into a `Nat.rec`-headed term (measured, `l3_p5`). Side B would
+///   have to reproduce an elaborator normal form, which is not an operand
+///   vocabulary question at all.
+///
+/// The term construction mirrors the two frozen routes exactly — the `ite`
+/// tree Clean's own `elab_if` mints (the 2026-07-25 Option-B ruling) — with
+/// the comparison's instance chosen by the RIGHT operand's form, because the
+/// real elaborator chooses it that way: a parameter comparison resolves at the
+/// carrier instance (`instDecidable{C}Lt`), and a literal comparison at `<`
+/// resolves by REDUCTION TO NAT (`instDecidableNatLt` over the parameter's
+/// `toNat` projection chain — the R2/C9 spelling-gap finding). `add_decl`
+/// FULL-KERNEL-CHECKS the result; the arms are ordinary `ite` arguments, so a
+/// wrong arm is a wrong term the caller's definitional-reduction test refuses.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_select_operands_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    cmp: SelectCmp,
+    cmp_left: usize,
+    cmp_right: SelectOperand,
+    then_arm: SelectOperand,
+    else_arm: SelectOperand,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    let mut indices = vec![cmp_left];
+    for operand in [cmp_right, then_arm, else_arm] {
+        if let SelectOperand::Param(index) = operand {
+            indices.push(index);
+        }
+    }
+    for index in indices {
+        if index >= n {
+            return Err(format!("select index {index} out of range for a {n}-parameter function"));
+        }
+    }
+    let d = param_domains.first().ok_or("select needs at least one parameter")?;
+    if !param_domains.iter().all(|x| x == d) {
+        return Err("select over mixed parameter domains is unsupported".into());
+    }
+    let carrier = match d {
+        Domain::Machine(w) => w.carrier(),
+        _ => return Err("select currently requires a machine-integer domain".into()),
+    };
+    // Under n binders the source parameter i is de Bruijn index n-1-i.
+    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    // ONE operand renderer for every position — the comparison's right-hand
+    // side and both arms. A numeral is minted by `Domain::numeral`, which
+    // range-checks it and fails closed before the kernel; that is also the
+    // spelling (`{C}.ofNat v`) the real island elaborates a constant arm to.
+    let operand = |o: SelectOperand| -> Result<Expr, String> {
+        match o {
+            SelectOperand::Param(index) => Ok(bvar(index)),
+            SelectOperand::Literal(value) => d.numeral(value),
+        }
+    };
+    let ty = d.ty();
+    let zero = Level::zero();
+    let one = Level::succ(Level::zero());
+    let l = bvar(cmp_left);
+    let r = operand(cmp_right)?;
+    let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
+    let (prop, inst) = match (cmp, cmp_right) {
+        // The literal comparison at `<`: the REAL elaborator's Nat-reduced
+        // instance, identical to `admit_select_literal_function`'s arm. Only
+        // `<` is measured through the real island path; `<=`/`==` against a
+        // literal keep the carrier instance the frozen route mints, so this
+        // route and that one agree everywhere they overlap.
+        (SelectCmp::Lt, SelectOperand::Literal(value)) => (
+            Expr::apps(
+                Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
+                [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
+            ),
+            {
+                let bare_nat = u64::try_from(value)
+                    .map_err(|_| format!("select literal {value} exceeds u64"))?;
+                Expr::apps(
+                    inst_c("instDecidableNatLt"),
+                    [
+                        Expr::proj(
+                            Name::from_string("Fin"),
+                            0,
+                            Expr::proj(
+                                Name::from_string("BitVec"),
+                                0,
+                                Expr::proj(Name::from_string(carrier), 0, bvar(cmp_left)),
+                            ),
+                        ),
+                        Expr::nat_lit(bare_nat),
+                    ],
+                )
+            },
+        ),
+        (SelectCmp::Lt, SelectOperand::Param(_)) => (
+            Expr::apps(
+                Expr::const_(Name::from_string("LT.lt"), vec![zero.clone()]),
+                [ty.clone(), inst_c(&format!("instLT{carrier}")), l.clone(), r.clone()],
+            ),
+            Expr::apps(inst_c(&format!("instDecidable{carrier}Lt")), [l, r]),
+        ),
+        (SelectCmp::Le, _) => (
+            Expr::apps(
+                Expr::const_(Name::from_string("LE.le"), vec![zero.clone()]),
+                [ty.clone(), inst_c(&format!("instLE{carrier}")), l.clone(), r.clone()],
+            ),
+            Expr::apps(inst_c(&format!("instDecidable{carrier}Le")), [l, r]),
+        ),
+        (SelectCmp::Eq, _) => (
+            Expr::apps(
+                Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
+                [ty.clone(), l.clone(), r.clone()],
+            ),
+            Expr::apps(inst_c(&format!("instDecidableEq{carrier}")), [l, r]),
+        ),
+    };
+    // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth — the
+    // same polarity trap both frozen routes document, and the reason
+    // `control_10`'s swapped-arm half exists.
+    let body = Expr::apps(
+        Expr::const_(Name::from_string("ite"), vec![one]),
+        [ty.clone(), prop, inst, operand(then_arm)?, operand(else_arm)?],
+    );
+    let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, d.ty(), acc));
+    let arrow_ty = (0..n).fold(d.ty(), |acc, _| Expr::arrow(d.ty(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the general-select defining equation: {e:?}"))?;
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
+}
+
+/// Mint an E6 [`Admission`] for a **`BEq`-CONDITIONED SELECT** (§6f landing 5)
+/// — the select a user writes with the idiomatic `==` rather than the
+/// propositional `=`:
+///
+/// ```text
+/// def eqbeq (a b : UInt64) : UInt64 := if a == b then a else b
+/// ```
+///
+/// A **NEW admit route**, added BESIDE [`admit_select_function`],
+/// [`admit_select_literal_function`] and [`admit_select_operands_function`],
+/// all three of which are untouched — the discipline R2/C9 established when
+/// the literal comparison operand turned out to be unrepresentable in a frozen
+/// producer's signature, and §6f landing 3 repeated for the operand arms.
+///
+/// # Why it is a route and not a `SelectCmp` variant
+///
+/// `==` is **not a fourth comparison**. It is a SECOND SPELLING of the
+/// equality one, and the difference is a whole layer rather than an operator:
+/// [`SelectCmp::Eq`] states the condition as the PROPOSITION `Eq {C} l r`,
+/// while `==` states it as a **`Bool`-level decision lifted back to a
+/// proposition**. Measured on the real island elaborator at every machine
+/// width (`trust-clean-origin/tests/landing5_selection_probes.rs::l5_p1`),
+/// `if a == b then a else b` elaborates to
+///
+/// ```text
+/// ite.{1} {C}
+///   (Eq.{1} Bool (BEq.beq.{0} {C} (instBEqOfDecidableEq.{0} {C} instDecidableEq{C}) l r)
+///                Bool.true)
+///   (instDecidableEqBool (BEq.beq.{0} {C} (instBEqOfDecidableEq.{0} {C} instDecidableEq{C}) l r)
+///                        Bool.true)
+///   then else
+/// ```
+///
+/// Adding a `SelectCmp` variant would have forced an arm into the two frozen
+/// producers' exhaustive `match cmp`, which is exactly the edit R2/C9 refused
+/// to make; and the two spellings are NOT definitionally equal — the kernel
+/// says so in its own words, since the island cannot even close
+/// `theorem … : (if a == b then a else b) = (if a = b then a else b) := rfl`
+/// (measured, `l5_p3`). So this is a real second term, not a rendering choice.
+///
+/// # The instance is UNIFORM across the operand vocabulary
+///
+/// The decidability instance is `instDecidableEqBool <decision> Bool.true` for
+/// EVERY operand vocabulary — parameter-vs-parameter and parameter-vs-numeral
+/// alike — because the decision is resolved at `Bool`, where both operands are
+/// already `Bool`, one layer above the carrier. That is measured
+/// (`l5_p1`), and it is the one respect in which this route is SIMPLER than
+/// [`admit_select_operands_function`], whose `<`-against-a-literal arm has to
+/// mint the elaborator's Nat-reduced instance (the R2/C9 spelling-gap
+/// finding). One spelling, no per-operand arm.
+///
+/// # What it deliberately does NOT cover
+///
+/// * **`!=`.** Measured (`l5_p7`): `a != b` elaborates to the same tree with a
+///   `Bool.not` wrapped around the decision. That is a third spelling with no
+///   MIR realization on the emit lane (`SelectCmp` has no `Ne`), and admitting
+///   the negation here would let a caller mint a term whose emitted diamond
+///   would have to branch the other way — the polarity trap, one layer up. It
+///   is a separate demand in the ledger, not a flag on this route.
+/// * **A numeral on the comparison's LEFT**, for the reason `l3_p6` measured
+///   for every other select route: the shape does not elaborate at all.
+///
+/// `add_decl` FULL-KERNEL-CHECKS the result; the arms are ordinary `ite`
+/// arguments, so a wrong arm is a wrong term the caller's definitional-
+/// reduction test refuses.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_select_beq_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    cmp_left: usize,
+    cmp_right: SelectOperand,
+    then_arm: SelectOperand,
+    else_arm: SelectOperand,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    let mut indices = vec![cmp_left];
+    for operand in [cmp_right, then_arm, else_arm] {
+        if let SelectOperand::Param(index) = operand {
+            indices.push(index);
+        }
+    }
+    for index in indices {
+        if index >= n {
+            return Err(format!("select index {index} out of range for a {n}-parameter function"));
+        }
+    }
+    let d = param_domains.first().ok_or("select needs at least one parameter")?;
+    if !param_domains.iter().all(|x| x == d) {
+        return Err("select over mixed parameter domains is unsupported".into());
+    }
+    let carrier = match d {
+        Domain::Machine(w) => w.carrier(),
+        _ => return Err("select currently requires a machine-integer domain".into()),
+    };
+    // Under n binders the source parameter i is de Bruijn index n-1-i.
+    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    // ONE operand renderer for every position, exactly as the general select
+    // route states it: a numeral is minted by `Domain::numeral`, which
+    // range-checks it and fails closed before the kernel, and which is the
+    // spelling (`{C}.ofNat v`) the real island elaborates a constant operand
+    // to in this tree as well (measured, `l5_p1`).
+    let operand = |o: SelectOperand| -> Result<Expr, String> {
+        match o {
+            SelectOperand::Param(index) => Ok(bvar(index)),
+            SelectOperand::Literal(value) => d.numeral(value),
+        }
+    };
+    let ty = d.ty();
+    let zero = Level::zero();
+    let one = Level::succ(Level::zero());
+    let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
+    let bool_ty = Expr::const_(Name::from_string("Bool"), vec![]);
+    let bool_true = Expr::const_(Name::from_string("Bool.true"), vec![]);
+    // The `Bool`-level DECISION. It appears TWICE in the elaborated tree — in
+    // the proposition and inside the instance — and it is built ONCE here for
+    // that reason: two constructions of one subterm are two places a spelling
+    // can drift, and the kernel compares the instance's operands against the
+    // proposition's.
+    let decision = Expr::apps(
+        Expr::const_(Name::from_string("BEq.beq"), vec![zero.clone()]),
+        [
+            ty.clone(),
+            Expr::apps(
+                Expr::const_(Name::from_string("instBEqOfDecidableEq"), vec![zero]),
+                [ty.clone(), inst_c(&format!("instDecidableEq{carrier}"))],
+            ),
+            bvar(cmp_left),
+            operand(cmp_right)?,
+        ],
+    );
+    // The lift: a `Bool` decision becomes a proposition by `= true`. The
+    // SCRUTINEE is `Bool.true` and nothing else — `Bool.false` here would mint
+    // the complementary function while every arm, index and width stayed
+    // right, which is why `l5_p4` refuses that mutant explicitly.
+    let prop = Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
+        [bool_ty, decision.clone(), bool_true.clone()],
+    );
+    let inst = Expr::apps(inst_c("instDecidableEqBool"), [decision, bool_true]);
+    // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth — the
+    // same polarity trap all three sibling routes document.
+    let body = Expr::apps(
+        Expr::const_(Name::from_string("ite"), vec![one]),
+        [ty.clone(), prop, inst, operand(then_arm)?, operand(else_arm)?],
+    );
+    let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, d.ty(), acc));
+    let arrow_ty = (0..n).fold(d.ty(), |acc, _| Expr::arrow(d.ty(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the `==`-select defining equation: {e:?}"))?;
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
+}
+
+/// **§6f LANDING 8** — one DECISION operand of
+/// [`admit_select_beq_operands_function`].
+///
+/// [`SelectOperand`]'s two leaves, plus a COMPUTED operand carried as a SURFACE
+/// RENDERING rather than as a term.
+///
+/// # The rendering is the point, not a shortcut
+///
+/// A `Computed` operand's `Expr` is built by [`elab_term`] — the FROZEN
+/// elaborator this crate has used for the Rust→Clean direction since long
+/// before the Clean-origin lane existed, and the same one `admit_expr_function`
+/// calls for a whole-body `p0 & 1`. So the computed subterm rides frozen-R's
+/// pedigree exactly as §6f landing 7's four raw-binop rows do, and this route
+/// authors no new arithmetic encoding at all: it authors the `ite` frame around
+/// one, which is what its three sibling select routes already do.
+///
+/// The de Bruijn convention matches by construction rather than by agreement:
+/// `elab_term(_, vars, 0, _)` gives a variable at position `i` the index
+/// `vars.len() - 1 - i`, which is the same `bvar(i)` the surrounding frame
+/// uses. There is no re-indexing step, and therefore no place one could be
+/// wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectBeqOperand {
+    /// A 0-based source parameter.
+    Param(usize),
+    /// An in-range machine numeral, minted in the CARRIER spelling
+    /// (`{C}.ofNat n`) by [`Domain::numeral`], which range-checks it and fails
+    /// closed BEFORE the kernel.
+    Literal(u128),
+    /// A computed operand, as a surface expression over `p0 … p{n-1}`
+    /// (`"p0 & 1"`, `"p0 / 3"`), elaborated by the FROZEN [`elab_term`].
+    ///
+    /// **`elab_term` is where the divisor rule is enforced on this side**, and
+    /// that is deliberate: it refuses `p0 / p1` and `p0 / 0` in its own words
+    /// (*"division/remainder in a spec requires a positive integer literal
+    /// divisor"*), from a program written years earlier for the opposite
+    /// direction which knows nothing about this lane. That is the independent
+    /// half of the double fault, not a restatement of the planner's rule.
+    Computed(String),
+}
+
+/// Mint an E6 [`Admission`] for a **GENERAL `BEq`-CONDITIONED SELECT**
+/// (§6f landing 8) — [`admit_select_beq_function`]'s tree with the two
+/// coordinates that route fixes made parameters:
+///
+/// ```text
+/// def q (a b : UInt64) : UInt64 := if (a &&& 1) == 0 then a else b   -- computed operand
+/// def r (a b : UInt64) : UInt64 := if (a == b) = false then a else b -- scrutinee `false`
+/// ```
+///
+/// A **NEW admit route**, added BESIDE [`admit_select_function`],
+/// [`admit_select_literal_function`], [`admit_select_operands_function`] and
+/// [`admit_select_beq_function`], all of which are untouched — the discipline
+/// R2/C9 established when the literal comparison operand turned out to be
+/// unrepresentable in a frozen producer's signature, and which §6f landings 3
+/// and 6 each repeated rather than widening a shipped signature.
+///
+/// # `scrutinee` is a POLARITY, and it is the caller's to state because side B
+/// READ it
+///
+/// The lift `<decision> = <scrutinee>` is what turns a `Bool` into a
+/// proposition. `==` lifts against `Bool.true`; `(a == b) = false` lifts against
+/// `Bool.false`, and the two are NOT definitionally equal — the island refuses
+/// `rfl` between them, and refuses it even against the `==` body with SWAPPED
+/// ARMS, which computes the same function
+/// (`trust-clean-origin/tests/landing8_selection_probes.rs::l8_p2`). So a
+/// caller that passed the wrong polarity would mint the COMPLEMENTARY function
+/// and the gate would refuse it, which is why this is a parameter rather than
+/// a flag the route infers.
+///
+/// `Bool.false` is minted for `false`, and a real source spells the scrutinee
+/// `false` — a bare, depth-1 constant, NOT `Bool.false`. The two are
+/// definitionally equal (measured, `l8_p2`), so the kernel bridges the
+/// spellings; what must never happen is a READER keyed on a spelling no source
+/// produces, and that constraint binds `trust-clean-origin`'s side-A recogniser,
+/// not this producer.
+///
+/// # The instance is UNIFORM, exactly as in the narrow route
+///
+/// `instDecidableEqBool <decision> <scrutinee>` for every operand vocabulary
+/// and both polarities, because the decision is resolved at `Bool`, one layer
+/// above the carrier. That is measured, and it is the reason a COMPUTED operand
+/// is cheap HERE and refused under `<`/`<=`: `if a + 1 < b` resolves its
+/// decidability through a `Nat.rec`-headed normal form of the modular
+/// reduction, while `if (a &&& 1) == 0` carries the computed operand VERBATIM
+/// in both the proposition and the instance (`l8_p1`).
+///
+/// `add_decl` FULL-KERNEL-CHECKS the result; a wrong operand is a wrong term
+/// the caller's definitional-reduction test refuses.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_select_beq_operands_function(
+    env: &mut Environment,
+    kernel_const: &str,
+    param_domains: &[Domain],
+    scrutinee: bool,
+    cmp_left: &SelectBeqOperand,
+    cmp_right: &SelectBeqOperand,
+    then_arm: SelectOperand,
+    else_arm: SelectOperand,
+) -> Result<Admission, String> {
+    let n = param_domains.len();
+    let mut indices = Vec::new();
+    for operand in [cmp_left, cmp_right] {
+        if let SelectBeqOperand::Param(index) = operand {
+            indices.push(*index);
+        }
+    }
+    for operand in [then_arm, else_arm] {
+        if let SelectOperand::Param(index) = operand {
+            indices.push(index);
+        }
+    }
+    for index in indices {
+        if index >= n {
+            return Err(format!("select index {index} out of range for a {n}-parameter function"));
+        }
+    }
+    let d = param_domains.first().ok_or("select needs at least one parameter")?;
+    if !param_domains.iter().all(|x| x == d) {
+        return Err("select over mixed parameter domains is unsupported".into());
+    }
+    let carrier = match d {
+        Domain::Machine(w) => w.carrier(),
+        _ => return Err("select currently requires a machine-integer domain".into()),
+    };
+    // Under n binders the source parameter i is de Bruijn index n-1-i — the
+    // convention `elab_term` uses at offset 0, so a computed operand's term
+    // needs no re-indexing and there is no second place an index could be set.
+    let bvar = |i: usize| Expr::bvar((n - 1 - i) as u32);
+    let names: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+    let arm = |o: SelectOperand| -> Result<Expr, String> {
+        match o {
+            SelectOperand::Param(index) => Ok(bvar(index)),
+            SelectOperand::Literal(value) => d.numeral(value),
+        }
+    };
+    let decision_operand = |o: &SelectBeqOperand| -> Result<Expr, String> {
+        match o {
+            SelectBeqOperand::Param(index) => Ok(bvar(*index)),
+            SelectBeqOperand::Literal(value) => d.numeral(*value),
+            SelectBeqOperand::Computed(rendering) => {
+                let syn: SynExpr = syn::parse_str(rendering)
+                    .map_err(|e| format!("parse error in a computed select operand: {e}"))?;
+                elab_term(&syn, &names, 0, d)
+            }
+        }
+    };
+    let ty = d.ty();
+    let zero = Level::zero();
+    let one = Level::succ(Level::zero());
+    let inst_c = |s: &str| Expr::const_(Name::from_string(s), vec![]);
+    let bool_ty = Expr::const_(Name::from_string("Bool"), vec![]);
+    let bool_lit =
+        Expr::const_(Name::from_string(if scrutinee { "Bool.true" } else { "Bool.false" }), vec![]);
+    // The `Bool`-level DECISION, built ONCE: it appears in the proposition AND
+    // inside the instance, and two constructions of one subterm are two places
+    // a spelling can drift.
+    let decision = Expr::apps(
+        Expr::const_(Name::from_string("BEq.beq"), vec![zero.clone()]),
+        [
+            ty.clone(),
+            Expr::apps(
+                Expr::const_(Name::from_string("instBEqOfDecidableEq"), vec![zero]),
+                [ty.clone(), inst_c(&format!("instDecidableEq{carrier}"))],
+            ),
+            decision_operand(cmp_left)?,
+            decision_operand(cmp_right)?,
+        ],
+    );
+    let prop = Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![one.clone()]),
+        [bool_ty, decision.clone(), bool_lit.clone()],
+    );
+    let inst = Expr::apps(inst_c("instDecidableEqBool"), [decision, bool_lit]);
+    // ARGUMENT ORDER: `ite α c h t e` takes THEN fourth and ELSE fifth — the
+    // same polarity trap all four sibling routes document, and one that BITES
+    // twice here: with `scrutinee = false` the arms read in the order the
+    // SOURCE wrote them, never swapped to "compensate" for the negation.
+    let body = Expr::apps(
+        Expr::const_(Name::from_string("ite"), vec![one]),
+        [ty.clone(), prop, inst, arm(then_arm)?, arm(else_arm)?],
+    );
+    let lam = (0..n).fold(body, |acc, _| Expr::lam(BinderInfo::Default, d.ty(), acc));
+    let arrow_ty = (0..n).fold(d.ty(), |acc, _| Expr::arrow(d.ty(), acc));
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string(kernel_const),
+        level_params: vec![],
+        type_: arrow_ty,
+        value: lam,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("kernel rejected the general `==`-select defining equation: {e:?}"))?;
+    // I2: reflected carrier — see `admit_constant_function`.
+    Ok(Admission::reflected(kernel_const, n))
+}
+
 thread_local! {
     /// E6 brick 4: the ambient facet table for the current admission-aware
     /// elaboration. `elab_term`'s call arm reads it to elaborate an ADMITTED
@@ -2748,6 +3484,18 @@ fn parse_exact_typed_clause(
     let ast: SynExpr = syn::parse_str(spec).map_err(|e| format!("parse error: {e}"))?;
     let mut vars = Vec::new();
     collect_vars(&ast, &mut vars);
+    // A bare identifier that names an ambient-admitted constant is a
+    // CITATION, not a clause variable — a ZERO-ARITY one resolves to the
+    // kernel constant in `elab_term`'s Path arm, and a parametered one is
+    // refused there and in [`atom_domain`] with the fix named ("must be
+    // applied") — so the exact-binding bijection must not demand a type for
+    // it. Precedence is fail-closed and matches `elab_term`: a name the
+    // caller BINDS stays a variable (params shadow admissions), so an island
+    // definition can never change what an existing green clause means.
+    // Outside an [`AdmissionScope`] the ambient table is empty and this
+    // retains everything — the plain `elaborate_goal_typed` path is
+    // byte-identical to before.
+    vars.retain(|v| var_types.iter().any(|(n, _)| n == v) || ambient_admission(v).is_none());
     let bindings = exact_typed_bindings(&vars, var_types)?;
     Ok((ast, vars, bindings))
 }
@@ -2799,14 +3547,47 @@ fn exact_typed_bindings(
 /// The single domain of one atom (a comparison, equality, or bare boolean): the
 /// common domain of the variables occurring in it. Distinct comparisons in a
 /// `&& || !` tree may differ, but the operands of ONE comparison must share a
-/// type (`x == flag` mixing `u64` and `bool` fails closed). A variable-free
-/// atom (`2 < 3`) defaults to `Nat`; a literal adopts the atom's domain.
+/// type (`x == flag` mixing `u64` and `bool` fails closed). A VARIABLE-FREE
+/// atom derives its domain from its TERMS — an admitted callee's recorded
+/// return domain, a suffixed integer literal — and only defaults to `Nat`
+/// when no term yields one (`2 < 3`); conflicting term evidence fails closed.
+/// An unsuffixed literal adopts the atom's domain.
 fn atom_domain(atom: &SynExpr, var_domains: &BTreeMap<String, Domain>) -> Result<Domain, String> {
     let mut vs = Vec::new();
     collect_vars(atom, &mut vs);
     let mut dom: Option<Domain> = None;
     for v in &vs {
-        let d = var_domains.get(v).ok_or_else(|| format!("unbound variable `{v}`"))?;
+        let Some(d) = var_domains.get(v) else {
+            // Not a bound clause variable. A bare identifier naming an
+            // ambient-admitted ZERO-ARITY constant is a citation
+            // (`elab_term`'s Path arm resolves it to the kernel constant);
+            // its recorded return domain is term evidence exactly like an
+            // admitted CALLEE's — steering only, merged fail-closed, and an
+            // admission without a recorded domain contributes nothing. A
+            // PARAMETERED admission cited bare is refused with the fix named
+            // (its bare name is a function value, outside the term
+            // fragment). Anything else is genuinely unbound. Bindings win
+            // over admissions, same precedence as everywhere on this path.
+            if let Some(admission) = ambient_admission(v) {
+                if admission.arity != 0 {
+                    return Err(format!(
+                        "admitted `{v}` has arity {} and must be applied (`{v}(…)`); a \
+                         bare reference to a parametered definition is outside the term \
+                         fragment",
+                        admission.arity
+                    ));
+                }
+                if let Some(found) = admission.return_domain() {
+                    merge_term_domain_evidence(
+                        &mut dom,
+                        found.clone(),
+                        &format!("admitted constant `{v}`"),
+                    )?;
+                }
+                continue;
+            }
+            return Err(format!("unbound variable `{v}`"));
+        };
         match &dom {
             None => dom = Some(d.clone()),
             Some(existing) if existing == d => {}
@@ -2818,7 +3599,114 @@ fn atom_domain(atom: &SynExpr, var_domains: &BTreeMap<String, Domain>) -> Result
             }
         }
     }
+    if dom.is_none() {
+        // A variable-free atom (`answer() == c42(0)` after the ensures-path
+        // `result` rewrite) used to fall straight through to the `Nat`
+        // default, minting `Eq Nat` over machine-carrier terms — an ill-typed
+        // proposition the kernel then rejects even when the two sides ARE
+        // definitionally equal (the e6 f06–f09 defeq rejections). Derive the
+        // domain from the atom's terms instead; the `Nat` default below is
+        // reserved for an atom with genuinely NO domain evidence, so nothing
+        // is ever guessed.
+        collect_term_domain_evidence(atom, &mut dom)?;
+    }
     Ok(dom.unwrap_or(Domain::Nat))
+}
+
+/// Merge one piece of term-derived domain evidence into `dom`, failing closed
+/// on a conflict: the operands of a single comparison must share a type, and
+/// two terms that pin different domains cannot be reconciled by preferring
+/// either — whichever loses would elaborate at the wrong carrier.
+fn merge_term_domain_evidence(
+    dom: &mut Option<Domain>,
+    found: Domain,
+    source: &str,
+) -> Result<(), String> {
+    match dom {
+        None => {
+            *dom = Some(found);
+            Ok(())
+        }
+        Some(existing) if *existing == found => Ok(()),
+        Some(existing) => Err(format!(
+            "mixed domains in one comparison ({existing:?} and {found:?} from {source}) — the \
+             operands of a single comparison must share a type"
+        )),
+    }
+}
+
+/// Walk one atom for the domain its TERMS pin down. Two term shapes carry
+/// evidence:
+///
+/// * a call to an ADMITTED callee whose [`Admission`] records a return domain
+///   — read from the same ambient table `elab_term`'s call arm consults, so
+///   the domain used to type the comparison is the domain of the kernel
+///   constant that will appear in it;
+/// * a SUFFIXED integer literal (`42u64`) — the source spelled the type.
+///
+/// Everything else contributes nothing: an unsuffixed literal adopts the
+/// atom's domain exactly as before, an admission without a recorded return
+/// domain keeps the pre-existing default, and a non-admitted call fails
+/// closed later regardless of the domain chosen here. Conflicting evidence
+/// fails closed ([`merge_term_domain_evidence`]); a literal suffix outside
+/// the supported domain set fails closed with the fix rather than being
+/// silently dropped.
+fn collect_term_domain_evidence(e: &SynExpr, dom: &mut Option<Domain>) -> Result<(), String> {
+    match e {
+        SynExpr::Paren(p) => collect_term_domain_evidence(&p.expr, dom),
+        SynExpr::Unary(u) => collect_term_domain_evidence(&u.expr, dom),
+        SynExpr::Binary(b) => {
+            collect_term_domain_evidence(&b.left, dom)?;
+            collect_term_domain_evidence(&b.right, dom)
+        }
+        SynExpr::Lit(l) => {
+            if let Lit::Int(i) = &l.lit {
+                let suffix = i.suffix();
+                if !suffix.is_empty() {
+                    let found = Domain::from_binding_ty(suffix).ok_or_else(|| {
+                        format!(
+                            "unsupported literal suffix `{suffix}` in a spec atom; drop the \
+                             suffix (an unsuffixed literal adopts the comparison's domain) or \
+                             bind the value through a typed clause variable"
+                        )
+                    })?;
+                    merge_term_domain_evidence(dom, found, &format!("literal suffix `{suffix}`"))?;
+                }
+            }
+            Ok(())
+        }
+        SynExpr::Call(c) => {
+            if let SynExpr::Path(p) = &*c.func {
+                let callee = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                if let Some(found) =
+                    ambient_admission(&callee).and_then(|a| a.return_domain().cloned())
+                {
+                    merge_term_domain_evidence(dom, found, &format!("admitted callee `{callee}`"))?;
+                }
+            }
+            // Argument terms are elaborated at the atom's domain (the admitted
+            // fragment is single-domain), so evidence found inside them
+            // constrains the same choice.
+            for arg in &c.args {
+                collect_term_domain_evidence(arg, dom)?;
+            }
+            Ok(())
+        }
+        SynExpr::MethodCall(m) => {
+            collect_term_domain_evidence(&m.receiver, dom)?;
+            for arg in &m.args {
+                collect_term_domain_evidence(arg, dom)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Elaborate a proposition where each atom takes its own domain (from
@@ -5802,10 +6690,7 @@ mod machine_domain_tests {
         let mut table = table;
         table.admit("crate::f", Admission::reflected("f_def", 1));
         table.admit("crate::g", Admission::reflected("g_def", 1));
-        assert_eq!(
-            table.admitted("crate::f"),
-            Some(&Admission::reflected("f_def", 1))
-        );
+        assert_eq!(table.admitted("crate::f"), Some(&Admission::reflected("f_def", 1)));
         assert_eq!(
             table.admitted("crate::g"),
             None,
@@ -5819,15 +6704,21 @@ mod machine_domain_tests {
     #[test]
     fn a_minted_carrier_is_reflected_and_findable_by_kernel_constant() {
         let mut env = Environment::with_prelude();
-        let adm = admit_constant_function(&mut env, "trust_import_crate__answer", 42, MachineUIntWidth::U64)
-            .expect("a constant u64 function must admit");
+        let adm = admit_constant_function(
+            &mut env,
+            "trust_import_crate__answer",
+            42,
+            MachineUIntWidth::U64,
+        )
+        .expect("a constant u64 function must admit");
         assert!(adm.status().is_reflected());
         assert!(
             adm.require_kernel_check().is_err(),
             "a reflected carrier never satisfies a kernel-check requirement"
         );
 
-        let mut table = FacetTable::from_structural_facets([("crate::answer", true, true, true, true)]);
+        let mut table =
+            FacetTable::from_structural_facets([("crate::answer", true, true, true, true)]);
         table.admit("crate::answer", adm);
         // Found by the KERNEL CONSTANT, not the callee path — that is the
         // lookup the refusal site has available.
@@ -5918,6 +6809,145 @@ mod machine_domain_tests {
     }
 
     #[test]
+    fn admit_select_literal_function_mints_kernel_checked_threshold_selects() {
+        let mut env = Environment::with_prelude();
+        let u = Domain::Machine(MachineUIntWidth::U64);
+        // fn min10(a, b) -> u64 { if a < 10 { a } else { b } } — R2/C9's shape.
+        admit_select_literal_function(
+            &mut env,
+            "min10_def",
+            &[u.clone(), u.clone()],
+            SelectCmp::Lt,
+            0,
+            10,
+            0,
+            1,
+        )
+        .expect("the threshold select must admit");
+        // fn ifz(a, b) -> u64 { if a == 0 { b } else { a } } — gcd's guard shape.
+        admit_select_literal_function(
+            &mut env,
+            "ifz_def",
+            &[u.clone(), u.clone()],
+            SelectCmp::Eq,
+            0,
+            0,
+            1,
+            0,
+        )
+        .expect("the zero-guard select must admit");
+        // fn le5(a, b) -> u64 { if a <= 5 { a } else { b } }.
+        admit_select_literal_function(
+            &mut env,
+            "le5_def",
+            &[u.clone(), u.clone()],
+            SelectCmp::Le,
+            0,
+            5,
+            0,
+            1,
+        )
+        .expect("the Le threshold select must admit");
+
+        // The kernel knows the minted type.
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let uint64 = || Expr::const_(Name::from_string("UInt64"), vec![]);
+        let arrow = Expr::arrow(uint64(), Expr::arrow(uint64(), uint64()));
+        tc.check_type(&Expr::const_(Name::from_string("min10_def"), vec![]), &arrow)
+            .expect("min10_def typechecks as u64 -> u64 -> u64");
+
+        // SEMANTIC validation by definitional reduction — the branch is taken
+        // correctly on closed inputs, INCLUDING the boundary value, where a
+        // Le-for-Lt (or off-by-one-literal) mistake would show.
+        let n = |v: u64| u.numeral(u128::from(v)).unwrap();
+        let app2 = |f: &str, a: u64, b: u64| {
+            Expr::apps(Expr::const_(Name::from_string(f), vec![]), [n(a), n(b)])
+        };
+        assert!(tc.is_def_eq(&app2("min10_def", 3, 99), &n(3)), "min10(3,99) = 3");
+        assert!(tc.is_def_eq(&app2("min10_def", 15, 99), &n(99)), "min10(15,99) = 99");
+        assert!(tc.is_def_eq(&app2("min10_def", 10, 99), &n(99)), "min10(10,99) = 99 (boundary)");
+        assert!(tc.is_def_eq(&app2("ifz_def", 0, 7), &n(7)), "ifz(0,7) = 7");
+        assert!(tc.is_def_eq(&app2("ifz_def", 3, 7), &n(3)), "ifz(3,7) = 3");
+        assert!(tc.is_def_eq(&app2("le5_def", 5, 9), &n(5)), "le5(5,9) = 5 (boundary)");
+        assert!(tc.is_def_eq(&app2("le5_def", 6, 9), &n(9)), "le5(6,9) = 9");
+    }
+
+    #[test]
+    fn admit_select_literal_function_fails_closed() {
+        let mut env = Environment::with_prelude();
+        let u64d = || Domain::Machine(MachineUIntWidth::U64);
+        let u8d = || Domain::Machine(MachineUIntWidth::U8);
+
+        // Out-of-range literal: range-checked BEFORE the kernel, fails closed.
+        assert!(
+            admit_select_literal_function(
+                &mut env,
+                "bad_range",
+                &[u8d(), u8d()],
+                SelectCmp::Lt,
+                0,
+                300,
+                0,
+                1,
+            )
+            .is_err(),
+            "literal 300 does not fit u8"
+        );
+        // Out-of-range parameter index.
+        assert!(
+            admit_select_literal_function(
+                &mut env,
+                "bad_index",
+                &[u64d(), u64d()],
+                SelectCmp::Lt,
+                2,
+                10,
+                0,
+                1,
+            )
+            .is_err(),
+            "parameter 2 of a 2-parameter function"
+        );
+        // Mixed parameter domains.
+        assert!(
+            admit_select_literal_function(
+                &mut env,
+                "bad_mixed",
+                &[u64d(), u8d()],
+                SelectCmp::Lt,
+                0,
+                10,
+                0,
+                1,
+            )
+            .is_err(),
+            "select over mixed domains is unsupported"
+        );
+        // Non-machine domain.
+        assert!(
+            admit_select_literal_function(
+                &mut env,
+                "bad_domain",
+                &[Domain::Nat, Domain::Nat],
+                SelectCmp::Lt,
+                0,
+                10,
+                0,
+                1,
+            )
+            .is_err(),
+            "select requires a machine-integer domain"
+        );
+        // None of the refusals left a constant behind.
+        for name in ["bad_range", "bad_index", "bad_mixed", "bad_domain"] {
+            assert!(
+                env.get_const(&Name::from_string(name)).is_none(),
+                "a refused mint must not leave `{name}` in the environment"
+            );
+        }
+    }
+
+    #[test]
     fn admit_expr_function_mints_a_semantically_correct_arithmetic_admission() {
         let mut env = Environment::with_prelude();
         let u = Domain::Machine(MachineUIntWidth::U64);
@@ -5964,6 +6994,254 @@ mod machine_domain_tests {
         let u = || Expr::const_(Name::from_string("UInt64"), vec![]);
         let arrow = Expr::arrow(u(), Expr::arrow(u(), u()));
         tc.check_type(&fst, &arrow).expect("fst_def typechecks as u64 → u64 → u64");
+    }
+
+    /// C6 clause-path regression (e6 probes f06–f09): a VARIABLE-FREE ensures
+    /// atom used to fall to the `Nat` default and mint `Eq Nat` over `UInt64`
+    /// terms — ill-typed, so the defeq route rejected clauses whose two sides
+    /// were definitionally equal. The atom's domain now comes from its TERMS:
+    /// here, the admitted callees' recorded return domains.
+    #[test]
+    fn variable_free_atom_elaborates_at_the_admitted_callees_return_domain() {
+        let mut env = Environment::with_prelude();
+        let u64d = Domain::Machine(MachineUIntWidth::U64);
+        // `fn answer() -> u64 { 42 }` (the probes' self-fn) and `cid`, a
+        // one-parameter identity applied to a literal (probe f09's shape).
+        admit_constant_function(&mut env, "answer_def", 42, MachineUIntWidth::U64)
+            .expect("constant admits");
+        admit_projection_function(&mut env, "cid_def", &[u64d.clone()], 0)
+            .expect("identity admits");
+
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let admissible =
+            || FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
+        let mut facets = FacetTable::new();
+        facets.insert("answer", admissible());
+        facets.admit(
+            "answer",
+            Admission::reflected("answer_def", 0).with_return_domain(u64d.clone()),
+        );
+        facets.insert("cid", admissible());
+        facets.admit("cid", Admission::reflected("cid_def", 1).with_return_domain(u64d.clone()));
+
+        // On a nullary function the `result` rewrite leaves NO free variable:
+        // `result == cid(42)` becomes `answer() == cid(42)`.
+        let goal = elaborate_ensures("result == cid(42)", &[], "answer", &facets)
+            .expect("a variable-free machine atom must elaborate");
+
+        // KERNEL-CHECKED, twice over: the goal must be a well-typed
+        // proposition (`Eq UInt64 …`, not the old ill-typed `Eq Nat` over
+        // UInt64 terms), and reflexivity must close it — both sides reduce to
+        // `UInt64.ofNat 42`, which is exactly the probes' defeq route.
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let _ = tc
+            .infer_type(&goal)
+            .expect("the machine-domain goal must be well-typed");
+        let refl = Expr::apps(
+            Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+            [
+                Expr::const_(Name::from_string("UInt64"), vec![]),
+                Expr::const_(Name::from_string("answer_def"), vec![]),
+            ],
+        );
+        tc.check_type(&refl, &goal).expect("Eq.refl must close the machine-domain goal");
+    }
+
+    /// The default is preserved: with NO term evidence the variable-free atom
+    /// still elaborates over `Nat`, and an admission that records no return
+    /// domain (exactly what the four `admit_*` mints produce) changes nothing
+    /// — the fix derives, it does not guess.
+    #[test]
+    fn a_variable_free_atom_without_term_evidence_still_defaults_to_nat() {
+        let env = Environment::with_prelude();
+        let tc = clean_kernel::TypeChecker::new(&env);
+
+        // No calls, no suffixes: byte-identical to the untyped Nat path.
+        let goal = elaborate_goal_typed("2 < 3", &[]).expect("bare literal atom elaborates");
+        let want = elaborate_goal("2 < 3").expect("the Nat path elaborates");
+        assert!(tc.is_def_eq(&goal, &want), "no evidence keeps the Nat default");
+
+        // An admitted callee whose admission records NO return domain: the
+        // atom still elaborates at the default, minting `Eq Nat` over the
+        // UInt64 constant, and the reflexivity candidate still fails
+        // `check_type` — the exact pre-fix "defeq-rejected" symptom the e6
+        // probes showed (`infer_type` alone runs infer-only and does not
+        // check App arguments, so the refusal is check_type's).
+        let mut env2 = Environment::with_prelude();
+        admit_constant_function(&mut env2, "answer_def", 42, MachineUIntWidth::U64)
+            .expect("constant admits");
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let mut facets = FacetTable::new();
+        facets.insert(
+            "answer",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        facets.admit("answer", Admission::reflected("answer_def", 0));
+        let goal = elaborate_goal_typed_with_facets("answer() == 42", &[], &facets)
+            .expect("elaboration itself is total over the admitted structure");
+        let tc2 = clean_kernel::TypeChecker::new(&env2);
+        let refl = Expr::apps(
+            Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+            [nat(), Expr::const_(Name::from_string("answer_def"), vec![])],
+        );
+        assert!(
+            tc2.check_type(&refl, &goal).is_err(),
+            "a domain-less admission must keep the pre-fix Nat default (the reflexivity \
+             candidate stays refused by the kernel), not guess the machine domain"
+        );
+    }
+
+    /// The wrong-domain controls: conflicting term evidence refuses instead of
+    /// picking a side, and a contradictory typed literal refuses the same way.
+    #[test]
+    fn conflicting_term_domain_evidence_refuses() {
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let admissible =
+            || FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
+        let mut facets = FacetTable::new();
+        facets.insert("a64", admissible());
+        facets.admit(
+            "a64",
+            Admission::reflected("a64_def", 0)
+                .with_return_domain(Domain::Machine(MachineUIntWidth::U64)),
+        );
+        facets.insert("b32", admissible());
+        facets.admit(
+            "b32",
+            Admission::reflected("b32_def", 0)
+                .with_return_domain(Domain::Machine(MachineUIntWidth::U32)),
+        );
+
+        // Two admitted callees with different recorded return domains.
+        let err = elaborate_goal_typed_with_facets("a64() == b32()", &[], &facets)
+            .expect_err("a u64/u32 comparison must refuse");
+        assert!(err.contains("mixed domains"), "unexpected diagnostic: {err}");
+
+        // A typed literal contradicting the callee's recorded domain.
+        let err = elaborate_goal_typed_with_facets("a64() == 42u32", &[], &facets)
+            .expect_err("a u64 callee against a u32 literal must refuse");
+        assert!(err.contains("mixed domains"), "unexpected diagnostic: {err}");
+    }
+
+    /// e6 probe f04's spelling at the elaborator: a BARE identifier naming an
+    /// ambient-admitted ZERO-ARITY constant is a citation, not a clause
+    /// variable — it elaborates to the admitted kernel constant (the same
+    /// constant `c()` resolves to), the exact-binding gate does not demand a
+    /// type for it, and its recorded return domain types the atom.
+    #[test]
+    fn a_bare_identifier_naming_a_nullary_admission_elaborates_to_its_constant() {
+        let mut env = Environment::with_prelude();
+        admit_constant_function(&mut env, "c_def", 42, MachineUIntWidth::U64)
+            .expect("constant admits");
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let mut facets = FacetTable::new();
+        facets.insert(
+            "c",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        facets.admit(
+            "c",
+            Admission::reflected("c_def", 0)
+                .with_return_domain(Domain::Machine(MachineUIntWidth::U64)),
+        );
+
+        let goal = elaborate_goal_typed_with_facets("c == 42", &[], &facets)
+            .expect("a bare nullary citation must elaborate");
+        // Same proposition as the CALLED spelling — one admission, one
+        // constant, two surface spellings.
+        let called = elaborate_goal_typed_with_facets("c() == 42", &[], &facets)
+            .expect("the called spelling elaborates");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let _ = tc
+            .infer_type(&goal)
+            .expect("the bare-citation goal must be well-typed");
+        assert!(
+            tc.is_def_eq(&goal, &called),
+            "bare and called spellings must elaborate to the same proposition"
+        );
+    }
+
+    /// Precedence is fail-closed: a clause BINDING shadows a same-named
+    /// admission, so an island definition can never change what an existing
+    /// green clause means. `x` stays the ∀-bound variable even when an
+    /// admitted constant `x` (:= 7) exists.
+    #[test]
+    fn a_clause_binding_shadows_a_same_named_nullary_admission() {
+        let mut env = Environment::with_prelude();
+        admit_constant_function(&mut env, "x_def", 7, MachineUIntWidth::U64)
+            .expect("constant admits");
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let mut facets = FacetTable::new();
+        facets.insert(
+            "x",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        facets.admit(
+            "x",
+            Admission::reflected("x_def", 0)
+                .with_return_domain(Domain::Machine(MachineUIntWidth::U64)),
+        );
+
+        let shadowed = elaborate_goal_typed_with_facets("x == 1", &[("x", "u64")], &facets)
+            .expect("a bound variable must stay elaborable under a same-named admission");
+        let plain = elaborate_goal_typed("x == 1", &[("x", "u64")])
+            .expect("the no-facets elaboration is the reference");
+        let tc = clean_kernel::TypeChecker::new(&env);
+        assert!(
+            tc.is_def_eq(&shadowed, &plain),
+            "the binding must win: `x` is the ∀-bound variable, never the admitted \
+             constant (x_def := 7 would make this `∀ x, 7 == 1`)"
+        );
+    }
+
+    /// A parametered admission cited bare keeps failing closed — its bare name
+    /// is a function value, outside the term fragment — and the refusal names
+    /// the fix (v7/D3). An unadmitted bare identifier still fails the
+    /// exact-binding gate exactly as before.
+    #[test]
+    fn a_bare_reference_to_a_parametered_admission_fails_closed_with_the_fix() {
+        let cert = || FacetStatus::Certified { evidence: "test".into() };
+        let mut facets = FacetTable::new();
+        facets.insert(
+            "f",
+            FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
+        );
+        facets.admit(
+            "f",
+            Admission::reflected("f_def", 1)
+                .with_return_domain(Domain::Machine(MachineUIntWidth::U64)),
+        );
+
+        let err = elaborate_goal_typed_with_facets("f == 1", &[], &facets)
+            .expect_err("a bare arity-1 reference must refuse");
+        assert!(err.contains("must be applied"), "the refusal must carry the fix: {err}");
+
+        let err = elaborate_goal_typed_with_facets("y == 1", &[], &facets)
+            .expect_err("an unadmitted bare identifier must still refuse");
+        assert!(
+            err.contains("not exact") && err.contains("y"),
+            "the exact-binding gate must still name the unbound identifier: {err}"
+        );
+    }
+
+    /// A SUFFIXED literal is domain evidence on its own — and an unsupported
+    /// suffix fails closed with the fix rather than silently minting `Nat`.
+    #[test]
+    fn a_typed_literal_pins_the_variable_free_atoms_domain() {
+        let env = Environment::with_prelude();
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let goal = elaborate_goal_typed("42u64 == 42", &[]).expect("suffixed literal elaborates");
+        let _ = tc
+            .infer_type(&goal)
+            .expect("the machine-domain goal must be well-typed");
+        let want = elaborate_goal_in("42 == 42", &Domain::Machine(MachineUIntWidth::U64))
+            .expect("explicit-domain path elaborates");
+        assert!(tc.is_def_eq(&goal, &want), "the u64 suffix must select the UInt64 carrier");
+
+        // `usize` names no width; refusing carries the fix (v7/D3).
+        let err =
+            elaborate_goal_typed("1usize == 1", &[]).expect_err("a widthless suffix must refuse");
+        assert!(err.contains("unsupported literal suffix"), "unexpected diagnostic: {err}");
     }
 
     // E9 discharge criterion (design note 2026-07-15): `elaborate_ensures`
@@ -6263,8 +7541,10 @@ mod machine_domain_tests {
         t.admit("min2", Admission::reflected("min2", 2));
 
         for use_site in [trust_symbols::Capability::Proof, trust_symbols::Capability::Call] {
-            let goal = elaborate_goal_typed_in(use_site, "min2(x, y) <= x", vt, &t)
-                .unwrap_or_else(|e| panic!("a reflected Rust carrier is executable ({use_site:?}): {e}"));
+            let goal =
+                elaborate_goal_typed_in(use_site, "min2(x, y) <= x", vt, &t).unwrap_or_else(|e| {
+                    panic!("a reflected Rust carrier is executable ({use_site:?}): {e}")
+                });
             assert!(format!("{goal:?}").contains("min2"), "{goal:?}");
         }
     }
@@ -6373,7 +7653,9 @@ mod machine_domain_tests {
         assert_eq!(once.restrict(call, None).capability(), proof);
         // Unrecorded is absorbing here too.
         assert_eq!(
-            Admission::reflected("h", 1).restrict(EffectiveCapability::Unrecorded, None).capability(),
+            Admission::reflected("h", 1)
+                .restrict(EffectiveCapability::Unrecorded, None)
+                .capability(),
             EffectiveCapability::Unrecorded
         );
     }
@@ -6408,8 +7690,9 @@ mod machine_domain_tests {
             FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() },
         );
         t.admit("f", Admission::reflected("f_def", 2));
-        let goal = elaborate_ensures("result <= clean_min2(x, y)", &[("x", "u64"), ("y", "u64")], "f", &t)
-            .expect("a citation observes a proof-only symbol without ceremony");
+        let goal =
+            elaborate_ensures("result <= clean_min2(x, y)", &[("x", "u64"), ("y", "u64")], "f", &t)
+                .expect("a citation observes a proof-only symbol without ceremony");
         assert!(format!("{goal:?}").contains("clean_min2"), "{goal:?}");
     }
 

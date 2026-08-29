@@ -133,9 +133,7 @@ impl Mutation {
     }
 
     pub fn from_name(s: &str) -> Option<Self> {
-        std::iter::once(Mutation::None)
-            .chain(BATTERY)
-            .find(|m| m.name() == s)
+        std::iter::once(Mutation::None).chain(BATTERY).find(|m| m.name() == s)
     }
 
     /// The real fault this mutation reproduces, and the state component whose

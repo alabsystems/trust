@@ -11,8 +11,16 @@ use std::process::Command;
 
 pub const OUT_N: usize = 10;
 pub const OUT_NAMES: [&str; OUT_N] = [
-    "EXECUTED", "SIGILL", "MEMFAULT", "TRAP_SELF", "ESCAPED", "SIGSYS", "SIGFPE", "TIMEOUT",
-    "OTHER", "KILLED",
+    "EXECUTED",
+    "SIGILL",
+    "MEMFAULT",
+    "TRAP_SELF",
+    "ESCAPED",
+    "SIGSYS",
+    "SIGFPE",
+    "TIMEOUT",
+    "OTHER",
+    "KILLED",
 ];
 /// The only outcome that violates the invariant: the CPU refused the encoding.
 pub const OUT_SIGILL: usize = 1;

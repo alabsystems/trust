@@ -1,0 +1,12 @@
+# Blob-equivalence INPUT side: the original creusot/pearlite-attributed
+# source. This package is the tippy lint's input in the full lane; it is
+# never driven through `targo trust spec` itself.
+[package]
+name = "creusot-equiv-pearlite"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

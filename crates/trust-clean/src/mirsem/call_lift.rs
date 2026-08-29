@@ -478,7 +478,12 @@ pub(super) fn sem_call_arg_operand(
     {
         let opaque_call_value = match body.locals.get(place.local).map(|local| &local.ty) {
             Some(Ty::Ref { mutable: false, .. }) => !deref_write_exists(body, place.local),
-            Some(Ty::RawPtr { .. }) => true,
+            // Trust: SYMMETRY WITH THE SHARED-REF ARM (2026-08-24). This was
+            // unconditionally `true` while the `Ty::Ref` arm directly above requires
+            // `!deref_write_exists`. The asymmetry was undocumented and strictly
+            // weaker: a raw pointer written through in this body is exactly the case
+            // the shared-ref check exists to reject.
+            Some(Ty::RawPtr { .. }) => !deref_write_exists(body, place.local),
             Some(ty)
                 if crate::assignment_types::modeled_enum_variant_count(&body.datatype_defs, ty)
                     .is_some() =>
@@ -514,8 +519,7 @@ pub(super) fn sem_call_arg_operand(
     }
     // Trust: W-CAST-ARG — a SAME-WIDTH signedness-reinterpret bitcast fed as the
     // actual argument (signed leading_zeros/swap_bytes/reverse_bits delegate).
-    if let Some(bitcast) =
-        sem_call_arg_samewidth_bitcast_operand(body, op, use_block, param_index)
+    if let Some(bitcast) = sem_call_arg_samewidth_bitcast_operand(body, op, use_block, param_index)
     {
         return Some(bitcast);
     }
@@ -794,9 +798,9 @@ pub(super) fn sem_call_arg_field_read_operand(
     // deterministic-opaque-token shape at a different width and depth.
     if let Some(Ty::Ref { mutable: false, inner }) = body.locals.get(p.local).map(|l| &l.ty)
         && let Ty::Adt { fields, .. } = inner.as_ref()
-        && fields.get(*fld).is_some_and(|(_, ty)| {
-            opaque_guard_newtype_u64(ty) || opaque_guard_newtype_chain(ty)
-        })
+        && fields
+            .get(*fld)
+            .is_some_and(|(_, ty)| opaque_guard_newtype_u64(ty) || opaque_guard_newtype_chain(ty))
     {
         if param_reassigned_by_stmt(body, p.local) || deref_write_exists(body, p.local) {
             return None;
@@ -833,6 +837,52 @@ pub(super) fn sem_call_arg_field_read_operand(
 
 /// Follow only `Goto` edges from MIR entry (`BlockId(0)`) and report whether
 /// `target` is reached. Bounded by the block count so a cycle fails closed.
+/// Trust: GUARDED DELEGATION (2026-08-24) — the blocks from which `ret` is
+/// reachable, i.e. the blocks a RETURNING execution can occupy.
+///
+/// Successors are taken exactly as MIR gives them, with three deliberate empties:
+/// a `Call` with `target: None` never returns, and `Unreachable`/`Resume` have no
+/// successor at all. Everything reachable only through those is therefore outside
+/// the returning subgraph.
+fn blocks_that_can_return(
+    body: &trust_types::VerifiableBody,
+    ret: trust_types::BlockId,
+) -> Vec<trust_types::BlockId> {
+    let mut set: Vec<trust_types::BlockId> = vec![ret];
+    // Backward fixpoint: a block is returning if ANY successor is.
+    loop {
+        let mut grew = false;
+        for block in &body.blocks {
+            if set.contains(&block.id) {
+                continue;
+            }
+            if block_successors(block).iter().any(|s| set.contains(s)) {
+                set.push(block.id);
+                grew = true;
+            }
+        }
+        if !grew {
+            return set;
+        }
+    }
+}
+
+/// MIR successors of a block. A diverging call, `Unreachable` and `Resume` have
+/// none — that is the whole content of the divergence-sink treatment.
+fn block_successors(block: &trust_types::BasicBlock) -> Vec<trust_types::BlockId> {
+    use trust_types::Terminator;
+    match &block.terminator {
+        Terminator::Goto(t) => vec![*t],
+        Terminator::Call { target, .. } => target.iter().copied().collect(),
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            let mut v: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+            v.push(*otherwise);
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(super) fn goto_only_entry_reaches(
     body: &trust_types::VerifiableBody,
     target: trust_types::BlockId,
@@ -886,13 +936,42 @@ pub(super) fn goto_only_entry_reaches(
 /// `call_return_fully_faithful_via_trustir` reuses this recognizer SHAPE-ONLY;
 /// its kernel evidence is the trust-ir `callReturnInstance`, and no MirSem
 /// kernel certificate is minted on that path.)
+/// Trust: DECLINE REASON (2026-08-24). Record WHY the lane refused, without
+/// changing whether it refuses.
+///
+/// The recognizer had ~20 fail-closed exits and reported all of them as one
+/// undifferentiated `None`, which the census then reports as a single `SHAPE_GAP`
+/// bucket covering ~2892 real bodies. Two consecutive widening attempts were
+/// planned from MIR-shape histograms and gained exactly zero, because the shape
+/// filter cannot see which gate actually fired — the recognizer knows, and could
+/// not say. This makes it say.
+///
+/// Diagnostic only: `decline` sets the reason and returns `None`, so the control
+/// flow is byte-identical to `return None`.
+#[inline]
+fn decline<T>(why: &mut Option<&'static str>, reason: &'static str) -> Option<T> {
+    if why.is_none() {
+        *why = Some(reason);
+    }
+    None
+}
+
 pub(crate) fn sem_call_return_of_mir(
     func: &trust_types::VerifiableFunction,
     callees: &std::collections::BTreeMap<String, CalleeFact>,
 ) -> Option<SemCallReturn> {
+    sem_call_return_of_mir_diag(func, callees, &mut None)
+}
+
+/// [`sem_call_return_of_mir`] that also reports the FIRST gate to refuse.
+pub(crate) fn sem_call_return_of_mir_diag(
+    func: &trust_types::VerifiableFunction,
+    callees: &std::collections::BTreeMap<String, CalleeFact>,
+    why: &mut Option<&'static str>,
+) -> Option<SemCallReturn> {
     use trust_types::{Operand, Rvalue, Statement, Terminator, Ty};
     if callees.is_empty() {
-        return None; // no certified callee ⇒ the shape can never be admitted.
+        return decline(why, "no-certified-callee-in-registry"); // no certified callee ⇒ the shape can never be admitted.
     }
     let body = &func.body;
     let arg_count = body.arg_count;
@@ -923,10 +1002,31 @@ pub(crate) fn sem_call_return_of_mir(
     // Any `Unsupported` statement anywhere ⇒ unmodeled semantics ⇒ fail closed.
     if body.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(s, Statement::Unsupported { .. }))
     {
-        return None;
+        return decline(why, "Unsupported-statement-in-body");
     }
 
-    // EXACTLY ONE Call terminator; every other terminator must be Goto/Return.
+    // EXACTLY ONE RETURNING Call terminator; every other terminator must be
+    // Goto/Return, or a DIVERGENCE SINK.
+    //
+    // Trust: DIVERGING CALLS ARE SINKS (2026-08-24). A `Terminator::Call` with
+    // `target: None` has NO successor — rustc emits that shape only for a callee
+    // typed `!`, and `core::panicking::panic{,_fmt,_nounwind_fmt}` /
+    // `assert_failed` are the overwhelming instances (measured: 511 of 511 panic
+    // call sites in a 3082-body real-code harvest have `target: None`, and none
+    // has a target). No RETURNING execution passes through such a block, and this
+    // certificate speaks only about returning executions — the transport lemma is
+    // partial correctness, with no termination obligation anywhere.
+    //
+    // Previously any second `Call` declined the body outright, so an ordinary
+    // `fn f(x) -> T { g(x) }` compiled with a bounds check or an `unwrap` was
+    // rejected for a call it can never return from. Measured on the same harvest:
+    // 244 SHAPE_GAP bodies contain a diverging call while every LIVE callee is
+    // available, 96 of them leaving exactly one live call.
+    //
+    // `Unreachable` is admitted for the same reason and was already excluded only
+    // by the catch-all. The write disciplines below are UNCHANGED and still scan
+    // every block, so a sink block that writes `_0` or the dest still declines —
+    // conservative, and deliberately so.
     let mut call = None;
     for block in &body.blocks {
         match &block.terminator {
@@ -940,8 +1040,11 @@ pub(crate) fn sem_call_return_of_mir(
                 is_unsafe_sig,
                 ..
             } => {
+                if target.is_none() {
+                    continue; // divergence sink — no returning execution leaves it.
+                }
                 if call.is_some() {
-                    return None; // a second call — not the sole-call shape.
+                    return decline(why, "second-returning-call"); // a second RETURNING call — not the sole-call shape.
                 }
                 call = Some((
                     block.id,
@@ -954,79 +1057,148 @@ pub(crate) fn sem_call_return_of_mir(
                     *is_unsafe_sig,
                 ));
             }
-            Terminator::Goto(_) | Terminator::Return => {}
-            _ => return None, // any other terminator ⇒ outside the modeled spine.
+            // Trust: GUARDED DELEGATION (2026-08-24) — `SwitchInt` is admitted here
+            // and CONSTRAINED below by the returning-path walk, which requires
+            // exactly ONE successor able to reach the `Return`. A guard whose other
+            // arms all diverge (`if i >= len { panic() } else { g(x) }` — the shape
+            // every bounds-checked delegation compiles to) is therefore admitted,
+            // while a genuine two-way join still declines.
+            Terminator::Goto(_)
+            | Terminator::Return
+            | Terminator::Unreachable
+            | Terminator::SwitchInt { .. } => {}
+            _ => return decline(why, "terminator-outside-modeled-spine"), // any other terminator ⇒ outside the modeled spine.
         }
     }
-    let (call_block_id, callee_str, args, dest, target, atomic, is_foreign, is_unsafe_sig) = call?;
+    let Some((call_block_id, callee_str, args, dest, target, atomic, is_foreign, is_unsafe_sig)) = call else {
+        return decline(why, "no-call-terminator-at-all");
+    };
 
     // ABI fail-closes: foreign / atomic / diverging (no return target).
     if is_foreign || atomic.is_some() || is_unsafe_sig {
-        return None;
+        return decline(why, "abi-foreign-or-atomic-or-unsafe-sig");
     }
-    let target = target?;
+    let Some(target) = target else {
+        return decline(why, "call-diverges-no-return-edge");
+    };
 
-    // Trust: ENTRY-REACHABILITY — a sole Call elsewhere in the block table does
-    // not establish that the function executes it. In particular, reject a
-    // diverging entry self-loop plus an unreachable Call/Return island. This
-    // shape admits only the linear Goto prefix leading from `BlockId(0)` to the
-    // recognized Call.
-    if !goto_only_entry_reaches(body, call_block_id) {
-        return None;
+    // Trust: ENTRY-REACHABILITY is now enforced by the RETURNING-PATH walk further
+    // down (it must start at `BlockId(0)`, pass through this call, and end at the
+    // unique `Return`), which subsumes the old `goto_only_entry_reaches` prefix
+    // check and additionally handles guards whose other arms diverge.
+    // Dest must be a BARE local (no projections — an unmodeled dest projection
+    // like `_0.0 = call()` fails closed).
+    //
+    // Trust: NON-SCALAR DELEGATION RETURN (2026-08-24). This used to additionally
+    // require the dest and `_0` to be Int/Bool. That gate was carrier protection,
+    // and in THIS shape there is no carrier to protect: the recognized shape is a
+    // pure PASSTHROUGH — one Call, a Goto-only spine to the unique Return, and the
+    // rooted-write discipline below admits exactly `_0 = g(args)` or
+    // `_t = g(args); _0 = Use(_t)` with no other write to either local. The value
+    // is produced by the call and returned untouched; it is never an operand of an
+    // Int operation, never compared, never joined.
+    //
+    // The denotation says the same thing: the return is the opaque `call_result`
+    // projection — "the value the SEPARATELY-VERIFIED callee returns". That claim
+    // is value-identity and is type-agnostic; asserting it of an `Adt`/`Ref`/`Tuple`
+    // return makes no arithmetic claim about the value, exactly as the float
+    // identity-move lane returns a `Ty::Float` parameter through `Var(slot)` on the
+    // same Int-typed `Env` without claiming anything numeric.
+    //
+    // MEASURED (2026-08-24, 3082 real crates.io bodies incl. std): 532 single-call
+    // passthroughs return a non-scalar, of which 19 also have all-scalar ARGS. The
+    // argument gate below is deliberately UNCHANGED — it is a different and much
+    // stronger obligation, because a `&mut` argument lets the callee mutate through
+    // it and `call_result(id, arg_values)` would then not be a faithful model of the
+    // body. Only the RETURN side is opened here.
+    if !dest.projections.is_empty() {
+        return decline(why, "dest-has-projections");
     }
-    // Dest must be a BARE local of integer (or, Trust: Bool-dest/ret widening,
-    // Bool) type (no projections — an unmodeled dest projection like
-    // `_0.0 = call()` fails closed).
-    if !dest.projections.is_empty() || !local_is_int_or_bool(dest.local) || !local_is_int_or_bool(0)
-    {
-        return None;
-    }
+    let _ = &local_is_int_or_bool; // retained: the ARG side still uses scalar gating.
 
     // Resolve the callee in the certified registry (exact / UNIQUE suffix).
-    let (resolved, fact, callee_id) = resolve_certified_callee(callees, callee_str)?;
+    let Some((resolved, fact, callee_id)) = resolve_certified_callee(callees, callee_str) else {
+        return decline(why, "callee-not-resolvable-in-registry");
+    };
     // Self-recursion fails closed (by def-path AND by resolution): the callee's
     // certificate cannot precede the caller's own.
     if resolved == func.def_path || *callee_str == func.def_path {
-        return None;
+        return decline(why, "self-recursion");
     }
     // The actual signature must match the compiler-extracted certified
     // signature exactly. MIR has already made every coercion explicit.
     if !crate::mirsem::callee_signature_matches(func, args, dest, fact) {
-        return None;
+        return decline(why, "callee-signature-mismatch");
     }
 
     // EVERY actual argument must be a modeled scalar operand; at least one.
     if args.is_empty() {
-        return None;
+        return decline(why, "call-has-no-arguments");
     }
     // Trust: THE LIFT — `sem_call_arg_operand` extends `sem_operand_of_mir` with the
     // field-read-through-a-temp chase (the closure-env upvar shape); the bare
     // param/const path stays byte-identical (tried first, unchanged).
     let mut sem_args = Vec::with_capacity(args.len());
     for a in args {
-        sem_args.push(sem_call_arg_operand(body, a, call_block_id, &param_index)?);
+        let Some(sem) = sem_call_arg_operand(body, a, call_block_id, &param_index) else {
+            return decline(why, "argument-outside-modeled-operand-fragment");
+        };
+        sem_args.push(sem);
     }
 
     // The UNIQUE Return block.
     let mut rets = body.blocks.iter().filter(|b| matches!(b.terminator, Terminator::Return));
-    let ret_block = rets.next()?;
+    let Some(ret_block) = rets.next() else {
+        return decline(why, "no-Return-block");
+    };
     if rets.next().is_some() {
-        return None;
+        return decline(why, "not-a-unique-Return-block");
     }
-    // The call's continuation reaches the Return block through Gotos ONLY.
-    let mut cur = target;
+    // Trust: THE RETURNING PATH (2026-08-24). Every returning execution follows
+    // ONE path from the entry block, through this call, to the unique `Return`.
+    //
+    // Enforced by walking the RETURNING SUBGRAPH — the blocks from which `Return`
+    // is reachable — and requiring each step to have exactly ONE successor inside
+    // it. Any other successor cannot return (it diverges, panics, unwinds, or
+    // loops forever), and this certificate is partial correctness over returning
+    // executions only, so those arms contribute nothing to the returned value.
+    //
+    // This subsumes the previous Goto-only prefix + Goto-only continuation checks
+    // (a Goto chain is the degenerate case) and additionally admits a GUARD whose
+    // other arms all diverge. A real two-way join still declines: both arms would
+    // be in the returning subgraph, so the `!= 1` test fires.
+    let returning = blocks_that_can_return(body, ret_block.id);
+    let entry = trust_types::BlockId(0);
+    if !returning.contains(&entry) {
+        return decline(why, "entry-cannot-return"); // the entry cannot return at all.
+    }
+    let mut cur = entry;
+    let mut through_call = false;
     let mut steps = 0usize;
     while cur != ret_block.id {
-        let blk = body.blocks.iter().find(|b| b.id == cur)?;
-        match &blk.terminator {
-            Terminator::Goto(t) => cur = *t,
-            _ => return None,
+        if cur == call_block_id {
+            through_call = true;
         }
+        let Some(blk) = body.blocks.iter().find(|b| b.id == cur) else {
+            return decline(why, "returning-path-names-a-missing-block");
+        };
+        let mut next = block_successors(blk).into_iter().filter(|s| returning.contains(s));
+        let Some(only) = next.next() else {
+            return decline(why, "returning-path-dead-ends");
+        };
+        if next.next().is_some() {
+            return decline(why, "two-arms-can-return-a-join"); // two arms can return — a join, not a guard.
+        }
+        cur = only;
         steps += 1;
         if steps > body.blocks.len() {
-            return None; // cycle — not a linear return spine.
+            return decline(why, "cycle-on-the-returning-path"); // cycle — not a linear return spine.
         }
     }
+    if !through_call {
+        return decline(why, "call-not-on-the-returning-path"); // the call is not on the returning path — it is not executed.
+    }
+    let _ = target;
 
     // Complete rooted-write discipline on the returned value. The recognized
     // Call destination is allowed exactly at `call_block_id`; every projected,
@@ -1034,29 +1206,32 @@ pub(crate) fn sem_call_return_of_mir(
     if dest.local == 0 {
         // Case A: `_0 = g(args) -> [return: bb]` — nothing else may write `_0`.
         if !call_family_local_writes_exact(body, 0, 0, &[call_block_id]) {
-            return None;
+            return decline(why, "dest-is-_0-but-other-writes-to-_0");
         }
     } else {
         // Case B: `_t = g(args)`, then the Return block's `_0 := Use(Copy/Move _t)`.
         let t = dest.local;
         if param_index(t).is_some() {
-            return None; // a call overwriting a parameter place — unmodeled.
+            return decline(why, "call-overwrites-a-parameter"); // a call overwriting a parameter place — unmodeled.
         }
         // The ONE write to `_0` is the Return block's bare move/copy of `_t`.
         if !call_family_local_writes_exact(body, 0, 1, &[])
             || !call_family_local_writes_exact(body, t, 0, &[call_block_id])
         {
-            return None;
+            return decline(why, "temp-dest-write-profile-mismatch");
         }
-        let last_to_0 = ret_block
+        let Some(last_to_0) = ret_block
             .stmts
             .iter()
             .rev()
-            .find_map(|s| crate::assignment_types::assigned_local_rvalue(body, s, 0))?;
+            .find_map(|s| crate::assignment_types::assigned_local_rvalue(body, s, 0))
+        else {
+            return decline(why, "return-block-never-writes-_0");
+        };
         match last_to_0 {
             Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
                 if p.local == t && p.projections.is_empty() => {}
-            _ => return None,
+            _ => return decline(why, "return-block-does-not-move-the-temp-into-_0"),
         }
     }
 

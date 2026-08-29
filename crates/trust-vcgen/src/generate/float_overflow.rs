@@ -376,10 +376,15 @@ pub(super) fn v2_float_overflow_witness_formula(
             let rhs_value = operand_to_formula(func, rhs);
             let sign_width = 1;
             let mag_width = width - sign_width;
-            let (exp_width, frac_width, threshold_bits, finite_exponent_value) = match width {
-                32 => (8, 23, (f32::MAX / 2.0).to_bits() as u128, 0xff),
-                64 => (11, 52, (f64::MAX / 2.0).to_bits() as u128, 0x7ff),
-                _ => unreachable!("the match arm admits only binary32/binary64"),
+            // `width` is bound by this arm's `32 | 64` pattern, so a two-way
+            // choice is TOTAL — there is no third case, hence nothing to panic
+            // on. (Was a three-arm `match` with `_ => unreachable!`, a panic on
+            // a production path in the TCB for a case the type system of the
+            // outer pattern already excludes.)
+            let (exp_width, frac_width, threshold_bits, finite_exponent_value) = if width == 32 {
+                (8, 23, (f32::MAX / 2.0).to_bits() as u128, 0xff)
+            } else {
+                (11, 52, (f64::MAX / 2.0).to_bits() as u128, 0x7ff)
             };
             let magnitude_mask = (1u128 << mag_width) - 1;
             let threshold = Formula::BitVec {
@@ -442,10 +447,11 @@ pub(super) fn v2_float_overflow_witness_formula(
         // small operand).
         (BinOp::Mul, width @ (32 | 64)) => {
             let mag_width = width - 1;
-            let threshold_bits = match width {
-                32 => f32::MAX.sqrt().to_bits() as u128,
-                64 => f64::MAX.sqrt().to_bits() as u128,
-                _ => unreachable!("the match arm admits only binary32/binary64"),
+            // Total by this arm's `32 | 64` binding — see the Add/Sub arm.
+            let threshold_bits = if width == 32 {
+                f32::MAX.sqrt().to_bits() as u128
+            } else {
+                f64::MAX.sqrt().to_bits() as u128
             };
             let magnitude_mask = (1u128 << mag_width) - 1;
             let threshold = Formula::BitVec {
@@ -476,16 +482,15 @@ pub(super) fn v2_float_overflow_witness_formula(
         // never an overflow — so the shape over-approximates exactly.
         (BinOp::Div, width @ (32 | 64)) => {
             let mag_width = width - 1;
-            let (exp_width, frac_width, one_bits, finite_exponent_value) = match width {
-                32 => (8, 23, 1.0f32.to_bits() as u128, 0xff),
-                64 => (11, 52, 1.0f64.to_bits() as u128, 0x7ff),
-                _ => unreachable!("the match arm admits only binary32/binary64"),
+            // Total by this arm's `32 | 64` binding — see the Add/Sub arm.
+            let (exp_width, frac_width, one_bits, finite_exponent_value) = if width == 32 {
+                (8, 23, 1.0f32.to_bits() as u128, 0xff)
+            } else {
+                (11, 52, 1.0f64.to_bits() as u128, 0x7ff)
             };
             let magnitude_mask = (1u128 << mag_width) - 1;
-            let divisor_threshold = Formula::BitVec {
-                value: (one_bits & magnitude_mask) as i128,
-                width: mag_width,
-            };
+            let divisor_threshold =
+                Formula::BitVec { value: (one_bits & magnitude_mask) as i128, width: mag_width };
             let finite_exponent =
                 Formula::BitVec { value: finite_exponent_value, width: exp_width };
             let lhs_value = operand_to_formula(func, lhs);

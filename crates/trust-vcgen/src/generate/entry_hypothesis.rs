@@ -414,8 +414,7 @@ pub(super) fn forced_parameter_alias(
     }
 
     // Exactly one parameter position the clause does not already name.
-    let mut unclaimed =
-        parameters.iter().copied().filter(|(name, _)| !clause_vars.contains(*name));
+    let mut unclaimed = parameters.iter().copied().filter(|(name, _)| !clause_vars.contains(*name));
     let (body_spelling, declared_ty) = unclaimed.next()?;
     if unclaimed.next().is_some() {
         return None;

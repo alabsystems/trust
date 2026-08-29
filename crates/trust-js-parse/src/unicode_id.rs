@@ -1481,4 +1481,3 @@ pub static ID_CONTINUE: &[(u32, u32)] = &[
     (0x31350, 0x323AF),
     (0xE0100, 0xE01EF),
 ];
-

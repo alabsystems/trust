@@ -331,14 +331,13 @@ fn compute_modified(
 
 #[cfg(test)]
 mod tests {
-    use crate::error::SymexError;
-
     use trust_types::{
         BasicBlock, BinOp, BlockId, ConstValue, Counterexample, CounterexampleValue, Formula,
         Operand, Place, Rvalue, SourceSpan, Statement, Terminator, VcKind, VerificationCondition,
     };
 
     use super::*;
+    use crate::error::SymexError;
 
     fn span() -> SourceSpan {
         SourceSpan::default()

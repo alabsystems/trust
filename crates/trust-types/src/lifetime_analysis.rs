@@ -10,11 +10,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::{FxHashMap, FxHashSet};
-
 use serde::{Deserialize, Serialize};
 
 use crate::formula::{Formula, VcKind, VerificationCondition};
+use crate::fx::{FxHashMap, FxHashSet};
 use crate::lifetime::{
     BorrowChecker, BorrowError, BorrowInfo, Lifetime, LifetimeRelation, Mutability,
     check_lifetime_constraints,
@@ -446,7 +445,7 @@ fn analyze_terminator_borrows(
             // Drop expires all borrows of the dropped place.
             borrow_set.expire_local(place.local);
         }
-        Terminator::Return => {
+        Terminator::Return | Terminator::TailCall { .. } => {
             // At return, check for dangling borrows of locals.
             for borrow in &borrow_set.borrows {
                 if borrow.lifetime.name != "'static" {

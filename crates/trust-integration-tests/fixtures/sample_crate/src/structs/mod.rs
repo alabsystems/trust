@@ -22,17 +22,11 @@ impl Point {
     }
 
     pub fn translate(&self, dx: f64, dy: f64) -> Point {
-        Point {
-            x: self.x + dx,
-            y: self.y + dy,
-        }
+        Point { x: self.x + dx, y: self.y + dy }
     }
 
     pub fn scale(&self, factor: f64) -> Point {
-        Point {
-            x: self.x * factor,
-            y: self.y * factor,
-        }
+        Point { x: self.x * factor, y: self.y * factor }
     }
 
     pub fn magnitude(&self) -> f64 {

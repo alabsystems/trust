@@ -216,18 +216,11 @@ pub fn compute_entry_preservation(
         return refuse("duplicate block ids in body".to_string());
     }
 
-    let param_by_local: FxHashMap<usize, usize> = bindings
-        .params
-        .iter()
-        .enumerate()
-        .map(|(i, param)| (param.local_index, i))
-        .collect();
+    let param_by_local: FxHashMap<usize, usize> =
+        bindings.params.iter().enumerate().map(|(i, param)| (param.local_index, i)).collect();
 
-    let all_params: u32 = if bindings.params.is_empty() {
-        0
-    } else {
-        (1u32 << bindings.params.len()) - 1
-    };
+    let all_params: u32 =
+        if bindings.params.is_empty() { 0 } else { (1u32 << bindings.params.len()) - 1 };
 
     // Kill sets per block position, from an exhaustive statement match. The
     // strict binary lift emits ONLY `Assign` (its `Nop`s are retained out);
@@ -339,12 +332,8 @@ pub fn compute_entry_preservation(
         }
     }
 
-    let preserved_by_id: FxHashMap<usize, u32> = body
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(pos, bb)| (bb.id.0, preserved[pos]))
-        .collect();
+    let preserved_by_id: FxHashMap<usize, u32> =
+        body.blocks.iter().enumerate().map(|(pos, bb)| (bb.id.0, preserved[pos])).collect();
 
     Ok(EntryPreservation { preserved: preserved_by_id, kills })
 }
@@ -462,10 +451,9 @@ fn build_le_load(mem: &Formula, root: &Formula) -> Formula {
 
 #[cfg(test)]
 mod tests {
+    use trust_types::{BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Ty};
+
     use super::*;
-    use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Ty,
-    };
 
     fn u64_ty() -> Ty {
         Ty::Int { width: 64, signed: false }
@@ -516,10 +504,7 @@ mod tests {
 
     #[test]
     fn single_block_preserves_everything_at_entry() {
-        let b = body(
-            locals_with_regs(&[(8, "RDI")]),
-            vec![block(0, vec![], Terminator::Return)],
-        );
+        let b = body(locals_with_regs(&[(8, "RDI")]), vec![block(0, vec![], Terminator::Return)]);
         let preservation = compute_entry_preservation(&b, &rdi_bindings()).expect("computes");
         assert!(preservation.is_preserved(0, 0));
     }
@@ -616,17 +601,20 @@ mod tests {
     fn entry_as_loop_head_with_clobber_is_not_preserved() {
         let b = body(
             locals_with_regs(&[(8, "RDI")]),
-            vec![block(
-                0,
-                vec![assign_to(8)],
-                Terminator::SwitchInt {
-                    discr: Operand::Constant(trust_types::ConstValue::Bool(true)),
-                    targets: vec![(1, BlockId(0))],
-                    otherwise: BlockId(1),
-                    exhaustive_enum_unreachable: false,
-                    span: SourceSpan::default(),
-                },
-            ), block(1, vec![], Terminator::Return)],
+            vec![
+                block(
+                    0,
+                    vec![assign_to(8)],
+                    Terminator::SwitchInt {
+                        discr: Operand::Constant(trust_types::ConstValue::Bool(true)),
+                        targets: vec![(1, BlockId(0))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                ),
+                block(1, vec![], Terminator::Return),
+            ],
         );
         let preservation = compute_entry_preservation(&b, &rdi_bindings()).expect("computes");
         assert!(
@@ -641,17 +629,20 @@ mod tests {
     fn entry_as_loop_head_without_clobber_stays_preserved() {
         let b = body(
             locals_with_regs(&[(8, "RDI")]),
-            vec![block(
-                0,
-                vec![],
-                Terminator::SwitchInt {
-                    discr: Operand::Constant(trust_types::ConstValue::Bool(true)),
-                    targets: vec![(1, BlockId(0))],
-                    otherwise: BlockId(1),
-                    exhaustive_enum_unreachable: false,
-                    span: SourceSpan::default(),
-                },
-            ), block(1, vec![], Terminator::Return)],
+            vec![
+                block(
+                    0,
+                    vec![],
+                    Terminator::SwitchInt {
+                        discr: Operand::Constant(trust_types::ConstValue::Bool(true)),
+                        targets: vec![(1, BlockId(0))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                ),
+                block(1, vec![], Terminator::Return),
+            ],
         );
         let preservation = compute_entry_preservation(&b, &rdi_bindings()).expect("computes");
         assert!(preservation.is_preserved(0, 0));
@@ -662,10 +653,7 @@ mod tests {
     fn unreachable_non_entry_block_preserves_nothing() {
         let b = body(
             locals_with_regs(&[(8, "RDI")]),
-            vec![
-                block(0, vec![], Terminator::Return),
-                block(1, vec![], Terminator::Return),
-            ],
+            vec![block(0, vec![], Terminator::Return), block(1, vec![], Terminator::Return)],
         );
         let preservation = compute_entry_preservation(&b, &rdi_bindings()).expect("computes");
         assert!(!preservation.is_preserved(1, 0));
@@ -683,10 +671,8 @@ mod tests {
 
     #[test]
     fn terminator_outside_the_lift_contract_refuses() {
-        let b = body(
-            locals_with_regs(&[(8, "RDI")]),
-            vec![block(0, vec![], Terminator::Unreachable)],
-        );
+        let b =
+            body(locals_with_regs(&[(8, "RDI")]), vec![block(0, vec![], Terminator::Unreachable)]);
         let err = compute_entry_preservation(&b, &rdi_bindings()).expect_err("refuses");
         assert!(err.reason.contains("terminator"), "{}", err.reason);
     }
@@ -703,10 +689,7 @@ mod tests {
             })
             .collect();
         let bindings = BinaryEntryBindings { arch: BindingArch::X86_64, params };
-        let b = body(
-            locals_with_regs(&[(8, "RDI")]),
-            vec![block(0, vec![], Terminator::Return)],
-        );
+        let b = body(locals_with_regs(&[(8, "RDI")]), vec![block(0, vec![], Terminator::Return)]);
         let err = compute_entry_preservation(&b, &bindings).expect_err("refuses at 32");
         assert!(err.reason.contains("at most 31"), "{}", err.reason);
     }
@@ -724,10 +707,7 @@ mod tests {
                 local_index: 7,
             }],
         };
-        let b = body(
-            locals_with_regs(&[(7, "RSI")]),
-            vec![block(0, vec![], Terminator::Return)],
-        );
+        let b = body(locals_with_regs(&[(7, "RSI")]), vec![block(0, vec![], Terminator::Return)]);
         let err = compute_entry_preservation(&b, &bindings).expect_err("refuses non-prefix");
         assert!(err.reason.contains("ABI slot 0"), "{}", err.reason);
     }
@@ -744,10 +724,7 @@ mod tests {
                 local_index: 8,
             }],
         };
-        let b = body(
-            locals_with_regs(&[(8, "RDI")]),
-            vec![block(0, vec![], Terminator::Return)],
-        );
+        let b = body(locals_with_regs(&[(8, "RDI")]), vec![block(0, vec![], Terminator::Return)]);
         let err = compute_entry_preservation(&b, &bindings).expect_err("refuses wrong arch");
         assert!(err.reason.contains("Aarch64"), "{}", err.reason);
     }
@@ -757,10 +734,7 @@ mod tests {
         // A binding table applied to a body whose local 8 is not RDI (e.g. an
         // AArch64 layout, where local 8 is X7's neighbor namespace) must
         // refuse rather than bind the wrong register.
-        let b = body(
-            locals_with_regs(&[(8, "X7")]),
-            vec![block(0, vec![], Terminator::Return)],
-        );
+        let b = body(locals_with_regs(&[(8, "X7")]), vec![block(0, vec![], Terminator::Return)]);
         let err = compute_entry_preservation(&b, &rdi_bindings()).expect_err("refuses");
         assert!(err.reason.contains("does not match"), "{}", err.reason);
     }
@@ -797,11 +771,8 @@ mod tests {
 
     #[test]
     fn recognizes_a_constant_displacement_root() {
-        let root = Formula::BvAdd(
-            Box::new(x7()),
-            Box::new(Formula::BitVec { value: 16, width: 64 }),
-            64,
-        );
+        let root =
+            Formula::BvAdd(Box::new(x7()), Box::new(Formula::BitVec { value: 16, width: 64 }), 64);
         let formula = build_le_load(&mem_seed(), &root);
         assert_eq!(
             recognize_le_load(&formula),

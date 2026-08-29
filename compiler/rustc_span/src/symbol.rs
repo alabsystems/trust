@@ -2493,6 +2493,43 @@ symbols! {
         // `Nat` is the struct the loader's sanity check requires it to export.
         Nat,
         trust_bignum,
+        // D4: the builtin attr macro the resolver substitutes for the
+        // trust-spec `trust::decreases` proc-macro passthrough. Unlike
+        // `trust_contracts_requires` / `trust_contracts_ensures` it injects the
+        // NATIVE clause spelling rather than a Trust-origin clause keyword, so
+        // the attribute and first-class surfaces share one parse and one lane.
+        trust_contracts_decreases,
+        // The refusal builtin for the `trust::invariant` attribute surface.
+        // Unlike its `trust_contracts_requires` / `trust_contracts_ensures`
+        // siblings this names an expander that ONLY emits an error: a
+        // function-position `invariant` has no loop to bind to and no defined
+        // program point, so it must never lower. See
+        // `rustc_builtin_macros::contracts::ExpandTrustInvariant`.
+        //
+        // INTEGRATION NOTE (2026-08-27): this section is CHRONOLOGICAL and
+        // index-stable, so `decreases` before `invariant` is now the frozen
+        // order regardless of which lane landed first.
+        trust_contracts_invariant,
+        // The STOCK-SURVIVING transport for the E4 loop-invariant clause.
+        //
+        // `#[cfg_attr(trust_verify, trust::loop_invariant(P))]` on a `while` /
+        // `loop` expression is the only spelling of a loop clause that a crate
+        // which must ALSO build on stock rustc can write: measured on stock
+        // rustc 1.97.1 (8bab26f4f), `cfg_attr` is stripped BEFORE
+        // expression-attribute feature gating, so with the cfg unset the file
+        // compiles clean, while the native grammar (`loop invariant P { .. }`)
+        // and a direct `#[trust::loop_invariant(P)]` are both hard errors there.
+        //
+        // It is deliberately NOT spelled `invariant`: `trust::invariant` is a
+        // REFUSAL at every position (`trust_contracts_invariant` above), and
+        // ay's `attribute_invariant_silent.rs` probe depends on that staying
+        // true. A separate name also says which program point is constrained.
+        //
+        // The termination measure reuses `trust::decreases` — one name, one
+        // meaning ("the measure of the construct this is attached to"), exactly
+        // as the native grammar spells it in both the signature and the loop
+        // clause position.
+        loop_invariant,
     }
 }
 

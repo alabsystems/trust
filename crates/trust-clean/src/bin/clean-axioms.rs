@@ -101,9 +101,7 @@ fn read_input(path: &Option<String>) -> Result<String, String> {
     match path.as_deref() {
         None | Some("-") => {
             let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| format!("reading stdin: {e}"))?;
+            std::io::stdin().read_to_string(&mut buf).map_err(|e| format!("reading stdin: {e}"))?;
             Ok(buf)
         }
         Some(p) => std::fs::read_to_string(p).map_err(|e| format!("reading {p}: {e}")),

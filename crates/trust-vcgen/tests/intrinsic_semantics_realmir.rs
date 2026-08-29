@@ -78,12 +78,10 @@ fn postcondition_verdict(func: &VerifiableFunction) -> VerificationResult {
         .stack_size(SOLVER_STACK_BYTES)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let post = vcs
-                .iter()
-                .find(|vc| matches!(vc.kind, VcKind::Postcondition))
-                .unwrap_or_else(|| {
-                    panic!("{}: the ensures clause must produce a Postcondition VC", func.name)
-                });
+            let post =
+                vcs.iter().find(|vc| matches!(vc.kind, VcKind::Postcondition)).unwrap_or_else(
+                    || panic!("{}: the ensures clause must produce a Postcondition VC", func.name),
+                );
             let router = trust_router::Router::deterministic_in_process_ay(30_000);
             let results = router.verify_all(std::slice::from_ref(post));
             results.into_iter().next().expect("one verdict per VC").1
@@ -238,18 +236,47 @@ fn ctlz_at_zero_is_the_width_not_zero() {
 // demonstrates: both spellings land on the identical strict-certification
 // boundary, which is exactly what "reaches the same model" means here.
 
+/// `requires x >= 1 ensures result <= 31` over the `ctlz` intrinsic — PROVED.
+///
+/// This row used to sit in the residual test below: ay decided it UNSAT and the
+/// mandatory strict UNSAT-proof validation then rejected the proof with
+/// `step tN uses unsupported theory lemma kind Generic in strict mode`, so the
+/// honest verdict was `Unknown`. As of 2026-08-24 it certifies.
+///
+/// PROMOTED ON EVIDENCE, not on the say-so of the assertion that flagged it:
+///
+///   * The change is PER ROW, not a lost check. The other three residual rows still
+///     return `Unknown` with `(incomplete self-check-rejected)` on the same path —
+///     if strict validation had been dropped they would all have flipped together.
+///   * STABLE: measured over three consecutive runs, `Proved` every time. A verdict
+///     that appears only sometimes must not become an unconditional assertion.
+///   * The negative controls still hold. `saturating_add_lower_bound_is_not_strict`
+///     (a clause that is FALSE at `b == 0`), `bswap_is_not_modeled_as_a_no_op`,
+///     `bitreverse_is_not_the_width8_identity`, `ctpop_has_no_spurious_nonzero_lower_bound`
+///     and `ctpop_bound_is_not_off_by_one` all still fail to prove, so the lane is
+///     not proving things indiscriminately.
+///   * The proposition is true: `ctlz` of a nonzero `u32` lies in `0..=31`, and
+///     reaches 32 only at `x == 0`, which the precondition excludes.
+///     `ctlz_at_zero_is_the_width_not_zero` pins that boundary separately.
+#[test]
+fn ctlz_nonzero_upper_bound_is_proved() {
+    assert_proved(include_str!("fixtures/intrinsic_ctlz_u32_nonzero_lt32_mir.json"));
+}
+
 /// THE RESIDUAL, stated rather than hidden.
 ///
-/// Three rows in this corpus are DECIDED by the facts — the ay engine computes
+/// Two shapes in this corpus are DECIDED by the facts — the ay engine computes
 /// UNSAT — and are then rejected by the mandatory strict UNSAT-proof validation
 /// with `step tN uses unsupported theory lemma kind Generic in strict mode`. The
 /// verdict is `Unknown`, and `Unknown` is the honest answer: an uncertified UNSAT
-/// proves nothing under `-Ztrust-policy=certify`. UNPROVED IS NOT PROVED, so
-/// these rows are asserted in their MEASURED state rather than promoted.
+/// proves nothing under `-Ztrust-policy=certify`. UNPROVED IS NOT PROVED, so these
+/// rows are asserted in their MEASURED state rather than promoted.
 ///
-///   * `ctlz_u32_nonzero_lt32` — `requires x >= 1 ensures result <= 31`, which
-///     needs the `ctlz(x) == 32 <-> x == 0` pair together with the range bound.
 ///   * `sat_add_ge` / `sat_sub_le` — the saturating clamp model.
+///
+/// (`ctlz_u32_nonzero_lt32` was the third; it now certifies and has moved to
+/// `ctlz_nonzero_upper_bound_is_proved` above. That it moved ALONE, while these
+/// did not, is the evidence that the strict layer is still running here.)
 ///
 /// THE MISSING PIECE IS NOT IN THIS LANE, and the third row below is the
 /// evidence: `fixtures/sat_add_ge.json` is the ALREADY-SHIPPED METHOD spelling
@@ -261,12 +288,22 @@ fn ctlz_at_zero_is_the_width_not_zero() {
 /// proof-certification layer's theory-lemma vocabulary, not to the definitions.
 ///
 /// This test FAILS the day that layer learns the lemma kind — deliberately. Move
-/// the row up to `assert_proved` then; do not delete this comment without
-/// re-measuring.
+/// the row up to `assert_proved` then, on the same evidence the ctlz row required;
+/// do not delete this comment without re-measuring.
 #[test]
 fn residual_rows_are_decided_by_ay_but_not_strictly_certifiable() {
+    // Trust: `ctlz_u32_nonzero_lt32` was PROMOTED out of this list on 2026-08-25.
+    // The strict-certification layer learned the lemma kind its clause needed, so
+    // the row is now `Proved { strength: ProofStrength { reasoning: Smt, assurance:
+    // SmtBacked } }` — measured, not assumed. This test asked for exactly that
+    // move ("Promote the row to `assert_proved` and update the doc above"), and it
+    // is asserted below rather than merely dropped: a row that silently stopped
+    // being proved again would otherwise go unnoticed.
+    //
+    // The remaining three rows still sit at the boundary. Do NOT delete this test
+    // when the last one is promoted; it is the instrument that tells you the
+    // boundary moved.
     for (name, json) in [
-        ("ctlz_u32_nonzero_lt32", include_str!("fixtures/intrinsic_ctlz_u32_nonzero_lt32_mir.json")),
         ("sat_add_ge (intrinsic spelling)", include_str!("fixtures/intrinsic_sat_add_ge_mir.json")),
         ("sat_sub_le (intrinsic spelling)", include_str!("fixtures/intrinsic_sat_sub_le_mir.json")),
         // The METHOD spelling of the same clause, already in the tree before this
@@ -282,6 +319,16 @@ fn residual_rows_are_decided_by_ay_but_not_strictly_certifiable() {
              Got {verdict:?}"
         );
     }
+
+    // The promoted row, now asserted in the POSITIVE direction.
+    let func = load(include_str!("fixtures/intrinsic_ctlz_u32_nonzero_lt32_mir.json"));
+    let verdict = postcondition_verdict(&func);
+    assert!(
+        matches!(verdict, VerificationResult::Proved { .. }),
+        "ctlz_u32_nonzero_lt32 was promoted on 2026-08-25 after the strict-certification \
+         layer learned its lemma kind. Losing it again is a REGRESSION in that layer, not a \
+         return to a known boundary. Got {verdict:?}"
+    );
 }
 
 /// `ensures result > a` — FALSE at `b == 0`. Pins that the clamp model gives the

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Pipeline test module. Tests reach into multiple submodules — sibling-module
 // helpers are imported explicitly; mod.rs re-exports cover the public surface.
 //
@@ -25,14 +26,14 @@ use super::probe::{
     native_runtime_library_paths, trusted_runtime_search_path_value,
 };
 use super::provenance::runtime_binary_source_provenance_for_rewrite_loop;
+#[cfg(unix)]
+use super::run::with_test_memory_coordinator_ready;
 use super::run::{
     CompilerRun, canonical_single_file_report_subject, cargo_child_rustc_path,
     live_report_consumer_rejection, missing_trust_json_diagnostic,
     resolve_cargo_selection_for_compiler, rewrite_iteration_success, run_compiler,
     single_file_report_subject,
 };
-#[cfg(unix)]
-use super::run::with_test_memory_coordinator_ready;
 use super::standalone::standalone_hardened_help;
 use super::surface::{LINKED_TRUST_SURFACE_TOOLS, detect_linked_trust_cargo_surface_with_search};
 use super::transport::{CargoTargetIdentity, ParsedCompilerOutput};
@@ -227,7 +228,7 @@ fn bound_native_proof_artifact(
 
 fn hardened_native_proof_result() -> VerificationResult {
     let owner = "crate::paths::render:hardened0";
-    let native_id = "trust_ir-native-trust-wp-request-8-proof-9";
+    let native_id = "trust_ir-native-trust-mc-request-8-proof-9";
     let input = bound_native_proof_artifact(
         "NormalizedObligation",
         b"exact hardened normalized obligation",
@@ -263,24 +264,24 @@ fn hardened_native_proof_result() -> VerificationResult {
         description: "hardened boundary (byte_loss): byte-exact path rendering".into(),
         location: None,
         outcome: trust_types::Outcome::Proved,
-        solver: "trust-wp".into(),
+        solver: "trust-mc".into(),
         time_ms: 4,
         counterexample: None,
         counterexample_model: None,
         reason: None,
         design_mandate: false,
         native_trust_ir: Some(trust_types::TransportNativeTrustIrEvidence {
-            suite: "trust-wp".into(),
-            backend: "trust-wp".into(),
+            suite: "trust-mc".into(),
+            backend: "trust-mc".into(),
             request_id: Some("8".into()),
             native_id: Some(native_id.into()),
             present: true,
-            artifacts: native_shape_artifacts("trust-wp", "8", "9"),
+            artifacts: native_shape_artifacts("trust-mc", "8", "9"),
             diagnostics: Vec::new(),
         }),
         proof_evidence: Some(trust_types::TransportProofEvidence {
-            suite: "trust-wp".into(),
-            backend: "trust-wp".into(),
+            suite: "trust-mc".into(),
+            backend: "trust-mc".into(),
             request_id: Some("8".into()),
             proof_id: Some("9".into()),
             native_id: Some(native_id.into()),
@@ -712,13 +713,28 @@ fn gate_advisory_lane_matches_contract_table() {
 fn gate_certify_lane_never_conditional_passes() {
     use GateDecision::*;
     // mandated = 1 -> Inconclusive in the strict lane (NOT ConditionalPass).
-    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 0, 0, 1)), Inconclusive);
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 0, 0, 1)),
+        Inconclusive
+    );
     // assumed / runtime-checked likewise fail the strict lane as Inconclusive.
-    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 0, 1, 0)), Inconclusive);
-    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 1, 0, 0)), Inconclusive);
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 0, 1, 0)),
+        Inconclusive
+    );
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 1, 0, 0)),
+        Inconclusive
+    );
     // Genuine unknown / empty -> Inconclusive; refutation / nonzero exit -> Fail.
-    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, oc(1, 0, 1, 0, 0, 0)), Inconclusive);
-    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 0, 0, 0)), Inconclusive);
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Certify, 0, oc(1, 0, 1, 0, 0, 0)),
+        Inconclusive
+    );
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Certify, 0, oc(0, 0, 0, 0, 0, 0)),
+        Inconclusive
+    );
     assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, oc(1, 1, 0, 0, 0, 0)), Fail);
     assert_eq!(evaluate_verification_gate(GateLane::Certify, 101, oc(2, 0, 0, 0, 0, 0)), Fail);
     // All proved -> Pass.
@@ -830,10 +846,7 @@ fn coroutine_resume_contract_row_counts_as_conditional_evidence_never_proof() {
         ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 }
     );
     assert!(
-        !matches!(
-            evaluate_verification_gate(GateLane::Strict, 0, counts),
-            GateDecision::Pass
-        ),
+        !matches!(evaluate_verification_gate(GateLane::Strict, 0, counts), GateDecision::Pass),
         "an exported contract is verified-modulo-callers, never a bare strict pass"
     );
 
@@ -1325,6 +1338,7 @@ fn run_compiler_reports_artifact_gate_failure() {
         hardened: false,
         trust_profile: None,
         ay_path: None,
+        spec_emit_dir: None,
         format: OutputFormat::Terminal,
         report_dir: Some(report_dir),
         unsafe_memory_report: None,
@@ -1435,6 +1449,7 @@ fn live_report_consumer_cannot_override_early_proof_followed_by_ice() {
         hardened: false,
         trust_profile: None,
         ay_path: None,
+        spec_emit_dir: None,
         format: OutputFormat::Terminal,
         report_dir: None,
         unsafe_memory_report: None,
@@ -1491,6 +1506,7 @@ fn live_report_consumer_cannot_override_early_proof_followed_by_signal() {
         hardened: false,
         trust_profile: None,
         ay_path: None,
+        spec_emit_dir: None,
         format: OutputFormat::Terminal,
         report_dir: None,
         unsafe_memory_report: None,
@@ -1761,6 +1777,7 @@ fn test_run_compiler_crate_mode_without_trust_json_rows_is_hard_error() {
             hardened: false,
             trust_profile: None,
             ay_path: None,
+            spec_emit_dir: None,
             format: OutputFormat::Terminal,
             report_dir: Some(report_dir_str),
             unsafe_memory_report: None,
@@ -1880,7 +1897,11 @@ fn linked_toolchain_status(path: Option<PathBuf>) -> LinkedTrustToolchainStatus 
 }
 
 fn write_executable_marker(path: &Path) {
-    std::fs::write(path, "").expect("should create executable marker");
+    write_executable_contents(path, "");
+}
+
+fn write_executable_contents(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("should create executable marker");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2093,7 +2114,9 @@ fn parse_transport_message(message: trust_types::TransportMessage) -> ParsedComp
 
 #[test]
 fn parse_compiler_stderr_rejects_nested_proved_when_transport_unknown() {
-    let parsed = parse_transport_message(full_verifier_transport_with_nested_proved(trust_types::Outcome::Unknown));
+    let parsed = parse_transport_message(full_verifier_transport_with_nested_proved(
+        trust_types::Outcome::Unknown,
+    ));
 
     assert_eq!(parsed.verification_results.len(), 1);
     let result = &parsed.verification_results[0];
@@ -2135,8 +2158,9 @@ fn parse_compiler_stderr_accumulates_cache_replays() {
 
 #[test]
 fn parse_compiler_stderr_rejects_nested_proved_when_transport_runtime_checked() {
-    let parsed =
-        parse_transport_message(full_verifier_transport_with_nested_proved(trust_types::Outcome::RuntimeChecked));
+    let parsed = parse_transport_message(full_verifier_transport_with_nested_proved(
+        trust_types::Outcome::RuntimeChecked,
+    ));
 
     assert_eq!(parsed.verification_results.len(), 1);
     let result = &parsed.verification_results[0];
@@ -2828,8 +2852,8 @@ fn test_detect_linked_trust_cargo_surface_rejects_retired_public_aliases() {
     std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
 
     write_required_surface_tool_markers(&bin_dir);
-    let rustdoc = bin_dir.join(host_executable_name("rustdoc"));
-    write_executable_marker(&rustdoc);
+    let rustfmt = bin_dir.join(host_executable_name("rustfmt"));
+    write_executable_marker(&rustfmt);
 
     let rustc = bin_dir.join(host_executable_name("rustc"));
     let linked = linked_toolchain_status(Some(canonicalize_or_self(rustc)));
@@ -2837,12 +2861,43 @@ fn test_detect_linked_trust_cargo_surface_rejects_retired_public_aliases() {
 
     assert!(!status.ready, "{status:?}");
     assert_eq!(status.kind, LinkedTrustCargoSurfaceKind::InvalidInheritedNameEvidence);
-    assert_eq!(surface_tool(&status, "trustdoc").status, LinkedTrustSurfaceToolStatusKind::Present);
+    assert_eq!(surface_tool(&status, "trustfmt").status, LinkedTrustSurfaceToolStatusKind::Present);
     assert!(
         status.detail.as_deref().is_some_and(|detail| {
-            detail.contains("forbidden retired public entrypoint") && detail.contains("rustdoc")
+            detail.contains("forbidden retired public entrypoint") && detail.contains("rustfmt")
         }),
-        "retired alias blocker should identify rustdoc: {status:?}"
+        "retired alias blocker should identify rustfmt: {status:?}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("should remove temp dir");
+}
+
+// `rustdoc` left the forbidden list in 76d408e1cd's wake: bootstrap installs it
+// into every stage >= 1 sysroot because cargo spawns it by name for doctests.
+// It is admitted the way `rustc` and `cargo` are -- as a same-surface alias --
+// so a `rustdoc` that is NOT this root's `trustdoc` must still be rejected.
+#[test]
+fn test_detect_linked_trust_cargo_surface_rejects_foreign_rustdoc_alias() {
+    let root = temp_test_dir("linked-surface-foreign-rustdoc");
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("should create bin dir");
+
+    write_required_surface_tool_markers(&bin_dir);
+    let rustdoc = bin_dir.join(host_executable_name("rustdoc"));
+    write_executable_contents(&rustdoc, "stock upstream rustdoc, not this sysroot's trustdoc");
+
+    let rustc = bin_dir.join(host_executable_name("rustc"));
+    let linked = linked_toolchain_status(Some(canonicalize_or_self(rustc)));
+    let status = detect_linked_trust_cargo_surface_with_search(&linked, &[]);
+
+    assert!(!status.ready, "{status:?}");
+    assert_eq!(status.kind, LinkedTrustCargoSurfaceKind::AmbientFallback);
+    assert!(
+        status
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("rustdoc does not bind to canonical trustdoc")),
+        "foreign rustdoc must be rejected as an unbound alias: {status:?}"
     );
 
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
@@ -3208,6 +3263,38 @@ fn test_native_runtime_library_paths_include_sysroot_rustlib_and_stage_rustc_dep
         paths,
         [sysroot_lib, rustlib_lib, stage_deps].map(canonicalize_or_self).to_vec(),
         "runtime search order preserves semantic tiers instead of globally sorting paths"
+    );
+
+    std::fs::remove_dir_all(&root).expect("should remove temp dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_native_runtime_library_paths_skip_bootstrap_doc_symlink_sibling() {
+    let root = temp_test_dir("runtime-paths-doc-symlink");
+    let rustc = root.join("build/host/stage1/bin/rustc");
+    let sysroot_lib = root.join("build/host/stage1/lib");
+    let stage_deps = root.join("build/host/stage1-rustc/host/release/deps");
+    let doc_payload = root.join("compiler-doc/release/deps");
+    let doc_link = root.join("build/host/stage1-rustc/doc");
+
+    std::fs::create_dir_all(rustc.parent().expect("rustc should have parent"))
+        .expect("should create rustc bin dir");
+    std::fs::write(&rustc, "").expect("should create rustc marker");
+    std::fs::create_dir_all(&sysroot_lib).expect("should create sysroot lib");
+    std::fs::create_dir_all(&stage_deps).expect("should create stage deps dir");
+    std::fs::create_dir_all(&doc_payload).expect("should create plausible doc payload");
+    std::os::unix::fs::symlink(root.join("compiler-doc"), &doc_link)
+        .expect("should create bootstrap doc symlink sibling");
+
+    let paths = native_runtime_library_paths(&rustc);
+    assert!(
+        paths.contains(&canonicalize_or_self(stage_deps)),
+        "real target dependency directory must remain in the runtime closure: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&canonicalize_or_self(doc_payload)),
+        "bootstrap doc symlink payload must not enter the runtime closure: {paths:?}"
     );
 
     std::fs::remove_dir_all(&root).expect("should remove temp dir");

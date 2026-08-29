@@ -172,8 +172,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         let val = m >> shift;
         let rem = m & ((1 << shift) - 1);
         let half = 1u32 << (shift - 1);
-        let rounded =
-            val + u32::from(rem > half || (rem == half && (val & 1) == 1));
+        let rounded = val + u32::from(rem > half || (rem == half && (val & 1) == 1));
         return sign | rounded as u16;
     }
     let val = frac >> 13;
@@ -699,12 +698,18 @@ impl ConcreteState {
                     (5, 11) => f16_bits_to_f32(bits as u16) as i128,
                     (8, 24) => f32::from_bits(bits as u32) as i128,
                     (11, 53) => f64::from_bits(bits as u64) as i128,
-                    _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64"));
+                    }
                 };
                 let (min, max) = match width {
                     32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
                     64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
-                    _ => return Err(ConcreteError::UnsupportedFormula("FCVTZS width outside 32/64")),
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula(
+                            "FCVTZS width outside 32/64",
+                        ));
+                    }
                 };
                 let clamped = wide.clamp(min, max);
                 let mask = if *width == 128 { u128::MAX } else { (1u128 << width) - 1 };
@@ -721,17 +726,22 @@ impl ConcreteState {
                     (5, 11) => f16_bits_to_f32(bits as u16) as u128,
                     (8, 24) => f32::from_bits(bits as u32) as u128,
                     (11, 53) => f64::from_bits(bits as u64) as u128,
-                    _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64"));
+                    }
                 };
                 let max = match width {
                     32 => u128::from(u32::MAX),
                     64 => u128::from(u64::MAX),
-                    _ => return Err(ConcreteError::UnsupportedFormula("FCVTZU width outside 32/64")),
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula(
+                            "FCVTZU width outside 32/64",
+                        ));
+                    }
                 };
                 Ok(ConcreteValue::Bv { value: wide.min(max), width: *width })
             }
-            Formula::FpFromSbv { rm, value, eb, sb }
-            | Formula::FpFromUbv { rm, value, eb, sb } => {
+            Formula::FpFromSbv { rm, value, eb, sb } | Formula::FpFromUbv { rm, value, eb, sb } => {
                 if !matches!(**rm, Formula::FpRoundingMode(RoundingMode::RNE)) {
                     return Err(ConcreteError::UnsupportedFormula(
                         "int-to-FP rounding mode other than RNE",
@@ -767,7 +777,9 @@ impl ConcreteState {
                         };
                         u128::from(x.to_bits())
                     }
-                    _ => return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64")),
+                    _ => {
+                        return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64"));
+                    }
                 };
                 // The node's sort is Float; wrap back to bits only via
                 // FpToIeeeBv, which arrives here as the parent. Represent the
@@ -790,22 +802,18 @@ impl ConcreteState {
                     }
                     // f16 widenings are exact; narrowings go via f32, which is
                     // Figueroa-safe for p = 11 (see the binop lane).
-                    ((5, 11), (8, 24)) => {
-                        u128::from(f16_bits_to_f32(bits as u16).to_bits())
-                    }
+                    ((5, 11), (8, 24)) => u128::from(f16_bits_to_f32(bits as u16).to_bits()),
                     ((5, 11), (11, 53)) => {
                         u128::from(f64::from(f16_bits_to_f32(bits as u16)).to_bits())
                     }
-                    ((8, 24), (5, 11)) => {
-                        u128::from(f32_to_f16_bits(f32::from_bits(bits as u32)))
-                    }
+                    ((8, 24), (5, 11)) => u128::from(f32_to_f16_bits(f32::from_bits(bits as u32))),
                     ((11, 53), (5, 11)) => {
                         u128::from(f32_to_f16_bits(f64::from_bits(bits as u64) as f32))
                     }
                     _ => {
                         return Err(ConcreteError::UnsupportedFormula(
                             "FP conversion outside f32<->f64",
-                        ))
+                        ));
                     }
                 };
                 Ok(ConcreteValue::Bv { value: result_bits, width: eb + sb })
@@ -817,9 +825,7 @@ impl ConcreteState {
                     (8, 24) => f32::from_bits(bits as u32).is_nan(),
                     (11, 53) => f64::from_bits(bits as u64).is_nan(),
                     _ => {
-                        return Err(ConcreteError::UnsupportedFormula(
-                            "FP format outside f32/f64",
-                        ))
+                        return Err(ConcreteError::UnsupportedFormula("FP format outside f32/f64"));
                     }
                 }))
             }
@@ -1275,9 +1281,8 @@ contract_requires { a <= b }
 mod tests {
     use trust_types::{Formula, Sort};
 
-    use crate::effect::{Aarch64AtomicAccessKind, Aarch64AtomicOrdering};
-
     use super::*;
+    use crate::effect::{Aarch64AtomicAccessKind, Aarch64AtomicOrdering};
 
     fn bv(value: i128, width: u32) -> Formula {
         Formula::BitVec { value, width }
@@ -1600,7 +1605,8 @@ mod f16_primitive_tests {
             let is_snan = exp == 0x1F && frac != 0 && (frac & 0x200) == 0;
             let expected = if is_snan { h | 0x200 } else { h };
             assert_eq!(
-                back, expected,
+                back,
+                expected,
                 "f16 {h:#06x} widened to {widened} ({:#010x}) and came back {back:#06x}",
                 widened.to_bits()
             );
@@ -1615,7 +1621,7 @@ mod f16_primitive_tests {
         let cases: &[(u16, f32)] = &[
             (0x3C00, 1.0),
             (0xBC00, -1.0),
-            (0x3555, 0.333_251_95), // closest f16 to 1/3
+            (0x3555, 0.333_251_95),   // closest f16 to 1/3
             (0x0001, 5.960_464_5e-8), // smallest subnormal, 2^-24
             (0x03FF, 6.097_555_1e-5), // largest subnormal
             (0x0400, 6.103_515_6e-5), // smallest normal, 2^-14

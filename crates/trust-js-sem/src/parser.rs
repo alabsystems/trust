@@ -7,6 +7,9 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::collections::HashSet;
+use std::rc::Rc;
+
 use crate::ast::{
     BinOp, BindTarget, ClassKey, ClassLit, ClassMember, DeclKind, Expr, ForInOfLeft, FuncLit,
     LogOp, MemberProp, MethodKind, ObjKey, Param, PatElem, Pattern, Program, PropDef, Stmt,
@@ -14,8 +17,6 @@ use crate::ast::{
 };
 use crate::lexer::{Lexer, Tok, Token, TplPiece};
 use crate::value::units_from_str;
-use std::collections::HashSet;
-use std::rc::Rc;
 
 type R<T> = Result<T, String>;
 
@@ -25,7 +26,6 @@ const MAX_PARSE_DEPTH: u32 = 256;
 /// table + the private-in ShiftExpression cut). Higher binds tighter.
 const REL_PREC: u8 = 6; // relational: < <= > >= instanceof in
 const SHIFT_PREC: u8 = 7; // shift: << >> >>>
-
 
 /// Internal marker distinguishing a fully-specified early Syntax Error from
 /// an out-of-slice refusal while errors bubble as strings. (Shared with the
@@ -64,12 +64,52 @@ impl std::fmt::Display for ParseFail {
 fn is_reserved(id: &str) -> bool {
     matches!(
         id,
-        "var" | "let" | "const" | "function" | "return" | "if" | "else" | "while" | "do" | "for"
-            | "break" | "continue" | "throw" | "try" | "catch" | "finally" | "switch" | "case"
-            | "default" | "new" | "typeof" | "instanceof" | "true" | "false" | "null" | "this"
-            | "in" | "delete" | "void" | "class" | "extends" | "super" | "import" | "export"
-            | "yield" | "await" | "debugger" | "with" | "enum" | "static" | "implements"
-            | "interface" | "package" | "private" | "protected" | "public"
+        "var"
+            | "let"
+            | "const"
+            | "function"
+            | "return"
+            | "if"
+            | "else"
+            | "while"
+            | "do"
+            | "for"
+            | "break"
+            | "continue"
+            | "throw"
+            | "try"
+            | "catch"
+            | "finally"
+            | "switch"
+            | "case"
+            | "default"
+            | "new"
+            | "typeof"
+            | "instanceof"
+            | "true"
+            | "false"
+            | "null"
+            | "this"
+            | "in"
+            | "delete"
+            | "void"
+            | "class"
+            | "extends"
+            | "super"
+            | "import"
+            | "export"
+            | "yield"
+            | "await"
+            | "debugger"
+            | "with"
+            | "enum"
+            | "static"
+            | "implements"
+            | "interface"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
     )
 }
 
@@ -80,16 +120,54 @@ fn is_reserved(id: &str) -> bool {
 fn is_true_reserved(id: &str, strict: bool) -> bool {
     matches!(
         id,
-        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger" | "default"
-            | "delete" | "do" | "else" | "enum" | "export" | "extends" | "false" | "finally"
-            | "for" | "function" | "if" | "import" | "in" | "instanceof" | "new" | "null"
-            | "return" | "super" | "switch" | "this" | "throw" | "true" | "try" | "typeof"
-            | "var" | "void" | "while" | "with"
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
     ) || (strict
         && matches!(
             id,
-            "implements" | "interface" | "let" | "package" | "private" | "protected"
-                | "public" | "static" | "yield"
+            "implements"
+                | "interface"
+                | "let"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "static"
+                | "yield"
         ))
 }
 
@@ -247,22 +325,16 @@ fn parse_program_inner(src: &str, force_strict: bool) -> R<Program> {
     // duplicate-`__proto__` brace form was a genuine ObjectLiteral, and
     // B.3.1's early error applies.
     if p.proto_dup_count > 0 || p.saw_proto_dup {
-        return Err(early_syntax(
-            "duplicate `__proto__` data property in object literal",
-        ));
+        return Err(early_syntax("duplicate `__proto__` data property in object literal"));
     }
     if p.proto_single_count > 0 {
-        return Err(
-            "object literal `__proto__` data property (sets [[Prototype]], out of slice)"
-                .to_string(),
-        );
+        return Err("object literal `__proto__` data property (sets [[Prototype]], out of slice)"
+            .to_string());
     }
     if p.cover_init_count > 0 {
         // CoverInitializedName outside a destructuring reparse is a pinned
         // SyntaxError.
-        return Err(early_syntax(
-            "shorthand property initializer outside a destructuring pattern",
-        ));
+        return Err(early_syntax("shorthand property initializer outside a destructuring pattern"));
     }
     if p.obj_spread_count > 0 {
         // Object spread in a surviving literal is legal JS but unmodeled (it
@@ -273,12 +345,7 @@ fn parse_program_inner(src: &str, force_strict: bool) -> R<Program> {
     collect_vars(&body, &mut vars);
     let funcs = top_level_funcs(&body);
     check_scope(&body, &[], &vars)?;
-    Ok(Program {
-        strict: p.strict,
-        body,
-        vars,
-        funcs,
-    })
+    Ok(Program { strict: p.strict, body, vars, funcs })
 }
 
 impl Parser {
@@ -343,8 +410,10 @@ impl Parser {
         // arguments object per FunctionDeclarationInstantiation step 19, and
         // parse via binding_ident_param.)
         if self.in_function && id == "arguments" {
-            return Err("`arguments` binding inside a function (arguments-object overlay out of slice)"
-                .to_string());
+            return Err(
+                "`arguments` binding inside a function (arguments-object overlay out of slice)"
+                    .to_string(),
+            );
         }
         Ok(id)
     }
@@ -367,9 +436,7 @@ impl Parser {
             // ReservedWord set (contextual keywords are legal names). Inside a
             // generator body `yield` is reserved regardless of strictness.
             if is_true_reserved(&id, self.strict) || (self.in_generator && id == "yield") {
-                return Err(early_syntax(&format!(
-                    "escaped reserved word `{id}` as binding"
-                )));
+                return Err(early_syntax(&format!("escaped reserved word `{id}` as binding")));
             }
         } else if is_reserved(&id) {
             return Err(format!("reserved word `{id}` as binding"));
@@ -642,11 +709,7 @@ impl Parser {
                     if catch.is_none() && finally.is_none() {
                         return Err("try without catch/finally".into());
                     }
-                    return Ok(Stmt::Try {
-                        block,
-                        catch,
-                        finally,
-                    });
+                    return Ok(Stmt::Try { block, catch, finally });
                 }
                 "switch" => {
                     self.pos += 1;
@@ -721,9 +784,7 @@ impl Parser {
                 }
                 if matches!(target, BindTarget::Pattern(_)) {
                     // 14.3.x: a pattern declarator REQUIRES an initializer.
-                    return Err(early_syntax(
-                        "destructuring declaration without initializer",
-                    ));
+                    return Err(early_syntax("destructuring declaration without initializer"));
                 }
                 None
             };
@@ -799,11 +860,8 @@ impl Parser {
                 } else {
                     Pattern::Ident(self.binding_ident()?)
                 };
-                let default = if self.eat("=") {
-                    Some(Rc::new(self.parse_assignment_in()?))
-                } else {
-                    None
-                };
+                let default =
+                    if self.eat("=") { Some(Rc::new(self.parse_assignment_in()?)) } else { None };
                 elems.push(Some(PatElem { pat, default }));
                 if self.eat("]") {
                     break;
@@ -835,11 +893,8 @@ impl Parser {
                 } else {
                     Pattern::Ident(self.binding_ident()?)
                 };
-                let default = if self.eat("=") {
-                    Some(Rc::new(self.parse_assignment_in()?))
-                } else {
-                    None
-                };
+                let default =
+                    if self.eat("=") { Some(Rc::new(self.parse_assignment_in()?)) } else { None };
                 PatElem { pat, default }
             } else {
                 // Shorthand (with optional default).
@@ -858,15 +913,9 @@ impl Parser {
                             .into(),
                     );
                 }
-                let default = if self.eat("=") {
-                    Some(Rc::new(self.parse_assignment_in()?))
-                } else {
-                    None
-                };
-                PatElem {
-                    pat: Pattern::Ident(id),
-                    default,
-                }
+                let default =
+                    if self.eat("=") { Some(Rc::new(self.parse_assignment_in()?)) } else { None };
+                PatElem { pat: Pattern::Ident(id), default }
             };
             props.push((key, elem));
             if self.eat("}") {
@@ -940,11 +989,7 @@ impl Parser {
         Ok(if is_in {
             Stmt::ForIn { left, obj: head, body }
         } else {
-            Stmt::ForOf {
-                left,
-                expr: head,
-                body,
-            }
+            Stmt::ForOf { left, expr: head, body }
         })
     }
 
@@ -1053,8 +1098,7 @@ impl Parser {
                             .into(),
                     );
                 }
-                return self
-                    .parse_forinof_tail(ForInOfLeft::Var(decls[0].0.clone()), is_in);
+                return self.parse_forinof_tail(ForInOfLeft::Var(decls[0].0.clone()), is_in);
             }
             self.expect(";")?;
             Some(crate::ast::ForInit::Var(decls))
@@ -1082,17 +1126,9 @@ impl Parser {
             self.expect(";")?;
             Some(crate::ast::ForInit::Expr(e))
         };
-        let test = if self.at(";") {
-            None
-        } else {
-            Some(self.parse_expression()?)
-        };
+        let test = if self.at(";") { None } else { Some(self.parse_expression()?) };
         self.expect(";")?;
-        let update = if self.at(")") {
-            None
-        } else {
-            Some(self.parse_expression()?)
-        };
+        let update = if self.at(")") { None } else { Some(self.parse_expression()?) };
         self.expect(")")?;
         let body = Box::new(self.parse_loop_body()?);
         // 14.7.4.1: a lexical for-head name may not appear in the body's
@@ -1112,12 +1148,7 @@ impl Parser {
                 }
             }
         }
-        Ok(Stmt::For {
-            init,
-            test,
-            update,
-            body,
-        })
+        Ok(Stmt::For { init, test, update, body })
     }
 
     fn parse_switch(&mut self) -> R<Stmt> {
@@ -1255,9 +1286,7 @@ impl Parser {
             }
             for p in param_names(&params, &rest_param) {
                 if p == "eval" || p == "arguments" {
-                    return Err(early_syntax(&format!(
-                        "`{p}` as strict function parameter"
-                    )));
+                    return Err(early_syntax(&format!("`{p}` as strict function parameter")));
                 }
             }
         }
@@ -1416,9 +1445,7 @@ impl Parser {
             self.pending_priv_refs.push(name);
             Ok(())
         } else {
-            Err(early_syntax(&format!(
-                "private name `#{name}` outside a class body"
-            )))
+            Err(early_syntax(&format!("private name `#{name}` outside a class body")))
         }
     }
 
@@ -1427,10 +1454,7 @@ impl Parser {
         if name == "constructor" {
             return Err(early_syntax("private class element named `#constructor`"));
         }
-        let top = self
-            .priv_stack
-            .last_mut()
-            .expect("private declaration inside a class scope");
+        let top = self.priv_stack.last_mut().expect("private declaration inside a class scope");
         let mut kinds = top.entries.get(name).cloned().unwrap_or_default();
         let first = kinds.is_empty();
         kinds.push((kind, is_static));
@@ -1574,9 +1598,7 @@ impl Parser {
                 ClassKey::Private(n) => Some(n.clone()),
                 _ => None,
             };
-            let fixed_is = |k: &ClassKey, s: &str| {
-                matches!(k, ClassKey::Fixed(u) if crate::value::units_eq_ascii(u, s))
-            };
+            let fixed_is = |k: &ClassKey, s: &str| matches!(k, ClassKey::Fixed(u) if crate::value::units_eq_ascii(u, s));
             if is_gen && !self.at("(") {
                 // A `*`-prefixed class member is a GeneratorMethod and MUST
                 // carry a parameter list; `class C { *x }` / `*x = 1` (no
@@ -1631,12 +1653,7 @@ impl Parser {
                     self.declare_private(n, kind, stat)?;
                 }
                 let lit = self.parse_method_fn(mk, true, derived, true, is_gen, is_async)?;
-                members.push(ClassMember::Method {
-                    stat,
-                    key,
-                    mk,
-                    lit,
-                });
+                members.push(ClassMember::Method { stat, key, mk, lit });
             } else {
                 // FieldDefinition.
                 if mk != MethodKind::Normal {
@@ -1711,9 +1728,7 @@ impl Parser {
             }
             Tok::Num(n) => {
                 self.pos += 1;
-                Ok(ClassKey::Fixed(units_from_str(
-                    &crate::number::js_number_to_string(n),
-                )))
+                Ok(ClassKey::Fixed(units_from_str(&crate::number::js_number_to_string(n))))
             }
             Tok::BigInt(b) => {
                 self.pos += 1;
@@ -1825,9 +1840,7 @@ impl Parser {
         if strict {
             for p in &pnames {
                 if p == "eval" || p == "arguments" {
-                    return Err(early_syntax(&format!(
-                        "`{p}` as strict method parameter"
-                    )));
+                    return Err(early_syntax(&format!("`{p}` as strict method parameter")));
                 }
             }
         }
@@ -1861,9 +1874,7 @@ impl Parser {
         match e {
             Expr::Ident(id) => {
                 if self.strict && (id == "eval" || id == "arguments") {
-                    return Err(early_syntax(&format!(
-                        "assignment to `{id}` in strict code"
-                    )));
+                    return Err(early_syntax(&format!("assignment to `{id}` in strict code")));
                 }
                 Ok(Pattern::Ident(id))
             }
@@ -1886,16 +1897,9 @@ impl Parser {
                             }
                             rest = Some(Box::new(self.expr_to_pattern(*inner)?));
                         }
-                        Some(Expr::Assign {
-                            op: None,
-                            target,
-                            value,
-                        }) => {
+                        Some(Expr::Assign { op: None, target, value }) => {
                             let pat = self.expr_to_pattern(*target)?;
-                            out.push(Some(PatElem {
-                                pat,
-                                default: Some(Rc::new(*value)),
-                            }));
+                            out.push(Some(PatElem { pat, default: Some(Rc::new(*value)) }));
                         }
                         Some(other) => {
                             let pat = self.expr_to_pattern(other)?;
@@ -1910,10 +1914,7 @@ impl Parser {
                 let mut rest: Option<Box<Pattern>> = None;
                 // Undo this literal's __proto__ accounting: in a PATTERN the
                 // colon form is an ordinary property (duplicates legal).
-                let protos = props
-                    .iter()
-                    .filter(|d| matches!(d, PropDef::ProtoData(_)))
-                    .count();
+                let protos = props.iter().filter(|d| matches!(d, PropDef::ProtoData(_))).count();
                 if protos == 1 {
                     self.proto_single_count -= 1;
                 } else if protos >= 2 {
@@ -1924,16 +1925,11 @@ impl Parser {
                     match def {
                         PropDef::ProtoData(v) => {
                             let elem = match v {
-                                Expr::Assign {
-                                    op: None,
-                                    target,
-                                    value,
-                                } if matches!(*target, Expr::Ident(_)) => {
+                                Expr::Assign { op: None, target, value }
+                                    if matches!(*target, Expr::Ident(_)) =>
+                                {
                                     let pat = self.expr_to_pattern(*target)?;
-                                    PatElem {
-                                        pat,
-                                        default: Some(Rc::new(*value)),
-                                    }
+                                    PatElem { pat, default: Some(Rc::new(*value)) }
                                 }
                                 other => {
                                     let pat = self.expr_to_pattern(other)?;
@@ -1957,11 +1953,9 @@ impl Parser {
                             // A CoverInitializedName arrives as
                             // `Assign { Ident, default }` (counter-tracked).
                             let elem = match v {
-                                Expr::Assign {
-                                    op: None,
-                                    target,
-                                    value,
-                                } if matches!(*target, Expr::Ident(_)) => {
+                                Expr::Assign { op: None, target, value }
+                                    if matches!(*target, Expr::Ident(_)) =>
+                                {
                                     // Distinguish cover-init (shorthand) from
                                     // an ordinary `k: a = b` — both are legal
                                     // patterns with the same semantics; only
@@ -1971,10 +1965,7 @@ impl Parser {
                                         self.cover_init_count -= 1;
                                     }
                                     let pat = self.expr_to_pattern(*target)?;
-                                    PatElem {
-                                        pat,
-                                        default: Some(Rc::new(*value)),
-                                    }
+                                    PatElem { pat, default: Some(Rc::new(*value)) }
                                 }
                                 other => {
                                     let pat = self.expr_to_pattern(other)?;
@@ -1994,9 +1985,7 @@ impl Parser {
                 Expr::Ident(_) | Expr::Member { .. } | Expr::SuperMember { .. } => {
                     Ok(Pattern::Target(Rc::new(*inner)))
                 }
-                _ => Err(early_syntax(
-                    "parenthesized literal in a destructuring pattern",
-                )),
+                _ => Err(early_syntax("parenthesized literal in a destructuring pattern")),
             },
             Expr::PatternAssign { .. } => {
                 Err("nested pattern-assign in pattern (out of slice)".into())
@@ -2012,10 +2001,7 @@ impl Parser {
         if self.at("}") || matches!(self.cur_tok(), Tok::Eof) || self.cur().newline_before {
             return Ok(()); // ASI
         }
-        Err(format!(
-            "expected `;`, found {:?} (no ASI opportunity)",
-            self.cur_tok()
-        ))
+        Err(format!("expected `;`, found {:?} (no ASI opportunity)", self.cur_tok()))
     }
 
     // -- expressions --------------------------------------------------------
@@ -2090,9 +2076,7 @@ impl Parser {
                     // NamedEvaluation — and the strict eval/arguments early
                     // error still applies through the parens.
                     if self.strict && (id == "eval" || id == "arguments") {
-                        return Err(early_syntax(&format!(
-                            "assignment to `{id}` in strict code"
-                        )));
+                        return Err(early_syntax(&format!("assignment to `{id}` in strict code")));
                     }
                     let value = self.parse_assignment()?;
                     Ok(Expr::Assign {
@@ -2111,15 +2095,9 @@ impl Parser {
             }
             let pat = self.expr_to_pattern(left)?;
             let value = self.parse_assignment()?;
-            return Ok(Expr::PatternAssign {
-                pat: Rc::new(pat),
-                value: Box::new(value),
-            });
+            return Ok(Expr::PatternAssign { pat: Rc::new(pat), value: Box::new(value) });
         }
-        if !matches!(
-            left,
-            Expr::Ident(_) | Expr::Member { .. } | Expr::SuperMember { .. }
-        ) {
+        if !matches!(left, Expr::Ident(_) | Expr::Member { .. } | Expr::SuperMember { .. }) {
             return Err("invalid assignment target".into());
         }
         // 13.15.1: in strict code, `eval`/`arguments` have AssignmentTargetType
@@ -2136,11 +2114,7 @@ impl Parser {
                 infer_fn_name(&mut value, id);
             }
         }
-        Ok(Expr::Assign {
-            op,
-            target: Box::new(left),
-            value: Box::new(value),
-        })
+        Ok(Expr::Assign { op, target: Box::new(left), value: Box::new(value) })
     }
 
     /// YieldExpression (14.4): `yield`, `yield [no LTH] AssignmentExpression`,
@@ -2164,10 +2138,7 @@ impl Parser {
     /// The current token cannot begin a YieldExpression operand (so a bare
     /// `yield` ends here).
     fn yield_operand_absent(&self) -> bool {
-        matches!(
-            self.cur_tok(),
-            Tok::Eof | Tok::Punct(")" | "]" | "}" | ";" | "," | ":")
-        )
+        matches!(self.cur_tok(), Tok::Eof | Tok::Punct(")" | "]" | "}" | ";" | "," | ":"))
     }
 
     fn parse_conditional(&mut self) -> R<Expr> {
@@ -2179,11 +2150,7 @@ impl Parser {
         let cons = self.parse_assignment_in()?;
         self.expect(":")?;
         let alt = self.parse_assignment()?;
-        Ok(Expr::Cond {
-            test: Box::new(test),
-            cons: Box::new(cons),
-            alt: Box::new(alt),
-        })
+        Ok(Expr::Cond { test: Box::new(test), cons: Box::new(cons), alt: Box::new(alt) })
     }
 
     /// ExponentiationExpression (13.6): `UpdateExpression ** ExponentiationExpression`,
@@ -2204,11 +2171,7 @@ impl Parser {
             }
             self.pos += 1;
             let exp = self.parse_exponent()?; // right-associative
-            return Ok(Expr::Binary {
-                op: BinOp::Exp,
-                left: Box::new(base),
-                right: Box::new(exp),
-            });
+            return Ok(Expr::Binary { op: BinOp::Exp, left: Box::new(base), right: Box::new(exp) });
         }
         Ok(base)
     }
@@ -2243,14 +2206,10 @@ impl Parser {
             && !self.no_in
             && matches!(self.cur_tok(), Tok::PrivateIdent(_))
         {
-            let Tok::PrivateIdent(name) = self.cur_tok().clone() else {
-                unreachable!()
-            };
+            let Tok::PrivateIdent(name) = self.cur_tok().clone() else { unreachable!() };
             self.pos += 1;
             if !self.at_kw("in") {
-                return Err(early_syntax(
-                    "`#name` is only valid as `obj.#name` or `#name in obj`",
-                ));
+                return Err(early_syntax("`#name` is only valid as `obj.#name` or `#name in obj`"));
             }
             self.pos += 1; // `in`
             // The RHS is a ShiftExpression: an arrow function (an
@@ -2263,10 +2222,7 @@ impl Parser {
             }
             self.record_priv_ref(name.clone())?;
             let obj = self.parse_binary(SHIFT_PREC)?; // ShiftExpression (relational excluded)
-            Expr::PrivateIn {
-                name,
-                obj: Box::new(obj),
-            }
+            Expr::PrivateIn { name, obj: Box::new(obj) }
         } else {
             self.parse_exponent()?
         };
@@ -2302,7 +2258,7 @@ impl Parser {
                 Tok::Punct("%") => (9, Some(BinOp::Rem)),
                 // `??` cannot mix with `||`/`&&` and is otherwise out of slice.
                 Tok::Punct("??") => {
-                    return Err("nullish coalescing `??` (out of slice)".to_string())
+                    return Err("nullish coalescing `??` (out of slice)".to_string());
                 }
                 _ => return Ok(left),
             };
@@ -2312,11 +2268,7 @@ impl Parser {
             self.pos += 1;
             let right = self.parse_binary(prec + 1)?;
             left = match op {
-                Some(op) => Expr::Binary {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
+                Some(op) => Expr::Binary { op, left: Box::new(left), right: Box::new(right) },
                 None => Expr::Logical {
                     op: if prec == 0 { LogOp::Or } else { LogOp::And },
                     left: Box::new(left),
@@ -2350,18 +2302,10 @@ impl Parser {
                     peeled = inner;
                 }
                 if self.strict && matches!(peeled, Expr::Ident(_)) {
-                    return Err(early_syntax(
-                        "`delete` of an identifier reference in strict code",
-                    ));
+                    return Err(early_syntax("`delete` of an identifier reference in strict code"));
                 }
                 // 13.5.1.1: `delete` of a private reference is a Syntax Error.
-                if matches!(
-                    peeled,
-                    Expr::Member {
-                        prop: MemberProp::Private(_),
-                        ..
-                    }
-                ) {
+                if matches!(peeled, Expr::Member { prop: MemberProp::Private(_), .. }) {
                     return Err(early_syntax("`delete` of a private reference"));
                 }
                 return Ok(Expr::Delete(Box::new(operand)));
@@ -2381,21 +2325,14 @@ impl Parser {
                 self.pos += 1;
                 let target = self.parse_unary()?;
                 self.check_update_target(&target)?;
-                return Ok(Expr::Update {
-                    inc,
-                    prefix: true,
-                    target: Box::new(target),
-                });
+                return Ok(Expr::Update { inc, prefix: true, target: Box::new(target) });
             }
             _ => None,
         };
         if let Some(op) = op {
             self.pos += 1;
             let expr = self.parse_unary()?;
-            return Ok(Expr::Unary {
-                op,
-                expr: Box::new(expr),
-            });
+            return Ok(Expr::Unary { op, expr: Box::new(expr) });
         }
         // Postfix update (no line terminator before the operator).
         let e = self.parse_lhs()?;
@@ -2403,11 +2340,7 @@ impl Parser {
             let inc = self.at("++");
             self.pos += 1;
             self.check_update_target(&e)?;
-            return Ok(Expr::Update {
-                inc,
-                prefix: false,
-                target: Box::new(e),
-            });
+            return Ok(Expr::Update { inc, prefix: false, target: Box::new(e) });
         }
         Ok(e)
     }
@@ -2419,9 +2352,7 @@ impl Parser {
             Expr::Paren(inner) => self.check_update_target(inner),
             Expr::Ident(id) => {
                 if self.strict && (id == "eval" || id == "arguments") {
-                    return Err(early_syntax(&format!(
-                        "`++`/`--` on `{id}` in strict code"
-                    )));
+                    return Err(early_syntax(&format!("`++`/`--` on `{id}` in strict code")));
                 }
                 Ok(())
             }
@@ -2436,16 +2367,10 @@ impl Parser {
         if let Tok::PrivateIdent(name) = self.cur_tok().clone() {
             self.pos += 1;
             self.record_priv_ref(name.clone())?;
-            Ok(Expr::Member {
-                obj: Box::new(obj),
-                prop: MemberProp::Private(name),
-            })
+            Ok(Expr::Member { obj: Box::new(obj), prop: MemberProp::Private(name) })
         } else {
             let name = self.ident_name()?;
-            Ok(Expr::Member {
-                obj: Box::new(obj),
-                prop: MemberProp::Dot(name),
-            })
+            Ok(Expr::Member { obj: Box::new(obj), prop: MemberProp::Dot(name) })
         }
     }
 
@@ -2457,16 +2382,10 @@ impl Parser {
             } else if self.eat("[") {
                 let k = self.parse_expression_in()?;
                 self.expect("]")?;
-                e = Expr::Member {
-                    obj: Box::new(e),
-                    prop: MemberProp::Computed(Box::new(k)),
-                };
+                e = Expr::Member { obj: Box::new(e), prop: MemberProp::Computed(Box::new(k)) };
             } else if self.at("(") {
                 let args = self.parse_args()?;
-                e = Expr::Call {
-                    callee: Box::new(e),
-                    args,
-                };
+                e = Expr::Call { callee: Box::new(e), args };
             } else if self.at("?.") {
                 return Err("optional chaining (out of slice)".into());
             } else if matches!(self.cur_tok(), Tok::Template(_)) {
@@ -2500,17 +2419,13 @@ impl Parser {
             if self.eat(".") {
                 self.check_super_member()?;
                 let name = self.ident_name()?;
-                return Ok(Expr::SuperMember {
-                    prop: MemberProp::Dot(name),
-                });
+                return Ok(Expr::SuperMember { prop: MemberProp::Dot(name) });
             }
             if self.eat("[") {
                 self.check_super_member()?;
                 let k = self.parse_expression_in()?;
                 self.expect("]")?;
-                return Ok(Expr::SuperMember {
-                    prop: MemberProp::Computed(Box::new(k)),
-                });
+                return Ok(Expr::SuperMember { prop: MemberProp::Computed(Box::new(k)) });
             }
             return Err("bare `super` (out of slice)".into());
         }
@@ -2520,15 +2435,8 @@ impl Parser {
                 return Err("new.target (out of slice)".into());
             }
             let callee = self.parse_new_expr()?;
-            let args = if self.at("(") {
-                self.parse_args()?
-            } else {
-                Vec::new()
-            };
-            return Ok(Expr::New {
-                callee: Box::new(callee),
-                args,
-            });
+            let args = if self.at("(") { self.parse_args()? } else { Vec::new() };
+            return Ok(Expr::New { callee: Box::new(callee), args });
         }
         let mut e = self.parse_primary()?;
         loop {
@@ -2537,10 +2445,7 @@ impl Parser {
             } else if self.eat("[") {
                 let k = self.parse_expression_in()?;
                 self.expect("]")?;
-                e = Expr::Member {
-                    obj: Box::new(e),
-                    prop: MemberProp::Computed(Box::new(k)),
-                };
+                e = Expr::Member { obj: Box::new(e), prop: MemberProp::Computed(Box::new(k)) };
             } else if matches!(self.cur_tok(), Tok::Template(_)) {
                 return Err("tagged template (out of slice)".into());
             } else {
@@ -2663,10 +2568,7 @@ impl Parser {
                 // construct maps to NoCoverage (never a guessed SyntaxError).
                 let flags_str: String = flags.iter().map(|&u| u as u8 as char).collect();
                 match trust_js_regexp::compile(&body, &flags_str) {
-                    Ok(_) => Ok(Expr::Regex {
-                        body: Rc::new(body),
-                        flags: Rc::new(flags),
-                    }),
+                    Ok(_) => Ok(Expr::Regex { body: Rc::new(body), flags: Rc::new(flags) }),
                     Err(trust_js_regexp::CompileError::Syntax(_)) => {
                         Err(early_syntax("invalid regular expression literal"))
                     }
@@ -2809,9 +2711,9 @@ impl Parser {
                 // IdentifierReference. In strict code that is a pinned early
                 // Syntax Error (13.1.1); sloppy `yield` as a plain identifier
                 // is legal but out of slice, so it refuses below.
-                "yield" if self.strict => Err(early_syntax(
-                    "`yield` as an identifier reference in strict code",
-                )),
+                "yield" if self.strict => {
+                    Err(early_syntax("`yield` as an identifier reference in strict code"))
+                }
                 _ if is_reserved(&id) => Err(format!("reserved word `{id}` as expression")),
                 _ => {
                     self.pos += 1;
@@ -2846,9 +2748,9 @@ impl Parser {
             // A bare `#name` in any operand position is a Syntax Error — a
             // PrivateIdentifier is only legal in `obj.#name` (handled by the
             // member path) or `#name in obj` (handled at relational level).
-            Tok::PrivateIdent(_) => Err(early_syntax(
-                "private name not in a `obj.#name` or `#name in obj` position",
-            )),
+            Tok::PrivateIdent(_) => {
+                Err(early_syntax("private name not in a `obj.#name` or `#name in obj` position"))
+            }
             t => Err(format!("unexpected token {t:?} in expression")),
         }
     }
@@ -2938,18 +2840,9 @@ impl Parser {
             Some(id) => {
                 // Strict eval/arguments arrow params are early errors.
                 if self.strict && (id == "eval" || id == "arguments") {
-                    return Err(early_syntax(&format!(
-                        "`{id}` as arrow parameter in strict code"
-                    )));
+                    return Err(early_syntax(&format!("`{id}` as arrow parameter in strict code")));
                 }
-                (
-                    vec![Param {
-                        target: BindTarget::Name(id),
-                        default: None,
-                    }],
-                    None,
-                    true,
-                )
+                (vec![Param { target: BindTarget::Name(id), default: None }], None, true)
             }
             None => self.parse_params()?,
         };
@@ -3011,9 +2904,7 @@ impl Parser {
         if strict {
             for p in &pnames {
                 if p == "eval" || p == "arguments" {
-                    return Err(early_syntax(&format!(
-                        "`{p}` as strict arrow parameter"
-                    )));
+                    return Err(early_syntax(&format!("`{p}` as strict arrow parameter")));
                 }
             }
         }
@@ -3054,10 +2945,7 @@ impl Parser {
             }
             Tok::Num(n) => {
                 self.pos += 1;
-                Ok((
-                    ObjKey::Fixed(units_from_str(&crate::number::js_number_to_string(n))),
-                    None,
-                ))
+                Ok((ObjKey::Fixed(units_from_str(&crate::number::js_number_to_string(n))), None))
             }
             Tok::BigInt(b) => {
                 self.pos += 1;
@@ -3105,10 +2993,7 @@ impl Parser {
             // and no LineTerminator follows. `async *m(){}` is an async
             // generator method (refused in parse_method_fn).
             let is_async = self.at_kw("async")
-                && !matches!(
-                    self.toks[self.pos + 1].tok,
-                    Tok::Punct(":" | "," | "}" | "(" | "=")
-                )
+                && !matches!(self.toks[self.pos + 1].tok, Tok::Punct(":" | "," | "}" | "(" | "="))
                 && !self.toks[self.pos + 1].newline_before;
             if is_async {
                 self.pos += 1; // consume `async`
@@ -3123,10 +3008,7 @@ impl Parser {
                 if !is_async
                     && !is_gen
                     && (is_get || is_set)
-                    && !matches!(
-                        self.toks[self.pos + 1].tok,
-                        Tok::Punct(":" | "," | "}" | "(")
-                    )
+                    && !matches!(self.toks[self.pos + 1].tok, Tok::Punct(":" | "," | "}" | "("))
                 {
                     self.pos += 1;
                     let (key, _) = self.parse_obj_key()?;
@@ -3185,11 +3067,7 @@ impl Parser {
                     let key_s = crate::value::units_to_lossy(u);
                     infer_fn_name(&mut v, &key_s);
                 }
-                if is_proto {
-                    PropDef::ProtoData(v)
-                } else {
-                    PropDef::Data(key, v)
-                }
+                if is_proto { PropDef::ProtoData(v) } else { PropDef::Data(key, v) }
             } else if self.at(",") || self.at("}") {
                 // Shorthand `{ a }` — the key must be a plain identifier.
                 // (`{ __proto__ }` is an ordinary own property per spec and
@@ -3223,10 +3101,7 @@ impl Parser {
                     },
                 )
             } else {
-                return Err(format!(
-                    "expected `:` in object literal, found {:?}",
-                    self.cur_tok()
-                ));
+                return Err(format!("expected `:` in object literal, found {:?}", self.cur_tok()));
             };
             entries.push(def);
             if self.eat("}") {
@@ -3340,10 +3215,9 @@ fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 walk_expr(a, f);
             }
         }
-        Expr::Unary { expr, .. }
-        | Expr::Delete(expr)
-        | Expr::Spread(expr)
-        | Expr::Paren(expr) => walk_expr(expr, f),
+        Expr::Unary { expr, .. } | Expr::Delete(expr) | Expr::Spread(expr) | Expr::Paren(expr) => {
+            walk_expr(expr, f)
+        }
         Expr::Update { target, .. } => walk_expr(target, f),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             walk_expr(left, f);
@@ -3417,11 +3291,7 @@ fn collect_vars_stmt(s: &Stmt, out: &mut Vec<String>) {
             }
             collect_vars_stmt(body, out);
         }
-        Stmt::Try {
-            block,
-            catch,
-            finally,
-        } => {
+        Stmt::Try { block, catch, finally } => {
             collect_vars(block, out);
             if let Some((_, b)) = catch {
                 collect_vars(b, out);
@@ -3509,14 +3379,10 @@ fn collect_lexical(stmts: &[Stmt], all: &mut HashSet<String>) -> R<()> {
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                 collect_lexical(std::slice::from_ref(body), all)?;
             }
-            Stmt::For { body, .. }
-            | Stmt::ForIn { body, .. }
-            | Stmt::ForOf { body, .. } => collect_lexical(std::slice::from_ref(body), all)?,
-            Stmt::Try {
-                block,
-                catch,
-                finally,
-            } => {
+            Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForOf { body, .. } => {
+                collect_lexical(std::slice::from_ref(body), all)?
+            }
+            Stmt::Try { block, catch, finally } => {
                 collect_lexical(block, all)?;
                 if let Some((_, b)) = catch {
                     collect_lexical(b, all)?;

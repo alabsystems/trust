@@ -45,7 +45,7 @@
 
 use clean_kernel::{BinderInfo, Environment, Expr, Name, TypeChecker};
 use trust_clean_carrier::carrier_at;
-use trust_clean_origin::{check_faithful, GateRefusal};
+use trust_clean_origin::{GateRefusal, check_faithful};
 use trust_types::Ty;
 
 /// `UInt64`, the Clean fixed-width type that actually carries.
@@ -68,8 +68,7 @@ fn u64_carrier() -> trust_clean_carrier::Carrier {
 /// precisely the class of one-construct error a lowering makes.
 fn env_with_double() -> (Environment, Expr) {
     let mut env = Environment::new();
-    env.init_uint_arith()
-        .expect("UInt8/16/32/64 plus wrapping add/sub/mul must initialize");
+    env.init_uint_arith().expect("UInt8/16/32/64 plus wrapping add/sub/mul must initialize");
 
     let body = correct_lowering();
 
@@ -165,10 +164,8 @@ fn half_3_the_mutation_is_genuinely_one_construct_and_genuinely_different() {
     );
 
     // ...and they really do differ on a concrete carrier value: 3 + 3 = 6, 3 * 3 = 9.
-    let three = Expr::app(
-        Expr::const_(Name::from_string("UInt64.ofNat"), vec![]),
-        Expr::nat_lit(3),
-    );
+    let three =
+        Expr::app(Expr::const_(Name::from_string("UInt64.ofNat"), vec![]), Expr::nat_lit(3));
     let applied_correct = Expr::app(correct_lowering(), three.clone());
     let applied_mutated = Expr::app(mistranslated_lowering(), three);
 
@@ -184,8 +181,7 @@ fn half_4_a_declaration_with_no_definition_body_is_refused() {
     // emitted code to agree with, so the gate must refuse rather than compare
     // against whatever happens to be in the environment.
     let mut env = Environment::new();
-    env.init_uint_arith()
-        .expect("UInt8/16/32/64 plus wrapping add/sub/mul must initialize");
+    env.init_uint_arith().expect("UInt8/16/32/64 plus wrapping add/sub/mul must initialize");
     env.add_decl(clean_kernel::Declaration::Axiom {
         name: Name::from_string("assumed"),
         level_params: vec![],

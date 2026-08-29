@@ -200,13 +200,8 @@ fn is_line_terminator(c: char) -> bool {
 }
 
 fn is_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        '\u{9}' | '\u{B}' | '\u{C}' | '\u{20}' | '\u{A0}' | '\u{FEFF}'
-    ) || matches!(
-        c,
-        '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
-    )
+    matches!(c, '\u{9}' | '\u{B}' | '\u{C}' | '\u{20}' | '\u{A0}' | '\u{FEFF}')
+        || matches!(c, '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
 }
 
 fn in_table(table: &[(u32, u32)], c: char) -> bool {
@@ -239,10 +234,7 @@ pub struct Lexer {
 
 impl Lexer {
     pub fn new(source: &str) -> Self {
-        Lexer {
-            src: source.chars().collect(),
-            pos: 0,
-        }
+        Lexer { src: source.chars().collect(), pos: 0 }
     }
 
     pub fn pos(&self) -> usize {
@@ -327,18 +319,14 @@ impl Lexer {
                         && self.peek_at(2) == Some('-')
                         && self.peek_at(3) == Some('-') =>
                 {
-                    return Err(Fail::unsupported(
-                        "annexB html-open-comment <!-- (out of slice)",
-                    ));
+                    return Err(Fail::unsupported("annexB html-open-comment <!-- (out of slice)"));
                 }
                 Some('-')
                     if self.peek_at(1) == Some('-')
                         && self.peek_at(2) == Some('>')
                         && (newline || self.at_line_start()) =>
                 {
-                    return Err(Fail::unsupported(
-                        "annexB html-close-comment --> (out of slice)",
-                    ));
+                    return Err(Fail::unsupported("annexB html-close-comment --> (out of slice)"));
                 }
                 _ => break,
             }
@@ -396,13 +384,7 @@ impl Lexer {
             Some('`') => self.lex_template(true)?,
             Some(_) => self.lex_punct()?,
         };
-        Ok(Token {
-            kind,
-            start,
-            end: self.pos,
-            newline_before,
-            had_escape,
-        })
+        Ok(Token { kind, start, end: self.pos, newline_before, had_escape })
     }
 
     fn lex_unicode_escape_in_ident(&mut self) -> LexResult<char> {
@@ -655,7 +637,7 @@ impl Lexer {
             match self.peek() {
                 None => return Err(Fail::early("unterminated string literal")),
                 Some(c) if c == '\n' || c == '\r' => {
-                    return Err(Fail::early("line terminator in string literal"))
+                    return Err(Fail::early("line terminator in string literal"));
                 }
                 Some(c) if c == quote => {
                     let raw: String = self.src[raw_start..self.pos].iter().collect();
@@ -746,23 +728,13 @@ impl Lexer {
                     let raw: String = self.src[raw_start..self.pos].iter().collect();
                     self.pos += 1;
                     let kind = if from_tick { TplKind::NoSub } else { TplKind::Tail };
-                    return Ok(TokenKind::Template {
-                        kind,
-                        raw,
-                        invalid_escape,
-                        octal_escape,
-                    });
+                    return Ok(TokenKind::Template { kind, raw, invalid_escape, octal_escape });
                 }
                 Some('$') if self.peek_at(1) == Some('{') => {
                     let raw: String = self.src[raw_start..self.pos].iter().collect();
                     self.pos += 2;
                     let kind = if from_tick { TplKind::Head } else { TplKind::Middle };
-                    return Ok(TokenKind::Template {
-                        kind,
-                        raw,
-                        invalid_escape,
-                        octal_escape,
-                    });
+                    return Ok(TokenKind::Template { kind, raw, invalid_escape, octal_escape });
                 }
                 Some('\\') => {
                     self.pos += 1;
@@ -833,13 +805,7 @@ impl Lexer {
         debug_assert_eq!(self.peek(), Some('}'));
         let start = self.pos;
         let kind = self.lex_template(false)?;
-        Ok(Token {
-            kind,
-            start,
-            end: self.pos,
-            newline_before: false,
-            had_escape: false,
-        })
+        Ok(Token { kind, start, end: self.pos, newline_before: false, had_escape: false })
     }
 
     /// Re-lex a regex literal starting from a `/` (or `/=`) token position.
@@ -854,18 +820,16 @@ impl Lexer {
             match self.peek() {
                 None => return Err(Fail::early("unterminated regular expression literal")),
                 Some(c) if is_line_terminator(c) => {
-                    return Err(Fail::early("line terminator in regular expression literal"))
+                    return Err(Fail::early("line terminator in regular expression literal"));
                 }
                 Some('\\') => {
                     self.pos += 1;
                     match self.peek() {
-                        None => {
-                            return Err(Fail::early("unterminated regular expression literal"))
-                        }
+                        None => return Err(Fail::early("unterminated regular expression literal")),
                         Some(c) if is_line_terminator(c) => {
                             return Err(Fail::early(
                                 "line terminator in regular expression literal",
-                            ))
+                            ));
                         }
                         Some(_) => {
                             self.pos += 1;
@@ -1081,10 +1045,7 @@ impl Lexer {
                 }
                 t!(1, Slash)
             }
-            other => Err(Fail::early(format!(
-                "unexpected character U+{:04X}",
-                other as u32
-            ))),
+            other => Err(Fail::early(format!("unexpected character U+{:04X}", other as u32))),
         }
     }
 }

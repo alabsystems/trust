@@ -102,9 +102,11 @@ done
 
 git config --local core.hooksPath "$HOOKS_DIR"
 echo "Trust git hooks: installed (core.hooksPath = $HOOKS_DIR)"
-echo "  pre-push runs scripts/pr_gate.sh, scripts/check_pin_coherence.sh, and"
-echo "  scripts/check_bridge_pin.sh --check. A known-red lane needs an owned,"
-echo "  expiring row in tests/trust-comprehensive/divergences.toml."
+echo "  pre-push runs every gate-manifest row carrying the \`push\` profile; it"
+echo "  hand-lists nothing. See the current set with:"
+echo "      bash tests/run_trust_comprehensive_harness.sh --list push"
+echo "  A known-red lane needs an owned, expiring row in"
+echo "  tests/trust-comprehensive/divergences.toml."
 echo
 echo "  post-merge / post-rewrite / post-checkout are ADVISORY: they announce"
 echo "  submodule pin drift right after a pull, rebase or branch switch — the"

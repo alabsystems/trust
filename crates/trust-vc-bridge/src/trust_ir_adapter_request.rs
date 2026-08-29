@@ -261,8 +261,9 @@ impl<'a> AdapterEmitter<'a> {
         let sort = spec_sort(variable.sort).ok_or_else(|| {
             TrustVcTmirAdapterEmissionError::UnsupportedSpecExpression {
                 obligation_id: obligation_id.to_string(),
-                reason: "array and float sorts are outside the trust_vc direct scalar adapter fragment"
-                    .to_string(),
+                reason:
+                    "array and float sorts are outside the trust_vc direct scalar adapter fragment"
+                        .to_string(),
             }
         })?;
         record_variable_sort(&mut self.variables, variable.name.clone(), sort)
@@ -1155,6 +1156,17 @@ mod tests {
         let error = trust_vc_trust_ir_adapter_request_from_bundle(&bundle)
             .expect_err("trust_vc direct scalar adapter must reject arrays");
         assert!(matches!(error, TrustVcTmirAdapterEmissionError::UnsupportedSpecExpression { .. }));
-        assert!(error.to_string().contains("array sorts are outside"), "{error}");
+        // Trust: assert the two things that MATTER — the message names arrays,
+        // and it says they are outside the fragment — rather than pinning the
+        // exact conjunction. The message became "array and float sorts are
+        // outside …" when float joined it, and the old substring
+        // ("array sorts are outside") silently stopped matching. A refusal that
+        // grows another excluded sort should not break this test again.
+        let message = error.to_string();
+        assert!(message.contains("array"), "the refusal must name arrays: {message}");
+        assert!(
+            message.contains("outside the trust_vc direct scalar adapter fragment"),
+            "the refusal must say arrays are outside the fragment: {message}"
+        );
     }
 }

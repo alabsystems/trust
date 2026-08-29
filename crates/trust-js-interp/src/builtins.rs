@@ -6,15 +6,17 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
-use crate::props::PartialDesc;
 use std::rc::Rc;
+
 use trust_js_trace::HostEvent;
 use trust_js_value::{
-    exact_uint32, js_number_to_string, to_integer_or_infinity, to_length_u64, units_from_str,
     ErrKind, JsValue, NativeFn, ObjId, ObjKind, PropKey, PropValue, Property, SymId, Units, WkSym,
-    WrapperPrim,
+    WrapperPrim, exact_uint32, js_number_to_string, to_integer_or_infinity, to_length_u64,
+    units_from_str,
 };
+
+use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
+use crate::props::PartialDesc;
 
 impl Interp {
     /// Refuse an output recording the trace driver could not perform. The
@@ -121,8 +123,10 @@ impl Interp {
                     if !matches!(ntv, JsValue::Obj(o) if *o == fid) {
                         let proto =
                             self.get_prototype_from_constructor(ntv, self.intr.object_proto)?;
-                        let oid = self
-                            .alloc_obj(trust_js_value::JsObject::new(ObjKind::Plain, Some(proto)))?;
+                        let oid = self.alloc_obj(trust_js_value::JsObject::new(
+                            ObjKind::Plain,
+                            Some(proto),
+                        ))?;
                         return Ok(JsValue::Obj(oid));
                     }
                 }
@@ -325,7 +329,8 @@ impl Interp {
             NativeFn::ArrayJoin => self.array_join(&this, &arg(0)),
             NativeFn::ArrayToString => {
                 let oid = self.to_object(&this)?;
-                let func = self.get_from_object(oid, &PropKey::from_str("join"), JsValue::Obj(oid))?;
+                let func =
+                    self.get_from_object(oid, &PropKey::from_str("join"), JsValue::Obj(oid))?;
                 if let JsValue::Obj(f) = &func {
                     if self.heap.obj(*f).is_callable() {
                         return self.call_value(&func, JsValue::Obj(oid), Vec::new());
@@ -340,7 +345,12 @@ impl Interp {
                     return Err(self.throw_type_error());
                 }
                 for v in args {
-                    self.set_on_object(oid, &PropKey::Str(units_from_str(&len.to_string())), v, true)?;
+                    self.set_on_object(
+                        oid,
+                        &PropKey::Str(units_from_str(&len.to_string())),
+                        v,
+                        true,
+                    )?;
                     len += 1;
                 }
                 #[allow(clippy::cast_precision_loss)]
@@ -442,7 +452,12 @@ impl Interp {
                     k += 1;
                 }
                 #[allow(clippy::cast_precision_loss)]
-                self.set_on_object(out, &PropKey::from_str("length"), JsValue::Num(n as f64), true)?;
+                self.set_on_object(
+                    out,
+                    &PropKey::from_str("length"),
+                    JsValue::Num(n as f64),
+                    true,
+                )?;
                 Ok(JsValue::Obj(out))
             }
             NativeFn::ArrayMap | NativeFn::ArrayForEach => {
@@ -455,11 +470,7 @@ impl Interp {
                     _ => return Err(self.throw_type_error()),
                 }
                 let this_arg = arg(1);
-                let result = if map {
-                    Some(self.array_species_create(oid, len)?)
-                } else {
-                    None
-                };
+                let result = if map { Some(self.array_species_create(oid, len)?) } else { None };
                 for k in 0..len {
                     self.charge_loop()?;
                     let key = PropKey::Str(units_from_str(&k.to_string()));
@@ -521,7 +532,12 @@ impl Interp {
                     }
                 }
                 #[allow(clippy::cast_precision_loss)]
-                self.set_on_object(out, &PropKey::from_str("length"), JsValue::Num(n as f64), true)?;
+                self.set_on_object(
+                    out,
+                    &PropKey::from_str("length"),
+                    JsValue::Num(n as f64),
+                    true,
+                )?;
                 Ok(JsValue::Obj(out))
             }
             NativeFn::ArrayValues | NativeFn::ArrayKeys | NativeFn::ArrayEntries => {
@@ -537,11 +553,8 @@ impl Interp {
             NativeFn::StringCtor => {
                 if let Some(ntv) = new_target {
                     // 22.1.1.1 with NewTarget: NO symbol special case.
-                    let s = if args.is_empty() {
-                        Vec::new()
-                    } else {
-                        self.to_string_units(&arg(0))?
-                    };
+                    let s =
+                        if args.is_empty() { Vec::new() } else { self.to_string_units(&arg(0))? };
                     let proto =
                         self.get_prototype_from_constructor(&ntv, self.intr.string_proto)?;
                     let oid = self.make_string_wrapper(&Rc::new(s), proto)?;
@@ -711,9 +724,7 @@ impl Interp {
             NativeFn::SuppressedErrorCtor => {
                 self.suppressed_error_construct(&args, new_target.as_ref())
             }
-            NativeFn::DisposableStackCtor => {
-                self.disposable_stack_construct(new_target.as_ref())
-            }
+            NativeFn::DisposableStackCtor => self.disposable_stack_construct(new_target.as_ref()),
             NativeFn::DisposableStackUse => self.ds_use(&this, arg(0)),
             NativeFn::DisposableStackAdopt => self.ds_adopt(&this, arg(0), arg(1)),
             NativeFn::DisposableStackDefer => self.ds_defer(&this, arg(0)),
@@ -1192,7 +1203,10 @@ impl Interp {
         Ok(to_length_u64(self.to_number(&v)?))
     }
 
-    pub(crate) fn create_list_from_array_like(&mut self, oid: ObjId) -> Result<Vec<JsValue>, Abrupt> {
+    pub(crate) fn create_list_from_array_like(
+        &mut self,
+        oid: ObjId,
+    ) -> Result<Vec<JsValue>, Abrupt> {
         let len = self.length_of_array_like(oid)?;
         if len > 1_000_000 {
             return Err(Abrupt::Fatal("array-like argument list cap exceeded".to_string()));
@@ -1217,16 +1231,16 @@ impl Interp {
             &PropKey::Str(units_from_str(key)),
             PartialDesc::full_data(v, true, true, true),
         )?;
-        if ok {
-            Ok(())
-        } else {
-            Err(self.throw_type_error())
-        }
+        if ok { Ok(()) } else { Err(self.throw_type_error()) }
     }
 
     /// ArraySpeciesCreate (10.4.2.3), exact: Get(O, "constructor") →
     /// Get(C, @@species) → Construct(C, [len]) (subclass-aware).
-    pub(crate) fn array_species_create(&mut self, origin: ObjId, len: u64) -> Result<ObjId, Abrupt> {
+    pub(crate) fn array_species_create(
+        &mut self,
+        origin: ObjId,
+        len: u64,
+    ) -> Result<ObjId, Abrupt> {
         let array_create = |it: &mut Interp, len: u64| -> Result<ObjId, Abrupt> {
             let Ok(len32) = u32::try_from(len) else {
                 return Err(it.throw_native(ErrKind::Range));
@@ -1541,20 +1555,14 @@ impl Interp {
             PropValue::Accessor { get, set } => {
                 let g = get.map_or(JsValue::Undefined, JsValue::Obj);
                 let s = set.map_or(JsValue::Undefined, JsValue::Obj);
-                self.heap
-                    .obj_mut(oid)
-                    .props
-                    .insert(PropKey::from_str("get"), Property::data(g));
-                self.heap
-                    .obj_mut(oid)
-                    .props
-                    .insert(PropKey::from_str("set"), Property::data(s));
+                self.heap.obj_mut(oid).props.insert(PropKey::from_str("get"), Property::data(g));
+                self.heap.obj_mut(oid).props.insert(PropKey::from_str("set"), Property::data(s));
             }
         }
-        self.heap.obj_mut(oid).props.insert(
-            PropKey::from_str("enumerable"),
-            Property::data(JsValue::Bool(p.enumerable)),
-        );
+        self.heap
+            .obj_mut(oid)
+            .props
+            .insert(PropKey::from_str("enumerable"), Property::data(JsValue::Bool(p.enumerable)));
         self.heap.obj_mut(oid).props.insert(
             PropKey::from_str("configurable"),
             Property::data(JsValue::Bool(p.configurable)),
@@ -1581,11 +1589,7 @@ fn integer_to_radix_string(n: f64, radix: u32) -> String {
         v /= u128::from(radix);
     }
     let body: String = digits.into_iter().rev().collect();
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if neg { format!("-{body}") } else { body }
 }
 
 fn clamp_i64(t: f64) -> i64 {
@@ -1660,8 +1664,9 @@ pub(crate) fn json_quote_units(s: &[u16]) -> Units {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_value::units_to_lossy;
+
+    use super::*;
 
     #[test]
     fn json_quote_vectors() {

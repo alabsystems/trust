@@ -8,9 +8,5 @@
 // bounded-multiply discharge. Pairs with mutant/guarded_two_var_mul.rs (the bound
 // widened past the overflow threshold).
 pub fn guarded_two_var_mul(a: u32, b: u32) -> u32 {
-    if a < 1000 && b < 1000 {
-        a * b
-    } else {
-        0
-    }
+    if a < 1000 && b < 1000 { a * b } else { 0 }
 }

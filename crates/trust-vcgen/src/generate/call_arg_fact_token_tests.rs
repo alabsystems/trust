@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-    Terminator, Ty, VerifiableBody, VerifiableFunction,
+    Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::call_arg_fact_token;
@@ -35,6 +34,7 @@ fn caller_with(pre_call_stmts: Vec<Statement>) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },

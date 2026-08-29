@@ -58,7 +58,15 @@
 //
 // The 16 gained rows are still EXACTLY the fourteen widenings plus the two
 // fieldless-`Error` methods this test was written to pin — measured, not
-// assumed. That is why this file keeps its name and its purpose.
+// assumed. That is why this file keeps its name and its purpose. Three later,
+// independently kernel-checked float commits deliberately move another exact
+// slice: `b6241368148` certifies 23 integer-to-float conversions,
+// `49691430295` certifies the one widening float conversion in this corpus, and
+// `8269a6dd9fe` restores the two same-width float identities that the July
+// re-freeze had deliberately held closed. The 24 new conversions are counted
+// as a separate capability delta below; the two restored identities were
+// already faithful in the historical baseline, so only their diagnostic rows
+// change. The remaining >64-bit integer false accept stays closed.
 // ===========================================================================
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -259,20 +267,50 @@ fn strict_unsigned_to_signed_widening_is_the_exact_production_corpus_delta() {
             .collect();
     let expected_changes: BTreeSet<String> =
         expected_widenings.union(&expected_fieldless_error).cloned().collect();
-    // REQUIRED regressions vs the 2026-07-11 baseline: the three rows HEAD
-    // closed on purpose (re-freeze report §6). Two are the non-`Int` return-type
-    // blanket over float→float identity casts; the third was a genuine FALSE
-    // ACCEPT at >64-bit witness width. Pinned so that re-blessing one is a
-    // failure here, and so that "lost_faithful is empty" can no longer be
-    // written as an unconditional assertion that quietly stops being true.
-    let expected_regressions: BTreeSet<String> = [
-        "_64::<impl From<f32> for f32>::cast",
-        "_64::<impl From<f64> for f64>::cast",
-        "_x128::<impl From<u128> for i128>::cast",
+    // The independently landed R4 float lanes: 23 integer-to-float conversions
+    // plus the sole widening float-to-float conversion in this corpus.
+    let expected_float_conversions: BTreeSet<String> = [
+        "_64::<impl From<f32> for f64>::cast",
+        "_64::<impl From<i16> for f32>::cast",
+        "_64::<impl From<i16> for f64>::cast",
+        "_64::<impl From<i32> for f32>::cast",
+        "_64::<impl From<i32> for f64>::cast",
+        "_64::<impl From<i64> for f32>::cast",
+        "_64::<impl From<i64> for f64>::cast",
+        "_64::<impl From<i8> for f32>::cast",
+        "_64::<impl From<i8> for f64>::cast",
+        "_64::<impl From<isize> for f32>::cast",
+        "_64::<impl From<isize> for f64>::cast",
+        "_64::<impl From<u16> for f32>::cast",
+        "_64::<impl From<u16> for f64>::cast",
+        "_64::<impl From<u32> for f32>::cast",
+        "_64::<impl From<u32> for f64>::cast",
+        "_64::<impl From<u64> for f32>::cast",
+        "_64::<impl From<u64> for f64>::cast",
+        "_64::<impl From<u8> for f32>::cast",
+        "_64::<impl From<u8> for f64>::cast",
+        "_64::<impl From<usize> for f32>::cast",
+        "_64::<impl From<usize> for f64>::cast",
+        "_x128::<impl From<i128> for f32>::cast",
+        "_x128::<impl From<i128> for f64>::cast",
+        "_x128::<impl From<u128> for f64>::cast",
     ]
     .into_iter()
     .map(str::to_string)
     .collect();
+    // These two identities were faithful in the historical baseline, closed by
+    // the July re-freeze, and soundly restored by the later exact float lane.
+    // Their diagnostics change, but they are neither new nor lost relative to
+    // that baseline.
+    let expected_restored_float_identities: BTreeSet<String> =
+        ["_64::<impl From<f32> for f32>::cast", "_64::<impl From<f64> for f64>::cast"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    // The one REQUIRED regression that remains: a genuine FALSE ACCEPT at
+    // >64-bit witness width (re-freeze report §6).
+    let expected_regressions: BTreeSet<String> =
+        ["_x128::<impl From<u128> for i128>::cast"].into_iter().map(str::to_string).collect();
 
     assert_eq!(funcs.len(), 202, "cast corpus inventory drifted");
     assert_eq!(baseline.len(), 202, "baseline inventory drifted");
@@ -303,24 +341,77 @@ fn strict_unsigned_to_signed_widening_is_the_exact_production_corpus_delta() {
         })
         .collect();
 
-    let expected_changed: BTreeSet<String> =
-        expected_changes.union(&expected_regressions).cloned().collect();
+    let expected_newly_faithful: BTreeSet<String> =
+        expected_changes.union(&expected_float_conversions).cloned().collect();
+    let expected_changed: BTreeSet<String> = expected_newly_faithful
+        .union(&expected_regressions)
+        .cloned()
+        .chain(expected_restored_float_identities.iter().cloned())
+        .collect();
     assert_eq!(changed, expected_changed, "a non-target diagnostic row changed");
     assert_eq!(
-        newly_faithful, expected_changes,
-        "the false→true delta is not exactly the fourteen widenings plus two fieldless enums"
+        newly_faithful, expected_newly_faithful,
+        "the false→true delta is not exactly the original sixteen plus 24 float conversions"
     );
     assert_eq!(
         lost_faithful, expected_regressions,
-        "the true→false delta is not exactly the three deliberately closed rows"
+        "the true→false delta is not exactly the one deliberately closed >64-bit row"
     );
-    // 132 + 16 gained - 3 lost = 145. See the header: 148 was this test's number
-    // before the re-freeze made the three §6 closures visible on this corpus.
+    let historical_float_shape_gap = GateRow {
+        cluster: "SHAPE_GAP".into(),
+        via_ir_shape: false,
+        via_ir_safety: false,
+        via_mirsem_shape: false,
+        via_mirsem_sl_safety_discharged: false,
+        via_mirsem_call_requires: false,
+        via_mirsem_loop_full: false,
+        fully_faithful: false,
+    };
+    let current_float_trustir_row = GateRow {
+        cluster: "FULLY_FAITHFUL".into(),
+        via_ir_shape: true,
+        via_ir_safety: true,
+        via_mirsem_shape: false,
+        via_mirsem_sl_safety_discharged: false,
+        via_mirsem_call_requires: false,
+        via_mirsem_loop_full: false,
+        fully_faithful: true,
+    };
+    for path in &expected_float_conversions {
+        assert_eq!(
+            baseline.get(path),
+            Some(&historical_float_shape_gap),
+            "{path}: the historical row must be the exact pre-float-lane shape gap"
+        );
+        assert_eq!(
+            current.get(path),
+            Some(&current_float_trustir_row),
+            "{path}: the current row must be exact TrustIR shape+safety certification"
+        );
+    }
+    for path in &expected_restored_float_identities {
+        assert!(
+            baseline.get(path).expect("identity row is in the exact inventory").fully_faithful
+                && current
+                    .get(path)
+                    .expect("identity row is in the exact inventory")
+                    .fully_faithful,
+            "{path}: the exact float-identity lane must restore baseline capability"
+        );
+        assert_eq!(
+            current.get(path),
+            Some(&current_float_trustir_row),
+            "{path}: the restored identity must use the exact TrustIR shape+safety lane"
+        );
+    }
+    // 132 + (16 original + 24 float) gained - 1 lost = 171.
     assert_eq!(baseline.values().filter(|row| row.fully_faithful).count(), 132);
-    assert_eq!(current.values().filter(|row| row.fully_faithful).count(), 145);
+    assert_eq!(current.values().filter(|row| row.fully_faithful).count(), 171);
     assert_eq!(expected_widenings.len(), 14);
-    assert_eq!(newly_faithful.len(), 16);
-    assert_eq!(lost_faithful.len(), 3);
+    assert_eq!(newly_faithful.len(), 40);
+    assert_eq!(lost_faithful.len(), 1);
+    assert_eq!(expected_float_conversions.len(), 24);
+    assert_eq!(expected_restored_float_identities.len(), 2);
 
     let expected_target_diagnosis = FullyFaithfulDiagnosis {
         via_ir_shape: true,

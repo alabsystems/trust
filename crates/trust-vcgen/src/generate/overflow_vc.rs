@@ -18,27 +18,20 @@ use super::*;
 pub(super) fn v2_signed_mul_dominating_facts(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
+    use_stmt_index: usize,
+    names: &[String],
 ) -> Vec<(String, BvGuardCmp, i128)> {
     let mut facts = Vec::new();
     let path_map = v2_build_path_guard_map(func);
     let Some(paths) = path_map.get(&block.id) else {
         return facts;
     };
-    let resolved: Vec<Vec<Formula>> = paths
-        .iter()
-        .map(|gs| gs.iter().map(|(_, g)| guards::guard_to_formula(func, g)).collect())
-        .collect();
-    let Some((first, rest)) = resolved.split_first() else {
-        return facts;
-    };
-    for fact in first {
-        if !rest.iter().all(|path| path.contains(fact)) {
-            continue;
-        }
-        for leaf in v2_flatten_guard_conjuncts(fact) {
-            if let Some((name, cmp, c)) = v2_linear_var_const_fact(leaf) {
-                facts.push((name.to_string(), cmp, c));
-            }
+    let sv = StmtVersionCtx::build(func);
+    for name in names {
+        for (cmp, constant) in
+            v2_dominating_linear_facts_for_var(func, &sv, paths, name, block.id, use_stmt_index)
+        {
+            facts.push((name.clone(), cmp, constant));
         }
     }
     facts
@@ -49,7 +42,12 @@ pub(super) fn v2_signed_mul_dominating_facts(
 /// flow i128 the fact is dropped (a bound at the type extreme is not a real
 /// tightening). All updates are monotone (a bound can only shrink the box), so a
 /// fact can never enlarge the interval — soundness is preserved.
-pub(super) fn v2_tighten_bound(cmp: BvGuardCmp, c: i128, lo: &mut Option<i128>, hi: &mut Option<i128>) {
+pub(super) fn v2_tighten_bound(
+    cmp: BvGuardCmp,
+    c: i128,
+    lo: &mut Option<i128>,
+    hi: &mut Option<i128>,
+) {
     match cmp {
         BvGuardCmp::Le => *hi = Some(hi.map_or(c, |h| h.min(c))),
         BvGuardCmp::Lt => {
@@ -83,8 +81,8 @@ pub(super) fn v2_tighten_bound(cmp: BvGuardCmp, c: i128, lo: &mut Option<i128>, 
 ///     its live value at the multiply;
 ///   * a NON-constant in-block (re)assignment makes any block-entry guard stale,
 ///     so the operand yields no bound (fail closed);
-///   * a contract precondition is used only if its parameter is never reassigned
-///     anywhere (`v2_local_assigned_anywhere`), matching the BV guard arm.
+///   * a contract precondition is used only while the operand still has its
+///     function-entry version at the multiply.
 ///
 /// A missing side (only a lower OR only an upper bound established) yields `None`:
 /// the corner check needs a genuinely finite box on BOTH axes, so a symbolic /
@@ -95,6 +93,7 @@ pub(super) fn v2_signed_mul_operand_bounds(
     op: &Operand,
     end: usize,
     guard_facts: &[(String, BvGuardCmp, i128)],
+    sv: &StmtVersionCtx,
 ) -> Option<(i128, i128)> {
     // Literal constant operand: an exact single-point box.
     if let Some(c) = operand_const_int(op) {
@@ -108,6 +107,9 @@ pub(super) fn v2_signed_mul_operand_bounds(
     }
     let local = place.local;
     let base = crate::place_to_var_name(func, place);
+    if guards::value_local_is_unstable(func, local) {
+        return None;
+    }
 
     // BLOCK-DEF CONSTANT PIN: the operand's LAST projection-free definition
     // strictly before the multiply is `local = <const>`.
@@ -148,7 +150,7 @@ pub(super) fn v2_signed_mul_operand_bounds(
         let Some((name, cmp, c)) = v2_linear_var_const_fact(fact) else {
             continue;
         };
-        if name != base || v2_local_assigned_anywhere(func, name) {
+        if name != base || sv.version_token_at(func, block.id, end, name).is_some() {
             continue;
         }
         v2_tighten_bound(cmp, c, &mut lo, &mut hi);
@@ -171,9 +173,19 @@ pub(super) fn v2_signed_mul_corner_bounds(
     stmt_index: Option<usize>,
 ) -> Option<((i128, i128), (i128, i128))> {
     let end = stmt_index.unwrap_or(block.stmts.len());
-    let guard_facts = v2_signed_mul_dominating_facts(func, block);
-    let a = v2_signed_mul_operand_bounds(func, block, lhs, end, &guard_facts)?;
-    let b = v2_signed_mul_operand_bounds(func, block, rhs, end, &guard_facts)?;
+    let names: Vec<String> = [lhs, rhs]
+        .into_iter()
+        .filter_map(|operand| match operand {
+            Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
+                Some(crate::place_to_var_name(func, place))
+            }
+            _ => None,
+        })
+        .collect();
+    let guard_facts = v2_signed_mul_dominating_facts(func, block, end, &names);
+    let sv = StmtVersionCtx::build(func);
+    let a = v2_signed_mul_operand_bounds(func, block, lhs, end, &guard_facts, &sv)?;
+    let b = v2_signed_mul_operand_bounds(func, block, rhs, end, &guard_facts, &sv)?;
     Some((a, b))
 }
 
@@ -275,6 +287,10 @@ pub(super) fn v2_arith_overflow_seed_record(
     Some(ObligationRecord { body: atomic_core, wrappers, subject: None, width: Some(width) })
 }
 
+// Production callers all thread the audited destination type through the
+// `_typed` entry below; only the operand-inference test suites still exercise
+// this untyped entry directly.
+#[cfg(test)]
 pub(super) fn v2_build_overflow_vc_for_operands(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
@@ -284,12 +300,125 @@ pub(super) fn v2_build_overflow_vc_for_operands(
     span: &SourceSpan,
     stmt_index: Option<usize>,
 ) -> Option<VerificationCondition> {
-    let lhs_ty = crate::operand_ty(func, lhs)?;
-    let rhs_ty = crate::operand_ty(func, rhs)?;
+    v2_build_overflow_vc_for_operands_impl(
+        func,
+        block,
+        op,
+        lhs,
+        rhs,
+        span,
+        stmt_index,
+        None,
+        "IntegerMulOverflow",
+    )
+}
+
+/// Trust (width-soundness): the plain/checked overflow row built at the
+/// assignment DESTINATION's VALIDATED integer type, mirroring what the
+/// `UncheckedBinaryOp` arm already does. Signed constants carry no width in
+/// TrustIR, so when BOTH operands are widthless constants `int_op_type`
+/// fabricates i64 and a forged-but-admitted `_1: i8 = Add(100, 100)` (each
+/// literal fits i8, so `validate_binary_assignment_types` admits it) would be
+/// checked against the i64 bound — `200 outside i64` is UNSAT and the runtime
+/// i8 overflow is falsely PROVED away. The destination type is the audited
+/// operation type (admission pins every operand to it), so threading it can
+/// only replace a fabricated width with the true one. `operation_ty: None`
+/// preserves the untyped operand-inference behavior byte-for-byte for callers
+/// with no destination authority.
+pub(super) fn v2_build_overflow_vc_for_operands_typed(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    span: &SourceSpan,
+    stmt_index: Option<usize>,
+    operation_ty: Option<Ty>,
+) -> Option<VerificationCondition> {
+    v2_build_overflow_vc_for_operands_impl(
+        func,
+        block,
+        op,
+        lhs,
+        rhs,
+        span,
+        stmt_index,
+        operation_ty,
+        "IntegerMulOverflow",
+    )
+}
+
+/// Build the mandatory overflow row for a validated UB-bearing unchecked
+/// assignment. Unlike ordinary binary arithmetic, the operation's type comes
+/// from the assignment destination: signed constants do not retain a width in
+/// TrustIR, so inferring from two constants could silently check i64 bounds for
+/// an i8 operation.
+pub(super) fn v2_build_unchecked_overflow_vc_for_operands(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    span: &SourceSpan,
+    stmt_index: Option<usize>,
+    operation_ty: Ty,
+) -> Option<VerificationCondition> {
+    v2_build_overflow_vc_for_operands_impl(
+        func,
+        block,
+        op,
+        lhs,
+        rhs,
+        span,
+        stmt_index,
+        Some(operation_ty),
+        "Rvalue::UncheckedBinaryOp",
+    )
+}
+
+fn v2_build_overflow_vc_for_operands_impl(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    span: &SourceSpan,
+    stmt_index: Option<usize>,
+    operation_ty: Option<Ty>,
+    unsupported_carrier_kind: &'static str,
+) -> Option<VerificationCondition> {
+    // `OpaqueScalar` has a type but no occurrence identity. Rendering two
+    // same-typed operands through `operand_to_formula` aliases them to one
+    // symbol; for subtraction that would manufacture `x - x` and could
+    // certify an operation whose concrete operands actually overflow. Refuse
+    // before formula construction for every arithmetic carrier that shares
+    // this builder. Const parameters are distinct: they retain a stable name.
+    if matches!(lhs, Operand::Constant(ConstValue::OpaqueScalar { .. }))
+        || matches!(rhs, Operand::Constant(ConstValue::OpaqueScalar { .. }))
+    {
+        return Some(unsupported_mir_vc(
+            func,
+            "IntegerArithmeticOpaqueScalar".to_string(),
+            format!(
+                "bb{}: overflow checking cannot distinguish identity-less OpaqueScalar operands",
+                block.id.0
+            ),
+            span.clone(),
+        ));
+    }
+
+    let inferred_lhs_ty = crate::operand_ty(func, lhs)?;
+    let inferred_rhs_ty = crate::operand_ty(func, rhs)?;
     // Recover the true (width, signed) from a non-constant operand — a signed
     // constant lhs (e.g. `100i8 + x`) loses its width and would otherwise make
     // this check the overflow bound at i64 instead of the real type (round-19).
-    let (width, signed) = int_op_type(func, lhs, rhs)?;
+    let (width, signed, lhs_ty, rhs_ty) = if let Some(operation_ty) = operation_ty {
+        let (width, signed) = crate::fixed_width_integer_descriptor(&operation_ty)?;
+        (width, signed, operation_ty.clone(), operation_ty)
+    } else {
+        let (width, signed) = int_op_type(func, lhs, rhs)?;
+        (width, signed, inferred_lhs_ty, inferred_rhs_ty)
+    };
 
     // Trust #soundness (i128): in the ABSTRACT, the Int/LIA path is sound for signed
     // 128-bit ADD/SUB — `Sort::Int` is unbounded arbitrary-precision (ay lowers every
@@ -383,7 +512,7 @@ pub(super) fn v2_build_overflow_vc_for_operands(
         }
         return Some(unsupported_mir_vc(
             func,
-            "Rvalue::CheckedBinaryOp".to_string(),
+            unsupported_carrier_kind.to_string(),
             format!(
                 "bb{}: signed {width}-bit Mul overflow is nonlinear (NIA) and not decidable \
                  on the Int path; the BV path declines width > 64 → fail-closed to runtime-check",
@@ -416,8 +545,9 @@ pub(super) fn v2_build_overflow_vc_for_operands(
             // was reassigned / `&mut`-borrowed after it (verified: the unsigned `&mut`-stale
             // mul stays Failed) — so a stale `a < 10` over a `*p = b` reassignment does NOT
             // thread, and the unguarded `a + b` (no dominating fact) stays refutable.
-            terms
-                .extend(v2_bv_mul_dominating_guard_constraints(func, block, lhs, rhs, width, true));
+            terms.extend(v2_bv_mul_dominating_guard_constraints(
+                func, block, lhs, rhs, stmt_index, width, true,
+            ));
             // Also render a SIGNED-accumulator reduction bound (`acc ∈ [init, init+K·per_max]`,
             // `addend ∈ [0, per_max]`) onto the fresh BV operands, so an i128 shift/widening
             // reduction whose sum provably fits PROVES (the global Int accumulator facts don't
@@ -518,8 +648,9 @@ pub(super) fn v2_build_overflow_vc_for_operands(
             // Conjoin BV-encoded dominating guard bounds on the operands so a
             // guard-bounded mul (`if cols <= 4096 { cols * 64 }`) PROVES
             // instead of false-Failing on the fresh, unconstrained BV vars.
-            let mut terms =
-                v2_bv_mul_dominating_guard_constraints(func, block, lhs, rhs, width, signed);
+            let mut terms = v2_bv_mul_dominating_guard_constraints(
+                func, block, lhs, rhs, stmt_index, width, signed,
+            );
             // Also render a LOOP-VAR yield bound (`y < W` for `for y in 0..W`) onto the operands so
             // a flattened-2D-index `y*W` mul-overflow PROVES. See `v2_bv_yield_constraints`.
             terms.extend(v2_bv_yield_constraints(func, block, lhs, rhs, width, signed));
@@ -653,9 +784,9 @@ pub(super) fn v2_build_overflow_vc_for_operands(
     };
 
     let body = Formula::And(vec![lhs_range, rhs_range, out_of_range]);
-    // Direct-BinaryOp callers pass the statement index so defs are taken BEFORE
-    // the operation (not the whole block, which would include the op's own
-    // result definition); the checked path conjoins whole-block defs.
+    // Direct and checked-BinaryOp callers pass the statement index so defs are
+    // taken BEFORE the operation (not the whole block, which would include the
+    // op's own result definition or later operand reassignments).
     //
     // Trust (arith ARM, 2026-07-31): use the RECORDED block-defs helper — its `.0` is
     // byte-identical to the previous `v2_formula_with_block_defs{_before_stmt}` (both are
@@ -897,7 +1028,12 @@ pub(crate) fn v2_signed_bv_addsub_overflow_formula(
 /// test). An unconstrained operand keeps it satisfiable, so a real `i128::MAX - (-1)` /
 /// `1<<127` overflow stays SAT/refutable; a defining shift + dominating bound (conjoined
 /// by the caller) removes the infeasible witnesses so the guarded case PROVES.
-pub(super) fn signed_bv_addsub_overflow_sign_test(a: Formula, b: Formula, op: BinOp, width: u32) -> Formula {
+pub(super) fn signed_bv_addsub_overflow_sign_test(
+    a: Formula,
+    b: Formula,
+    op: BinOp,
+    width: u32,
+) -> Formula {
     // The sign-bit mask `2^(width-1)`. For `width == 128` this is `i128::MIN`'s bit
     // pattern (the `BitVec` value field is two's-complement; the SMT layer masks to
     // `width`) — the SAME representation the neg `INT_MIN` check uses.
@@ -997,7 +1133,8 @@ pub(crate) fn v2_signed_bv_neg_overflow_formula(
 ///
 /// SOUNDNESS: the conjoined bounds are TRUE on every reaching path (the same facts the Int lane
 /// emits, gated by the same `total_loop_iterations`/`addend_per_iteration_bound`/
-/// `accumulator_init_const` recognition that excludes call-clobbered / mutably-aliased / unbounded
+/// `accumulator_bound_init_const` recognition that excludes call-clobbered / mutably-aliased /
+/// parameter-entry-valued / unbounded
 /// reductions), rendered via the validated signed-BV helper. SELF-LIMITING: a genuinely-overflowing
 /// reduction has `bound > i128::MAX`, so the `acc ≤ bound` constraint does NOT remove the overflow
 /// model and it stays refutable.
@@ -1035,7 +1172,7 @@ pub(super) fn v2_signed_bv_accumulator_constraints(
     let Some((_, per_max)) = addend_per_iteration_bound(func, rhs_p.local) else {
         return Vec::new();
     };
-    let Some(init_c) = accumulator_init_const(func, acc_p.local, ck_dest_local) else {
+    let Some(init_c) = accumulator_bound_init_const(func, acc_p.local, ck_dest_local) else {
         return Vec::new();
     };
     let Some(bound) = k.checked_mul(per_max).and_then(|nm| init_c.checked_add(nm)) else {
@@ -1075,7 +1212,10 @@ pub(super) fn v2_bv_yield_constraints(
     let mut out = Vec::new();
     for (op, role) in [(lhs, "lhs"), (rhs, "rhs")] {
         let (Operand::Copy(p) | Operand::Move(p)) = op else { continue };
-        if !p.projections.is_empty() || v2_widening_bv_source(func, op, width).is_some() {
+        if !p.projections.is_empty()
+            || guards::value_local_is_unstable(func, p.local)
+            || v2_widening_bv_source(func, op, width).is_some()
+        {
             continue;
         }
         if block
@@ -1126,7 +1266,10 @@ pub(super) fn v2_bv_rem_constraints(
     let mut out = Vec::new();
     for (op, role) in [(lhs, "lhs"), (rhs, "rhs")] {
         let (Operand::Copy(p) | Operand::Move(p)) = op else { continue };
-        if !p.projections.is_empty() || v2_widening_bv_source(func, op, width).is_some() {
+        if !p.projections.is_empty()
+            || guards::value_local_is_unstable(func, p.local)
+            || v2_widening_bv_source(func, op, width).is_some()
+        {
             continue;
         }
         let Some(Rvalue::BinaryOp(BinOp::Rem, _, divisor)) =
@@ -1180,13 +1323,18 @@ pub(crate) fn v2_signed_bv_blockdef_constraints(
 /// cond is `Move/Copy(_N.1)`; this returns the operands of the matching
 /// `_N = CheckedBinaryOp(op, ..)`, so a block carrying multiple same-`op`
 /// statements (a u32 amount sub AND the i128 result sub) selects the ASSERTED one.
-/// `None` if the cond is not a `.1` flag, or no matching CheckedBinaryOp defines
-/// it (the caller then falls back to the first block binop).
+/// `None` if the cond is not a `.1` flag, or the live definition is not the
+/// matching CheckedBinaryOp. Callers may then use only an independently unique
+/// target-block candidate; no path selects the first same-op statement. The
+/// returned statement index is part of the authority: formulas and block
+/// definitions must be versioned at the operation, not at the terminator after
+/// later writes may have changed either operand local.
 pub(super) fn v2_find_checked_binop_for_assert_cond<'a>(
+    func: &VerifiableFunction,
     block: &'a trust_types::BasicBlock,
     cond: &Operand,
     op: BinOp,
-) -> Option<(&'a Operand, &'a Operand)> {
+) -> Option<(usize, &'a Operand, &'a Operand)> {
     let cond_place = match cond {
         Operand::Copy(p) | Operand::Move(p) => p,
         _ => return None,
@@ -1199,18 +1347,34 @@ pub(super) fn v2_find_checked_binop_for_assert_cond<'a>(
         return None;
     };
     let tuple_local = cond_place.local;
-    block.stmts.iter().find_map(|stmt| {
-        let Statement::Assign { place, rvalue: Rvalue::CheckedBinaryOp(stmt_op, lhs, rhs), .. } =
-            stmt
-        else {
+    if guards::value_local_is_unstable(func, tuple_local) {
+        return None;
+    }
+    let cond_name = crate::place_to_var_name(func, cond_place);
+    // MIR in the public schema is not required to be SSA. The assert observes
+    // the last write to `_tuple.1` before the terminator, never the first
+    // same-op assignment in the block. Walk backwards and stop at the live
+    // whole-local definition or at a direct mutation of the flag field.
+    for (stmt_index, stmt) in block.stmts.iter().enumerate().rev() {
+        if !stmt_writes_name(func, block, stmt_index, &cond_name) {
+            continue;
+        }
+        let Statement::Assign { place, rvalue, .. } = stmt else {
             return None;
         };
-        if place.local == tuple_local && place.projections.is_empty() && *stmt_op == op {
-            Some((lhs, rhs))
-        } else {
-            None
+        if place.local == tuple_local && place.projections.is_empty() {
+            return match rvalue {
+                Rvalue::CheckedBinaryOp(stmt_op, lhs, rhs) if *stmt_op == op => {
+                    Some((stmt_index, lhs, rhs))
+                }
+                _ => None,
+            };
         }
-    })
+        // Any other canonical write overlapping the observed `.1` flag—direct,
+        // projected, or through a mutable alias—replaces the checked result.
+        return None;
+    }
+    None
 }
 
 /// Build the standalone BV overflow-violation formula for a signed >= 128-bit
@@ -1249,8 +1413,13 @@ pub(crate) fn v2_hardened_signed_bv_overflow_formula(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
     msg: &AssertMessage,
+    cond: &Operand,
+    expected: bool,
     target: BlockId,
 ) -> Option<Formula> {
+    if expected {
+        return None;
+    }
     match msg {
         // `Overflow(Add|Sub)`: the assert block IS the CheckedBinaryOp block; the
         // cond is the overflow flag `_N.1`. Recover the operands from the
@@ -1259,23 +1428,15 @@ pub(crate) fn v2_hardened_signed_bv_overflow_formula(
         // holds `_6 = width - 1` AND `_9 = CheckedSub(_5, 1)`; keying on `_9` is what
         // selects the i128 sub, not the u32 amount sub.)
         AssertMessage::Overflow(op @ (BinOp::Add | BinOp::Sub)) => {
-            let Terminator::Assert { cond, .. } = &block.terminator else {
-                return None;
-            };
-            let (lhs, rhs) = v2_find_checked_binop_for_assert_cond(block, cond, *op)
-                // Fall back to the first matching binop (e.g. a direct
-                // `_N = CheckedBinaryOp(...)` whose flag the assert reads, with no
-                // confounding same-op statement). Sound: if both shapes resolve to
-                // different operands, the cond-keyed one is the asserted op.
-                .or_else(|| v2_find_block_binary_operands(block, *op))?;
+            let (stmt_index, lhs, rhs) =
+                v2_find_checked_binop_for_assert_cond(func, block, cond, *op)?;
             let (width, signed) = int_op_type(func, lhs, rhs)?;
             if !signed || width < 128 {
                 return None;
             }
             let bv_formula = v2_signed_bv_addsub_overflow_formula(func, lhs, rhs, *op, width)?;
-            // The CheckedBinaryOp's overflow is asserted at the block terminator,
-            // so the operands' defining shifts are whole-block defs (`None`).
-            let mut terms = v2_signed_bv_blockdef_constraints(func, block, lhs, rhs, None, width);
+            let mut terms =
+                v2_signed_bv_blockdef_constraints(func, block, lhs, rhs, Some(stmt_index), width);
             if terms.is_empty() {
                 Some(bv_formula)
             } else {
@@ -1283,9 +1444,9 @@ pub(crate) fn v2_hardened_signed_bv_overflow_formula(
                 Some(Formula::And(terms))
             }
         }
-        // `OverflowNeg`: the `Neg(x)` runs in the TARGET block (the assert cond is
-        // `_c = (x == INT_MIN)`); recover `x` from there. The operand's defining
-        // shift (signed_min's `-(1i128 << (width-1))`) lives in THIS source block.
+        // `OverflowNeg`: require the exact source comparison against the signed
+        // minimum and the unique, non-reassigned target Neg operand. A message
+        // and target operation alone are not proof authority.
         AssertMessage::OverflowNeg => {
             let operand = v2_find_target_neg_operand(func, target)?;
             let ty = crate::operand_ty_cow(func, operand)?;
@@ -1294,6 +1455,22 @@ pub(crate) fn v2_hardened_signed_bv_overflow_formula(
             }
             let width = ty.int_width()?;
             if width < 128 {
+                return None;
+            }
+            let (_, BinOp::Eq, lhs, rhs) = v2_find_condition_binary_operands(func, block, cond)?
+            else {
+                return None;
+            };
+            let same_runtime_operand = |candidate: &Operand| match (candidate, operand) {
+                (Operand::Copy(a) | Operand::Move(a), Operand::Copy(b) | Operand::Move(b)) => {
+                    a == b
+                }
+                _ => false,
+            };
+            let min = crate::range::signed_min(width);
+            if !((same_runtime_operand(lhs) && const_int_value(rhs) == Some(min))
+                || (same_runtime_operand(rhs) && const_int_value(lhs) == Some(min)))
+            {
                 return None;
             }
             let bv_formula = v2_signed_bv_neg_overflow_formula(func, operand, width)?;
@@ -1338,23 +1515,32 @@ pub(crate) fn v2_collect_bv_shl_blockdef(
     width: u32,
     out: &mut Vec<Formula>,
 ) {
-    // Find the LAST defining `Shl` of `target_local` strictly before `end`.
-    let mut found: Option<(&Operand, &Operand)> = None;
-    for stmt in block.stmts.iter().take(end) {
-        let Statement::Assign { place, rvalue, .. } = stmt else {
-            continue;
-        };
-        if place.local != target_local || !place.projections.is_empty() {
+    if guards::value_local_is_unstable(func, target_local) {
+        return;
+    }
+    // Find the LAST canonical write of `target_local` strictly before `end`.
+    // A dereference through a separately named `&mut` can write the same local,
+    // so local-id comparisons are not an authority boundary here: use exactly
+    // the overlap-aware write relation that drives statement versioning.
+    let target_place = Place::local(target_local);
+    let target_name = crate::place_to_var_name(func, &target_place);
+    let mut found: Option<(usize, &Operand, &Operand)> = None;
+    for (stmt_index, stmt) in block.stmts.iter().take(end).enumerate() {
+        if !stmt_writes_name(func, block, stmt_index, &target_name) {
             continue;
         }
-        match rvalue {
-            Rvalue::BinaryOp(BinOp::Shl, base, amount) => found = Some((base, amount)),
+        match stmt {
+            Statement::Assign {
+                place, rvalue: Rvalue::BinaryOp(BinOp::Shl, base, amount), ..
+            } if place == &target_place => {
+                found = Some((stmt_index, base, amount));
+            }
             // Any OTHER (re)definition of this local before `end` means the value
             // is not the clean single-Shl shape — decline (omit, sound).
             _ => found = None,
         }
     }
-    let Some((base, amount)) = found else {
+    let Some((shl_stmt_index, base, amount)) = found else {
         return;
     };
     // The shifted base must be an integer constant (e.g. `1i128`); a symbolic base
@@ -1374,7 +1560,18 @@ pub(crate) fn v2_collect_bv_shl_blockdef(
     if !amt_place.projections.is_empty() {
         return;
     }
+    if guards::value_local_is_unstable(func, amt_place.local) {
+        return;
+    }
     let amt_base = crate::place_to_var_name(func, amt_place);
+    // The equality below is evaluated at the overflow-check point. If the
+    // shift amount has changed since the defining Shl—even through an alias—
+    // it no longer describes the snapshotted result and must be omitted.
+    if (shl_stmt_index + 1..end)
+        .any(|stmt_index| stmt_writes_name(func, block, stmt_index, &amt_base))
+    {
+        return;
+    }
     // The shift-amount BV var, at the shift-result width.
     let amt_bv = Formula::var_owned(format!("__trust_ovf_bv_amt_{amt_base}"), Sort::BitVec(width));
     // `bv_name == bvshl(BitVec(base), amt_bv)`.
@@ -1392,70 +1589,179 @@ pub(crate) fn v2_collect_bv_shl_blockdef(
     // `< width`. That bound (rendered `bvult(amt_bv, BitVec(width))`) is what makes
     // `base << amount` a power of two in `[1, 2^(width-1)]` (for base = 1), so
     // `_5 - 1` cannot underflow. Conjoin it as a TRUE dominating fact.
-    let amt_bound = v2_dominating_shift_amount_bound(func, block, amt_place.local, width);
+    let amt_bound =
+        v2_dominating_shift_amount_bound(func, block, shl_stmt_index, amt_place.local, width);
     if let Some(bound) = amt_bound {
         out.push(bound);
     }
 }
 
-/// Inline a bare boolean-temp guard fact (`Var(_c, Bool)`) to its defining
-/// comparison (`_c = (n < K)`), so an assert-sourced shift guard exposes the
-/// linear bound on the shift amount. Leaves any other fact unchanged. A `Not(_c)`
-/// wrapper is preserved around the inlined comparison (the linear-fact reader then
-/// inverts it). Only single-comparison bool defs are inlined; anything else (a
-/// logical `&&`/`||`, a non-comparison) passes through unchanged (sound: a fact we
-/// can't inline simply yields no bound).
-pub(super) fn v2_inline_bool_guard_fact(func: &VerifiableFunction, fact: Formula) -> Formula {
-    // Resolve a bool local name to its UNIQUE defining comparison formula.
-    let define = |name: &str| -> Option<Formula> {
-        let mut found: Option<Formula> = None;
-        for block in &func.body.blocks {
-            for stmt in &block.stmts {
-                let Statement::Assign { place, rvalue, .. } = stmt else {
-                    continue;
-                };
-                if !place.projections.is_empty() || crate::place_to_var_name(func, place) != name {
-                    continue;
-                }
-                let Rvalue::BinaryOp(op, lhs, rhs) = rvalue else {
-                    return None;
-                };
-                // Only simple integer comparisons are useful here.
-                if !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq) {
-                    return None;
-                }
-                let l = operand_to_formula(func, lhs);
-                let r = operand_to_formula(func, rhs);
-                let f = match op {
-                    BinOp::Lt => Formula::Lt(Box::new(l), Box::new(r)),
-                    BinOp::Le => Formula::Le(Box::new(l), Box::new(r)),
-                    BinOp::Gt => Formula::Gt(Box::new(l), Box::new(r)),
-                    BinOp::Ge => Formula::Ge(Box::new(l), Box::new(r)),
-                    BinOp::Eq => Formula::Eq(Box::new(l), Box::new(r)),
-                    _ => return None,
-                };
-                match &found {
-                    Some(prev) if prev != &f => return None, // ambiguous: decline
-                    _ => found = Some(f),
-                }
-            }
-        }
-        found
+/// A path fact together with the exact program point whose value it describes.
+///
+/// The source point is proof authority.  A syntactically identical `_n < 127`
+/// elsewhere in the function (including an unreachable block) says nothing
+/// about the value used by the guarded shift.
+struct V2SourcedGuardFact {
+    source: BlockId,
+    stmt_index: usize,
+    formula: Formula,
+}
+
+fn v2_comparison_formula(
+    func: &VerifiableFunction,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Option<Formula> {
+    let lhs = Box::new(operand_to_formula(func, lhs));
+    let rhs = Box::new(operand_to_formula(func, rhs));
+    Some(match op {
+        BinOp::Lt => Formula::Lt(lhs, rhs),
+        BinOp::Le => Formula::Le(lhs, rhs),
+        BinOp::Gt => Formula::Gt(lhs, rhs),
+        BinOp::Ge => Formula::Ge(lhs, rhs),
+        BinOp::Eq => Formula::Eq(lhs, rhs),
+        BinOp::Ne => Formula::Not(Box::new(Formula::Eq(lhs, rhs))),
+        _ => return None,
+    })
+}
+
+/// Resolve a control-flow guard at the block that actually produced it.
+///
+/// Boolean temporaries are inlined only through the live comparison definition
+/// in that source block.  `v2_find_condition_binary_operands` rejects a later
+/// direct or aliasing rewrite, so the returned statement point denotes the value
+/// observed by the terminator.  We deliberately do not search the whole function
+/// by local name: doing so let a dead block manufacture a bound for a live shift.
+fn v2_sourced_guard_fact(
+    func: &VerifiableFunction,
+    source: BlockId,
+    guard: &trust_types::GuardCondition,
+) -> Option<V2SourcedGuardFact> {
+    use trust_types::GuardCondition;
+
+    let block = func.body.blocks.get(source.0).filter(|block| block.id == source)?;
+    let comparison = |cond: &Operand, truth: bool| -> Option<V2SourcedGuardFact> {
+        let (stmt_index, op, lhs, rhs) = v2_find_condition_binary_operands(func, block, cond)?;
+        let formula = v2_comparison_formula(func, op, lhs, rhs)?;
+        Some(V2SourcedGuardFact {
+            source,
+            stmt_index,
+            formula: if truth { formula } else { Formula::Not(Box::new(formula)) },
+        })
     };
-    match &fact {
-        Formula::Var(name, Sort::Bool) => define(name.as_str()).unwrap_or(fact),
-        Formula::Not(inner) => {
-            if let Formula::Var(name, Sort::Bool) = inner.as_ref() {
-                match define(name.as_str()) {
-                    Some(f) => Formula::Not(Box::new(f)),
-                    None => fact,
-                }
-            } else {
-                fact
-            }
+
+    match guard {
+        GuardCondition::AssertHolds { cond, expected } => comparison(cond, *expected),
+        GuardCondition::AssertFails { cond, expected, .. } => comparison(cond, !*expected),
+        GuardCondition::SwitchIntMatch { discr, value }
+            if matches!(
+                crate::operand_ty_cow(func, discr).as_deref(),
+                Some(trust_types::Ty::Bool)
+            ) =>
+        {
+            comparison(discr, *value != 0)
         }
-        _ => fact,
+        GuardCondition::SwitchIntOtherwise { discr, excluded_values }
+            if matches!(
+                crate::operand_ty_cow(func, discr).as_deref(),
+                Some(trust_types::Ty::Bool)
+            ) =>
+        {
+            let excludes_false = excluded_values.contains(&0);
+            let excludes_true = excluded_values.iter().any(|value| *value != 0);
+            let truth = match (excludes_false, excludes_true) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => return None,
+            };
+            comparison(discr, truth)
+        }
+        // A non-boolean SwitchInt guard reads its discriminant at the source
+        // terminator.  Its direct formula is safe once the variable's reaching
+        // version is checked against the use point below.
+        GuardCondition::SwitchIntMatch { .. } | GuardCondition::SwitchIntOtherwise { .. } => {
+            Some(V2SourcedGuardFact {
+                source,
+                stmt_index: block.stmts.len(),
+                formula: guards::guard_to_formula(func, guard),
+            })
+        }
+        _ => None,
     }
+}
+
+/// Linear guard facts about `var` that are both present on every recorded path
+/// and version-identical to the value read at `use_block/use_stmt_index`.
+///
+/// This is intentionally an exact intersection.  Different bounds on different
+/// paths could be joined by interval union, but declining that precision keeps
+/// this proof-strengthening lane small and monotone.  Most importantly, neither
+/// a same-named definition in an unreachable block nor a direct/alias rewrite
+/// between the branch and the operation can enter the result.
+fn v2_dominating_linear_facts_for_var(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    paths: &[Vec<(BlockId, trust_types::GuardCondition)>],
+    var: &str,
+    use_block: BlockId,
+    use_stmt_index: usize,
+) -> Vec<(BvGuardCmp, i128)> {
+    let use_token = sv.version_token_at(func, use_block, use_stmt_index, var);
+    let resolved: Vec<Vec<(BvGuardCmp, i128)>> = paths
+        .iter()
+        .map(|path| {
+            let mut facts = Vec::new();
+            for (source, guard) in path {
+                let Some(sourced) = v2_sourced_guard_fact(func, *source, guard) else {
+                    continue;
+                };
+                for leaf in v2_flatten_guard_conjuncts(&sourced.formula) {
+                    let Some((name, cmp, constant)) = v2_linear_var_const_fact(leaf) else {
+                        continue;
+                    };
+                    if name == var
+                        && sv.version_token_at(func, sourced.source, sourced.stmt_index, name)
+                            == use_token
+                        && !facts.contains(&(cmp, constant))
+                    {
+                        facts.push((cmp, constant));
+                    }
+                }
+            }
+            facts
+        })
+        .collect();
+    let Some((first, rest)) = resolved.split_first() else {
+        return Vec::new();
+    };
+    first.iter().copied().filter(|fact| rest.iter().all(|path| path.contains(fact))).collect()
+}
+
+/// Tightest strict upper bound on `var` that holds on every recorded path and
+/// describes the exact reaching value at `use_block/use_stmt_index`.
+fn v2_dominating_strict_upper_bound(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    paths: &[Vec<(BlockId, trust_types::GuardCondition)>],
+    var: &str,
+    use_block: BlockId,
+    use_stmt_index: usize,
+) -> Option<i128> {
+    let mut bound = None;
+    for (cmp, constant) in
+        v2_dominating_linear_facts_for_var(func, sv, paths, var, use_block, use_stmt_index)
+    {
+        let upper = match cmp {
+            BvGuardCmp::Lt => Some(constant),
+            BvGuardCmp::Le => constant.checked_add(1),
+            _ => None,
+        };
+        if let Some(upper) = upper {
+            bound = Some(bound.map_or(upper, |current: i128| current.min(upper)));
+        }
+    }
+    bound
 }
 
 /// The dominating upper bound `amount < width` on a shift amount local, rendered
@@ -1467,6 +1773,7 @@ pub(super) fn v2_inline_bool_guard_fact(func: &VerifiableFunction, fact: Formula
 pub(super) fn v2_dominating_shift_amount_bound(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
+    shl_stmt_index: usize,
     amt_local: usize,
     width: u32,
 ) -> Option<Formula> {
@@ -1474,47 +1781,7 @@ pub(super) fn v2_dominating_shift_amount_bound(
     let amt_bv = Formula::var_owned(format!("__trust_ovf_bv_amt_{amt_base}"), Sort::BitVec(width));
     let path_map = v2_build_path_guard_map(func);
     let paths = path_map.get(&block.id)?;
-    // Resolve each path's guards to semantic facts; keep facts on EVERY path.
-    // A shift's `amount < bits` guard reaches the block as an `AssertHolds { _c }`
-    // whose cond `_c` is a bare bool temp (`guard_to_formula` does NOT inline an
-    // assert cond's defining comparison, unlike a SwitchInt discriminant). So we
-    // additionally INLINE a bare `Var(_c, Bool)` fact to its defining `_c = (n < K)`
-    // comparison, then look for the linear bound on the shift amount.
-    let resolved: Vec<Vec<Formula>> = paths
-        .iter()
-        .map(|gs| {
-            gs.iter()
-                .map(|(_, g)| v2_inline_bool_guard_fact(func, guards::guard_to_formula(func, g)))
-                .collect()
-        })
-        .collect();
-    let (first, rest) = resolved.split_first()?;
-    // Collect the DOMINATING facts (present on every path).
-    let dominating: Vec<&Formula> = first
-        .iter()
-        .filter(|fact| rest.iter().all(|path| path.contains(*fact)))
-        .flat_map(v2_flatten_guard_conjuncts)
-        .collect();
-
-    // The tightest STRICT upper bound `var < ub` derivable from the dominating facts.
-    let strict_ub = |var: &str| -> Option<i128> {
-        let mut best: Option<i128> = None;
-        for leaf in &dominating {
-            if let Some((name, cmp, c)) = v2_linear_var_const_fact(leaf)
-                && name == var
-            {
-                let ub = match cmp {
-                    BvGuardCmp::Lt => Some(c),
-                    BvGuardCmp::Le => c.checked_add(1),
-                    _ => None,
-                };
-                if let Some(ub) = ub {
-                    best = Some(best.map_or(ub, |b: i128| b.min(ub)));
-                }
-            }
-        }
-        best
-    };
+    let sv = StmtVersionCtx::build(func);
 
     // (1) A direct dominating bound on the shift amount (`_6 < 128` from the SHL
     //     assert), and
@@ -1523,10 +1790,18 @@ pub(super) fn v2_dominating_shift_amount_bound(
     //     1`. This is what derives `_6 <= 126` from `width <= 127` (`signed_max`/
     //     `signed_min`'s `_6 = width - 1`), the bound that makes `_5` a power of two in
     //     `[1, 2^126]` so `_5 - 1` / `-_5` provably cannot overflow.
-    let mut best: Option<i128> = strict_ub(&amt_base);
-    if let Some((src_local, sub_const)) = v2_amount_sub_source(func, amt_local)
-        && let Some(src_ub_excl) =
-            strict_ub(&crate::place_to_var_name(func, &Place::local(src_local)))
+    let mut best =
+        v2_dominating_strict_upper_bound(func, &sv, paths, &amt_base, block.id, shl_stmt_index);
+    if let Some((src_local, sub_const, source_block, source_stmt_index)) =
+        v2_amount_sub_source_at_use(func, &sv, block.id, shl_stmt_index, amt_local)
+        && let Some(src_ub_excl) = v2_dominating_strict_upper_bound(
+            func,
+            &sv,
+            paths,
+            &crate::place_to_var_name(func, &Place::local(src_local)),
+            source_block,
+            source_stmt_index,
+        )
     {
         // src < src_ub_excl  ⇒  src <= src_ub_excl - 1  ⇒  amt = src - c <= src_ub_excl
         // - 1 - c  ⇒  amt < src_ub_excl - c.
@@ -1541,113 +1816,216 @@ pub(super) fn v2_dominating_shift_amount_bound(
     Some(Formula::BvULt(Box::new(amt_bv), Box::new(Formula::BitVec { value: ub, width }), width))
 }
 
-/// If the shift-amount local is uniquely defined by `amt = src - c` (a `Sub` of a
-/// plain local minus an integer constant), return `(src_local, c)`. Used to thread
-/// a dominating bound on `src` (`width <= 127`) through to the amount (`_6 = width
-/// - 1 <= 126`). Returns `None` for any other defining shape (sound: no derived
-/// bound, the prove may simply fail).
-pub(super) fn v2_amount_sub_source(func: &VerifiableFunction, amt_local: usize) -> Option<(usize, i128)> {
-    let mut found: Option<(usize, i128)> = None;
+/// Recover the exact reaching `amount = source - constant` definition at a Shl
+/// use point.  The returned source program point is where `source` was read.
+/// Joined, ambiguous, unreachable, or overwritten definitions decline.
+fn v2_amount_sub_source_at_use(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    use_block: BlockId,
+    use_stmt_index: usize,
+    amt_local: usize,
+) -> Option<(usize, i128, BlockId, usize)> {
+    if guards::value_local_is_unstable(func, amt_local) {
+        return None;
+    }
+    let amt_name = crate::place_to_var_name(func, &Place::local(amt_local));
+    let use_token = sv.version_token_at(func, use_block, use_stmt_index, &amt_name)?;
+    let mut found = None;
+
     for block in &func.body.blocks {
-        for stmt in &block.stmts {
+        for (stmt_index, stmt) in block.stmts.iter().enumerate() {
             let Statement::Assign { place, rvalue, .. } = stmt else {
                 continue;
             };
-            if place.local != amt_local || !place.projections.is_empty() {
+            if place != &Place::local(amt_local)
+                || sv.version_token_at(func, block.id, stmt_index + 1, &amt_name)
+                    != Some(use_token.clone())
+            {
                 continue;
             }
-            // Only a clean `src - const` defines a usable derived bound.
-            let cand = match rvalue {
-                Rvalue::BinaryOp(BinOp::Sub, src, c)
-                | Rvalue::CheckedBinaryOp(BinOp::Sub, src, c) => {
-                    let (Operand::Copy(sp) | Operand::Move(sp)) = src else {
-                        return None;
-                    };
-                    if !sp.projections.is_empty() {
-                        return None;
-                    }
-                    let cv = match c {
-                        Operand::Constant(ConstValue::Int(n)) => *n,
-                        Operand::Constant(ConstValue::Uint(n, _)) => *n as i128,
-                        _ => return None,
-                    };
-                    Some((sp.local, cv))
-                }
-                // `_6 = move (_N.0)`: rustc lowers a checked `width - 1` as
-                // `_N = SubWithOverflow(width, 1); assert(!_N.1); _6 = _N.0`, so the
-                // amount is the RESULT FIELD of a CheckedBinaryOp Sub, reached via a
-                // `.0` projection — not a direct `Sub` defining `_6`. Follow the
-                // projection to that Sub's operands so the dominating bound on `width`
-                // (`width <= 127`) still threads to `_6 <= 126`. Without this, the
-                // derived bound is lost and a guarded `1i128 << (width-1)` shift
-                // false-FAILs (only the weak `_6 < 128` survives, admitting
-                // `_6 = 127 ⇒ _5 = i128::MIN`).
-                Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
-                    if p.projections.len() == 1
-                        && matches!(p.projections[0], trust_types::Projection::Field(0)) =>
+            let candidate = match rvalue {
+                Rvalue::BinaryOp(BinOp::Sub, src, constant) => v2_plain_sub_source(src, constant)
+                    .map(|(local, value)| (local, value, block.id, stmt_index)),
+                Rvalue::Use(Operand::Copy(tuple_result) | Operand::Move(tuple_result))
+                    if tuple_result.projections.len() == 1
+                        && matches!(
+                            tuple_result.projections[0],
+                            trust_types::Projection::Field(0)
+                        ) =>
                 {
-                    match v2_checked_sub_operands_for_tuple(func, p.local) {
-                        Some(pair) => Some(pair),
-                        None => return None,
-                    }
+                    v2_checked_sub_source_at_use(func, block.id, stmt_index, tuple_result)
                 }
-                // Any other (re)definition of the amount means it is not the clean
-                // single-Sub shape — decline.
-                _ => return None,
-            };
-            match (found, cand) {
-                (Some(prev), Some(cand)) if prev != cand => return None,
-                (_, Some(cand)) => found = Some(cand),
-                (_, None) => {}
+                _ => None,
+            }?;
+            if guards::value_local_is_unstable(func, candidate.0) {
+                return None;
+            }
+            if found.replace(candidate).is_some() {
+                return None;
             }
         }
     }
     found
 }
 
-/// Operands `(src_local, c)` of the unique `_N = CheckedBinaryOp(Sub, src, c)`
-/// (`SubWithOverflow`) that defines tuple local `_N`, where `src` is a bare local
-/// and `c` an integer constant. Used by [`v2_amount_sub_source`] to thread a
-/// dominating bound on `src` through a checked `width - 1` whose result is read as
-/// `_N.0`. `None` for any other shape (sound: no derived bound).
-pub(super) fn v2_checked_sub_operands_for_tuple(
+fn v2_plain_sub_source(src: &Operand, constant: &Operand) -> Option<(usize, i128)> {
+    let (Operand::Copy(place) | Operand::Move(place)) = src else {
+        return None;
+    };
+    if !place.projections.is_empty() {
+        return None;
+    }
+    let value = match constant {
+        Operand::Constant(ConstValue::Int(value)) => *value,
+        Operand::Constant(ConstValue::Uint(value, _)) => i128::try_from(*value).ok()?,
+        _ => return None,
+    };
+    Some((place.local, value))
+}
+
+/// Recover the `source - constant` behind a `tuple.0` read of a `CheckedBinaryOp
+/// (Sub)` result, authenticated as MATHEMATICAL subtraction at the use point.
+///
+/// Reaching identity is deliberately NOT established with `version_token_at`: the
+/// statement-version oracle derives written names from the block-def extraction,
+/// which SKIPS `CheckedBinaryOp` (its `.0` value is only meaningful on the assert
+/// success edge), so the oracle is blind to the tuple's own write and reports the
+/// entry value on BOTH sides of exactly the canonical `_7 = SubWithOverflow(w, 1);
+/// assert(!_7.1); _6 = _7.0` shape — a token pin here can never authenticate the
+/// def it exists for. The replacement is structural and at least as strong:
+///   * `v2_checked_sub_success_edge_dominates_use` requires the defining block's
+///     own `Overflow(Sub)` assert on THIS tuple's live `.1` flag to target
+///     `use_block` DIRECTLY and to lie on EVERY recorded path into it, so the
+///     definition is the immediate predecessor of the use on every path (no
+///     intermediate block exists in which the value could be rewritten);
+///   * the two `stmt_writes_name` scans below refuse any interposed write that
+///     overlaps the `.0` value — after the checked sub in the defining block and
+///     before the read in the use block. `stmt_writes_name` sees every `Assign`
+///     dest (including the `CheckedBinaryOp` writes the token oracle cannot), and
+///     the assert authenticates only the `.1` flag, so a sibling `.0` store
+///     between the two points would change the value while keeping the flag
+///     authentic — exactly what these scans decline (fail-closed).
+fn v2_checked_sub_source_at_use(
     func: &VerifiableFunction,
-    tuple_local: usize,
-) -> Option<(usize, i128)> {
-    let mut found: Option<(usize, i128)> = None;
+    use_block: BlockId,
+    use_stmt_index: usize,
+    tuple_result: &Place,
+) -> Option<(usize, i128, BlockId, usize)> {
+    if guards::value_local_is_unstable(func, tuple_result.local) {
+        return None;
+    }
+    let tuple_name = crate::place_to_var_name(func, tuple_result);
+    let use_bb = func.body.blocks.get(use_block.0).filter(|b| b.id == use_block)?;
+    let mut found = None;
     for block in &func.body.blocks {
-        for stmt in &block.stmts {
+        for (stmt_index, stmt) in block.stmts.iter().enumerate() {
             let Statement::Assign {
                 place,
-                rvalue:
-                    Rvalue::CheckedBinaryOp(BinOp::Sub, src, c) | Rvalue::BinaryOp(BinOp::Sub, src, c),
+                rvalue: Rvalue::CheckedBinaryOp(BinOp::Sub, src, constant),
                 ..
             } = stmt
             else {
                 continue;
             };
-            if place.local != tuple_local || !place.projections.is_empty() {
+            if place != &Place::local(tuple_result.local) {
                 continue;
             }
-            let (Operand::Copy(sp) | Operand::Move(sp)) = src else {
-                return None;
-            };
-            if !sp.projections.is_empty() {
-                return None;
+            if !v2_checked_sub_success_edge_dominates_use(
+                func,
+                block,
+                stmt_index,
+                tuple_result.local,
+                use_block,
+            ) {
+                continue;
             }
-            let cv = match c {
-                Operand::Constant(ConstValue::Int(n)) => *n,
-                Operand::Constant(ConstValue::Uint(n, _)) => *n as i128,
-                _ => return None,
-            };
-            let cand = (sp.local, cv);
-            match found {
-                Some(prev) if prev != cand => return None,
-                _ => found = Some(cand),
+            // No later write in the DEFINING block may overlap the read `.0`
+            // value (the assert's reverse scan pins only `.1`-overlapping writes).
+            if (stmt_index + 1..block.stmts.len())
+                .any(|later| stmt_writes_name(func, block, later, &tuple_name))
+            {
+                continue;
+            }
+            // Nor may any write in the USE block before the read point.
+            if (0..use_stmt_index.min(use_bb.stmts.len()))
+                .any(|earlier| stmt_writes_name(func, use_bb, earlier, &tuple_name))
+            {
+                continue;
+            }
+            let (source, value) = v2_plain_sub_source(src, constant)?;
+            let candidate = (source, value, block.id, stmt_index);
+            if found.replace(candidate).is_some() {
+                return None;
             }
         }
     }
     found
+}
+
+/// Authenticate a checked subtraction's `.0` value as MATHEMATICAL subtraction.
+///
+/// `CheckedBinaryOp(Sub)` always computes a wrapping tuple value; `.0 == lhs -
+/// rhs` over mathematical integers is valid only on the NORMAL edge of the exact
+/// `Assert(tuple.1, expected = false, Overflow(Sub))` that checks its `.1` flag.
+/// A caller-built TrustIR body may otherwise ignore the flag and feed the wrapped
+/// value to a later shift.  Treating that value as mathematical subtraction can
+/// manufacture a false dominating shift bound and make a real i128 overflow
+/// UNSAT.  We therefore require both occurrence identity (the assert observes
+/// this exact live tuple definition) and every-path dominance of its success edge.
+fn v2_checked_sub_success_edge_dominates_use(
+    func: &VerifiableFunction,
+    defining_block: &trust_types::BasicBlock,
+    defining_stmt_index: usize,
+    tuple_local: usize,
+    use_block: BlockId,
+) -> bool {
+    let Terminator::Assert {
+        cond,
+        expected: false,
+        msg: AssertMessage::Overflow(BinOp::Sub),
+        target,
+        ..
+    } = &defining_block.terminator
+    else {
+        return false;
+    };
+    if *target != use_block {
+        return false;
+    }
+    let (Operand::Copy(flag_place) | Operand::Move(flag_place)) = cond else {
+        return false;
+    };
+    if flag_place != &Place::field(tuple_local, 1) {
+        return false;
+    }
+    let Some((authenticated_stmt_index, _, _)) =
+        v2_find_checked_binop_for_assert_cond(func, defining_block, cond, BinOp::Sub)
+    else {
+        return false;
+    };
+    if authenticated_stmt_index != defining_stmt_index {
+        return false;
+    }
+
+    let path_map = v2_build_path_guard_map(func);
+    let Some(paths) = path_map.get(&use_block).filter(|paths| !paths.is_empty()) else {
+        return false;
+    };
+    paths.iter().all(|path| {
+        path.iter().any(|(source, guard)| {
+            if *source != defining_block.id {
+                return false;
+            }
+            matches!(
+                guard,
+                GuardCondition::AssertHolds {
+                    cond: Operand::Copy(path_flag) | Operand::Move(path_flag),
+                    expected: false,
+                } if path_flag == flag_place
+            )
+        })
+    })
 }
 
 /// Try to read a path fact as `<var> CMP <integer constant>` (either argument
@@ -1799,24 +2177,23 @@ pub(super) fn v2_bv_mul_dominating_guard_constraints(
     block: &trust_types::BasicBlock,
     lhs: &Operand,
     rhs: &Operand,
+    stmt_index: Option<usize>,
     width: u32,
     signed: bool,
 ) -> Vec<Formula> {
     // (local name, fresh BV var name) for each plain-local operand. Constants
     // need no bound; widening-cast operands already encode their true range
     // structurally (and their fresh var lives at the narrower source width).
+    let use_stmt_index = stmt_index.unwrap_or(block.stmts.len());
     let mut targets: Vec<(String, String)> = Vec::new();
     for (op, role) in [(lhs, "lhs"), (rhs, "rhs")] {
         let (Operand::Copy(place) | Operand::Move(place)) = op else {
             continue;
         };
-        if !place.projections.is_empty() || v2_widening_bv_source(func, op, width).is_some() {
-            continue;
-        }
-        let assigned_in_block = block.stmts.iter().any(|stmt| {
-            matches!(stmt, trust_types::Statement::Assign { place: p, .. } if p.local == place.local)
-        });
-        if assigned_in_block {
+        if !place.projections.is_empty()
+            || guards::value_local_is_unstable(func, place.local)
+            || v2_widening_bv_source(func, op, width).is_some()
+        {
             continue;
         }
         let base = crate::place_to_var_name(func, place);
@@ -1830,37 +2207,15 @@ pub(super) fn v2_bv_mul_dominating_guard_constraints(
     let Some(paths) = path_map.get(&block.id) else {
         return Vec::new();
     };
-    // Resolve each path's guard conditions to semantic formulas, then keep
-    // only facts present on EVERY path (set intersection by formula equality).
-    let resolved: Vec<Vec<Formula>> = paths
-        .iter()
-        .map(|gs| gs.iter().map(|(_, g)| guards::guard_to_formula(func, g)).collect())
-        .collect();
-    let Some((first, rest)) = resolved.split_first() else {
-        return Vec::new();
-    };
+    let sv = StmtVersionCtx::build(func);
     let mut constraints = Vec::new();
-    for fact in first {
-        if !rest.iter().all(|path| path.contains(fact)) {
-            continue;
-        }
-        // A range-validation guard `(L..=U).contains(&x)` resolves to a single
-        // `And(Ge(x,L), Le(x,U))` (the rewrite's `BitAnd`), unlike a hand-written
-        // `&&` guard which splits into two single-fact switches. Flatten conjuncts
-        // so BOTH bounds bind to the BV operand; otherwise a range-validated
-        // `x * <const>` false-FAILs. Post-intersection, so only facts true on EVERY
-        // dominating path are flattened (sound). GUARD lane only — distinct from the
-        // precondition `And`-flatten reverted above for the days_from_civil spin.
-        for leaf in v2_flatten_guard_conjuncts(fact) {
-            let Some((name, cmp, c)) = v2_linear_var_const_fact(leaf) else {
-                continue;
-            };
-            for (base, bv_name) in &targets {
-                if base == name
-                    && let Some(constraint) = v2_bv_guard_constraint(bv_name, cmp, c, width, signed)
-                {
-                    constraints.push(constraint);
-                }
+    for (base, bv_name) in &targets {
+        for (cmp, constant) in
+            v2_dominating_linear_facts_for_var(func, &sv, paths, base, block.id, use_stmt_index)
+        {
+            if let Some(constraint) = v2_bv_guard_constraint(bv_name, cmp, constant, width, signed)
+            {
+                constraints.push(constraint);
             }
         }
     }
@@ -1871,10 +2226,13 @@ pub(super) fn v2_bv_mul_dominating_guard_constraints(
     // the Int lane conjoins via conjoin_live_preconditions. Translate the
     // var-vs-const comparisons among them onto the fresh BV operand vars so a
     // contract-bounded multiply (`#[trust::requires(x <= 1000)] ... x * 4`)
-    // proves instead of false-Failing. Staleness is handled strictly more
-    // conservatively than the Int lane's killed-set discipline: a fact is
-    // skipped if its parameter is assigned ANYWHERE in the function
-    // (preconditions speak about entry values).
+    // proves instead of false-Failing. Staleness is STATEMENT-GRANULAR via the
+    // version-token oracle: a fact is skipped iff `version_token_at` reports the
+    // parameter no longer holds its ENTRY value at the multiply's own use point
+    // `(block, use_stmt_index)` — an overlap-aware earlier same-block write, or a
+    // non-entry reaching-def version at block entry (preconditions speak about
+    // entry values). A write that happens only LATER in the block, or on a path
+    // that does not reach this use point, does NOT kill the fact.
     // NOTE: a `#[requires(a && b)]` parses to ONE `And` precondition, so a
     // conjunctive bound currently does NOT reach the BV mul operand here (only
     // flat, single-comparison preconditions do). Flattening the `And` (so both
@@ -1888,7 +2246,7 @@ pub(super) fn v2_bv_mul_dominating_guard_constraints(
         let Some((name, cmp, c)) = v2_linear_var_const_fact(fact) else {
             continue;
         };
-        if v2_local_assigned_anywhere(func, name) {
+        if sv.version_token_at(func, block.id, use_stmt_index, name).is_some() {
             continue;
         }
         for (base, bv_name) in &targets {
@@ -1900,22 +2258,6 @@ pub(super) fn v2_bv_mul_dominating_guard_constraints(
         }
     }
     constraints
-}
-
-/// Whether any statement in the function assigns the plain local named
-/// `name` (projection-free writes; conservative for the precondition
-/// staleness check above).
-pub(super) fn v2_local_assigned_anywhere(func: &VerifiableFunction, name: &str) -> bool {
-    func.body.blocks.iter().any(|block| {
-        block.stmts.iter().any(|stmt| {
-            matches!(
-                stmt,
-                Statement::Assign { place, .. }
-                    if place.projections.is_empty()
-                        && crate::place_to_var_name(func, place) == name
-            )
-        })
-    })
 }
 
 /// widening-mul: if `op` is a bare local defined (uniquely) by a
@@ -2038,7 +2380,11 @@ pub(super) fn v2_bv_operand_term(
     }
 }
 
-pub(super) fn v2_assert_failure_formula(func: &VerifiableFunction, cond: &Operand, expected: bool) -> Formula {
+pub(super) fn v2_assert_failure_formula(
+    func: &VerifiableFunction,
+    cond: &Operand,
+    expected: bool,
+) -> Formula {
     let cond_f = operand_to_formula(func, cond);
     if expected { Formula::Not(Box::new(cond_f)) } else { cond_f }
 }
@@ -2059,44 +2405,9 @@ pub(super) fn v2_assert_failure_is_known_false(
     trust_types::static_truth::assert_failure_is_known_false(block, cond, expected)
 }
 
-pub(super) fn v2_condition_truth_until(
-    block: &trust_types::BasicBlock,
-    cond: &Operand,
-    end_stmt_exclusive: usize,
-) -> Option<bool> {
-    trust_types::static_truth::condition_truth_until(block, cond, end_stmt_exclusive)
-}
-
-pub(super) fn v2_local_condition_truth_until(
-    block: &trust_types::BasicBlock,
-    local: usize,
-    end_stmt_exclusive: usize,
-) -> Option<bool> {
-    trust_types::static_truth::local_condition_truth_until(block, local, end_stmt_exclusive)
-}
-
-pub(super) fn v2_constant_eq_truth(lhs: &Operand, rhs: &Operand) -> Option<bool> {
-    trust_types::static_truth::constant_eq_truth(lhs, rhs)
-}
-
+#[cfg(test)]
 pub(super) fn v2_const_eq_truth(lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
     trust_types::static_truth::const_eq_truth(lhs, rhs)
-}
-
-/// True iff `target` is the `otherwise` arm of some `SwitchInt` whose
-/// `exhaustive_enum_unreachable` flag is set — i.e. a TyCtxt-certified-exhaustive
-/// enum-discriminant switch whose default is provably infeasible. Used to suppress
-/// the redundant per-VC `Unreachable` obligation that the native CHC structural
-/// proof already discharges (the flag is set only under the strict soundness gate
-/// in `trust-mir-extract::mark_exhaustive_enum_unreachable_switches`).
-pub(super) fn v2_is_exhaustive_enum_unreachable_target(func: &VerifiableFunction, target: BlockId) -> bool {
-    func.body.blocks.iter().any(|b| {
-        matches!(
-            &b.terminator,
-            Terminator::SwitchInt { otherwise, exhaustive_enum_unreachable: true, .. }
-                if *otherwise == target
-        )
-    })
 }
 
 pub(super) fn v2_build_terminator_vc(
@@ -2104,22 +2415,12 @@ pub(super) fn v2_build_terminator_vc(
     block: &trust_types::BasicBlock,
 ) -> Option<VerificationCondition> {
     let (kind, span) = match &block.terminator {
-        // A bare `Unreachable` reached ONLY as the `otherwise` arm of an
-        // exhaustive enum-discriminant `SwitchInt` (flag `exhaustive_enum_unreachable`,
-        // set ONLY by trust-mir-extract's TyCtxt-vetted gate: single-assignment
-        // `Discriminant(enum)` selector whose explicit cases equal the enum's FULL
-        // tag set) is GENUINELY infeasible — `disc ∈ {cases}` is a type invariant.
-        // The native CHC structural proof discharges it soundly (trust-ir-bridge
-        // conjoins `disc ∈ {case tags}` on that edge, `assume_discriminant_in_cases`),
-        // but the per-VC obligation's `Bool(true)` goal carries the un-lowerable
-        // `Discriminant` def in its path facts and reports UNKNOWN. Suppress that
-        // redundant per-VC obligation here. Soundness: a partial match / genuine
-        // `unreachable_unchecked` keeps the flag FALSE, so its obligation is still
-        // emitted and still refutes — only TyCtxt-certified-exhaustive arms are
-        // suppressed. (The `?`/`Try`→`ControlFlow` desugar is one such arm.)
-        Terminator::Unreachable if v2_is_exhaustive_enum_unreachable_target(func, block.id) => {
-            return None;
-        }
+        // `SwitchInt::exhaustive_enum_unreachable` is serialized public input,
+        // not proof authority. Even when the compiler normally stamps it after
+        // a TyCtxt check, a caller can construct or replay the same bit. Always
+        // keep the public per-VC `Unreachable` row; compiler-native structural
+        // lanes may use independently rederived facts, but this lane must not
+        // erase an obligation from an unauthenticated hint.
         Terminator::Unreachable => (VcKind::Unreachable, v2_block_span(func, block)),
         Terminator::Call { func: callee, span, .. } if v2_is_unreachable_panic_call(callee) => {
             (VcKind::Unreachable, span.clone())

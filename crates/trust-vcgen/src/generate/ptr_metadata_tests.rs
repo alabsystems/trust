@@ -1,10 +1,20 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
-    Ty, UnOp, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Projection, Rvalue, Sort, SourceSpan,
+    Statement, Terminator, Ty, UnOp, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::unsupported_mir_vcs;
+use crate::{VcgenError, generate_vcs, try_generate_vcs, validate_function};
+
+fn assert_ptr_metadata_malformed_fails_closed(func: &VerifiableFunction) {
+    assert!(try_generate_vcs(func).is_err());
+    let vcs = generate_vcs(func);
+    assert_eq!(vcs.len(), 1);
+    assert!(matches!(
+        &vcs[0].kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+    ));
+}
 
 /// SOUNDNESS GATE for the slice-len `isize::MAX` upper bound: it may apply ONLY
 /// to provably non-ZST elements (a `&[()]` length can reach `usize::MAX`, so an
@@ -21,22 +31,30 @@ fn slice_len_upper_bound_gate_excludes_zst() {
     assert!(ty_is_definitely_non_zst(&Ty::Ref { mutable: false, inner: Box::new(Ty::Bool) }));
     // Struct/tuple with a non-ZST field is non-ZST (no regression on &[Struct]).
     assert!(ty_is_definitely_non_zst(&Ty::Tuple(vec![Ty::Unit, Ty::Bool])));
-    assert!(ty_is_definitely_non_zst(&Ty::Adt { adt_kind: None, layout: None, 
+    assert!(ty_is_definitely_non_zst(&Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "S".into(),
         fields: vec![("a".into(), Ty::Unit), ("b".into(), Ty::Int { width: 8, signed: false })],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }));
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }));
     // ZST or all-ZST: MUST be excluded (no upper bound).
     assert!(!ty_is_definitely_non_zst(&Ty::Unit));
     assert!(!ty_is_definitely_non_zst(&Ty::Tuple(vec![])));
     assert!(!ty_is_definitely_non_zst(&Ty::Tuple(vec![Ty::Unit, Ty::Unit])));
-    assert!(!ty_is_definitely_non_zst(&Ty::Adt { adt_kind: None, layout: None, 
+    assert!(!ty_is_definitely_non_zst(&Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Z".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }));
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }));
     assert!(!ty_is_definitely_non_zst(&Ty::Array {
         elem: Box::new(Ty::Int { width: 8, signed: false }),
         len: 0,
@@ -47,6 +65,19 @@ fn slice_len_upper_bound_gate_excludes_zst() {
 /// single statement exercises exactly the `collect_rvalue_unsupported`
 /// PtrMetadata arm under test.
 fn ptr_metadata_fn(operand_ty: Ty) -> VerifiableFunction {
+    let metadata_ty = match &operand_ty {
+        Ty::Ref { inner, .. } | Ty::RawPtr { pointee: inner, .. }
+            if matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Str) =>
+        {
+            Ty::usize()
+        }
+        Ty::Ref { inner, .. } | Ty::RawPtr { pointee: inner, .. }
+            if !matches!(inner.as_ref(), Ty::Dynamic { .. } | Ty::Unsupported { .. }) =>
+        {
+            Ty::Unit
+        }
+        _ => Ty::usize(),
+    };
     VerifiableFunction {
         name: "ptr_meta".to_string(),
         def_path: "test::ptr_meta".to_string(),
@@ -55,7 +86,7 @@ fn ptr_metadata_fn(operand_ty: Ty) -> VerifiableFunction {
             locals: vec![
                 LocalDecl { index: 0, ty: Ty::u32(), name: None }, // return
                 LocalDecl { index: 1, ty: operand_ty, name: Some("p".into()) }, // operand
-                LocalDecl { index: 2, ty: Ty::u32(), name: Some("len".into()) }, // metadata dest
+                LocalDecl { index: 2, ty: metadata_ty, name: Some("metadata".into()) },
             ],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -183,9 +214,9 @@ fn non_recursive_unsupported_type_still_fails_closed() {
     };
     let unsupported = unsupported_mir_vcs(&func)
         .into_iter()
-        .filter(|vc| {
-            matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind == "TyKind::Alias")
-        })
+        .filter(
+            |vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind == "TyKind::Alias"),
+        )
         .count();
     assert!(
         unsupported >= 1,
@@ -538,16 +569,90 @@ fn slice_ref_ptr_metadata_emits_no_unsupported_vc() {
 }
 
 #[test]
-fn raw_ptr_ptr_metadata_still_fails_closed() {
-    // `*const u32`: `slice_len_formula` returns None (no fat-pointer length
-    // semantics), so the obligation must still fail closed to Unknown.
-    let func = ptr_metadata_fn(Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) });
+fn str_metadata_uses_the_canonical_utf8_byte_length_for_direct_ref_and_raw_ptr() {
+    let cases = [
+        ("&str", Ty::Ref { mutable: false, inner: Box::new(Ty::Str) }),
+        ("*const str", Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Str) }),
+    ];
+
+    for (label, ty) in cases {
+        let func = ptr_metadata_fn(ty);
+        assert_eq!(
+            ptr_metadata_unsupported(&func),
+            0,
+            "PtrMetadata over {label} is its UTF-8 byte length"
+        );
+        let crate::PtrMetadataModel::Length(len) =
+            crate::ptr_metadata_model(&func, &Operand::Copy(Place::local(1)))
+        else {
+            panic!("str-shaped metadata must have one canonical length term");
+        };
+        assert!(matches!(
+            len,
+            Formula::Var(name, Sort::Int) if name.ends_with("__slice_len")
+        ));
+    }
+}
+
+#[test]
+fn sized_and_array_pointer_metadata_is_unit_not_length() {
+    for ty in [
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Array { elem: Box::new(Ty::u8()), len: 7 }) },
+        Ty::RawPtr {
+            mutable: false,
+            pointee: Box::new(Ty::Array { elem: Box::new(Ty::u8()), len: 7 }),
+        },
+    ] {
+        let func = ptr_metadata_fn(ty);
+        assert!(matches!(
+            crate::ptr_metadata_model(&func, &Operand::Copy(Place::local(1))),
+            crate::PtrMetadataModel::Unit
+        ));
+        assert_eq!(ptr_metadata_unsupported(&func), 0);
+        assert!(validate_function(&func).is_ok());
+    }
+}
+
+#[test]
+fn dynamic_pointer_metadata_still_fails_closed() {
+    let func = ptr_metadata_fn(Ty::RawPtr {
+        mutable: false,
+        pointee: Box::new(Ty::Dynamic {
+            trait_name: "test::Trait".into(),
+            principal_key: Some("test::Trait".into()),
+        }),
+    });
     assert_eq!(
         ptr_metadata_unsupported(&func),
         1,
-        "PtrMetadata over a raw pointer is unmodelable and must still emit \
+        "PtrMetadata over a dyn pointer is unmodelable and must still emit \
          exactly one UnsupportedMir obligation"
     );
+}
+
+#[test]
+fn ptr_metadata_rejects_nonpointer_wrong_destination_and_projection_carriers() {
+    let nonpointer = ptr_metadata_fn(Ty::u32());
+    assert!(matches!(
+        validate_function(&nonpointer),
+        Err(VcgenError::MalformedMir { detail, .. }) if detail.contains("pointer operand")
+    ));
+
+    let mut wrong_destination = ptr_metadata_fn(Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
+    });
+    wrong_destination.body.locals[2].ty = Ty::Unit;
+    assert_ptr_metadata_malformed_fails_closed(&wrong_destination);
+
+    let mut projected_destination =
+        ptr_metadata_fn(Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) });
+    let Statement::Assign { place, .. } = &mut projected_destination.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    place.projections.push(Projection::Field(0));
+    assert_ptr_metadata_malformed_fails_closed(&projected_destination);
 }
 
 // ----------------------------------------------------------------------
@@ -578,21 +683,20 @@ fn ci(v: u128) -> Operand {
 ///   _4 = <&[u8] as TryInto<[u8; arr_len]>>::try_into(_3) (-> Result<[u8;N],_>)
 ///   _5 = Result::unwrap(move _4)                         (-> [u8; arr_len])
 /// `result_ty` lets a test inject a non-array `_5`/`_4` to exercise declines.
-fn try_into_unwrap_fn(
-    start: u128,
-    end: u128,
-    arr_len: u64,
-    result_ty: Ty,
-) -> VerifiableFunction {
+fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> VerifiableFunction {
     let arr = Ty::Array { elem: Box::new(Ty::Int { width: 8, signed: false }), len: arr_len };
     let slice_ref =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
-    let range_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let range_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::ops::Range".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     VerifiableFunction {
         name: "hashy".into(),
         def_path: "test::hashy".into(),
@@ -625,15 +729,13 @@ fn try_into_unwrap_fn(
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         func: "core::ops::index::Index::index".into(),
-                        args: vec![
-                            Operand::Move(Place::local(1)),
-                            Operand::Move(Place::local(2)),
-                        ],
+                        args: vec![Operand::Move(Place::local(1)), Operand::Move(Place::local(2))],
                         dest: Place::local(3),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -649,6 +751,7 @@ fn try_into_unwrap_fn(
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -664,6 +767,7 @@ fn try_into_unwrap_fn(
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -681,7 +785,9 @@ fn try_into_unwrap_fn(
 }
 
 fn result_array(n: u64) -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::result::Result".into(),
         fields: vec![
@@ -689,7 +795,9 @@ fn result_array(n: u64) -> Ty {
             ("1".into(), Ty::Unit),
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 /// The targeted PROOF: `bytes[0..8].try_into().unwrap()` into `[u8; 8]` from a
@@ -758,12 +866,16 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "core::result::Result".into(),
                         fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: None,
                 },
                 LocalDecl { index: 2, ty: Ty::u64(), name: None },
@@ -781,6 +893,7 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -796,6 +909,7 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -829,12 +943,16 @@ fn user_index_impl_const_range_try_into_unwrap_is_flagged() {
     // Retype the index RECEIVER local `_1` from `&[u8]` to a user ADT `&MyWrap`.
     func.body.locals[1].ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "mycrate::MyWrap".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     assert_eq!(
         unwrap_panic_freedom_count(&func),
@@ -866,19 +984,27 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
     let arr = Ty::Array { elem: Box::new(Ty::u8()), len: arr_len };
     let slice_ref =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
-    let rangefrom_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let rangefrom_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::ops::RangeFrom".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let usize_ty = Ty::Int { width: 64, signed: false };
-    let checked_sub_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let checked_sub_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "(usize, bool)".into(),
         fields: vec![("0".into(), usize_ty.clone()), ("1".into(), Ty::Bool)],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     VerifiableFunction {
         name: "suffix".into(),
         def_path: "test::suffix".into(),
@@ -888,11 +1014,11 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                 LocalDecl { index: 0, ty: Ty::u64(), name: None }, // _0 ret
                 LocalDecl { index: 1, ty: slice_ref.clone(), name: Some("bytes".into()) }, // _1
                 LocalDecl { index: 2, ty: usize_ty.clone(), name: Some("len".into()) }, // _2 len
-                LocalDecl { index: 3, ty: arr, name: None }, // _3 [u8;N]
+                LocalDecl { index: 3, ty: arr, name: None },       // _3 [u8;N]
                 LocalDecl { index: 4, ty: result_array(arr_len), name: None }, // _4 Result
                 LocalDecl { index: 5, ty: slice_ref.clone(), name: None }, // _5 &[u8]
                 LocalDecl { index: 6, ty: rangefrom_ty, name: None }, // _6 RangeFrom
-                LocalDecl { index: 7, ty: usize_ty, name: None }, // _7 len-K value
+                LocalDecl { index: 7, ty: usize_ty, name: None },  // _7 len-K value
                 LocalDecl { index: 8, ty: checked_sub_ty, name: None }, // _8 (val, ovf)
                 // _9: an extra slice, used as the "other slice" length source.
                 LocalDecl { index: 9, ty: slice_ref, name: Some("other".into()) },
@@ -947,15 +1073,13 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         func: "core::ops::index::Index::index".into(),
-                        args: vec![
-                            Operand::Copy(Place::local(1)),
-                            Operand::Move(Place::local(6)),
-                        ],
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(6))],
                         dest: Place::local(5),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -971,6 +1095,7 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -986,6 +1111,7 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -1129,12 +1255,16 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "core::result::Result".into(),
                         fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: None,
                 },
                 LocalDecl { index: 2, ty: Ty::u64(), name: None },
@@ -1152,6 +1282,7 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -1167,6 +1298,7 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },

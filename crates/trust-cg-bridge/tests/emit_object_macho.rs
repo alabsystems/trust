@@ -104,13 +104,17 @@ fn make_unit_main() -> VerifiableFunction {
 }
 
 fn make_checked_div_option() -> VerifiableFunction {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None,
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Option".to_string(),
         fields: vec![("tag".to_string(), Ty::i64()), ("value".to_string(), Ty::i32())],
         disc_index_safe: false,
         // Trust (B3-1 field completion): pre-existing E0063 missed by 11598e13fe.
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
 
     VerifiableFunction {
         name: "checked_div".to_string(),
@@ -193,13 +197,17 @@ fn make_checked_div_option() -> VerifiableFunction {
 }
 
 fn pair_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None,
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Pair".to_string(),
         fields: vec![("left".to_string(), Ty::i64()), ("right".to_string(), Ty::i32())],
         disc_index_safe: false,
         // Trust (B3-1 field completion): pre-existing E0063 missed by 11598e13fe.
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn make_pair_helper() -> VerifiableFunction {
@@ -220,7 +228,12 @@ fn make_pair_helper() -> VerifiableFunction {
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Pair".into(), variant: 0, active_field: None, args: None },
+                        AggregateKind::Adt {
+                            name: "Pair".into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
                     span: SourceSpan::default(),
@@ -258,6 +271,7 @@ fn make_pair_via_helper_call() -> VerifiableFunction {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "make_pair_helper".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -365,6 +379,7 @@ fn make_checked_add_overflow_main() -> VerifiableFunction {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "checked_add_overflowing".to_string(),
                         args: vec![

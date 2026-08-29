@@ -106,11 +106,7 @@ pub fn t12_aggregate_of_cmp_result(a: u32, b: u32) -> Out {
 
 #[inline(never)]
 pub fn t13_aggregate_in_if_arms(c: bool, x: u32, y: u32) -> Out {
-    if c {
-        Out { p: x, q: y }
-    } else {
-        Out { p: y, q: x }
-    }
+    if c { Out { p: x, q: y } } else { Out { p: y, q: x } }
 }
 
 #[inline(never)]

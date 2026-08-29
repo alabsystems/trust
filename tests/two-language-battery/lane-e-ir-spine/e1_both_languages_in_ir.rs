@@ -15,21 +15,25 @@
 //! languages, dumps the crate-level TrustIr artifact (`-Ztrust-dump=ir:`, the
 //! `--emit=trust-ir` spelling), and looks inside for each language's marker.
 //!
-//! Two facts already established from source, which this lane exists to
-//! CONFIRM EMPIRICALLY rather than take on trust:
-//!   * Rust does reach TrustIr directly — `trust_thir_lower` lowers source
+//! Two facts established from source, which this lane exists to CONFIRM
+//! EMPIRICALLY rather than take on trust:
+//!   * Rust reaches TrustIr directly — `trust_thir_lower` lowers source
 //!     (THIR) straight to trust-ir under a differential gate against MIR
-//!     (rustc_mir_build/src/builder/mod.rs:92), so the Rust marker should
-//!     appear.
-//!   * The island does NOT — `trust_ir::Module` has the slot for it
-//!     (`proof_certificates`, `ProofEvidence::LeanProof`), but no production
-//!     path populates it from a `clean { … }` island. The Lean marker is
-//!     expected to be ABSENT.
+//!     (rustc_mir_build/src/builder/mod.rs), so the Rust marker appears.
+//!   * The island NOW DOES TOO (flipped 2026-08-27, increment IR-1 of
+//!     docs/design/2026-08-27-two-language-direct-to-trust-ir.md): the
+//!     Clean-origin recording path re-earns the kernel verdict per def at the
+//!     finalize seam and appends the trust-ir spelling to the same Module,
+//!     tier `structural`, claim-free, `Producer::Clean`. The Lean marker is
+//!     expected PRESENT under verification.
 //!
-//! A verdict of `ir-rust-only` is therefore the honest expected result today,
-//! and it is the precise statement of what remains to build for the spine
-//! claim to be true. If the Lean marker ever appears, this lane flips to
-//! `ir-carries-both-languages` and the claim is earned.
+//! This lane's earlier prose said `ir-rust-only` was "the honest expected
+//! result today" and that if the Lean marker ever appeared "this lane flips to
+//! `ir-carries-both-languages` and the claim is earned." It appeared; the
+//! verdict flipped; the claim is earned AT MARKER-PRESENCE STRENGTH ONLY:
+//! Rust→Clean call edges in the Module still target the fail-closed bodyless
+//! declarations (linkage is increment IR-5), and the Clean rows are ungated
+//! below tier `gate` — no codegen may consume them.
 
 clean {
     def trust_battery_island_def (x : UInt64) : UInt64 := x

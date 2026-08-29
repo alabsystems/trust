@@ -64,6 +64,7 @@
 #
 # Usage:
 #   scripts/check_revert_rationale.sh --pre-push        # reads git's pre-push stdin
+#   scripts/check_revert_rationale.sh --push-context    # --pre-push via $TRUST_PUSHED_REFS
 #   scripts/check_revert_rationale.sh <rev-range>...    # e.g. origin/main..HEAD
 #   scripts/check_revert_rationale.sh --history [<since-rev>]   # default: 90 days, --all
 #
@@ -82,6 +83,25 @@ LEDGER_REL="scripts/revert-rationale-grandfathered.txt"
 SOUNDNESS_PATH_RE='^(crates/trust-thir-lower/|crates/trust-ir|compiler/rustc_trust|scripts/check_|scripts/hooks|src/tools/trust|tests/trust-comprehensive/divergences.toml)'
 
 die() { printf 'check_revert_rationale: %s\n' "$*" >&2; exit 2; }
+
+# --push-context is --pre-push with the ref lines taken from TRUST_PUSHED_REFS.
+# A manifest command string is fixed and receives no stdin, so scripts/hooks/pre-push
+# exports the refs instead and the SAME row text runs in both runners. UNSET means
+# no push is in flight and the subject WIDENS to --history; it never narrows to
+# nothing. Unset, not empty: an empty-but-set var is a real push with no updated
+# refs, which must stay the green it is today. SUBJECT: says which reading it took,
+# so a `push` run outside a hook cannot be mistaken for a rehearsal of one.
+if [ "${1:-}" = "--push-context" ]; then
+  shift
+  self="$0"; case "$self" in /*) ;; *) self="$PWD/$self" ;; esac
+  if [ -n "${TRUST_PUSHED_REFS+x}" ]; then
+    refcount="$(printf '%s' "$TRUST_PUSHED_REFS" | grep -c . || true)"
+    echo "SUBJECT: push ($refcount ref update(s))"
+    exec bash "$self" --pre-push "$@" <<< "$TRUST_PUSHED_REFS"
+  fi
+  echo "SUBJECT: history (no push in flight; TRUST_PUSHED_REFS unset)"
+  exec bash "$self" --history "$@"
+fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git worktree"
 cd "$REPO_ROOT" || die "cannot enter $REPO_ROOT"

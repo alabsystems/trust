@@ -1,13 +1,10 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    AggregateKind, BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
-    Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, VariantDef, VcKind,
-    VerifiableBody, VerifiableFunction,
+    AggregateKind, BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Projection,
+    Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VariantDef, VcKind, VerifiableBody,
+    VerifiableFunction,
 };
 
-use super::{
-    generate_unwrap_panic_freedom_vcs, unsupported_mir_vcs, v2_build_path_definition_map,
-};
+use super::{generate_unwrap_panic_freedom_vcs, unsupported_mir_vcs, v2_build_path_definition_map};
 
 const RESULT_UNWRAP: &str = "core::result::Result::<T, E>::unwrap";
 const OPTION_EXPECT: &str = "core::option::Option::<T>::expect";
@@ -23,7 +20,9 @@ fn enter_bool_pred_summaries(
 /// `Result<u64, ()>` in the flattened `lower_enum_adt` shape: the explicit
 /// `__tag` slot plus per-variant defs carrying the REAL discriminant tags.
 fn std_result_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -43,12 +42,16 @@ fn std_result_ty() -> Ty {
             },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 /// `Option<u64>` in the same flattened shape (`None` = 0, `Some` = 1).
 fn std_option_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::option::Option".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -63,7 +66,9 @@ fn std_option_ty() -> Ty {
             },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn call_term(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Terminator {
@@ -76,6 +81,7 @@ fn call_term(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Te
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     }
 }
@@ -93,7 +99,13 @@ fn func_of(
         name: "unwrap_fixture".into(),
         def_path: "test::unwrap_fixture".into(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty: Ty::u64(), datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -109,11 +121,7 @@ fn guarded_result_unwrap_fn() -> VerifiableFunction {
         vec![
             LocalDecl { index: 0, ty: Ty::u64(), name: None },
             LocalDecl { index: 1, ty: std_result_ty(), name: Some("r".into()) },
-            LocalDecl {
-                index: 2,
-                ty: Ty::Int { width: 64, signed: true },
-                name: Some("d".into()),
-            },
+            LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: Some("d".into()) },
             LocalDecl { index: 3, ty: Ty::u64(), name: Some("x".into()) },
         ],
         vec![
@@ -135,12 +143,7 @@ fn guarded_result_unwrap_fn() -> VerifiableFunction {
             BasicBlock {
                 id: BlockId(1),
                 stmts: vec![],
-                terminator: call_term(
-                    RESULT_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    3,
-                    3,
-                ),
+                terminator: call_term(RESULT_UNWRAP, vec![Operand::Move(Place::local(1))], 3, 3),
             },
             ret_block(2),
             ret_block(3),
@@ -295,12 +298,7 @@ fn param_unwrap_guarded_by_uninlined_is_some_connects() {
                     rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(2))],
-                    3,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(2))], 3, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -316,12 +314,7 @@ fn param_unwrap_guarded_by_uninlined_is_some_connects() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    4,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 4, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -430,12 +423,7 @@ fn infers_bool_pred_real_mir_shapes() {
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![Statement::StorageLive(2)],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Copy(Place::local(1))],
-                    2,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Copy(Place::local(1))], 2, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -474,12 +462,7 @@ fn infers_bool_pred_real_mir_shapes() {
                     },
                     Statement::StorageLive(3),
                 ],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Copy(Place::local(2))],
-                    3,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Copy(Place::local(2))], 3, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -515,11 +498,7 @@ fn infers_bool_pred_real_mir_shapes() {
         vec![
             LocalDecl { index: 0, ty: Ty::Bool, name: None },
             LocalDecl { index: 1, ty: ref_option(), name: Some("o".into()) },
-            LocalDecl {
-                index: 2,
-                ty: Ty::Int { width: 64, signed: true },
-                name: Some("d".into()),
-            },
+            LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: Some("d".into()) },
         ],
         vec![
             BasicBlock {
@@ -694,12 +673,16 @@ fn infers_bool_pred_from_field_probe() {
     const OPTION_IS_SOME: &str = "core::option::Option::<T>::is_some";
     let widget_ref = |mutable: bool| Ty::Ref {
         mutable,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "mycrate::Widget".into(),
             fields: vec![("slot".into(), std_option_ty())],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     // bb0: _2 = &((*_1).0); _3 = is_some(move _2) -> bb1
     // bb1: _0 = copy _3; return
@@ -807,12 +790,7 @@ fn helper_guarded_unwrap_connects_via_inferred_contract() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    4,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 4, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -869,12 +847,16 @@ fn field_guarded_field_unwrap_connects_via_inferred_contract() {
     const IS_READY: &str = "mycrate::Widget::is_ready";
     let widget_ref = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "mycrate::Widget".into(),
             fields: vec![("slot".into(), std_option_ty())],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     // bb0: _2 = is_ready(copy _1) -> bb1
     // bb1: switchInt(_2) -> [0: bb3], otherwise: bb2   (guard TRUE → unwrap)
@@ -914,12 +896,7 @@ fn field_guarded_field_unwrap_connects_via_inferred_contract() {
                     })),
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(3))],
-                    4,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(3))], 4, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -978,12 +955,16 @@ fn unguarded_field_unwrap_refutes_with_witness() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Widget".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, }),
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    }),
                 },
                 name: Some("x".into()),
             },
@@ -1001,12 +982,7 @@ fn unguarded_field_unwrap_refutes_with_witness() {
                     })),
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(2))],
-                    3,
-                    1,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(2))], 3, 1),
             },
             ret_block(1),
         ],
@@ -1073,12 +1049,7 @@ fn multi_arm_probe_body_records_nothing() {
                     },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(3))],
-                    4,
-                    3,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(3))], 4, 3),
             },
             BasicBlock {
                 id: BlockId(2),
@@ -1190,11 +1161,7 @@ fn place_to_var_name_generated_namespace_never_collides() {
                 name: Some("s".into()),
             },
             LocalDecl { index: 2, ty: Ty::usize(), name: Some("s__slice_len".into()) },
-            LocalDecl {
-                index: 3,
-                ty: Ty::usize(),
-                name: Some("__trust_constparam_0_N".into()),
-            },
+            LocalDecl { index: 3, ty: Ty::usize(), name: Some("__trust_constparam_0_N".into()) },
         ],
         vec![ret_block(0)],
         3,
@@ -1227,12 +1194,16 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Foo".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, }),
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    }),
                 },
                 name: Some("x".into()),
             },
@@ -1240,12 +1211,16 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 2,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Foo".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, }),
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    }),
                 },
                 name: Some("a".into()),
             },
@@ -1253,12 +1228,16 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 3,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::Foo".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, }),
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    }),
                 },
                 name: Some("b".into()),
             },
@@ -1304,12 +1283,7 @@ fn field_observer_gate_follows_multihop_base_copy() {
                     })),
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(5))],
-                    6,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(5))], 6, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -1350,12 +1324,7 @@ fn infers_bool_pred_by_value_param() {
                     rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(2))],
-                    3,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(2))], 3, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -1406,12 +1375,7 @@ fn infers_bool_pred_multi_param() {
                     },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(3))],
-                    4,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(3))], 4, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -1485,12 +1449,7 @@ fn multi_param_consumer_connects_only_at_exact_arity() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    5,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 5, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -1527,10 +1486,7 @@ fn multi_param_consumer_connects_only_at_exact_arity() {
         mismatched_vcs.is_empty(),
         "a wrong-arity summary must not mint predicate facts: {mismatched_vcs:?}"
     );
-    assert_eq!(
-        mismatched_rows, 1,
-        "a wrong-arity summary leaves the observed unwrap fail-closed"
-    );
+    assert_eq!(mismatched_rows, 1, "a wrong-arity summary leaves the observed unwrap fail-closed");
 }
 
 /// (2p2) ENUM-NOT-FIRST: `fn check(flag: bool, o: &Option<u32>) -> bool {
@@ -1561,12 +1517,7 @@ fn infers_bool_pred_enum_not_first() {
                     },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(3))],
-                    4,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(3))], 4, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -1604,11 +1555,7 @@ fn infers_implies_true_from_payload_guard() {
                 ty: Ty::Ref { mutable: false, inner: Box::new(std_option_ty()) },
                 name: Some("o".into()),
             },
-            LocalDecl {
-                index: 2,
-                ty: Ty::Int { width: 64, signed: true },
-                name: Some("d".into()),
-            },
+            LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: Some("d".into()) },
             LocalDecl { index: 3, ty: Ty::u64(), name: Some("x".into()) },
             LocalDecl { index: 4, ty: Ty::Bool, name: Some("c".into()) },
         ],
@@ -1671,9 +1618,7 @@ fn infers_implies_true_from_payload_guard() {
                 id: BlockId(2),
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
-                    rvalue: Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(
-                        false,
-                    ))),
+                    rvalue: Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(false))),
                     span: SourceSpan::default(),
                 }],
                 terminator: Terminator::Goto(BlockId(3)),
@@ -1736,12 +1681,7 @@ fn implies_true_emits_one_directional_fact() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    4,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 4, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -1812,12 +1752,7 @@ fn infers_implies_true_from_probe_and() {
                     },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(2))],
-                    3,
-                    1,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(2))], 3, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -1834,9 +1769,7 @@ fn infers_implies_true_from_probe_and() {
                 id: BlockId(2),
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
-                    rvalue: Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(
-                        false,
-                    ))),
+                    rvalue: Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(false))),
                     span: SourceSpan::default(),
                 }],
                 terminator: Terminator::Goto(BlockId(4)),
@@ -1908,12 +1841,7 @@ fn by_value_guarded_unwrap_connects_via_inferred_contract() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    3,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 3, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -1972,10 +1900,7 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
                 index: 4,
                 ty: Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Ref {
-                        mutable: false,
-                        inner: Box::new(std_option_ty()),
-                    }),
+                    inner: Box::new(Ty::Ref { mutable: false, inner: Box::new(std_option_ty()) }),
                 },
                 name: Some("m".into()),
             },
@@ -2020,12 +1945,7 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    6,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 6, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -2051,10 +1971,7 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
     let rows = unverified_row_count(&func);
     // The reseated guard must NOT connect o.unwrap() (that would false-PROVE);
     // it stays fail-closed.
-    assert!(
-        vcs.is_empty(),
-        "a reseated whole-pointee guard must not connect the unwrap: {vcs:?}"
-    );
+    assert!(vcs.is_empty(), "a reseated whole-pointee guard must not connect the unwrap: {vcs:?}");
     assert_eq!(rows, 1, "the unwrap stays fail-closed");
 }
 
@@ -2069,12 +1986,16 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
 fn raw_pointer_field_base_is_not_pinned() {
     const OPTION_UNWRAP: &str = "core::option::Option::<T>::unwrap";
     const IS_READY: &str = "mycrate::S::is_ready";
-    let s_adt = || Ty::Adt { adt_kind: None, layout: None, 
+    let s_adt = || Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "mycrate::S".into(),
         fields: vec![("f".into(), std_option_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = func_of(
         vec![
             LocalDecl { index: 0, ty: Ty::u64(), name: None },
@@ -2126,12 +2047,7 @@ fn raw_pointer_field_base_is_not_pinned() {
                     })),
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(4))],
-                    5,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(4))], 5, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -2173,12 +2089,16 @@ fn raw_pointer_field_base_is_not_pinned() {
 fn field_guard_through_aliased_reseat_does_not_connect() {
     const OPTION_UNWRAP: &str = "core::option::Option::<T>::unwrap";
     const CHECK: &str = "mycrate::S::check";
-    let s_adt = || Ty::Adt { adt_kind: None, layout: None, 
+    let s_adt = || Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "mycrate::S".into(),
         fields: vec![("slot".into(), std_option_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let ref_s = || Ty::Ref { mutable: false, inner: Box::new(s_adt()) };
     let func = func_of(
         vec![
@@ -2233,12 +2153,7 @@ fn field_guard_through_aliased_reseat_does_not_connect() {
                     })),
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(5))],
-                    6,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(5))], 6, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -2273,11 +2188,7 @@ fn field_guard_through_aliased_reseat_does_not_connect() {
     // With the guard disconnected the field tag is FREE ⇒ the unwrap refutes
     // over `o.slot == None` (sound: o.slot is genuinely unpinned here), never
     // a discharged proof.
-    assert_eq!(
-        vcs.len(),
-        1,
-        "the field unwrap must refute over the free tag, not be discharged"
-    );
+    assert_eq!(vcs.len(), 1, "the field unwrap must refute over the free tag, not be discharged");
     assert!(
         has_and_conjunct(&vcs[0].formula, &|f| eq_var_int(f, "o*.0.0", 0)),
         "refutation over the free field tag, not a guard discharge: {:?}",
@@ -2302,12 +2213,16 @@ fn unwrap_field_place_rejects_aliased_reseated_temp() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                    inner: Box::new(Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "mycrate::S".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, }),
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    }),
                 },
                 name: Some("x".into()),
             },
@@ -2343,12 +2258,7 @@ fn unwrap_field_place_rejects_aliased_reseated_temp() {
             BasicBlock {
                 id: BlockId(1),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(2))],
-                    5,
-                    2,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(2))], 5, 2),
             },
             ret_block(2),
         ],
@@ -2422,12 +2332,7 @@ fn param_unwrap_guarded_by_eq_none_const_connects() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    5,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 5, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -2517,12 +2422,7 @@ fn eq_some_payload_pin_fails_closed() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    6,
-                    4,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 6, 4),
             },
             ret_block(3),
             ret_block(4),
@@ -2564,12 +2464,7 @@ fn as_ref_result_unpinned_fails_closed() {
                     rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    OPTION_AS_REF,
-                    vec![Operand::Move(Place::local(2))],
-                    3,
-                    1,
-                ),
+                terminator: call_term(OPTION_AS_REF, vec![Operand::Move(Place::local(2))], 3, 1),
             },
             BasicBlock {
                 id: BlockId(1),
@@ -2586,12 +2481,7 @@ fn as_ref_result_unpinned_fails_closed() {
                         span: SourceSpan::default(),
                     },
                 ],
-                terminator: call_term(
-                    OPTION_IS_SOME,
-                    vec![Operand::Move(Place::local(4))],
-                    5,
-                    2,
-                ),
+                terminator: call_term(OPTION_IS_SOME, vec![Operand::Move(Place::local(4))], 5, 2),
             },
             BasicBlock {
                 id: BlockId(2),
@@ -2607,12 +2497,7 @@ fn as_ref_result_unpinned_fails_closed() {
             BasicBlock {
                 id: BlockId(3),
                 stmts: vec![],
-                terminator: call_term(
-                    OPTION_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    6,
-                    5,
-                ),
+                terminator: call_term(OPTION_UNWRAP, vec![Operand::Move(Place::local(1))], 6, 5),
             },
             ret_block(4),
             ret_block(5),
@@ -2714,11 +2599,7 @@ fn guarded_option_expect_gets_unsat_shaped_vc() {
         vec![
             LocalDecl { index: 0, ty: Ty::u64(), name: None },
             LocalDecl { index: 1, ty: std_option_ty(), name: Some("o".into()) },
-            LocalDecl {
-                index: 2,
-                ty: Ty::Int { width: 64, signed: true },
-                name: Some("d".into()),
-            },
+            LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: Some("d".into()) },
             LocalDecl { index: 3, ty: Ty::u64(), name: Some("x".into()) },
         ],
         vec![
@@ -2797,12 +2678,7 @@ fn construction_pinned_fn(variant: usize) -> VerifiableFunction {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: call_term(
-                    RESULT_UNWRAP,
-                    vec![Operand::Move(Place::local(1))],
-                    2,
-                    1,
-                ),
+                terminator: call_term(RESULT_UNWRAP, vec![Operand::Move(Place::local(1))], 2, 1),
             },
             ret_block(1),
         ],
@@ -2929,10 +2805,7 @@ fn discriminant_read_through_shared_borrow_is_recognized() {
         },
         Statement::Assign {
             place: Place::local(2),
-            rvalue: Rvalue::Discriminant(Place {
-                local: 4,
-                projections: vec![Projection::Deref],
-            }),
+            rvalue: Rvalue::Discriminant(Place { local: 4, projections: vec![Projection::Deref] }),
             span: SourceSpan::default(),
         },
     ];

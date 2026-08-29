@@ -8,6 +8,7 @@ mod divergence_tests;
 mod fp;
 mod helpers;
 
+use helpers::{compute_nzcv, compute_nzcv_with_carry, operand_to_formula, resolve_mem_address};
 use trust_disasm::Instruction;
 use trust_disasm::opcode::Opcode;
 use trust_disasm::operand::{
@@ -22,8 +23,6 @@ use crate::effect::{
 use crate::error::SemError;
 use crate::semantics::Semantics;
 use crate::state::MachineState;
-
-use helpers::{compute_nzcv, compute_nzcv_with_carry, operand_to_formula, resolve_mem_address};
 
 /// AArch64 instruction semantics.
 pub struct Aarch64Semantics;
@@ -763,14 +762,7 @@ impl Aarch64Semantics {
             // `compute_nzcv_with_carry`: `compute_nzcv` computes the carry-out
             // as though the carry-in were zero, and the differential caught it
             // 456 times.
-            effects.push(compute_nzcv_with_carry(
-                &rn,
-                &rm,
-                &result,
-                width,
-                false,
-                &state.flags.c,
-            ));
+            effects.push(compute_nzcv_with_carry(&rn, &rm, &result, width, false, &state.flags.c));
         }
         effects.push(pc_advance(state, insn));
         Ok(effects)
@@ -2508,10 +2500,7 @@ fn extract_imm(insn: &Instruction, index: usize) -> Result<u64, SemError> {
 /// no legal decode reaches this. That is exactly why the check belongs here as
 /// well: an arithmetic hazard must not be protected only by the ordering of a
 /// check in another crate.
-fn extract_bitfield_positions(
-    insn: &Instruction,
-    width: u32,
-) -> Result<(u32, u32), SemError> {
+fn extract_bitfield_positions(insn: &Instruction, width: u32) -> Result<(u32, u32), SemError> {
     let immr = extract_imm(insn, 2)? as u32;
     let imms = extract_imm(insn, 3)? as u32;
     if immr >= width || imms >= width {
@@ -2687,9 +2676,10 @@ fn load_le_bytes(
 
 #[cfg(test)]
 mod tests {
+    use trust_disasm::decode_aarch64;
+
     use super::*;
     use crate::semantics::Semantics;
-    use trust_disasm::decode_aarch64;
 
     fn decode(enc: u32) -> Instruction {
         decode_aarch64(&enc.to_le_bytes(), 0x1000).expect("decode AArch64 instruction")
@@ -2885,9 +2875,7 @@ mod tests {
             Formula::BitVec { width, .. } => Some(*width),
             Formula::Var(_, trust_types::Sort::BitVec(w)) => Some(*w),
             Formula::Select(_, _) => Some(8), // memory element sort is BitVec(8)
-            Formula::BvZeroExt(a, n) | Formula::BvSignExt(a, n) => {
-                smt_bv_width(a).map(|w| w + n)
-            }
+            Formula::BvZeroExt(a, n) | Formula::BvSignExt(a, n) => smt_bv_width(a).map(|w| w + n),
             Formula::BvExtract { high, low, .. } => Some(high - low + 1),
             Formula::BvAdd(a, b, w)
             | Formula::BvSub(a, b, w)
@@ -3717,12 +3705,11 @@ mod tests {
             Opcode::Clrex,
             Opcode::Fadd,
             Opcode::Fsub,
-Opcode::Fmul,
+            Opcode::Fmul,
             // `MOV Vd.<T>, Vn.<T>` — a full-width register copy, modeled since
             // the ORR-alias decode landed. It was a typed proof blocker while
             // the decoder could not produce it at all.
             Opcode::SimdMov,
-            
             Opcode::Fdiv,
             Opcode::Fcmp,
             Opcode::FmovReg,

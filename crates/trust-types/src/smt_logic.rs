@@ -58,11 +58,7 @@ fn same_sort(
 ) -> Result<Sort, FormulaSortError> {
     let left = check_formula_sort(left)?;
     let right = check_formula_sort(right)?;
-    if left == right {
-        Ok(left)
-    } else {
-        Err(FormulaSortError::Mismatch { operator, left, right })
-    }
+    if left == right { Ok(left) } else { Err(FormulaSortError::Mismatch { operator, left, right }) }
 }
 
 fn int_binary(
@@ -82,16 +78,12 @@ fn bv_operand(
 ) -> Result<(), FormulaSortError> {
     match check_formula_sort(operand)? {
         Sort::BitVec(actual) if actual == width => Ok(()),
-        Sort::BitVec(actual) => Err(FormulaSortError::BitWidth {
-            operator,
-            declared: width,
-            actual,
-        }),
-        actual => Err(FormulaSortError::Expected {
-            operator,
-            expected: Sort::BitVec(width),
-            actual,
-        }),
+        Sort::BitVec(actual) => {
+            Err(FormulaSortError::BitWidth { operator, declared: width, actual })
+        }
+        actual => {
+            Err(FormulaSortError::Expected { operator, expected: Sort::BitVec(width), actual })
+        }
     }
 }
 
@@ -198,13 +190,9 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
         | Formula::BvXor(left, right, width)
         | Formula::BvShl(left, right, width)
         | Formula::BvLShr(left, right, width)
-        | Formula::BvAShr(left, right, width) => bv_binary(
-            "bitvector binary operation",
-            left,
-            right,
-            *width,
-            Sort::BitVec(*width),
-        ),
+        | Formula::BvAShr(left, right, width) => {
+            bv_binary("bitvector binary operation", left, right, *width, Sort::BitVec(*width))
+        }
         Formula::BvNot(inner, width) => {
             bv_operand("bitvector not", inner, *width)?;
             Ok(Sort::BitVec(*width))
@@ -212,13 +200,9 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
         Formula::BvULt(left, right, width)
         | Formula::BvULe(left, right, width)
         | Formula::BvSLt(left, right, width)
-        | Formula::BvSLe(left, right, width) => bv_binary(
-            "bitvector comparison",
-            left,
-            right,
-            *width,
-            Sort::Bool,
-        ),
+        | Formula::BvSLe(left, right, width) => {
+            bv_binary("bitvector comparison", left, right, *width, Sort::Bool)
+        }
         Formula::BvToInt(inner, width, _) => {
             bv_operand("bitvector-to-int", inner, *width)?;
             Ok(Sort::Int)
@@ -236,11 +220,7 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
                 });
             };
             if high < low || *high >= width {
-                return Err(FormulaSortError::InvalidExtract {
-                    high: *high,
-                    low: *low,
-                    width,
-                });
+                return Err(FormulaSortError::InvalidExtract { high: *high, low: *low, width });
             }
             Ok(Sort::BitVec(high - low + 1))
         }
@@ -312,7 +292,11 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
             }
         }
         Formula::FpFma(round, first, second, third) => {
-            expect_sort("floating fused multiply-add", check_formula_sort(round)?, Sort::RoundingMode)?;
+            expect_sort(
+                "floating fused multiply-add",
+                check_formula_sort(round)?,
+                Sort::RoundingMode,
+            )?;
             let sort = same_sort("floating fused multiply-add", first, second)?;
             float_operand("floating fused multiply-add", third, &sort)?;
             if matches!(sort, Sort::Float { .. }) {
@@ -354,8 +338,7 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
             )?;
             Ok(Sort::BitVec(*width))
         }
-        Formula::FpFromSbv { rm, value, eb, sb }
-        | Formula::FpFromUbv { rm, value, eb, sb } => {
+        Formula::FpFromSbv { rm, value, eb, sb } | Formula::FpFromUbv { rm, value, eb, sb } => {
             expect_sort("integer to floating", check_formula_sort(rm)?, Sort::RoundingMode)?;
             let sort = check_formula_sort(value)?;
             if !matches!(sort, Sort::BitVec(_)) {
@@ -379,9 +362,7 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
             }
             Ok(Sort::Float { eb: *eb, sb: *sb })
         }
-        Formula::FpRem(left, right)
-        | Formula::FpMin(left, right)
-        | Formula::FpMax(left, right) => {
+        Formula::FpRem(left, right) | Formula::FpMin(left, right) | Formula::FpMax(left, right) => {
             let sort = same_sort("floating binary operation", left, right)?;
             if matches!(sort, Sort::Float { .. }) {
                 Ok(sort)
@@ -459,8 +440,16 @@ pub fn check_formula_sort(formula: &Formula) -> Result<Sort, FormulaSortError> {
         },
         Formula::Store(array, index, value) => match check_formula_sort(array)? {
             Sort::Array(index_sort, element_sort) => {
-                expect_sort("array store index", check_formula_sort(index)?, (*index_sort).clone())?;
-                expect_sort("array store value", check_formula_sort(value)?, (*element_sort).clone())?;
+                expect_sort(
+                    "array store index",
+                    check_formula_sort(index)?,
+                    (*index_sort).clone(),
+                )?;
+                expect_sort(
+                    "array store value",
+                    check_formula_sort(value)?,
+                    (*element_sort).clone(),
+                )?;
                 Ok(Sort::Array(index_sort, element_sort))
             }
             actual => Err(FormulaSortError::Expected {
@@ -528,9 +517,7 @@ pub fn select_logic(formula: &Formula) -> &'static str {
         // at all, so keying on variables alone would pick a logic that does not
         // admit the datatype theory.
         Formula::Sel { .. } | Formula::IsCtor { .. } => has_datatype = true,
-        Formula::Ctor { sort: s, .. } | Formula::FnApp { sort: s, .. }
-            if s.contains_datatype() =>
-        {
+        Formula::Ctor { sort: s, .. } | Formula::FnApp { sort: s, .. } if s.contains_datatype() => {
             has_datatype = true;
         }
         // FloatingPoint theory: any fp.* operator/literal or FP/RoundingMode var.
@@ -1065,11 +1052,8 @@ mod tests {
         );
         assert_eq!(select_logic(&sel), "ALL", "a selector application ranges over a datatype");
 
-        let is_ctor = Formula::IsCtor {
-            datatype: "Expr".into(),
-            ctor: "Const".into(),
-            arg: Box::new(n),
-        };
+        let is_ctor =
+            Formula::IsCtor { datatype: "Expr".into(), ctor: "Const".into(), arg: Box::new(n) };
         assert_eq!(select_logic(&is_ctor), "ALL", "a constructor tester ranges over a datatype");
     }
 
@@ -1266,10 +1250,7 @@ mod tests {
             infer_sort(&Formula::FpLe(Box::new(fp_var("x")), Box::new(fp_var("y")))),
             Sort::Bool
         );
-        assert_eq!(
-            infer_sort(&Formula::FpRoundingMode(RoundingMode::RTZ)),
-            Sort::RoundingMode
-        );
+        assert_eq!(infer_sort(&Formula::FpRoundingMode(RoundingMode::RTZ)), Sort::RoundingMode);
     }
 
     #[test]

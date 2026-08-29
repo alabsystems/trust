@@ -2761,5 +2761,62 @@ class BootstrapLineageTests(unittest.TestCase):
             self.assertTrue(any("valid UTF-8 TOML" in error for error in lineage["errors"]))
 
 
+class AyBcpFeatureSpellingTests(unittest.TestCase):
+    """`install_ay_solver`'s rebuild must ask for the feature ay DECLARES.
+
+    These vectors are the same five that pin
+    `ay_bootstrap_cargo_args_for_manifest` in
+    src/bootstrap/src/core/build_steps/tool/tests.rs. The two implementations
+    build the same crate from the same pin, so they must not be able to select
+    different capabilities.
+    """
+
+    @staticmethod
+    def _ay_dir(directory: str, manifest: str) -> Path:
+        crate = Path(directory) / "crates" / "ay"
+        crate.mkdir(parents=True)
+        (crate / "Cargo.toml").write_text(manifest, encoding="utf-8")
+        return Path(directory)
+
+    def _assert_spelling(self, manifest: str, expected: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                recreate_bootstrap.ay_bcp_cargo_features(self._ay_dir(directory, manifest)),
+                expected,
+            )
+
+    def test_new_spelling_manifest_selects_unsafe_bcp(self):
+        self._assert_spelling("[features]\nunsafe-bcp = []\ncli = []\n", "cli,unsafe-bcp")
+
+    def test_old_spelling_manifest_selects_raw_pointer_bcp(self):
+        self._assert_spelling(
+            "[features]\nraw-pointer-bcp = []\ncli = []\n", "cli,raw-pointer-bcp"
+        )
+
+    def test_unreadable_manifest_fails_safe_to_the_current_spelling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # No crates/ay/Cargo.toml at all.
+            self.assertEqual(
+                recreate_bootstrap.ay_bcp_cargo_features(Path(directory)), "cli,unsafe-bcp"
+            )
+
+    def test_mid_rename_manifest_declaring_both_prefers_the_new_spelling(self):
+        self._assert_spelling(
+            "[features]\nraw-pointer-bcp = []\nunsafe-bcp = []\n", "cli,unsafe-bcp"
+        )
+
+    def test_key_outside_the_features_table_cannot_spoof_the_capability(self):
+        self._assert_spelling(
+            'unsafe-bcp = "0.1"\n[features]\nraw-pointer-bcp = []\ncli = []\n',
+            "cli,raw-pointer-bcp",
+        )
+
+    def test_comment_only_declaration_does_not_count(self):
+        self._assert_spelling(
+            "[features]\n# unsafe-bcp = []\nraw-pointer-bcp = []\ncli = []\n",
+            "cli,raw-pointer-bcp",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

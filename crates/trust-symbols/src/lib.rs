@@ -181,9 +181,7 @@ impl SegmentPath {
     ///
     /// [`PathError::EmptyPath`] if the iterator is empty. A symbol with no
     /// segments has no name, and an unnameable symbol cannot be disclosed.
-    pub fn from_segments(
-        segments: impl IntoIterator<Item = Segment>,
-    ) -> Result<Self, PathError> {
+    pub fn from_segments(segments: impl IntoIterator<Item = Segment>) -> Result<Self, PathError> {
         let segments: Vec<Segment> = segments.into_iter().collect();
         if segments.is_empty() {
             return Err(PathError::EmptyPath);
@@ -219,12 +217,11 @@ impl SegmentPath {
             // crate-root spelling. A `Crate` deeper in the path is an ordinary
             // namespace called `Crate`, and normalizing it would silently merge
             // two distinct symbols.
-            let normalized =
-                if index == 0 && (raw == CRATE_ROOT || raw == CRATE_ROOT_CLEAN) {
-                    CRATE_ROOT
-                } else {
-                    raw
-                };
+            let normalized = if index == 0 && (raw == CRATE_ROOT || raw == CRATE_ROOT_CLEAN) {
+                CRATE_ROOT
+            } else {
+                raw
+            };
             segments.push(Segment::new(normalized)?);
         }
         Self::from_segments(segments)
@@ -1654,10 +1651,9 @@ impl KernelStatus {
                     }
                 }
             }
-            _ => Certification {
-                tier: CertificationTier::NotKernelChecked,
-                assumptions: Vec::new(),
-            },
+            _ => {
+                Certification { tier: CertificationTier::NotKernelChecked, assumptions: Vec::new() }
+            }
         }
     }
 
@@ -1865,12 +1861,8 @@ impl Certification {
                  construction; (3) cite it from a PROOF context only"
             ),
             CertificationTier::AssumptionBearing => {
-                let listed = self
-                    .assumptions
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let listed =
+                    self.assumptions.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
                 format!(
                     "`{symbol}` is kernel-checked but ASSUMPTION-BEARING: its \
                      proof rests on {count} assumption(s): {listed}. It is \
@@ -2735,7 +2727,10 @@ impl SymbolGraph {
         // Unreachable for a 3-high chain; if the lattice ever grows, this is
         // the fail-closed exit rather than a silently truncated iteration.
         CapabilityClosure {
-            effective: effective.into_keys().map(|id| (id, EffectiveCapability::Unrecorded)).collect(),
+            effective: effective
+                .into_keys()
+                .map(|id| (id, EffectiveCapability::Unrecorded))
+                .collect(),
             witness: BTreeMap::new(),
         }
     }
@@ -2949,10 +2944,7 @@ mod tests {
     fn a_segment_may_not_smuggle_a_separator() {
         assert_eq!(
             Segment::new("m::f"),
-            Err(PathError::SeparatorInSegment {
-                segment: "m::f".to_string(),
-                offender: ':'
-            })
+            Err(PathError::SeparatorInSegment { segment: "m::f".to_string(), offender: ':' })
         );
         assert!(matches!(
             Segment::new("m.f"),
@@ -3046,8 +3038,10 @@ mod tests {
     /// reference across islands fails. Here there is no order to depend on.
     #[test]
     fn declaration_order_does_not_change_the_graph() {
-        let later = SymbolHeader::new(rust_path("crate::a::Later::step"), Sort::Term, Producer::Clean);
-        let uses = SymbolHeader::new(rust_path("crate::b::uses_later"), Sort::Prop, Producer::Clean);
+        let later =
+            SymbolHeader::new(rust_path("crate::a::Later::step"), Sort::Term, Producer::Clean);
+        let uses =
+            SymbolHeader::new(rust_path("crate::b::uses_later"), Sort::Prop, Producer::Clean);
 
         let mut forward = SymbolGraph::new();
         forward.declare(uses.clone()).unwrap();
@@ -3167,10 +3161,7 @@ mod tests {
         assert_eq!(header.status().certification().tier(), CertificationTier::NotKernelChecked);
         // A total carrier is NOT enough: CALL also needs Certified, which a
         // reflection can never reach.
-        assert!(matches!(
-            header.grant_call(),
-            Err(CapabilityRefused::NotCertified { .. })
-        ));
+        assert!(matches!(header.grant_call(), Err(CapabilityRefused::NotCertified { .. })));
         // `Reflected` carries no closure at all, and that is `unrecorded`,
         // never `empty` — the fail-closed side.
         assert!(!KernelStatus::Reflected.closure().is_recorded());
@@ -3202,8 +3193,7 @@ mod tests {
     #[test]
     fn a_transitive_assumption_survives_the_merge() {
         let own = AxiomClosure::audited([]);
-        let dependency =
-            AxiomClosure::audited([Assumption::trust_marker("sorryAx").unwrap()]);
+        let dependency = AxiomClosure::audited([Assumption::trust_marker("sorryAx").unwrap()]);
         let merged = own.merge(&dependency);
 
         assert!(!merged.is_audited_empty());
@@ -3794,10 +3784,7 @@ mod tests {
         let downgraded = header.with_carrier(UnwitnessedCarrier::Declared);
         assert_eq!(downgraded.carrier(), CarrierEvidence::Declared);
         assert!(downgraded.carrier_witness().is_none());
-        assert!(matches!(
-            downgraded.grant_call(),
-            Err(CapabilityRefused::NoTotalCarrier { .. })
-        ));
+        assert!(matches!(downgraded.grant_call(), Err(CapabilityRefused::NoTotalCarrier { .. })));
     }
 
     /// The positive control, so the four refusals above are not just "grant_call
@@ -3824,12 +3811,8 @@ mod tests {
         let mut graph = SymbolGraph::new();
         let clean_path = rust_path("crate::m::good");
         let debt_path = rust_path("crate::m::shaky");
-        graph
-            .declare(SymbolHeader::new(clean_path.clone(), Sort::Prop, Producer::Clean))
-            .unwrap();
-        graph
-            .declare(SymbolHeader::new(debt_path.clone(), Sort::Prop, Producer::Clean))
-            .unwrap();
+        graph.declare(SymbolHeader::new(clean_path.clone(), Sort::Prop, Producer::Clean)).unwrap();
+        graph.declare(SymbolHeader::new(debt_path.clone(), Sort::Prop, Producer::Clean)).unwrap();
 
         graph
             .record_status(&SymbolId::new(clean_path, Namespace::Proof), certified_status())

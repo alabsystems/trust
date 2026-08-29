@@ -308,11 +308,11 @@ pub fn n02_nested_outer_out_of_order(x: u32, y: u32, k: u32) -> Out2 {
 }
 #[inline(never)]
 pub fn n03_nested_inner_out_of_order(x: u32, y: u32, k: u32) -> Out2 {
-    Out2 { i: In2 { y: y, x: x }, k }
+    Out2 { i: In2 { y, x }, k }
 }
 #[inline(never)]
 pub fn n04_nested_both_out_of_order(x: u32, y: u32, k: u32) -> Out2 {
-    Out2 { k, i: In2 { y: y, x: x } }
+    Out2 { k, i: In2 { y, x } }
 }
 #[inline(never)]
 pub fn n05_double_nested_in_order(x: u32, y: u32, k: u32, m: u32) -> Out3 {
@@ -320,7 +320,7 @@ pub fn n05_double_nested_in_order(x: u32, y: u32, k: u32, m: u32) -> Out3 {
 }
 #[inline(never)]
 pub fn n06_double_nested_out_of_order(x: u32, y: u32, k: u32, m: u32) -> Out3 {
-    Out3 { m, o: Out2 { k, i: In2 { y: y, x: x } } }
+    Out3 { m, o: Out2 { k, i: In2 { y, x } } }
 }
 #[inline(never)]
 pub fn n07_nested_with_computed(x: u32, y: u32, k: u32) -> Out2 {

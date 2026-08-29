@@ -1,0 +1,8 @@
+error: expected a predicate expression after the contract clause keyword
+  --> $DIR/trust-spec-decreases-desugars-to-native-clause.rs:97:33
+   |
+LL | fn empty_measure(n: u32) -> u32 {
+   |                                 ^
+
+error: aborting due to 1 previous error
+

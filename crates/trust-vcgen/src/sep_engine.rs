@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/sep_engine.rs: Minimal separation logic provenance engine
 //
 // Combines the symbolic heap (separation_logic.rs) with provenance tracking
@@ -553,11 +554,14 @@ impl SepEngine {
             // `has_unsafe_patterns` fires, and (in the 810baa6c4c revert's
             // measurement) a body whose only unsafe surface IS this statement
             // tripped nothing — so the extractor flip verified an out-of-bounds
-            // copy silently. `has_unsafe_patterns` (and the outer
-            // `has_intrinsic_unsafe_surface` gate in generate/entry.rs) now match
-            // this statement directly; the unit tests below drive the PRODUCTION
-            // `check_sep_unsafe` entry, gates included, so a regression in either
-            // gate fails them, not only a regression in this arm.
+            // copy silently. `has_unsafe_patterns` matches this statement
+            // directly; the unit tests below drive the PRODUCTION
+            // `check_sep_unsafe` entry, gates included, so a regression in the
+            // gate fails them, not only a regression in this arm. (Before the
+            // 2026-08-28 split, `generate/entry.rs` ALSO required
+            // `has_intrinsic_unsafe_surface` — which matches this statement too,
+            // so this arm's reachability is unchanged by the split; the engine
+            // now simply admits on its own predicate.)
             //
             // The callee string MUST contain "nonoverlapping" — that substring is
             // what gates the overlap obligation inside `interpret_ptr_copy`.
@@ -580,6 +584,9 @@ impl SepEngine {
             // Pattern 3: Allocation via alloc::alloc, Box::new, Vec::with_capacity, etc.
             Terminator::Call { func: callee, args, dest, span, .. } => {
                 self.interpret_call(callee, args, dest, span);
+            }
+            Terminator::TailCall { func: callee, args, span, .. } => {
+                self.interpret_call(callee, args, &Place::local(0), span);
             }
             // Pattern 4: Deallocation via Drop
             Terminator::Drop { place, span, .. } => {
@@ -1337,20 +1344,19 @@ impl SepEngine {
             // `mycrate::…::box_assume_init_into_vec_unsafe` (bare `contains` matched it)
             // must NOT discharge the `assume_init` obligation — that would falsely prove
             // a read of uninitialized memory as safe. Fail-closed to the unjustified var.
-            let formula =
-                if tag == "assume_init"
-                    && callee_is_std_crate_rooted(&lower)
-                    && lower.contains("box_assume_init_into_vec_unsafe")
-                {
-                    // justified ∧ unjustified ⇒ UNSAT (proved). Sound by the std `vec!`
-                    // contract (full write precedes); references the real obligation var, so
-                    // it is not vacuous (the `Var` atom is opaque to the vacuity gate).
-                    Formula::And(vec![Formula::Not(Box::new(unjustified.clone())), unjustified])
-                } else {
-                    // Fail-closed: an unconstrained predicate the solver cannot prove
-                    // false, so the obligation stays caught until justified.
-                    unjustified
-                };
+            let formula = if tag == "assume_init"
+                && callee_is_std_crate_rooted(&lower)
+                && lower.contains("box_assume_init_into_vec_unsafe")
+            {
+                // justified ∧ unjustified ⇒ UNSAT (proved). Sound by the std `vec!`
+                // contract (full write precedes); references the real obligation var, so
+                // it is not vacuous (the `Var` atom is opaque to the vacuity gate).
+                Formula::And(vec![Formula::Not(Box::new(unjustified.clone())), unjustified])
+            } else {
+                // Fail-closed: an unconstrained predicate the solver cannot prove
+                // false, so the obligation stays caught until justified.
+                unjustified
+            };
             self.vcs.push(VerificationCondition {
                 kind: VcKind::Assertion {
                     message: format!("[unsafe:sep:{tag}] {condition} in {}", self.func_name),
@@ -1406,11 +1412,33 @@ impl SepEngine {
             // obligation that the index is in bounds. Fail-closed by default; a
             // guard `if i < len { ... }` discharges it. Closes an unsafe-op
             // coverage gap — previously this UB-class op produced no obligation.
+            //
+            // The kind is `UncheckedIndexBounds`, NOT `IndexOutOfBounds`. That
+            // is load-bearing, not cosmetic: `IndexOutOfBounds` answers
+            // `has_runtime_fallback` unconditionally `true`, which is correct for
+            // the safe `xs[i]` it names (`panic_bounds_check` survives every
+            // profile) and FALSE here — MEASURED on stage2, the release
+            // `SliceIndex::get_unchecked` body is a bare `getelementptr` with no
+            // guard, and the `assert_unsafe_precondition!` that appears under
+            // `-Zub-checks=yes` is the only one there ever is. This row is also
+            // the SOLE obligation on the block: `block_is_bounds_complete_
+            // unchecked_index` (unsafe_verify/detection.rs) suppresses the
+            // always-refuting `[unsafe] missing SAFETY comment` lint here
+            // precisely because a real, discharge-able obligation is emitted, so
+            // a fallback claim on it left the unchecked index entirely unwatched.
+            // The suppression keys on the block's own terminator identity, not on
+            // this VcKind, so it is unaffected by the split.
             if let (Some(recv), Some(idx_op)) = (args.first(), args.get(1)) {
                 let len = self.operand_container_len(recv);
                 let index = self.operand_named_formula(idx_op);
                 self.vcs.push(VerificationCondition {
-                    kind: VcKind::IndexOutOfBounds,
+                    kind: VcKind::UncheckedIndexBounds {
+                        callee: callee.to_string(),
+                        detail: format!(
+                            "unchecked index must be < the container length in {}",
+                            self.func_name
+                        ),
+                    },
                     function: self.func_name.clone().into(),
                     location: span.clone(),
                     // Violation (prove UNSAT): index past the container length.
@@ -2566,6 +2594,7 @@ fn terminator_successors(term: &Terminator) -> Option<Vec<usize>> {
         Terminator::Drop { target, .. } => vec![target.0],
         Terminator::Opaque { targets, .. } => targets.iter().map(|b| b.0).collect(),
         Terminator::Call { target: None, .. }
+        | Terminator::TailCall { .. }
         | Terminator::Return
         | Terminator::Unreachable
         | Terminator::Resume => Vec::new(),
@@ -2668,6 +2697,15 @@ pub(crate) fn check_sep_unsafe_blocked(
         }
     }
 
+    // A stdlib source span means "trusted dependency" only when stdlib is
+    // actually outside the compilation subject. When `core`/`alloc`/`std`
+    // itself is the local crate being verified, dropping these rows would make
+    // the subject vacuous. The compiler supplies this owner-bound bit through
+    // `VcgenContext`; callers without crate-ownership information retain the
+    // historical dependency suppression.
+    let verify_stdlib_subject_memory_safety =
+        crate::verify_stdlib_subject_memory_safety_for(&func.def_path);
+
     engine
         .into_vcs()
         .into_iter()
@@ -2679,10 +2717,11 @@ pub(crate) fn check_sep_unsafe_blocked(
         // unsafe op is std-internal — e.g. the `vec!` macro's inlined
         // `RawVec`/`Box::new_uninit`/`assume_init`, whose span is
         // `alloc/src/macros.rs` even though the macro was expanded into a user
-        // function's MIR. Std is already the trusted TCB the verifier hard-skips
-        // for `core`/`alloc`/`std` ("all proofs are conditional on its
-        // correctness", `trust_proof_cert`), so charging its macro-internal
-        // unsafe to the user is inconsistent. Discharge (drop) it here.
+        // function's MIR. Std is a trusted dependency of the user subject, so
+        // charging its macro-internal unsafe to the user is inconsistent.
+        // Discharge (drop) it here only in that dependency case. A stdlib
+        // compilation subject retains the row and must verify its own unsafe
+        // operation.
         //
         // SOUNDNESS: gated STRICTLY on the std-span check ([`is_trusted_std_span`],
         // fail-closed) — never on obligation kind. A user-written `unsafe` block
@@ -2690,7 +2729,7 @@ pub(crate) fn check_sep_unsafe_blocked(
         // obligation is preserved untouched. Only unsafe-operation VCs pass
         // through this driver, so slice-bounds / arithmetic / absent-callee
         // obligations (emitted elsewhere) are unaffected.
-        .filter(|(vc, _)| !is_trusted_std_span(&vc.location))
+        .filter(|(vc, _)| verify_stdlib_subject_memory_safety || !is_trusted_std_span(&vc.location))
         .collect()
 }
 
@@ -2882,6 +2921,14 @@ fn metadata_only_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
                 }
                 place_index_reads(dest, &mut reads);
             }
+            Terminator::TailCall { args, .. } => {
+                for op in args {
+                    operand_reads(op, &mut reads);
+                }
+                if candidates.contains(&0) {
+                    disqualified.insert(0);
+                }
+            }
             Terminator::SwitchInt { discr, .. } => operand_reads(discr, &mut reads),
             Terminator::Assert { cond, .. } => operand_reads(cond, &mut reads),
             Terminator::Drop { place, .. } => {
@@ -2960,6 +3007,7 @@ fn terminator_mentions_any(term: &Terminator, set: &FxHashSet<usize>) -> bool {
         |op: &Operand| matches!(op, Operand::Copy(p) | Operand::Move(p) if place_mentions(p));
     match term {
         Terminator::Call { args, dest, .. } => args.iter().any(op_mentions) || place_mentions(dest),
+        Terminator::TailCall { args, .. } => set.contains(&0) || args.iter().any(op_mentions),
         Terminator::SwitchInt { discr, .. } => op_mentions(discr),
         Terminator::Assert { cond, .. } => op_mentions(cond),
         Terminator::Drop { place, .. } => place_mentions(place),
@@ -3003,8 +3051,10 @@ fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usiz
 
     for (bidx, block) in func.body.blocks.iter().enumerate() {
         // Only a block ending in a call can consume the pointer.
-        let Terminator::Call { args: call_args, dest: call_dest, .. } = &block.terminator else {
-            continue;
+        let (call_args, call_dest) = match &block.terminator {
+            Terminator::Call { args, dest, .. } => (args, dest.clone()),
+            Terminator::TailCall { args, .. } => (args, Place::local(0)),
+            _ => continue,
         };
 
         'candidates: for (sidx, stmt) in block.stmts.iter().enumerate() {
@@ -3171,7 +3221,29 @@ fn call_arg_confined_addr_of_locals(func: &VerifiableFunction) -> FxHashSet<usiz
 }
 
 /// Check if a function contains patterns that warrant sep-logic analysis.
-fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
+///
+/// This is the separation engine's OWN admission predicate, and
+/// [`check_sep_unsafe_blocked`] returns empty whenever it is false. It is
+/// `pub(crate)` so `generate::entry` can gate the engine's (expensive) path-guard
+/// setup on the SAME predicate the engine itself uses, instead of on
+/// `semantic_guard::has_intrinsic_unsafe_surface` — a DIFFERENT predicate that
+/// gates the always-`Bool(true)` missing-SAFETY-comment lint. Neither predicate
+/// is a superset of the other:
+///
+///   * only THIS one admits the allocator / dealloc / realloc / `ptr::copy` /
+///     `from_raw_parts` / `mem::transmute` / unchecked-index / `unwrap_unchecked`
+///     CALLEE family (a safe `Box::new` is `is_alloc_call`);
+///   * only `has_intrinsic_unsafe_surface` admits a raw-pointer LOCAL that is
+///     never dereferenced, an `Rvalue::Ref` over a raw deref, and an
+///     `is_unsafe_sig` / `is_unsafe_fn_call` callee.
+///
+/// Gating the engine on the other one therefore made the sep row set
+/// BODY-scoped rather than site-scoped: a safe `Box::new` minted its
+/// `[unsafe:sep:alloc]` rows only when something UNRELATED in the same body
+/// (e.g. an unused `*const i64` parameter that is only `is_null()`-tested)
+/// happened to open the lint's gate. See
+/// `generate::safe_intrinsic_lint_tests`.
+pub(crate) fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             // The `copy_nonoverlapping` STATEMENT is itself the unsafe pattern
@@ -3203,24 +3275,26 @@ fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
             }
         }
         // Check for unsafe calls
-        if let Terminator::Call { func: callee, .. } = &block.terminator {
-            let lower = callee.to_lowercase();
-            if is_alloc_call(&lower)
-                || is_dealloc_call(&lower)
-                || is_realloc_call(&lower)
-                || is_external_map_call(&lower)
-                || is_ptr_offset_call(&lower)
-                || lower.contains("ptr::copy")
-                || lower.contains("from_raw_parts")
-                || lower.contains("mem::transmute")
-                || is_unchecked_index_call(&lower)
-                || is_raw_read_write_call(&lower)
-                || unsafe_assertion_op(&lower).is_some()
-                || is_unsafe_arith_op(&lower)
-                || is_unwrap_unchecked_call(&lower)
-            {
-                return true;
-            }
+        let callee = match &block.terminator {
+            Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => func,
+            _ => continue,
+        };
+        let lower = callee.to_lowercase();
+        if is_alloc_call(&lower)
+            || is_dealloc_call(&lower)
+            || is_realloc_call(&lower)
+            || is_external_map_call(&lower)
+            || is_ptr_offset_call(&lower)
+            || lower.contains("ptr::copy")
+            || lower.contains("from_raw_parts")
+            || lower.contains("mem::transmute")
+            || is_unchecked_index_call(&lower)
+            || is_raw_read_write_call(&lower)
+            || unsafe_assertion_op(&lower).is_some()
+            || is_unsafe_arith_op(&lower)
+            || is_unwrap_unchecked_call(&lower)
+        {
+            return true;
         }
     }
     false
@@ -3228,12 +3302,12 @@ fn has_unsafe_patterns(func: &VerifiableFunction) -> bool {
 
 /// True when an unsafe operation's OWN source span resolves to the sysroot
 /// standard library — the `core`/`alloc`/`std` (and the rest of the `library/`)
-/// tree that the verifier already treats as trusted TCB and hard-skips (see
-/// `trust_proof_cert`'s std hard-skip: "all proofs are conditional on its
-/// correctness"). Such an unsafe op is std-internal — e.g. the `vec!` macro's
-/// inlined `RawVec` / `Box::new_uninit` / `assume_init`, whose span is
-/// `alloc/src/macros.rs` even after the macro is expanded into a user function's
-/// MIR — NOT user unsafe. So it must not be charged as a user-facing obligation.
+/// tree. When stdlib is a dependency, such an unsafe op is std-internal — e.g.
+/// the `vec!` macro's inlined `RawVec` / `Box::new_uninit` / `assume_init`, whose
+/// span is `alloc/src/macros.rs` even after expansion into user MIR — and must
+/// not be charged to the user. When stdlib itself is the verification subject,
+/// [`check_sep_unsafe_blocked`] explicitly retains the behavioral rows; this
+/// predicate identifies span provenance and does not decide ownership alone.
 ///
 /// SOUNDNESS / fail-closed: returns `true` ONLY for a span we can positively
 /// identify as sysroot std. An empty file, binary provenance, or ANY first-party
@@ -3266,23 +3340,10 @@ fn is_trusted_std_file(file: &str) -> bool {
     // Normalize separators so path-segment matching is platform-independent.
     let norm = file.replace('\\', "/");
 
-    // The sysroot crates whose sources this gate may trust. A crate whose name
-    // is not on this list is somebody else's code, wherever it happens to sit.
-    const STD_CRATES: [&str; 9] = [
-        "core",
-        "alloc",
-        "std",
-        "proc_macro",
-        "test",
-        "panic_abort",
-        "panic_unwind",
-        "std_detect",
-        "unwind",
-    ];
     let is_std_crate_root = |rest: &str| {
-        STD_CRATES
-            .iter()
-            .any(|krate| rest.strip_prefix(krate).is_some_and(|tail| tail.starts_with("/src/")))
+        rest.split_once('/').is_some_and(|(krate, tail)| {
+            crate::is_stdlib_crate_name(krate) && tail.starts_with("src/")
+        })
     };
 
     // (1) The sysroot standard-library source tree: a `library/` segment
@@ -3911,10 +3972,10 @@ fn operand_to_formula_simple(op: &Operand) -> Formula {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, ProofLevel, Rvalue,
-        SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+        RuntimeCheckEnv, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody,
+        VerifiableFunction, VerificationCondition, VerificationResult,
     };
 
     use super::*;
@@ -3938,7 +3999,13 @@ mod tests {
             name: name.to_string(),
             def_path: format!("test::{name}"),
             span: empty_span(),
-            body: VerifiableBody { return_ty: Ty::Unit, locals, arg_count, blocks, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                return_ty: Ty::Unit,
+                locals,
+                arg_count,
+                blocks,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -4180,6 +4247,7 @@ mod tests {
                         atomic: None,
                         is_foreign: true,
                         is_unsafe_sig: true,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: b1_stmts, terminator: Terminator::Return },
@@ -4243,6 +4311,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::alloc::alloc".to_string(),
                         args: vec![],
@@ -4290,6 +4359,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::alloc::alloc".to_string(),
                         args: vec![],
@@ -4351,6 +4421,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::copy_nonoverlapping".to_string(),
                         args: vec![],
@@ -4394,6 +4465,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::copy_nonoverlapping".to_string(),
                         args: vec![],
@@ -4503,10 +4575,8 @@ mod tests {
     #[test]
     fn copy_statement_oob_binds_concrete_allocation_sizes() {
         let arr = || Ty::Array { elem: Box::new(Ty::u8()), len: 8 };
-        let slice_ref = |mutable| Ty::Ref {
-            mutable,
-            inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
-        };
+        let slice_ref =
+            |mutable| Ty::Ref { mutable, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
         let arr_ref = |mutable| Ty::Ref { mutable, inner: Box::new(arr()) };
         let raw = |mutable| Ty::RawPtr { mutable, pointee: Box::new(Ty::u8()) };
         let func = make_func(
@@ -4541,6 +4611,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::as_ptr".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -4567,6 +4638,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::as_mut_ptr".to_string(),
                         args: vec![Operand::Move(Place::local(7))],
@@ -4658,6 +4730,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "aterm_scrollback::mmap::MmapMut::map_mut".to_string(),
                         args: vec![],
@@ -4719,6 +4792,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "my_arena::Slot::map_mut".to_string(),
                         args: vec![],
@@ -4758,6 +4832,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
@@ -4836,6 +4911,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::slice::from_raw_parts".to_string(),
                         args: vec![],
@@ -4886,6 +4962,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![],
@@ -4902,6 +4979,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -4990,6 +5068,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::copy_nonoverlapping".to_string(),
                         // (src, dst, count)
@@ -5079,6 +5158,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::const_ptr::<impl *const u8>::add".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(4))],
@@ -5095,6 +5175,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(5))],
@@ -5200,6 +5281,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::alloc::layout::Layout::from_size_align_unchecked".to_string(),
                         args: vec![
@@ -5218,6 +5300,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5246,6 +5329,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(2)), Operand::Copy(Place::local(3))],
@@ -5318,6 +5402,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::alloc::layout::Layout::from_size_align".to_string(),
                         args: vec![
@@ -5337,6 +5422,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::result::Result::<T, E>::unwrap".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -5353,6 +5439,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "alloc::alloc::alloc".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5369,6 +5456,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -5464,6 +5552,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::mut_ptr::<impl *mut u8>::add".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(4))],
@@ -5480,6 +5569,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::copy_nonoverlapping".to_string(),
                         args: vec![
@@ -5559,6 +5649,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(3))],
@@ -5682,6 +5773,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::as_ptr".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5705,6 +5797,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(2))],
@@ -5791,7 +5884,12 @@ mod tests {
                     Statement::Assign {
                         place: Place::local(0),
                         rvalue: Rvalue::Aggregate(
-                            AggregateKind::Adt { name: "S".into(), variant: 0, active_field: None, args: None },
+                            AggregateKind::Adt {
+                                name: "S".into(),
+                                variant: 0,
+                                active_field: None,
+                                args: None,
+                            },
                             vec![
                                 Operand::Move(Place::local(2)),
                                 Operand::Constant(trust_types::ConstValue::Uint(64, 64)),
@@ -5853,7 +5951,9 @@ mod tests {
                     index: 1,
                     ty: Ty::Ref {
                         mutable: false,
-                        inner: Box::new(Ty::Adt { adt_kind: None, layout: None, 
+                        inner: Box::new(Ty::Adt {
+                            adt_kind: None,
+                            layout: None,
                             variants: Vec::new(),
                             name: "MmapMut".into(),
                             fields: vec![
@@ -5864,7 +5964,9 @@ mod tests {
                                 ("len".into(), Ty::Int { width: 64, signed: false }),
                             ],
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, }),
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                        }),
                     },
                     name: Some("self".into()),
                 },
@@ -5879,7 +5981,9 @@ mod tests {
             "x",
             vec![LocalDecl {
                 index: 0,
-                ty: Ty::Adt { adt_kind: None, layout: None, 
+                ty: Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
                     variants: Vec::new(),
                     name: "X".into(),
                     fields: vec![
@@ -5888,7 +5992,9 @@ mod tests {
                         ("n".into(), Ty::Int { width: 64, signed: false }),
                     ],
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                },
                 name: None,
             }],
             0,
@@ -5929,6 +6035,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: true,
                         func: "libc::mmap".to_string(),
                         args: vec![
@@ -5951,7 +6058,12 @@ mod tests {
                     stmts: vec![Statement::Assign {
                         place: Place::local(0),
                         rvalue: Rvalue::Aggregate(
-                            AggregateKind::Adt { name: "S".into(), variant: 0, active_field: None, args: None },
+                            AggregateKind::Adt {
+                                name: "S".into(),
+                                variant: 0,
+                                active_field: None,
+                                args: None,
+                            },
                             vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(1))],
                         ),
                         span: empty_span(),
@@ -6021,6 +6133,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: true,
                         func: "libc::mmap".to_string(),
                         args: vec![
@@ -6138,6 +6251,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
@@ -6240,6 +6354,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
@@ -6328,6 +6443,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::<impl [u32]>::get_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -6342,8 +6458,8 @@ mod tests {
         );
         let bounds = check_sep_unsafe(&func)
             .into_iter()
-            .find(|vc| matches!(&vc.kind, VcKind::IndexOutOfBounds))
-            .expect("get_unchecked must emit IndexOutOfBounds");
+            .find(|vc| matches!(&vc.kind, VcKind::UncheckedIndexBounds { .. }))
+            .expect("get_unchecked must emit UncheckedIndexBounds");
         assert_eq!(
             bounds.formula,
             Formula::Ge(
@@ -6401,6 +6517,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::ptr::read".to_string(),
                         args: vec![Operand::Copy(Place::local(3))],
@@ -6459,6 +6576,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::str::from_utf8_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -6515,6 +6633,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::ptr::read".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -6547,7 +6666,7 @@ mod tests {
     }
 
     /// Trust (unsafe-op completeness): `slice.get_unchecked(i)` over a `[u8; 8]`
-    /// emits an `IndexOutOfBounds` obligation `i >= 8` — the bounds check the
+    /// emits an `UncheckedIndexBounds` obligation `i >= 8` — the bounds check the
     /// language omits for the unchecked accessor. Fail-closed by default; a
     /// `i < 8` guard discharges it. Previously this UB-class op was uncaught.
     #[test]
@@ -6578,6 +6697,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::<impl [u8]>::get_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -6593,14 +6713,39 @@ mod tests {
         let vcs = check_sep_unsafe(&func);
         let bounds = vcs
             .iter()
-            .find(|vc| matches!(&vc.kind, VcKind::IndexOutOfBounds))
-            .expect("get_unchecked must emit an IndexOutOfBounds obligation");
+            .find(|vc| matches!(&vc.kind, VcKind::UncheckedIndexBounds { .. }))
+            .expect("get_unchecked must emit an UncheckedIndexBounds obligation");
         assert_eq!(
             bounds.formula,
             Formula::Ge(Box::new(Formula::Var("i".into(), Sort::Int)), Box::new(Formula::Int(8)),),
             "obligation must be `i >= 8` (the array length), got {:?}",
             bounds.formula
         );
+        // REGRESSION LOCK for the runtime-fallback fail-open. Reverting the mint
+        // to `VcKind::IndexOutOfBounds` makes BOTH of these fail: that variant
+        // answers `true` unconditionally, so it would report an unproved
+        // unchecked index as runtime-monitored — the claim
+        // `classify_runtime_disposition` turns into `RuntimeChecked` and
+        // `residual_gap_tolerance_denial` turns into an advisory exit code.
+        // MEASURED (stage2, `--emit=llvm-ir`): the release `get_unchecked` body
+        // is a bare `getelementptr` with no guard; the guard appears only under
+        // `-Zub-checks=yes`, and does NOT track `-Coverflow-checks`.
+        assert!(
+            !bounds.kind.has_runtime_fallback_in(RuntimeCheckEnv::new(true, false)),
+            "an unchecked index has NO guard when ub_checks is off, whatever \
+             overflow_checks says: {:?}",
+            bounds.kind
+        );
+        assert!(
+            bounds.kind.has_runtime_fallback_in(RuntimeCheckEnv::new(false, true)),
+            "the `assert_unsafe_precondition!` guard tracks ub_checks, so it must \
+             be reported when ub_checks is on: {:?}",
+            bounds.kind
+        );
+        // The `overflow_checks`-only adapter cannot see `ub_checks` and must
+        // resolve it to "no guard" in BOTH directions.
+        assert!(!bounds.kind.has_runtime_fallback(true));
+        assert!(!bounds.kind.has_runtime_fallback(false));
     }
 
     // ── Unsafe-op completeness: NonZero/NonNull::new_unchecked, char::from_u32_unchecked,
@@ -6624,6 +6769,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args,
@@ -6711,6 +6857,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::num::NonZeroU32::new_unchecked".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -6970,6 +7117,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Copy(Place::local(3))],
@@ -7060,6 +7208,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::mem::transmute".to_string(),
                         args: vec![],
@@ -7233,6 +7382,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::copy_nonoverlapping".to_string(),
                         args: vec![],
@@ -7248,6 +7398,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "memmap2::MmapMut::map_mut".to_string(),
                         args: vec![],
@@ -7392,6 +7543,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::alloc::alloc".to_string(),
                         args: vec![],
@@ -7454,6 +7606,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::alloc::realloc".to_string(),
                         args: vec![],
@@ -7519,6 +7672,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::ptr::const_ptr::<impl *const u8>::offset".to_string(),
                         args: vec![
@@ -7537,6 +7691,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Copy(Place::local(3)), Operand::Copy(Place::local(4))],
@@ -7580,7 +7735,9 @@ mod tests {
     fn verifier_probe_as_slice_backing_assume_is_fail_closed() {
         // No explicit summary context: this probe asserts the UNCERTIFIED
         // (fail-closed) shape.
-        let buf_ty = Ty::Adt { adt_kind: None, layout: None, 
+        let buf_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Buf".into(),
             fields: vec![
@@ -7588,7 +7745,9 @@ mod tests {
                 ("len".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = make_func(
             "as_slice",
             vec![
@@ -7637,6 +7796,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
@@ -7711,7 +7871,9 @@ mod tests {
     /// from_raw_parts(self.ptr, self.len) }` — the use-site fixture shared by the
     /// certified/uncertified consumer tests below.
     fn as_slice_buf_fixture() -> VerifiableFunction {
-        let buf_ty = Ty::Adt { adt_kind: None, layout: None, 
+        let buf_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Buf".into(),
             fields: vec![
@@ -7719,7 +7881,9 @@ mod tests {
                 ("len".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         make_func(
             "as_slice",
             vec![
@@ -7765,6 +7929,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".to_string(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
@@ -7947,12 +8112,31 @@ mod tests {
     //
     // An unsafe operation whose OWN span is in the sysroot standard library
     // (`alloc/src/macros.rs` etc. — the `vec!` macro's inlined RawVec /
-    // Box::new_uninit / assume_init) is std-internal TCB, already trusted, so it
-    // must NOT be charged to the user function it expanded into. A user `unsafe`
-    // op (span in a first-party crate) MUST still be charged (fail-closed).
+    // Box::new_uninit / assume_init) must NOT be charged to a user function it
+    // expanded into. The same row MUST survive when stdlib is the compilation
+    // subject, and user unsafe must always be charged (fail-closed).
 
     fn span_in(file: &str) -> SourceSpan {
         SourceSpan { file: file.to_string(), line_start: 1, col_start: 1, line_end: 1, col_end: 20 }
+    }
+
+    fn compiler_shaped_vcs(
+        func: &VerifiableFunction,
+        context: &crate::VcgenContext,
+    ) -> (Vec<VerificationCondition>, Vec<(VerificationCondition, VerificationResult)>) {
+        crate::generate_vcs_with_discharge_and_summaries_configured_with_context(
+            func,
+            &crate::SummaryDatabase::default(),
+            false,
+            context,
+        )
+    }
+
+    fn is_sep_memory_safety_vc(vc: &VerificationCondition) -> bool {
+        matches!(
+            &vc.kind,
+            VcKind::Assertion { message } if message.contains("[unsafe:sep:")
+        )
     }
 
     /// A minimal function containing exactly one unsafe raw-pointer deref read,
@@ -7962,20 +8146,20 @@ mod tests {
             "deref_read",
             vec![
                 LocalDecl { index: 0, ty: Ty::Unit, name: None },
-                LocalDecl { index: 1, ty: Ty::u32(), name: Some("val".into()) },
                 LocalDecl {
-                    index: 2,
+                    index: 1,
                     ty: Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
                     name: Some("ptr".into()),
                 },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("val".into()) },
             ],
-            0,
+            1,
             vec![BasicBlock {
                 id: BlockId(0),
                 stmts: vec![Statement::Assign {
-                    place: Place::local(1),
+                    place: Place::local(2),
                     rvalue: Rvalue::Use(Operand::Copy(Place {
-                        local: 2,
+                        local: 1,
                         projections: vec![Projection::Deref],
                     })),
                     span: span_in(file),
@@ -8054,11 +8238,12 @@ mod tests {
         }
     }
 
-    /// The legitimate sysroot layouts must keep working — this gate exists so
-    /// std's own `unsafe` is not re-verified, and over-tightening it would flood
-    /// every build with std obligations.
+    /// The legitimate sysroot layouts must keep being recognized. This
+    /// provenance classification suppresses rows only when stdlib is a
+    /// dependency; owner-scoped policy deliberately retains the same rows when
+    /// stdlib is the compilation subject.
     #[test]
-    fn sysroot_std_layouts_remain_trusted() {
+    fn sysroot_std_layouts_remain_recognized() {
         for std_file in [
             "library/core/src/ptr/mod.rs",
             "library/std/src/vec/mod.rs",
@@ -8073,15 +8258,68 @@ mod tests {
     }
 
     #[test]
-    fn test_std_span_unsafe_op_not_charged() {
-        // The exact task shape: the `vec!`-macro unsafe charged with a std span.
-        let func = deref_read_func_with_span("alloc/src/macros.rs");
-        let vcs = check_sep_unsafe(&func);
+    fn dependency_std_span_unsafe_op_not_charged() {
+        // Dependency case: cover both the original `vec!`-macro `alloc` span
+        // and the exact `core` path used by the subject control below. Exercise
+        // the public compiler-shaped generation/discharge entry, not just the
+        // sep helper.
+        for file in ["alloc/src/macros.rs", "library/core/src/ptr/mod.rs"] {
+            let func = deref_read_func_with_span(file);
+            let context = crate::VcgenContext::for_function(func.def_path.clone());
+            let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
+            let solver_sep_vcs =
+                solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
+            let discharged_sep_vcs =
+                discharged.iter().filter(|(vc, _)| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
+            assert!(
+                solver_sep_vcs.is_empty() && discharged_sep_vcs.is_empty(),
+                "dependency `{file}` must emit/check 0 sep obligations; solver={solver_sep_vcs:?}, discharged={discharged_sep_vcs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdlib_subject_sends_its_own_std_span_memory_safety_rows_to_the_solver() {
+        let func = deref_read_func_with_span("library/core/src/ptr/mod.rs");
+        let context = crate::VcgenContext::for_function(func.def_path.clone())
+            .with_stdlib_subject_memory_safety(true);
+        let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
+        let solver_sep_vcs =
+            solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
+        let discharged_sep_vcs =
+            discharged.iter().filter(|(vc, _)| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
+
         assert!(
-            vcs.is_empty(),
-            "unsafe op with a std-library span must be trusted (0 obligations), got {}: {:?}",
-            vcs.len(),
-            vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+            solver_sep_vcs.len() >= 3,
+            "the stdlib subject must send raw-deref VCs to solver checking; got {}: {:?}",
+            solver_sep_vcs.len(),
+            solver_sep_vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            discharged_sep_vcs.is_empty(),
+            "an unconstrained raw pointer's sep rows must not disappear into pre-discharge: {discharged_sep_vcs:?}"
+        );
+        assert!(solver_sep_vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::Assertion { message } if message.contains("null check")
+        )));
+        assert!(solver_sep_vcs.iter().all(|vc| vc.location.file == "library/core/src/ptr/mod.rs"));
+    }
+
+    #[test]
+    fn mismatched_stdlib_subject_context_cannot_unsuppress_another_function() {
+        let func = deref_read_func_with_span("library/core/src/ptr/mod.rs");
+        let context = crate::VcgenContext::for_function("core::different")
+            .with_stdlib_subject_memory_safety(true);
+        let (solver_vcs, discharged) = compiler_shaped_vcs(&func, &context);
+        let solver_sep_vcs =
+            solver_vcs.iter().filter(|vc| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
+        let discharged_sep_vcs =
+            discharged.iter().filter(|(vc, _)| is_sep_memory_safety_vc(vc)).collect::<Vec<_>>();
+
+        assert!(
+            solver_sep_vcs.is_empty() && discharged_sep_vcs.is_empty(),
+            "owner mismatch must retain dependency suppression; solver={solver_sep_vcs:?}, discharged={discharged_sep_vcs:?}"
         );
     }
 

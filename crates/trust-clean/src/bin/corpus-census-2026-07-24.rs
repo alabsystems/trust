@@ -82,6 +82,9 @@ fn accumulate(total: &mut ProveScorecard, one: &ProveScorecard) {
     total.postcondition_obligations += one.postcondition_obligations;
     total.safety_obligations += one.safety_obligations;
     total.safety_discharged += one.safety_discharged;
+    total.unsupported_obligations += one.unsupported_obligations;
+    total.unrefutable_by_construction += one.unrefutable_by_construction;
+    total.contract_suggestible += one.contract_suggestible;
     // Trust: R4 MIGRATION METRIC (2026-07-25). `fully_faithful == via_trustir +
     // mirsem_fallback` is a pinned invariant, and the MirSem teardown's stated exit
     // criterion is `mirsem_fallback == 0` across every measured corpus. TrustIr is the
@@ -127,7 +130,9 @@ fn main() {
     println!("# budget_secs\t{budget_secs}");
     println!("# jobs\t{jobs}");
     println!("# dump_dirs\t{}", dirs.len());
-    println!("dir\ttotal\tinhabited\ttype_grounded_not_inhabited\tnot_grounded\tkernel_rejected\ttotal_obligations\tsafety_obligations\tsafety_discharged\tfully_faithful\tvia_trustir\tmirsem_fallback");
+    println!(
+        "dir\ttotal\tinhabited\ttype_grounded_not_inhabited\tnot_grounded\tkernel_rejected\ttotal_obligations\tsafety_obligations\tsafety_discharged\tunsupported_obligations\tunrefutable_by_construction\tcontract_suggestible\tfully_faithful\tvia_trustir\tmirsem_fallback"
+    );
 
     let next = Arc::new(Mutex::new(0usize));
     let results: Arc<Mutex<Vec<(PathBuf, ProveScorecard)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -168,7 +173,7 @@ fn main() {
     for (dir, sc) in &results {
         let name = dir.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(dir);
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             name.display(),
             sc.total,
             sc.inhabited,
@@ -178,6 +183,9 @@ fn main() {
             sc.total_obligations,
             sc.safety_obligations,
             sc.safety_discharged,
+            sc.unsupported_obligations,
+            sc.unrefutable_by_construction,
+            sc.contract_suggestible,
             sc.fully_faithful,
             sc.fully_faithful_via_trustir,
             sc.fully_faithful_mirsem_fallback,
@@ -186,7 +194,9 @@ fn main() {
     }
 
     let distinct_proven: BTreeSet<&String> = agg.proven.iter().collect();
-    eprintln!("\n=== AGGREGATE (budget {budget_secs}s/fn — a budgeted run UNDERSTATES inhabited) ===");
+    eprintln!(
+        "\n=== AGGREGATE (budget {budget_secs}s/fn — a budgeted run UNDERSTATES inhabited) ==="
+    );
     eprintln!("dump_dirs                    {}", results.len());
     eprintln!("functions (total)            {}", agg.total);
     eprintln!("inhabited (kernel-proven)    {}", agg.inhabited);
@@ -196,21 +206,36 @@ fn main() {
     eprintln!("total_obligations            {}", agg.total_obligations);
     eprintln!("safety_obligations           {}", agg.safety_obligations);
     eprintln!("safety_discharged            {}", agg.safety_discharged);
+    eprintln!(
+        "  of which NON-PROPOSITIONS   {} vacuous (UnsupportedMir etc) — no engine can discharge these",
+        agg.unsupported_obligations
+    );
+    {
+        let contentful = agg.safety_obligations.saturating_sub(agg.unsupported_obligations);
+        if contentful > 0 {
+            eprintln!(
+                "  contentful denominator      {} → {:.1}% discharged over real propositions",
+                contentful,
+                100.0 * agg.safety_discharged as f64 / contentful as f64
+            );
+        }
+    }
     eprintln!("KERNEL_REJECTED              {}  (MUST be 0)", agg.kernel_rejected);
     eprintln!();
     eprintln!("--- R4 MIGRATION (TrustIr is the TARGET IR; MirSem is a compatibility lane) ---");
     eprintln!("fully_faithful               {}", agg.fully_faithful);
     eprintln!("  via_trustir                {}", agg.fully_faithful_via_trustir);
-    eprintln!("  mirsem_fallback            {}  (teardown exit criterion: 0)", agg.fully_faithful_mirsem_fallback);
+    eprintln!(
+        "  mirsem_fallback            {}  (teardown exit criterion: 0)",
+        agg.fully_faithful_mirsem_fallback
+    );
     // Trust (#54): NAME them. A bare count cannot be worked, and these rows are
     // composition-dependent -- proving a body alone does not reproduce the
     // fallback, so outside-in attribution finds nothing.
     for row in &agg.mirsem_fallback_rows {
         eprintln!("    fallback row: {row}");
     }
-    if agg.fully_faithful
-        != agg.fully_faithful_via_trustir + agg.fully_faithful_mirsem_fallback
-    {
+    if agg.fully_faithful != agg.fully_faithful_via_trustir + agg.fully_faithful_mirsem_fallback {
         eprintln!(
             "INVARIANT VIOLATED: fully_faithful != via_trustir + mirsem_fallback \
              (this equality is pinned by the switchover test)"

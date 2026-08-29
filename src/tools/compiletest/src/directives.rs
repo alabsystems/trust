@@ -462,9 +462,7 @@ fn has_explicit_trust_verification_config(flags: &[String]) -> bool {
     // it is not an explicit statement of mode either.
     let is_explicit = |flag: &str| matches!(flag, "trust-verify=on" | "trust-verify=off");
     flags.iter().any(|flag| flag.strip_prefix("-Z").is_some_and(is_explicit))
-        || flags
-            .windows(2)
-            .any(|pair| pair[0] == "-Z" && is_explicit(pair[1].as_str()))
+        || flags.windows(2).any(|pair| pair[0] == "-Z" && is_explicit(pair[1].as_str()))
 }
 
 fn validate_trust_verification_opt_in(

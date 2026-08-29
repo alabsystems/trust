@@ -4,9 +4,25 @@
 # Callers may set TRUST_TOOLCHAIN_PYTHON3 to a specific Python 3 interpreter.
 
 # Keep this inventory coherent with bootstrap's stage0 contract and
-# targo-trust's linked/release surface. Optional canonical trust-miri and
-# targo-miri are deliberately not forbidden in complete stage2 roots.
-TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_BINS='cargo-trust tcargo tcargo-trust tcargo-fmt rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver targo-clippy trust-clippy trust-clippy-driver rust-analyzer miri cargo-miri rust-gdb rust-gdbgui rust-lldb rust-windbg.cmd'
+# targo-trust's linked/release surface. This list governs COMPLETE roots, so it
+# is bootstrap.py's STAGE0_FORBIDDEN_BINS minus two deliberate carve-outs;
+# scripts/check_toolchain_coherence.py derives exactly that difference and fails
+# if these mirrors drift.
+#   trust-miri, targo-miri  optional canonical Trust tools. A complete stage2
+#                           root may ship them.
+#   rustdoc                 a deliberate same-surface ALIAS of trustdoc since
+#                           76d408e1cd: cargo spawns a binary named `rustdoc`
+#                           for its doctest phase and rustup's proxy refuses a
+#                           linked toolchain without it, so bootstrap installs
+#                           both names at every stage >= 1
+#                           (tool.rs:1676 rustdoc_sysroot_bins) and dist ships
+#                           both. It is admitted exactly the way `rustc` and
+#                           `cargo` are -- as an alias whose byte-identity with
+#                           its canonical Trust tool is enforced separately by
+#                           trust_toolchain_alias_pair_error -- never as a stock
+#                           entrypoint standing on its own. A stage0 SEED still
+#                           forbids the name; that list stays in bootstrap.py.
+TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_BINS='cargo-trust tcargo tcargo-trust tcargo-fmt rustfmt cargo-fmt cargo-clippy clippy-driver targo-clippy trust-clippy trust-clippy-driver rust-analyzer miri cargo-miri rust-gdb rust-gdbgui rust-lldb rust-windbg.cmd'
 TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_LIBEXEC_BINS='rust-analyzer-proc-macro-srv'
 
 trust_toolchain_resolve_path() {

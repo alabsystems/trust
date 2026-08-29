@@ -8,9 +8,5 @@
 // must fully discharge it.
 #[core::contracts::ensures(move |r: &u32| *r == x || *r == 0)]
 pub fn disjunctive_contract(x: u32) -> u32 {
-    if x > 0 {
-        x
-    } else {
-        0
-    }
+    if x > 0 { x } else { 0 }
 }

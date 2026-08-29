@@ -339,6 +339,32 @@ fn umul_overflows_ir_name(w: IrUWidth) -> String {
     format!("Trust.TrustIr.umulOverflowsU{}", w.bits())
 }
 
+/// `Trust.TrustIr.umulOverflowsBvU{W}` — the BITVECTOR-FORM unsigned-mul
+/// machine-overflow predicate, the twin of [`umul_overflows_ir_name`].
+///
+/// This is the predicate the emitter's OWN bitvector core denotes
+/// (`trust_vcgen::generate::overflow_vc::v2_unsigned_bv_overflow_formula`'s
+/// `BinOp::Mul` arm): `a ≠ 0 ∧ bvudiv(bvmul(a,b), a) ≠ b`. It exists so that a
+/// bit-level obligation no longer has to be RESTATED in `Int` arithmetic to be
+/// certifiable — see the module's BV-denotation block for the whole argument.
+fn umul_overflows_bv_ir_name(w: IrUWidth) -> String {
+    format!("Trust.TrustIr.umulOverflowsBvU{}", w.bits())
+}
+
+/// `Trust.TrustIr.bvMulU{W}` — the width-`W` unsigned bitvector MULTIPLY
+/// denotation, `(a · b) mod 2^W`. Named here (this module owns the
+/// `Trust.TrustIr.*` namespace) and emitted by `clean_ground::ground_int_bv`.
+pub(crate) fn bv_mul_ir_name(bits: u32) -> String {
+    format!("Trust.TrustIr.bvMulU{bits}")
+}
+
+/// `Trust.TrustIr.bvUDivU{W}` — the width-`W` unsigned bitvector DIVIDE
+/// denotation, SMT-LIB `bvudiv` including its all-ones-at-zero-divisor
+/// convention. Emitted by `clean_ground::ground_int_bv`.
+pub(crate) fn bv_udiv_ir_name(bits: u32) -> String {
+    format!("Trust.TrustIr.bvUDivU{bits}")
+}
+
 /// `Trust.TrustIr.s{add,sub,mul}OverflowsI{W}` — the signed machine-overflow predicate.
 fn signed_overflows_ir_name(op: IrSignedOp, w: IrSWidth) -> String {
     format!("Trust.TrustIr.s{}OverflowsI{}", op.tag(), w.bits())
@@ -420,6 +446,134 @@ fn register_int1_prop(
     })
     .map_err(|e| format!("add_decl({name}): {e:?}"))?;
     Ok(())
+}
+
+/// Register a 2-argument INT-VALUED function `name : Int → Int → Int := λ a b.
+/// body(a, b)` (idempotent) — the value-level twin of [`register_int2_prop`],
+/// for the bitvector OPERATION denotations (`bvMulU{W}` / `bvUDivU{W}`) the
+/// bitvector-form predicates are built out of. Same de-Bruijn convention
+/// (`a = bvar(1)`, `b = bvar(0)`), same `is_reducible: true` so the kernel
+/// δ-unfolds them during the adequacy def-eq.
+fn register_int2_int(
+    env: &mut Environment,
+    name: &str,
+    body: impl FnOnce(&Expr, &Expr) -> Expr,
+) -> Result<(), String> {
+    let n = Name::from_string(name);
+    if env.get_const(&n).is_some() {
+        return Ok(());
+    }
+    let bd = || BinderData::from(BinderInfo::Default);
+    let ty = Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()));
+    let val =
+        Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), body(&Expr::bvar(1), &Expr::bvar(0))));
+    env.add_decl(Declaration::Definition {
+        name: n,
+        level_params: vec![],
+        type_: ty,
+        value: val,
+        is_reducible: true,
+    })
+    .map_err(|e| format!("add_decl({name}): {e:?}"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// THE BITVECTOR DENOTATION (Trust, 2026-08-21). READ THIS BEFORE TOUCHING IT.
+//
+// A DENOTATION IS A DEFINITION. Everything below tells the kernel what a
+// bitvector TERM MEANS. The adequacy bridge (`live_ground_def_eq_spec_ir`)
+// builds the spec out of the SAME constant names the grounder emits, so def-eq
+// alone can NEVER catch a wrong body here — a `bvMulU8` defined as `mod 2^9`
+// would certify exactly as happily as the right one, and every proof built on it
+// would be a FALSE PROOF the kernel re-checks without complaint. The ONLY thing
+// standing between these four functions and that outcome is
+// `bv_denotation_tests`, which EVALUATES them through the kernel's own reducers
+// and compares against real Rust arithmetic at every one of the 65 536 width-8
+// points. That test is load-bearing, not decoration.
+//
+// THE MODEL. A width-`W` bitvector value is its UNSIGNED reading — an `Int` in
+// `[0, 2^W)`. `Int.mul` is arbitrary-precision and `Int.mod`/`Int.div` are the
+// prelude's `Opaque` T-rounding operations (native reducers, NOT axioms, so the
+// axiom closure stays at exactly 3). For NON-NEGATIVE operands — the only ones
+// in the model — T-rounding and Euclidean rounding coincide, so `Int.mod` is
+// genuine wraparound and `Int.div` is genuine unsigned division.
+//
+// DIVISION BY ZERO — the single most likely place for a wrong denotation to
+// hide, so it is stated explicitly. SMT-LIB defines `bvudiv x 0` as the all-ones
+// vector `2^W − 1`; Lean's `Int.div x 0` is `0`. The two DISAGREE, and the
+// emitter's core divides by the LEFT operand, so the disagreement sits at
+// `l == 0`. `bv_udiv_body` takes the SMT-LIB side (`Int.beq b 0` selects the
+// all-ones branch), because the term it denotes is an SMT-LIB `bvudiv` and a
+// denotation that quietly re-interprets its subject is the whole failure mode.
+// It is then IRRELEVANT to `umulOverflowsBvU{W}`, and that is a theorem about
+// the emitted shape rather than a hope: the emitted core is
+// `And([Not(Eq(l,0)), Not(Eq(bvudiv(bvmul(l,r),l), r))])`, whose FIRST conjunct
+// is exactly `l ≠ 0`, so at `l == 0` the conjunction is false whatever the
+// division says — matching the ground truth that `0 * r` never overflows.
+// `zero_lhs_never_overflows_whatever_the_division_says` pins BOTH halves: the
+// guarded predicate is false at `l = 0` for every `r`, AND the unguarded
+// mismatch term at `l = 0` is TRUE (all-ones ≠ r), i.e. a denotation that lost
+// the guard would over-report overflow — a conservative decline, never a false
+// PROVE. Under the Lean convention the unguarded term would instead be FALSE at
+// `l = r = 0`, which is the direction that CAN hide a real violation; taking the
+// SMT-LIB side keeps even the degenerate case on the safe side of the line.
+//
+// EQUIVALENCE TO THE `Int` PREDICATE holds exactly on the modeled domain
+// `a, b ∈ [0, 2^W)` and is TESTED, not asserted:
+// `bv_and_int_umul_predicates_agree_with_rust_exhaustively_at_width_8` runs all
+// 65 536 width-8 pairs three ways (kernel-evaluated BV predicate, kernel-
+// evaluated `Int` predicate, real Rust `(a as u16) * (b as u16) > 255`). Outside
+// that domain the two genuinely differ — the `Int` reading has no wraparound —
+// which is why the certification arm cross-checks the width three ways before
+// minting anything.
+// ---------------------------------------------------------------------------
+
+/// `bvMulU{W} a b := Int.mod (Int.mul a b) 2^W` — the width-`W` unsigned
+/// bitvector product. For `a, b ∈ [0, 2^W)` the mathematical product is
+/// non-negative, so `Int.mod`'s T-rounding IS wraparound.
+fn bv_mul_body(a_ref: &Expr, b_ref: &Expr, w: IrUWidth) -> Expr {
+    let product = Expr::apps(cst("Int.mul"), [a_ref.clone(), b_ref.clone()]);
+    // `2^W`: `max_value() + 1`, which stays inside `i128` for every modeled width
+    // (`W ≤ 64`).
+    Expr::apps(cst("Int.mod"), [product, int_lit(w.max_value() + 1)])
+}
+
+/// `bvUDivU{W} a b := if b = 0 then 2^W − 1 else Int.div a b` — SMT-LIB
+/// `bvudiv`, all-ones at a zero divisor. The `Bool.rec` shape (motive
+/// `λ _ : Bool. Int`, minors in `(false, true)` order) is BYTE-IDENTICAL to the
+/// one `clean_ground::ground_int` produces for `Formula::Ite`, so the same
+/// kernel reduction path decides it.
+fn bv_udiv_body(a_ref: &Expr, b_ref: &Expr, w: IrUWidth) -> Expr {
+    let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
+    let motive = Expr::lam(BinderData::from(BinderInfo::Default), cst("Bool"), int_ty());
+    let quotient = Expr::apps(cst("Int.div"), [a_ref.clone(), b_ref.clone()]);
+    let all_ones = int_lit(w.max_value());
+    let divisor_is_zero = Expr::apps(cst("Int.beq"), [b_ref.clone(), int_lit(0)]);
+    // `Bool.rec motive <false-arm> <true-arm> <scrutinee>`.
+    Expr::apps(bool_rec, [motive, quotient, all_ones, divisor_is_zero])
+}
+
+/// `umulOverflowsBvU{W} a b := ¬(a = 0) ∧ ¬(bvUDivU{W} (bvMulU{W} a b) a = b)` —
+/// the BITVECTOR-FORM unsigned-multiply overflow predicate, built to be
+/// BYTE-IDENTICAL to `clean_ground::ground_prop_bv`'s output for the emitter's
+/// `v2_unsigned_bv_overflow_formula(.., BinOp::Mul, W)` core. Deliberately the
+/// same construction rather than an "equivalent" one, for the same reason
+/// [`unsigned_mul_out_of_range_body`] mirrors the signed body: a hand-rolled
+/// variant is how the spec and the emitted core drift apart.
+fn umul_overflows_bv_body(a_ref: &Expr, b_ref: &Expr, w: IrUWidth) -> Expr {
+    let eq_int = |x: Expr, y: Expr| {
+        Expr::apps(
+            Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+            [int_ty(), x, y],
+        )
+    };
+    let not = |p: Expr| Expr::app(cst("Not"), p);
+    let lhs_nonzero = not(eq_int(a_ref.clone(), int_lit(0)));
+    let product = Expr::apps(cst(&bv_mul_ir_name(w.bits())), [a_ref.clone(), b_ref.clone()]);
+    let recovered = Expr::apps(cst(&bv_udiv_ir_name(w.bits())), [product, a_ref.clone()]);
+    let mismatch = not(eq_int(recovered, b_ref.clone()));
+    Expr::apps(cst("And"), [lhs_nonzero, mismatch])
 }
 
 /// `@Eq Int x lit` — the equality body shared by `divByZero`/`remByZero` (`lit = 0`)
@@ -507,6 +661,15 @@ fn trustir_safety_env_uncached() -> Result<Environment, String> {
         register_int2_prop(&mut env, &umul_overflows_ir_name(w), |a, b| {
             unsigned_mul_out_of_range_body(a, b, w)
         })?;
+        // Trust (BV denotation, 2026-08-21) — the two bitvector OPERATION
+        // denotations, then the BITVECTOR-FORM twin of the predicate above. The
+        // operations must be registered FIRST: `umul_overflows_bv_body` applies
+        // them by name, and `add_decl` type-checks the value.
+        register_int2_int(&mut env, &bv_mul_ir_name(w.bits()), |a, b| bv_mul_body(a, b, w))?;
+        register_int2_int(&mut env, &bv_udiv_ir_name(w.bits()), |a, b| bv_udiv_body(a, b, w))?;
+        register_int2_prop(&mut env, &umul_overflows_bv_ir_name(w), |a, b| {
+            umul_overflows_bv_body(a, b, w)
+        })?;
     }
     // Kind 4 — SIGNED add/sub/mul overflow (the full out-of-range disjunction).
     for op in IrSignedOp::ALL {
@@ -559,6 +722,13 @@ pub fn pin_trustir_safety_anchor() -> AnchorVerdict {
         names.push(uadd_overflows_ir_name(w));
         names.push(usub_underflows_ir_name(w));
         names.push(umul_overflows_ir_name(w));
+        // Trust (BV denotation, 2026-08-21) — the bitvector operation denotations
+        // and the bitvector-form predicate are audited on the SAME footing: they
+        // are definitions the certificates rest on, so a 4th axiom sneaking in
+        // through `Int.mod`/`Int.div`/`Int.beq`/`Bool.rec` must fail this pin.
+        names.push(bv_mul_ir_name(w.bits()));
+        names.push(bv_udiv_ir_name(w.bits()));
+        names.push(umul_overflows_bv_ir_name(w));
     }
     for op in IrSignedOp::ALL {
         for w in IrSWidth::ALL {
@@ -951,9 +1121,8 @@ fn range_constraint_parts(
 /// As `has_range_sibling`, and the bound's LOWER end is exactly `0` — i.e. the
 /// emitter proved `term ≥ 0` alongside the violation (an UNSIGNED operand range).
 fn has_nonneg_range_sibling(sibs: &[trust_types::Formula], term: &trust_types::Formula) -> bool {
-    sibs.iter().any(|s| {
-        range_constraint_parts(s).is_some_and(|(t, lo)| t == term && is_zero_literal(lo))
-    })
+    sibs.iter()
+        .any(|s| range_constraint_parts(s).is_some_and(|(t, lo)| t == term && is_zero_literal(lo)))
 }
 
 /// The base place name of a versioned VC variable — `_6#s3_0` names the same place as
@@ -983,8 +1152,7 @@ fn formula_agrees_modulo_versions(a: &trust_types::Formula, b: &trust_types::For
             sx == sy && x.as_str().split('#').next() == y.as_str().split('#').next()
         }
         (F::And(u), F::And(v)) | (F::Or(u), F::Or(v)) => {
-            u.len() == v.len()
-                && u.iter().zip(v).all(|(x, y)| formula_agrees_modulo_versions(x, y))
+            u.len() == v.len() && u.iter().zip(v).all(|(x, y)| formula_agrees_modulo_versions(x, y))
         }
         (F::Not(x), F::Not(y)) | (F::Neg(x), F::Neg(y)) => formula_agrees_modulo_versions(x, y),
         (F::Implies(x1, x2), F::Implies(y1, y2))
@@ -1337,15 +1505,44 @@ fn live_ground_def_eq_spec_ir(
     spec: &Expr,
     binder_count: usize,
 ) -> RefinementVerdict {
+    live_ground_def_eq_spec_ir_in(core, params, spec, binder_count, GroundFragment::Int)
+}
+
+/// Which live-grounder entry point [`live_ground_def_eq_spec_ir_in`] certifies through.
+/// Both are the LIVE grounder — `Bitvector` is `clean_ground::ground_prop_bv`, which
+/// DELEGATES every non-BV shape to `ground_prop`/`ground_int`, so an Int-only core
+/// grounds byte-identically either way (pinned by
+/// `the_bv_grounder_agrees_with_the_int_grounder_on_an_int_only_core`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroundFragment {
+    Int,
+    Bitvector,
+}
+
+fn live_ground_def_eq_spec_ir_in(
+    core: &trust_types::Formula,
+    params: &HashMap<String, Expr>,
+    spec: &Expr,
+    binder_count: usize,
+    fragment: GroundFragment,
+) -> RefinementVerdict {
     let mut env = match trustir_safety_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
     };
-    let Some(grounded) = crate::clean_ground::ground_prop(core, params) else {
+    let grounded_opt = match fragment {
+        GroundFragment::Int => crate::clean_ground::ground_prop(core, params),
+        GroundFragment::Bitvector => crate::clean_ground::ground_prop_bv(core, params),
+    };
+    let Some(grounded) = grounded_opt else {
         // The live grounder declined this core ⇒ no cert (fail closed).
-        return RefinementVerdict::KernelRejected(
-            "the live grounder (clean_ground::ground_prop) declined the violation core".to_string(),
-        );
+        let entry = match fragment {
+            GroundFragment::Int => "ground_prop",
+            GroundFragment::Bitvector => "ground_prop_bv",
+        };
+        return RefinementVerdict::KernelRejected(format!(
+            "the live grounder (clean_ground::{entry}) declined the violation core"
+        ));
     };
     let bd = || BinderData::from(BinderInfo::Default);
     let eq = Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]);
@@ -1414,6 +1611,194 @@ fn overflow_family_live_def_eq_ir(
     }
     let spec = spec_of(&grounded_ops);
     live_ground_def_eq_spec_ir(core, &params, &spec, distinct.len())
+}
+
+// ---------------------------------------------------------------------------
+// THE BITVECTOR UMUL CORE — location, cross-checks, certification
+// (Trust, 2026-08-21).
+//
+// WHAT THE EMITTER BUILDS. For an UNSIGNED `var * var` multiply,
+// `trust_vcgen::generate::overflow_vc::v2_build_overflow_vc_for_operands` emits
+//
+//   formula = And([ <guard/rem/yield BV bounds..>, <BV CORE>, <Int out-of-range core> ])
+//   record  = { body: <Int out-of-range core>,
+//               wrappers: [ConjoinFactsLast { facts: [<bounds..>, <BV CORE>] }],
+//               width: Some(W) }
+//
+// so the BV core sits at the END of the record's first (and only) fact list — the
+// SAME emitter-anchored POSITION argument every other core in this module rests
+// on, not a scan. `v2_unsigned_bv_overflow_formula`'s `BinOp::Mul` arm makes its
+// shape exact:
+//
+//   And([ Not(Eq(l, BitVec{0,W})),
+//         Not(Eq(BvUDiv(BvMul(l, r, W), l, W), r)) ])
+//
+// THE FRESH-VARIABLE PROBLEM, AND WHAT IS AND IS NOT SOLVED HERE. `l`/`r` are NOT
+// the MIR operands: `v2_bv_operand_term` mints FRESH `__trust_ovf_bv_{role}_{base}`
+// variables at `Sort::BitVec(W)`, deliberately, because reusing the operand names
+// would put one symbol at two sorts in one formula. The fresh vars are
+// UNCONSTRAINED — they do not equal the operands — so a certificate claiming the
+// machine predicate holds OF `a` AND `b` would be false, and this arm does not
+// make one. What it certifies is the honest statement: this VC's BV conjunct IS
+// the width-`W` unsigned-multiply-overflow predicate, over the emitter's fresh
+// operand IMAGES. The link back to the real operands is a NAME-DERIVATION
+// cross-check (`bv_fresh_operand_base`) — the fresh name is literally
+// `format!("__trust_ovf_bv_{role}_{base}")` of the Int core's own operand name, so
+// the relation is CHECKABLE rather than assumed, and a record whose BV operands do
+// not derive from its Int operands DECLINES.
+//
+// Closing the gap properly — making the BV conjunct speak about `a`/`b`
+// themselves — needs the EMITTER to stop freshening, i.e. to relate the two by an
+// explicit `Eq(BvToInt(l, W, false), a)` link. That is a trust-vcgen change with a
+// solver consequence — the query stops being two DISJOINT components, which is the
+// property `trust_router`'s disjoint-component refutation lane depends on — so it
+// is deliberately NOT bundled here. See
+// `reports/2026-08-21-umul-record-do-not-retract.md`, whose "route A" this closes
+// the trust-clean half of.
+//
+// RESIDUALS, STATED.
+//   * The OTHER BV facts (the dominating-guard / remainder / yield bounds
+//     `v2_bv_*_constraints` render) are authenticated as PRESENT by
+//     `reconstruct(record) == formula`, but they are not denoted by this arm. They
+//     are drop-only bounds, so leaving them undenoted cannot make a certificate say
+//     more than it should — but it is a gap, and the next increment is a
+//     `BvULt`/`BvULe` denotation on the same model.
+//   * A WIDENING-CAST operand (`(x as u64) * (y as u64)`, where `v2_bv_operand_term`
+//     wraps the fresh var in `BvZeroExt`/`BvSignExt`) is NOT recognized, so those
+//     rows keep exactly their previous `Int`-only verdict. Denoting the extensions
+//     is another increment; declining is the fail-closed side.
+// ---------------------------------------------------------------------------
+
+/// The MIR operand name a fresh bitvector operand `__trust_ovf_bv_{role}_{base}`
+/// was derived from, or `None` if `name` is not of that form. The prefix is
+/// `v2_bv_operand_term`'s own `format!` — this is the checkable half of the
+/// fresh-variable link.
+fn bv_fresh_operand_base<'a>(name: &'a str, role: &str) -> Option<&'a str> {
+    let base = name.strip_prefix("__trust_ovf_bv_")?.strip_prefix(role)?.strip_prefix('_')?;
+    (!base.is_empty()).then_some(base)
+}
+
+/// Recognize the emitted UNSIGNED-MUL bitvector core and return its
+/// `(lhs_var, rhs_var, width)`. EXACT shape only: the guard `Not(Eq(l, 0:BV_W))`
+/// followed by the mismatch `Not(Eq(BvUDiv(BvMul(l,r,W), l, W), r))`, every
+/// bitvector position at the SAME width `W`, both operands bare `Var`s at
+/// `Sort::BitVec(W)`, and the two disjunct positions naming the SAME `l`.
+///
+/// Anything else — a missing guard, a widened (`BvZeroExt`/`BvSignExt`) operand, a
+/// mixed width, a swapped divisor — returns `None` and the caller fails closed.
+/// The GUARD is not optional: without it the core would divide by `l` at `l == 0`,
+/// where SMT-LIB `bvudiv` is all-ones, and the predicate would stop being the
+/// machine one (see the BV-denotation block).
+fn bv_umul_core_operands(core: &trust_types::Formula) -> Option<(&str, &str, u32)> {
+    use trust_types::{Formula as F, Sort};
+    /// A bare `Var` at EXACTLY `Sort::BitVec(w)` — nothing else is an operand leaf
+    /// here, so a widened (`BvZeroExt`/`BvSignExt`) operand declines.
+    fn bv_var(f: &trust_types::Formula, w: u32) -> Option<&str> {
+        match f {
+            F::Var(n, Sort::BitVec(vw)) if *vw == w => Some(n.as_str()),
+            _ => None,
+        }
+    }
+    let F::And(v) = core else { return None };
+    let [F::Not(guard), F::Not(mismatch)] = v.as_slice() else { return None };
+
+    // guard := Eq(l, BitVec { value: 0, width: W })
+    let F::Eq(g_lhs, g_rhs) = &**guard else { return None };
+    let F::BitVec { value: 0, width } = &**g_rhs else { return None };
+    let width = *width;
+    let l_name = bv_var(g_lhs, width)?;
+
+    // mismatch := Eq(BvUDiv(BvMul(l, r, W), l, W), r)
+    let F::Eq(m_lhs, m_rhs) = &**mismatch else { return None };
+    let F::BvUDiv(prod, divisor, div_w) = &**m_lhs else { return None };
+    if *div_w != width {
+        return None;
+    }
+    let F::BvMul(mul_l, mul_r, mul_w) = &**prod else { return None };
+    if *mul_w != width {
+        return None;
+    }
+    if bv_var(mul_l, width)? != l_name || bv_var(divisor, width)? != l_name {
+        return None;
+    }
+    let r_name = bv_var(mul_r, width)?;
+    if bv_var(m_rhs, width)? != r_name {
+        return None;
+    }
+    Some((l_name, r_name, width))
+}
+
+/// The BV core the umul record carries, if it carries one: the LAST fact of the
+/// record's FIRST `ConjoinFactsLast` wrapper — the emitter's own construction
+/// position (`terms.push(bv_formula)` immediately before the record is built), not
+/// a scan of the formula.
+///
+/// `None` means this record is not the BV-path one (the CONSTANT-multiplier mul
+/// and the symbolic-operand fallback both take the Int/LIA path, whose record has
+/// no BV fact at all); the caller then leaves the existing `Int` verdict alone.
+fn recorded_bv_umul_core(rec: &trust_types::ObligationRecord) -> Option<&trust_types::Formula> {
+    let trust_types::ObligationWrapper::ConjoinFactsLast { facts } = rec.wrappers.first()? else {
+        return None;
+    };
+    let last = facts.last()?;
+    bv_umul_core_operands(last).is_some().then_some(last)
+}
+
+/// Certify the recorded BV umul core against `Trust.TrustIr.umulOverflowsBvU{W}`,
+/// with every cross-check the `Int` arm applies plus the two the bitvector reading
+/// adds:
+///
+///  * WIDTH — the width read out of the BV core's OWN `BitVec`/`BvMul`/`BvUDiv`
+///    positions must equal the width the `Int` arm recovered from the emitted
+///    `(MIN, MAX)` thresholds (which is itself already cross-checked against
+///    `rec.width` and against the VC kind's `operand_tys`). A denotation applied at
+///    the wrong width is exactly the false-proof this pins shut, so it is checked
+///    against an INDEPENDENTLY recovered width, never against itself.
+///  * SUBJECT — each fresh BV operand must DERIVE (by `v2_bv_operand_term`'s own
+///    naming) from the corresponding `Int` core operand, which must itself be a
+///    bare `Var`. A constant or field operand in the `Int` core has no fresh BV
+///    twin, so the link is unprovable and the arm declines.
+fn certify_bv_umul_core(
+    core: &trust_types::Formula,
+    int_lhs: &trust_types::Formula,
+    int_rhs: &trust_types::Formula,
+    w: IrUWidth,
+) -> RefinementVerdict {
+    let Some((l_name, r_name, core_width)) = bv_umul_core_operands(core) else {
+        return RefinementVerdict::KernelRejected(
+            "umul BV core: not the emitted `l ≠ 0 ∧ bvudiv(bvmul(l,r),l) ≠ r` shape".to_string(),
+        );
+    };
+    if core_width != w.bits() {
+        return RefinementVerdict::KernelRejected(
+            "umul BV core: the bitvector width disagrees with the width recovered from the \
+             emitted (MIN,MAX) thresholds — a desynchronised record"
+                .to_string(),
+        );
+    }
+    let (Some(int_l), Some(int_r)) = (formula_var_name(int_lhs), formula_var_name(int_rhs)) else {
+        return RefinementVerdict::KernelRejected(
+            "umul BV core: the Int core's operands are not both bare `Var`s, so the fresh \
+             bitvector operands cannot be linked to them"
+                .to_string(),
+        );
+    };
+    if bv_fresh_operand_base(l_name, "lhs") != Some(int_l)
+        || bv_fresh_operand_base(r_name, "rhs") != Some(int_r)
+    {
+        return RefinementVerdict::KernelRejected(
+            "umul BV core: the fresh bitvector operands do not derive from this VC's own \
+             multiply operands"
+                .to_string(),
+        );
+    }
+    // The certificate's binders ARE the fresh operands (see the block above): the
+    // claim is about the emitter's operand images, not about `a`/`b`.
+    let distinct = vec![l_name, r_name];
+    let params = debruijn_params(&distinct);
+    let name = umul_overflows_bv_ir_name(w);
+    let spec = Expr::apps(cst(&name), [Expr::bvar(1), Expr::bvar(0)]);
+    live_ground_def_eq_spec_ir_in(core, &params, &spec, 2, GroundFragment::Bitvector)
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,10 +2052,7 @@ fn authenticated_record(
 /// read the deleted peel used for the unsigned-overflow vacuity side condition. The operand
 /// ranges are the innermost `ConjoinFactsLast` wrapper, shared across every path, so one
 /// check over the record's facts covers every occurrence the peel's universal quantified.
-fn record_pins_nonneg(
-    rec: &trust_types::ObligationRecord,
-    term: &trust_types::Formula,
-) -> bool {
+fn record_pins_nonneg(rec: &trust_types::ObligationRecord, term: &trust_types::Formula) -> bool {
     rec.wrappers.iter().any(|w| match w {
         trust_types::ObligationWrapper::ConjoinFactsLast { facts } => {
             has_nonneg_range_sibling(facts, term)
@@ -2022,7 +2404,9 @@ fn trustir_safety_vc_adequate_kind(
                         );
                     };
                     let F::Or(disjuncts) = &rec.body else {
-                        return declined("uadd VC: recorded obligation body is not the `Or` range form");
+                        return declined(
+                            "uadd VC: recorded obligation body is not the `Or` range form",
+                        );
                     };
                     let [F::Lt(under_t, zero_f), leaf @ F::Gt(..)] = disjuncts.as_slice() else {
                         return declined("uadd VC: no `Gt(a+b, MAX)` disjunct in the violation");
@@ -2324,12 +2708,29 @@ fn trustir_safety_vc_adequate_kind(
                         );
                     }
                     let name = umul_overflows_ir_name(w);
-                    (
-                        Some(IrSafetyVcKind::UMulOverflow(w)),
+                    let int_verdict =
                         overflow_family_live_def_eq_ir(&rec.body, &[a_op, b_op], &|ops| {
                             Expr::apps(cst(&name), [ops[0].clone(), ops[1].clone()])
-                        }),
-                    )
+                        });
+                    // Trust (BV denotation, 2026-08-21) — when this record is the
+                    // BITVECTOR-path one, its BV core is certified TOO, and its
+                    // failure DECLINES the VC. Requiring it (rather than treating
+                    // the BV certificate as a bonus) is the point: the conjunct the
+                    // solver actually decides this obligation on used to be an
+                    // un-denoted blob that the tier authenticated as PRESENT and
+                    // then said nothing about. A record with NO BV fact (the
+                    // constant-multiplier mul and the symbolic-operand fallback both
+                    // take the Int/LIA path) is unaffected — `recorded_bv_umul_core`
+                    // returns `None` and the Int verdict stands unchanged.
+                    let verdict = match recorded_bv_umul_core(rec) {
+                        Some(bv_core)
+                            if matches!(int_verdict, RefinementVerdict::ProvenModulo3) =>
+                        {
+                            certify_bv_umul_core(bv_core, a_op, b_op, w)
+                        }
+                        _ => int_verdict,
+                    };
+                    (Some(IrSafetyVcKind::UMulOverflow(w)), verdict)
                 }
                 _ => declined("overflow VC: op/signedness combination is not modeled"),
             }
@@ -2586,7 +2987,13 @@ pub fn trustir_safety_vc_adequate(
 ///     grounder def-eq bridge ⇒ else `false`;
 ///   * a function that emits NO safety VC at all is VACUOUSLY faithful (`true`) —
 ///     nothing unsafe to capture (the same vacuously-safe edge the MirSem witness
-///     admits with `safety = None`).
+///     admits with `safety = None`);
+///   * an OPEN DECLINED row (`mirsem::function_has_open_declined_vc`) ⇒ `false`. It is
+///     NOT an `is_safety_vc_kind` member, so without an explicit clause the filter drops
+///     it and the `all()` below is vacuously `true` on the resulting empty set — the
+///     same omission that let `prove::function_safety_vcs_all_discharged` pass a body
+///     whose only obligation was a decline. "Open" excludes exactly the
+///     `Rvalue::PtrOffset` row that `prove::function_ptr_offsets_all_discharged` closes.
 ///
 /// Non-safety VCs (postconditions, contracts, temporal, …) are not this gate's
 /// concern and are skipped, exactly as in the MirSem tier.
@@ -2595,6 +3002,9 @@ pub fn function_safety_vcs_faithful_via_trustir(func: &trust_types::VerifiableFu
     // Drive the REAL emitter so the gate is over the VCs that ACTUALLY get raised
     // (the same empirical grounding the MirSem tier rests on).
     let vcs = trust_vcgen::generate_vcs(func);
+    if crate::mirsem::function_has_open_declined_vc(func) {
+        return false;
+    }
     vcs.iter()
         .filter(|vc| is_safety_vc_kind(&vc.kind))
         .all(|vc| matches!(trustir_safety_vc_adequate(func, vc), RefinementVerdict::ProvenModulo3))
@@ -3030,12 +3440,21 @@ mod tests {
             VcKind::Postcondition,
             VcKind::Precondition { callee: "c".into() },
             VcKind::Unreachable,
+            // The DECLINED kind: both tiers must agree it is NOT a safety obligation
+            // (it is a coverage gap), and both must instead refuse it through the
+            // explicit `is_declined_vc_kind` clause their gates now carry.
+            VcKind::UnsupportedMir { kind: "k".into(), detail: "d".into() },
         ];
         for k in &kinds {
             assert_eq!(
                 is_safety_vc_kind(k),
                 crate::mirsem::is_safety_vc_kind_pub(k),
                 "safety-kind classifier lockstep broken for {k:?}"
+            );
+            assert_eq!(
+                crate::mirsem::is_declined_vc_kind_pub(k),
+                matches!(k, VcKind::UnsupportedMir { .. }),
+                "decline classifier must name exactly UnsupportedMir, disagreed on {k:?}"
             );
         }
     }
@@ -3429,9 +3848,6 @@ mod tests {
     }
 }
 
-
-
-
 #[cfg(test)]
 mod umul_overflow_family_tests {
     //! Trust (#53): the unsigned-multiply overflow family's fail-closed gates.
@@ -3473,10 +3889,13 @@ mod umul_overflow_family_tests {
         let b = int_lit(9);
         for w in IrUWidth::ALL {
             let result = Expr::apps(cst("Int.mul"), [a.clone(), b.clone()]);
-            let expected = Expr::apps(cst("Or"), [
-                Expr::apps(cst("Int.lt"), [result.clone(), int_lit(0)]),
-                Expr::apps(cst("Int.lt"), [int_lit(w.max_value()), result]),
-            ]);
+            let expected = Expr::apps(
+                cst("Or"),
+                [
+                    Expr::apps(cst("Int.lt"), [result.clone(), int_lit(0)]),
+                    Expr::apps(cst("Int.lt"), [int_lit(w.max_value()), result]),
+                ],
+            );
             assert_eq!(
                 unsigned_mul_out_of_range_body(&a, &b, w),
                 expected,
@@ -3503,3 +3922,626 @@ mod umul_overflow_family_tests {
     }
 }
 
+#[cfg(test)]
+mod bv_denotation_tests {
+    //! Trust (BV denotation, 2026-08-21) — THE VALIDATION OF A DEFINITION.
+    //!
+    //! `bv_mul_body` / `bv_udiv_body` / `umul_overflows_bv_body` tell the kernel what
+    //! a bitvector term MEANS. Nothing in the adequacy path checks them:
+    //! `def_eq_alone_cannot_catch_a_wrong_bv_denotation` measures that directly — the
+    //! grounded core and the registered spec are byte-identical BEFORE either
+    //! `bvMulU{W}` or `bvUDivU{W}` is unfolded, so a body defined at the wrong width
+    //! would certify exactly as happily as the right one and every downstream proof
+    //! would rest on it. This module is therefore the ONLY guard, and it validates by
+    //! EVALUATION through the kernel's own reducers against real Rust arithmetic —
+    //! exhaustively at width 8 (all 65 536 pairs), and by construction elsewhere.
+
+    use trust_types::{
+        BasicBlock, BinOp, BlockId, Formula, LocalDecl, ObligationRecord, ObligationWrapper,
+        Operand, Place, Rvalue, Sort, Statement, Terminator, Ty, VerifiableBody,
+        VerifiableFunction,
+    };
+
+    use super::*;
+
+    /// A fresh `TypeChecker` over the pinned safety env (built once per test).
+    fn safety_env() -> Environment {
+        trustir_safety_env().expect("the trust-ir safety env builds")
+    }
+
+    fn apply2(name: &str, a: &Expr, b: &Expr) -> Expr {
+        Expr::apps(cst(name), [a.clone(), b.clone()])
+    }
+
+    /// A NORMALIZER over the closed arithmetic fragment.
+    ///
+    /// `whnf` reduces only the HEAD, and the kernel's native `Int.*` reducers fire
+    /// only once their arguments are already literals — so `Int.mod (Int.mul a b)
+    /// 256` sticks at `whnf` with the inner product unreduced. This walks the
+    /// application spine bottom-up and re-`whnf`s until stable. EVERY reduction step
+    /// is the kernel's own (`whnf`); this decides only the ORDER, so what the tests
+    /// below observe is genuinely the kernel's computation of the denotation.
+    fn nf(tc: &TypeChecker, e: &Expr) -> Expr {
+        use clean_kernel::ExprKind;
+        let head = tc.whnf(e);
+        match head.kind() {
+            ExprKind::App(f, a) => {
+                let rebuilt = Expr::app(nf(tc, f), nf(tc, a));
+                let reduced = tc.whnf(&rebuilt);
+                if reduced == rebuilt { rebuilt } else { nf(tc, &reduced) }
+            }
+            _ => head,
+        }
+    }
+
+    // ---- registration / shape ------------------------------------------------
+
+    /// Every modeled width must carry all three declarations, and the anchor audit
+    /// must still come back `Modulo3` with them in it — a bitvector denotation that
+    /// dragged in a 4th axiom would be a new trusted assumption, not a definition.
+    #[test]
+    fn bv_denotations_are_registered_for_every_width_modulo_three_axioms() {
+        let env = safety_env();
+        for w in IrUWidth::ALL {
+            for name in
+                [bv_mul_ir_name(w.bits()), bv_udiv_ir_name(w.bits()), umul_overflows_bv_ir_name(w)]
+            {
+                assert!(
+                    env.get_const(&Name::from_string(&name)).is_some(),
+                    "{name} must be registered"
+                );
+            }
+        }
+        assert_eq!(
+            pin_trustir_safety_anchor(),
+            AnchorVerdict::Modulo3,
+            "the safety anchor must stay at exactly the 3 foundational axioms with the \
+             bitvector denotations registered"
+        );
+    }
+
+    /// The registered predicate body must be EXACTLY what the live BV grounder
+    /// produces for the emitter's own core — asserted structurally, both directions.
+    /// If these ever diverge the umul BV arm silently stops certifying.
+    #[test]
+    fn the_registered_bv_predicate_is_the_grounded_emitter_core() {
+        for w in IrUWidth::ALL {
+            let (core, params) = emitted_bv_core(w.bits(), "a", "b");
+            let grounded = crate::clean_ground::ground_prop_bv(&core, &params)
+                .expect("the BV grounder grounds the emitted core");
+            assert_eq!(
+                grounded,
+                umul_overflows_bv_body(&Expr::bvar(1), &Expr::bvar(0), w),
+                "u{}: the registered `umulOverflowsBvU` body must BE the grounded core",
+                w.bits()
+            );
+        }
+    }
+
+    /// THE HONEST WARNING, MEASURED. The grounded core is byte-identical to the
+    /// registered body while both still name `bvMulU{W}` / `bvUDivU{W}` as opaque
+    /// heads — the def-eq NEVER looks inside them. So no amount of kernel checking in
+    /// the adequacy path can catch a wrong denotation, and the exhaustive evaluation
+    /// below is load-bearing rather than belt-and-braces.
+    /// Whether `e` mentions the constant `name` anywhere (structural, not a Debug
+    /// string match — a `Name`'s rendering is not part of this claim).
+    fn mentions_const(e: &Expr, name: &str) -> bool {
+        use clean_kernel::ExprKind;
+        let target = Name::from_string(name);
+        match e.kind() {
+            ExprKind::Const(n, _) => *n == target,
+            ExprKind::App(f, a) => mentions_const(f, name) || mentions_const(a, name),
+            ExprKind::Lam(_, t, b) | ExprKind::Pi(_, t, b) => {
+                mentions_const(t, name) || mentions_const(b, name)
+            }
+            ExprKind::Let(_, t, v, b, _) => {
+                mentions_const(t, name) || mentions_const(v, name) || mentions_const(b, name)
+            }
+            ExprKind::Proj(_, _, inner) | ExprKind::MData(_, inner) => mentions_const(inner, name),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn def_eq_alone_cannot_catch_a_wrong_bv_denotation() {
+        let (core, params) = emitted_bv_core(8, "a", "b");
+        let grounded = crate::clean_ground::ground_prop_bv(&core, &params).expect("grounds");
+        assert!(
+            mentions_const(&grounded, &bv_mul_ir_name(8))
+                && mentions_const(&grounded, &bv_udiv_ir_name(8)),
+            "the certified term keeps the denotation as an UNEXPANDED head — so def-eq \
+             is blind to its body"
+        );
+        assert!(
+            !mentions_const(&grounded, "Int.mod") && !mentions_const(&grounded, "Int.div"),
+            "nothing in the adequacy path unfolds the denotation, which is precisely why \
+             `bv_and_int_umul_predicates_agree_with_rust_exhaustively_at_width_8` exists"
+        );
+    }
+
+    // ---- THE EXHAUSTIVE WIDTH-8 VALIDATION -----------------------------------
+
+    /// EXHAUSTIVE at width 8: all 65 536 pairs `(a, b) ∈ [0,256) × [0,256)`, three
+    /// ways.
+    ///
+    ///   1. the kernel's OWN reduction of `bvMulU8 a b` must be `(a·b) mod 256`;
+    ///   2. the kernel's OWN reduction of `bvUDivU8 (that) a` must be SMT-LIB
+    ///      `bvudiv` (all-ones at `a = 0`);
+    ///   3. the resulting BV predicate `a ≠ 0 ∧ recovered ≠ b`, the `Int` predicate
+    ///      `a·b < 0 ∨ 255 < a·b` (also kernel-reduced), and the real Rust ground
+    ///      truth `(a as u16) * (b as u16) > 255` must ALL agree, at every point.
+    ///
+    /// The kernel values are pinned by comparing against `int_lit(expected)`, whose
+    /// injectivity is itself pinned (`int_lit_encoders_agree_and_are_exact`), so
+    /// "equals the expected literal" really does mean "computed the expected value".
+    #[test]
+    fn bv_and_int_umul_predicates_agree_with_rust_exhaustively_at_width_8() {
+        let env = safety_env();
+        let tc = TypeChecker::new(&env);
+        let mul = bv_mul_ir_name(8);
+        let udiv = bv_udiv_ir_name(8);
+        let mut overflow_points = 0usize;
+        for a in 0u32..256 {
+            let a_lit = int_lit(i128::from(a));
+            for b in 0u32..256 {
+                let b_lit = int_lit(i128::from(b));
+
+                // GROUND TRUTH — real Rust `(a as u16) * (b as u16) > 255`, computed
+                // in `u32` so the reference product itself cannot wrap (max 65 025).
+                let truth = a * b > 255;
+                if truth {
+                    overflow_points += 1;
+                }
+
+                // (1) the kernel's bvmul.
+                let prod = nf(&tc, &apply2(&mul, &a_lit, &b_lit));
+                let prod_expected = i128::from((a * b) % 256);
+                assert_eq!(
+                    prod,
+                    int_lit(prod_expected),
+                    "bvMulU8 {a} {b} must reduce to (a*b) mod 256"
+                );
+
+                // (2) the kernel's bvudiv, over the kernel's own product term.
+                let recovered = nf(&tc, &apply2(&udiv, &prod, &a_lit));
+                let recovered_expected = if a == 0 { 255 } else { prod_expected / i128::from(a) };
+                assert_eq!(
+                    recovered,
+                    int_lit(recovered_expected),
+                    "bvUDivU8 ((a*b) mod 256) {a} must be SMT-LIB bvudiv (all-ones at a=0)"
+                );
+
+                // (3) the two predicates against the ground truth.
+                let bv_predicate = a != 0 && recovered_expected != i128::from(b);
+                assert_eq!(bv_predicate, truth, "BV predicate disagrees with Rust at a={a}, b={b}");
+                let int_product = nf(&tc, &apply2("Int.mul", &a_lit, &b_lit));
+                let int_product_expected = i128::from(a) * i128::from(b);
+                assert_eq!(int_product, int_lit(int_product_expected));
+                let int_predicate = int_product_expected < 0 || int_product_expected > 255;
+                assert_eq!(
+                    int_predicate, truth,
+                    "Int predicate disagrees with Rust at a={a}, b={b}"
+                );
+            }
+        }
+        // NON-VACUITY: a check that never sees an overflow proves nothing.
+        assert_eq!(
+            overflow_points, 63_568,
+            "the exhaustive sweep must actually visit overflowing points"
+        );
+    }
+
+    /// The `l = 0` case, stated and pinned in BOTH directions.
+    ///
+    /// * SMT-LIB says `bvudiv x 0` is all-ones; that is what the denotation says.
+    /// * The GUARDED predicate is FALSE at `l = 0` for every `r`, matching the ground
+    ///   truth that `0 * r` never overflows — whatever the division returns.
+    /// * The UNGUARDED mismatch term at `l = 0` is TRUE for every `r < 255` (all-ones
+    ///   ≠ r), i.e. a denotation that lost the guard OVER-reports overflow: a
+    ///   conservative decline, never a hidden violation. Under Lean's `Int.div x 0 = 0`
+    ///   convention it would instead be FALSE at `l = r = 0` — the direction that CAN
+    ///   hide one. Taking the SMT-LIB side keeps even the degenerate case safe.
+    #[test]
+    fn zero_lhs_never_overflows_whatever_the_division_says() {
+        let env = safety_env();
+        let tc = TypeChecker::new(&env);
+        for w in IrUWidth::ALL {
+            let udiv = bv_udiv_ir_name(w.bits());
+            for x in [0i128, 1, 7, 255] {
+                assert_eq!(
+                    nf(&tc, &apply2(&udiv, &int_lit(x), &int_lit(0))),
+                    int_lit(w.max_value()),
+                    "u{}: bvudiv {x} 0 must be the all-ones vector (SMT-LIB)",
+                    w.bits()
+                );
+            }
+        }
+        // The GUARDED predicate at l = 0: the first conjunct is `Not(Eq(0, 0))`, which
+        // is false, so the conjunction is false for EVERY rhs — matching the ground
+        // truth that `0 * b` never overflows, whatever the division returns.
+        let udiv8 = bv_udiv_ir_name(8);
+        for b in 0u32..256 {
+            assert!(!(0u32 * b > 255), "ground truth: 0 * {b} never overflows");
+            // The division the guard masks, computed for real: bvudiv(bvmul(0,b), 0).
+            let prod = nf(&tc, &apply2(&bv_mul_ir_name(8), &int_lit(0), &int_lit(i128::from(b))));
+            assert_eq!(prod, int_lit(0));
+            let recovered = nf(&tc, &apply2(&udiv8, &prod, &int_lit(0)));
+            assert_eq!(recovered, int_lit(255), "the masked division is all-ones, not 0");
+            // Guarded: FALSE, i.e. exactly the ground truth.
+            let guarded = false && recovered != int_lit(i128::from(b));
+            assert_eq!(guarded, 0u32 * b > 255);
+        }
+        // The UNGUARDED term, both conventions, at the one point that separates them.
+        assert_ne!(
+            int_lit(255),
+            int_lit(0),
+            "SMT-LIB: unguarded `bvudiv(0,0) != 0` is TRUE — over-reports overflow, a \
+             conservative decline"
+        );
+        assert_eq!(
+            int_lit(0),
+            int_lit(0),
+            "Lean `Int.div 0 0 = 0`: the unguarded term at l = r = 0 would be FALSE — the \
+             direction that can HIDE a violation. Recorded so the choice is not \
+             re-litigated by accident."
+        );
+    }
+
+    // ---- FALSIFICATION: seeded wrong denotations ------------------------------
+
+    /// A width-off-by-one denotation (`mod 2^9` instead of `mod 2^8`) MUST be caught.
+    /// It is registered under a mutant name, evaluated the same way, and a concrete
+    /// disagreement witness against Rust is required to exist — if this test ever
+    /// stops finding one, the exhaustive check above has stopped being a check.
+    #[test]
+    fn a_width_off_by_one_bv_denotation_is_falsified() {
+        let mut env = trustir_env().expect("anchor env");
+        // `mutBvMulU8 a b := (a*b) mod 512` — the off-by-one-width mutant.
+        register_int2_int(&mut env, "Trust.TrustIr.mutBvMulU8", |a, b| {
+            let product = Expr::apps(cst("Int.mul"), [a.clone(), b.clone()]);
+            Expr::apps(cst("Int.mod"), [product, int_lit(512)])
+        })
+        .expect("register the mutant");
+        register_int2_int(&mut env, "Trust.TrustIr.mutBvUDivU8", |a, b| {
+            bv_udiv_body(a, b, IrUWidth::W8)
+        })
+        .expect("register the mutant divider");
+        let tc = TypeChecker::new(&env);
+        let mut witness = None;
+        'outer: for a in 1u32..256 {
+            for b in 0u32..256 {
+                let truth = a * b > 255;
+                let prod = nf(
+                    &tc,
+                    &apply2(
+                        "Trust.TrustIr.mutBvMulU8",
+                        &int_lit(i128::from(a)),
+                        &int_lit(i128::from(b)),
+                    ),
+                );
+                let rec =
+                    nf(&tc, &apply2("Trust.TrustIr.mutBvUDivU8", &prod, &int_lit(i128::from(a))));
+                let mutant_predicate = rec != int_lit(i128::from(b));
+                if mutant_predicate != truth {
+                    witness = Some((a, b, truth, mutant_predicate));
+                    break 'outer;
+                }
+            }
+        }
+        let (a, b, truth, mutant) = witness.expect(
+            "a width-off-by-one denotation MUST disagree with Rust somewhere — if it does \
+             not, the exhaustive check cannot detect a wrong width and is worthless",
+        );
+        assert_ne!(truth, mutant, "the witness must be a genuine disagreement");
+        // MEASURED: the first witness is a = 2, b = 128. `2 * 128 = 256` DOES overflow
+        // `u8`, but the mod-2^9 denotation keeps the product exactly, recovers
+        // `256 / 2 = 128 = b`, and reports NO overflow — i.e. an off-by-one width is a
+        // FALSE PROVE on an overflowing program, not a lost refutation.
+        assert_eq!(
+            (a, b, truth, mutant),
+            (2, 128, true, false),
+            "the width-off-by-one denotation must falsely clear the overflowing 2 * 128"
+        );
+    }
+
+    /// The GUARD is not optional and is not a stylistic choice: a core that lost it
+    /// must not be recognizable as the machine predicate at all. (It cannot be
+    /// certified by accident — `bv_umul_core_operands` is the only door.)
+    #[test]
+    fn a_guardless_bv_core_is_not_recognized() {
+        let (core, _) = emitted_bv_core(8, "a", "b");
+        let Formula::And(v) = &core else { unreachable!() };
+        let guardless = v[1].clone();
+        assert!(
+            bv_umul_core_operands(&guardless).is_none(),
+            "the bare mismatch term must NOT be admitted as the umul BV core"
+        );
+        assert!(
+            bv_umul_core_operands(&Formula::And(vec![v[1].clone(), v[1].clone()])).is_none(),
+            "a duplicated mismatch term must not stand in for the missing guard"
+        );
+    }
+
+    // ---- the grounder's delegation contract ------------------------------------
+
+    /// The bitvector grounder must be the SAME live grounder on everything that is
+    /// not bitvector-shaped — otherwise "the certified term is the live grounder's
+    /// output" quietly stops being true for the Int leaves.
+    #[test]
+    fn the_bv_grounder_agrees_with_the_int_grounder_on_an_int_only_core() {
+        let params = debruijn_params(&["a", "b"]);
+        let a = || Box::new(Formula::var("a", Sort::Int));
+        let b = || Box::new(Formula::var("b", Sort::Int));
+        let cores = [
+            Formula::Or(vec![
+                Formula::Lt(Box::new(Formula::Mul(a(), b())), Box::new(Formula::Int(0))),
+                Formula::Gt(Box::new(Formula::Mul(a(), b())), Box::new(Formula::Int(255))),
+            ]),
+            Formula::And(vec![
+                Formula::Not(Box::new(Formula::Eq(a(), Box::new(Formula::Int(0))))),
+                Formula::Le(a(), b()),
+            ]),
+            Formula::Eq(a(), b()),
+        ];
+        for core in cores {
+            assert_eq!(
+                crate::clean_ground::ground_prop_bv(&core, &params),
+                crate::clean_ground::ground_prop(&core, &params),
+                "the BV grounder must delegate an Int-only core byte-identically"
+            );
+        }
+    }
+
+    /// The bitvector LITERAL decode is the unsigned reading of the low `width` bits,
+    /// and it declines the widths where the mask itself would be wrong.
+    #[test]
+    fn bv_literal_decodes_the_low_bits_unsigned() {
+        use crate::clean_ground::bv_literal_unsigned;
+        assert_eq!(bv_literal_unsigned(0, 8), Some(0));
+        assert_eq!(bv_literal_unsigned(255, 8), Some(255));
+        assert_eq!(bv_literal_unsigned(256, 8), Some(0), "the low 8 bits of 256 are zero");
+        assert_eq!(bv_literal_unsigned(-1, 8), Some(255), "−1 is the all-ones pattern");
+        assert_eq!(bv_literal_unsigned(-1, 32), Some(4_294_967_295));
+        assert_eq!(bv_literal_unsigned(0, 0), None, "width 0 has no value");
+        assert_eq!(bv_literal_unsigned(0, 128), None, "the mask would overflow i128");
+    }
+
+    // ---- the fresh-variable link ----------------------------------------------
+
+    /// The fresh-operand naming is the only thing linking the BV conjunct back to
+    /// the MIR operands, so both the accept and the reject side are pinned.
+    #[test]
+    fn fresh_bitvector_operand_names_derive_from_the_mir_operands() {
+        assert_eq!(bv_fresh_operand_base("__trust_ovf_bv_lhs_a", "lhs"), Some("a"));
+        assert_eq!(bv_fresh_operand_base("__trust_ovf_bv_rhs__5", "rhs"), Some("_5"));
+        assert_eq!(bv_fresh_operand_base("__trust_ovf_bv_lhs_a", "rhs"), None);
+        assert_eq!(bv_fresh_operand_base("__trust_ovf_bv_lhs_", "lhs"), None);
+        assert_eq!(bv_fresh_operand_base("a", "lhs"), None);
+    }
+
+    // ---- END TO END, through the real emitter ----------------------------------
+
+    fn binop_func(op: BinOp, width: u32, signed: bool) -> VerifiableFunction {
+        let t = || Ty::Int { width, signed };
+        VerifiableFunction {
+            name: "f".into(),
+            def_path: "crate::f".into(),
+            span: Default::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: t(), name: Some("_0".into()) },
+                    LocalDecl { index: 1, ty: t(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: t(), name: Some("b".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::BinaryOp(
+                            op,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: Default::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 2,
+                return_ty: t(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    /// The emitted core `v2_unsigned_bv_overflow_formula` builds for a `var * var`
+    /// unsigned multiply, plus its de-Bruijn map. Built HERE so the shape tests do
+    /// not depend on running the emitter; `the_real_emitter_umul_vc_carries_this_core`
+    /// checks the real emitter agrees.
+    fn emitted_bv_core(width: u32, lhs: &str, rhs: &str) -> (Formula, HashMap<String, Expr>) {
+        let l = format!("__trust_ovf_bv_lhs_{lhs}");
+        let r = format!("__trust_ovf_bv_rhs_{rhs}");
+        let lv = || Box::new(Formula::var_owned(l.clone(), Sort::BitVec(width)));
+        let rv = || Box::new(Formula::var_owned(r.clone(), Sort::BitVec(width)));
+        let core = Formula::And(vec![
+            Formula::Not(Box::new(Formula::Eq(
+                lv(),
+                Box::new(Formula::BitVec { value: 0, width }),
+            ))),
+            Formula::Not(Box::new(Formula::Eq(
+                Box::new(Formula::BvUDiv(Box::new(Formula::BvMul(lv(), rv(), width)), lv(), width)),
+                rv(),
+            ))),
+        ]);
+        let params = debruijn_params(&[l.as_str(), r.as_str()]);
+        (core, params)
+    }
+
+    /// THE END-TO-END ROW. The REAL emitter's `u8 var*var` multiply VC must carry a
+    /// recognizable BV core over the fresh images of `a`/`b`, and the whole VC must
+    /// certify `ProvenModulo3` — i.e. the BV conjunct is now certified alongside the
+    /// `Int` one, not merely authenticated as present.
+    #[test]
+    fn the_real_emitter_umul_vc_certifies_through_its_bitvector_core() {
+        for width in [8u32, 16, 32, 64] {
+            let f = binop_func(BinOp::Mul, width, false);
+            let vcs = trust_vcgen::generate_vcs(&f);
+            let vc = vcs
+                .iter()
+                .find(|vc| matches!(vc.kind, trust_types::VcKind::ArithmeticOverflow { .. }))
+                .unwrap_or_else(|| panic!("u{width}: the multiply must raise an overflow VC"));
+            let rec = vc.obligation.as_ref().unwrap_or_else(|| {
+                panic!("u{width}: the umul VC must carry an authenticated record")
+            });
+            let core = recorded_bv_umul_core(rec).unwrap_or_else(|| {
+                panic!("u{width}: the record's last fact must be the BV umul core")
+            });
+            assert_eq!(
+                bv_umul_core_operands(core),
+                Some(("__trust_ovf_bv_lhs_a", "__trust_ovf_bv_rhs_b", width)),
+                "u{width}: the BV core's operands must be the fresh images of a and b"
+            );
+            let (kind, verdict) = trustir_safety_vc_adequate_kind(&f, vc);
+            assert_eq!(
+                kind,
+                Some(IrSafetyVcKind::UMulOverflow(IrUWidth::from_mir(width, false).unwrap()))
+            );
+            assert_eq!(
+                verdict,
+                RefinementVerdict::ProvenModulo3,
+                "u{width}: the umul VC must certify with the BV core required"
+            );
+        }
+    }
+
+    /// A record whose BV core is at the WRONG WIDTH must DECLINE — the certificate
+    /// would otherwise apply a width-`W'` denotation to a width-`W` obligation, which
+    /// is exactly the false-proof shape a denotation makes possible. Previously this
+    /// record certified (the BV conjunct was not looked at), so this is the arm's
+    /// measurable strengthening.
+    #[test]
+    fn a_width_desynced_bitvector_core_declines() {
+        let f = binop_func(BinOp::Mul, 8, false);
+        let vcs = trust_vcgen::generate_vcs(&f);
+        let vc = vcs
+            .iter()
+            .find(|vc| matches!(vc.kind, trust_types::VcKind::ArithmeticOverflow { .. }))
+            .expect("overflow VC");
+        // Sanity: unmodified, it certifies.
+        assert_eq!(trustir_safety_vc_adequate(&f, vc), RefinementVerdict::ProvenModulo3);
+
+        let rec = vc.obligation.as_ref().expect("record").clone();
+        let ObligationWrapper::ConjoinFactsLast { facts } = &rec.wrappers[0] else {
+            panic!("the BV-path record has one ConjoinFactsLast wrapper")
+        };
+        // Swap the BV core for the SAME shape at width 16 — the formula is rebuilt
+        // from the record so the authentication invariant still holds.
+        let (wrong_width_core, _) = emitted_bv_core(16, "a", "b");
+        let mut new_facts = facts.clone();
+        *new_facts.last_mut().expect("a fact") = wrong_width_core;
+        let doctored = ObligationRecord {
+            body: rec.body.clone(),
+            wrappers: vec![ObligationWrapper::ConjoinFactsLast { facts: new_facts }],
+            subject: rec.subject.clone(),
+            width: rec.width,
+        };
+        let mut vc2 = vc.clone();
+        vc2.formula = reconstruct_obligation(&doctored);
+        vc2.obligation = Some(doctored);
+        assert!(
+            !matches!(trustir_safety_vc_adequate(&f, &vc2), RefinementVerdict::ProvenModulo3),
+            "a width-desynchronised BV core must not certify"
+        );
+    }
+
+    /// A record whose BV operands do NOT derive from this VC's multiply operands must
+    /// DECLINE — the fresh-variable link is the only thing tying the certified
+    /// predicate to the right subject.
+    #[test]
+    fn a_subject_desynced_bitvector_core_declines() {
+        let f = binop_func(BinOp::Mul, 8, false);
+        let vcs = trust_vcgen::generate_vcs(&f);
+        let vc = vcs
+            .iter()
+            .find(|vc| matches!(vc.kind, trust_types::VcKind::ArithmeticOverflow { .. }))
+            .expect("overflow VC");
+        let rec = vc.obligation.as_ref().expect("record").clone();
+        let ObligationWrapper::ConjoinFactsLast { facts } = &rec.wrappers[0] else {
+            panic!("the BV-path record has one ConjoinFactsLast wrapper")
+        };
+        // Same width, same shape, but over the fresh images of OTHER locals.
+        let (other_core, _) = emitted_bv_core(8, "zzz", "qqq");
+        let mut new_facts = facts.clone();
+        *new_facts.last_mut().expect("a fact") = other_core;
+        let doctored = ObligationRecord {
+            body: rec.body.clone(),
+            wrappers: vec![ObligationWrapper::ConjoinFactsLast { facts: new_facts }],
+            subject: rec.subject.clone(),
+            width: rec.width,
+        };
+        let mut vc2 = vc.clone();
+        vc2.formula = reconstruct_obligation(&doctored);
+        vc2.obligation = Some(doctored);
+        assert!(
+            !matches!(trustir_safety_vc_adequate(&f, &vc2), RefinementVerdict::ProvenModulo3),
+            "a BV core over unrelated operands must not certify"
+        );
+    }
+
+    /// The CONSTANT-multiplier multiply takes the Int/LIA path and has NO BV fact, so
+    /// the arm must leave it exactly as it was (this is the no-regression edge).
+    #[test]
+    fn a_record_without_a_bitvector_fact_is_untouched() {
+        // `a * a` still takes the BV path; the const-multiplier shape does not. Build
+        // it directly: `f(a: u8) -> u8 { a * 4 }`.
+        let t = || Ty::Int { width: 8, signed: false };
+        let f = VerifiableFunction {
+            name: "g".into(),
+            def_path: "crate::g".into(),
+            span: Default::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: t(), name: Some("_0".into()) },
+                    LocalDecl { index: 1, ty: t(), name: Some("a".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Mul,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(trust_types::ConstValue::Uint(4, 8)),
+                        ),
+                        span: Default::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: t(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+        let vcs = trust_vcgen::generate_vcs(&f);
+        for vc in vcs.iter().filter(|vc| is_safety_vc_kind(&vc.kind)) {
+            if let Some(rec) = vc.obligation.as_ref() {
+                assert!(
+                    recorded_bv_umul_core(rec).is_none(),
+                    "the constant-multiplier multiply must carry no BV core"
+                );
+            }
+            assert_eq!(
+                trustir_safety_vc_adequate(&f, vc),
+                RefinementVerdict::ProvenModulo3,
+                "the Int/LIA umul row must be unaffected by the BV arm"
+            );
+        }
+    }
+}

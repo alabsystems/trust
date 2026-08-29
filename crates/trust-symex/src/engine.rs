@@ -198,6 +198,9 @@ impl SymbolicExecutor {
             Terminator::Call { func, .. } => Err(unsupported(format!(
                 "call terminator requires a function summary before symex: {func}"
             ))),
+            Terminator::TailCall { func, .. } => Err(unsupported(format!(
+                "tail-call terminator requires a function summary before symex: {func}"
+            ))),
             Terminator::Drop { place, .. } => Err(unsupported(format!(
                 "drop terminator requires drop semantics before symex: {}",
                 place_to_name(place)
@@ -513,8 +516,7 @@ fn unsupported(message: impl Into<String>) -> SymexError {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
-    use trust_types::{AssertMessage, BlockId, SourceSpan};
+    use trust_types::{AssertMessage, BlockId, SourceSpan, UnwindEdge};
 
     use super::*;
 
@@ -726,13 +728,17 @@ mod tests {
         let block = BasicBlock {
             id: BlockId(0),
             stmts: vec![],
-            terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+            terminator: Terminator::Call {
+                unwind: UnwindEdge::Unreachable,
+                is_unsafe_sig: false,
+                is_foreign: false,
                 func: "callee".into(),
                 args: vec![],
                 dest: Place::local(2),
                 target: Some(BlockId(1)),
                 span: span(),
                 atomic: None,
+                callee_identity: None,
             },
         };
 

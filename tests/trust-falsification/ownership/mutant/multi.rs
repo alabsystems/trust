@@ -6,4 +6,7 @@
 pub struct Token(u32);
 fn sink(_t: Token) {}
 #[trust::must_consume]
-pub fn handle(a: Token, b: Token) { sink(a); let _ = b.0; }
+pub fn handle(a: Token, b: Token) {
+    sink(a);
+    let _ = b.0;
+}

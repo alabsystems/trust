@@ -1162,8 +1162,7 @@ fn should_encode_mir(
     //
     // Registry lookup, never a HIR-derived filter: a Clean-origin def is exactly the
     // thing HIR inventories cannot see.
-    if tcx.resolutions(()).clean_origin_defs.iter().any(|&(clean_def, _, _)| clean_def == def_id)
-    {
+    if tcx.resolutions(()).clean_origin_defs.iter().any(|&(clean_def, _, _)| clean_def == def_id) {
         return (true, true);
     }
     match tcx.def_kind(def_id) {

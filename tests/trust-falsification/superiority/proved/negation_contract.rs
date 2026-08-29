@@ -10,4 +10,6 @@
 // `ret < 0` under `requires(x > 0)` (default mode, 0 runtime-checked).
 #[core::contracts::requires(x > 0)]
 #[core::contracts::ensures(move |r: &i32| *r < 0)]
-pub fn negate(x: i32) -> i32 { -x }
+pub fn negate(x: i32) -> i32 {
+    -x
+}

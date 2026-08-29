@@ -20,10 +20,9 @@
 //     ResumedAfterReturn sentinel), not by hand-building a formula, so the test
 //     exercises the same seam production does.
 
-use trust_types::UnwindEdge;
 use trust_types::{
     AssertMessage, BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-    SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::coroutine_sentinel::coroutine_sentinel_refutation_vcs;

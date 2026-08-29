@@ -1,0 +1,493 @@
+# Ratcheted self-proof baseline for `trust-semantics`, a crate in trustc's OWN
+# link closure (reached via trust-vcgen -> rustc_mir_transform). This is the
+# "real compiler-dependency crate" that docs/SELF_PROOF.md §5 item 1 asks for
+# and that scripts/trust_self_verify.sh lacks — that lane runs on extracted
+# MINIATURES of compiler logic, which are not the compiler.
+#
+# Gate: scripts/trust_self_verify_crate.sh   (selftest: --selftest)
+#
+# ###########################################################################
+# READ THIS FIRST — THE CRATE DOES NOT CURRENTLY VERIFY, AND THE NUMBERS BELOW
+# DESCRIBE ONLY THE BODIES THAT LOWERED.
+#
+# Caught 2026-08-26 by this gate's own did-not-compile refusal, on the first
+# real run after that check was added. `targo trust check -p trust-semantics`
+# ends with:
+#
+#   error: could not compile `trust-semantics` (lib) due to 27 previous errors
+#
+# preceded by SEVEN `Trust full verification failed for ...: native typed-
+# TrustIr lowering did not complete, so the panic-freedom of an unmodeled
+# construct could not be established` — on `le_int`, `ensure_hle`,
+# `overflow_safety_env`, `rustvir_safety_env`, `rustvir_full_env`,
+# `noOverflow_violation_formula`, `noOverflow_safe_range_formula`.
+#
+# Those seven errors are present in EVERY measurement of this crate taken on
+# 2026-08-26, identical set, including the ones taken BEFORE any contract was
+# attached. They were not introduced by the contract work. They were simply
+# never read: the `Summary:` line says `0 failed` because a body whose lowering
+# ABORTS emits no obligations to fail with — only its surviving `unreachable`
+# row, which proves. Coverage says `24/24 (complete)` because those bodies were
+# PROCESSED; they just had nothing left to ask.
+#
+# So this gate now REFUSES this crate, and will keep refusing until the seven
+# lowering failures are fixed. That is correct and intended: the floors below
+# are NOT a certificate that the crate verifies. They are a record of what the
+# lowered subset produced, kept so the eventual fix has something to compare
+# against. Do not cite them as a self-proof result.
+# ###########################################################################
+#
+# MEASURED 2026-08-26 from
+#   RUSTFLAGS=--cfg=trust_contracts targo trust check -p trust-semantics
+# against driver `rustc 1.99.0-dev (095ba9993 2026-08-26) (trustc 0.1.0)`
+# — ON THE LOWERED SUBSET ONLY, see the block above:
+#
+#   Summary:  29 proved, 0 failed, 2 runtime-checked, 6 assumed,
+#             12 mandated, 0 contract-panic, 42 inconclusive (91 total)
+#   Coverage: 24/24 eligible function bodies verified (complete)
+#   certified (sum of per-function kernel-rechecked rows): 7
+#
+# What DOES survive the correction: the contract propagation genuinely
+# discharged obligations on the bodies that lowered — proved 23 -> 25 -> 29 as
+# the domain was pushed outward, the two FAILED caller-side rows became PROVED,
+# and the row TOTAL rose 83 -> 89 -> 91 at every step, so nothing vanished.
+# That is a real result about those bodies. It is not a result about the crate.
+#
+# READ THIS BEFORE RAISING ANY NUMBER.
+#
+# `floor` entries are MONOTONE — they may only rise, and a rise is a claim that
+# the improvement is real. Never express them as a percentage: a percentage
+# improves when the DENOMINATOR shrinks, and an obligation that disappears is
+# not one that proved.
+#
+# `assumed_max` is a CEILING and is the load-bearing entry. SELF_PROOF.md §5
+# item 2 records annotating the callee perimeter with `#[trust::assume_total]`
+# as FORBIDDEN: it converts every `[trust-absent-callee-assumption]` row into an
+# `AssumedTotalCalleeAssumption` row, and "the crate would go green while
+# proving strictly less than it does today. It is the cheapest way to make the
+# number move and it is the wrong one." A floor on proved rows does NOT catch
+# that — proved goes UP under laundering. Only this ceiling does. The gate's
+# --selftest mutation-proves exactly that case.
+#
+# WHAT A PASS DOES NOT MEAN. This is a ratchet, not a strict-lane pass. The run
+# still exits 1: 2 runtime-checked rows remain, both `[trust-absent-callee-
+# assumption]` rows for `clean_kernel` bodies that no verification fact crosses
+# the crate boundary for. See SELF_PROOF.md §2.4 — absent callees are the
+# dominant unproved class, and closing them with assumptions is the forbidden
+# move above.
+#
+# The 6 `assumed` rows are the definition-entry assumptions of the six
+# `#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]` clauses
+# in crates/trust-semantics/src/lib.rs. They are CONDITIONAL and disclosed:
+# each says "every caller must establish this". Repo-wide the only callers of
+# those functions outside the crate live in `crates/trust-vcgen/src/range.rs`
+# under `#[cfg(test)] mod tests`, so nothing in a shipping path establishes
+# them today. That is honest conditionality, not a discharged obligation — do
+# not read `0 failed` as "the domain is proved".
+#
+# ###########################################################################
+# 2026-08-27 — WHY CONTRACTS CANNOT CARRY THIS CRATE TO A STRICT PASS.
+#
+# Asked to drive this crate to a non-vacuous strict pass BY WRITING CONTRACTS.
+# Measured with `RUSTFLAGS=--cfg=trust_contracts targo trust check -p
+# trust-semantics` on targo/trustc `31ccf1b56 2026-08-27`:
+#
+#   exit 1
+#   Summary:  31 proved, 0 failed, 2 runtime-checked, 6 assumed, 12 mandated,
+#             0 contract-panic, 48 inconclusive (99 total)
+#   Coverage: 24/24 eligible function bodies verified (complete)
+#   Gate:     FAIL [strict lane, exit 1]
+#   error: could not compile `trust-semantics` (lib) due to 27 previous errors
+#
+# The 31 proved SPLIT BY KIND is 27 safety + 4 `unreachable`. Quote the split:
+# `VcKind::Unreachable`'s formula is `Bool(true)` and proving it deletes no
+# runtime check.
+#
+# ALL 24 function bodies are INCONCLUSIVE. Not one is fully verified. The 21
+# functions carrying the 27 errors partition into three classes, and NONE of
+# them is an under-strength contract:
+#
+#   13  ABSENT CALLEE, sole-blocked, one row each. `int_ty`, `prop_ty`,
+#       `and_prop`, `lt_int`, `int_zero`, `binary_int_pred`, `no_overflow_type`,
+#       `no_overflow_body`, `no_neg_overflow_sub_body`, `noOverflow_app`,
+#       `noOverflow_definition`, `noNegOverflowSub_app`,
+#       `noNegOverflowSub_definition`. Every one is
+#         [assertion] [trust-absent-callee-assumption] call to absent callee
+#         `clean_kernel::name::Name::from_string` (body not in the lowered
+#         bundle) may panic UNKNOWN
+#       NOT closable by any contract, anywhere. The cross-crate bundling gate is
+#       a hardcoded crate-NAME allowlist — trust_verify.rs:27944,
+#       `if !matches!(callee_krate.as_str(), "std" | "core" | "alloc") { continue; }`
+#       — so `clean_kernel` bodies never enter the bundle. A postcondition on
+#       `Name::from_string` in first-party/clean would not be read, because the
+#       callee is excluded before any contract is consulted. This is a compiler
+#       change (widen the allowlist), not authoring work.
+#
+#    7  NATIVE LOWERING INCOMPLETE. `le_int`, `ensure_hle`, `overflow_safety_env`,
+#       `rustvir_safety_env`, `rustvir_full_env`, `noOverflow_violation_formula`,
+#       `noOverflow_safe_range_formula` — "native typed-TrustIr lowering did not
+#       complete, so the panic-freedom of an unmodeled construct could not be
+#       established". These bodies build `clean_kernel::Expr` trees. Producer
+#       work; a contract cannot supply a lowering.
+#
+#    3  ARITHMETIC. `signed_min` (9), `signed_max` (8), `type_max_formula` (5).
+#       These are the only contract-shaped ones, and their unproved rows are
+#       still not contract-strength gaps: the `hardened_panic_boundary`
+#       Overflow(Shl/Sub/Neg) twins (the `unix_hardened` twin gap), an ay
+#       authority downgrade on `shift_overflow_shl` ("compiler transport claimed
+#       a favorable outcome without attachable proof evidence"), and a producer
+#       ENCODING defect on the postcondition VC:
+#         invalid native solve input `request.obligation.vc`: integer constant
+#         340282366920938463463374607431768211456 does not fit i128
+#       (that constant is 2^128).
+#
+# AND THE METHOD IS ANTI-CORRELATED WITH THE GOAL. Controlled experiment, one
+# variable, in tests/self-proof/strict-pass-frontier (pinned by
+# scripts/trust_strict_pass_frontier.sh so it cannot drift):
+#
+#   pass.rs        exit 0  Gate: PASS          2 proved, 0 unknown       (2 total)
+#   + one ensures  exit 1  Gate: FAIL          3 proved, 2 inconclusive  (5 total)
+#   + one requires exit 1  Gate: INCONCLUSIVE  2 proved, 1 assumed       (3 total)
+#
+# Bodies byte-identical; the only change is one TRUE contract clause. The clause
+# is genuinely proved (`ens` reports one `[postcondition] PROVED`,
+# kernel-rechecked; the FALSE twin `ens_false.rs` reports zero, so the row
+# discriminates). What breaks the pass is the COMPANION rows each clause mints.
+#
+# CORRECTION (2026-08-27, same day): an earlier revision of this block said
+# those companion rows are ones "that nothing can discharge", and that every
+# clause moves this crate at least one row FURTHER from a strict pass. **That
+# generalization is FALSE.** `tests/self-proof/strict-pass-frontier/multi.rs`
+# carries a grammar `ensures result <= 100` and measures exit 0, Gate: PASS
+# [strict lane], Coverage 2/2 complete, 4 proved / 0 failed / 0 unknown, with
+# two [PROVED] [postcond] rows that are KERNEL-RECHECKED and zero `unreachable`
+# rows. The `trust-exact-source-clause-discharge` marker therefore DOES
+# discharge — it is ABSENT from a passing run, not UNKNOWN.
+#
+# The accurate, narrow statement: for `ensures`, a
+# `trust-exact-source-clause-discharge` catalog marker and a trust-mc native row;
+# on THIS crate's shapes the native row can go Inconclusive (measured: a
+# per-branch VC `n / d <= n`, unsigned-division non-increasing). That is a
+# solver-coverage gap on specific shapes, NOT a law about contracts. Do not
+# read this file as saying annotation is the wrong lever.
+# for `requires`, the def-site `unsupported MIR FullVerification::Precondition`
+# marker that `native_contract_vc_kind` routes to the UnsupportedMir fallthrough
+# on purpose. Row totals RISE (2 -> 5, 2 -> 3), so nothing vanished — the
+# additions are real and simply undischargeable.
+#
+# CONSEQUENCE: every contract clause added to this crate moves it at least one
+# row FURTHER from a strict pass. The six `requires` already here account for
+# six of the `unsupported_mir` rows and all six `assumed` rows. The ordered work
+# is (1) discharge the hardened Overflow(*) twin, (2) make the contract
+# companion markers discharge or genuinely not count, (3) widen the callee
+# bundling allowlist past std/core/alloc, (4) close the 7 lowering gaps. None of
+# the four is annotation.
+# ###########################################################################
+#
+# ###########################################################################
+# 2026-08-27 (later, driver `rustc 1.99.0-dev (779d3d46d)`) — THE 27 ERRORS,
+# ROOT-CAUSED VERBATIM. Item (4) above, "close the 7 lowering gaps", named no
+# cause; it is TWO distinct producer ceilings, and neither is about
+# `clean_kernel::Expr` trees per se. Re-measured with
+#   RUSTFLAGS=--cfg=trust_contracts targo trust check -p trust-semantics
+#
+#   exit 1
+#   Summary:  33 proved, 0 failed, 2 runtime-checked, 6 assumed, 12 mandated,
+#             0 contract-panic, 48 inconclusive (101 total)
+#   Coverage: 24/24 eligible function bodies verified (complete)
+#   error: could not compile `trust-semantics` (lib) due to 27 previous errors
+#
+# SPLIT THE PROVED COUNT: the 33 published `[PROVED]` rows are 29 real-safety
+# + 4 `[unreach]`, whose formula is `Bool(true)`. Never quote 33 unsplit.
+# (Compiler-side the json carries 37 Proved; targo WITHHELD 4 — 2
+# `hardened_panic_boundary`, 2 `shift:left` — "for want of clean-kernel or
+# publishable native proof evidence".)
+#
+# The 27 errors are 7 + 4 + 16 by SHAPE:
+#    7  `Trust full verification failed ...: native typed-TrustIr lowering did
+#       not complete`
+#    4  `Trust Level 0 safety verification incomplete ...`
+#   16  `Trust strict verification failed ...`
+#
+# and FIVE root causes by CAUSE. Every one is a deliberate fail-closed refusal
+# or an out-of-repo defect; NONE is under-strength authoring:
+#
+#   13  ABSENT CALLEE (unchanged from the block above). 11 are `clean_kernel`
+#       callees; 2 are the crate's OWN `trust_semantics::int_ty`, which is a
+#       poison-drop CASCADE (evicting the unlowerable member mints its absent
+#       row on the caller), not an independent gap.
+#
+#    4  TRUSTIR TYPE-LOWERING NODE BUDGET. `ensure_hle`, `overflow_safety_env`,
+#       `rustvir_safety_env`, `rustvir_full_env`:
+#         failed to lower `...` into typed TrustIr NativeVerificationBundle
+#         input: unsupported type: Unsupported { kind: "TyKind::Adt", detail:
+#         "recursive ADT (degraded: type lowering exceeded produced-node
+#         budget)" }
+#
+#       ###################################################################
+#       RESOLVED 2026-08-28 — AND THIS ENTRY NAMED THE WRONG GUARD.
+#
+#       WRONG ATTRIBUTION. This entry said the guard was `MAX_BUNDLE_ADT_BUDGET
+#       = 2_000_000` in crates/trust-vcgen/src/lib.rs. It is not. There are
+#       three distinct "recursive ADT (degraded: ...)" strings in the tree, one
+#       per budget, and the error quoted above carries the FIRST:
+#         "type lowering exceeded produced-node budget"
+#             -> MAX_TYPE_LOWERING_PRODUCED_NODES = 8_000,
+#                crates/trust-mir-extract/src/ty_convert.rs
+#         "function exceeded VC-generation work budget"
+#             -> MAX_GENERATION_WORK_BUDGET = 2_000_000, trust-vcgen
+#         "over per-function bundle ADT budget"
+#             -> MAX_BUNDLE_ADT_BUDGET = 2_000_000, trust-vcgen
+#       Measured: across a full verified run of this crate the other two strings
+#       occur ZERO times. `MAX_BUNDLE_ADT_BUDGET` never fires here at all, and
+#       could not — the extractor degrades the type to a one-node leaf upstream,
+#       so the bundle-side cost is trivial by the time that budget is consulted.
+#
+#       WRONG MECHANISM. This entry also said the guard exists because the
+#       cluster "NEVER COMPLETES" and that raising it "re-opens a
+#       non-terminating lowering". No run ever backed that. The runs on record
+#       (b9b201ecc4) describe an OOM-KILL WITH PROGRESS -- "29/1771 fns in 40
+#       min" -- i.e. memory exhaustion, not divergence; and ty_convert.rs's own
+#       comment already said OOM, and already said the stall is in the
+#       EXTRACTOR, "not in trust-vcgen". Measured directly on 2026-08-28 with
+#       the budget overridden to 100_000_000 under a 900 s watchdog: the
+#       lowering TERMINATED on its own in 164 s against a 171 s baseline, peak
+#       RSS 6.80 GB vs 6.84 GB, zero degradations. It does not diverge.
+#
+#       ACTUAL CAUSE: an accounting defect in the guard, not the guard's value.
+#       `convert_ty_inner` charged the size of the WHOLE produced subtree at
+#       EVERY level of its own recursion, so each node was billed once for
+#       itself and once more per ancestor -- an O(nodes x depth) meter whose
+#       effective allowance was `budget / average-depth`. Over 20319 traced
+#       walks the only type it degraded in this entire crate was
+#       `Result<(), clean_kernel::EnvError>` (an ACYCLIC error enum, not the
+#       recursive cluster the constant was written for): charged 8005 against
+#       the 8000 budget for a walk that materializes 5633 nodes and RETAINS 6.
+#       Fixed at the charge site (`fresh_node_charge`); same correction
+#       `a0f2d05e35` had already made to trust-vcgen's sibling meter.
+#
+#       EFFECT, measured (baseline -> corrected meter, budget unchanged at
+#       8_000, and byte-identical to the 100M ablation):
+#         degraded walks              83 -> 0
+#         rows                       101 -> 104   (0 LOST, 3 GAINED, 0 CHANGED)
+#         proved             29 safety + 4 unreach -> UNCHANGED
+#         "native typed-TrustIr lowering did not complete"   9 fns -> 6 fns
+#       `overflow_safety_env`, `rustvir_safety_env` and `rustvir_full_env` now
+#       LOWER; their errors become ordinary `Trust strict verification failed`
+#       verdicts on real obligations (3 new absent-callee rows) instead of a
+#       producer refusal that emitted nothing. Un-emitted is unchecked, so this
+#       is a real gain even though `proved` did not move.
+#
+#       `ensure_hle` is NOT fixed by this and was never sole-blocked: it also
+#       carries the UnmodeledSafetyAssert(NullPointerDereference /
+#       MisalignedPointerDereference) rows in cause (4) below. Per-class blocker
+#       counts in this file are FLOORS -- bodies are multi-blocked.
+#
+#       The budget STAYS at 8_000. It is the only bound on a DAG-to-tree
+#       expansion that nothing else caps, and it now sits 8000/5633 = 1.42x
+#       above the worst real walk in this crate. Do not shrink it without
+#       re-measuring, and do not cite it as a non-termination guard.
+#       ###################################################################
+#
+#    3  TRUSTIR HAS NO UNION REPRESENTATION. `le_int`,
+#       `noOverflow_violation_formula`, `noOverflow_safe_range_formula`:
+#         unsupported operation: field projection on union
+#         core::mem::maybe_uninit::MaybeUninit requires a trust-ir union
+#         representation
+#       Raised in crates/trust-ir-bridge/src/lower.rs `field_type`, on purpose:
+#       "a positively identified union has overlapping fields, while the
+#       trust-ir aggregate spelling used by this bridge has independent fields.
+#       Any field projection would therefore invent struct semantics." The
+#       union arrives from the `vec![..]` desugar, not from crate source.
+#
+#    4  L0: TWO MIR ASSERT KINDS ARE NOT MODELLED BY VCGEN. `le_int` (2),
+#       `ensure_hle` (4), and both formula builders (3 each):
+#         unsupported MIR `UnmodeledSafetyAssert(NullPointerDereference)` /
+#         `(MisalignedPointerDereference)`: safety assert not modeled by vcgen
+#       Located at `alloc/src/macros.rs:59` — `ElaborateBoxDerefs` runs BEFORE
+#       `CheckNull`/`CheckAlignment`, so `vec![..]`/`Box` become raw-pointer
+#       derefs and pick up UB-check asserts even in a `#![forbid(unsafe_code)]`
+#       crate. Modelling them makes them FAILED, not proved: discharge needs
+#       alloc-internal `NonNull` / allocator-alignment facts. The two formula
+#       builders additionally carry
+#       `TrustSymbolicAggregateFieldSortMissing` on the same `vec![..]`.
+#
+#    3  ARITHMETIC — AND THE 2^128 CONSTANT IS NO LONGER THE MAIN STORY.
+#       `signed_min` (9 obligations), `signed_max` (8), `type_max_formula` (5).
+#       The `1i128 << width` shift is where they die, and there are two
+#       independent blockers, both measured in one run:
+#         (a) `ay` returns models that FALSIFY ITS OWN ASSERTION on the shift
+#             encoding — its soundness gate fired 263 times, e.g.
+#               assertion: (= _8 (bv2nat (bvshl #x…01 ((_ int2bv 64) _9))))
+#               falsified under model: _8 = 5, _9 = 1
+#             fail-closed to `unknown` (SOUND, and an ay-side bug).
+#         (b) trust-mc's native lane returns unknown for every one:
+#             "PDR invariant candidates require fresh private consumer replay
+#             before proof-grade admission" (10x), and 11 refutations are
+#             demoted to unknown for want of producer fidelity attestation.
+#       Why the shift is not bounded linearly instead: `shift_result_range`
+#       (crates/trust-vcgen/src/guards.rs) admits `Shl` only for an UNSIGNED
+#       lhs with a CONSTANT amount. Here the lhs is `1i128` (signed) and the
+#       amount is the variable `width`, so NO result range is emitted and the
+#       consuming `- 1` / unary `-` cannot discharge. No unconditional bound
+#       exists without the path condition `width <= 127`, which is exactly what
+#       the CHC lane is for — so (a)/(b) are the real wall.
+#       The old `integer constant 340282366920938463463374607431768211456 does
+#       not fit i128` defect is still present, but ONCE, on `signed_min`.
+#       A NEW module-validity defect surfaced alongside it:
+#         invalid native solve input
+#         `native_trust_ir_bundle.module.functions.instructions`: function
+#         `no_overflow_body` block #0 instruction 0 uses Alloca without an
+#         internally bound extent, pointee-type, and alignment derivation
+#
+# WHY ITEM (3) ABOVE ("widen the callee bundling allowlist past std/core/alloc")
+# MUST NOT BE DONE AS WRITTEN. The `std|core|alloc` conjunct was REMOVED from
+# `native_trust_ir_direct_local_fn_callees` on 2026-08-25 precisely because it
+# was fail-OPEN: the in-code note records the measurement — a dependency
+# `#[inline] fn idx_inline(xs,i) { xs[i] }` built `-Ztrust-verify=off`, called
+# out of bounds, certified EXIT 0 while the binary panicked (exit 101), and
+# with the dep built advisory the recorded `outcome=failed` was discarded too.
+# Bundling is decided by MIR AVAILABILITY; VERIFICATION is decided by the
+# PRODUCING compilation, which under targo is `-Ztrust-verify=off` for every
+# dependency unit. Re-widening the allowlist re-opens that false PROVE. The
+# absent-callee rows are the correct verdict until a dependency unit can carry
+# its own obligations.
+#
+# CONSEQUENCE, stated plainly: this crate cannot be made to COMPILE under the
+# strict lane by any change to crates/trust-semantics/src/lib.rs that does not
+# delete an obligation. All five causes are compiler/solver-side, and two of
+# them (`ay`'s invalid model, a trust-ir union representation) live in
+# submodules.
+# ###########################################################################
+#
+# ###########################################################################
+# 2026-08-28 — THE CONSEQUENCE ABOVE HOLDS, BUT ITS STATED REASON IS WRONG, AND
+# THE ESCAPE CLAUSE IS WHAT CARRIES IT.
+#
+# The block above concludes: "this crate cannot be made to COMPILE under the
+# strict lane by any change to crates/trust-semantics/src/lib.rs that does not
+# delete an obligation. All five causes are compiler/solver-side."
+#
+# Both halves were tested directly, one variable per build, on driver
+# `targo/trustc 1.99.0-dev (c0f8f7596 2026-08-28)` with
+# `RUSTFLAGS=--cfg=trust_contracts targo trust check -p trust-semantics`.
+# The second sentence is FALSE. The first is TRUE — but only because of "that
+# does not delete an obligation", not because the causes are out of reach.
+#
+# BASELINE (all four lines, always quoted together):
+#   exit 1
+#   Summary:  33 proved, 0 failed, 1 runtime-checked, 6 assumed, 12 mandated,
+#             0 contract-panic, 52 inconclusive (104 total)
+#   Coverage: 24/24 eligible function bodies verified (complete)
+#   error: could not compile `trust-semantics` (lib) due to 28 previous errors
+#   PROVED SPLIT: 29 real safety/functional + 4 `unreach` (formula `Bool(true)`).
+#   Publication boundary: 39 passed the compiler, 34 published, 5 WITHHELD.
+#
+# ---------------------------------------------------------------------------
+# EXPERIMENT A — `vec![..]` -> `Vec::from([..])`.  REJECTED, REVERTED.
+#
+# CAUSE (3) "TRUSTIR HAS NO UNION REPRESENTATION" AND CAUSE (4) "TWO MIR ASSERT
+# KINDS NOT MODELLED BY VCGEN" ARE ONE SOURCE-LEVEL IDIOM, NOT TWO COMPILER
+# GAPS. Both are wholly attributable to the NON-EMPTY arm of `vec![..]`. This
+# crate had exactly five such sites, in four functions — `le_int` (1),
+# `ensure_hle` (2), `noOverflow_violation_formula` (1),
+# `noOverflow_safe_range_formula` (1) — which is precisely the function set
+# causes (3) and (4) name. `library/alloc/src/macros.rs:59` expands
+# `vec![a, b]` to
+#   box_assume_init_into_vec_unsafe(write_box_via_move(Box::new_uninit(), [a,b]))
+# and `write_box_via_move` is a `#[rustc_intrinsic]` that rustc_mir_build lowers
+# INTO THE CALLER'S OWN MIR (`expr/into.rs`, `sym::write_box_via_move`) as
+#   (*b).value.value.value = val;
+# — a `Box<MaybeUninit<[T; N]>>` Deref plus union-field projections, appearing in
+# a `#![forbid(unsafe_code)]` crate that declares no union and boxes nothing.
+# Empty `vec![]` is a different macro arm (`Vec::new()`) and is harmless.
+#
+# `Vec::from([..])` is `<[T]>::into_vec(Box::new(s))`: same `Vec`, but the
+# allocation and its obligations sit in `Vec::from`'s own body instead of inline
+# in ours. Meaning preservation is externally pinned — all 7 crate tests pass,
+# including `test_violation_formula_matches_range_rs_shape`, which compares the
+# `Vec::from`-built production term against a `vec![..]`-built expectation.
+#
+# MEASURED:
+#   exit 1                                                   (unchanged)
+#   errors                            28 -> 24
+#   Coverage                          24/24 complete         (unchanged)
+#   Summary  20 proved, 0 failed, 1 runtime-checked, 6 assumed, 12 mandated,
+#            0 contract-panic, 32 inconclusive (71 total)
+#   ROW TOTAL                        104 -> 71   (35 LOST, 2 GAINED, 0 CHANGED)
+#   PROVED                            33 -> 20;  real safety 29 -> 16
+#   `field projection on union MaybeUninit`   26 -> 0
+#   `UnmodeledSafetyAssert(...)`              20 -> 0
+#   `le_int` and `ensure_hle` LOWER for the first time — both lost their
+#     "native typed-TrustIr lowering did not complete" error and each GAINED the
+#     honest absent-callee row it previously could not emit.
+#
+# THE ERROR COUNT IMPROVED AND THE CRATE GOT WORSE. 27 of the 35 lost rows are
+# the vec!-desugar's own memory obligations at alloc/src/macros.rs:59; that
+# operation is gone, so arguably so should they be. THE OTHER EIGHT ARE NOT:
+#
+#   4  [PROVED] [hardened_unsafe_operation] (clean-kernel-certified)
+#      [unsafe:sep:alloc] allocation result null check for
+#      `alloc::boxed::Box::<Formula>::new` in `noOverflow_violation_formula`
+#   4  the same, in `noOverflow_safe_range_formula`
+#
+# Each of those two functions contains exactly four `Box::new` calls and had
+# exactly four such rows. THOSE CALL SITES WERE NOT TOUCHED BY THE PATCH. The
+# allocations still happen; their kernel-certified null-check proofs simply stop
+# being emitted (`unsafe:sep:alloc` occurrences 16 -> 0). Un-emitted is
+# unchecked — and it is invisible in the one number that moved the right way.
+# A reader optimizing `28 -> 24` ships this.
+#
+# ---------------------------------------------------------------------------
+# EXPERIMENT B — the 12 `mandated` rows, `.ok()` -> `?`.  REJECTED, REVERTED.
+#
+# The mandate fires on a LITERAL NEEDLE, `"core::result::Result::ok"`
+# (crates/trust-vcgen/src/hardened.rs `CallRule`). So ANY rewrite that removes
+# the `.ok()` call removes the row — including a `match` that still drops the
+# error. That is needle evasion, not discharge. Nor can the row be discharged in
+# place: this run's own evidence note for
+# `vc:trust_semantics__rustvir_safety_env:error_discard:1` reads "TrustSpecPredicate
+# lowered to boolean true; no trust-mc CHC error condition was emitted" — there is
+# no condition to prove. The only non-evasive rewrite is real PROPAGATION, i.e.
+# three `pub fn`s changing from `Option<Environment>` to
+# `Result<Environment, EnvError>`.
+#
+# Measured that anyway (all 7 tests still pass):
+#   exit 1                                                   (unchanged)
+#   errors                            28 -> 28               (UNCHANGED)
+#   Coverage                          24/24 complete         (unchanged)
+#   Summary  33 proved, 0 failed, 1 runtime-checked, 6 assumed, 0 mandated,
+#            0 contract-panic, 52 inconclusive (92 total)
+#   ROW TOTAL                        104 -> 92   (-12, exactly the 12 mandate
+#            rows; the 4 other lost/gained keys are BlockId renumbering twins,
+#            17->16 / 24->23 / 64->62 / 65->63, same kind and same outcome)
+#   PROVED                            33 -> 33   (UNCHANGED, 29 real + 4 unreach)
+#
+# Twelve rows deleted, ZERO errors removed, zero obligations discharged. The
+# `mandated` bucket contributes to the per-function "N obligation(s) were not
+# fully verified" counts (`overflow_safety_env` 5->2, `rustvir_full_env` 8->2,
+# `rustvir_safety_env` 3->2) but never to the ERROR COUNT, so removing it buys
+# nothing and costs the only record that the hazard is there.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS LEAVES. Causes (1) absent-callee, (2) the bundle-admission refusal
+# "member has a guarded or non-entry-prefix Assert" (crates/trust-ir-bridge/src/
+# lower.rs) that poisons `type_min_formula`/`type_max_formula` through
+# `signed_min`/`signed_max`, and (5) the ay/trust-mc shift encoding are untouched
+# by either experiment and remain compiler/solver-side. Cause (2) is not
+# authoring-reachable either: making `signed_max`'s Assert unguarded and
+# entry-prefix means deleting the branch structure that makes the body TOTAL,
+# reintroducing the panics the totality rewrite removed — and that admission path
+# only derives `Not(Eq(v, 0))` divisor shapes, so an unguarded `Shl` Assert has no
+# admitted shape there in the first place.
+#
+# NET: source-level authoring CAN move this crate's error count (28 -> 24, ~14%),
+# and the mechanism is now named and located. It cannot do so without deleting
+# obligations, which is exactly what the sentence above claimed. Both patches were
+# reverted; neither is in the tree. Do not re-derive Experiment A from the error
+# count alone.
+# ###########################################################################
+
+certified_min = 7
+proved_min    = 29
+assumed_max   = 6

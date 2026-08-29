@@ -1,10 +1,10 @@
+// ignore-tidy-dbg -- `lenwitness_dbg!` is a gated debug channel, not std dbg!; tidy's check is textual
 // trust_vcgen/generate.rs: Core verification condition generation
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::{FxHashMap, FxHashSet};
-
 use trust_types::{
     AggregateKind, AssertMessage, BinOp, BlockId, ConstValue, ContractKind, ContractMetadata,
     Formula, GuardCondition, ObligationRecord, ObligationWrapper, Operand, PathGuardTerm, Place,
@@ -12,11 +12,10 @@ use trust_types::{
     VerifiableFunction, VerificationCondition, VerificationResult,
 };
 
-use crate::abstract_interp;
-
 use crate::{
-    contracts, ffi_summary, ffi_vcgen, guards, hardened, memory_ordering, operand_to_formula,
-    place_to_var_name, rvalue_safety, sep_engine, spec_parser, termination, unsafe_verify,
+    abstract_interp, contracts, ffi_summary, ffi_vcgen, guards, hardened, memory_ordering,
+    operand_to_formula, place_to_var_name, rvalue_safety, sep_engine, spec_parser, termination,
+    unsafe_verify,
 };
 
 /// Cap on the number of case-split branches a single relation may expand into
@@ -433,7 +432,7 @@ enum LocalDef<'a> {
 }
 
 /// Linear comparison shapes recognized by the BV guard translation.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BvGuardCmp {
     Le,
     Lt,
@@ -556,7 +555,8 @@ struct FloatRangeCtx<'a> {
     /// passed during computation, so its enclosure is context-independent;
     /// a refusal may be stack-dependent (deeper nesting, mid-cycle) and is
     /// NEVER cached (fail-closed recomputation).
-    trace_memo: std::rc::Rc<std::cell::RefCell<FxHashMap<(BlockId, String, String, String), (f64, f64)>>>,
+    trace_memo:
+        std::rc::Rc<std::cell::RefCell<FxHashMap<(BlockId, String, String, String), (f64, f64)>>>,
 }
 
 impl<'a> FloatRangeCtx<'a> {
@@ -834,7 +834,31 @@ impl StmtVersionCtx {
         // (whole-place `s = ..` before a field read `s.v`; a havoc of `r` before
         // a pointee read `r*`) pass the search yet be gated out here, silently
         // falling through to the entry map with the write invisible.
-        if writes_until(func, bb, stmt_idx).iter().any(|w| place_names_overlap(w, name)) {
+        // Trust #soundness (2026-08-26): the gate must admit EXACTLY what the
+        // `stmt_writes_name` search below admits, which is
+        // `place_names_overlap(dest, name) || write_covers_derived_slice_len(dest, name)`.
+        // Testing only the first left a write of `p` invisible for the DERIVED name
+        // `p__slice_len` (`place_names_overlap("p", "p__slice_len")` is FALSE — `_` is
+        // not a projection separator), so a same-block reassignment fell through to the
+        // inter-block entry map and the read kept its PRE-reassignment token.
+        //
+        // MEASURED via TRUST_DUMP_V2_VC on
+        // `let mut p=&raw const *sa; if sa.len()>2 { p=&raw const *sb; (*p)[2] }`:
+        //     Eq(p__slice_len#s0_1, sa__slice_len)   <- tie, at its establish token
+        //     Eq(p#s2_3, _7)                         <- reassignment DOES bump `p`
+        //     Eq(_10, p__slice_len#s0_1)             <- but the READ still reads #s0_1
+        // The base name is versioned and the derived one is not, so the stale length
+        // unified with the read and the bounds row shipped `proved` while the binary
+        // panics "index out of bounds: the len is 1 but the index is 2".
+        //
+        // Mirroring the search is what makes this safe rather than a widening: the
+        // `s{b}_pre` phantom-token arm below (the hazard `writes_until`'s own doc warns
+        // about) is unreachable for a name admitted here, because the search tests the
+        // same disjunction statement-by-statement and must therefore find one.
+        if writes_until(func, bb, stmt_idx)
+            .iter()
+            .any(|w| place_names_overlap(w, name) || write_covers_derived_slice_len(w, name))
+        {
             // P-A: the LATEST single statement < stmt_idx that ITSELF writes an
             // overlap of `name` gives a point-distinct token. Test each statement
             // directly (`stmt_writes_name`), NOT the cumulative `writes_until` delta —
@@ -883,6 +907,21 @@ impl StmtVersionCtx {
             return None;
         }
         Some(toks.iter().cloned().collect::<Vec<_>>().join("_"))
+    }
+
+    /// True iff `block`'s entry-version map TRACKS a name overlapping `name`.
+    ///
+    /// Where it does NOT, [`Self::version_token_at`]'s `None` does not mean "the
+    /// entry value". `block_entry_versions` builds its predecessor lists from
+    /// `v2_terminator_targets`, which has no unwind arm, so a block reached only by
+    /// a cleanup edge gets an EMPTY map and every name renders bare there
+    /// regardless of its real version — while `v2_path_def_fixpoint` DOES transport
+    /// facts across those same edges. A caller that reads a bare (or `#e`) spelling
+    /// AS the entry value must consult this first.
+    pub(crate) fn entry_map_covers(&self, block: BlockId, name: &str) -> bool {
+        self.entry
+            .get(&block)
+            .is_some_and(|em| em.keys().any(|tracked| place_names_overlap(tracked, name)))
     }
 
     /// Overlap-aware staleness at a precise point: is a fact whose sole free var is
@@ -1219,83 +1258,84 @@ mod call_facts;
 // with a definition. Its own module because it is the only place in this crate
 // that ADDS facts to the hypothesis set — see its header for the soundness
 // discipline that follows from that.
-mod intrinsic_semantics;
-mod ite;
-mod int_conversion;
-mod semantic_guard;
-mod iterator_yield;
+mod alloc_bounds;
+mod alloc_vcs;
+mod assert_refutation;
+mod block_defs;
+mod bmc_reduction;
 mod callee_summaries;
-mod value_facts;
-mod induction;
-mod loop_bounds;
-mod container_len;
-mod entry;
-mod unsupported;
-mod unwrap_panic;
-mod slice_conversion;
-mod discharge;
+pub(crate) mod callee_write_set;
 mod callsite;
 mod callsite_replay;
-mod safety;
-mod alloc_bounds;
-mod panic_calls;
-mod alloc_vcs;
-mod type_ranges;
-mod overflow_vc;
-mod assert_refutation;
-mod bmc_reduction;
-mod block_defs;
 mod checked_vcs;
-mod float_range;
+mod container_len;
+mod contract_vcs;
+mod discharge;
+mod entry;
+mod entry_hypothesis;
 mod float_overflow;
+mod float_range;
+mod havoc_decline;
+mod induction;
+mod int_conversion;
+mod intrinsic_semantics;
+mod ite;
+mod iterator_yield;
+mod loop_bounds;
+mod overflow_vc;
+mod panic_calls;
 mod path_defs;
 mod per_path_refute;
-pub(crate) mod callee_write_set;
+mod safety;
+mod semantic_guard;
+mod slice_conversion;
+mod type_ranges;
+mod unsupported;
+mod unwrap_panic;
+mod value_facts;
 mod witness_grounding;
-mod contract_vcs;
-mod entry_hypothesis;
 // Trust (coroutine resume-state contract): the refutation-lane prover for the
 // compiler-inserted `ResumedAfter*` executor-protocol sentinels. Deliberately a
 // module of its own — see its header.
 pub(crate) mod coroutine_sentinel;
 
+pub(crate) use alloc_bounds::*;
+pub(crate) use alloc_vcs::*;
+pub use assert_refutation::*;
+pub(crate) use block_defs::*;
+pub use bmc_reduction::*;
 use call_facts::*;
-use intrinsic_semantics::*;
-use ite::*;
-use int_conversion::*;
-pub(crate) use semantic_guard::*;
-use iterator_yield::*;
 pub use callee_summaries::*;
-pub(crate) use value_facts::*;
-use induction::*;
-use loop_bounds::*;
-pub(crate) use container_len::*;
-pub use entry::*;
-pub(crate) use unsupported::*;
-pub(crate) use unwrap_panic::*;
-use slice_conversion::*;
-pub use discharge::*;
 pub use callsite::*;
 pub use callsite_replay::*;
-pub use safety::*;
-pub(crate) use alloc_bounds::*;
-pub(crate) use panic_calls::*;
-pub(crate) use alloc_vcs::*;
-pub(crate) use type_ranges::*;
+pub(crate) use checked_vcs::*;
+pub(crate) use container_len::*;
+use contract_vcs::*;
+pub use discharge::*;
+pub use entry::*;
+use entry_hypothesis::*;
+use float_overflow::*;
+pub use float_range::*;
+use induction::*;
+use int_conversion::*;
+use intrinsic_semantics::*;
+use ite::*;
+use iterator_yield::*;
+use loop_bounds::*;
 pub(crate) use overflow_vc::*;
-pub use assert_refutation::*;
+pub(crate) use panic_calls::*;
+pub(crate) use path_defs::*;
 pub use per_path_refute::{
     generate_per_path_assert_refutation_vcs, generate_per_path_assert_refutation_vcs_with_context,
 };
-pub use bmc_reduction::*;
-pub(crate) use block_defs::*;
-pub(crate) use checked_vcs::*;
-pub use float_range::*;
-use float_overflow::*;
-pub(crate) use path_defs::*;
+pub use safety::*;
+pub(crate) use semantic_guard::*;
+use slice_conversion::*;
+pub(crate) use type_ranges::*;
+pub(crate) use unsupported::*;
+pub(crate) use unwrap_panic::*;
+pub(crate) use value_facts::*;
 use witness_grounding::*;
-use contract_vcs::*;
-use entry_hypothesis::*;
 
 #[cfg(test)]
 mod coroutine_sentinel_tests;
@@ -1303,18 +1343,37 @@ mod coroutine_sentinel_tests;
 // compiler-extracted resume body of the falsification fixture, not a synthetic
 // one. See the file header for why that distinction is load-bearing.
 #[cfg(test)]
-mod coroutine_sentinel_real_mir_tests;
-#[cfg(test)]
 mod clamp_upper_bound_tests;
+#[cfg(test)]
+mod coroutine_sentinel_real_mir_tests;
+// Trust (false-obligation lane): safe vs. unsafe intrinsics — the missing-SAFETY
+// demand AND (since the 2026-08-28 split) the SEP-ALLOC ROW SET, pinned in both
+// directions. `has_intrinsic_unsafe_surface` no longer gates the sep engine; the
+// row-set tests here assert on `generate_vcs` output rather than on that
+// predicate, because the predicate-only form was blind — it passed both with the
+// row set fixed and with the defect re-introduced. Lives here rather than in
+// `unsafe_verify::tests` because the gate it must pin is `pub(super)` to this
+// module.
+#[cfg(test)]
+mod safe_intrinsic_lint_tests;
+// Trust (false-obligation lane): the compiler's modular-arithmetic certificate —
+// `intrinsics::wrapping_add` vs. a plain `+` in the identical extracted shape.
+#[cfg(test)]
+mod modular_arith_certificate_tests;
+// Trust (width-soundness): overflow rows for widthless-constant operands must be
+// built at the VALIDATED destination width, never a fabricated i64 — the
+// `_0: i8 = Add(100, 100)` false-PROVE regression.
+#[cfg(test)]
+mod overflow_width_tests;
 // Trust (std-intrinsics lane): the EXHAUSTIVE width-8 differential against the
 // real Rust operations, plus the recognizer-strictness and vacuity checks. This
 // is the module that makes the added facts auditable — see its header.
 #[cfg(test)]
+mod call_arg_fact_token_tests;
+#[cfg(test)]
 mod intrinsic_semantics_tests;
 #[cfg(test)]
 mod recursion_decreases_production_variant_tests;
-#[cfg(test)]
-mod call_arg_fact_token_tests;
 #[cfg(test)]
 mod summary_callsite_tests;
 // Callsite L0 replay (refutation-only): the substitution filter's
@@ -1324,9 +1383,13 @@ mod summary_callsite_tests;
 #[cfg(test)]
 mod callsite_replay_tests;
 #[cfg(test)]
-mod v2_path_guard_tests;
-#[cfg(test)]
 mod contract_field_bound_tests;
+#[cfg(test)]
+mod v2_path_guard_tests;
+// The two path-guard COLLAPSE modes and the anti-vacuity guard on the fixtures
+// that exercise them.
+#[cfg(test)]
+mod path_guard_collapse_tests;
 // A `bool` contract clause could never equal the re-parse of its own source
 // text, because `parse_spec_expr` has no type environment and defaults every
 // leaf to `Sort::Int`. That minted a duplicate ill-sorted postcondition VC and
@@ -1339,19 +1402,35 @@ mod clause_sort_match_tests;
 // FREE, so an early-return body's clause AND its exact negation were both
 // "refuted" — identical verdicts for P and !P.
 #[cfg(test)]
+mod bounds_const_index_tests;
+// The rvalue lane's native-`BoundsCheck` suppression is EXACT-BINDING (cond
+// resolved in the assert's own block, index identity, length correspondence,
+// sole-entry success edge), never bare target identity — the same discipline
+// the Overflow/OverflowNeg and Div/Rem lanes carry. These tests pin both
+// directions: the unrelated row emits, the exactly-bound row stays suppressed.
+#[cfg(test)]
+mod bounds_exact_binding_tests;
+#[cfg(test)]
 mod early_return_postcondition_tests;
+// The AGGREGATE-FIELD twin of the two defects above, and the one still OPEN: a
+// clause over a FIELD of the returned struct, whose source local is written in
+// two select arms. The clause is negated at `_0.0#s3_0` while the field pin
+// carries `_0.0`, and the merge pin ties the former to the reaching-def join
+// `c#s1_0_s2_0` that no arm defines -- `is_return_slot_name` matches neither
+// `_0.0` nor `_0.0#tok`, and `return_edge_merge_pins` covers only
+// &mut-parameter places. Its one test is #[ignore]d with the diagnosis.
+#[cfg(test)]
+mod aggregate_field_join_version_tests;
 #[cfg(test)]
 mod float_range_tests;
 #[cfg(test)]
-mod bounds_const_index_tests;
-#[cfg(test)]
-mod trait_object_unsize_cast_tests;
-#[cfg(test)]
-mod round14_stability_tests;
+mod return_pin_dedup_tests;
 #[cfg(test)]
 mod return_projection_pin_tests;
 #[cfg(test)]
-mod return_pin_dedup_tests;
+mod round14_stability_tests;
+#[cfg(test)]
+mod trait_object_unsize_cast_tests;
 // PtrMetadata over a slice/str/array fat pointer is its length, which
 // `slice_len_formula` models deterministically — so `collect_rvalue_unsupported`
 // must NOT emit a spurious `Rvalue::UnaryOp(PtrMetadata)` UnsupportedMir
@@ -1361,15 +1440,20 @@ mod return_pin_dedup_tests;
 // pin both halves of that contract on the exact function the fix lives in. Plain
 // `#[cfg(test)]` because `unsupported_mir_vcs` is part of the canonical pipeline.
 #[cfg(test)]
-mod result_return_grounding_tests;
+mod len_witness_grounding_tests;
+// A flattened nested-loop index bound is global, so its checked-result
+// consumer must have one stable bare-name value. These tests pin the merged
+// local, reassigned-parameter, and mutable-alias false-proof boundaries.
+#[cfg(test)]
+mod loop_bounds_tests;
 #[cfg(test)]
 mod machine_faithful_contract_lane_tests;
-#[cfg(test)]
-mod len_witness_grounding_tests;
 #[cfg(test)]
 mod ordering_witness_grounding_tests;
 #[cfg(test)]
 mod ptr_metadata_tests;
+#[cfg(test)]
+mod result_return_grounding_tests;
 // a `SwitchInt` join followed by a guard
 // (`let m = if a < b { a } else { b }; if m < 1000 { m + 1 }`) used to false-FAIL
 // the guarded overflow VC: the path-definition BFS weakened the join to `true`,
@@ -1387,6 +1471,12 @@ mod ptr_metadata_tests;
 //       JOIN block's own hypotheses (no regression of the merged-local recovery).
 #[cfg(test)]
 mod path_definition_map_tests;
+// Trust (2026-08-20): the bare-`Rvalue::BinaryOp` wrapping value model — the
+// -O / overflow-checks-off form — pinned encoding-identical to the
+// marker-authenticated wrapping-call model, plus the false-prove control that
+// the old unbounded `dest == a + b` def failed. See the module header.
+#[cfg(test)]
+mod wrapping_binop_defs_tests;
 // The bounded-collect grant's two authenticators, measured on real
 // `-Ztrust-dump=mir` bundles rather than hand-built doubles:
 //   * `trusted_root_spoof_iter_producer_tests` — the CALLEE-path half, on the
@@ -1399,19 +1489,19 @@ mod path_definition_map_tests;
 //     and both authenticators were handed a bare `std::` root. That is the case
 //     the producer-side IDENTITY rule exists for.
 #[cfg(test)]
-mod trusted_root_spoof_iter_producer_tests;
-#[cfg(test)]
 mod authenticated_std_iter_chain_tests;
-#[cfg(test)]
-mod no_std_sysroot_impersonation_tests;
 #[cfg(test)]
 mod bounded_source_value_tests;
 #[cfg(test)]
-mod refute3_rangefrom_tests;
-#[cfg(test)]
 mod capture_avoiding_tests;
 #[cfg(test)]
+mod no_std_sysroot_impersonation_tests;
+#[cfg(test)]
 mod ord_method_tests;
+#[cfg(test)]
+mod refute3_rangefrom_tests;
+#[cfg(test)]
+mod trusted_root_spoof_iter_producer_tests;
 // ======================================================================
 // Integer try_from/try_into + unwrap_or result modeling (tests)
 // ======================================================================
@@ -1424,14 +1514,20 @@ mod int_wrapping_neg_tests;
 #[cfg(test)]
 mod clean_origin_wrapping_summary_tests;
 // ======================================================================
+// Postcondition composition slice 2: a preconditioned callee's `ensures`
+// rides at a call site UNDER its own `requires` (tests)
+// ======================================================================
+#[cfg(test)]
+mod guarded_postcondition_tests;
+// ======================================================================
 // Const-return summaries: lower/upper bound + exact const set (tests)
 // ======================================================================
+#[cfg(test)]
+mod int_try_from_unwrap_or_tests;
 #[cfg(test)]
 mod return_const_summary_tests;
 #[cfg(test)]
 mod trivial_setter_summary_tests;
-#[cfg(test)]
-mod int_try_from_unwrap_or_tests;
 #[cfg(test)]
 mod unbounded_alloc_tests;
 // Trust: arithmetic hidden INSIDE a library/intrinsic Call (`i32::pow`,
@@ -1480,20 +1576,6 @@ mod slice_method_panic_tests;
 // constructions: a guard on the WRONG FIELD mints a DIFFERENT var (fields are
 // distinct because the key is the full projected place), and a `&mut self` root
 // declines the field key entirely (per-temp vars that never unify).
-#[cfg(test)]
-mod field_vec_len_key_tests;
-#[cfg(test)]
-mod push_guard_elem_len_tests;
-/// Cast VC model: value-preserving WIDENING casts into a 128-bit target.
-///
-/// Covers the `u32 as u128` (and friends) widening that previously returned
-/// UNKNOWN ("target integer range is not representable by the cast VC model"),
-/// plus the adversarial guarantee that the widening fact never vacuously proves
-/// a genuinely-overflowing 128-bit arithmetic safe.
-#[cfg(test)]
-mod widening_cast_128_tests;
-#[cfg(test)]
-mod zst_len_bound_tests;
 /// REM-bounded BV multiply: `(a % 100) * (b % 50)` is provably in-range
 /// (product <= 99*49 = 4851 << u32::MAX), yet the BV mul lane's fresh operand
 /// vars carried NO mod bound — the solver fabricated an internally inconsistent
@@ -1502,6 +1584,10 @@ mod zst_len_bound_tests;
 /// BV vars; these tests pin the constraint presence and the refutability floor.
 #[cfg(test)]
 mod bv_rem_mul_tests;
+#[cfg(test)]
+mod field_vec_len_key_tests;
+#[cfg(test)]
+mod push_guard_elem_len_tests;
 /// 128-bit signed CheckedBinaryOp (add/sub) overflow and i128 negation overflow.
 ///
 /// Pre-fix: the Int-path overflow builder fail-closed `signed && width >= 128` to
@@ -1517,8 +1603,25 @@ mod bv_rem_mul_tests;
 /// predicate, never weaker (no false-PROVE).
 #[cfg(test)]
 mod signed_128_overflow_tests;
+/// Cast VC model: value-preserving WIDENING casts into a 128-bit target.
+///
+/// Covers the `u32 as u128` (and friends) widening that previously returned
+/// UNKNOWN ("target integer range is not representable by the cast VC model"),
+/// plus the adversarial guarantee that the widening fact never vacuously proves
+/// a genuinely-overflowing 128-bit arithmetic safe.
+#[cfg(test)]
+mod widening_cast_128_tests;
 #[cfg(test)]
 mod widening_mul_tests;
+#[cfg(test)]
+mod zst_len_bound_tests;
+// Trust (NEGATIVE-LENGTH class): `conjoin_length_nonneg_bounds` must attach
+// `0 <= len` to the canonical `__slice_len` symbol (and its SSA-versioned
+// spellings) for EVERY element type, ZSTs included; must never attach the
+// pointer-width `len <= isize::MAX` half, the only direction that could hide a
+// real length overflow; and must never introduce a free variable.
+#[cfg(test)]
+mod length_nonneg_facts_tests;
 // SOUNDNESS (hunt-15 Class B): `postcondition_references_mutated_param` must flag a
 // param mutated through a `&mut`/`&raw mut` borrow (not just a whole-local reassign),
 // so a bare `#[ensures(move |r| *r == a)]` over `let p=&mut a; *p=..; a` fail-closes
@@ -1548,6 +1651,14 @@ mod known_panicking_method_tests;
 // so proof behavior never depends on process-global environment state.
 #[cfg(test)]
 mod gen_work_budget_tests;
+// Trust (UNINHABITED MATCH ARM, false REFUTATION): `inhabited_enum_variant_tag_set`
+// drops the tag of a variant whose payload is PROVABLY uninhabited, so the dead
+// `Err` arm of a `Result<u8, Infallible>` match stops being accused. Every `true`
+// deletes a tag from a globally published premise, so the tests' "must decline"
+// half — `[T; 0]`, a fieldless struct, a union, anything behind a pointer, an
+// unresolved generic, an un-migrated `adt_kind: None` — is the load-bearing half.
+#[cfg(test)]
+mod uninhabited_variant_tests;
 // Trust: piece #7a — folds + freshen-list soundness for the const-generic
 // `ConstValue::ConstParam` value.
 #[cfg(test)]
@@ -1565,24 +1676,24 @@ mod unwrap_panic_freedom_tests;
 // fail-closed) and its use site — the unwrap panic-freedom lane's
 // SUMMARY-pinned call-result receiver (`let r = Rat::new(n, d); r.unwrap()`).
 #[cfg(test)]
-mod return_disc_summary_tests;
-#[cfg(test)]
 mod ite_elimination_tests;
+#[cfg(test)]
+mod return_disc_summary_tests;
 // Trust (countdown-loop piece): the division-countdown trip theorem — the
 // exactly-tight T/K tables (an off-by-one DOWN in T is a false proof; the u64
 // quad loop runs EXACTLY 5 times, consuming a 20-byte buffer to offset 0) and
 // the builder's soundness gates, each pinned on REAL MIR extracted with
 // `-Ztrust-dump=mir:<dir>` from the trap shape it kills.
 #[cfg(test)]
+mod const_param_range_tests;
+#[cfg(test)]
 mod countdown_trip_tests;
 #[cfg(test)]
 mod immutable_read_value_tie_tests;
 #[cfg(test)]
-mod const_param_range_tests;
+mod per_arg_havoc_refinement_tests;
 #[cfg(test)]
 mod vec_index_dest_value_tie_tests;
-#[cfg(test)]
-mod per_arg_havoc_refinement_tests;
 // ======================================================================
 // Float bit-reinterpretation call models: `f64::to_bits`/`from_bits` and the
 // f32 siblings. Task #66 (completeness half): restore the correlation between a
@@ -1601,3 +1712,9 @@ mod float_bits_call_model_tests;
 // genuinely-refutable one are both untouched.
 #[cfg(test)]
 mod entry_hypothesis_tests;
+// The premise the CONSUMER-SIDE clause of `entry_sentinel_tie_is_sound` is dead
+// under: `v2_terminator_targets` ⊆ the path-def fixpoint's enqueue set, so a
+// consumer's mandatory v2 in-edge is always intersected in. Nothing else in the
+// suite notices when that stops holding.
+#[cfg(test)]
+mod entry_sentinel_tie_subsumption_tests;

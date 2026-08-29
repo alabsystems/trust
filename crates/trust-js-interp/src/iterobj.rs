@@ -15,12 +15,14 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_value::{
+    JsObject, JsValue, ObjId, ObjKind, PropKey, Property, Units, to_length_u64, units_from_str,
+};
+
 use crate::builtins_regexp::advance_string_index;
 use crate::interp::{Abrupt, ERes, Interp};
-use std::rc::Rc;
-use trust_js_value::{
-    to_length_u64, units_from_str, JsObject, JsValue, ObjId, ObjKind, PropKey, Property, Units,
-};
 
 /// Which projection each `next` step yields ([[ArrayLikeIterationKind]] /
 /// [[MapIterationKind]] / [[SetIterationKind]]).
@@ -37,35 +39,19 @@ pub(crate) enum IterObj {
     /// Array Iterator over an array-like object (23.1.5): `length` and elements
     /// are re-read each step through observable [[Get]]s. `target` = None once
     /// completed ([[IteratedArrayLike]] set to undefined).
-    Array {
-        target: Option<ObjId>,
-        kind: IterKind,
-        index: u64,
-    },
+    Array { target: Option<ObjId>, kind: IterKind, index: u64 },
     /// Array Iterator over a TypedArray (shares %ArrayIteratorPrototype%): the
     /// backing buffer is validated each step; a detached/out-of-bounds source
     /// throws TypeError mid-iteration.
-    TypedArray {
-        target: Option<ObjId>,
-        kind: IterKind,
-        index: usize,
-    },
+    TypedArray { target: Option<ObjId>, kind: IterKind, index: usize },
     /// String Iterator (22.1.5): by code point.
     Str { units: Rc<Units>, pos: usize },
     /// Map Iterator over the live [[MapData]] (24.1.5): tombstones skipped,
     /// appended entries visited. `target` = None latches completion even if the
     /// map later grows.
-    Map {
-        target: Option<ObjId>,
-        kind: IterKind,
-        index: usize,
-    },
+    Map { target: Option<ObjId>, kind: IterKind, index: usize },
     /// Set Iterator over the live [[SetData]] (24.2.5); keys === values.
-    Set {
-        target: Option<ObjId>,
-        kind: IterKind,
-        index: usize,
-    },
+    Set { target: Option<ObjId>, kind: IterKind, index: usize },
     /// RegExp String Iterator (22.2.9.2.1 %RegExpStringIteratorPrototype%.next).
     /// `matcher` = R, the [[IteratingRegExp]] (None latches [[Done]]). Each step
     /// runs one RegExpExec(R, S); a global empty match performs the
@@ -73,12 +59,7 @@ pub(crate) enum IterObj {
     /// same step (the modern spec's next is an ordinary method, not a suspended
     /// closure — the advance is observable via a custom exec before the next
     /// step).
-    RegExpString {
-        matcher: Option<ObjId>,
-        s: Rc<Units>,
-        global: bool,
-        full_unicode: bool,
-    },
+    RegExpString { matcher: Option<ObjId>, s: Rc<Units>, global: bool, full_unicode: bool },
 }
 
 /// The family a `.next` brand-check requires.
@@ -128,11 +109,7 @@ impl Interp {
     pub(crate) fn make_array_iterator(&mut self, target: ObjId, kind: IterKind) -> ERes {
         self.alloc_iterator(
             self.intr.array_iterator_proto,
-            IterObj::Array {
-                target: Some(target),
-                kind,
-                index: 0,
-            },
+            IterObj::Array { target: Some(target), kind, index: 0 },
         )
     }
 
@@ -141,11 +118,7 @@ impl Interp {
     pub(crate) fn make_typed_array_iterator(&mut self, target: ObjId, kind: IterKind) -> ERes {
         self.alloc_iterator(
             self.intr.array_iterator_proto,
-            IterObj::TypedArray {
-                target: Some(target),
-                kind,
-                index: 0,
-            },
+            IterObj::TypedArray { target: Some(target), kind, index: 0 },
         )
     }
 
@@ -158,11 +131,7 @@ impl Interp {
     pub(crate) fn make_map_iterator(&mut self, target: ObjId, kind: IterKind) -> ERes {
         self.alloc_iterator(
             self.intr.map_iterator_proto,
-            IterObj::Map {
-                target: Some(target),
-                kind,
-                index: 0,
-            },
+            IterObj::Map { target: Some(target), kind, index: 0 },
         )
     }
 
@@ -170,11 +139,7 @@ impl Interp {
     pub(crate) fn make_set_iterator(&mut self, target: ObjId, kind: IterKind) -> ERes {
         self.alloc_iterator(
             self.intr.set_iterator_proto,
-            IterObj::Set {
-                target: Some(target),
-                kind,
-                index: 0,
-            },
+            IterObj::Set { target: Some(target), kind, index: 0 },
         )
     }
 
@@ -188,12 +153,7 @@ impl Interp {
     ) -> ERes {
         self.alloc_iterator(
             self.intr.regexp_string_iterator_proto,
-            IterObj::RegExpString {
-                matcher: Some(matcher),
-                s,
-                global,
-                full_unicode,
-            },
+            IterObj::RegExpString { matcher: Some(matcher), s, global, full_unicode },
         )
     }
 
@@ -298,9 +258,7 @@ impl Interp {
                 }
                 let c0 = units[*pos];
                 let take_pair = (0xd800..=0xdbff).contains(&c0)
-                    && units
-                        .get(*pos + 1)
-                        .is_some_and(|c1| (0xdc00..=0xdfff).contains(c1));
+                    && units.get(*pos + 1).is_some_and(|c1| (0xdc00..=0xdfff).contains(c1));
                 let s: Units = if take_pair {
                     let s = vec![c0, units[*pos + 1]];
                     *pos += 2;
@@ -387,12 +345,7 @@ impl Interp {
                     }
                 }
             }
-            IterObj::RegExpString {
-                matcher,
-                s,
-                global,
-                full_unicode,
-            } => {
+            IterObj::RegExpString { matcher, s, global, full_unicode } => {
                 // Step 4: [[Done]] latched.
                 let Some(r) = *matcher else {
                     return self.create_iter_result(JsValue::Undefined, true);
@@ -439,14 +392,8 @@ impl Interp {
     /// CreateArrayFromList(« a, b »): a fresh two-element array.
     fn iter_pair(&mut self, a: JsValue, b: JsValue) -> ERes {
         let arr = self.new_array(2)?;
-        self.heap
-            .obj_mut(arr)
-            .props
-            .insert(PropKey::Str(units_from_str("0")), Property::data(a));
-        self.heap
-            .obj_mut(arr)
-            .props
-            .insert(PropKey::Str(units_from_str("1")), Property::data(b));
+        self.heap.obj_mut(arr).props.insert(PropKey::Str(units_from_str("0")), Property::data(a));
+        self.heap.obj_mut(arr).props.insert(PropKey::Str(units_from_str("1")), Property::data(b));
         Ok(JsValue::Obj(arr))
     }
 }

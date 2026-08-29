@@ -8,10 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::types::{ComposabilityResult, ComposedProof, CompositionError, Property};
 use crate::formula_norm::formula_subsumes;
 use crate::{ChainValidator, ProofCertificate};
-
-use super::types::{ComposabilityResult, ComposedProof, CompositionError, Property};
 
 /// Check structural compatibility between two certificate records.
 ///

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 //, #565: Adapter bridging trust-lift output to trust_vcgen for binary verification.
 //
 // Converts LiftedFunction (binary -> CFG -> SSA -> TrustIr) into VerificationConditions
@@ -211,6 +212,12 @@ fn terminator_to_abstract_insn(
             args: args.iter().map(operand_to_abstract_value).collect(),
             dest: None,
             next: target.map(|t| synthetic_block_address(entry_point, t.0)),
+        },
+        Terminator::TailCall { func: callee, args, .. } => AbstractOp::Call {
+            func: callee.clone(),
+            args: args.iter().map(operand_to_abstract_value).collect(),
+            dest: None,
+            next: None,
         },
         Terminator::SwitchInt { discr, targets, otherwise, .. } => {
             if let Some((_, true_target)) = targets.first() {
@@ -913,8 +920,10 @@ fn copy_sink_length_call_vc(
     lifted: &LiftedFunction,
     block: &trust_types::BasicBlock,
 ) -> Option<VerificationCondition> {
-    let Terminator::Call { func: callee, args, span, .. } = &block.terminator else {
-        return None;
+    let (callee, args, span) = match &block.terminator {
+        Terminator::Call { func, args, span, .. }
+        | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+        _ => return None,
     };
     let spec = copy_sink_spec(callee)?;
     let dest = args.get(spec.dest_index).map(|arg| format_operand_formula(arg, lifted));
@@ -2661,7 +2670,7 @@ pub fn generate_memory_model_vcs(lifted: &LiftedFunction) -> Vec<VerificationCon
         }
 
         // Stack discipline: check that Return terminators restore SP.
-        if matches!(block.terminator, Terminator::Return) {
+        if matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. }) {
             let sp_mismatch = stack_pointer_mismatch_formula(block, sp_local_index);
 
             vcs.push(VerificationCondition {
@@ -2794,8 +2803,10 @@ fn format_string_call_vc(
     lifted: &LiftedFunction,
     block: &trust_types::BasicBlock,
 ) -> Option<VerificationCondition> {
-    let Terminator::Call { func: callee, args, span, .. } = &block.terminator else {
-        return None;
+    let (callee, args, span) = match &block.terminator {
+        Terminator::Call { func, args, span, .. }
+        | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+        _ => return None,
     };
     let short = callee.rsplit("::").next().unwrap_or(callee);
     let format_index = printf_family_format_index(short)?;
@@ -3046,14 +3057,13 @@ fn memory_access_vc(func_name: &str, access: &MemoryAccessFact) -> VerificationC
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_lift::cfg::{Cfg, LiftedBlock};
     use trust_types::{
         BasicBlock, BinOp, BinaryAbiFact, BinaryAbiFactKind, BinaryFactConfidence,
         BinaryFactEvidence, BinaryFactSubject, BinaryOrigin, BinaryStorageFact,
         BinaryStorageLocation, BlockId, Endianness, LocalDecl, MemoryAccessFact, MemoryAccessKind,
         MemoryRegionKind, Operand, Place, Rvalue, SourceSpan, Statement, Terminator, TrustLevel,
-        Ty, VerifiableBody, VerificationCondition,
+        Ty, UnwindEdge, VerifiableBody, VerificationCondition,
     };
 
     use super::*;
@@ -3232,6 +3242,7 @@ mod tests {
         let term = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "callee".to_string(),
             args: vec![Operand::Symbolic(formula.clone())],
@@ -3804,6 +3815,7 @@ mod tests {
         let term = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "callee".to_string(),
             args: vec![Operand::Symbolic(formula.clone())],
@@ -4565,6 +4577,7 @@ mod tests {
         lifted.trust_ir_body.blocks[0].terminator = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "memcpy".to_string(),
             args: vec![
@@ -4616,6 +4629,7 @@ mod tests {
         lifted.trust_ir_body.blocks[0].terminator = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "printf".to_string(),
             args: vec![Operand::Copy(Place::local(1))],
@@ -4648,6 +4662,7 @@ mod tests {
         lifted.trust_ir_body.blocks[0].terminator = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "printf".to_string(),
             args: vec![Operand::Constant(ConstValue::Uint(0x4000, 64))],

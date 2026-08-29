@@ -11,6 +11,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::VecDeque;
+
 use trust_types::fx::{FxHashMap, FxHashSet};
 
 use crate::cfg::Cfg;

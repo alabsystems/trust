@@ -423,9 +423,10 @@ impl CounterexampleTrace {
 
 #[cfg(test)]
 mod tests {
+    use trust_types::BinOp;
+
     use super::*;
     use crate::state::SymbolicValue;
-    use trust_types::BinOp;
 
     #[test]
     fn test_trace_step_new() {

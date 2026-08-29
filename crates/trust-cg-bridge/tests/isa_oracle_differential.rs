@@ -24,7 +24,7 @@ use std::process::Command;
 
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_types::{
-    BasicBlock, BlockId, BinOp, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+    BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
     Terminator, Ty, VerifiableBody, VerifiableFunction,
 };
 
@@ -104,12 +104,10 @@ fn emit_obj(func: &VerifiableFunction) -> Option<Vec<u8>> {
 /// few instructions, no jump tables), so the bytes are a self-contained code
 /// image loaded at `vmaddr`.
 fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let rd_u32 = |o: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?))
-    };
-    let rd_u64 = |o: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?))
-    };
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
+    let rd_u64 =
+        |o: usize| -> Option<u64> { Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?)) };
     if rd_u32(0)? != 0xfeed_facf {
         return None; // not 64-bit Mach-O (little-endian)
     }
@@ -153,7 +151,7 @@ fn run_alu_isa(
     a: i32,
     b: i32,
 ) -> Option<i32> {
-    use trust_disasm::{decode_aarch64, Opcode};
+    use trust_disasm::{Opcode, decode_aarch64};
     use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics};
 
     for g in cs.gpr.iter_mut() {
@@ -252,13 +250,8 @@ int main(void) {{
     );
     fs::write(&c_path, harness).ok()?;
 
-    let link = Command::new("cc")
-        .arg(&c_path)
-        .arg(&obj_path)
-        .arg("-o")
-        .arg(&bin_path)
-        .output()
-        .ok()?;
+    let link =
+        Command::new("cc").arg(&c_path).arg(&obj_path).arg("-o").arg(&bin_path).output().ok()?;
     if !link.status.success() {
         eprintln!("cc link FAILED: {}", String::from_utf8_lossy(&link.stderr));
         return None;
@@ -337,11 +330,7 @@ fn input_pairs(seed: u64) -> Vec<(i32, i32)> {
 // ---------------------------------------------------------------------------
 
 /// Run the full differential for one op. Returns (sample_count, mismatches).
-fn differential_for_op(
-    name: &str,
-    op: BinOp,
-    seed: u64,
-) -> (usize, Vec<(i32, i32, i32, i32)>) {
+fn differential_for_op(name: &str, op: BinOp, seed: u64) -> (usize, Vec<(i32, i32, i32, i32)>) {
     let vf = author_alu_vf(name, op);
     let pairs = input_pairs(seed);
 
@@ -351,8 +340,7 @@ fn differential_for_op(
 
     // route-(a): formal ISA model on the SAME emitted bytes.
     let obj = emit_obj(&vf).unwrap_or_else(|| panic!("emit object for op {name}"));
-    let (code, base) = macho_text(&obj)
-        .unwrap_or_else(|| panic!("extract __text for op {name}"));
+    let (code, base) = macho_text(&obj).unwrap_or_else(|| panic!("extract __text for op {name}"));
     let mut cs = trust_machine_sem::ConcreteState::new();
     for (i, byte) in code.iter().enumerate() {
         cs.store_memory_le(base + i as u64, 1, *byte as u128).expect("seed image");
@@ -456,5 +444,8 @@ fn negative_control_wrong_op_pairing_is_detected() {
             }
         }
     }
-    println!("negative control: all {} wrong op pairings detected as mismatches", OPS.len() * (OPS.len() - 1));
+    println!(
+        "negative control: all {} wrong op pairings detected as mismatches",
+        OPS.len() * (OPS.len() - 1)
+    );
 }

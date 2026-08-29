@@ -34,8 +34,7 @@ pub(crate) const PROOF_CERT_SCHEMA: &str = "trust.package.proof-cert.v1";
 
 /// What the record claims, stated verbatim inside the record so a reader who
 /// only ever sees the JSON gets the honest reading with it.
-pub(crate) const AUTHORITY: &str =
-    "a publisher-recorded verdict distribution from one local verification run of this exact \
+pub(crate) const AUTHORITY: &str = "a publisher-recorded verdict distribution from one local verification run of this exact \
      package; not an independently checkable proof and not evidence that any consumer re-ran it";
 
 /// The evidence file's path relative to a package root. Also its path inside
@@ -199,11 +198,12 @@ impl std::fmt::Display for ProofCertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Absent => write!(f, "no {PROOF_CERT_RELATIVE_PATH}"),
-            Self::Malformed(detail) => write!(f, "{PROOF_CERT_RELATIVE_PATH} is malformed: {detail}"),
-            Self::WrongPackage { found, want } => write!(
-                f,
-                "{PROOF_CERT_RELATIVE_PATH} describes `{found}`, not `{want}`"
-            ),
+            Self::Malformed(detail) => {
+                write!(f, "{PROOF_CERT_RELATIVE_PATH} is malformed: {detail}")
+            }
+            Self::WrongPackage { found, want } => {
+                write!(f, "{PROOF_CERT_RELATIVE_PATH} describes `{found}`, not `{want}`")
+            }
         }
     }
 }
@@ -271,19 +271,16 @@ pub(crate) fn evaluate(
 fn package_identity(manifest_path: &Path) -> Result<(String, String), String> {
     let text = std::fs::read_to_string(manifest_path)
         .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    let doc: toml::Value = text
-        .parse()
-        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let doc: toml::Value = text.parse().map_err(|e| format!("{}: {e}", manifest_path.display()))?;
     let package = doc
         .get("package")
         .ok_or_else(|| format!("{} has no [package] table", manifest_path.display()))?;
-    let field = |key: &str| {
-        package
-            .get(key)
-            .and_then(toml::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("{} has no literal [package] {key}", manifest_path.display()))
-    };
+    let field =
+        |key: &str| {
+            package.get(key).and_then(toml::Value::as_str).map(str::to_string).ok_or_else(|| {
+                format!("{} has no literal [package] {key}", manifest_path.display())
+            })
+        };
     Ok((field("name")?, field("version")?))
 }
 
@@ -379,8 +376,9 @@ fn normalize_crate_name(name: &str) -> String {
 /// flag for it (DESIGN_PHILOSOPHY §3). Under the default `none` this walks the
 /// graph and reports, which is the useful thing to be able to do before opting
 /// in to something stricter.
-fn check_dependencies(manifest: &Path) -> Result<(DepEvidencePolicy, Vec<DepEvidenceFinding>), String>
-{
+fn check_dependencies(
+    manifest: &Path,
+) -> Result<(DepEvidencePolicy, Vec<DepEvidenceFinding>), String> {
     let dir = manifest.parent().unwrap_or(Path::new("."));
     let resolved =
         crate::config::resolve_trust_config(dir, Some(manifest)).map_err(|e| e.to_string())?;
@@ -572,8 +570,8 @@ mod tests {
     fn an_unknown_schema_is_refused_rather_than_guessed_at() {
         let mut value: serde_json::Value = serde_json::to_value(cert(1, 0, 0, 0)).unwrap();
         value["schema"] = serde_json::json!("trust.package.proof-cert.v99");
-        let err =
-            PackageProofCert::parse_for(value.to_string().as_bytes(), "widget", "1.2.3").unwrap_err();
+        let err = PackageProofCert::parse_for(value.to_string().as_bytes(), "widget", "1.2.3")
+            .unwrap_err();
         assert!(matches!(err, ProofCertError::Malformed(_)), "{err}");
     }
 

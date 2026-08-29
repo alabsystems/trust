@@ -347,11 +347,7 @@ fn push_unique(outcome: &mut CleanIslandOutcome, diagnostic: CleanIslandDiagnost
 /// repeat and rotating to the earliest-authored member makes the rendered cycle
 /// a function of the program rather than of the search, which is what a
 /// diagnostic pinned by a test needs.
-fn cycle_sites(
-    witness: &[Site],
-    names: &[Name],
-    sources: &[&str],
-) -> Vec<CleanIslandCycleSite> {
+fn cycle_sites(witness: &[Site], names: &[Name], sources: &[&str]) -> Vec<CleanIslandCycleSite> {
     let mut walk: Vec<(Site, String)> =
         witness.iter().copied().zip(names.iter().map(ToString::to_string)).collect();
     walk.dedup_by(|later, earlier| later.1 == earlier.1);

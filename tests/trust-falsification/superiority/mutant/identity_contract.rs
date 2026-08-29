@@ -6,4 +6,6 @@
 // param-name fix connects `x` to the body, it does not make false specs pass).
 #[core::contracts::requires(x < 100)]
 #[core::contracts::ensures(move |ret: &u32| *ret > x)]
-pub fn identity_contract(x: u32) -> u32 { x }
+pub fn identity_contract(x: u32) -> u32 {
+    x
+}

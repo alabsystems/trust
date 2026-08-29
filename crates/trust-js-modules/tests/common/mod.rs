@@ -17,10 +17,11 @@
 
 #![allow(dead_code)]
 
-use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+
+use indexmap::IndexMap;
 use trust_js_modules::{
     Host, ImportBinding, ImportEntry, IndirectExport, LocalExport, ModuleGraph, ParseError,
     ParsedModule, ResolveError, StarExport,

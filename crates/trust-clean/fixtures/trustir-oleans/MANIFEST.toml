@@ -1,24 +1,24 @@
-schema = "trust.trust-clean.trustir-oleans.manifest.v1"
+schema = "trust.trust-clean.trustir-oleans.manifest.v2"
 
 [provenance]
-trustir_commit = "5e83171f45cb87aff34d58966db3d3373ee9d002"
+trustir_commit = "e936914015c33f78c612c31eeb0d6ab2a85ff47c"
 # The first-party/clean revision these bytes are staged against — the olean
 # reader that decodes them and the kernel that admits the decoded declarations
 # both live there, so a clean pin bump changes what "the bridge replays" means
 # just as surely as a trust-ir bump changes what it replays. Kept equal to the
 # indexed gitlink by scripts/check_bridge_pin.sh; the replay itself is
 # validated by crates/trust-clean/tests/lean_clean_bridge.rs.
-clean_commit = "d93b2fbb906a08768ed29a860feca4f1f09affb6"
+clean_commit = "2cd0ef016c08f97f3b105271655478c5a7293372"
 lean_toolchain = "leanprover/lean4:v4.8.0"
-lean_version = "Lean (version 4.8.0, aarch64-unknown-linux-gnu, commit df668f00e6c0, Release)"
 root_module = "TrustIr.Semantics.Arith"
 source_subdir = "lean/trust_ir-semantics"
 build_command = "lake build (unmodified sources at trustir_commit; toolchain pinned by lean-toolchain)"
-built_on = "2026-08-20"
 # Minimal module closure of root_module: computed by loading the root with
 # clean-olean load_module_with_deps and vendoring exactly the visited TrustIr
 # modules. Regenerate + audit with scripts/regen-trustir-oleans.sh.
 
+# Files whose bytes are IDENTICAL on every platform listed below. Path is
+# the key, relative to this manifest.
 [files]
 "TrustIr/Basic.olean" = "a948abc405c00121b1494e1bc84344fa6839f3bf705b098f09736e734f96dab4"
 "TrustIr/BinOp.olean" = "7c363abce7881513baefc700856a8b6f35dcce6e1166809e477cd00285309039"
@@ -47,3 +47,17 @@ built_on = "2026-08-20"
 "TrustIr/State/Memory.olean" = "6e03dcb206b67863adaffb305ac3d8310baf35fb4c5653f06ede4b2c1aad62be"
 "TrustIr/State/Permission.olean" = "482e2db117ff8093d8fc57f18eedd2403ec1657fe5688f92fe536f896e656f38"
 "TrustIr/State/ValueMap.olean" = "28d90b0031014848a0f72a659ffe5519cf17efbafdc92542ecb121966b9c50a7"
+
+# Per-platform artifacts. A file appears here only when platforms actually
+# DISAGREE on its bytes; its on-disk path is platform/<triple>/<key>. A
+# consumer must verify the shared set plus its OWN triple, and must fail
+# closed on a triple absent here rather than fall back to another
+# platform's bytes.
+
+[platforms."aarch64-apple-darwin"]
+lean_version = "Lean (version 4.8.0, aarch64-apple-darwin, commit df668f00e6c0, Release)"
+built_on = "2026-08-28"
+
+[platforms."aarch64-unknown-linux-gnu"]
+lean_version = "Lean (version 4.8.0, aarch64-unknown-linux-gnu, commit df668f00e6c0, Release)"
+built_on = "2026-08-27"

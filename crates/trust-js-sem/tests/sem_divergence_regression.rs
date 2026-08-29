@@ -34,10 +34,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
-use trust_js_trace::{
-    extract_trace, traces_equal, Completion, ProjectedValue, ThrownProjection,
-};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
+use trust_js_trace::{Completion, ProjectedValue, ThrownProjection, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
 // CARGO_MANIFEST_DIR so it works in any checkout; override with
@@ -93,27 +92,15 @@ const PINS: &[(&str, Disp)] = &[
         Disp::ParseSyntaxError,
     ),
     // -- Cluster 3: yield in generator/arrow parameter defaults --------------
-    (
-        "test/language/expressions/arrow-function/param-dflt-yield-expr.js",
-        Disp::ParseSyntaxError,
-    ),
-    (
-        "test/language/expressions/function/param-dflt-yield-strict.js",
-        Disp::ParseSyntaxError,
-    ),
-    (
-        "test/language/statements/function/param-dflt-yield-strict.js",
-        Disp::ParseSyntaxError,
-    ),
+    ("test/language/expressions/arrow-function/param-dflt-yield-expr.js", Disp::ParseSyntaxError),
+    ("test/language/expressions/function/param-dflt-yield-strict.js", Disp::ParseSyntaxError),
+    ("test/language/statements/function/param-dflt-yield-strict.js", Disp::ParseSyntaxError),
     (
         "test/language/expressions/object/method-definition/generator-param-init-yield.js",
         Disp::ParseSyntaxError,
     ),
     // -- Cluster 4: `({* foo})` -----------------------------------------------
-    (
-        "test/language/expressions/object/prop-def-invalid-star-prefix.js",
-        Disp::ParseSyntaxError,
-    ),
+    ("test/language/expressions/object/prop-def-invalid-star-prefix.js", Disp::ParseSyntaxError),
     // -- Cluster 2: GeneratorFunction subclassing (refuse) -------------------
     (
         "test/language/statements/class/subclass/builtin-objects/GeneratorFunction/instance-length.js",
@@ -141,10 +128,7 @@ const PINS: &[(&str, Disp)] = &[
     // is false for a generator function, a bound generator function, and a
     // proxy over one — so it is no longer a pinned divergence).
     // -- Cluster 5: Object.prototype.toString on generators (refuse) ---------
-    (
-        "test/built-ins/Object/prototype/toString/symbol-tag-generators-builtin.js",
-        Disp::Refuse,
-    ),
+    ("test/built-ins/Object/prototype/toString/symbol-tag-generators-builtin.js", Disp::Refuse),
 ];
 
 /// A parse-phase SyntaxError throw, exactly as a conforming engine (and the
@@ -220,20 +204,11 @@ fn cluster1_heritage_private_name_is_syntax_error() {
 fn cluster3_yield_in_generator_params_is_syntax_error() {
     // Arrow parameters inside a generator are [+Yield]: a YieldExpression there
     // is an early error.
-    assert!(is_syntax_error_trace(&evaluate_case(
-        &[],
-        "function *g() { (x = yield) => {}; }"
-    )));
+    assert!(is_syntax_error_trace(&evaluate_case(&[], "function *g() { (x = yield) => {}; }")));
     // Generator method's own parameters are [+Yield].
-    assert!(is_syntax_error_trace(&evaluate_case(
-        &[],
-        "({ *method(x = yield) {} });"
-    )));
+    assert!(is_syntax_error_trace(&evaluate_case(&[], "({ *method(x = yield) {} });")));
     // A generator function's OWN parameters are [+Yield].
-    assert!(is_syntax_error_trace(&evaluate_case(
-        &[],
-        "function* g(x = yield) {}"
-    )));
+    assert!(is_syntax_error_trace(&evaluate_case(&[], "function* g(x = yield) {}")));
     // Strict-mode `yield` as a parameter IdentifierReference in a non-generator
     // nested function.
     assert!(is_syntax_error_trace(&evaluate_case(
@@ -281,19 +256,14 @@ fn generator_instance_is_not_a_constructor() {
     // A generator function INSTANCE has no [[Construct]] — `extends` it throws
     // TypeError (superclass-generator-function.js: IsConstructor before the
     // "prototype" lookup).
-    assert!(is_type_error_throw(&evaluate_case(
-        &[],
-        "function* fn() {}\nclass A extends fn {}"
-    )));
+    assert!(is_type_error_throw(&evaluate_case(&[], "function* fn() {}\nclass A extends fn {}")));
     // And `new` on a generator function throws TypeError.
     assert_eq!(
         completion_of(evaluate_case(
             &[],
             "var t = false;\ntry { new (function*(){})(); } catch (e) { t = e instanceof TypeError; }\nt;"
         )),
-        Completion::Normal {
-            v: Some(ProjectedValue::Bool { v: true })
-        }
+        Completion::Normal { v: Some(ProjectedValue::Bool { v: true }) }
     );
 }
 
@@ -343,10 +313,7 @@ fn parse_frontmatter(body: &str) -> Frontmatter {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 includes.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             } else {
                 while let Some(next) = lines.peek() {
@@ -364,10 +331,7 @@ fn parse_frontmatter(body: &str) -> Frontmatter {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 flags.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             }
         }
@@ -386,8 +350,9 @@ fn modes_for(flags: &[String]) -> &'static [bool] {
 }
 
 fn corpus_root() -> Option<PathBuf> {
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     corpus.join("harness/assert.js").is_file().then_some(corpus)
 }
 
@@ -417,11 +382,8 @@ fn pinned_divergences_local_disposition() {
         };
         let fm = parse_frontmatter(&body);
         let raw = fm.flags.iter().any(|f| f == "raw");
-        let mut include_names: Vec<String> = if raw {
-            Vec::new()
-        } else {
-            vec!["assert.js".into(), "sta.js".into()]
-        };
+        let mut include_names: Vec<String> =
+            if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
         include_names.extend(fm.includes.iter().cloned());
         let mut include_srcs = Vec::new();
         for name in &include_names {
@@ -434,11 +396,7 @@ fn pinned_divergences_local_disposition() {
 
         for &strict in modes_for(&fm.flags) {
             checked += 1;
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let out = evaluate_case_opts(&inc_refs, &sem_body, false);
             let mode = if strict { "strict" } else { "bare" };
             let ok = match disp {
@@ -490,11 +448,8 @@ fn pinned_divergences_vs_node() {
         let body = std::fs::read_to_string(&path).expect("read pinned case");
         let fm = parse_frontmatter(&body);
         let raw = fm.flags.iter().any(|f| f == "raw");
-        let mut include_names: Vec<String> = if raw {
-            Vec::new()
-        } else {
-            vec!["assert.js".into(), "sta.js".into()]
-        };
+        let mut include_names: Vec<String> =
+            if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
         include_names.extend(fm.includes.iter().cloned());
         let mut include_srcs = Vec::new();
         let mut include_paths = Vec::new();
@@ -511,19 +466,14 @@ fn pinned_divergences_vs_node() {
         for &strict in modes_for(&fm.flags) {
             case_no += 1;
             let mode = if strict { "strict" } else { "bare" };
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let sem = evaluate_case_opts(&inc_refs, &sem_body, false);
 
             // Disposition contract, checked FIRST (independent of Node).
             match (disp, &sem) {
                 (Disp::ParseSyntaxError, _) if !is_syntax_error_trace(&sem) => {
-                    failures.push(format!(
-                        "{rel} [{mode}]: expected parse SyntaxError, got {sem:?}"
-                    ));
+                    failures
+                        .push(format!("{rel} [{mode}]: expected parse SyntaxError, got {sem:?}"));
                     continue;
                 }
                 (Disp::Refuse, SemOutcome::Trace(t)) => {
@@ -558,8 +508,7 @@ fn pinned_divergences_vs_node() {
             });
             let manifest_path = tmp.path().join(format!("pin-{case_no}.manifest.json"));
             let mut mf = std::fs::File::create(&manifest_path).expect("create manifest");
-            mf.write_all(manifest.to_string().as_bytes())
-                .expect("write manifest");
+            mf.write_all(manifest.to_string().as_bytes()).expect("write manifest");
             drop(mf);
 
             let out = Command::new(&node)

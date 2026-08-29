@@ -6,11 +6,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#[cfg(feature = "macho")]
-use trust_binary_parse::MachO;
-
 #[cfg(feature = "elf")]
 use trust_binary_parse::Elf64;
+#[cfg(feature = "macho")]
+use trust_binary_parse::MachO;
 
 #[cfg(any(feature = "macho", feature = "elf", test))]
 use crate::error::LiftError;

@@ -3,10 +3,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_disasm::{ControlFlow, Instruction};
 use trust_types::fx::FxHashMap;
 use trust_types::{MemoryAccessFact, TrustLevel, UnsupportedLedger};
-
-use trust_disasm::{ControlFlow, Instruction};
 
 /// Role of a recovered CFG edge.
 ///

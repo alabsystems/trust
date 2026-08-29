@@ -11,12 +11,11 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 #![allow(clippy::result_large_err)]
 
-use crate::fx::FxHashMap;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::formula::{Formula, VcKind, VerificationCondition};
+use crate::fx::FxHashMap;
 use crate::model::{
     BasicBlock, BlockId, Operand, Place, Rvalue, SourceSpan, Statement, Terminator, VerifiableBody,
 };

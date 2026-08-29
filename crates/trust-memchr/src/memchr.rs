@@ -97,12 +97,7 @@ pub fn memrchr2(needle1: u8, needle2: u8, haystack: &[u8]) -> Option<usize> {
 /// assert_eq!(memchr3(b'k', b'q', b'u', haystack), Some(4));
 /// ```
 #[inline]
-pub fn memchr3(
-    needle1: u8,
-    needle2: u8,
-    needle3: u8,
-    haystack: &[u8],
-) -> Option<usize> {
+pub fn memchr3(needle1: u8, needle2: u8, needle3: u8, haystack: &[u8]) -> Option<usize> {
     let end = haystack.len();
     scan::find3(haystack, 0, end, needle1, needle2, needle3)
 }
@@ -122,12 +117,7 @@ pub fn memchr3(
 /// assert_eq!(memrchr3(b'k', b'o', b'n', haystack), Some(17));
 /// ```
 #[inline]
-pub fn memrchr3(
-    needle1: u8,
-    needle2: u8,
-    needle3: u8,
-    haystack: &[u8],
-) -> Option<usize> {
+pub fn memrchr3(needle1: u8, needle2: u8, needle3: u8, haystack: &[u8]) -> Option<usize> {
     let end = haystack.len();
     scan::rfind3(haystack, 0, end, needle1, needle2, needle3)
 }
@@ -156,11 +146,7 @@ pub fn memrchr_iter(needle: u8, haystack: &[u8]) -> Rev<Memchr<'_>> {
 /// The iterator returned implements `DoubleEndedIterator`. This means it
 /// can also be used to find occurrences in reverse order.
 #[inline]
-pub fn memchr2_iter<'h>(
-    needle1: u8,
-    needle2: u8,
-    haystack: &'h [u8],
-) -> Memchr2<'h> {
+pub fn memchr2_iter<'h>(needle1: u8, needle2: u8, haystack: &'h [u8]) -> Memchr2<'h> {
     let end = haystack.len();
     Memchr2 { needle1, needle2, it: Cursor { haystack, start: 0, end } }
 }
@@ -168,11 +154,7 @@ pub fn memchr2_iter<'h>(
 /// Returns an iterator over all occurrences of the needles in a haystack, in
 /// reverse.
 #[inline]
-pub fn memrchr2_iter(
-    needle1: u8,
-    needle2: u8,
-    haystack: &[u8],
-) -> Rev<Memchr2<'_>> {
+pub fn memrchr2_iter(needle1: u8, needle2: u8, haystack: &[u8]) -> Rev<Memchr2<'_>> {
     let end = haystack.len();
     let it = Memchr2 { needle1, needle2, it: Cursor { haystack, start: 0, end } };
     it.rev()
@@ -183,12 +165,7 @@ pub fn memrchr2_iter(
 /// The iterator returned implements `DoubleEndedIterator`. This means it
 /// can also be used to find occurrences in reverse order.
 #[inline]
-pub fn memchr3_iter<'h>(
-    needle1: u8,
-    needle2: u8,
-    needle3: u8,
-    haystack: &'h [u8],
-) -> Memchr3<'h> {
+pub fn memchr3_iter<'h>(needle1: u8, needle2: u8, needle3: u8, haystack: &'h [u8]) -> Memchr3<'h> {
     let end = haystack.len();
     Memchr3 { needle1, needle2, needle3, it: Cursor { haystack, start: 0, end } }
 }
@@ -196,15 +173,9 @@ pub fn memchr3_iter<'h>(
 /// Returns an iterator over all occurrences of the needles in a haystack, in
 /// reverse.
 #[inline]
-pub fn memrchr3_iter(
-    needle1: u8,
-    needle2: u8,
-    needle3: u8,
-    haystack: &[u8],
-) -> Rev<Memchr3<'_>> {
+pub fn memrchr3_iter(needle1: u8, needle2: u8, needle3: u8, haystack: &[u8]) -> Rev<Memchr3<'_>> {
     let end = haystack.len();
-    let it =
-        Memchr3 { needle1, needle2, needle3, it: Cursor { haystack, start: 0, end } };
+    let it = Memchr3 { needle1, needle2, needle3, it: Cursor { haystack, start: 0, end } };
     it.rev()
 }
 
@@ -382,12 +353,7 @@ impl<'h> Memchr3<'h> {
     /// The iterator returned implements `DoubleEndedIterator`. This means it
     /// can also be used to find occurrences in reverse order.
     #[inline]
-    pub fn new(
-        needle1: u8,
-        needle2: u8,
-        needle3: u8,
-        haystack: &'h [u8],
-    ) -> Memchr3<'h> {
+    pub fn new(needle1: u8, needle2: u8, needle3: u8, haystack: &'h [u8]) -> Memchr3<'h> {
         let end = haystack.len();
         Memchr3 { needle1, needle2, needle3, it: Cursor { haystack, start: 0, end } }
     }
@@ -401,14 +367,7 @@ impl<'h> Iterator for Memchr3<'h> {
         let haystack = self.it.haystack;
         let start = self.it.start;
         let end = self.it.end;
-        let found = scan::find3(
-            haystack,
-            start,
-            end,
-            self.needle1,
-            self.needle2,
-            self.needle3,
-        );
+        let found = scan::find3(haystack, start, end, self.needle1, self.needle2, self.needle3);
         match found {
             None => None,
             Some(at) => {
@@ -430,14 +389,7 @@ impl<'h> DoubleEndedIterator for Memchr3<'h> {
         let haystack = self.it.haystack;
         let start = self.it.start;
         let end = self.it.end;
-        let found = scan::rfind3(
-            haystack,
-            start,
-            end,
-            self.needle1,
-            self.needle2,
-            self.needle3,
-        );
+        let found = scan::rfind3(haystack, start, end, self.needle1, self.needle2, self.needle3);
         match found {
             None => None,
             Some(at) => {

@@ -6,11 +6,7 @@
 const SAFE_LIMIT: f64 = 1.0e300;
 
 fn float_add_guarded(a: f64, b: f64) -> f64 {
-    if a > SAFE_LIMIT || a < -SAFE_LIMIT || b > SAFE_LIMIT || b < -SAFE_LIMIT {
-        0.0
-    } else {
-        a + b
-    }
+    if a > SAFE_LIMIT || a < -SAFE_LIMIT || b > SAFE_LIMIT || b < -SAFE_LIMIT { 0.0 } else { a + b }
 }
 
 fn main() {

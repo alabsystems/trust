@@ -15,6 +15,9 @@
 //!    `MAJOR.MINOR.PATCH` version and `src/ci/channel` is exactly `trust`. This
 //!    is verifiable with no build at all: a publish that shipped an unparseable
 //!    version or a stock (`nightly`/`beta`/`stable`) channel would be malformed.
+//!    `src/rust-compat-version` — the separate file stating the Rust release the
+//!    `-V` protocol reports — is read the same way, and is what the stage2
+//!    compiler's `release:` line is measured against.
 //! 2. `discover_sysroot` — resolve the first `build/*/stage2` whose `bin/trustc`
 //!    is an executable, canonicalized. Absent under strict/release ⇒ failure.
 //! 3. `assert_toolchain_surface` — the daily-driver toolchain and analyzer
@@ -94,18 +97,19 @@ pub(crate) fn run(root: &Path, policy: GatePolicy) -> Result<()> {
     // (4) The resolved trustc is the standalone one (reports this exact sysroot).
     let identity = assert_compiler_identity(&sysroot, scratch.path())?;
     println!("host triple: {}", identity.host_triple);
-    // Trust: bootstrap renders the `trust` channel release as `{src/version}-dev`
-    // (src/bootstrap lib.rs `release()`), and the canonical version identity
-    // (`targo trust version` → trust.version.v2 `rust_compat_version`) documents
-    // exactly that spelling. The publishable precondition is therefore the
-    // channel-derived compat version, not the bare src/version.
-    let expected_release = format!("{version}-dev");
+    // Trust: `release:` in `trustc -Vv` is the rustc `-V` PROTOCOL line, which
+    // bootstrap renders from `src/rust-compat-version` (lib.rs `rust_release()`
+    // -> `release()`), not from Trust's own `src/version`. Measuring it against
+    // src/version was correct only while the two files carried the same number;
+    // since they were split it compared 1.99.0-dev against 0.1.0-dev.
+    let compat_version = assert_rust_compat_version(root)?;
+    let expected_release = trust_version::rust_compat_release(&compat_version, EXPECTED_CHANNEL);
     if identity.release != expected_release {
         bail!(
-            "stage2 trustc release {:?} does not match the trust-channel compat version {:?} (src/version {:?} + trust-channel `-dev` suffix)",
+            "stage2 trustc release {:?} does not match the trust-channel compat version {:?} (src/rust-compat-version {:?} + trust-channel `-dev` suffix)",
             identity.release,
             expected_release,
-            version
+            compat_version
         );
     }
     println!("compiler release matches the trust-channel compat version: {expected_release}");
@@ -157,6 +161,26 @@ fn assert_version_coherence(root: &Path) -> Result<String> {
         "  PASS: workspace version {version} is a parseable MAJOR.MINOR.PATCH and channel is {EXPECTED_CHANNEL}"
     );
     Ok(version.to_string())
+}
+
+/// Read `src/rust-compat-version` — the Rust release the `-V` protocol reports
+/// — through the same bounded, symlink-safe evidence reader. It must parse as a
+/// canonical `MAJOR.MINOR.PATCH`: it is embedded in `CFG_RELEASE`, which the
+/// crates.io ecosystem parses out of `rustc -V`.
+fn assert_rust_compat_version(root: &Path) -> Result<String> {
+    let bytes = read_bounded_exact_file_under(
+        root,
+        Path::new("src/rust-compat-version"),
+        MAX_VERSION_BYTES,
+    )?;
+    let text = String::from_utf8(bytes).context("src/rust-compat-version is not valid UTF-8")?;
+    let compat = text.trim();
+    if !is_semver_core(compat) {
+        bail!(
+            "src/rust-compat-version is not a parseable MAJOR.MINOR.PATCH version: {compat:?} (build scripts parse this out of `rustc -V`)"
+        );
+    }
+    Ok(compat.to_string())
 }
 
 /// A canonical SemVer spelling with exactly three numeric core fields. Numeric

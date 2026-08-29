@@ -37,10 +37,11 @@ use clean_kernel::{
 };
 
 use crate::mirsem::{
-    MIRSEM_DISCRIMINANT_TAG_KEY, MIRSEM_IDX_ELEM_PRIME, MIRSEM_SET_KEY_EQ, SemAdtArm, SemAdtPayload,
-    SemAdtPayloadExtract, SemAdtPayloadExtractDiverging, SemAdtReturn, SemAdtReturn3,
-    SemAdtReturnOpaqueOrd, SemCmpOp, SemCondTree, SemFieldRmw, SemFieldSet, SemIterStep, SemOperand,
-    SemRmwOp, SemRmwRhs, SemScalarSentinelSelect, SemStructField, SemStructReturn,
+    MIRSEM_DISCRIMINANT_TAG_KEY, MIRSEM_IDX_ELEM_PRIME, MIRSEM_SET_KEY_EQ, SemAdtArm,
+    SemAdtPayload, SemAdtPayloadExtract, SemAdtPayloadExtractDiverging, SemAdtReturn,
+    SemAdtReturn3, SemAdtReturnOpaqueOrd, SemCmpOp, SemCondTree, SemFieldRmw, SemFieldSet,
+    SemIterStep, SemOperand, SemRmwOp, SemRmwRhs, SemScalarSentinelSelect, SemStructField,
+    SemStructReturn,
 };
 use crate::trustir_anchor::{
     RefinementVerdict, TRUSTIR_IDX_ELEM, TRUSTIR_ITER_HAS_NEXT, TRUSTIR_ITER_HAS_NEXT2,
@@ -257,6 +258,32 @@ fn nested_stub_ty(enum_name: &str, variant: i128) -> trust_types::Ty {
 /// destination width before that value enters the constructor), or a single
 /// NESTED-enum field (the
 /// [`nested_stub_ty`] carrier).
+/// Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — the stub for a nested constructor WITH
+/// operands, the sibling of [`nested_stub_ty`].
+///
+/// Same discipline: a SINGLE-variant stub asserting exactly "the payload is constructor
+/// `V<variant>` applied to these values", and nothing about any other variant of the real
+/// Rust type. The difference is that this one carries `n` `Int` slots, so the applied
+/// constructor's arity and argument ORDER are what the kernel checks — which is the whole
+/// content of the claim (`Inner(a, b)` and `Inner(b, a)` must not be the same theorem).
+///
+/// The slots are `Int` because the recognizer admits only SCALAR inner fields
+/// (`mirsem::adt_shapes::nested_fields_all_scalar`); a typed-slot stub is what a deeper
+/// nest would need.
+fn nested_ctor_stub_ty(enum_name: &str, variant: i128, arity: usize) -> trust_types::Ty {
+    use trust_types::{Ty, VariantDef};
+    Ty::adt_enum(
+        enum_name.to_string(),
+        vec![VariantDef {
+            name: format!("V{variant}"),
+            discriminant: variant,
+            fields: (0..arity)
+                .map(|i| (i.to_string(), Ty::Int { width: 64, signed: true }))
+                .collect(),
+        }],
+    )
+}
+
 fn nested_arm_name(enum_name: &str, position: usize) -> String {
     format!("{enum_name}#adt-return-{position}")
 }
@@ -274,8 +301,36 @@ fn variant_def_for_arm(arm: &SemAdtArm, position: usize) -> trust_types::Variant
         ) => {
             vec![("0".to_string(), Ty::Int { width: 64, signed: true })]
         }
+        // Trust: NON-SCALAR DOWNCAST PAYLOAD (2026-08-26) — the carrier field takes the
+        // payload's OWN type, so the outer enum registers as `Some : <payload carrier> →
+        // Option` and the `oᵀ` denotation is well-typed. This is exactly what the
+        // `Int`-keyed sibling could not provide, and the reason the cheap relaxation
+        // experiment gained 3 bodies instead of 410.
+        Some(SemAdtPayload::DowncastOpaque { payload_ty, .. }) => {
+            vec![("0".to_string(), payload_ty.clone())]
+        }
         Some(SemAdtPayload::NullaryNested { enum_name, variant }) => {
             vec![("0".to_string(), nested_stub_ty(&nested_arm_name(enum_name, position), *variant))]
+        }
+        // Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — a STUB carrier, exactly as the
+        // `NullaryNested` sibling uses, NOT the inner `Ty` itself.
+        //
+        // Handing the real inner type here does not work and the failure is quiet: the
+        // outer reflection encodes an ADT-typed field STRUCTURALLY, so `Arm1` came out
+        // taking `Prod (BitVec 64) (Prod (BitVec 64) Unit)` while the witness applied
+        // `Trust.Adt.Inner.mk`, and the kernel rejected a type it had every right to
+        // reject. The stub makes the outer field an inductive the witness can actually
+        // construct.
+        Some(SemAdtPayload::NestedCtor { ty, variant, fields }) => {
+            let inner_name = match ty {
+                Ty::Adt { name, .. } => name.as_str(),
+                _ => "nested",
+            };
+            let v = i128::try_from(variant.unwrap_or(0)).unwrap_or(0);
+            vec![(
+                "0".to_string(),
+                nested_ctor_stub_ty(&nested_arm_name(inner_name, position), v, fields.len()),
+            )]
         }
     };
     VariantDef { name: format!("Arm{}", arm.variant), discriminant: arm.variant, fields }
@@ -305,6 +360,28 @@ fn register_outer_enum(
             .into_iter()
             .enumerate()
     {
+        // Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — same registration path as the
+        // nullary sibling; the slot carries the BARE constructor const, which
+        // `arm_value_expr` then applies to the field denotations (it has `e_bvar`; this
+        // function does not, which is exactly why the application happens there).
+        if let Some(SemAdtPayload::NestedCtor { ty, variant, fields }) = &arm.payload {
+            let inner_name = match ty {
+                trust_types::Ty::Adt { name, .. } => name.as_str(),
+                _ => "nested",
+            };
+            let v = i128::try_from(variant.unwrap_or(0)).ok()?;
+            let nested_ty =
+                nested_ctor_stub_ty(&nested_arm_name(inner_name, position), v, fields.len());
+            let nested_carrier = crate::reflect::reflect_enum(&nested_ty)?;
+            let name = nested_carrier.name.clone();
+            let registry = crate::clean_ground::register_adt_carriers(
+                env,
+                std::slice::from_ref(&nested_carrier),
+            );
+            let confirmed = registry.get(&name)?;
+            let ctor_name = confirmed.constructors.first()?.name.clone();
+            *slot = Some(Expr::const_(Name::from_string(&ctor_name), LevelVec::new()));
+        }
         if let Some(SemAdtPayload::NullaryNested { enum_name, variant }) = &arm.payload {
             let nested_ty = nested_stub_ty(&nested_arm_name(enum_name, position), *variant);
             let nested_carrier = crate::reflect::reflect_enum(&nested_ty)?;
@@ -403,6 +480,24 @@ fn arm_value_expr(
     nested_closed_val: Option<&Expr>,
     e_bvar: u32,
 ) -> Option<Expr> {
+    arm_value_expr_with_opaque(ctor_name, payload, nested_closed_val, e_bvar, None)
+}
+
+/// [`arm_value_expr`] with the OPAQUE ENVIRONMENT binder index, for a non-scalar
+/// downcast payload.
+///
+/// `o_bvar` is the de Bruijn index of the `oᵀ : Nat → Nat → <payload carrier>` binder at
+/// the point the arm value is built. `build_refinement` binds it OUTERMOST, which is what
+/// leaves every pre-existing index in that witness untouched: under `λo λe λhg` the
+/// hypothesis is still 0 and `e` is still 1, so `o_bvar` is simply `e_bvar + 1`. A
+/// `None` here with a `DowncastOpaque` payload declines rather than inventing a binder.
+fn arm_value_expr_with_opaque(
+    ctor_name: &str,
+    payload: &Option<SemAdtPayload>,
+    nested_closed_val: Option<&Expr>,
+    e_bvar: u32,
+    o_bvar: Option<u32>,
+) -> Option<Expr> {
     let ctor = Expr::const_(Name::from_string(ctor_name), LevelVec::new());
     match payload {
         None => Some(ctor),
@@ -419,8 +514,38 @@ fn arm_value_expr(
             let field = SemOperand::Field(Box::new(SemOperand::Var(*base_param)), *flat_key);
             Some(Expr::app(ctor, sem_operand_to_expr(&field, e_bvar)?))
         }
+        // Trust: NON-SCALAR DOWNCAST PAYLOAD (2026-08-26) — `ctor (oᵀ base flat_key)`.
+        // The key is the same VARIANT-DISJOINT flattened position the scalar sibling
+        // uses, so two variants' payloads stay distinct terms and a forged wrong-variant
+        // claim is still kernel-rejected.
+        Some(SemAdtPayload::DowncastOpaque { base_param, flat_key, .. }) => {
+            let o = Expr::bvar(o_bvar?);
+            Some(Expr::app(
+                ctor,
+                Expr::apps(o, [Expr::nat_lit(*base_param), Expr::nat_lit(*flat_key)]),
+            ))
+        }
         Some(SemAdtPayload::NullaryNested { .. }) => {
             Some(Expr::app(ctor, nested_closed_val?.clone()))
+        }
+        // Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — EXACT STRUCTURE: apply the inner
+        // constructor to the inner field denotations, so the kernel checks
+        // `Arm{n} (Inner.mk ⟦x⟧)` rather than an opaque stand-in. Shares the struct lane's
+        // `nested_ctor_expr`, and the empty `outer_opaque` is honest: this lane refuses
+        // OPAQUE-PARAM fields upstream (see `SemAdtPayload::NestedCtor`), so there is no
+        // opaque binder to index and none is invented. `e_bvar` is threaded so scalar
+        // leaves read the SAME env binder the sibling payload arms read.
+        // Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — EXACT STRUCTURE: the stub's
+        // constructor applied to the inner field denotations, so the kernel checks
+        // `Arm1 (V0 ⟦a⟧ ⟦b⟧)`. Argument ORDER is what makes `Inner(a, b)` and
+        // `Inner(b, a)` different theorems.
+        Some(SemAdtPayload::NestedCtor { fields, .. }) => {
+            let mut inner = nested_closed_val?.clone();
+            for f in fields {
+                let SemStructField::Scalar(op) = f else { return None };
+                inner = Expr::app(inner, sem_operand_to_expr(op, e_bvar)?);
+            }
+            Some(Expr::app(ctor, inner))
         }
     }
 }
@@ -450,13 +575,52 @@ fn build_refinement(r: &SemAdtReturn, claimed: Option<&Expr>) -> Option<(Environ
     let adt_ty = || Expr::const_(Name::from_string(&adt_name), LevelVec::new());
     let l1 = Level::succ(Level::zero());
 
+    // Trust: NON-SCALAR DOWNCAST PAYLOAD (2026-08-26) — if either arm carries one, the
+    // statement gains an OUTERMOST opaque-environment binder
+    // `oᵀ : Nat → Nat → <payload carrier>`. Outermost placement is what keeps every
+    // pre-existing index in this witness unchanged: `e` and the guard hypothesis keep
+    // their positions, so the `None` path below is byte-identical to before.
+    let opaque_payload_ty = [&r.then_arm.payload, &r.else_arm.payload]
+        .into_iter()
+        .flatten()
+        .find_map(|p| match p {
+            SemAdtPayload::DowncastOpaque { payload_ty, .. } => Some(payload_ty.clone()),
+            _ => None,
+        });
+    let o_ty = match &opaque_payload_ty {
+        None => None,
+        Some(ty) => {
+            // Both arms must agree on the payload carrier — one binder, one type.
+            let disagrees = [&r.then_arm.payload, &r.else_arm.payload]
+                .into_iter()
+                .flatten()
+                .any(|p| matches!(p, SemAdtPayload::DowncastOpaque { payload_ty, .. } if payload_ty != ty));
+            if disagrees {
+                return None;
+            }
+            let carrier = crate::reflect::reflect_struct(ty)?;
+            let registry = crate::clean_ground::register_adt_carriers(
+                &mut env,
+                &crate::clean_ground::carrier_closure_for(ty, &carrier),
+            );
+            registry.get(&carrier.name)?;
+            let nat = || Expr::const_(Name::from_string("Nat"), LevelVec::new());
+            let payload_carrier = Expr::const_(Name::from_string(&carrier.name), LevelVec::new());
+            Some(Expr::pi(bd(), nat(), Expr::pi(bd(), nat(), payload_carrier)))
+        }
+    };
+    // Under `λo λe λhg`: hg=0, e=1, o=2 — so `o_bvar = e_bvar + 1` at every depth.
+    let ob = |e_bvar: u32| o_ty.as_ref().map(|_| e_bvar + 1);
+
     // STATEMENT: ∀ (e:Env), guard e = true → select e = <claimed OR then_val>.  Under
     // `λ e`: e=0.
     let guard0 = cond_bool(&r.cond, 0)?;
     let guard_eq = eq_bool_true(guard0);
     // Under `λ e λ hg`: hg=0, e=1.
-    let then_v1 = arm_value_expr(&then_ctor, &r.then_arm.payload, then_nested.as_ref(), 1)?;
-    let else_v1 = arm_value_expr(&else_ctor, &r.else_arm.payload, else_nested.as_ref(), 1)?;
+    let then_v1 =
+        arm_value_expr_with_opaque(&then_ctor, &r.then_arm.payload, then_nested.as_ref(), 1, ob(1))?;
+    let else_v1 =
+        arm_value_expr_with_opaque(&else_ctor, &r.else_arm.payload, else_nested.as_ref(), 1, ob(1))?;
     let guard1 = cond_bool(&r.cond, 1)?;
     let lhs = {
         let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![l1.clone()]);
@@ -466,7 +630,10 @@ fn build_refinement(r: &SemAdtReturn, claimed: Option<&Expr>) -> Option<(Environ
     let rhs = claimed.cloned().unwrap_or_else(|| then_v1.clone());
     let eq =
         Expr::apps(Expr::const_(Name::from_string("Eq"), vec![l1.clone()]), [adt_ty(), lhs, rhs]);
-    let statement = Expr::pi(bd(), env_ty(), Expr::pi(bd(), guard_eq, eq));
+    let mut statement = Expr::pi(bd(), env_ty(), Expr::pi(bd(), guard_eq, eq));
+    if let Some(t) = &o_ty {
+        statement = Expr::pi(bd(), t.clone(), statement);
+    }
 
     // PROOF (genuine — uses the guard hypothesis via `congrArg` transport, mirroring
     // `guarded_index_refinement`'s proof EXACTLY, `Int` swapped for `adt_ty()`):
@@ -480,8 +647,20 @@ fn build_refinement(r: &SemAdtReturn, claimed: Option<&Expr>) -> Option<(Environ
         let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![l1.clone()]);
         let motive = Expr::lam(bd(), cst("Bool"), adt_ty());
         // Under `λ e λ hg λ x`: x=0, hg=1, e=2.
-        let then_v2 = arm_value_expr(&then_ctor, &r.then_arm.payload, then_nested.as_ref(), 2)?;
-        let else_v2 = arm_value_expr(&else_ctor, &r.else_arm.payload, else_nested.as_ref(), 2)?;
+        let then_v2 = arm_value_expr_with_opaque(
+            &then_ctor,
+            &r.then_arm.payload,
+            then_nested.as_ref(),
+            2,
+            ob(2),
+        )?;
+        let else_v2 = arm_value_expr_with_opaque(
+            &else_ctor,
+            &r.else_arm.payload,
+            else_nested.as_ref(),
+            2,
+            ob(2),
+        )?;
         let select_x = Expr::apps(bool_rec, [motive, else_v2, then_v2, Expr::bvar(0)]);
         Expr::lam(bd(), cst("Bool"), select_x)
     };
@@ -491,7 +670,11 @@ fn build_refinement(r: &SemAdtReturn, claimed: Option<&Expr>) -> Option<(Environ
         [cst("Bool"), adt_ty(), guard1_for_proof, cst("Bool.true"), f, Expr::bvar(0)],
     );
     let guard0_for_proof = cond_bool(&r.cond, 0)?;
-    let proof = Expr::lam(bd(), env_ty(), Expr::lam(bd(), eq_bool_true(guard0_for_proof), congr));
+    let mut proof =
+        Expr::lam(bd(), env_ty(), Expr::lam(bd(), eq_bool_true(guard0_for_proof), congr));
+    if let Some(t) = &o_ty {
+        proof = Expr::lam(bd(), t.clone(), proof);
+    }
 
     Some((env, statement, proof))
 }
@@ -580,6 +763,23 @@ fn then_value_for_test(r: &SemAdtReturn) -> Option<Expr> {
 /// independently-built env. `pub(crate)` so the `mirsem::tests` MIR-order-fidelity
 /// probe can build a cross-instance claim without duplicating the plumbing.
 #[cfg(test)]
+/// Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — the THEN-arm value an ADT-return
+/// obligation states, exposed so a forgery probe can build a claim from ONE shape and
+/// assert it against ANOTHER.
+///
+/// Without this a "does the lane claim argument order?" test can only compare recognized
+/// PAYLOADS, which is a statement about the recognizer and not about what the kernel is
+/// asked — the witness rebuilds model and claim from the same data, so it would certify
+/// either way. Builds exactly what `build_refinement`'s then-arm builds (same env, same
+/// `e_bvar`), so the override is apples-to-apples.
+#[must_use]
+pub(crate) fn honest_adt_then_value_for_test(r: &SemAdtReturn) -> Option<Expr> {
+    let mut env = crate::trustir_anchor::trustir_env().ok()?;
+    let (then_ctor, _else_ctor, then_nested, _else_nested, _name) =
+        register_outer_enum(&mut env, r)?;
+    arm_value_expr(&then_ctor, &r.then_arm.payload, then_nested.as_ref(), 1)
+}
+
 pub(crate) fn honest_value_for_test(r: &SemStructReturn) -> Option<Expr> {
     let mut env = crate::trustir_anchor::trustir_env().ok()?;
     let carrier = crate::reflect::reflect_struct(&r.struct_ty)?;
@@ -762,10 +962,7 @@ fn build_iter_step_env(step: &SemIterStep) -> Option<(Environment, String, Strin
     let ret2_body = {
         let motive = Expr::lam(bd(), cst("Bool"), cst(&opt_name));
         let some = Expr::app(cst(&some_ctor), iter_seq_e(1, 0));
-        let rec = Expr::apps(
-            bool_rec(),
-            [motive, cst(&none_ctor), some, iter_has_next2_e(1, 0)],
-        );
+        let rec = Expr::apps(bool_rec(), [motive, cst(&none_ctor), some, iter_has_next2_e(1, 0)]);
         Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), rec))
     };
     let ret2_ty = Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), cst(&opt_name)));
@@ -781,10 +978,8 @@ fn build_iter_step_env(step: &SemIterStep) -> Option<(Environment, String, Strin
     // post2 := λ recv g. Bool.rec (λ_:Bool. Int) g (Int.add g 1) (iter_has_next2 recv g).
     let post2_body = {
         let motive = Expr::lam(bd(), cst("Bool"), int_ty());
-        let rec = Expr::apps(
-            bool_rec(),
-            [motive, Expr::bvar(0), int_add1_e(0), iter_has_next2_e(1, 0)],
-        );
+        let rec =
+            Expr::apps(bool_rec(), [motive, Expr::bvar(0), int_add1_e(0), iter_has_next2_e(1, 0)]);
         Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), rec))
     };
     let post2_ty = Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()));
@@ -816,13 +1011,11 @@ fn build_iter_step_obligation(
     let is_ret2 = matches!(thm, IterStepThm::Val2 | IterStepThm::None2);
     let def_name = if is_ret2 { ITER_STEP_RET2 } else { ITER_STEP_POST2 };
     let motive_ty = || if is_ret2 { cst(&opt_name) } else { int_ty() };
-    let def_e = |recv_b: u32, g_b: u32| {
-        Expr::apps(cst(def_name), [Expr::bvar(recv_b), Expr::bvar(g_b)])
-    };
+    let def_e =
+        |recv_b: u32, g_b: u32| Expr::apps(cst(def_name), [Expr::bvar(recv_b), Expr::bvar(g_b)]);
     // The `Bool.rec` minors at a given (recv_b, g_b) — false (else) and true (then).
-    let false_minor = |g_b: u32| -> Expr {
-        if is_ret2 { cst(&none_ctor) } else { Expr::bvar(g_b) }
-    };
+    let false_minor =
+        |g_b: u32| -> Expr { if is_ret2 { cst(&none_ctor) } else { Expr::bvar(g_b) } };
     let true_minor = |recv_b: u32, g_b: u32| -> Expr {
         if is_ret2 { Expr::app(cst(&some_ctor), iter_seq_e(recv_b, g_b)) } else { int_add1_e(g_b) }
     };
@@ -849,10 +1042,7 @@ fn build_iter_step_obligation(
     let f = {
         let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![l1.clone()]);
         let motive = Expr::lam(bd(), cst("Bool"), motive_ty());
-        let rec = Expr::apps(
-            bool_rec,
-            [motive, false_minor(2), true_minor(3, 2), Expr::bvar(0)],
-        );
+        let rec = Expr::apps(bool_rec, [motive, false_minor(2), true_minor(3, 2), Expr::bvar(0)]);
         Expr::lam(bd(), cst("Bool"), rec)
     };
     let target = if pol { cst("Bool.true") } else { cst("Bool.false") };
@@ -1091,11 +1281,7 @@ fn build_field_set_obligation(
         Expr::pi(
             bd(),
             int_ty(),
-            Expr::pi(
-                bd(),
-                int_ty(),
-                Expr::pi(bd(), int_ty(), Expr::pi(bd(), hyp_ty.clone(), eq)),
-            ),
+            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), Expr::pi(bd(), hyp_ty.clone(), eq))),
         ),
     );
 
@@ -1107,10 +1293,8 @@ fn build_field_set_obligation(
     let f = {
         let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![l1.clone()]);
         let motive = Expr::lam(bd(), cst("Bool"), int_ty());
-        let rec = Expr::apps(
-            bool_rec,
-            [motive, idx_elem_prime_e(5, 4, 3), Expr::bvar(2), Expr::bvar(0)],
-        );
+        let rec =
+            Expr::apps(bool_rec, [motive, idx_elem_prime_e(5, 4, 3), Expr::bvar(2), Expr::bvar(0)]);
         Expr::lam(bd(), cst("Bool"), rec)
     };
     let target = if pol { cst("Bool.true") } else { cst("Bool.false") };
@@ -1124,11 +1308,7 @@ fn build_field_set_obligation(
         Expr::lam(
             bd(),
             int_ty(),
-            Expr::lam(
-                bd(),
-                int_ty(),
-                Expr::lam(bd(), int_ty(), Expr::lam(bd(), hyp_ty, congr)),
-            ),
+            Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), Expr::lam(bd(), hyp_ty, congr))),
         ),
     );
 
@@ -1280,11 +1460,10 @@ fn rmw_op_const(op: SemRmwOp) -> &'static str {
 /// depend on which key the selector is later interrogated at — which is exactly what
 /// keeps the `congrArg` transport (whose `f` abstracts ONLY the guard scrutinee) valid.
 fn rmw_value_e(rmw: &SemFieldRmw, recv_b: u32, g_b: u32, v_b: u32) -> Expr {
-    let pre = Expr::apps(cst(MIRSEM_IDX_ELEM_PRIME), [
-        Expr::bvar(recv_b),
-        int_lit(i128::from(rmw.field_key)),
-        Expr::bvar(g_b),
-    ]);
+    let pre = Expr::apps(
+        cst(MIRSEM_IDX_ELEM_PRIME),
+        [Expr::bvar(recv_b), int_lit(i128::from(rmw.field_key)), Expr::bvar(g_b)],
+    );
     let rhs = match rmw.rhs {
         SemRmwRhs::Const(c) => int_lit(c),
         SemRmwRhs::Param(_) => Expr::bvar(v_b),
@@ -1307,12 +1486,10 @@ fn build_field_rmw_env(rmw: &SemFieldRmw) -> Option<Environment> {
     // Under λ recv λ k λ g λ v: recv = 3, k = 2, g = 1, v = 0.
     let rmw_post_body = {
         let motive = Expr::lam(bd(), cst("Bool"), int_ty());
-        let rec = Expr::apps(bool_rec, [
-            motive,
-            idx_elem_prime_e(3, 2, 1),
-            rmw_value_e(rmw, 3, 1, 0),
-            set_key_eq_e(2, fld),
-        ]);
+        let rec = Expr::apps(
+            bool_rec,
+            [motive, idx_elem_prime_e(3, 2, 1), rmw_value_e(rmw, 3, 1, 0), set_key_eq_e(2, fld)],
+        );
         Expr::lam(
             bd(),
             int_ty(),
@@ -1351,12 +1528,10 @@ fn build_field_rmw_obligation(
     let l1 = Level::succ(Level::zero());
     let pol = matches!(thm, FieldRmwThm::Set);
     let rmw_post_e = |recv_b: u32, k_b: u32, g_b: u32, v_b: u32| {
-        Expr::apps(cst(RMW_POST), [
-            Expr::bvar(recv_b),
-            Expr::bvar(k_b),
-            Expr::bvar(g_b),
-            Expr::bvar(v_b),
-        ])
+        Expr::apps(
+            cst(RMW_POST),
+            [Expr::bvar(recv_b), Expr::bvar(k_b), Expr::bvar(g_b), Expr::bvar(v_b)],
+        )
     };
 
     // STATEMENT (under `Π recv Π k Π g Π v Π hg`): at the eq recv=4,k=3,g=2,v=1,hg=0; at
@@ -1367,25 +1542,19 @@ fn build_field_rmw_obligation(
     };
     // honest minor: TRUE (k==fld) ↦ the arithmetic term over the PRE-state selector;
     // FALSE (k!=fld) ↦ the untouched pre-state selector at the queried key.
-    let honest_rhs =
-        if pol { rmw_value_e(rmw, 4, 2, 1) } else { idx_elem_prime_e(4, 3, 2) };
+    let honest_rhs = if pol { rmw_value_e(rmw, 4, 2, 1) } else { idx_elem_prime_e(4, 3, 2) };
     let rhs = claimed.cloned().unwrap_or(honest_rhs);
-    let eq = Expr::apps(Expr::const_(Name::from_string("Eq"), vec![l1.clone()]), [
-        int_ty(),
-        rmw_post_e(4, 3, 2, 1),
-        rhs,
-    ]);
+    let eq = Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![l1.clone()]),
+        [int_ty(), rmw_post_e(4, 3, 2, 1), rhs],
+    );
     let statement = Expr::pi(
         bd(),
         int_ty(),
         Expr::pi(
             bd(),
             int_ty(),
-            Expr::pi(
-                bd(),
-                int_ty(),
-                Expr::pi(bd(), int_ty(), Expr::pi(bd(), hyp_ty.clone(), eq)),
-            ),
+            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), Expr::pi(bd(), hyp_ty.clone(), eq))),
         ),
     );
 
@@ -1397,34 +1566,24 @@ fn build_field_rmw_obligation(
     let f = {
         let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![l1.clone()]);
         let motive = Expr::lam(bd(), cst("Bool"), int_ty());
-        let rec = Expr::apps(bool_rec, [
-            motive,
-            idx_elem_prime_e(5, 4, 3),
-            rmw_value_e(rmw, 5, 3, 2),
-            Expr::bvar(0),
-        ]);
+        let rec = Expr::apps(
+            bool_rec,
+            [motive, idx_elem_prime_e(5, 4, 3), rmw_value_e(rmw, 5, 3, 2), Expr::bvar(0)],
+        );
         Expr::lam(bd(), cst("Bool"), rec)
     };
     let target = if pol { cst("Bool.true") } else { cst("Bool.false") };
-    let congr = Expr::apps(Expr::const_(Name::from_string("congrArg"), vec![l1.clone(), l1]), [
-        cst("Bool"),
-        int_ty(),
-        set_key_eq_e(3, fld),
-        target,
-        f,
-        Expr::bvar(0),
-    ]);
+    let congr = Expr::apps(
+        Expr::const_(Name::from_string("congrArg"), vec![l1.clone(), l1]),
+        [cst("Bool"), int_ty(), set_key_eq_e(3, fld), target, f, Expr::bvar(0)],
+    );
     let proof = Expr::lam(
         bd(),
         int_ty(),
         Expr::lam(
             bd(),
             int_ty(),
-            Expr::lam(
-                bd(),
-                int_ty(),
-                Expr::lam(bd(), int_ty(), Expr::lam(bd(), hyp_ty, congr)),
-            ),
+            Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), Expr::lam(bd(), hyp_ty, congr))),
         ),
     );
 
@@ -1585,10 +1744,18 @@ pub fn check_field_rmw_refinement(rmw: &SemFieldRmw) -> RefinementVerdict {
 /// raw-CFG offset discharge (clause (c) — enforced by the recognizer + forgery probe).
 fn struct_field_expr(field: &SemStructField, e_bvar: u32) -> Option<Expr> {
     match field {
+        // Trust: GENERIC-CTOR increment (2026-08-25) — a param-typed field has NO
+        // `Env` denotation (`Env` is `Int`-sorted); it denotes a ∀-bound binder that
+        // only `build_struct_refinement` can index, because the index depends on the
+        // whole binder layout. Fail closed here so no other caller can silently give
+        // it an `Int` reading.
+        SemStructField::OpaqueParam { .. } => None,
+        // Trust: NESTED-CTOR (2026-08-25) — a nested constructor's denotation depends on
+        // the whole binder layout (its own fields may be opaque), so only
+        // `build_ctor_refinement` can build it. Fail closed here, as for `OpaqueParam`.
+        SemStructField::NestedCtor { .. } => None,
         SemStructField::Scalar(op) => sem_operand_to_expr(op, e_bvar),
-        SemStructField::Unit => {
-            Some(Expr::const_(Name::from_string("Unit.unit"), LevelVec::new()))
-        }
+        SemStructField::Unit => Some(Expr::const_(Name::from_string("Unit.unit"), LevelVec::new())),
         // GATE-PTR-SLOT-OPACITY(a): a slice-START pointer field — `sliceStart ⟦root⟧`,
         // a fresh opaque application on the root (provenance root ≠ value identity),
         // NEVER the bare `e p` slot.
@@ -1627,48 +1794,601 @@ fn build_struct_refinement(
     r: &SemStructReturn,
     claimed: Option<&Expr>,
 ) -> Option<(Environment, Expr, Expr)> {
+    build_ctor_refinement(&r.struct_ty, &r.fields, None, claimed)
+}
+
+/// Trust: BARE-ENUM-CTOR increment (2026-08-25) — the shared constructor-refinement
+/// builder behind both the STRUCT lane (`variant: None`, the single anonymous `.mk`)
+/// and the bare ENUM-CONSTRUCTOR lane (`variant: Some(v)`, the enum inductive's v-th
+/// constructor). Everything that makes the struct witness honest — the `Sort 1` type
+/// binders, the parameter-keyed opaque environments `oᵀ p`, the `Eq.refl` proof and the
+/// `claimed`-override probe seam — is shared verbatim, so the enum lane cannot drift
+/// into a weaker claim than its sibling.
+///
+/// Measured demand: 22 of the 26 real bare single-statement ENUM constructors already
+/// have a carrier that REGISTERS modulo 3; they declined only because no lane built the
+/// witness.
+fn build_ctor_refinement(
+    ty: &trust_types::Ty,
+    r_fields: &[SemStructField],
+    variant: Option<usize>,
+    claimed: Option<&Expr>,
+) -> Option<(Environment, Expr, Expr)> {
     let mut env = crate::trustir_anchor::trustir_env().ok()?;
     // Register the single-`.mk` carrier through the UNCHANGED reflect/register path;
     // RE-GET the registry (a gate-failed inductive stays in the env but out of the
     // registry — never assume registration succeeded).
-    let carrier = crate::reflect::reflect_struct(&r.struct_ty)?;
-    if !carrier.type_params.is_empty() || carrier.is_enum() {
-        return None; // concrete-only: a Pi-wrapped generic `.mk` is deferred (increment > 1).
+    let carrier = crate::reflect::reflect_struct(ty)?;
+    if carrier.is_enum() != variant.is_some() {
+        // A STRUCT request against an enum carrier (or the reverse) is a shape/lane
+        // mismatch, never an approximation. Fail closed.
+        return None;
     }
-    let registry =
-        crate::clean_ground::register_adt_carriers(&mut env, std::slice::from_ref(&carrier));
+    let registry = crate::clean_ground::register_adt_carriers(
+        &mut env,
+        &crate::clean_ground::carrier_closure_for(ty, &carrier),
+    );
     let confirmed = registry.get(&carrier.name)?;
-    if confirmed.fields.len() != r.fields.len() {
-        return None; // arity: `.mk` argument count must equal the recognized field count.
+    // The constructor to apply, and ITS field carriers: for an enum the v-th variant
+    // constructor over that variant's own fields; for a struct the anonymous `.mk` over
+    // the struct's fields. The enum flat (all-variant) `fields` view is NOT the ctor
+    // shape and is deliberately not used here.
+    let (ctor_name, ctor_fields): (String, &[(String, crate::kernel_check::ProofTerm)]) =
+        match variant {
+            Some(v) => {
+                let ctor = confirmed.constructors.get(v)?;
+                (ctor.name.clone(), ctor.fields.as_slice())
+            }
+            None => (confirmed.ctor_name.clone(), confirmed.fields.as_slice()),
+        };
+    if ctor_fields.len() != r_fields.len() {
+        return None; // arity: constructor argument count must equal the recognized fields.
     }
-    let ctor_name = confirmed.ctor_name.clone();
-    let adt_ty = || Expr::const_(Name::from_string(&carrier.name), LevelVec::new());
     let l1 = Level::succ(Level::zero());
 
-    // The honest ctor application `S.mk ⟦f_0⟧e … ⟦f_n⟧e` at binder depth 0 (under `λ e`
-    // / `Π (e:Env)`, `e` is bvar 0).
+    // Trust: GENERIC-CTOR increment (2026-08-25) — the Pi-wrapped generalization.
+    // `register_adt_carriers` declares `S : Type → … → Type` (one arrow per type
+    // param) and `S.mk : Π(T₀:Type)…Π(T_{k-1}:Type). τ₁ → … → τₙ → S T₀ … T_{k-1}`,
+    // so the witness binds those `k` type binders OUTERMOST, then one VALUE binder
+    // per generic-typed source PARAMETER, then `e`. For `k = 0` this is byte-for-byte
+    // the previous concrete construction (no binders added, `e` still bvar 0).
+    //
+    // Binder order outermost→innermost is `T₀ … T_{k-1}, v₀ … v_{m-1}, e`, so at the
+    // innermost point (`k + m + 1` binders above): `T_i = bvar(k + m - i)`,
+    // `v_j = bvar(m - j)`, `e = bvar(0)`. Concrete fields therefore keep denoting
+    // `struct_field_expr(field, 0)` UNCHANGED — that is what preserves their tie to
+    // the real parameter values rather than universally quantifying them away.
+    let k = u32::try_from(carrier.type_params.len()).ok()?;
+
+    // The distinct FIELD CARRIER CODES of the opaque fields, in first-appearance
+    // order — ONE binder each, of type `Nat → <that field type>`.
+    //
+    // The binder is an OPAQUE ENVIRONMENT, exactly parallel to `e : Nat → Int`, and an
+    // opaque field sourced from parameter `p` denotes `oᵀ p`. This is what records
+    // PROVENANCE in the theorem. The earlier design — one plain value binder per
+    // source parameter — silently lost it whenever a body had a SINGLE opaque field:
+    // with `m = 1` the binder is `bvar(1)` no matter which parameter supplied it, so
+    // `Wrap { inner: p₀, n }` and `Wrap { inner: p₂, n }` produced the SAME theorem
+    // and the witness certified "returns `Wrap.mk` of SOME value", which over-claims
+    // faithfulness. Caught by `a_concrete_nested_adt_ctor_witness_is_parameter_keyed`.
+    let mut opaque_codes: Vec<&crate::kernel_check::ProofTerm> = Vec::new();
+    for (idx, field) in r_fields.iter().enumerate() {
+        if matches!(field, SemStructField::OpaqueParam { .. }) {
+            let (_, code) = ctor_fields.get(idx)?;
+            if !opaque_codes.iter().any(|c| *c == code) {
+                opaque_codes.push(code);
+            }
+        }
+    }
+    let m = u32::try_from(opaque_codes.len()).ok()?;
+
+    // Each opaque environment's binder TYPE, `Π (_ : Nat) (_ : Nat), <field type>`.
+    // TWO indices: the source PARAMETER and the PART of it (0 = the parameter itself,
+    // n+1 = its field n), so `p` and `p.0` denote distinctly. The field type decodes at
+    // depth `k + j + 2` — the `+ 2` is the two `Nat` binders above the codomain.
+    let mut binder_types: Vec<Expr> = Vec::with_capacity(opaque_codes.len());
+    for (j, code) in opaque_codes.iter().enumerate() {
+        let depth = k.checked_add(u32::try_from(j).ok()?)?.checked_add(2)?;
+        let field_ty = crate::clean_ground::ctor_field_type(&carrier, code, depth)?;
+        let nat = || Expr::const_(Name::from_string("Nat"), LevelVec::new());
+        binder_types.push(Expr::pi(bd(), nat(), Expr::pi(bd(), nat(), field_ty)));
+    }
+
+    // `S T₀ … T_{k-1}` at the innermost depth.
+    let adt_ty = || {
+        let mut ty = Expr::const_(Name::from_string(&carrier.name), LevelVec::new());
+        for i in 0..k {
+            ty = Expr::app(ty, Expr::bvar(k + m - i));
+        }
+        ty
+    };
+
+    // The honest ctor application `S.mk T₀ … T_{k-1} ⟦f_0⟧ … ⟦f_n⟧` at the innermost
+    // depth: a generic field takes its SOURCE PARAMETER's binder, a concrete field its
+    // unchanged `Env` denotation.
     let honest = {
         let mut app = Expr::const_(Name::from_string(&ctor_name), LevelVec::new());
-        for field in &r.fields {
-            app = Expr::app(app, struct_field_expr(field, 0)?);
+        for i in 0..k {
+            app = Expr::app(app, Expr::bvar(k + m - i));
+        }
+        for field in r_fields {
+            let arg = match field {
+                SemStructField::NestedCtor { ty: inner_ty, variant: inner_v, fields: inner_f } => {
+                    nested_ctor_expr(inner_ty, *inner_v, inner_f, &opaque_codes, k, m, 0, 0)?
+                }
+                SemStructField::OpaqueParam { param, part } => {
+                    let (idx, _) = r_fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, f)| std::ptr::eq(*f, field))
+                        .expect("the field is from this very list");
+                    let (_, code) = ctor_fields.get(idx)?;
+                    let j = u32::try_from(opaque_codes.iter().position(|c| *c == code)?).ok()?;
+                    // `oᵀ p k` — applied to the SOURCE PARAMETER and the PART of it
+                    // (0 = the parameter, n+1 = its field n).
+                    Expr::apps(
+                        Expr::bvar(m - j),
+                        [Expr::nat_lit(*param), Expr::nat_lit(*part)],
+                    )
+                }
+                other => struct_field_expr(other, 0)?,
+            };
+            app = Expr::app(app, arg);
         }
         app
     };
 
-    // STATEMENT: ∀ (e:Env), S.mk … = <claimed OR honest>.
+    // STATEMENT: ∀ (T…) (v…) (e:Env), S.mk … = <claimed OR honest>.
     let rhs = claimed.cloned().unwrap_or_else(|| honest.clone());
     let eq = Expr::apps(
         Expr::const_(Name::from_string("Eq"), vec![l1.clone()]),
         [adt_ty(), honest.clone(), rhs],
     );
-    let statement = Expr::pi(bd(), env_ty(), eq);
+    let mut statement = Expr::pi(bd(), env_ty(), eq);
+    for ty in binder_types.iter().rev() {
+        statement = Expr::pi(bd(), ty.clone(), statement);
+    }
+    for _ in 0..k {
+        statement = Expr::pi(bd(), Expr::type_(), statement);
+    }
 
-    // PROOF: λ (e:Env), Eq.refl S (S.mk …) — its type is `S.mk … = S.mk …`, so a wrong
-    // `claimed` RHS is NOT def-eq to the reduct and `check_type` rejects it.
+    // PROOF: λ (T…) (v…) (e:Env), Eq.refl (S T…) (S.mk …) — its type is
+    // `S.mk … = S.mk …`, so a wrong `claimed` RHS is NOT def-eq to the reduct and
+    // `check_type` rejects it, generic binders or not.
     let eq_refl = Expr::const_(Name::from_string("Eq.refl"), vec![l1]);
-    let proof = Expr::lam(bd(), env_ty(), Expr::apps(eq_refl, [adt_ty(), honest]));
+    let mut proof = Expr::lam(bd(), env_ty(), Expr::apps(eq_refl, [adt_ty(), honest]));
+    for ty in binder_types.iter().rev() {
+        proof = Expr::lam(bd(), ty.clone(), proof);
+    }
+    for _ in 0..k {
+        proof = Expr::lam(bd(), Expr::type_(), proof);
+    }
 
     Some((env, statement, proof))
+}
+
+/// Trust: NESTED-CTOR increment (2026-08-25) — the constructor application for a field
+/// that is itself a constructor.
+///
+/// Builds `Inner.mk <args>` (or the v-th variant constructor) at the SAME binder depth
+/// the enclosing application uses, so a nested opaque field still denotes `oᵀ p k`
+/// against the outer binder list. `depth` is reserved for the recursion and is currently
+/// always the innermost position, which is where every field argument is built.
+///
+/// Fail-closed on: an inner type with no carrier, one that does not register, a generic
+/// inner carrier (its type binders are not in scope here), an arity mismatch, or a field
+/// this cannot denote. Recursion is bounded by the caller's own depth limit.
+#[allow(clippy::too_many_arguments)]
+fn nested_ctor_expr(
+    ty: &trust_types::Ty,
+    variant: Option<usize>,
+    fields: &[SemStructField],
+    outer_opaque: &[&crate::kernel_check::ProofTerm],
+    k: u32,
+    m: u32,
+    depth: u32,
+    // Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — the ENV binder index for scalar
+    // leaves. Was hardcoded `0`, which is the struct lane's layout; the ADT-return lane
+    // binds `(o, e)` and needs its own index, so it is now a parameter. Every struct-lane
+    // call site passes `0`, leaving that lane byte-identical.
+    e_bvar: u32,
+) -> Option<Expr> {
+    if depth > 4 {
+        return None;
+    }
+    let mut env = crate::trustir_anchor::trustir_env().ok()?;
+    let carrier = crate::reflect::reflect_struct(ty)?;
+    if carrier.is_enum() != variant.is_some() || !carrier.type_params.is_empty() {
+        return None;
+    }
+    let registry = crate::clean_ground::register_adt_carriers(
+        &mut env,
+        &crate::clean_ground::carrier_closure_for(ty, &carrier),
+    );
+    let confirmed = registry.get(&carrier.name)?;
+    let (ctor_name, ctor_fields): (String, &[(String, crate::kernel_check::ProofTerm)]) =
+        match variant {
+            Some(v) => {
+                let c = confirmed.constructors.get(v)?;
+                (c.name.clone(), c.fields.as_slice())
+            }
+            None => (confirmed.ctor_name.clone(), confirmed.fields.as_slice()),
+        };
+    if ctor_fields.len() != fields.len() {
+        return None;
+    }
+    let mut app = Expr::const_(Name::from_string(&ctor_name), LevelVec::new());
+    for (idx, field) in fields.iter().enumerate() {
+        let arg = match field {
+            SemStructField::NestedCtor { ty: t2, variant: v2, fields: f2 } => {
+                nested_ctor_expr(t2, *v2, f2, outer_opaque, k, m, depth + 1, e_bvar)?
+            }
+            SemStructField::OpaqueParam { param, part } => {
+                // The inner field's carrier must already be one of the OUTER binder
+                // types, else there is no binder to denote it with — decline rather
+                // than invent one.
+                let (_, code) = ctor_fields.get(idx)?;
+                let j = u32::try_from(outer_opaque.iter().position(|c| *c == code)?).ok()?;
+                Expr::apps(Expr::bvar(m - j), [Expr::nat_lit(*param), Expr::nat_lit(*part)])
+            }
+            other => struct_field_expr(other, 0)?,
+        };
+        app = Expr::app(app, arg);
+    }
+    Some(app)
+}
+
+/// Trust: PASSTHROUGH-RETURN increment (2026-08-25) — the kernel witness for an
+/// identity return.
+///
+/// STATEMENT: `∀ (o : Nat → Nat → S) (e : Env), o p k = o p k`, where `o` is the same
+/// OPAQUE ENVIRONMENT the constructor lanes bind and `(p, k)` names the parameter part
+/// returned. Proved by `Eq.refl`.
+///
+/// The content is "this body returns exactly parameter part `(p, k)`", and it is
+/// DISTINGUISHING: a body returning a different parameter, or a different field of the
+/// same one, yields a different theorem, which
+/// `a_passthrough_witness_names_which_parameter` pins. It is not the vacuous shape this
+/// report declined to harvest for `Unit` no-ops — those assert nothing at all.
+///
+/// The carrier is registered through the same nested-closure path as every other
+/// carrier, so a return type whose inductive cannot be built fails closed here.
+#[must_use]
+pub fn check_passthrough_return_refinement(
+    r: &crate::mirsem::SemPassthroughReturn,
+) -> RefinementVerdict {
+    let (mut env, statement, proof) = match build_passthrough_refinement(r) {
+        Ok(t) => t,
+        Err(e) => return RefinementVerdict::KernelRejected(e),
+    };
+    let tc = TypeChecker::new(&env);
+    if let Err(e) = tc.check_type(&proof, &statement) {
+        return RefinementVerdict::KernelRejected(format!("check_type: {e:?}"));
+    }
+    drop(tc);
+    let name = Name::from_string("Trust.TrustIr.Refinement.passthrough_return");
+    if let Err(e) = env.add_decl(Declaration::Theorem {
+        name: name.clone(),
+        level_params: vec![],
+        type_: statement,
+        value: proof,
+    }) {
+        return RefinementVerdict::KernelRejected(format!("add_decl: {e:?}"));
+    }
+    match env.axiom_deps(&name) {
+        Some(residue) if residue.is_empty() => RefinementVerdict::ProvenModulo3,
+        Some(residue) => {
+            let mut names: Vec<String> = residue.iter().map(ToString::to_string).collect();
+            names.sort();
+            names.dedup();
+            RefinementVerdict::Residue(names)
+        }
+        None => RefinementVerdict::KernelRejected("decl not found after add".to_string()),
+    }
+}
+
+/// The passthrough statement and proof, split out so the probe can compare THEOREMS
+/// rather than the shapes that produced them — the lane's whole content is which
+/// parameter part it names, so that is what has to be asserted.
+/// Trust: CONST-RETURN witness (2026-08-28) — the kernel witness for a body that returns
+/// a fixed string literal.
+///
+/// STATEMENT: `lit = lit` at `List Int`, where `lit` is the literal's bytes rendered as
+/// a cons-list. Proved by `Eq.refl`.
+///
+/// The content is "this body returns THESE bytes", and it is DISTINGUISHING in exactly
+/// the way the passthrough witness is: the theorem's TYPE names the literal, so a body
+/// returning a different string yields a different theorem. It is not the vacuous shape
+/// declined for `Unit` no-ops — those assert nothing, because their type has no content
+/// to name.
+///
+/// `List Int` is the same kernel type `Trust.Sort.Slice Int` already grounds to, so this
+/// asserts nothing new about how a `&str` is denoted; it names a value in a carrier that
+/// already existed. Fail-closed: if `List`/`List.cons`/`Int.ofNat` do not typecheck as
+/// used, `check_type` refuses and the lane declines.
+#[must_use]
+pub fn check_const_return_refinement(
+    r: &crate::mirsem::SemConstReturn,
+) -> RefinementVerdict {
+    let (mut env, statement, proof) = match build_const_return_refinement(r) {
+        Ok(t) => t,
+        Err(e) => return RefinementVerdict::KernelRejected(e),
+    };
+    let tc = TypeChecker::new(&env);
+    if let Err(e) = tc.check_type(&proof, &statement) {
+        return RefinementVerdict::KernelRejected(format!("check_type: {e:?}"));
+    }
+    drop(tc);
+    let name = Name::from_string("Trust.TrustIr.Refinement.const_return");
+    if let Err(e) = env.add_decl(Declaration::Theorem {
+        name: name.clone(),
+        level_params: vec![],
+        type_: statement,
+        value: proof,
+    }) {
+        return RefinementVerdict::KernelRejected(format!("add_decl: {e:?}"));
+    }
+    match env.axiom_deps(&name) {
+        Some(residue) if residue.is_empty() => RefinementVerdict::ProvenModulo3,
+        Some(residue) => {
+            let mut names: Vec<String> = residue.iter().map(ToString::to_string).collect();
+            names.sort();
+            names.dedup();
+            RefinementVerdict::Residue(names)
+        }
+        None => RefinementVerdict::KernelRejected("decl not found after add".to_string()),
+    }
+}
+
+/// The const-return statement and proof, split out so a probe can compare THEOREMS
+/// rather than the shapes that produced them — the lane's whole content is which
+/// literal it names, so that is what has to be asserted.
+fn build_const_return_refinement(
+    r: &crate::mirsem::SemConstReturn,
+) -> Result<(Environment, Expr, Expr), String> {
+    let env = crate::trustir_anchor::trustir_env().map_err(|_| "env unavailable".to_string())?;
+    let l1 = Level::succ(Level::zero());
+    let int_ty = || Expr::const_(Name::from_string("Int"), LevelVec::new());
+    let list_int = Expr::apps(
+        Expr::const_(Name::from_string("List"), vec![Level::zero()]),
+        [int_ty()],
+    );
+    // Every byte is a `u8`, so it is non-negative and `Int.ofNat` is the whole encoding
+    // — no `Int.negSucc` branch can arise here.
+    let byte = |b: u8| {
+        Expr::app(
+            Expr::const_(Name::from_string("Int.ofNat"), vec![]),
+            Expr::nat_lit(u64::from(b)),
+        )
+    };
+    let mut lit = Expr::app(
+        Expr::const_(Name::from_string("List.nil"), vec![Level::zero()]),
+        int_ty(),
+    );
+    for b in r.bytes.iter().rev() {
+        lit = Expr::apps(
+            Expr::const_(Name::from_string("List.cons"), vec![Level::zero()]),
+            [int_ty(), byte(*b), lit],
+        );
+    }
+    let statement = Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![l1.clone()]),
+        [list_int.clone(), lit.clone(), lit.clone()],
+    );
+    let proof = Expr::apps(
+        Expr::const_(Name::from_string("Eq.refl"), vec![l1]),
+        [list_int, lit],
+    );
+    Ok((env, statement, proof))
+}
+
+/// Trust: what supplies the CARRIER TYPE of a passthrough witness.
+///
+/// Three cases, because the carriers genuinely differ in how their kernel type is
+/// obtained — and collapsing them into `Option<AdtCarrier>` is what silently excluded
+/// every slice: an `Option` can only say "ADT or scalar", so a `&[T]` had nowhere to go.
+enum PassthroughCarrier {
+    /// `Int`/`Bool`/`PtrSizedInt` — the kernel type is `Int` directly, no inductive.
+    Scalar,
+    /// An ADT — the inductive is built by `reflect_struct` and registered.
+    Adt(crate::reflect::AdtCarrier),
+    /// A carrier whose kernel type is already expressible without registering anything
+    /// new (`&[T]` -> `List T`, arrays, `&str`).
+    Direct(Expr),
+}
+
+fn build_passthrough_refinement(
+    r: &crate::mirsem::SemPassthroughReturn,
+) -> Result<(Environment, Expr, Expr), String> {
+    let mut env = crate::trustir_anchor::trustir_env().map_err(|_| "env unavailable".to_string())?;
+    // An immutable reference return reflects its REFERENT — the value-tier reading.
+    let carrier_ty = match &r.return_ty {
+        trust_types::Ty::Ref { mutable: false, inner } => inner.as_ref().clone(),
+        other => other.clone(),
+    };
+    // Trust: LEGACY-FLATTENED AMBIGUITY (2026-08-26) — a `__tag` / `__v{v}_{f}` field
+    // set is the pre-P4 flattened spelling of an ENUM, and is byte-identical to a legal
+    // Rust `struct S { __tag: isize }`. Neither may be guessed.
+    //
+    // `sem_struct_return_shape_of` has declined this since it was written; this witness
+    // did not, and the omission was caught by
+    // `fieldless_enum_recognizers_require_explicit_nullary_variants` the moment the
+    // accessor shape let `fn clone(&self) -> Self { *self }` reach it over an ambiguous
+    // type. Modelling a real enum as a single-constructor struct over its tag would be
+    // an unsound carrier, so decline exactly as the sibling lane does.
+    //
+    // REFINED (2026-08-26): the ambiguity is specifically a flattened field set with NO
+    // EXPLICIT `variants`. When `variants` is non-empty the type says outright that it
+    // is an enum, `reflect_struct` dispatches to `reflect_enum`, and there is nothing to
+    // guess — the negative control's fixture is precisely the variants-EMPTY case. The
+    // first version of this gate declined both, which withdrew 135 passthrough-shaped
+    // bodies where only the genuinely ambiguous subset should have gone.
+    if let trust_types::Ty::Adt { fields, variants, .. } = &carrier_ty
+        && variants.is_empty()
+        && fields.iter().any(|(n, _)| n == "__tag" || n.starts_with("__v"))
+    {
+        return Err("passthrough: legacy __tag/__v-flattened type is ambiguous".to_string());
+    }
+    // A SCALAR carrier needs no inductive: `Int` is the kernel type directly, and `Bool`
+    // rides the same `Int` carrier every scalar denotation in this crate uses.
+    // Trust: `PtrSizedInt` (2026-08-28) rides the Int carrier alongside the fixed-width
+    // integers. It is an integer; the only reason it was absent is that no fixture had
+    // needed it, and `usize` is pervasive in real code (`fn len(&self) -> usize`).
+    //
+    // Sound for THIS witness specifically, and the qualifier matters: the statement is
+    // `o p k = o p k`, closed by `Eq.refl`, so the carrier has to be a TYPE and nothing
+    // more — no arithmetic is asserted over it, and the target-width distinction that
+    // `TrustContractPropositionDomain` keeps (so `usize` and `u64` never share a
+    // proposition identity) is about clauses that DO arithmetic, not about reflexivity.
+    let scalar_carrier = matches!(
+        carrier_ty,
+        trust_types::Ty::Int { .. } | trust_types::Ty::Bool | trust_types::Ty::PtrSizedInt { .. }
+    );
+    // Trust: NON-ADT CARRIERS (2026-08-28). `reflect_struct` is ADT-ONLY by
+    // construction — it opens with `let Ty::Adt { .. } = ty else { return Err("not an
+    // ADT") }` — so routing every non-scalar carrier through it made `&[T]`, `&str` and
+    // arrays report "the return type has no carrier" when the carrier exists and is
+    // ordinary: `reflect_ty` already codes a slice as `Trust.Sort.Slice T`, and
+    // `carrier_binding_to_kernel_type` already decodes that to `List T`, which is a
+    // standard kernel inductive. Nothing new is asserted here; a path that already
+    // existed for grounding is reused for the witness type.
+    //
+    // Fail-closed twice over: a type `reflect_ty` cannot code, or a code the decoder
+    // cannot turn into a kernel type, refuses here; and anything malformed that got
+    // past both is still rejected by `check_type` against the statement.
+    let carrier = if scalar_carrier {
+        PassthroughCarrier::Scalar
+    } else if matches!(carrier_ty, trust_types::Ty::Adt { .. }) {
+        PassthroughCarrier::Adt(
+            crate::reflect::reflect_struct(&carrier_ty)
+                .ok_or_else(|| "passthrough: the return type has no carrier".to_string())?,
+        )
+    } else {
+        let code = crate::reflect::reflect_ty(&carrier_ty)
+            .map_err(|_| "passthrough: the return type has no carrier code".to_string())?;
+        PassthroughCarrier::Direct(
+            crate::clean_ground::carrier_binding_to_kernel_type(&code).ok_or_else(|| {
+                "passthrough: the carrier code has no kernel type".to_string()
+            })?,
+        )
+    };
+    if let PassthroughCarrier::Adt(c) = &carrier {
+        let registry = crate::clean_ground::register_adt_carriers(
+            &mut env,
+            &crate::clean_ground::carrier_closure_for(&carrier_ty, c),
+        );
+        if registry.get(&c.name).is_none() {
+            return Err("passthrough: the carrier does not register modulo 3".to_string());
+        }
+    }
+    // Trust: GENERIC PASSTHROUGH (2026-08-26) — a Pi-wrapped carrier is admitted by
+    // binding its type parameters OUTERMOST, exactly as `build_ctor_refinement` does.
+    // This gate used to decline them outright, and it was measured to matter:
+    // `<Error as From<Error>>::from` is the passthrough shape, is BLOCKING 64 CALLERS in
+    // the delegation lane, and was rejected here and nowhere else.
+    let k = u32::try_from(match &carrier {
+        PassthroughCarrier::Adt(c) => c.type_params.len(),
+        // A scalar or an already-closed kernel type binds no type parameter.
+        PassthroughCarrier::Scalar | PassthroughCarrier::Direct(_) => 0,
+    })
+    .map_err(|e| e.to_string())?;
+    let l1 = Level::succ(Level::zero());
+    let nat = || Expr::const_(Name::from_string("Nat"), LevelVec::new());
+    // Binders outermost→innermost: `T₀ … T_{k-1}`, `o`, `e`. Every position below has
+    // `k + 2` binders above it, so `T_i = bvar(k + 1 - i)`, `o = bvar(1)`, `e = bvar(0)`
+    // — and the SAME index arithmetic holds inside `o`'s own type, whose two `Nat`
+    // binders replace `o` and `e` in the count.
+    let adt = || match &carrier {
+        PassthroughCarrier::Scalar => Expr::const_(Name::from_string("Int"), LevelVec::new()),
+        PassthroughCarrier::Direct(ty) => ty.clone(),
+        PassthroughCarrier::Adt(c) => {
+            let mut ty = Expr::const_(Name::from_string(&c.name), LevelVec::new());
+            for i in 0..k {
+                ty = Expr::app(ty, Expr::bvar(k + 1 - i));
+            }
+            ty
+        }
+    };
+    let value = Expr::apps(Expr::bvar(1), [Expr::nat_lit(r.param), Expr::nat_lit(r.part)]);
+    let eq = Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![l1.clone()]),
+        [adt(), value.clone(), value.clone()],
+    );
+    let o_ty = Expr::pi(bd(), nat(), Expr::pi(bd(), nat(), adt()));
+    let mut statement = Expr::pi(bd(), o_ty.clone(), Expr::pi(bd(), env_ty(), eq));
+    let mut proof = Expr::lam(
+        bd(),
+        o_ty,
+        Expr::lam(
+            bd(),
+            env_ty(),
+            Expr::apps(Expr::const_(Name::from_string("Eq.refl"), vec![l1]), [adt(), value]),
+        ),
+    );
+    for _ in 0..k {
+        statement = Expr::pi(bd(), Expr::type_(), statement);
+        proof = Expr::lam(bd(), Expr::type_(), proof);
+    }
+    Ok((env, statement, proof))
+}
+
+/// Trust: BARE-ENUM-CTOR increment (2026-08-25) — check the bare ENUM-CONSTRUCTOR
+/// refinement for a recognized [`crate::mirsem::SemEnumCtorReturn`] against the real
+/// clean kernel, modulo 3.
+///
+/// Shares [`build_ctor_refinement`] with the struct lane, so the statement shape, the
+/// `Sort 1` type binders, the parameter-keyed opaque environments and the `Eq.refl`
+/// proof are identical; only the constructor selected differs. GENUINE (the
+/// `claimed`-override probes assert that both a transposed argument list AND a
+/// WRONG-VARIANT claim are `KernelRejected`) + MODEL-ONLY (`env`/carrier are freshly
+/// built per call). Fail-closed on any carrier decline, arity mismatch, or unresolved
+/// field.
+#[must_use]
+pub fn check_enum_ctor_return_refinement(
+    r: &crate::mirsem::SemEnumCtorReturn,
+) -> RefinementVerdict {
+    check_enum_ctor_return_refinement_claimed(r, None)
+}
+
+/// [`check_enum_ctor_return_refinement`] with an explicit `claimed` RHS override — the
+/// FAIL-CLOSED PROBE entry point, the enum sibling of
+/// [`check_struct_return_refinement_claimed`].
+#[must_use]
+pub(crate) fn check_enum_ctor_return_refinement_claimed(
+    r: &crate::mirsem::SemEnumCtorReturn,
+    claimed: Option<&Expr>,
+) -> RefinementVerdict {
+    let Some((mut env, statement, proof)) =
+        build_ctor_refinement(&r.enum_ty, &r.fields, Some(r.variant), claimed)
+    else {
+        return RefinementVerdict::KernelRejected(
+            "enum-ctor-return: shape/carrier outside the modeled fragment".to_string(),
+        );
+    };
+    let tc = TypeChecker::new(&env);
+    if let Err(e) = tc.check_type(&proof, &statement) {
+        return RefinementVerdict::KernelRejected(format!("check_type: {e:?}"));
+    }
+    drop(tc);
+    let name = Name::from_string("Trust.TrustIr.Refinement.enum_ctor_return");
+    if let Err(e) = env.add_decl(Declaration::Theorem {
+        name: name.clone(),
+        level_params: vec![],
+        type_: statement,
+        value: proof,
+    }) {
+        return RefinementVerdict::KernelRejected(format!("add_decl: {e:?}"));
+    }
+    match env.axiom_deps(&name) {
+        Some(residue) if residue.is_empty() => RefinementVerdict::ProvenModulo3,
+        Some(residue) => {
+            let mut names: Vec<String> = residue.iter().map(ToString::to_string).collect();
+            names.sort();
+            names.dedup();
+            RefinementVerdict::Residue(names)
+        }
+        None => RefinementVerdict::KernelRejected("decl not found after add".to_string()),
+    }
 }
 
 /// Check the RECORD (single-variant struct-constructor) refinement for a recognized
@@ -2420,7 +3140,10 @@ fn build_payload_extract(
         )
     };
     let refl = |v: Expr| {
-        Expr::apps(Expr::const_(Name::from_string("Eq.refl"), vec![l1.clone()]), [field_ty.clone(), v])
+        Expr::apps(
+            Expr::const_(Name::from_string("Eq.refl"), vec![l1.clone()]),
+            [field_ty.clone(), v],
+        )
     };
 
     // The two constructors' field kernel TYPES (for the base's fresh Π binders).
@@ -2650,7 +3373,8 @@ pub(crate) fn check_payload_extract_diverging_refinement_claimed(
         default_var: 0, // INERT — build_payload_extract does not read default_var, and
                         // the diverging witness checks the SOME obligation only.
     };
-    let Some((mut env, obligations)) = build_payload_extract(&proxy, [some_claim, None], swap_target_minor)
+    let Some((mut env, obligations)) =
+        build_payload_extract(&proxy, [some_claim, None], swap_target_minor)
     else {
         return RefinementVerdict::KernelRejected(
             "payload-extract-diverging: shape/carrier outside exact fragment".to_string(),
@@ -2834,9 +3558,11 @@ fn build_map_compose(
     // body sits under +1 binder.
     let build_minors = |ret_at: u32| -> Option<Vec<Expr>> {
         // Honest bodies (non-swapped): none ↦ C_none, call ↦ C_some(callResult ret).
-        let none_body = if swap_minors { call_val(Expr::bvar(ret_at)) } else { none_ctor_const.clone() };
+        let none_body =
+            if swap_minors { call_val(Expr::bvar(ret_at)) } else { none_ctor_const.clone() };
         let none_minor = none_body; // nullary — no field lambda.
-        let call_inner = if swap_minors { none_ctor_const.clone() } else { call_val(Expr::bvar(ret_at + 1)) };
+        let call_inner =
+            if swap_minors { none_ctor_const.clone() } else { call_val(Expr::bvar(ret_at + 1)) };
         let call_minor = Expr::lam(bd(), call_field_ty.clone(), call_inner);
         let mut minors: Vec<Option<Expr>> = vec![None, None];
         *minors.get_mut(none_v)? = Some(none_minor);
@@ -3250,6 +3976,13 @@ fn register_outer_enum3(
             Some(SemAdtPayload::Scalar(_) | SemAdtPayload::IntCast { .. }) => {
                 field_tys[i] = vec![("0".to_string(), Ty::Int { width: 64, signed: true })];
             }
+            // The 3-arm chain builder does not carry an opaque-environment binder; a
+            // non-scalar downcast payload declines here rather than being approximated.
+            // A NESTED-CTOR payload declines for the same reason — its scalar leaves read
+            // an env binder this builder does not bind.
+            Some(SemAdtPayload::DowncastOpaque { .. } | SemAdtPayload::NestedCtor { .. }) => {
+                return None;
+            }
             Some(SemAdtPayload::NullaryNested { enum_name, variant }) => {
                 let synthetic_name = format!("{enum_name}#chain{i}");
                 let nested_ty = nested_stub_ty(&synthetic_name, *variant);
@@ -3575,7 +4308,10 @@ mod tests {
         // The bare `S { a, b }` record closes modulo 3 — the registered single-`.mk`
         // inductive/recursor pass the axiom gate, and the theorem references only that
         // + Eq/Eq.refl (empty residue).
-        assert_eq!(check_struct_return_refinement(&record_mk_pair()), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            check_struct_return_refinement(&record_mk_pair()),
+            RefinementVerdict::ProvenModulo3
+        );
     }
 
     #[test]
@@ -3601,6 +4337,315 @@ mod tests {
             ],
         };
         assert_eq!(check_struct_return_refinement(&r), RefinementVerdict::ProvenModulo3);
+    }
+
+    /// `main::Holder<T> { a: T, b: T }` — a GENERIC struct whose two fields share one
+    /// type parameter, so which PARAMETER feeds which field is the only thing that can
+    /// distinguish two bodies over it.
+    fn generic_holder_ty() -> trust_types::Ty {
+        let param = || trust_types::Ty::Unsupported {
+            kind: crate::reflect::PARAM_KIND.into(),
+            detail: "generic parameter T/#0 needs monomorphization".into(),
+        };
+        trust_types::Ty::adt("main::Holder", vec![("a".into(), param()), ("b".into(), param())])
+    }
+
+    /// Trust: GENERIC-CTOR increment (2026-08-25) — THE NON-TAUTOLOGY PROBE.
+    ///
+    /// The generic witness binds a `Sort 1` binder per type param and a VALUE binder
+    /// per generic-typed source PARAMETER, then proves `Eq.refl`. The obvious cheaper
+    /// design — one value binder per FIELD — would make this witness worthless: the
+    /// bodies `Holder { a: x, b: y }` and `Holder { a: y, b: x }` would BOTH state
+    /// `∀ v₀ v₁, Holder.mk v₀ v₁ = Holder.mk v₀ v₁` and be indistinguishable, i.e. a
+    /// theorem that says nothing about the body it came from.
+    ///
+    /// Keyed by PARAMETER they state `Holder.mk v₀ v₁` and `Holder.mk v₁ v₀`, and this
+    /// test pins BOTH halves of that: the two statements differ, and claiming one
+    /// body's constructor application for the other is `KernelRejected`.
+    ///
+    /// Binder layout under test (k = 1 type param, m = 2 bound parameters), outermost
+    /// → innermost `T, v₀, v₁, e`, so at the innermost point `T = bvar(k+m-0) = 3`,
+    /// `v₀ = bvar(m-0) = 2`, `v₁ = bvar(m-1) = 1`, `e = bvar(0)`.
+    #[test]
+    fn a_generic_ctor_witness_distinguishes_which_parameter_feeds_which_field() {
+        let holder = |p0: u64, p1: u64| SemStructReturn {
+            struct_ty: generic_holder_ty(),
+            fields: vec![
+                SemStructField::OpaqueParam { param: p0, part: 0 },
+                SemStructField::OpaqueParam { param: p1, part: 0 },
+            ],
+        };
+        let honest = holder(0, 1);
+        let swapped = holder(1, 0);
+
+        // Both are honest bodies and both certify — non-vacuity.
+        assert_eq!(check_struct_return_refinement(&honest), RefinementVerdict::ProvenModulo3);
+        assert_eq!(check_struct_return_refinement(&swapped), RefinementVerdict::ProvenModulo3);
+
+        // ... but they are DIFFERENT theorems. This is the property a per-field binder
+        // design would lose.
+        let (_, honest_stmt, _) =
+            build_struct_refinement(&honest, None).expect("the honest witness builds");
+        let (_, swapped_stmt, _) =
+            build_struct_refinement(&swapped, None).expect("the swapped witness builds");
+        assert_ne!(
+            honest_stmt, swapped_stmt,
+            "two bodies differing only in which parameter feeds which field must yield \
+             DIFFERENT theorems, else the generic witness is a tautology"
+        );
+
+        // FORGERY: claim `Holder.mk T v₁ v₀` for the body that really builds
+        // `Holder.mk T v₀ v₁`. The binders are distinct bvars, never def-eq.
+        let carrier =
+            crate::reflect::reflect_struct(&generic_holder_ty()).expect("Holder<T> reflects");
+        assert_eq!(carrier.type_params.len(), 1, "sanity: exactly one type parameter");
+        let mut env = crate::trustir_anchor::trustir_env().expect("env");
+        let registry =
+            crate::clean_ground::register_adt_carriers(&mut env, std::slice::from_ref(&carrier));
+        let ctor = registry.get(&carrier.name).expect("Holder<T> registers").ctor_name.clone();
+        let forged = Expr::apps(
+            Expr::const_(Name::from_string(&ctor), LevelVec::new()),
+            [Expr::bvar(3), Expr::bvar(1), Expr::bvar(2)],
+        );
+        assert!(
+            matches!(
+                check_struct_return_refinement_claimed(&honest, Some(&forged)),
+                RefinementVerdict::KernelRejected(_)
+            ),
+            "a transposed generic claim must be kernel-rejected"
+        );
+    }
+
+    /// Trust: OPAQUE-CTOR-FIELD increment (2026-08-25) — the CONCRETE sibling of the
+    /// generic probe above. `Wrap { inner: Pair, n: i64 }` mixes an opaque nested-ADT
+    /// field (a ∀-bound binder keyed by its source parameter) with an ordinary scalar
+    /// field that keeps its `Env` denotation, which is the mix the 22 real
+    /// `Enumerate { iter, count }`-class bodies have. Pins that the mixed witness
+    /// certifies and that transposing the two SOURCE PARAMETERS is a different
+    /// theorem — the same non-tautology property, with no type parameters in play.
+    #[test]
+    fn a_concrete_nested_adt_ctor_witness_is_parameter_keyed() {
+        let wrap_ty = || {
+            trust_types::Ty::adt(
+                "main::Wrap",
+                vec![("inner".into(), pair_struct_ty()), ("n".into(), int64())],
+            )
+        };
+        // `fn wrap(p: Pair, n: i64) -> Wrap { Wrap { inner: p, n } }`
+        let honest = SemStructReturn {
+            struct_ty: wrap_ty(),
+            fields: vec![
+                SemStructField::OpaqueParam { param: 0, part: 0 },
+                SemStructField::Scalar(SemOperand::Var(1)),
+            ],
+        };
+        assert_eq!(check_struct_return_refinement(&honest), RefinementVerdict::ProvenModulo3);
+
+        // The SAME shape sourcing the opaque field from a different parameter is a
+        // DIFFERENT theorem (the scalar field keeps its own `Env` denotation).
+        let other = SemStructReturn {
+            struct_ty: wrap_ty(),
+            fields: vec![
+                SemStructField::OpaqueParam { param: 2, part: 0 },
+                SemStructField::Scalar(SemOperand::Var(1)),
+            ],
+        };
+        let (_, honest_stmt, _) =
+            build_struct_refinement(&honest, None).expect("the honest witness builds");
+        let (_, other_stmt, _) =
+            build_struct_refinement(&other, None).expect("the other witness builds");
+        assert_ne!(
+            honest_stmt, other_stmt,
+            "an opaque field sourced from a different parameter must be a different theorem"
+        );
+
+        // Trust: PROJECTED SOURCE (2026-08-25) — the same parameter but a DIFFERENT
+        // PART of it must also be a different theorem. Without the `part` index,
+        // `Wrap { inner: p }` and `Wrap { inner: p.0 }` would both denote `oᵀ p` and
+        // the witness could not tell a value from one of its fields.
+        let projected = SemStructReturn {
+            struct_ty: wrap_ty(),
+            fields: vec![
+                SemStructField::OpaqueParam { param: 0, part: 1 },
+                SemStructField::Scalar(SemOperand::Var(1)),
+            ],
+        };
+        assert_eq!(check_struct_return_refinement(&projected), RefinementVerdict::ProvenModulo3);
+        let (_, projected_stmt, _) =
+            build_struct_refinement(&projected, None).expect("the projected witness builds");
+        assert_ne!(
+            honest_stmt, projected_stmt,
+            "`p` and `p.0` must denote distinctly — otherwise a field of a parameter is \
+             indistinguishable from the parameter itself"
+        );
+    }
+
+    /// `main::Choice { A(i64), B(i64) }` — a two-variant enum whose variants have
+    /// IDENTICAL field shapes, so nothing but the constructor itself distinguishes
+    /// `A(x)` from `B(x)`.
+    fn choice_enum_ty() -> trust_types::Ty {
+        use trust_types::{Ty, VariantDef};
+        Ty::Adt {
+            name: "main::Choice".into(),
+            fields: vec![("__tag".into(), int64()), ("__v0_0".into(), int64()), ("__v1_0".into(), int64())],
+            variants: vec![
+                VariantDef { name: "A".into(), discriminant: 0, fields: vec![("0".into(), int64())] },
+                VariantDef { name: "B".into(), discriminant: 1, fields: vec![("0".into(), int64())] },
+            ],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            adt_kind: None,
+            layout: None,
+        }
+    }
+
+    /// Trust: PASSTHROUGH-RETURN increment (2026-08-25) — the witness must name WHICH
+    /// parameter part it returns.
+    ///
+    /// The lane's entire content is that identification. If the witness did not carry
+    /// `(param, part)`, every identity function over a given type would prove the same
+    /// theorem and `fn f(x, y) -> T { x }` would certify as `fn f(x, y) -> T { y }` —
+    /// which is the vacuous shape this report declined to harvest for `Unit` no-ops.
+    #[test]
+    fn a_passthrough_witness_names_which_parameter() {
+        use crate::mirsem::SemPassthroughReturn;
+        let at = |param: u64, part: u64| SemPassthroughReturn {
+            return_ty: pair_struct_ty(),
+            param,
+            part,
+        };
+        // Every honest variant certifies — non-vacuity.
+        for (p, k) in [(0u64, 0u64), (1, 0), (0, 1)] {
+            assert_eq!(
+                check_passthrough_return_refinement(&at(p, k)),
+                RefinementVerdict::ProvenModulo3,
+                "the identity return of parameter {p} part {k} must certify"
+            );
+        }
+        // ... and the THEOREMS differ, by parameter and by part. Comparing the shapes
+        // would prove nothing; these are the statements the kernel checked.
+        let stmt = |p: u64, k: u64| {
+            let (_, statement, _) =
+                build_passthrough_refinement(&at(p, k)).expect("the witness builds");
+            statement
+        };
+        assert_ne!(
+            stmt(0, 0),
+            stmt(1, 0),
+            "returning a DIFFERENT parameter must be a different theorem, else \
+             `fn f(x, y) -> T {{ x }}` would certify as `fn f(x, y) -> T {{ y }}`"
+        );
+        assert_ne!(
+            stmt(0, 0),
+            stmt(0, 1),
+            "returning a different PART of the same parameter must be a different theorem"
+        );
+    }
+
+    /// Trust: NESTED-CTOR increment (2026-08-25) — a nested constructor must be EXACT
+    /// structure, not an opaque stand-in.
+    ///
+    /// `Wrap { inner: Pair { a, b }, n }` must state the inner constructor applied to
+    /// the inner arguments. If the nest collapsed to an opaque binder, two bodies
+    /// building DIFFERENT inner values would prove the same theorem — which is exactly
+    /// what the nested lane exists to avoid.
+    #[test]
+    fn a_nested_constructor_is_exact_structure() {
+        // NOTE ON THE FIXTURE. Building this through the whole witness needs an OUTER
+        // carrier whose nested field decodes to the named inner inductive. A
+        // `Ty::adt`-built struct decodes its nested field to the `Prod` FLOOR instead,
+        // so the outer `.mk` would expect `Prod Int (Prod Int Unit)` and reject a
+        // `Trust.Adt.main_Pair` value — a real property of `reflect_ty`, not of this
+        // lane, and one the lane fails closed on. Real carriers do decode to the named
+        // inductive, which is why the lane is worth +71 bodies on measured code.
+        //
+        // So probe the BUILDER directly: the property at stake is that the inner
+        // constructor's arguments reach the term, and that is exactly what
+        // `nested_ctor_expr` decides.
+        let inner = |a: u64, b: u64| {
+            nested_ctor_expr(
+                &pair_struct_ty(),
+                None,
+                &[
+                    SemStructField::Scalar(SemOperand::Var(a)),
+                    SemStructField::Scalar(SemOperand::Var(b)),
+                ],
+                &[],
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        let ab = inner(0, 1).expect("the nested constructor application builds");
+        let ba = inner(1, 0).expect("the swapped nested application builds");
+        assert_ne!(
+            ab, ba,
+            "the INNER constructor's arguments must reach the term, else a nested \
+             constructor is an opaque stand-in and two different bodies build the same \
+             expression"
+        );
+        // ... and it really is the inner CONSTRUCTOR being applied, not a placeholder.
+        let rendered = format!("{ab:?}");
+        assert!(
+            rendered.contains("main_Pair"),
+            "the nested application must name the inner constructor: {rendered}"
+        );
+    }
+
+    /// Trust: BARE-ENUM-CTOR increment (2026-08-25) — THE WRONG-VARIANT PROBE.
+    ///
+    /// The enum lane's whole added content over the struct lane is WHICH CONSTRUCTOR is
+    /// applied, so that is what has to be pinned. `Choice::A(x)` and `Choice::B(x)` have
+    /// identical field shapes; if the witness were selecting a constructor by anything
+    /// other than the recognized variant — say always the first — both bodies would
+    /// prove the same theorem and the lane would certify a body that builds `B` as one
+    /// that builds `A`.
+    #[test]
+    fn a_wrong_variant_enum_ctor_claim_is_kernel_rejected() {
+        use crate::mirsem::SemEnumCtorReturn;
+        let arm = |v: usize| SemEnumCtorReturn {
+            enum_ty: choice_enum_ty(),
+            variant: v,
+            fields: vec![SemStructField::Scalar(SemOperand::Var(0))],
+        };
+        let a = arm(0);
+        let b = arm(1);
+
+        // Both honest bodies certify — non-vacuity.
+        assert_eq!(check_enum_ctor_return_refinement(&a), RefinementVerdict::ProvenModulo3);
+        assert_eq!(check_enum_ctor_return_refinement(&b), RefinementVerdict::ProvenModulo3);
+
+        // ... and they are DIFFERENT theorems.
+        let (_, a_stmt, _) = build_ctor_refinement(&a.enum_ty, &a.fields, Some(0), None)
+            .expect("the A witness builds");
+        let (_, b_stmt, _) = build_ctor_refinement(&b.enum_ty, &b.fields, Some(1), None)
+            .expect("the B witness builds");
+        assert_ne!(
+            a_stmt, b_stmt,
+            "two bodies constructing DIFFERENT variants with identical payloads must yield \
+             different theorems, else the enum lane does not actually claim the variant"
+        );
+
+        // FORGERY: claim `Choice.B x` for the body that really builds `Choice.A x`.
+        let carrier = crate::reflect::reflect_struct(&choice_enum_ty()).expect("Choice reflects");
+        let mut env = crate::trustir_anchor::trustir_env().expect("env");
+        let registry =
+            crate::clean_ground::register_adt_carriers(&mut env, std::slice::from_ref(&carrier));
+        let confirmed = registry.get(&carrier.name).expect("Choice registers");
+        let b_ctor = confirmed.constructors.get(1).expect("variant B is registered").name.clone();
+        let forged = Expr::app(
+            Expr::const_(Name::from_string(&b_ctor), LevelVec::new()),
+            struct_field_expr(&SemStructField::Scalar(SemOperand::Var(0)), 0).expect("field"),
+        );
+        assert!(
+            matches!(
+                check_enum_ctor_return_refinement_claimed(&a, Some(&forged)),
+                RefinementVerdict::KernelRejected(_)
+            ),
+            "a wrong-VARIANT claim must be kernel-rejected"
+        );
     }
 
     #[test]
@@ -3915,7 +4960,10 @@ mod tests {
     /// Option carrier passes the modulo-3 gate — so NO new axiom enters the closure.
     #[test]
     fn iter_step_quadruple_proves_modulo3() {
-        assert_eq!(check_iter_step_refinement(&example_iter_step()), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            check_iter_step_refinement(&example_iter_step()),
+            RefinementVerdict::ProvenModulo3
+        );
     }
 
     /// F-STRIDE2 (kernel half) — claiming `post2 = Int.add g 2` under the true guard is
@@ -3996,10 +5044,7 @@ mod tests {
     #[test]
     fn iter_step_str_element_declined() {
         let step = SemIterStep { recv_param: 1, element_ty: trust_types::Ty::Str };
-        assert!(matches!(
-            check_iter_step_refinement(&step),
-            RefinementVerdict::KernelRejected(_)
-        ));
+        assert!(matches!(check_iter_step_refinement(&step), RefinementVerdict::KernelRejected(_)));
     }
 
     /// NO-NEW-AXIOMS — `iter_seq`/`iter_len` (Opaque) and `iter_has_next2` (Definition) each
@@ -4007,11 +5052,9 @@ mod tests {
     #[test]
     fn iter_step_surface_has_empty_axiom_deps() {
         let env = crate::trustir_anchor::trustir_env().expect("anchor env");
-        for name in [
-            TRUSTIR_ITER_SEQ,
-            crate::trustir_anchor::TRUSTIR_ITER_LEN,
-            TRUSTIR_ITER_HAS_NEXT2,
-        ] {
+        for name in
+            [TRUSTIR_ITER_SEQ, crate::trustir_anchor::TRUSTIR_ITER_LEN, TRUSTIR_ITER_HAS_NEXT2]
+        {
             let residue = env
                 .axiom_deps(&Name::from_string(name))
                 .unwrap_or_else(|| panic!("{name} must be a registered decl"));
@@ -4045,7 +5088,8 @@ mod tests {
             names
         };
         // The two-key + per-certificate decls must NOT reference the one-arg family.
-        for n in [TRUSTIR_ITER_SEQ, iter_len, TRUSTIR_ITER_HAS_NEXT2, ITER_STEP_RET2, ITER_STEP_POST2]
+        for n in
+            [TRUSTIR_ITER_SEQ, iter_len, TRUSTIR_ITER_HAS_NEXT2, ITER_STEP_RET2, ITER_STEP_POST2]
         {
             let names = const_names_of(n);
             for bad in &one_arg {
@@ -4135,10 +5179,7 @@ mod tests {
     fn field_set_nonscalar_field_declined() {
         let mut fs = example_field_set();
         fs.field_ty = trust_types::Ty::Unit;
-        assert!(matches!(
-            check_field_set_refinement(&fs),
-            RefinementVerdict::KernelRejected(_)
-        ));
+        assert!(matches!(check_field_set_refinement(&fs), RefinementVerdict::KernelRejected(_)));
     }
 
     /// NO-NEW-AXIOMS — `idx_elem_prime` (Opaque) and `set_key_eq` (Definition → `Int.beq`
@@ -4154,8 +5195,7 @@ mod tests {
             assert!(residue.is_empty(), "{name} must have EMPTY axiom_deps, got {residue:?}");
         }
         let env2 = build_field_set_env(0).expect("witness env");
-        let residue =
-            env2.axiom_deps(&Name::from_string(SET_POST)).expect("set_post registered");
+        let residue = env2.axiom_deps(&Name::from_string(SET_POST)).expect("set_post registered");
         assert!(residue.is_empty(), "set_post must have EMPTY axiom_deps, got {residue:?}");
     }
 
@@ -4356,10 +5396,7 @@ mod tests {
     fn field_rmw_nonint_field_declined() {
         let mut rmw = example_field_rmw();
         rmw.field_ty = trust_types::Ty::Bool;
-        assert!(matches!(
-            check_field_rmw_refinement(&rmw),
-            RefinementVerdict::KernelRejected(_)
-        ));
+        assert!(matches!(check_field_rmw_refinement(&rmw), RefinementVerdict::KernelRejected(_)));
     }
 
     /// F-WIDTH (belt) — a hand-built witness over a 128-bit field is `KernelRejected` by
@@ -4370,10 +5407,7 @@ mod tests {
             field_ty: trust_types::Ty::Int { width: 128, signed: true },
             ..example_field_rmw()
         };
-        assert!(matches!(
-            check_field_rmw_refinement(&rmw),
-            RefinementVerdict::KernelRejected(_)
-        ));
+        assert!(matches!(check_field_rmw_refinement(&rmw), RefinementVerdict::KernelRejected(_)));
     }
 
     /// F-LITRANGE (belt) — a hand-built witness carrying a literal outside the FIELD's
@@ -4841,8 +5875,8 @@ mod tests {
     #[test]
     fn payload_extract_option_i32_certifies_modulo_3() {
         let f = load_payload_dump("std::option::Option::<i32>::unwrap_or");
-        let s = crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f)
-            .expect("recognized");
+        let s =
+            crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f).expect("recognized");
         assert_eq!(
             check_payload_extract_refinement(&s),
             RefinementVerdict::ProvenModulo3,
@@ -4857,8 +5891,8 @@ mod tests {
         // the de-Bruijn shift). This is the field-bearing-default-ctor case the
         // Option-only spec sketch did not cover; it MUST certify.
         let f = load_payload_dump("std::result::Result::<i32, u8>::unwrap_or");
-        let s = crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f)
-            .expect("recognized");
+        let s =
+            crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f).expect("recognized");
         assert_eq!(
             check_payload_extract_refinement(&s),
             RefinementVerdict::ProvenModulo3,
@@ -4873,8 +5907,8 @@ mod tests {
     #[test]
     fn payload_extract_some_to_default_is_kernel_rejected() {
         let f = load_payload_dump("std::option::Option::<i32>::unwrap_or");
-        let s = crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f)
-            .expect("recognized");
+        let s =
+            crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f).expect("recognized");
         let (d, _xf) = payload_extract_some_probe_bvars(&s).expect("probe bvars build");
         assert!(
             matches!(
@@ -4892,8 +5926,8 @@ mod tests {
     #[test]
     fn payload_extract_swapped_minor_is_kernel_rejected() {
         let f = load_payload_dump("std::option::Option::<i32>::unwrap_or");
-        let s = crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f)
-            .expect("recognized");
+        let s =
+            crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f).expect("recognized");
         assert!(
             matches!(
                 check_payload_extract_refinement_claimed(&s, [None, None], true),
@@ -4909,8 +5943,8 @@ mod tests {
     #[test]
     fn payload_extract_none_to_literal_is_kernel_rejected() {
         let f = load_payload_dump("std::option::Option::<i32>::unwrap_or");
-        let s = crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f)
-            .expect("recognized");
+        let s =
+            crate::mirsem::sem_adt_payload_extract_of_discriminant_switch(&f).expect("recognized");
         let seven = crate::trustir_anchor::int_lit(7);
         assert!(
             matches!(
@@ -5017,11 +6051,12 @@ mod tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod w6_map_compose_kernel_tests {
+    use clean_kernel::Name;
+    use trust_types::{Ty, VariantDef};
+
     use super::*;
     use crate::mirsem::{ComposeReturn, SemAdtFilterCompose, SemAdtMapCompose, SemOperand};
     use crate::trustir_anchor::IrOperand;
-    use clean_kernel::Name;
-    use trust_types::{Ty, VariantDef};
 
     fn option_i32() -> Ty {
         Ty::adt_enum_with_disc_safety(
@@ -5070,7 +6105,10 @@ mod w6_map_compose_kernel_tests {
     fn map_compose_kernel_proves_modulo3() {
         let arg = IrOperand::Var(1);
         assert!(
-            matches!(check_map_compose_refinement(&shape(), &arg), RefinementVerdict::ProvenModulo3),
+            matches!(
+                check_map_compose_refinement(&shape(), &arg),
+                RefinementVerdict::ProvenModulo3
+            ),
             "the two recursor ι-obligations (Some(call_result) + None construction) must prove modulo 3"
         );
     }
@@ -5110,7 +6148,12 @@ mod w6_map_compose_kernel_tests {
         let some_of_0 = Expr::app(some, crate::trustir_anchor::int_lit(0));
         assert!(
             matches!(
-                check_map_compose_refinement_claimed(&shape(), &arg, [None, Some(&some_of_0)], false),
+                check_map_compose_refinement_claimed(
+                    &shape(),
+                    &arg,
+                    [None, Some(&some_of_0)],
+                    false
+                ),
                 RefinementVerdict::KernelRejected(_)
             ),
             "NONE→C_some claim must KernelReject"
@@ -5126,7 +6169,12 @@ mod w6_map_compose_kernel_tests {
         let some_of_42 = Expr::app(some, crate::trustir_anchor::int_lit(42));
         assert!(
             matches!(
-                check_map_compose_refinement_claimed(&shape(), &arg, [Some(&some_of_42), None], false),
+                check_map_compose_refinement_claimed(
+                    &shape(),
+                    &arg,
+                    [Some(&some_of_42), None],
+                    false
+                ),
                 RefinementVerdict::KernelRejected(_)
             ),
             "a concrete-value SOME claim must KernelReject (no concrete ret is ever asserted)"
@@ -5175,10 +6223,15 @@ mod w6_map_compose_kernel_tests {
             );
         }
         // The trust-ir Call theory IS present.
-        assert!(env.get_const(&Name::from_string(crate::trustir_call::TRUSTIR_CALL_RESULT)).is_some());
+        assert!(
+            env.get_const(&Name::from_string(crate::trustir_call::TRUSTIR_CALL_RESULT)).is_some()
+        );
         // The Option carrier inductive IS registered.
         let carrier = crate::reflect::reflect_enum(&option_i32()).expect("reflect");
-        assert!(env.get_inductive(&Name::from_string(&carrier.name)).is_some(), "Option carrier registered");
+        assert!(
+            env.get_inductive(&Name::from_string(&carrier.name)).is_some(),
+            "Option carrier registered"
+        );
     }
 
     // ----- W6 increment 2: `and_then` flat-return witness -----
@@ -5349,7 +6402,9 @@ mod w6_map_compose_kernel_tests {
 #[cfg(test)]
 mod record_inc2_kernel_tests {
     use super::*;
-    use crate::mirsem::{SemAdtArm, SemAdtPayload, SemAdtReturn, SemCmpOp, SemCond, SemCondTree, SemOperand};
+    use crate::mirsem::{
+        SemAdtArm, SemAdtPayload, SemAdtReturn, SemCmpOp, SemCond, SemCondTree, SemOperand,
+    };
 
     /// The `Result::ok`-class 2-arm ADT-return whose `Some` arm carries a DowncastField at
     /// `flat_key`: guard `Discriminant(self = Var 0) == 0` (Ok); then = `Some(idxElem(e 0,

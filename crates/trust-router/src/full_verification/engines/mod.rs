@@ -6,10 +6,8 @@ mod native_ty;
 pub use native_trust_mc::{DEFAULT_PER_OBLIGATION_TIMEOUT_MS, NativeTrustMcTrustIrEngine};
 // Trust (b62 timeout-tuning regression): the one shared budgeted+proof-capable
 pub use native_ty::NativeTyEngine;
-
 use trust_vc_bridge::TrustVcVerificationEngine;
 use trust_verifier_api::VerificationEngine;
-use trust_wp::TrustWpVerificationEngine;
 
 /// Required native engines for every full-verifier lane, at the compiler's
 /// configured per-obligation SMT budget (`-Z trust-verify-timeout-ms`).
@@ -22,7 +20,6 @@ pub fn required_native_engines_with_timeout_ms(
     timeout_ms: u64,
 ) -> Vec<Box<dyn VerificationEngine + Send + Sync>> {
     vec![
-        Box::new(TrustWpVerificationEngine::new()),
         Box::new(TrustVcVerificationEngine::new()),
         Box::new(NativeTrustMcTrustIrEngine::with_timeout_ms(timeout_ms)),
         Box::new(NativeTyEngine::new()),

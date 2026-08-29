@@ -2,13 +2,22 @@
 //@ compile-flags: -Ztrust-verify=on -Ztrust-verify-timeout-ms=120000 -Copt-level=0
 // -Copt-level=0 is LOAD-BEARING, not a convenience: compiletest compiles
 // run-pass tests with -O, and at -O the MIR inliner dissolves core's tiny
-// wrapping_add CALL into Rvalue::BinaryOp — which the wrapping model
-// deliberately refuses (recognize_arithmetic authenticates the Call form and
-// nothing else), so the obligation havocs and the assert is refuted. That is a
-// PRE-EXISTING opt-level boundary of the L0 lane shared by ordinary Rust
-// wrapping code, not a property of Clean-origin calls; this fixture pins the
-// SUMMARY lane (a verified caller proving through the call boundary), which
-// requires the call to still BE a call when the verifier reads the MIR.
+// wrapping_add CALL into Rvalue::BinaryOp. UPDATE 2026-08-20: the VALUE model
+// no longer refuses that residual form — trust-vcgen now defines a bare
+// integer BinaryOp Add/Sub by the SAME modular-Ite the call model mints
+// (`wrapping_binop_modular_ite`, one shared constructor; previously the def
+// was the unbounded `a + b`, which was not merely a havoc but a measured
+// FALSE-PROVE vector in the -full refute lane — see
+// `trust_vcgen::generate::wrapping_binop_defs_tests`). -Copt-level=0 REMAINS
+// load-bearing for this fixture even so, for two reasons the crate-level fix
+// does not touch: (1) this fixture pins the SUMMARY lane (a verified caller
+// proving through the call boundary), which requires the call to still BE a
+// call when the verifier reads the MIR; and (2) the L0 safety lane still
+// mints an ArithmeticOverflow obligation for every bare integer Add/Sub/Mul
+// (generate/safety.rs, direct-binop arm — deliberate policy), which the
+// genuinely-wrapping `wsum(u64::MAX, 1)` refutes once inlining erases the
+// wrapping-call provenance. Lifting THAT needs compiler-side work (inliner
+// provenance or pre-inlining extraction), not a vcgen model.
 // (the generous timeout is NOT decoration: under parallel compiletest load the
 // in-process solver's default budget intermittently lapses on the modular-Ite
 // obligation, flipping a PROVED row to timed-out — measured flaking between

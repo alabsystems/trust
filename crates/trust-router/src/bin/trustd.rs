@@ -351,9 +351,9 @@ mod tests {
     #[test]
     fn recovery_help_rejects_ambient_path_guidance() {
         let text = help_text();
-        assert!(text.contains(
-            "/absolute/path/to/selected/sysroot/bin/trustd --recover-after-crash"
-        ));
+        assert!(
+            text.contains("/absolute/path/to/selected/sysroot/bin/trustd --recover-after-crash")
+        );
         assert!(!text.contains("\n            trustd --recover-after-crash"));
         assert!(text.contains("never ambient PATH"));
         assert!(text.contains("not packaged-byte proof"));

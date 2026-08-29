@@ -146,7 +146,6 @@ pub fn assert_annotation_count(
 #[cfg(test)]
 pub(crate) mod tests {
     use trust_types::UnwindEdge;
-
     // ===================================================================
     // trust-ir-spine dimension (B): verification-verdict parity harness
     // ===================================================================

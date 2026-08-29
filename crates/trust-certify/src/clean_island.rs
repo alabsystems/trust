@@ -23,12 +23,11 @@ use clean_elab::{
     ElabResult, FileContext, RegistrationWarningKind,
     elaborate_decl_and_register_with_context_and_warning, preprocess_decl_with_context,
 };
-use clean_kernel::{ConstantKind, Environment};
-
 // Re-export for the compiler's E9 in-walk discharge, which stashes a clone of
 // the island-checked environment in session state (it has no direct
 // clean_kernel dependency).
 pub use clean_kernel::Environment as KernelEnvironment;
+use clean_kernel::{ConstantKind, Environment};
 
 /// One island failure, spanning `start..end` BYTE OFFSETS into the island
 /// text (the caller maps these onto the enclosing Rust span).
@@ -384,17 +383,11 @@ pub fn admit_certified_island_definition(
         .map_err(|error| format!("island definition `{name}` has an invalid type: {error:?}"))?;
     let subject = clean_kernel::Expr::const_(kernel_name, Vec::new());
     let goal = clean_kernel::Expr::apps(
-        clean_kernel::Expr::const_(
-            clean_kernel::Name::from_string("Eq"),
-            vec![level.clone()],
-        ),
+        clean_kernel::Expr::const_(clean_kernel::Name::from_string("Eq"), vec![level.clone()]),
         [info.type_.clone(), subject.clone(), subject.clone()],
     );
     let proof = clean_kernel::Expr::apps(
-        clean_kernel::Expr::const_(
-            clean_kernel::Name::from_string("Eq.refl"),
-            vec![level],
-        ),
+        clean_kernel::Expr::const_(clean_kernel::Name::from_string("Eq.refl"), vec![level]),
         [info.type_.clone(), subject],
     );
     match cert_meter::grade(env, &goal, &proof) {
@@ -474,8 +467,44 @@ pub fn admit_certified_island_definition(
         .kernel_checked(digest, trust_symbols::AxiomClosure::audited([]));
     debug_assert!(status.is_certified(), "a Certified grade must project to a Certified status");
     let admission = trust_spec_elab::Admission::kernel_checked(name, arity, status);
+    // Record the island definition's RETURN domain — the Pi-telescope codomain
+    // of the type the kernel just re-checked — so a variable-free clause atom
+    // citing it (`answer() == c42(0)`) is typed at the definition's own
+    // carrier rather than the `Nat` default. Steering only: an unmapped
+    // codomain attaches nothing and the fail-closed default stays.
+    let admission = match island_return_domain(&info.type_) {
+        Some(domain) => admission.with_return_domain(domain),
+        None => admission,
+    };
     facets.admit(name, admission.clone());
     Ok(admission)
+}
+
+/// The elaboration [`trust_spec_elab::Domain`] named by an island
+/// definition's RETURN type — the Pi-telescope codomain of its declared
+/// kernel type — or `None` when the codomain is not one of the closed
+/// carriers the clause fragment supports, in which case no return domain is
+/// recorded and a variable-free atom keeps its fail-closed default. `BitVec
+/// _` is deliberately unanswered: `i64`, `u128`, and `usize64` all share that
+/// carrier, so the codomain alone cannot name the Rust-side domain.
+fn island_return_domain(ty: &clean_kernel::Expr) -> Option<trust_spec_elab::Domain> {
+    use trust_spec_elab::{Domain, MachineUIntWidth};
+    let mut codomain = ty;
+    while let clean_kernel::ExprKind::Pi(_, _, next) = codomain.kind() {
+        codomain = next;
+    }
+    let clean_kernel::ExprKind::Const(name, _) = codomain.kind() else {
+        return None;
+    };
+    Some(match name.to_string().as_str() {
+        "UInt8" => Domain::Machine(MachineUIntWidth::U8),
+        "UInt16" => Domain::Machine(MachineUIntWidth::U16),
+        "UInt32" => Domain::Machine(MachineUIntWidth::U32),
+        "UInt64" => Domain::Machine(MachineUIntWidth::U64),
+        "Nat" => Domain::Nat,
+        "Bool" => Domain::Bool,
+        _ => return None,
+    })
 }
 
 /// R4 §1 (typed-citation discharge; design note §1a): prove an UNCITED
@@ -782,8 +811,7 @@ pub fn check_generated_carrier_faithfulness(
     //    fails elaboration with "not E6-admitted" (caught by this gate's own
     //    GREEN control the first time around). A decline means the gate cannot
     //    check this carrier, so the build must refuse it.
-    let Some((_kernel_name, carrier_admission)) = admit_function_into(env, carrier, facets)
-    else {
+    let Some((_kernel_name, carrier_admission)) = admit_function_into(env, carrier, facets) else {
         return Err(R::CarrierOutsideCheckedFragment { carrier: carrier.def_path.clone() });
     };
     facets.admit(carrier.def_path.clone(), carrier_admission);
@@ -812,7 +840,7 @@ pub fn admit_function_into(
     func: &trust_types::VerifiableFunction,
     facet_table: &trust_spec_elab::FacetTable,
 ) -> Option<(String, trust_spec_elab::Admission)> {
-    use trust_types::admissible_body::{recognize_admissible_body, AdmissibleBody};
+    use trust_types::admissible_body::{AdmissibleBody, recognize_admissible_body};
     if std::env::var_os("TRUST_E6_DEBUG").is_some() {
         let admissible =
             facet_table.get(&func.def_path).is_some_and(trust_spec_elab::FnFacets::admissible);
@@ -844,7 +872,55 @@ pub fn admit_function_into(
             let (Some(width), Ok(v)) = (machine_width(width_bits), u64::try_from(value)) else {
                 return None;
             };
-            trust_spec_elab::admit_constant_function(env, &kernel_const, v, width)
+            // Belt-and-braces: the recognized value must fit the recognized
+            // width (Domain::numeral re-checks this downstream and fails
+            // closed, but an out-of-range constant should never even reach a
+            // mint attempt). `machine_width` restricts `width_bits` to
+            // 8/16/32/64, so the shift cannot overflow a u128.
+            if value >> width_bits != 0 {
+                return None;
+            }
+            if func.body.arg_count == 0 {
+                trust_spec_elab::admit_constant_function(env, &kernel_const, v, width)
+            } else {
+                // ARITY-PRESERVING route for a constant behind ignored
+                // parameters. The recognizer ERASES arity — a unary
+                // `fn f(a: u64) -> u64 { 6 }` reports the same
+                // `ConstantUint` a nullary one does — and the nullary mint
+                // (`admit_constant_function`, type `d`) then hands the defeq
+                // comparison a type-mismatched side B against the n-ary side
+                // A (`d → … → d`), which is why every unary-constant defeq
+                // refused (probe_e3, `fragment_widening_probes.rs`). The
+                // expr route mints the lambda-wrapped constant
+                // `fun p0 … p_{n-1} => <value>` instead — probe_e3 route 2
+                // measured the kernel ADMITs it in both side-A spellings.
+                //
+                // Guards mirror the Arithmetic arm below:
+                // `admit_expr_function` is single-domain, so every parameter
+                // must share one domain, the return type must be that same
+                // domain, and the recognized constant's width must BE that
+                // domain (a constant of a different width than the
+                // signature's carrier is a shape this routing must not
+                // launder).
+                let param_domains = param_domains_of(func)?;
+                let domain = param_domains.first().cloned()?;
+                if !param_domains.iter().all(|d| *d == domain)
+                    || ty_to_domain(&func.body.return_ty).as_ref() != Some(&domain)
+                    || domain != trust_spec_elab::Domain::Machine(width)
+                {
+                    return None;
+                }
+                let names: Vec<String> =
+                    (0..func.body.arg_count).map(|i| format!("p{i}")).collect();
+                let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                trust_spec_elab::admit_expr_function(
+                    env,
+                    &kernel_const,
+                    &v.to_string(),
+                    &name_refs,
+                    &domain,
+                )
+            }
         }
         AdmissibleBody::Projection { param } => {
             // Derive every parameter's domain from its declared type; fail
@@ -869,6 +945,31 @@ pub fn admit_function_into(
                 cmp,
                 cmp_left,
                 cmp_right,
+                then_param,
+                else_param,
+            )
+        }
+        // R2/C9: the param-vs-const compare, routed through the NEW admit
+        // route (`admit_select_literal_function` — the phase-1 probes
+        // measured that no pre-existing producer could mint this side B).
+        // Same boundary translation as the parameter select above; the
+        // producer does its own single-domain/Machine-only guards and
+        // range-checks the literal fail-closed.
+        AdmissibleBody::SelectLiteral { cmp, cmp_param, literal, then_param, else_param } => {
+            let param_domains = param_domains_of(func)?;
+            use trust_types::admissible_body::SelectCmp as RecCmp;
+            let cmp = match cmp {
+                RecCmp::Lt => trust_spec_elab::SelectCmp::Lt,
+                RecCmp::Le => trust_spec_elab::SelectCmp::Le,
+                RecCmp::Eq => trust_spec_elab::SelectCmp::Eq,
+            };
+            trust_spec_elab::admit_select_literal_function(
+                env,
+                &kernel_const,
+                &param_domains,
+                cmp,
+                cmp_param,
+                literal,
                 then_param,
                 else_param,
             )
@@ -937,7 +1038,22 @@ pub fn admit_function_into(
             trust_spec_elab::admit_expr_function(env, &kernel_const, &body, &name_refs, &domain)
         }
     };
-    result.ok().map(|admission| (func.def_path.clone(), admission))
+    result.ok().map(|admission| {
+        // Record the callee's RETURN domain on the admission when the typed
+        // signature pins one, so a VARIABLE-FREE clause atom (`answer() ==
+        // c42(0)` after the ensures-path `result` rewrite) elaborates at the
+        // machine domain instead of the `Nat` default — which minted an
+        // ill-typed `Eq Nat` over machine-carrier terms and defeq-rejected
+        // the e6 f06–f09 probes. Steering only, never authority: a wrong
+        // domain yields an ill-typed goal the kernel rejects, and an
+        // unsupported return type attaches nothing (the fail-closed default
+        // stays in force).
+        let admission = match ty_to_domain(&func.body.return_ty) {
+            Some(domain) => admission.with_return_domain(domain),
+            None => admission,
+        };
+        (func.def_path.clone(), admission)
+    })
 }
 
 /// Stateful, crate-local Clean checking session. A crate gets exactly one
@@ -998,10 +1114,7 @@ impl CleanIslandSession {
     /// The session is tainted if any island was rejected or any cycle found,
     /// so positive citation evidence is withheld exactly as it is for
     /// [`Self::check`].
-    pub fn check_all(
-        &mut self,
-        sources: &[&str],
-    ) -> crate::clean_island_batch::CleanIslandBatch {
+    pub fn check_all(&mut self, sources: &[&str]) -> crate::clean_island_batch::CleanIslandBatch {
         let batch = crate::clean_island_batch::check_islands_batched(
             &mut self.env,
             &mut self.file_ctx,
@@ -1116,7 +1229,12 @@ impl CleanIslandSession {
             CitationVerdict::SessionTainted
         } else {
             kernel_discharge_ensures_citation(
-                &self.env, theorem, clause_src, param_types, self_fn_name, facets,
+                &self.env,
+                theorem,
+                clause_src,
+                param_types,
+                self_fn_name,
+                facets,
             )
         }
     }
@@ -1161,7 +1279,7 @@ fn mangle_kernel_const(def_path: &str) -> String {
 /// The machine-integer width for a bit count, or `None` outside the supported
 /// widths (which fails the import closed).
 fn machine_width(bits: u32) -> Option<trust_spec_elab::MachineUIntWidth> {
-    use trust_spec_elab::MachineUIntWidth::{U16, U32, U64, U8};
+    use trust_spec_elab::MachineUIntWidth::{U8, U16, U32, U64};
     Some(match bits {
         8 => U8,
         16 => U16,
@@ -1178,10 +1296,10 @@ fn ty_to_domain(ty: &trust_types::Ty) -> Option<trust_spec_elab::Domain> {
     use trust_spec_elab::{Domain, MachineUIntWidth};
     match ty {
         trust_types::Ty::Bool => Some(Domain::Bool),
-        trust_types::Ty::Int { width, signed: false } => {
-            machine_width(*width).map(Domain::Machine)
+        trust_types::Ty::Int { width, signed: false } => machine_width(*width).map(Domain::Machine),
+        trust_types::Ty::PtrSizedInt { signed: false } => {
+            Some(Domain::Machine(MachineUIntWidth::U64))
         }
-        trust_types::Ty::PtrSizedInt { signed: false } => Some(Domain::Machine(MachineUIntWidth::U64)),
         _ => None,
     }
 }
@@ -1597,7 +1715,6 @@ pub fn clause_monitor_status(
 mod tests {
     use super::*;
 
-    #[test]
     /// Trust (#63, R3) — THE RED CASE, written before the green one per the
     /// plan's own acceptance: a generated carrier whose body does NOT match its
     /// Clean definition must be REJECTED, with the kernel as the only judge.
@@ -1617,11 +1734,7 @@ mod tests {
             span: SourceSpan::default(),
             body: VerifiableBody {
                 locals: vec![
-                    LocalDecl {
-                        index: 0,
-                        ty: Ty::Int { width: 64, signed: false },
-                        name: None,
-                    },
+                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
                     LocalDecl {
                         index: 1,
                         ty: Ty::Int { width: 64, signed: false },
@@ -1705,8 +1818,7 @@ mod tests {
             Terminator, Ty, VerifiableBody, VerifiableFunction,
         };
         let mut env = Environment::with_prelude();
-        let outcome =
-            check_clean_island_into("def r3_tgt (x : UInt64) : UInt64 := x", &mut env);
+        let outcome = check_clean_island_into("def r3_tgt (x : UInt64) : UInt64 := x", &mut env);
         assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
         let mut facets = trust_spec_elab::FacetTable::from_structural_facets([(
             "gen::opaque",
@@ -1843,8 +1955,13 @@ mod tests {
             postconditions: Vec::new(),
             spec: Default::default(),
         };
-        let facets =
-            trust_spec_elab::FacetTable::from_structural_facets([("crate::fst", true, true, true, true)]);
+        let facets = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::fst",
+            true,
+            true,
+            true,
+            true,
+        )]);
         let mut session = CleanIslandSession::new();
         let minted = session.admit_program_functions(&[fst], &facets);
         assert_eq!(minted.len(), 1, "the admissible projection is minted: {minted:?}");
@@ -2073,6 +2190,153 @@ mod tests {
         }
     }
 
+    /// `fn <name>(a0: <param_ty>, …) -> u64 { 6 }` — a constant body behind
+    /// `arg_count` (possibly zero) ignored parameters, as MIR shapes it: one
+    /// block, `_0 = const 6u64`, return. The recognizer reports the SAME
+    /// `ConstantUint { 6, 64 }` at every arity (it erases the parameters), so
+    /// this is the input that distinguishes the arity-preserving routing from
+    /// the nullary mint.
+    fn const6_verifiable_function(
+        name: &str,
+        arg_count: usize,
+        param_ty: trust_types::Ty,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let mut locals = vec![LocalDecl { index: 0, ty: Ty::u64(), name: None }];
+        for i in 1..=arg_count {
+            locals.push(LocalDecl {
+                index: i,
+                ty: param_ty.clone(),
+                name: Some(format!("a{}", i - 1)),
+            });
+        }
+        VerifiableFunction {
+            name: name.into(),
+            def_path: format!("crate::{name}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(6, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count,
+                return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        }
+    }
+
+    /// C6 (R2 campaign) — the `ConstantUint` routing is ARITY-PRESERVING.
+    ///
+    /// The recognizer erases arity: `fn c(a: u64) -> u64 { 6 }` reports the
+    /// same `ConstantUint { 6, 64 }` a nullary `fn c() -> u64 { 6 }` does.
+    /// `admit_function_into` used to route BOTH through the nullary mint
+    /// (`admit_constant_function`, side B of type `d`), so a caller applying
+    /// the unary function handed the defeq lane a type-mismatched term —
+    /// measured as `Disagreement` in `fragment_widening_probes.rs::probe_e3`,
+    /// whose route 2 also measured that the lambda-wrapped constant (the
+    /// `admit_expr_function` spelling) ADMITS. This test pins the routing at
+    /// the routing itself:
+    ///
+    ///  1. a unary constant admits at arity 1 and DISCHARGES an ensures
+    ///     clause end-to-end by kernel defeq (with a wrong-value control, so
+    ///     the discharge is not vacuous);
+    ///  2. the nullary path is byte-for-byte unchanged (arity 0);
+    ///  3. a mixed-domain unary constant (u32 parameter, u64 constant) still
+    ///     fails closed — `admit_expr_function` is single-domain.
+    #[test]
+    fn constant_uint_routing_preserves_arity() {
+        use trust_spec_elab::FacetTable;
+
+        // (1) UNARY constant: mints lambda-wrapped, discharges by defeq.
+        // Facets are recorded under BOTH the def-path and the bare name,
+        // exactly as the compiler lane dual-keys them (`FacetTable::admitted`
+        // requires the facet record and the admission under the SAME key, and
+        // the ensures self-call resolves the bare name).
+        let unary = const6_verifiable_function("c6u", 1, trust_types::Ty::u64());
+        let table = FacetTable::from_structural_facets([
+            ("crate::c6u", true, true, true, true),
+            ("c6u", true, true, true, true),
+        ]);
+        let mut env = Environment::with_prelude();
+        let outcome = check_clean_island_into(
+            "def c6_isl (x : UInt64) : UInt64 := 6\n\ndef c7_isl (x : UInt64) : UInt64 := 7",
+            &mut env,
+        );
+        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+        let (path, admission) = admit_function_into(&mut env, &unary, &table).expect(
+            "a unary constant must mint through the arity-preserving expr route \
+             (the nullary-only routing was the probe_e3 defect)",
+        );
+        assert_eq!(path, "crate::c6u");
+        assert_eq!(
+            admission.arity, 1,
+            "the routing must preserve the function's arity; 0 is the erased mint"
+        );
+        let params: &[(&str, &str)] = &[("a", "u64")];
+        let mut discharge_table = table.clone();
+        discharge_table.admit("c6u", admission.clone());
+        admit_certified_island_definition(&env, "c6_isl", &mut discharge_table)
+            .expect("the island definition must admit for citation");
+        let verdict = kernel_prove_ensures_by_defeq(
+            &env,
+            "result == c6_isl(a)",
+            params,
+            "c6u",
+            &discharge_table,
+        );
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "the lambda-wrapped constant must discharge end-to-end by kernel defeq; \
+             got {verdict:?}"
+        );
+
+        // TEETH: the same route must NOT identify the constant with a
+        // DIFFERENT island value, or the positive direction proves nothing.
+        let mut wrong_table = table.clone();
+        wrong_table.admit("c6u", admission);
+        admit_certified_island_definition(&env, "c7_isl", &mut wrong_table)
+            .expect("the control island definition must admit for citation");
+        let wrong =
+            kernel_prove_ensures_by_defeq(&env, "result == c7_isl(a)", params, "c6u", &wrong_table);
+        assert!(
+            !matches!(wrong, CitationVerdict::KernelStatementMatchCertified),
+            "`6 == 7` must not certify; got {wrong:?}"
+        );
+
+        // (2) NULLARY path unchanged: arity 0 through the constant mint.
+        let nullary = const6_verifiable_function("c6n", 0, trust_types::Ty::u64());
+        let table_n = FacetTable::from_structural_facets([("crate::c6n", true, true, true, true)]);
+        let mut env_n = Environment::with_prelude();
+        let (_, admission_n) = admit_function_into(&mut env_n, &nullary, &table_n)
+            .expect("the nullary constant path must keep minting");
+        assert_eq!(admission_n.arity, 0, "a genuinely nullary constant stays nullary");
+
+        // (3) MIXED-DOMAIN unary constant fails closed: u32 parameter, u64
+        // constant return — outside the single-domain expr fragment.
+        let mixed =
+            const6_verifiable_function("c6m", 1, trust_types::Ty::Int { width: 32, signed: false });
+        let table_m = FacetTable::from_structural_facets([("crate::c6m", true, true, true, true)]);
+        let mut env_m = Environment::with_prelude();
+        assert!(
+            admit_function_into(&mut env_m, &mixed, &table_m).is_none(),
+            "a mixed-domain unary constant must decline (fail closed), not mint"
+        );
+    }
+
     /// PHASE D, PILLAR 2 — MEASURED. What does a citation actually bind to?
     ///
     /// §4.1.1 ratifies that a citation binds `ItemKey` (crate-instance ×
@@ -2113,9 +2377,8 @@ mod tests {
         let mut facets = trust_spec_elab::FacetTable::new();
         admit_certified_island_definition(&env, "self_id", &mut facets)
             .expect("self_id must admit");
-        let verdict = kernel_discharge_ensures_citation(
-            &env, "t", "result >= x", params, "self_id", &facets,
-        );
+        let verdict =
+            kernel_discharge_ensures_citation(&env, "t", "result >= x", params, "self_id", &facets);
         assert!(
             matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
             "an honest theorem must discharge; got {verdict:?}"
@@ -2134,7 +2397,12 @@ mod tests {
         admit_certified_island_definition(&env2, "self_id", &mut facets2)
             .expect("self_id must admit");
         let swapped = kernel_discharge_ensures_citation(
-            &env2, "t", "result >= x", params, "self_id", &facets2,
+            &env2,
+            "t",
+            "result >= x",
+            params,
+            "self_id",
+            &facets2,
         );
         assert!(
             !matches!(swapped, CitationVerdict::KernelStatementMatchCertified),
@@ -2144,7 +2412,12 @@ mod tests {
         // (3) A NAME THAT IS NOT THERE fails closed rather than resolving to
         // anything nearby.
         let absent = kernel_discharge_ensures_citation(
-            &env, "t_absent", "result >= x", params, "self_id", &facets,
+            &env,
+            "t_absent",
+            "result >= x",
+            params,
+            "self_id",
+            &facets,
         );
         assert!(
             !matches!(absent, CitationVerdict::KernelStatementMatchCertified),
@@ -2257,6 +2530,249 @@ mod tests {
         );
     }
 
+    /// C6 clause-path regression, end-to-end at the crates level (e6 probe
+    /// f06's exact shape): `fn answer() -> u64 { 42 }` with
+    /// `ensures result == c42(0)` against an island
+    /// `def c42 (x : UInt64) : UInt64 := 42`. After the `result` rewrite the
+    /// clause is VARIABLE-FREE, and the atom used to default to `Nat` —
+    /// minting `Eq Nat` over UInt64 terms, which the defeq route then
+    /// rejected even though both sides reduce to `UInt64.ofNat 42`. The
+    /// admissions' recorded return domains now steer the atom to the machine
+    /// domain and the clause discharges.
+    #[test]
+    fn variable_free_constant_clause_discharges_at_the_machine_domain() {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        // fn answer() -> u64 { 42 } — the probes' nullary self-function.
+        let answer = VerifiableFunction {
+            name: "answer".into(),
+            def_path: "crate::answer".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::u64(), name: None }],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(42, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::answer",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[answer], &facet_seed);
+        assert_eq!(minted.len(), 1, "answer must mint: {minted:?}");
+        // The typed signature's return domain rides on the admission.
+        assert_eq!(
+            minted[0].1.return_domain(),
+            Some(&trust_spec_elab::Domain::Machine(trust_spec_elab::MachineUIntWidth::U64)),
+            "the mint must record the u64 return domain"
+        );
+
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            table.admit(path.clone(), admission.clone());
+            if let Some(bare) = path.rsplit("::").next() {
+                table.admit(bare.to_string(), admission.clone());
+            }
+        }
+        // f06's island: a one-parameter def the clause applies to a literal.
+        let outcome = session.check("def c42 (x : UInt64) : UInt64 := 42");
+        assert!(!outcome.is_rejected(), "island must check: {:?}", outcome.errors);
+        let env = session.environment().expect("session env").clone();
+        let c42 = admit_certified_island_definition(&env, "c42", &mut table)
+            .expect("the island definition must be admissible");
+        assert_eq!(
+            c42.return_domain(),
+            Some(&trust_spec_elab::Domain::Machine(trust_spec_elab::MachineUIntWidth::U64)),
+            "the island admission must record the UInt64 codomain"
+        );
+
+        let verdict =
+            kernel_prove_ensures_by_defeq(&env, "result == c42(0)", &[], "crate::answer", &table);
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "the variable-free constant clause must discharge by defeq; got {verdict:?}"
+        );
+    }
+
+    /// The f04 driver shape, end-to-end at the crates level: a NULLARY island
+    /// constant cited BARE — `ensures result == forty_two_isl`, no argument
+    /// list at all. This was the LAST constant refusal after the C6 pair
+    /// landed (74f315aa368 arity routing, 0acfcc223a2 clause domain): the
+    /// bare identifier was lexed as a clause VARIABLE, so the exact-binding
+    /// bijection demanded a type for it and elaboration refused before the
+    /// kernel ever saw the goal (and, at the driver, `called_identifiers`
+    /// never proposed it as a citation — measured TRUST_E9_DEBUG
+    /// NO-ISLAND-CALL). The bare spelling now resolves through the SAME
+    /// admission, firewall, and kernel constant as `forty_two_isl()`; the
+    /// discharge below is the same Eq.refl-rechecked defeq as every other
+    /// constant probe.
+    #[test]
+    fn bare_identifier_nullary_constant_citation_discharges() {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        // fn answer() -> u64 { 42 } — f04's nullary self-function.
+        let answer = VerifiableFunction {
+            name: "answer".into(),
+            def_path: "crate::answer".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::u64(), name: None }],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(42, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::answer",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[answer], &facet_seed);
+        assert_eq!(minted.len(), 1, "answer must mint: {minted:?}");
+
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            table.admit(path.clone(), admission.clone());
+            if let Some(bare) = path.rsplit("::").next() {
+                table.admit(bare.to_string(), admission.clone());
+            }
+        }
+        // f04's island: a zero-arity def the clause cites with no parens.
+        let outcome = session.check("def forty_two_isl : UInt64 := 42");
+        assert!(!outcome.is_rejected(), "island must check: {:?}", outcome.errors);
+        let env = session.environment().expect("session env").clone();
+        let isl = admit_certified_island_definition(&env, "forty_two_isl", &mut table)
+            .expect("the island definition must be admissible");
+        assert_eq!(isl.arity, 0, "a non-Pi island type is a zero-arity definition");
+        assert_eq!(
+            isl.return_domain(),
+            Some(&trust_spec_elab::Domain::Machine(trust_spec_elab::MachineUIntWidth::U64)),
+            "the island admission must record the UInt64 codomain"
+        );
+
+        let verdict = kernel_prove_ensures_by_defeq(
+            &env,
+            "result == forty_two_isl",
+            &[],
+            "crate::answer",
+            &table,
+        );
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "the bare nullary citation must discharge by defeq; got {verdict:?}"
+        );
+    }
+
+    /// The negative control the bare spelling needs on day one (the same
+    /// question f25 answers for the called spelling): island and clause
+    /// BYTE-IDENTICAL to the discharging bare-citation test above; only the
+    /// island's VALUE differs (43 against a body of 42). If this ever
+    /// discharges, the bare-citation lane is reading the clause and not the
+    /// kernel, and every bare discharge is worthless.
+    #[test]
+    fn bare_identifier_citation_of_a_wrong_constant_is_refused() {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let answer = VerifiableFunction {
+            name: "answer".into(),
+            def_path: "crate::answer".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::u64(), name: None }],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(42, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::answer",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[answer], &facet_seed);
+        assert_eq!(minted.len(), 1, "answer must mint: {minted:?}");
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            table.admit(path.clone(), admission.clone());
+            if let Some(bare) = path.rsplit("::").next() {
+                table.admit(bare.to_string(), admission.clone());
+            }
+        }
+        // The wrong constant: 43 against a Rust body of 42.
+        let outcome = session.check("def forty_two_isl : UInt64 := 43");
+        assert!(!outcome.is_rejected(), "island must check: {:?}", outcome.errors);
+        let env = session.environment().expect("session env").clone();
+        admit_certified_island_definition(&env, "forty_two_isl", &mut table)
+            .expect("the island definition must be admissible");
+        let verdict = kernel_prove_ensures_by_defeq(
+            &env,
+            "result == forty_two_isl",
+            &[],
+            "crate::answer",
+            &table,
+        );
+        assert!(
+            !matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "42 == 43 must NOT discharge by defeq; got {verdict:?}"
+        );
+    }
+
     #[test]
     fn admit_program_functions_mints_wrapping_arithmetic() {
         use trust_types::{
@@ -2290,6 +2806,7 @@ mod tests {
                             unwind: trust_types::UnwindEdge::Unreachable,
                             is_foreign: false,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                         },
                     },
                     BasicBlock {
@@ -2503,10 +3020,9 @@ mod tests {
     /// of this test.
     #[test]
     fn re_admitting_the_same_island_definition_is_idempotent() {
-        use trust_spec_elab::{Admission, FacetTable, FacetStatus, FnFacets};
+        use trust_spec_elab::{Admission, FacetStatus, FacetTable, FnFacets};
         let mut env = Environment::with_prelude();
-        let outcome =
-            check_clean_island_into("def ident_isl (x : UInt64) : UInt64 := x", &mut env);
+        let outcome = check_clean_island_into("def ident_isl (x : UInt64) : UInt64 := x", &mut env);
         assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
 
         let mut facets = FacetTable::new();
@@ -2531,10 +3047,7 @@ mod tests {
                 no_panic: certified(),
             },
         );
-        shadowed.admit(
-            "ident_isl",
-            Admission::reflected("trust_import_ident_isl", 1),
-        );
+        shadowed.admit("ident_isl", Admission::reflected("trust_import_ident_isl", 1));
         assert!(
             admit_certified_island_definition(&env, "ident_isl", &mut shadowed).is_err(),
             "an island definition shadowing a program-function facet key must still be refused"
@@ -2631,11 +3144,8 @@ mod tests {
         //    compiler path (`trust_verify.rs:19970-20013`) reaches this with the
         //    very same table the mints were recorded in, so the refusal has the
         //    provenance available to it and does not have to guess.
-        let refusal = admit_certified_island_definition(
-            &env,
-            "trust_import_crate__min2",
-            &mut table,
-        );
+        let refusal =
+            admit_certified_island_definition(&env, "trust_import_crate__min2", &mut table);
 
         let error = refusal.expect_err(
             "a Reflected Rust carrier must be REFUSED where a KernelChecked Clean \
@@ -2678,12 +3188,9 @@ mod tests {
             check_clean_island_into("def isl_min (x : UInt64) : UInt64 := x", &mut island_env);
         assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
         let mut island_facets = FacetTable::new();
-        let admitted = admit_certified_island_definition(
-            &island_env,
-            "isl_min",
-            &mut island_facets,
-        )
-        .expect("a kernel-re-checked island definition must still be admitted");
+        let admitted =
+            admit_certified_island_definition(&island_env, "isl_min", &mut island_facets)
+                .expect("a kernel-re-checked island definition must still be admitted");
         let verdict = admitted
             .require_kernel_check()
             .expect("an island definition the kernel re-checked carries KernelChecked");
@@ -2780,8 +3287,8 @@ mod tests {
             BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
             VerifiableBody, VerifiableFunction,
         };
-        let prim = |callee: &str, args: Vec<Operand>, dest: Place, target: BlockId| {
-            Terminator::Call {
+        let prim =
+            |callee: &str, args: Vec<Operand>, dest: Place, target: BlockId| Terminator::Call {
                 func: callee.into(),
                 args,
                 dest,
@@ -2791,8 +3298,8 @@ mod tests {
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_foreign: false,
                 is_unsafe_sig: false,
-            }
-        };
+                callee_identity: None,
+            };
         let chain = VerifiableFunction {
             name: "chain".into(),
             def_path: "crate::chain".into(),
@@ -3113,7 +3620,12 @@ mod tests {
         assert!(
             matches!(
                 kernel_discharge_ensures_citation(
-                    &env, "u64_ge_refl", "x >= x", params, "identity", &facets
+                    &env,
+                    "u64_ge_refl",
+                    "x >= x",
+                    params,
+                    "identity",
+                    &facets
                 ),
                 CitationVerdict::KernelStatementMatchCertified
             ),
@@ -3126,7 +3638,12 @@ mod tests {
         assert!(
             matches!(
                 kernel_discharge_ensures_citation(
-                    &env, "u64_ge_refl", "x > x", params, "identity", &facets
+                    &env,
+                    "u64_ge_refl",
+                    "x > x",
+                    params,
+                    "identity",
+                    &facets
                 ),
                 CitationVerdict::StatementOrCertificationRejected { .. }
             ),
@@ -3141,7 +3658,12 @@ mod tests {
         assert!(
             matches!(
                 kernel_discharge_ensures_citation(
-                    &env, "u64_ge_refl", "x >= x", params, "not_admitted", &facets
+                    &env,
+                    "u64_ge_refl",
+                    "x >= x",
+                    params,
+                    "not_admitted",
+                    &facets
                 ),
                 CitationVerdict::KernelStatementMatchCertified
             ),
@@ -3154,7 +3676,12 @@ mod tests {
         assert!(
             matches!(
                 kernel_discharge_ensures_citation(
-                    &env, "u64_ge_refl", "result >= x", params, "not_admitted", &facets
+                    &env,
+                    "u64_ge_refl",
+                    "result >= x",
+                    params,
+                    "not_admitted",
+                    &facets
                 ),
                 CitationVerdict::ClauseOutsideFragment { .. }
             ),
@@ -3165,7 +3692,12 @@ mod tests {
         assert!(
             matches!(
                 kernel_discharge_ensures_citation(
-                    &env, "no_such_thm", "x >= x", params, "identity", &facets
+                    &env,
+                    "no_such_thm",
+                    "x >= x",
+                    params,
+                    "identity",
+                    &facets
                 ),
                 CitationVerdict::TheoremNotFound
             ),

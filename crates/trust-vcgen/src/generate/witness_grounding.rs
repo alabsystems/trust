@@ -1,3 +1,4 @@
+// ignore-tidy-dbg -- `lenwitness_dbg!` is a gated debug channel, not std dbg!; tidy's check is textual
 // Return-value grounding for functions returning `Option`/`Result` and for
 // paired length and ordering witnesses. An ungrounded return leaves the
 // postcondition talking about a model variable nothing pins, so the credited
@@ -51,7 +52,11 @@ pub(super) fn std_enum_model_discr(kind: StdEnumReturn, variant: usize) -> i128 
     match kind {
         StdEnumReturn::Option => variant as i128,
         StdEnumReturn::Result => {
-            if variant == 0 { 1 } else { 0 }
+            if variant == 0 {
+                1
+            } else {
+                0
+            }
         }
     }
 }
@@ -233,8 +238,14 @@ pub(super) fn resolve_forwarded_call_return_variant(
             }
             n_reaching += 1;
             edge_target = Some(tgt.0);
-            forced = i128::try_from(*tag)
-                .ok()
+            // `VariantDef::discriminant` is DECODED at the extraction boundary,
+            // so the raw MIR arm label must be decoded too before the two can be
+            // compared. (They used to be raw-vs-raw, which agreed by accident.)
+            // An undecodable label leaves `forced` at `None`, which drops this
+            // grounding — fail closed.
+            forced = crate::operand_ty_cow(func, discr)
+                .as_deref()
+                .and_then(|ty| ty.decode_switch_label(*tag))
                 .and_then(|t| variants.iter().position(|v| v.discriminant == t));
         }
         if reachable_avoiding(func, otherwise.0, &avoid_g).contains(&fwd_block) {
@@ -244,8 +255,20 @@ pub(super) fn resolve_forwarded_call_return_variant(
             // variant only when that complement is a SINGLE variant (the exact
             // 2-variant / `n-1`-explicit-target enum partition — e.g. Result's
             // `switchInt(discr) -> [0: Ok]` with `otherwise` = Err).
-            let covered: FxHashSet<i128> =
-                targets.iter().filter_map(|(t, _)| i128::try_from(*t).ok()).collect();
+            // Same decode as the explicit-arm branch above: the complement is
+            // taken over DECODED tags, so the labels must be decoded too.
+            // ALL-OR-NOTHING: a dropped label would SHRINK `covered` and so
+            // GROW `remaining`, and a `remaining` that grows from 0 to 1 would
+            // force a variant on a path whose `otherwise` is in fact
+            // unreachable. Decline the whole complement instead.
+            let Some(covered) = crate::operand_ty_cow(func, discr).as_deref().and_then(|ty| {
+                targets
+                    .iter()
+                    .map(|(t, _)| ty.decode_switch_label(*t))
+                    .collect::<Option<FxHashSet<i128>>>()
+            }) else {
+                continue;
+            };
             let remaining: Vec<usize> = variants
                 .iter()
                 .enumerate()
@@ -278,9 +301,10 @@ pub(super) fn resolve_forwarded_call_return_variant(
             if !region.contains(&b.id.0) {
                 return false;
             }
-            let stmt_write = b.stmts.iter().any(|s| {
-                matches!(s, Statement::Assign { place, .. } if place.local == call_dest)
-            });
+            let stmt_write = b
+                .stmts
+                .iter()
+                .any(|s| matches!(s, Statement::Assign { place, .. } if place.local == call_dest));
             let call_write = matches!(&b.terminator, Terminator::Call { dest, .. }
                 if dest.local == call_dest);
             stmt_write || call_write
@@ -309,7 +333,8 @@ pub(super) fn resolve_enum_return_aggregate<'a>(
     vc_block: &'a trust_types::BasicBlock,
     block: &'a trust_types::BasicBlock,
 ) -> Option<(StdEnumReturn, usize, &'a [trust_types::Operand])> {
-    resolve_enum_return_aggregate_with_block(func, vc_block, block).map(|(k, v, ops, _)| (k, v, ops))
+    resolve_enum_return_aggregate_with_block(func, vc_block, block)
+        .map(|(k, v, ops, _)| (k, v, ops))
 }
 
 /// [`resolve_enum_return_aggregate`] plus the `BlockId` CONTAINING the resolved
@@ -391,9 +416,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                         .body
                         .blocks
                         .iter()
-                        .filter(|b| {
-                            v2_terminator_targets(&b.terminator).iter().any(|t| t.0 == cur)
-                        })
+                        .filter(|b| v2_terminator_targets(&b.terminator).iter().any(|t| t.0 == cur))
                         .collect();
                     let [only] = preds.as_slice() else { break };
                     let def = only.stmts.iter().find_map(|stmt| match stmt {
@@ -447,9 +470,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
             return None;
         };
         match rv {
-            Rvalue::Aggregate(AggregateKind::Adt { name, variant, .. }, ops)
-                if *variant <= 1 =>
-            {
+            Rvalue::Aggregate(AggregateKind::Adt { name, variant, .. }, ops) if *variant <= 1 => {
                 let kind = if is_std_option_name(name) {
                     StdEnumReturn::Option
                 } else if is_std_result_name(name) {
@@ -556,18 +577,17 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
         return empty;
     };
     // (kind, payload variant name, payload machine tag, empty-variant name+tag)
-    let (kind, payload_name, payload_tag, empty_name, empty_tag) =
-        if is_std_option_name(name) {
-            (StdEnumReturn::Option, "Some", 1, "None", 0)
-        } else if is_std_result_name(name) {
-            (StdEnumReturn::Result, "Ok", 0, "Err", 1)
-        } else {
-            lenwitness_dbg!(
-                &func.def_path,
-                "discr-gate: return adt name={name} is NOT std Option/Result -> _0__discr UNGROUNDED"
-            );
-            return empty;
-        };
+    let (kind, payload_name, payload_tag, empty_name, empty_tag) = if is_std_option_name(name) {
+        (StdEnumReturn::Option, "Some", 1, "None", 0)
+    } else if is_std_result_name(name) {
+        (StdEnumReturn::Result, "Ok", 0, "Err", 1)
+    } else {
+        lenwitness_dbg!(
+            &func.def_path,
+            "discr-gate: return adt name={name} is NOT std Option/Result -> _0__discr UNGROUNDED"
+        );
+        return empty;
+    };
     // Both variant defs present with their std machine tags — the pin loop maps
     // the aggregate's variant INDEX through `std_enum_model_discr`, which is
     // only meaningful for the genuine std layout; a degraded/partial lowering
@@ -637,7 +657,8 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
                         vc_block.id.0,
                         block.id.0,
                         match other {
-                            Some((k, _, _)) => format!("resolved kind={k:?} != return kind={kind:?}"),
+                            Some((k, _, _)) =>
+                                format!("resolved kind={k:?} != return kind={kind:?}"),
                             None => "resolve_enum_return_aggregate returned None".to_string(),
                         }
                     );
@@ -795,7 +816,11 @@ pub(super) fn component_ty_is_owned_vec(func: &VerifiableFunction, path: &[usize
 /// `src` yields NO candidates at all. Fuel-bounded: alias hops do not consume
 /// a path index, so the walk needs an explicit bound (which also breaks a
 /// pathological `_a = move _b; _b = move _a` single-def cycle).
-pub(super) fn component_candidate_places(func: &VerifiableFunction, src: usize, path: &[usize]) -> Vec<Place> {
+pub(super) fn component_candidate_places(
+    func: &VerifiableFunction,
+    src: usize,
+    path: &[usize],
+) -> Vec<Place> {
     const FUEL: usize = 16;
     let mut out = Vec::new();
     let mut local = src;
@@ -852,8 +877,7 @@ pub(super) fn component_candidate_places(func: &VerifiableFunction, src: usize, 
                 local = p.local;
             }
             _ => {
-                stop_reason =
-                    "def is not a positional aggregate or whole-local move alias (leaf reached, or Call-dest / projected / non-variant-0)";
+                stop_reason = "def is not a positional aggregate or whole-local move alias (leaf reached, or Call-dest / projected / non-variant-0)";
                 break;
             }
         }
@@ -887,7 +911,11 @@ pub(super) fn component_candidate_places(func: &VerifiableFunction, src: usize, 
 /// `place_source_is_stable` (a post-construction in-place mutation of a holder
 /// would divorce the leaf's length history from the returned component).
 /// `None` fails the construction lane closed.
-pub(super) fn component_source_leaf(func: &VerifiableFunction, src: usize, path: &[usize]) -> Option<usize> {
+pub(super) fn component_source_leaf(
+    func: &VerifiableFunction,
+    src: usize,
+    path: &[usize],
+) -> Option<usize> {
     let mut local = src;
     for &i in path {
         if !crate::place_source_is_stable(func, local) {
@@ -927,10 +955,7 @@ pub(super) fn component_source_leaf(func: &VerifiableFunction, src: usize, path:
         }
         local = p.local;
     }
-    lenwitness_dbg!(
-        &func.def_path,
-        "source-leaf: src=_{src} path={path:?} -> leaf _{local}"
-    );
+    lenwitness_dbg!(&func.def_path, "source-leaf: src=_{src} path={path:?} -> leaf _{local}");
     Some(local)
 }
 
@@ -994,7 +1019,8 @@ pub(super) fn dominating_len_equality_guard(
             (len_local_for(opl, cand_a), len_local_for(opr, cand_b))
         {
             Some((la, lb))
-        } else if let (Some(la), Some(lb)) = (len_local_for(opr, cand_a), len_local_for(opl, cand_b))
+        } else if let (Some(la), Some(lb)) =
+            (len_local_for(opr, cand_a), len_local_for(opl, cand_b))
         {
             Some((la, lb))
         } else {
@@ -1151,7 +1177,11 @@ pub(super) fn push_chain_mate(
 /// outside a push-pair interior: both satisfy the push-only empty-start
 /// discipline and their pushes are 1:1 chain-coupled (either orientation).
 /// Zero pushes on both sides is the trivially-equal `0 == 0` case.
-pub(super) fn paired_push_equal_lengths(func: &VerifiableFunction, leaf_a: usize, leaf_b: usize) -> bool {
+pub(super) fn paired_push_equal_lengths(
+    func: &VerifiableFunction,
+    leaf_a: usize,
+    leaf_b: usize,
+) -> bool {
     if leaf_a == leaf_b {
         return false;
     }
@@ -1204,7 +1234,10 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): resolve_enum_return_aggregate=None -> pair FAILS (path _0 unresolved)",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return None;
     };
@@ -1212,7 +1245,10 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): EMPTY variant (variant={variant} {kind:?}) -> Some(no pins; terms free is sound here)",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return Some(Vec::new());
     }
@@ -1220,7 +1256,11 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): payload aggregate ops.len()={} != 1 -> None",
-            bb.0, bb.1, names.0, names.1, ops.len()
+            bb.0,
+            bb.1,
+            names.0,
+            names.1,
+            ops.len()
         );
         return None;
     }
@@ -1228,7 +1268,10 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): payload operand is const/symbolic (not move/copy place) -> None",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return None;
     };
@@ -1236,19 +1279,27 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): payload operand _{}.<proj> carries a projection -> None",
-            bb.0, bb.1, names.0, names.1, sp.local
+            bb.0,
+            bb.1,
+            names.0,
+            names.1,
+            sp.local
         );
         return None;
     }
     let src = sp.local;
     // Both components must be owned-Vec-typed per the DECLARED payload type,
     // so the witness `len` has the std container semantics.
-    if !component_ty_is_owned_vec(func, &pair.0.path) || !component_ty_is_owned_vec(func, &pair.1.path)
+    if !component_ty_is_owned_vec(func, &pair.0.path)
+        || !component_ty_is_owned_vec(func, &pair.1.path)
     {
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): component type not owned Vec (a_ok={}, b_ok={}) -> None",
-            bb.0, bb.1, names.0, names.1,
+            bb.0,
+            bb.1,
+            names.0,
+            names.1,
             component_ty_is_owned_vec(func, &pair.0.path),
             component_ty_is_owned_vec(func, &pair.1.path)
         );
@@ -1268,13 +1319,22 @@ pub(super) fn len_witness_path_pins(
     lenwitness_dbg!(
         dp,
         "path-pins bb{}->bb{} pair({}/{}): src=_{src} agg_block=bb{} cand_a={} cand_b={} guard={guard:?}",
-        bb.0, bb.1, names.0, names.1, agg_block.0, cand_a.len(), cand_b.len()
+        bb.0,
+        bb.1,
+        names.0,
+        names.1,
+        agg_block.0,
+        cand_a.len(),
+        cand_b.len()
     );
     if let Some((la, lb)) = guard {
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): GUARD LANE grounded (len dests _{la}/_{lb}) -> Some(guard pins)",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return Some(vec![
             eq,
@@ -1293,7 +1353,10 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): no guard AND component_source_leaf(a)=None -> pair FAILS",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return None;
     };
@@ -1301,7 +1364,10 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): no guard AND component_source_leaf(b)=None -> pair FAILS",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return None;
     };
@@ -1309,14 +1375,20 @@ pub(super) fn len_witness_path_pins(
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): PUSH LANE grounded (leaves _{leaf_a}/_{leaf_b}) -> Some(eq pin)",
-            bb.0, bb.1, names.0, names.1
+            bb.0,
+            bb.1,
+            names.0,
+            names.1
         );
         return Some(vec![eq]);
     }
     lenwitness_dbg!(
         dp,
         "path-pins bb{}->bb{} pair({}/{}): neither guard nor paired-push (leaves _{leaf_a}/_{leaf_b}) -> pair FAILS",
-        bb.0, bb.1, names.0, names.1
+        bb.0,
+        bb.1,
+        names.0,
+        names.1
     );
     None
 }
@@ -1428,7 +1500,8 @@ pub(super) fn ordering_pair_coverage(posts: &[&Formula]) -> Vec<(OkPairModelVar,
             }
             if let Some((l, r)) = ordering_atom_sides(f)
                 && let (Formula::Var(a, _), Formula::Var(b, _)) = (l, r)
-                && let (Some(va), Some(vb)) = (parse_ok_pair_model_var(a), parse_ok_pair_model_var(b))
+                && let (Some(va), Some(vb)) =
+                    (parse_ok_pair_model_var(a), parse_ok_pair_model_var(b))
                 && va.index != vb.index
             {
                 *paired.entry(va.name.clone()).or_default() += 1;
@@ -1488,7 +1561,10 @@ pub(super) fn sign_var_covered(posts: &[&Formula]) -> bool {
 /// `Ref`/slice/other component types fail closed: a by-ref component's
 /// REFERENT mutability is not closed by `place_source_is_stable` on the
 /// place roots.
-pub(super) fn payload_component_adt_name(func: &VerifiableFunction, path: &[usize]) -> Option<String> {
+pub(super) fn payload_component_adt_name(
+    func: &VerifiableFunction,
+    path: &[usize],
+) -> Option<String> {
     let mut ty = return_payload_ty(func)?;
     for &i in path {
         ty = match ty {
@@ -1720,7 +1796,11 @@ pub(super) fn f4_local_edge_facts(
 /// second write — stops the walk at the hop itself, whose defs then fail the
 /// witness classification closed). The multi-def witness bool itself is NOT
 /// stable (several call-dest defs), so the walk stops exactly there.
-pub(super) fn f4_switch_root_local(func: &VerifiableFunction, discr: &Operand, fuel: u32) -> Option<usize> {
+pub(super) fn f4_switch_root_local(
+    func: &VerifiableFunction,
+    discr: &Operand,
+    fuel: u32,
+) -> Option<usize> {
     let (Operand::Copy(p) | Operand::Move(p)) = discr else {
         return None;
     };
@@ -1856,8 +1936,8 @@ pub(super) fn ordering_witness_path_pins(
             }
             let target = OrdWitnessTarget::Sign { ty_name: &ty_name, cands: &cands };
             let facts = dominating_ordering_witness_guard(func, agg_block.0, &target)?;
-            let pin = facts
-                .to_formula(Formula::var_owned(name.clone(), Sort::Int), Formula::Int(0))?;
+            let pin =
+                facts.to_formula(Formula::var_owned(name.clone(), Sort::Int), Formula::Int(0))?;
             Some(vec![pin])
         }
     }
@@ -1875,8 +1955,10 @@ pub(super) fn ordering_witness_credited_items(
     posts: &[(Formula, String, SourceSpan, Option<usize>)],
 ) -> Vec<OrdWitnessItem> {
     let refs: Vec<&Formula> = posts.iter().map(|(f, _, _, _)| f).collect();
-    let mut items: Vec<OrdWitnessItem> =
-        ordering_pair_coverage(&refs).into_iter().map(|(a, b)| OrdWitnessItem::Pair(a, b)).collect();
+    let mut items: Vec<OrdWitnessItem> = ordering_pair_coverage(&refs)
+        .into_iter()
+        .map(|(a, b)| OrdWitnessItem::Pair(a, b))
+        .collect();
     if sign_var_covered(&refs) {
         items.push(OrdWitnessItem::Sign("_0__value__sign".to_string()));
     }

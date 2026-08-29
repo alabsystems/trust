@@ -65,8 +65,8 @@ fn reparsed_integer_clause_still_matches() {
 /// the whole clause.
 #[test]
 fn mixed_int_and_bool_clause_matches() {
-    let parsed = trust_types::parse_spec_expr("((*self).0) == (0) && !((*self).1)")
-        .expect("must parse");
+    let parsed =
+        trust_types::parse_spec_expr("((*self).0) == (0) && !((*self).1)").expect("must parse");
     let typed = Formula::And(vec![
         eq(v("self*.0", Sort::Int), Formula::Int(0)),
         not(v("self*.1", Sort::Bool)),
@@ -98,10 +98,9 @@ fn forgiveness_is_only_for_the_parsed_int_sentinel() {
     ));
     // parsed Float vs typed Bool -> refused
     let f64s = Sort::Float { eb: 11, sb: 53 };
-    assert!(!parsed_clause_matches_typed(
-        &not(v("self*.0", f64s)),
-        &not(v("self*.0", Sort::Bool)),
-    ));
+    assert!(
+        !parsed_clause_matches_typed(&not(v("self*.0", f64s)), &not(v("self*.0", Sort::Bool)),)
+    );
 }
 
 /// Constants are compared exactly: a true clause must never match a false one.
@@ -145,10 +144,7 @@ fn differing_bitvector_width_is_refused() {
     let x = v("x", Sort::Int);
     let y = v("y", Sort::Int);
     let parsed = Formula::BvAdd(Box::new(x.clone()), Box::new(y.clone()), 32);
-    assert!(!parsed_clause_matches_typed(
-        &parsed,
-        &Formula::BvAdd(Box::new(x), Box::new(y), 64),
-    ));
+    assert!(!parsed_clause_matches_typed(&parsed, &Formula::BvAdd(Box::new(x), Box::new(y), 64),));
 }
 
 /// Quantifier binder lists are non-child payload and are compared exactly, so a
@@ -156,10 +152,14 @@ fn differing_bitvector_width_is_refused() {
 #[test]
 fn differing_quantifier_binders_are_refused() {
     let body = Formula::Le(Box::new(v("i", Sort::Int)), Box::new(Formula::Int(1)));
-    let parsed =
-        Formula::Forall(vec![(trust_types::Symbol::intern("i"), Sort::Int)], Box::new(body.clone()));
-    let other =
-        Formula::Forall(vec![(trust_types::Symbol::intern("i"), Sort::Bool)], Box::new(body.clone()));
+    let parsed = Formula::Forall(
+        vec![(trust_types::Symbol::intern("i"), Sort::Int)],
+        Box::new(body.clone()),
+    );
+    let other = Formula::Forall(
+        vec![(trust_types::Symbol::intern("i"), Sort::Bool)],
+        Box::new(body.clone()),
+    );
     assert!(!parsed_clause_matches_typed(&parsed, &other));
     // Same binders, same body: matches.
     assert!(parsed_clause_matches_typed(&parsed, &parsed.clone()));

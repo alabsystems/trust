@@ -175,8 +175,8 @@ fn rebuild_id_proof() -> Expr {
     let congr1 = Expr::apps(
         Expr::const_(Name::from_string("congrArg"), vec![u1(), u1()]),
         [
-            btree_ty(),            // {α}
-            btree_ty(),            // {β}
+            btree_ty(),             // {α}
+            btree_ty(),             // {β}
             rebuild(Expr::bvar(3)), // {a₁} = rebuild a
             Expr::bvar(3),          // {a₂} = a
             f1,                     // f
@@ -184,11 +184,7 @@ fn rebuild_id_proof() -> Expr {
         ],
     );
     // f2 := fun (y : BTree) => node a y   — under one more binder, a = #4.
-    let f2 = Expr::lam(
-        BinderInfo::Default,
-        btree_ty(),
-        btree_node(Expr::bvar(4), Expr::bvar(0)),
-    );
+    let f2 = Expr::lam(BinderInfo::Default, btree_ty(), btree_node(Expr::bvar(4), Expr::bvar(0)));
     // congrArg.{1,1} BTree BTree (rebuild b) b f2 ihb : node a (rebuild b) = node a b
     let congr2 = Expr::apps(
         Expr::const_(Name::from_string("congrArg"), vec![u1(), u1()]),
@@ -198,7 +194,7 @@ fn rebuild_id_proof() -> Expr {
             rebuild(Expr::bvar(2)), // {a₁} = rebuild b
             Expr::bvar(2),          // {a₂} = b
             f2,
-            Expr::bvar(0),          // h = ihb
+            Expr::bvar(0), // h = ihb
         ],
     );
     // Eq.trans.{1} BTree (node RA RB) (node a RB) (node a b) congr1 congr2
@@ -252,11 +248,7 @@ fn rebuild_node_step_goal() -> Expr {
         rebuild(btree_node(Expr::bvar(1), Expr::bvar(0))),
         btree_node(rebuild(Expr::bvar(1)), rebuild(Expr::bvar(0))),
     );
-    Expr::pi(
-        BinderInfo::Default,
-        btree_ty(),
-        Expr::pi(BinderInfo::Default, btree_ty(), body),
-    )
+    Expr::pi(BinderInfo::Default, btree_ty(), Expr::pi(BinderInfo::Default, btree_ty(), body))
 }
 
 /// `fun a b => Eq.refl BTree (node (rebuild a) (rebuild b))` — closes the
@@ -267,18 +259,13 @@ fn rebuild_node_step_refl_proof() -> Expr {
         Expr::const_(Name::from_string("Eq.refl"), vec![u1()]),
         [btree_ty(), btree_node(rebuild(Expr::bvar(1)), rebuild(Expr::bvar(0)))],
     );
-    Expr::lam(
-        BinderInfo::Default,
-        btree_ty(),
-        Expr::lam(BinderInfo::Default, btree_ty(), refl),
-    )
+    Expr::lam(BinderInfo::Default, btree_ty(), Expr::lam(BinderInfo::Default, btree_ty(), refl))
 }
 
 fn build_env() -> Environment {
     let mut env = Environment::new();
     env.init_eq().expect("init_eq");
-    env.add_inductive(btree_inductive())
-        .expect("add BTree inductive (=> BTree.rec)");
+    env.add_inductive(btree_inductive()).expect("add BTree inductive (=> BTree.rec)");
     env.add_decl(Declaration::Definition {
         name: Name::from_string("rebuild"),
         level_params: vec![],
@@ -291,9 +278,7 @@ fn build_env() -> Environment {
 }
 
 fn kernel_checks(env: &Environment, term: &Expr, goal: &Expr) -> bool {
-    TypeChecker::with_context(env, LocalContext::new())
-        .check_type(term, goal)
-        .is_ok()
+    TypeChecker::with_context(env, LocalContext::new()).check_type(term, goal).is_ok()
 }
 
 // --- the tests --------------------------------------------------------------

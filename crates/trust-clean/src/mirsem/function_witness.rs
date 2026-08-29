@@ -141,9 +141,9 @@ pub fn function_adequacy_witness_with_callees(
                             // gate spuriously rejects the whole body.
                             if let Operand::Copy(p) | Operand::Move(p) = op {
                                 if p.projections.len() >= 2
-                                    && p.projections.iter().all(|pr| {
-                                        matches!(pr, trust_types::Projection::Field(_))
-                                    })
+                                    && p.projections
+                                        .iter()
+                                        .all(|pr| matches!(pr, trust_types::Projection::Field(_)))
                                 {
                                     if let Some(sem) =
                                         sem_field_read_operand(body, op, &param_index)
@@ -542,16 +542,32 @@ pub fn function_adequacy_witness_with_callees(
 }
 
 /// Whether the function emits AT LEAST ONE safety VC that is NOT in the modeled set
-/// (`safety_vc_kind_is_modeled`). Drives the fail-closed gate: even one unmodeled
-/// safety VC means the function's reflection is not end-to-end kernel-proven, so it
-/// must NOT be counted fully faithful. (`function_safety_vcs_faithful` already
-/// fail-closes on an unmodeled VC, but it ALSO returns `None` for the vacuously-safe
-/// case; this helper lets the composer distinguish "has an unmodeled VC" from "has
-/// no safety VC at all".)
+/// (`safety_vc_kind_is_modeled`), OR at least one OPEN DECLINED obligation
+/// ([`function_has_open_declined_vc`]). Drives the fail-closed gate: either one means the
+/// function's reflection is not end-to-end kernel-proven, so it must NOT be counted
+/// fully faithful. (`function_safety_vcs_faithful` already fail-closes on an unmodeled
+/// VC, but it ALSO returns `None` for the vacuously-safe case; this helper lets the
+/// composer distinguish "has an unmodeled VC" from "has no safety VC at all".)
+///
+/// The DECLINE disjunct is not redundant with the `is_safety_vc_kind` conjunct — it is
+/// what makes this the COMPENSATING gate it is documented to be. `UnsupportedMir` is
+/// not an `is_safety_vc_kind` member, so before the disjunct this predicate applied the
+/// SAME filter as `prove::function_safety_vcs_all_discharged` and could not catch what
+/// that filter dropped: both returned the favorable answer for a body whose ONLY
+/// obligation was a decline (`fixtures/decline-handling-2026-08-25/dumps/p3_map_index`,
+/// which panics on an absent key).
+///
+/// The disjunct is LOAD-BEARING HERE specifically, and not merely a second copy of the
+/// clause in `prove::function_safety_vcs_all_discharged`: seven lanes
+/// (`prove::{synth_loop,break_loop,monotone_nested}_function_fully_faithful` and their
+/// `_via_trustir` siblings, plus `cond_update_fully_faithful_via_trustir`) call this
+/// predicate and do NOT conjoin that discharge gate. For a LOOP body this is the only
+/// place a decline is seen.
 pub(super) fn function_emits_unmodeled_safety_vc(func: &trust_types::VerifiableFunction) -> bool {
-    trust_vcgen::generate_vcs(func)
-        .iter()
-        .any(|vc| is_safety_vc_kind(&vc.kind) && !safety_vc_kind_is_modeled(&vc.kind))
+    function_has_open_declined_vc(func)
+        || trust_vcgen::generate_vcs(func)
+            .iter()
+            .any(|vc| is_safety_vc_kind(&vc.kind) && !safety_vc_kind_is_modeled(&vc.kind))
 }
 
 /// Public accessor for [`function_emits_unmodeled_safety_vc`] — the synthesized-loop
@@ -662,7 +678,6 @@ pub fn function_fully_faithful_witness_with_callees(
 
     Some(FullFaithfulnessCertificate { contract, safety })
 }
-
 
 #[cfg(test)]
 mod tuple_return_fail_closed_tests {

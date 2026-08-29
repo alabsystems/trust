@@ -37,7 +37,11 @@ fn guarded_abs_panic_obligation_carries_the_guard() {
     // `if x != i32::MIN { x.abs() }` — the guard reaches the abs block, so the
     // obligation is `(x != MIN) ∧ (x == MIN)` = UNSAT (proved).
     let vcs = abs_panic_vcs("abs_guarded");
-    assert_eq!(vcs.len(), 1, "guarded `x.abs()` still emits the obligation (discharged by the guard)");
+    assert_eq!(
+        vcs.len(),
+        1,
+        "guarded `x.abs()` still emits the obligation (discharged by the guard)"
+    );
     let dbg = format!("{:?}", vcs[0].formula);
     assert!(
         dbg.contains("Not(Eq(Var(\"x\", Int), Int(-2147483648)))"),

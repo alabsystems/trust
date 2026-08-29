@@ -106,11 +106,9 @@ pub mod inductive_functional;
 /// above the arithmetic `inductive_functional` (`Nat.add`) lane.
 pub mod checker_core;
 
-/// Kernel re-check of a compiler-finalized body-bound `ensures` claim — the
-/// lane that takes trust-wp's in-process adapter out of a
-/// `BodyBoundNativeReplay` row's trusted base. Unlike [`certify_vc`], its input
-/// is a POSITIVE postcondition envelope rather than a violation formula, so it
-/// builds and discharges the goal directly instead of refuting its negation.
+/// Standalone compatibility checker for the retired body-bound TrustWP
+/// envelope. No compiler authority route calls it; unlike [`certify_vc`], its
+/// input is a positive postcondition envelope rather than a violation formula.
 pub mod body_bound_ensures;
 
 /// Trust: `clean { … }` parser-island checking (two-language design E10) —
@@ -308,8 +306,31 @@ struct Hyp {
 /// the clean kernel re-checks with **zero** residual trust. Returns `None`
 /// (→ caller records `Trusted`) for every unsupported, unproved, trust-bearing,
 /// or kernel-rejected case. Never produces a false `Certified`.
+///
+/// # Kind admission
+///
+/// A kernel-checked UNSAT of `vc.formula` is a proof ABOUT THE PROGRAM only
+/// when that formula faithfully encodes "this obligation is violated" — the
+/// reaching program state conjoined with the negated predicate. For a kind
+/// whose formula is the bare negated clause with its free names unbound, UNSAT
+/// means only that the clause text is VALID, so the provable set is exactly the
+/// tautologies. [`VcKind::kernel_authority_refusal`] carries that judgement for
+/// every kind, with the measured evidence; this function refuses before any
+/// solver or kernel work when it fires.
+///
+/// Placing the check at the certificate entry points rather than at individual
+/// promotion sites is deliberate. Both this general route and
+/// [`certify_vc_for_native_planning`] accept a whole VC and can return evidence
+/// that compiler callers promote to kernel authority. Each independently checks
+/// the kind before minting a certificate, so a new caller cannot bypass the
+/// boundary merely by selecting the planning API.
 #[must_use]
 pub fn certify_vc(vc: &VerificationCondition) -> Option<trust_ir::ProofEvidence> {
+    // Fail closed BEFORE any solver or kernel work: a refused kind must not be
+    // able to produce a certificate at all, not merely be declined downstream.
+    if vc.kind.kernel_authority_refusal().is_some() {
+        return None;
+    }
     // Bind every field of the canonical serialized obligation, including
     // contract metadata, so the certificate cannot be swapped onto a different
     // obligation whose proof-driving formula happens to be identical.
@@ -475,6 +496,14 @@ pub fn vc_fits_native_planning_certification_budget(vc: &VerificationCondition) 
 pub fn certify_vc_for_native_planning(
     vc: &VerificationCondition,
 ) -> Option<trust_ir::ProofEvidence> {
+    // This is a second whole-VC certificate entry point, not merely a resource
+    // predicate. Apply the same exhaustive authority judgement as `certify_vc`
+    // before normalization, recognition, or kernel work. In particular, an
+    // order-shaped tautology under an item invariant fits the unsigned-BV
+    // planning grammar and would otherwise mint evidence through this route.
+    if vc.kind.kernel_authority_refusal().is_some() {
+        return None;
+    }
     preflight_unsigned_bv_order_vc_for_native_planning(vc).ok()?;
     let identity = ObligationIdentity::from_vc(vc)?;
     let normalized = normalize_violation(&vc.formula)?;
@@ -863,6 +892,48 @@ fn certify_with_identity_uncached(
     if let Some(evidence) =
         certify_reified_bool_guard_case_split(&conjuncts, &propositional, identity)
     {
+        return Some(evidence);
+    }
+
+    // LAST: PURE PROPOSITIONAL RESOLUTION of a membership disjunction against its
+    // own negated units — `(D₀ ∨ … ∨ Dₙ) ∧ ¬D₀ ∧ … ∧ ¬Dₙ`. This is the
+    // exhaustive-enum `otherwise → unreachable` trap: the discriminant validity
+    // fact `d ∈ {cases}` against the `SwitchIntOtherwise` guard `d ∉ {cases}`.
+    // Every lane above declines it, and each declines for a FRAGMENT reason, not
+    // for want of search:
+    //  * `certify_disjunctive_contradiction` hands each disjunct to
+    //    `parse_disjunct`, whose last arm requires `normalize_atom` to yield
+    //    EXACTLY ONE order atom; an `Eq(d, c)` normalizes to TWO (`d ≤ c` and
+    //    `c ≤ d`), so the `let [atom] = …` guard drops it. That refusal is
+    //    deliberate and documented at the head of that function.
+    //  * `certify_linear_int_fragment` drops the `Or` conjunct outright —
+    //    `normalize_atom` has no `Or` arm — leaving only the disequalities and
+    //    the interval `min ≤ d ≤ max` that `membership_interval_bounds` derives,
+    //    which is genuinely not closed by the single-disequality ℤ-trichotomy
+    //    lane (measured: the interval-only spelling declines too).
+    //  * `certify_propositional_closure_contradiction` wants a `Not(And(leaves))`
+    //    conjunct; here the negation is DISTRIBUTED (`¬D₀ ∧ ¬D₁`), never present
+    //    as one negated conjunction.
+    // Runs LAST and is inert unless the syntactic pattern is present, so no
+    // certificate this producer already mints changes shape or bytes. Takes the
+    // UNFILTERED view for the same reason the propositional-closure lane does: a
+    // `Bool`-sorted membership fact must stay visible.
+    if let Some(evidence) = certify_membership_disjunction_resolution(&propositional, identity) {
+        return Some(evidence);
+    }
+
+    // LAST, ONE INDIRECTION DEEPER: the same resolution PER PATH of a top-level
+    // `Or` over paths. This is what a3d's remaining `[unreach]` rows actually
+    // are — captured verbatim with `AY_CERT_DUMP=1`, not reconstructed: the
+    // violation is `And([Bool(true), Or([path₀, …, pathₘ])])` and each path is an
+    // `And` carrying its OWN discriminant contradiction plus 60–150 satisfiable
+    // validity/state facts for other locals. The flat rung above sees a pool of
+    // `[Bool(true), Or(paths)]`, in which no path appears negated, so it declines
+    // structurally — the same "one indirection deeper" step `eca5762d9e` was to
+    // `b76453697c`. Runs after every other lane and is inert unless EVERY path
+    // carries a witness, so no certificate this producer already mints changes
+    // shape or bytes.
+    if let Some(evidence) = certify_path_disjunction_membership(&propositional, identity) {
         return Some(evidence);
     }
 
@@ -2771,20 +2842,17 @@ fn propositional_closure_certificate(
 
     // The negated conjunction, in LEAF order (a repeated leaf reuses its
     // indicator and its hypothesis), right-nested to match `And`/`And.intro`.
-    let leaf_smt: Vec<String> = index_of
-        .iter()
-        .map(|&i| format!("(= {} 1)", encoded_var_name(&names[i])))
-        .collect();
-    let (conj_prop, conj_proof) = index_of
-        .iter()
-        .map(|&i| (atom_prop[i].clone(), Expr::fvar(atom_fvar[i])))
-        .rev()
-        .reduce(|(acc_prop, acc_proof), (prop, proof)| {
-            (
-                const_app("And", [prop.clone(), acc_prop.clone()]),
-                const_app("And.intro", [prop, acc_prop, proof, acc_proof]),
-            )
-        })?;
+    let leaf_smt: Vec<String> =
+        index_of.iter().map(|&i| format!("(= {} 1)", encoded_var_name(&names[i]))).collect();
+    let (conj_prop, conj_proof) =
+        index_of.iter().map(|&i| (atom_prop[i].clone(), Expr::fvar(atom_fvar[i]))).rev().reduce(
+            |(acc_prop, acc_proof), (prop, proof)| {
+                (
+                    const_app("And", [prop.clone(), acc_prop.clone()]),
+                    const_app("And.intro", [prop, acc_prop, proof, acc_proof]),
+                )
+            },
+        )?;
 
     let conj_smt = if leaf_smt.len() == 1 {
         leaf_smt[0].clone()
@@ -2796,6 +2864,604 @@ fn propositional_closure_certificate(
 
     let var_names: BTreeSet<String> = names.into_iter().collect();
     finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+// ---------------------------------------------------------------------------
+// Membership-disjunction resolution `(D₀ ∨ … ∨ Dₙ) ∧ ¬D₀ ∧ … ∧ ¬Dₙ`.
+// ---------------------------------------------------------------------------
+
+/// Max disjuncts of the membership `Or` this lane will case-split over. Bounds
+/// the `Or.rec` nesting depth and the certificate size; a wider disjunction
+/// fails closed. Matches the enum tag-set sizes the exhaustive-`SwitchInt`
+/// validity fact produces.
+const MEMBERSHIP_RESOLUTION_MAX_DISJUNCTS: usize = 32;
+
+/// Max flattened conjuncts the lane inspects. Bounds the quadratic
+/// disjunct × pool presence scan; a larger pool fails closed.
+const MEMBERSHIP_RESOLUTION_MAX_POOL: usize = 512;
+
+/// Name prefix of the opaque `Int` indicator standing for one abstracted
+/// disjunct. Distinct from [`PROP_INDICATOR_PREFIX`] so the two abstraction
+/// lanes never mint colliding terms; like it, a simple SMT symbol that
+/// [`encoded_var_name`] passes through unchanged.
+const MEMBERSHIP_INDICATOR_PREFIX: &str = "trust_disj_";
+
+/// Refute `(D₀ ∨ … ∨ Dₙ) ∧ ¬D₀ ∧ … ∧ ¬Dₙ`: a disjunction EVERY disjunct of which
+/// already appears, verbatim, negated as its own conjunct of the obligation.
+///
+/// This is the exhaustive-enum `otherwise → unreachable` trap, and it is the
+/// single most common `[unreach]` shape a real crate emits: the `?`/`Try`
+/// desugar, every total `match` on an enum, every `Ordering` three-way branch.
+/// vcgen conjoins the discriminant validity fact `d ∈ {cases}`
+/// (`Or([Eq(d,c₀), …])` — emitted by the exhaustive-`SwitchInt` validity lane or
+/// carried in as `enum_discriminant_range_preconditions`' always-true enum-range
+/// invariant), and the `SwitchIntOtherwise` path guard contributes `d ∉ {cases}`
+/// as the units `¬Eq(d,c₀) ∧ … ∧ ¬Eq(d,cₙ)`.
+///
+/// WHY THE ARITHMETIC LANES CANNOT REACH IT — a fragment gap in each, not a
+/// search-budget one. See the call-site banner in
+/// [`certify_with_identity_uncached`] for the three refusals, each measured.
+///
+/// ENCODING — the SAME opaque-indicator abstraction the propositional-closure
+/// lane above documents, applied to the dual shape. Each distinct disjunct `Dᵢ`
+/// is abstracted to a fresh opaque `Int` indicator pinned to `1`, keeping the
+/// whole proof inside the `Int` fragment [`build_env`] and
+/// [`proof_axiom_closure_is_clean`] already audit — no new sort, no widened
+/// axiom allowlist, and NOTHING about `Dᵢ` is interpreted. The hypotheses are
+/// `h_or : (P₀ = 1) ∨ … ∨ (Pₙ = 1)` and `h_ᵢ : ¬(Pᵢ = 1)`, and the term is a
+/// right-nested `Or.rec` whose branch `i` is `h_ᵢ` applied to the branch
+/// hypothesis. That is one resolution step per disjunct — no theory reasoning at
+/// all.
+///
+/// SOUNDNESS. The abstraction runs in the SAFE direction: any model `M` of the
+/// obligation induces the indicator assignment `Pᵢ := 1` iff `M ⊨ Dᵢ`, under
+/// which every asserted hypothesis holds; the kernel term derives `False` from
+/// those hypotheses with the `Pᵢ` uninterpreted, so no such `M` exists. Hence
+/// abstract-UNSAT ⇒ concrete-UNSAT. The atom → indicator map is a BIJECTION on
+/// distinct disjuncts (structural dedup, positional index), which is what makes
+/// the model transfer well defined — merging two distinct disjuncts would add an
+/// unsound "they agree" constraint. Every conjunct consulted is a base conjunct
+/// of the violation or an atom [`NORMALIZATION_STEPS`] derived from them, never a
+/// certificate byte.
+///
+/// FAIL-CLOSED, STRUCTURALLY. The lane fires only when EVERY disjunct is present
+/// negated. A partial/non-exhaustive trap — the genuinely REACHABLE
+/// `unreachable_unchecked`, which is real UB and must never be certified dead —
+/// has an uncovered tag whose `¬Dᵢ` unit is simply absent, so the gate fails and
+/// nothing is minted. The presence test is exact structural equality (after the
+/// equivalence-preserving [`propositional_form`] rewrite both sides share), so a
+/// near-miss disjunct cannot be paired with a different unit. Behind the gate,
+/// [`finish_certificate`] still runs the independent ay UNSAT cross-check, the
+/// full clean-kernel `check_type(term, False)` with its axiom-closure audit, and
+/// the serialize/deserialize round-trip re-check.
+fn certify_membership_disjunction_resolution(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    for branches in membership_witnesses(conjuncts, MEMBERSHIP_RESOLUTION_MAX_POOL) {
+        if let Some(evidence) = membership_resolution_certificate(&branches, identity) {
+            return Some(evidence);
+        }
+    }
+    None
+}
+
+/// THE MATCHING RULE of membership resolution, extracted so the flat lane above
+/// and the per-path lane below decide "is this conjunct set contradictory by
+/// membership resolution?" with ONE implementation. A second copy of the rule is
+/// how the two spellings drift apart, and a drifted copy of a soundness gate is
+/// a false proof waiting to happen.
+///
+/// Returns every `Or` conjunct of the pool EVERY disjunct of which also appears,
+/// verbatim, negated as its own conjunct — the branch list in branch order, in
+/// canonical [`propositional_form`], in pool order. Empty when there is none.
+///
+/// SOUNDNESS of the two rewrites the pool passes through: [`collect_conjuncts`]
+/// only flattens `And` and eliminates double negation, and [`propositional_form`]
+/// only rewrites a `Bool`-sorted equality against a literal. Both are
+/// EQUIVALENCES, so every returned branch atom and every matched negation is
+/// entailed by the conjunct set handed in — which is what lets the caller assert
+/// the abstracted disjunction as a weakening of its own input.
+fn membership_witnesses(conjuncts: &[&Formula], max_pool: usize) -> Vec<Vec<Formula>> {
+    let mut flat: Vec<&Formula> = Vec::new();
+    for &c in conjuncts {
+        collect_conjuncts(c, &mut flat);
+    }
+    if flat.is_empty() || flat.len() > max_pool {
+        return Vec::new();
+    }
+
+    // The pool in canonical propositional form.
+    let pool: Vec<Formula> = flat.iter().map(|c| propositional_form(c)).collect();
+    // The negated units available for resolution, in canonical form.
+    let negated: Vec<Formula> = pool
+        .iter()
+        .filter_map(|c| match c {
+            Formula::Not(inner) => Some(propositional_form(inner)),
+            _ => None,
+        })
+        .collect();
+
+    let mut found: Vec<Vec<Formula>> = Vec::new();
+    for candidate in &pool {
+        let Formula::Or(disjuncts) = candidate else { continue };
+        if disjuncts.is_empty() || disjuncts.len() > MEMBERSHIP_RESOLUTION_MAX_DISJUNCTS {
+            continue;
+        }
+        let branches: Vec<Formula> = disjuncts.iter().map(propositional_form).collect();
+        // THE GATE: every disjunct must appear negated as its own conjunct.
+        if !branches.iter().all(|d| negated.iter().any(|n| n == d)) {
+            continue;
+        }
+        found.push(branches);
+    }
+    found
+}
+
+/// Build and kernel-check the refutation for a matched membership disjunction:
+/// one opaque indicator per distinct disjunct, its negation hypothesis
+/// `¬(Pᵢ = 1)`, the disjunction hypothesis `(P₀ = 1) ∨ … ∨ (Pₙ = 1)` in BRANCH
+/// order, and the right-nested `Or.rec` term. Handed to [`finish_certificate`],
+/// which independently re-runs the ay UNSAT gate, the full clean-kernel
+/// `check_type(term, False)` + axiom-closure audit, and the round-trip re-check.
+fn membership_resolution_certificate(
+    branches: &[Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    // Injective disjunct → indicator index (structural dedup, positional index).
+    let mut distinct: Vec<&Formula> = Vec::new();
+    let mut index_of: Vec<usize> = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let idx = match distinct.iter().position(|d| *d == branch) {
+            Some(i) => i,
+            None => {
+                distinct.push(branch);
+                distinct.len() - 1
+            }
+        };
+        index_of.push(idx);
+    }
+    let names: Vec<String> =
+        (0..distinct.len()).map(|i| format!("{MEMBERSHIP_INDICATOR_PREFIX}{i}")).collect();
+
+    let one = int_literal_to_kernel(1)?;
+    let mut hyps: Vec<Hyp> = Vec::new();
+    // One NEGATION hypothesis per distinct indicator, in indicator order, so the
+    // consumer-side regeneration binds the identical fvar ids.
+    let mut atom_prop: Vec<Expr> = Vec::with_capacity(names.len());
+    let mut neg_fvar: Vec<FVarId> = Vec::with_capacity(names.len());
+    for name in &names {
+        let encoded = encoded_var_name(name);
+        let prop = eq_int(Expr::const_(Name::from_string(&encoded), vec![]), one.clone());
+        let fvar = push_hyp(&mut hyps, format!("(not (= {encoded} 1))"), not_prop(prop.clone()));
+        atom_prop.push(prop);
+        neg_fvar.push(fvar);
+    }
+
+    // The disjunction, in BRANCH order (a repeated disjunct reuses its indicator
+    // and its negation hypothesis), right-nested to match `Or`/`Or.rec`.
+    let branch_props: Vec<Expr> = index_of.iter().map(|&i| atom_prop[i].clone()).collect();
+    let branch_negs: Vec<FVarId> = index_of.iter().map(|&i| neg_fvar[i]).collect();
+    let or_prop = build_or_prop(&branch_props)?;
+    let branch_smt: Vec<String> =
+        index_of.iter().map(|&i| format!("(= {} 1)", encoded_var_name(&names[i]))).collect();
+    let or_smt = if branch_smt.len() == 1 {
+        branch_smt[0].clone()
+    } else {
+        format!("(or {})", branch_smt.join(" "))
+    };
+    let or_fvar = push_hyp(&mut hyps, or_smt, or_prop);
+
+    let term = membership_resolution_false(&branch_props, &branch_negs, Expr::fvar(or_fvar))?;
+
+    let var_names: BTreeSet<String> = names.into_iter().collect();
+    finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+/// Build a `False` term from `h_or : P₀ ∨ (P₁ ∨ …)` where branch `i` is closed
+/// by applying its own negation hypothesis `¬Pᵢ` to the branch hypothesis.
+/// Right-nested `Or.rec`, mirroring [`build_disjunctive_false`]: each branch
+/// binds its disjunct as bvar 0. The two slices are parallel by construction
+/// (`branch_props[i]` is the prop `branch_negs[i]` negates), so a length or
+/// order skew is impossible without an out-of-band edit — and would be caught by
+/// the kernel re-check regardless, which types the term against the SAME
+/// hypothesis context.
+fn membership_resolution_false(props: &[Expr], negs: &[FVarId], h_or: Expr) -> Option<Expr> {
+    // A props/negs length skew: refuse rather than guess.
+    if props.len() != negs.len() {
+        return None;
+    }
+    // The negations are FREE hypotheses here, so they are the same term at every
+    // binder depth — the `depth` the generator is handed is ignored.
+    membership_resolution_false_at(
+        props,
+        0,
+        0,
+        &|i, _depth| negs.get(i).map(|f| Expr::fvar(*f)),
+        h_or,
+    )
+}
+
+/// [`membership_resolution_false`] with the negation proofs supplied by a
+/// GENERATOR rather than read out of an fvar slice, so the identical `Or.rec`
+/// tree serves both the flat lane (free hypotheses) and the per-path lane
+/// (`And`-projections off a branch binder).
+///
+/// `neg(i, depth)` must return the proof of `¬props[i]` AS SEEN FROM `depth`
+/// binders inside this term. That parameter is the whole reason the generator
+/// exists: a projection off the enclosing `Or.rec` branch binder is a `bvar`,
+/// and a `bvar` SHIFTS by one for every lambda between its binder and its use.
+/// Regenerating at the use depth is exact by construction; cloning one captured
+/// `Expr` into the branch lambdas would silently point at the wrong binder.
+///
+/// `start` is the index of the first still-open disjunct; `props` is never
+/// re-sliced so `neg`'s index stays absolute.
+///
+/// Output is byte-identical to the previous slice-recursive spelling on the
+/// fvar path — same argument order, same right-nesting, same `bvar 0` branch
+/// binders — which the certificate-replay pins in
+/// `tests/membership_disjunction_resolution.rs` check.
+fn membership_resolution_false_at(
+    props: &[Expr],
+    start: usize,
+    depth: u32,
+    neg: &dyn Fn(usize, u32) -> Option<Expr>,
+    h_or: Expr,
+) -> Option<Expr> {
+    match props.get(start..)? {
+        // `h_or : P₀` (a one-disjunct `Or` prop IS its only operand) — the
+        // negation applied to it is already `False`.
+        [_only] => Some(Expr::app(neg(start, depth)?, h_or)),
+        [first, rest @ ..] if !rest.is_empty() => {
+            let rest_prop = build_or_prop(rest)?;
+            let or_ty = const_app("Or", [first.clone(), rest_prop.clone()]);
+            let motive = Expr::lam(BinderInfo::Default, or_ty, false_expr());
+            // inl: λ h : P₀ => (¬P₀) h, with h = bvar 0 — one binder deeper.
+            let inl = Expr::lam(
+                BinderInfo::Default,
+                first.clone(),
+                Expr::app(neg(start, depth + 1)?, Expr::bvar(0)),
+            );
+            // inr: λ hrest : rest => recurse with hrest = bvar 0.
+            let inr_body =
+                membership_resolution_false_at(props, start + 1, depth + 1, neg, Expr::bvar(0))?;
+            let inr = Expr::lam(BinderInfo::Default, rest_prop.clone(), inr_body);
+            Some(const_app("Or.rec", [first.clone(), rest_prop, motive, inl, inr, h_or]))
+        }
+        // Empty.
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PER-PATH membership resolution: `Or([Path₀, …, Pathₘ])` where EVERY path
+// disjunct is itself contradictory by membership resolution.
+//
+// THE SHAPE, captured verbatim from a3d-kernel at Trust HEAD with
+// `AY_CERT_DUMP=1` — all TEN remaining `[unreach]` rows of a3d's gate, 3–242 KB
+// each, pinned in `tests/fixtures/a3d-unreach-path-disjunctions.txt`:
+//
+//   And([ Bool(true),
+//         Or([ And([ Not(Eq(_19, 0)), Not(Eq(_19, 1)),      <- the contradiction
+//                    Or([Eq(_19, 0), Eq(_19, 1)]),          <- its own validity fact
+//                    Or([Eq(_23, 0), Eq(_23, 1)]), …,       <- 45 OTHER locals' validity
+//                    Eq(a[0;min=3]#s0_0, aex), … ]),           facts + array/state
+//              … 2 to 28 more path disjuncts, same internal shape … ]) ])
+//
+// The top level is an `Or` OVER PATHS — one disjunct per `?`-desugar site in the
+// function, each carrying its OWN membership contradiction nested one level down
+// and surrounded by 60–150 satisfiable conjuncts. The flat rung above cannot see
+// it: its pool is `[Bool(true), Or(paths)]`, in which no path appears negated.
+// (One row also carries the outer parameter-range context
+// `Ge(depth, 0) ∧ Le(depth, u32::MAX)` beside the `Or`; the lane ignores every
+// conjunct outside the candidate `Or`, so that context neither helps nor hurts.)
+//
+// MEASURED end to end at the crate boundary: the same a3d run dumps 294 unique
+// violations. With this lane stubbed out, exactly ELEVEN of them decline — these
+// ten plus a bare `Bool(false)` that is not one of the gate's 293 obligation
+// rows. With the lane in, only the `Bool(false)` does. Worst row: 1.97s.
+//
+// SOUNDNESS, the only thing that matters here. `Or` is false only when EVERY
+// disjunct is false, so the lane demands a membership witness inside EVERY path
+// and declines the whole candidate the moment one path has none. A closer that
+// accepted on "some path is contradictory" would certify a formula with a
+// genuinely REACHABLE trap on the remaining path — real UB blessed by the
+// verifier, the worst outcome available in this lane. That is what
+// `path_with_a_reachable_trap_declines` and the exhaustive model oracle in
+// `tests/path_membership_disjunction.rs` exist to catch.
+//
+// The two weakenings, both in the safe direction:
+//  * PER PATH: `Pathᵢ` is replaced by the projection
+//    `Wᵢ = (E₀ ∨ … ∨ E_k) ∧ ¬E₀ ∧ … ∧ ¬E_k` of its OWN flattened conjuncts, which
+//    `Pathᵢ` entails by `And`-projection (the same direction, and the same
+//    argument, as `parse_and_disjunct_internal_pair`'s two-conjunct projection).
+//    By `Or`-monotonicity `Or(Pathᵢ) ⟹ Or(Wᵢ)`, so refuting the weakened
+//    disjunction refutes the violation a fortiori. Only the path's own conjuncts
+//    are consulted — never the outer context, never a sibling path.
+//  * ABSTRACTION: each distinct atom becomes a fresh opaque `Int` indicator
+//    pinned to `1`, exactly as the flat lane and the propositional-closure lane
+//    do. The map is a function (structural dedup) and INJECTIVE on distinct
+//    atoms, so it merges nothing; the emitted term uses only `Or.rec`,
+//    `And.left`, `And.right` and application, i.e. it is a propositional
+//    tautology SCHEMA valid under any substitution for the indicators.
+//
+// The matching rule is [`membership_witnesses`] — literally the same function
+// the flat lane calls — and the per-path term is [`membership_resolution_false`]'s
+// own `Or.rec` tree via [`membership_resolution_false_at`]. There is no second
+// implementation of the resolution rule to drift.
+// ---------------------------------------------------------------------------
+
+/// Max path disjuncts of the top-level `Or` this lane will case-split over.
+/// Bounds the `Or.rec` nesting depth and the quadratic `rest_prop` blow-up of
+/// the emitted term. a3d's widest captured row has 29; a wider one fails closed.
+const PATH_MEMBERSHIP_MAX_PATHS: usize = 64;
+
+/// Max distinct abstracted atoms across all paths. Bounds the declared-variable
+/// count of the certificate environment; a wider one fails closed.
+const PATH_MEMBERSHIP_MAX_INDICATORS: usize = 256;
+
+/// Total flattened path conjuncts this lane will inspect in ONE invocation,
+/// across every candidate `Or` and every path. THE COST CAP: the scan is
+/// candidates × paths × path-pool and these formulas run to 242 KB. a3d's
+/// widest row costs ~4,400; exceeding the cap declines, which is fail-closed and
+/// costs only a certificate, never soundness.
+const PATH_MEMBERSHIP_MAX_TOTAL_CONJUNCTS: usize = 100_000;
+
+/// Name prefix of the opaque `Int` indicator standing for one abstracted path
+/// atom. Distinct from [`MEMBERSHIP_INDICATOR_PREFIX`] and
+/// [`PROP_INDICATOR_PREFIX`] so the abstraction lanes never mint colliding
+/// terms; like them, a simple SMT symbol [`encoded_var_name`] passes through.
+const PATH_MEMBERSHIP_INDICATOR_PREFIX: &str = "trust_path_";
+
+/// Where one path's weakened hypothesis `Wᵢ` lives while its branch is refuted.
+///
+/// [`PathCarrier::Free`] is the degenerate single-path case: the certificate's
+/// own `h_or` hypothesis IS the path's `And`, with no `Or.rec` above it, and an
+/// fvar does not move. [`PathCarrier::Bound`] is every other case: the binder of
+/// the enclosing `Or.rec` branch lambda, which shifts by one for each binder the
+/// inner resolution enters — hence [`PathCarrier::at`] takes that depth.
+#[derive(Clone, Copy)]
+enum PathCarrier {
+    Free(FVarId),
+    Bound(u32),
+}
+
+impl PathCarrier {
+    fn at(self, depth: u32) -> Expr {
+        match self {
+            PathCarrier::Free(fvar) => Expr::fvar(fvar),
+            PathCarrier::Bound(base) => Expr::bvar(base + depth),
+        }
+    }
+}
+
+/// One path disjunct, weakened to the membership contradiction it carries and
+/// abstracted onto opaque indicators.
+struct PathPlan {
+    /// Conjuncts of the weakened path prop `Wᵢ` in [`build_and_prop`] order: the
+    /// membership `Or` at index 0, then one `¬(Pⱼ = 1)` per DISTINCT branch atom
+    /// in first-occurrence order.
+    parts: Vec<Expr>,
+    /// `build_and_prop(&parts)` — the prop the enclosing `Or` binds.
+    prop: Expr,
+    /// SMT rendering of `prop`, for the ay cross-check.
+    smt: String,
+    /// The membership `Or`'s branch props, in BRANCH order (duplicates repeat).
+    branch_props: Vec<Expr>,
+    /// For branch `j`, the index in `parts` of its negation. Parallel to
+    /// `branch_props`.
+    neg_part: Vec<usize>,
+}
+
+impl PathPlan {
+    /// Project part `idx` out of the right-nested `And` chain, given the term
+    /// carrying the whole chain. Real `And.left`/`And.right` kernel constants —
+    /// the same idiom `IteCaseSplitPlan::refute_leaf` uses — so the projection is
+    /// re-checked like every other step.
+    fn project(&self, idx: usize, carrier: Expr) -> Option<Expr> {
+        let mut acc = carrier;
+        for k in 0..idx {
+            let rest = build_and_prop(self.parts.get(k + 1..)?)?;
+            acc = const_app("And.right", [self.parts.get(k)?.clone(), rest, acc]);
+        }
+        if idx + 1 == self.parts.len() {
+            return Some(acc);
+        }
+        let rest = build_and_prop(self.parts.get(idx + 1..)?)?;
+        Some(const_app("And.left", [self.parts.get(idx)?.clone(), rest, acc]))
+    }
+}
+
+/// See the section banner: refute an `Or` over PATHS, each path closed by the
+/// membership resolution it carries internally.
+fn certify_path_disjunction_membership(
+    conjuncts: &[&Formula],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    let mut flat: Vec<&Formula> = Vec::new();
+    for &c in conjuncts {
+        collect_conjuncts(c, &mut flat);
+    }
+    if flat.is_empty() || flat.len() > MEMBERSHIP_RESOLUTION_MAX_POOL {
+        return None;
+    }
+    // Candidate discovery reads the RAW conjunct: `propositional_form` only
+    // rewrites a `Bool`-sorted equality against a literal, so it can neither
+    // create nor destroy an `Or` — and cloning a 242 KB conjunct to learn that
+    // is pure cost.
+    let mut budget = PATH_MEMBERSHIP_MAX_TOTAL_CONJUNCTS;
+    for &candidate in &flat {
+        let Formula::Or(paths) = candidate else { continue };
+        if paths.is_empty() || paths.len() > PATH_MEMBERSHIP_MAX_PATHS {
+            continue;
+        }
+        // THE GATE: EVERY path must carry its own membership contradiction. One
+        // path without a witness is one path on which the trap is reachable, and
+        // the whole candidate is abandoned — `Or` is false only when all of its
+        // disjuncts are.
+        let mut witnesses: Vec<Vec<Formula>> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut path_flat: Vec<&Formula> = Vec::new();
+            collect_conjuncts(path, &mut path_flat);
+            let Some(remaining) = budget.checked_sub(path_flat.len()) else {
+                return None;
+            };
+            budget = remaining;
+            match membership_witnesses(&[path], MEMBERSHIP_RESOLUTION_MAX_POOL).into_iter().next() {
+                Some(witness) => witnesses.push(witness),
+                None => break,
+            }
+        }
+        if witnesses.len() != paths.len() {
+            continue;
+        }
+        if let Some(evidence) = path_membership_certificate(&witnesses, identity) {
+            return Some(evidence);
+        }
+    }
+    None
+}
+
+/// Build and kernel-check the refutation for a matched path disjunction: one
+/// opaque indicator per distinct atom across all paths, the single hypothesis
+/// `h_or : W₀ ∨ … ∨ Wₘ`, and the two-level `Or.rec` tree (paths outside,
+/// each path's membership resolution inside). Handed to [`finish_certificate`],
+/// which independently re-runs the ay UNSAT gate, the full clean-kernel
+/// `check_type(term, False)` + axiom-closure audit, and the round-trip re-check.
+fn path_membership_certificate(
+    paths: &[Vec<Formula>],
+    identity: &ObligationIdentity,
+) -> Option<trust_ir::ProofEvidence> {
+    // ONE global atom → indicator table across every path. Structural dedup, so
+    // the map is a function; distinct atoms get distinct indicators, so it merges
+    // nothing (merging two distinct atoms would add an unsound "they agree"
+    // constraint, exactly as the flat lane's doc-comment records).
+    let mut distinct: Vec<&Formula> = Vec::new();
+    let mut path_ids: Vec<Vec<usize>> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.is_empty() {
+            return None;
+        }
+        let mut ids = Vec::with_capacity(path.len());
+        for atom in path {
+            let idx = match distinct.iter().position(|d| *d == atom) {
+                Some(i) => i,
+                None => {
+                    distinct.push(atom);
+                    distinct.len() - 1
+                }
+            };
+            ids.push(idx);
+        }
+        path_ids.push(ids);
+    }
+    if distinct.len() > PATH_MEMBERSHIP_MAX_INDICATORS {
+        return None;
+    }
+
+    let names: Vec<String> =
+        (0..distinct.len()).map(|i| format!("{PATH_MEMBERSHIP_INDICATOR_PREFIX}{i}")).collect();
+    let one = int_literal_to_kernel(1)?;
+    let atom_prop: Vec<Expr> = names
+        .iter()
+        .map(|n| eq_int(Expr::const_(Name::from_string(&encoded_var_name(n)), vec![]), one.clone()))
+        .collect();
+    let atom_smt: Vec<String> =
+        names.iter().map(|n| format!("(= {} 1)", encoded_var_name(n))).collect();
+
+    let mut plans: Vec<PathPlan> = Vec::with_capacity(paths.len());
+    for ids in &path_ids {
+        // Distinct indicators of THIS path, in first-occurrence order: a repeated
+        // branch atom reuses its indicator and its single negation part.
+        let mut local: Vec<usize> = Vec::new();
+        for &i in ids {
+            if !local.contains(&i) {
+                local.push(i);
+            }
+        }
+        let branch_props: Vec<Expr> =
+            ids.iter().map(|&i| atom_prop.get(i).cloned()).collect::<Option<_>>()?;
+        let branch_smt: Vec<String> =
+            ids.iter().map(|&i| atom_smt.get(i).cloned()).collect::<Option<_>>()?;
+        let or_smt = if branch_smt.len() == 1 {
+            branch_smt[0].clone()
+        } else {
+            format!("(or {})", branch_smt.join(" "))
+        };
+
+        let mut parts = vec![build_or_prop(&branch_props)?];
+        let mut part_smt = vec![or_smt];
+        for &i in &local {
+            parts.push(not_prop(atom_prop.get(i)?.clone()));
+            part_smt.push(format!("(not {})", atom_smt.get(i)?));
+        }
+        let neg_part: Vec<usize> = ids
+            .iter()
+            .map(|i| local.iter().position(|l| l == i).map(|p| p + 1))
+            .collect::<Option<_>>()?;
+
+        plans.push(PathPlan {
+            prop: build_and_prop(&parts)?,
+            smt: build_and_smt(&part_smt)?,
+            parts,
+            branch_props,
+            neg_part,
+        });
+    }
+
+    let path_props: Vec<Expr> = plans.iter().map(|p| p.prop.clone()).collect();
+    let path_smt: Vec<String> = plans.iter().map(|p| p.smt.clone()).collect();
+    let or_smt = if path_smt.len() == 1 {
+        path_smt[0].clone()
+    } else {
+        format!("(or {})", path_smt.join(" "))
+    };
+
+    let mut hyps: Vec<Hyp> = Vec::new();
+    let or_fvar = push_hyp(&mut hyps, or_smt, build_or_prop(&path_props)?);
+    let term = path_disjunction_false(&plans, PathCarrier::Free(or_fvar))?;
+
+    let var_names: BTreeSet<String> = names.into_iter().collect();
+    finish_certificate(&hyps, &term, &var_names, identity)
+}
+
+/// Build a `False` term from `h : W₀ ∨ (W₁ ∨ …)`, each branch closed by the
+/// membership resolution that path carries. Right-nested `Or.rec`, mirroring
+/// [`build_disjunctive_false`]: each branch binds its path as bvar 0.
+fn path_disjunction_false(plans: &[PathPlan], h: PathCarrier) -> Option<Expr> {
+    match plans {
+        [] => None,
+        [only] => refute_path_membership(only, h),
+        [first, rest @ ..] => {
+            let rest_prop =
+                build_or_prop(&rest.iter().map(|p| p.prop.clone()).collect::<Vec<_>>())?;
+            let or_ty = const_app("Or", [first.prop.clone(), rest_prop.clone()]);
+            let motive = Expr::lam(BinderInfo::Default, or_ty, false_expr());
+            // inl: λ h : W₀ => resolve inside W₀, with W₀ = bvar 0.
+            let inl_body = refute_path_membership(first, PathCarrier::Bound(0))?;
+            let inl = Expr::lam(BinderInfo::Default, first.prop.clone(), inl_body);
+            // inr: λ hrest : rest => recurse with hrest = bvar 0.
+            let inr_body = path_disjunction_false(rest, PathCarrier::Bound(0))?;
+            let inr = Expr::lam(BinderInfo::Default, rest_prop.clone(), inr_body);
+            Some(const_app("Or.rec", [first.prop.clone(), rest_prop, motive, inl, inr, h.at(0)]))
+        }
+    }
+}
+
+/// One path's branch: project the membership `Or` and each negation out of the
+/// path's `And` chain, then hand them to the SAME `Or.rec` builder the flat
+/// membership lane uses. The projections are regenerated at each use depth
+/// because the carrier is a binder that shifts — see
+/// [`membership_resolution_false_at`].
+fn refute_path_membership(plan: &PathPlan, h: PathCarrier) -> Option<Expr> {
+    let h_or = plan.project(0, h.at(0))?;
+    membership_resolution_false_at(
+        &plan.branch_props,
+        0,
+        0,
+        &|j, depth| plan.project(*plan.neg_part.get(j)?, h.at(depth)),
+        h_or,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4651,11 +5317,9 @@ fn parse_and_disjunct_internal_pair(di: &Formula) -> Option<Disjunct<'_>> {
         let smt_c = int_literal_to_smt(c)?;
         let (q, smt_q, kind) = match kind_b {
             // `Eq(v, c)` against `Not(Eq(v, c))`.
-            None => (
-                not_prop(p.clone()),
-                format!("(not (= {smt_v} {smt_c}))"),
-                InternalPairKind::EqNeg,
-            ),
+            None => {
+                (not_prop(p.clone()), format!("(not (= {smt_v} {smt_c}))"), InternalPairKind::EqNeg)
+            }
             // `Eq(v, c)` against `Eq(v, b)`, `b ≠ c` — checked by the caller.
             Some(b) => (
                 eq_int(ve.clone(), int_literal_to_kernel(b)?),
@@ -6256,8 +6920,7 @@ fn certify_unsigned_bv_mul_no_overflow(
         let has_nonzero = conjuncts.iter().any(|&g| {
             let Formula::Not(ginner) = g else { return false };
             let Formula::Eq(ga, gb) = ginner.as_ref() else { return false };
-            (is_exact_bv_var(ga, &a_name, *w)
-                && exact_unsigned_bv_literal(gb, *w) == Some(0))
+            (is_exact_bv_var(ga, &a_name, *w) && exact_unsigned_bv_literal(gb, *w) == Some(0))
                 || (is_exact_bv_var(gb, &a_name, *w)
                     && exact_unsigned_bv_literal(ga, *w) == Some(0))
         });
@@ -11890,13 +12553,8 @@ mod tests {
         let a_ne_zero = Formula::Not(Box::new(Formula::Eq(a(), bv(0))));
         let prod = Formula::BvMul(a(), bext(), bvw);
         let recovered = Formula::BvUDiv(Box::new(prod), a(), bvw);
-        let mismatch =
-            Formula::Not(Box::new(Formula::Eq(Box::new(recovered), bext())));
-        let violation = Formula::And(vec![
-            a_ne_zero,
-            mismatch,
-            Formula::BvULt(a(), bv(10), bvw),
-        ]);
+        let mismatch = Formula::Not(Box::new(Formula::Eq(Box::new(recovered), bext())));
+        let violation = Formula::And(vec![a_ne_zero, mismatch, Formula::BvULt(a(), bv(10), bvw)]);
         assert!(
             certify_violation(&violation).is_none(),
             "a derived (sign-extended) operand must fail the raw-Var match (decline)"
@@ -11915,8 +12573,7 @@ mod tests {
         let prod = Formula::BvMul(a(), b(), bvw);
         let recovered = Formula::BvUDiv(Box::new(prod), a(), bvw);
         let mismatch = Formula::Not(Box::new(Formula::Eq(Box::new(recovered), b())));
-        let violation =
-            Formula::And(vec![a_ne_zero, mismatch, Formula::BvULt(a(), bv(1000), bvw)]);
+        let violation = Formula::And(vec![a_ne_zero, mismatch, Formula::BvULt(a(), bv(1000), bvw)]);
         assert!(
             certify_violation(&violation).is_none(),
             "a factor with no present bound may reach UMAX — must NOT certify"
@@ -12031,10 +12688,7 @@ mod tests {
         // conflicting literal equalities (no negation pair anywhere).
         let branch1 = Formula::And(vec![wf_range("v"), v1(), v2()]);
         let branch2 = Formula::And(vec![wf_range("v"), v2(), v1()]);
-        let violation = Formula::And(vec![
-            wf_range("v"),
-            Formula::Or(vec![branch1, branch2]),
-        ]);
+        let violation = Formula::And(vec![wf_range("v"), Formula::Or(vec![branch1, branch2])]);
         assert_formula_certificate_pairs(&violation);
     }
 
@@ -12090,12 +12744,8 @@ mod tests {
         let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
         let n_min = || wf_eq(wf_v("n"), Formula::Int(min32));
         let d_neg1 = || wf_eq(wf_v("d"), Formula::Int(-1));
-        let range_rev = |n: &str| {
-            Formula::And(vec![
-                le(i(min32), wf_v(n)),
-                le(wf_v(n), i(2_147_483_647)),
-            ])
-        };
+        let range_rev =
+            |n: &str| Formula::And(vec![le(i(min32), wf_v(n)), le(wf_v(n), i(2_147_483_647))]);
         let defs_tail = || {
             Formula::And(vec![
                 wf_eq(wf_b("_3"), wf_not(d0())),
@@ -12151,8 +12801,7 @@ mod tests {
         let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
         let inner = || Formula::And(vec![wf_range("n"), wf_range("d"), n_min(), d_neg1()]);
         // branch1 WITHOUT `¬(n = MIN)`, branch2 WITHOUT `¬(d = -1)`.
-        let branch1 =
-            Formula::And(vec![wf_not(d0()), wf_range("n"), wf_range("d"), inner()]);
+        let branch1 = Formula::And(vec![wf_not(d0()), wf_range("n"), wf_range("d"), inner()]);
         let branch2 =
             Formula::And(vec![wf_not(d0()), n_min(), wf_range("n"), wf_range("d"), inner()]);
         let violation = Formula::And(vec![
@@ -12174,8 +12823,7 @@ mod tests {
     fn waveform_late_unfold_respects_negated_reification() {
         let d0 = || wf_eq(wf_v("d"), Formula::Int(0));
         let spent_false = || Formula::And(vec![wf_eq(wf_b("_6"), d0()), wf_not(wf_b("_6"))]);
-        let branch1 =
-            Formula::And(vec![wf_not(d0()), wf_range("n"), wf_range("d"), spent_false()]);
+        let branch1 = Formula::And(vec![wf_not(d0()), wf_range("n"), wf_range("d"), spent_false()]);
         let branch2 = Formula::And(vec![
             wf_not(d0()),
             wf_eq(wf_v("n"), Formula::Int(7)),
@@ -12183,11 +12831,8 @@ mod tests {
             wf_range("d"),
             spent_false(),
         ]);
-        let violation = Formula::And(vec![
-            wf_range("d"),
-            wf_range("n"),
-            Formula::Or(vec![branch1, branch2]),
-        ]);
+        let violation =
+            Formula::And(vec![wf_range("d"), wf_range("n"), Formula::Or(vec![branch1, branch2])]);
         assert!(
             certify_violation(&violation).is_none(),
             "a false-asserted reification entails ¬(d=0), not d=0 — must NOT certify"
@@ -15586,6 +16231,173 @@ mod tests {
         // this test cannot pass by the certificate degenerating into something
         // simpler than the lane it is pinning.
         for required in ["Or.rec", "And.left", "Int.add_le_add_left", "Int.lt_irrefl"] {
+            assert!(used.contains(required), "certificate does not use {required}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PER-PATH membership resolution, in LANE ISOLATION.
+    //
+    // `certify_violation` runs sixteen rungs, so an end-to-end assertion cannot
+    // say WHICH one answered. These call
+    // `certify_path_disjunction_membership` directly, so every claim below is
+    // about this lane and nothing else. The end-to-end behaviour, the nine
+    // captured a3d violations, and the exhaustive model oracle live in
+    // `tests/path_membership_disjunction.rs`.
+    // -----------------------------------------------------------------------
+
+    /// Drive the per-path lane and nothing else.
+    fn path_lane(violation: &Formula) -> Option<ProofEvidence> {
+        let identity = ObligationIdentity::from_violation(violation)?;
+        let conjuncts: Vec<&Formula> = vec![violation];
+        certify_path_disjunction_membership(&conjuncts, &identity)
+    }
+
+    fn tag_eq(v: &str, tag: i128) -> Formula {
+        Formula::Eq(Box::new(Formula::Var(v.to_string(), Sort::Int)), Box::new(Formula::Int(tag)))
+    }
+    fn tag_neq(v: &str, tag: i128) -> Formula {
+        Formula::Not(Box::new(tag_eq(v, tag)))
+    }
+    fn tag_member(v: &str, tags: &[i128]) -> Formula {
+        Formula::Or(tags.iter().map(|&t| tag_eq(v, t)).collect())
+    }
+    /// One a3d-shaped path: the discriminant contradiction for `v`, buried under
+    /// `noise` satisfiable validity facts about other locals.
+    fn dead_path(v: &str, noise: usize) -> Formula {
+        let mut parts = vec![tag_neq(v, 0), tag_neq(v, 1), tag_member(v, &[0, 1])];
+        for k in 0..noise {
+            parts.push(tag_member(&format!("{v}_n{k}"), &[0, 1]));
+        }
+        Formula::And(parts)
+    }
+    fn a3d_shape(paths: Vec<Formula>) -> Formula {
+        Formula::And(vec![Formula::Bool(true), Formula::Or(paths)])
+    }
+
+    /// The lane closes a3d's shape: `And([Bool(true), Or([path, …])])` with the
+    /// contradiction nested one level down and surrounded by noise.
+    #[test]
+    fn path_lane_closes_the_a3d_shape() {
+        let paths = (0..4).map(|i| dead_path(&format!("_{i}"), 12)).collect();
+        assert!(path_lane(&a3d_shape(paths)).is_some(), "the per-path lane declined a3d's shape");
+    }
+
+    /// SOUNDNESS, the one that matters: one path is SATISFIABLE (tag 2 uncovered,
+    /// so the trap on that path is genuinely REACHABLE — real UB). `Or` is false
+    /// only when EVERY disjunct is, so the lane must decline the whole candidate.
+    #[test]
+    fn path_lane_declines_when_one_path_is_reachable() {
+        let mut paths: Vec<Formula> = (0..4).map(|i| dead_path(&format!("_{i}"), 12)).collect();
+        paths[2] =
+            Formula::And(vec![tag_neq("_2", 0), tag_neq("_2", 1), tag_member("_2", &[0, 1, 2])]);
+        assert!(
+            path_lane(&a3d_shape(paths)).is_none(),
+            "a REACHABLE trap on one path was certified dead — a false proof of UB"
+        );
+    }
+
+    /// The lane consults ONLY a path's own conjuncts. Here one path holds the
+    /// negations and its sibling holds the membership fact; paths are
+    /// ALTERNATIVES, not conjuncts, so pairing across them would be unsound.
+    #[test]
+    fn path_lane_never_borrows_a_sibling_paths_units() {
+        let negations = Formula::And(vec![tag_neq("_0", 0), tag_neq("_0", 1)]);
+        let membership = Formula::And(vec![tag_member("_0", &[0, 1])]);
+        assert!(
+            path_lane(&a3d_shape(vec![negations, membership])).is_none(),
+            "the lane paired one path's negations with a sibling's disjunction"
+        );
+    }
+
+    /// CONSERVATIVE, deliberately: the outer context's negations are NOT pulled
+    /// into a path. Joining them would be sound (`ctx ∧ Dᵢ ⊢ False` refutes
+    /// `ctx ∧ Or(Dᵢ)`), but it is not what this lane's weakening argument
+    /// covers, so it declines. Pinned here — in isolation, because the whole
+    /// violation IS unsatisfiable and an earlier rung closes it end to end — so
+    /// that widening to the outer context is a reviewed change, never a silent
+    /// one.
+    #[test]
+    fn path_lane_does_not_borrow_the_outer_context() {
+        let violation = Formula::And(vec![
+            tag_neq("_0", 0),
+            tag_neq("_0", 1),
+            Formula::Or(vec![
+                Formula::And(vec![tag_member("_0", &[0, 1]), tag_member("_5", &[0, 1])]),
+                Formula::And(vec![tag_member("_0", &[0, 1]), tag_member("_6", &[0, 1])]),
+            ]),
+        ]);
+        assert!(
+            path_lane(&violation).is_none(),
+            "the per-path lane borrowed the OUTER context's negations; if that is now \
+             intended, the weakening argument in the section banner must be rewritten"
+        );
+    }
+
+    /// A near-miss excluded tag inside one path (`{0,2}` excluded, `{0,1}` valid)
+    /// leaves `_0 = 1` a model of that path. The presence test is exact
+    /// structural equality one level down, so the lane declines.
+    #[test]
+    fn path_lane_declines_a_near_miss_tag_inside_a_path() {
+        let bad = Formula::And(vec![tag_neq("_0", 0), tag_neq("_0", 2), tag_member("_0", &[0, 1])]);
+        assert!(
+            path_lane(&a3d_shape(vec![dead_path("_1", 4), bad])).is_none(),
+            "a near-miss excluded tag inside a path was closed"
+        );
+    }
+
+    /// The CAPS are real: 64 paths certify, 65 fail closed. Declining on a cap
+    /// costs a certificate, never soundness.
+    #[test]
+    fn path_lane_caps_the_disjunction_width() {
+        let inside: Vec<Formula> =
+            (0..PATH_MEMBERSHIP_MAX_PATHS).map(|i| dead_path(&format!("_{i}"), 1)).collect();
+        assert!(path_lane(&a3d_shape(inside)).is_some(), "a 64-path disjunction is inside the cap");
+        let outside: Vec<Formula> =
+            (0..PATH_MEMBERSHIP_MAX_PATHS + 1).map(|i| dead_path(&format!("_{i}"), 1)).collect();
+        assert!(path_lane(&a3d_shape(outside)).is_none(), "a 65-path disjunction must fail closed");
+    }
+
+    /// The emitted certificate is a TWO-LEVEL `Or.rec` tree over `And`
+    /// projections, and it names no constant outside the audited inventory the
+    /// flat membership lane and the `Ite` case split already use. Pins that the
+    /// lane did not reach for a new axiom to close a3d's rows.
+    #[test]
+    fn path_lane_certificate_uses_only_the_existing_kernel_vocabulary() {
+        let paths = (0..3).map(|i| dead_path(&format!("_{i}"), 2)).collect();
+        let Some(ProofEvidence::CleanCic { term, .. }) = path_lane(&a3d_shape(paths)) else {
+            panic!("the per-path lane declined its own positive fixture");
+        };
+        let term = deserialize_term(&term).expect("the producer's own serialization");
+        let mut names = Vec::new();
+        assert!(collect_const_names(&term, &mut names), "every node must be auditable");
+        let used: BTreeSet<String> = names.iter().map(|n| n.to_string()).collect();
+        let expected: BTreeSet<String> = [
+            "Or",
+            "Or.rec",
+            "And",
+            "And.left",
+            "And.right",
+            "Not",
+            "False",
+            "Eq",
+            "Int",
+            "Int.ofNat",
+            "Nat.succ",
+            "Nat.zero",
+            "OfNat.ofNat",
+            "instOfNatNat",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain((0..6).map(|i| encoded_var_name(&format!("{PATH_MEMBERSHIP_INDICATOR_PREFIX}{i}"))))
+        .collect();
+        assert!(
+            used.is_subset(&expected),
+            "certificate names constants outside the pre-existing inventory: {:?}",
+            used.difference(&expected).collect::<Vec<_>>()
+        );
+        for required in ["Or.rec", "And.left", "And.right"] {
             assert!(used.contains(required), "certificate does not use {required}");
         }
     }

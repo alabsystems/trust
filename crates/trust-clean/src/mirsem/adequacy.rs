@@ -158,7 +158,10 @@ pub fn check_operand_adequacy(op: &SemOperand) -> AdequacyVerdict {
 
 /// Internal: `claimed_rhs = Some(e)` overrides the true denotation (the fail-closed
 /// path — a wrong RHS must make the reflexivity proof fail to type-check).
-pub(super) fn check_operand_adequacy_inner(op: &SemOperand, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_operand_adequacy_inner(
+    op: &SemOperand,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return AdequacyVerdict::KernelRejected(e),
@@ -214,7 +217,10 @@ pub(super) fn check_operand_adequacy_inner(op: &SemOperand, claimed_rhs: Option<
 /// name`, so `Int.<op> x_a x_b` matches `ground_int(Add/Sub/Mul/Div(a,b))` exactly.
 /// `claimed_rhs = Some` swaps the live-grounded RHS for the fail-closed test; `None`
 /// (the function returns `None`) means the live grounder declined `R.to_formula()`.
-pub(super) fn rvalue_adequacy_statement(rv: &SemRvalue, claimed_rhs: Option<&Expr>) -> Option<Expr> {
+pub(super) fn rvalue_adequacy_statement(
+    rv: &SemRvalue,
+    claimed_rhs: Option<&Expr>,
+) -> Option<Expr> {
     let bd = || BinderData::from(BinderInfo::Default);
     let indices = rv.var_indices();
     let n = indices.len();
@@ -263,7 +269,10 @@ pub fn check_rvalue_adequacy(rv: &SemRvalue) -> AdequacyVerdict {
     check_rvalue_adequacy_inner(rv, None)
 }
 
-pub(super) fn check_rvalue_adequacy_inner(rv: &SemRvalue, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_rvalue_adequacy_inner(
+    rv: &SemRvalue,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return AdequacyVerdict::KernelRejected(e),
@@ -431,7 +440,11 @@ pub(super) fn return_adequacy_proof(r: &SemReturn) -> Expr {
 /// (updating index `k` to `eval_rvalue e R`) and then evaluates the returned temp
 /// under the threaded env. `claimed_rhs = Some` swaps the true denotation for the
 /// fail-closed test.
-pub(super) fn ssa_temp_return_statement(r: &SemReturn, rv: &SemRvalue, claimed_rhs: Option<&Expr>) -> Expr {
+pub(super) fn ssa_temp_return_statement(
+    r: &SemReturn,
+    rv: &SemRvalue,
+    claimed_rhs: Option<&Expr>,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let e_ref = Expr::bvar(0);
     // exec e stmts
@@ -485,7 +498,10 @@ pub fn check_return_adequacy(r: &SemReturn) -> AdequacyVerdict {
     check_return_adequacy_inner(r, None)
 }
 
-pub(super) fn check_return_adequacy_inner(r: &SemReturn, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_return_adequacy_inner(
+    r: &SemReturn,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     // Build the statement + proof for whichever modeled fragment this return is in.
     // SSA-temp takes precedence (a returned Var that IS assigned), else closed; a
     // return in neither fragment fails closed.
@@ -659,7 +675,10 @@ pub fn check_cf_return_adequacy(r: &SemCfReturn) -> AdequacyVerdict {
     check_cf_return_adequacy_inner(r, None)
 }
 
-pub(super) fn check_cf_return_adequacy_inner(r: &SemCfReturn, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_cf_return_adequacy_inner(
+    r: &SemCfReturn,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let statement = cf_return_adequacy_statement(r, claimed_rhs);
     let proof = cf_return_adequacy_proof(r);
 

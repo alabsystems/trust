@@ -30,15 +30,15 @@
 
 #![cfg(feature = "kernel-recheck")]
 
-use clean_kernel::name::Name;
-use clean_kernel::{Environment, Expr, Level, TypeChecker};
 use std::fmt;
 use std::sync::{Condvar, LazyLock, Mutex};
-use trust_types::{Formula, Sort};
 
 /// Stack for the kernel `check_type` of the discharge (deep `bvfEval` reduction
 /// over 32/64-bit `List Bool` literals) — mirror the slow path's big stack.
 use clean_auto::proved_gate::RECHECK_STACK_BYTES;
+use clean_kernel::name::Name;
+use clean_kernel::{Environment, Expr, Level, TypeChecker};
+use trust_types::{Formula, Sort};
 
 /// Kernel reduction needs a 256 MiB native stack. The Rust test harness and
 /// parallel bridge callers used to reserve one such stack per proof without a
@@ -2126,9 +2126,10 @@ pub(crate) fn try_mem_store_load_discharge(
 // ── Test-support surface (used by verify_output's B2b/B4 tests) ────────────────
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{ReflectCtx, Reflected, discharge_env as denv, reflect_formula as reflect};
     use clean_kernel::{Environment, Expr};
     use trust_types::Formula;
+
+    use super::{ReflectCtx, Reflected, discharge_env as denv, reflect_formula as reflect};
 
     /// Reflect a Formula under the FAIL-CLOSED policy (no bare caller-memory read).
     pub(crate) fn reflect_formula(f: &Formula) -> Result<Reflected, String> {

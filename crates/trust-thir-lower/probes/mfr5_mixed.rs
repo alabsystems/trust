@@ -102,10 +102,7 @@ pub fn n12_agg_from_fields(m: M5) -> M5 {
 
 #[inline(never)]
 pub fn n13_agg_nested(a: u32, b: u32) -> Holder {
-    Holder {
-        one: M5 { u: a, v: b, w: 0, f: false },
-        two: M5 { u: b, v: a, w: 1, f: true },
-    }
+    Holder { one: M5 { u: a, v: b, w: 0, f: false }, two: M5 { u: b, v: a, w: 1, f: true } }
 }
 
 // --- D: the seam — a body that holds a field write AND a borrow, or a write AND an operand

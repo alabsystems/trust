@@ -1120,6 +1120,7 @@ fn fixture_precondition() {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::f64::sqrt".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],

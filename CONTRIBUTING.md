@@ -204,7 +204,6 @@ The `*_backend.rs` files that exist in `crates/trust-router/src/` and the
 | `name()` | File | `role()` |
 |---|---|---|
 | `ay-in-process` | `in_process_ay_backend.rs` | `SmtSolver` |
-| `trust-wp` | `trust_wp_backend.rs` | `Deductive` |
 | `ty` | `ty_backend.rs` | `Temporal` |
 | `interval` | `interval_backend.rs` | `AbstractInterpretation` |
 | `trust_cg-router` | `trust_cg_backend.rs` | `General` (codegen is not a solver role) |
@@ -215,6 +214,10 @@ SMT-LIB2 serialization and result-parsing utilities. trust-mc and trust-vc are
 reached through the full-verification engine, not through a `*_backend.rs` file
 here. Read the current directory before citing this table — a stale backend list
 was one of the errors that made this file untrustworthy.
+
+The former `trust_wp_backend.rs` parsed a subprocess protocol and has been
+retired. TrustWP currently advertises no compiler/full-verifier obligation
+kinds; historical wire records remain readable but are not proof authority.
 
 Steps to add a new backend:
 

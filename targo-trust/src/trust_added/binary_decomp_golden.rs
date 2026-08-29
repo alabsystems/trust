@@ -40,13 +40,12 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::stage2_tools::host_executable_name;
-
 use super::trustc_native::{Captured, capture};
 use super::{
     GatePolicy, pin_targo_sibling_toolchain, read_bounded_exact_file_under, resolve_gate_targo,
     scrub_gate_process_environment, section,
 };
+use crate::stage2_tools::host_executable_name;
 
 const X86_64_ENTRY: &str = "0x400000";
 
@@ -877,7 +876,6 @@ fn hex_value(byte: u8) -> Result<u8> {
         _ => bail!("non-hex byte"),
     }
 }
-
 
 /// 64-byte ET_REL header with e_machine EM_RISCV (243), unsupported by the
 /// lifter. Mirrors the shell's `struct.pack_into("<HHIQQQIHHHHHH", ...)`.

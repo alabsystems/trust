@@ -1,0 +1,48 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-hmac — the Trust-owned HMAC (RFC 2104 / FIPS PUB 198-1).
+#
+# WHY THIS CRATE EXISTS.
+# Companion to trust-sha2. The build cache and the proof cache seal their
+# entries with HMAC-SHA256; today that comes from the third-party `hmac` crate,
+# which the verified lane reports as `dependency-policy-excluded`. Replacing
+# `hmac` together with `sha2` is what actually removes the packages: `hmac`
+# drags in `digest`, `crypto-common`, `block-buffer`, `generic-array`,
+# `typenum` and `subtle`, none of which survive the swap.
+#
+# THE DEPENDENCY LIST IS ONE FIRST-PARTY PATH ENTRY, AND THAT IS THE FLOOR.
+# HMAC is defined over a hash function, so this crate has to name one — the
+# consumers write `type HmacSha256 = Hmac<Sha256>`, i.e. `Hmac` is generic and
+# the `Digest` trait must be shared with the hash crate. The incumbent has the
+# same shape (`hmac` -> `digest`). `trust-sha2` is Trust-owned, in this
+# workspace, and itself zero-dependency, so no third-party unit enters the
+# graph. There is no third alternative that keeps `Hmac<D>` generic.
+#
+# `#![no_std]`, no `alloc`.
+
+[package]
+name = "trust-hmac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned HMAC per RFC 2104 / FIPS PUB 198-1, generic over trust-sha2's Digest. No third-party dependencies, no_std."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ONLY dependency, and it is first-party and zero-dependency itself.
+# Read the header before adding a second.
+trust-sha2 = { workspace = true }
+
+[dev-dependencies]
+# TEST-ONLY: the differential acceptance gate against the incumbent
+# (`tests/differential_hmac.rs`). Delete both lines when the incumbent leaves
+# the graph.
+## NOT `workspace = true`: those names now resolve to the Trust-owned crates.
+## The differential needs the real incumbents, named explicitly.
+hmac = "0.12"
+sha2 = "0.10"

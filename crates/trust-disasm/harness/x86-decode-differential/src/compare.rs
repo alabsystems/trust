@@ -21,8 +21,8 @@
 //! sixteen defects (shift-count masking, shift flags) would not have been
 //! caught by it.
 
-use trust_disasm::operand::{MemoryOperand, Operand, RegKind};
 use trust_disasm::Instruction;
+use trust_disasm::operand::{MemoryOperand, Operand, RegKind};
 
 use crate::oracle::OracleInsn;
 
@@ -82,8 +82,7 @@ pub fn has_unmodelled_prefix(bytes: &[u8]) -> bool {
         if UNMODELLED_PREFIXES.contains(&b) {
             return true;
         }
-        let is_other_prefix =
-            matches!(b, 0xF0 | 0xF2 | 0xF3 | 0x66) || (0x40..=0x4F).contains(&b);
+        let is_other_prefix = matches!(b, 0xF0 | 0xF2 | 0xF3 | 0x66) || (0x40..=0x4F).contains(&b);
         if !is_other_prefix {
             return false;
         }
@@ -114,12 +113,9 @@ pub fn project_ours(insn: &Instruction) -> Result<Projection, Unchecked> {
 fn project_mem(m: &MemoryOperand) -> Result<MemProjection, Unchecked> {
     Ok(match m {
         MemoryOperand::Absolute { address } => MemProjection::Absolute(*address),
-        MemoryOperand::Base { base } => MemProjection::Computed {
-            base: Some(reg_name(base)),
-            index: None,
-            scale: 1,
-            disp: 0,
-        },
+        MemoryOperand::Base { base } => {
+            MemProjection::Computed { base: Some(reg_name(base)), index: None, scale: 1, disp: 0 }
+        }
         MemoryOperand::BaseOffset { base, offset } => MemProjection::Computed {
             base: Some(reg_name(base)),
             index: None,
@@ -137,7 +133,7 @@ fn project_mem(m: &MemoryOperand) -> Result<MemProjection, Unchecked> {
         // x86-64 must never produce these; if one appears the decoder bypassed
         // its own resolution choke point, which is a finding, not a skip.
         MemoryOperand::PcRelative { .. } | MemoryOperand::RipRelative { .. } => {
-            return Err(Unchecked::OurDecodeRefused)
+            return Err(Unchecked::OurDecodeRefused);
         }
         _ => return Err(Unchecked::OurDecodeRefused),
     })
@@ -270,18 +266,8 @@ fn parse_att_mem(text: &str, rip_target: Option<u64>) -> Result<MemProjection, U
             let target = rip_target.ok_or(Unchecked::OracleOperandUnparsed)?;
             Ok(MemProjection::Absolute(target))
         }
-        [b] => Ok(MemProjection::Computed {
-            base: reg_of(b),
-            index: None,
-            scale: 1,
-            disp,
-        }),
-        [b, i] => Ok(MemProjection::Computed {
-            base: reg_of(b),
-            index: reg_of(i),
-            scale: 1,
-            disp,
-        }),
+        [b] => Ok(MemProjection::Computed { base: reg_of(b), index: None, scale: 1, disp }),
+        [b, i] => Ok(MemProjection::Computed { base: reg_of(b), index: reg_of(i), scale: 1, disp }),
         [b, i, s] => Ok(MemProjection::Computed {
             base: reg_of(b),
             index: reg_of(i),
@@ -324,12 +310,9 @@ fn canonicalise(m: &MemProjection) -> MemProjection {
         MemProjection::Computed { base: None, index: None, disp, .. } => {
             MemProjection::Absolute(*disp as u64)
         }
-        MemProjection::Computed { base, index: None, disp, .. } => MemProjection::Computed {
-            base: base.clone(),
-            index: None,
-            scale: 1,
-            disp: *disp,
-        },
+        MemProjection::Computed { base, index: None, disp, .. } => {
+            MemProjection::Computed { base: base.clone(), index: None, scale: 1, disp: *disp }
+        }
         other => other.clone(),
     }
 }
@@ -359,13 +342,13 @@ pub fn compare(ours: &Projection, theirs: &Projection) -> Option<Mismatch> {
             return Some(Mismatch {
                 family: "memory_operand_presence",
                 detail: format!("ours={a:?} oracle=none"),
-            })
+            });
         }
         (None, Some(b)) => {
             return Some(Mismatch {
                 family: "memory_operand_presence",
                 detail: format!("ours=none oracle={b:?}"),
-            })
+            });
         }
         _ => {}
     }

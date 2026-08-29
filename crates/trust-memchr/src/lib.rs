@@ -115,9 +115,8 @@ extern crate std;
 extern crate alloc;
 
 pub use crate::memchr::{
-    memchr, memchr2, memchr2_iter, memchr3, memchr3_iter, memchr_iter,
-    memrchr, memrchr2, memrchr2_iter, memrchr3, memrchr3_iter, memrchr_iter,
-    Memchr, Memchr2, Memchr3,
+    Memchr, Memchr2, Memchr3, memchr, memchr_iter, memchr2, memchr2_iter, memchr3, memchr3_iter,
+    memrchr, memrchr_iter, memrchr2, memrchr2_iter, memrchr3, memrchr3_iter,
 };
 
 pub mod arch;

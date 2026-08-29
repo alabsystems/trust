@@ -99,8 +99,13 @@ fn run() -> Result<bool, String> {
     let params: Vec<(&str, &Ty)> =
         contract.params.iter().map(|p| (p.name.as_str(), &p.ty)).collect();
 
-    match reflect_contract(&params, &contract.pre, &contract.ret_name, &contract.ret_ty, &contract.post)
-    {
+    match reflect_contract(
+        &params,
+        &contract.pre,
+        &contract.ret_name,
+        &contract.ret_ty,
+        &contract.post,
+    ) {
         Ok(term) => {
             println!("contract type: {}", pp(&term));
             let ctx = carrier_context();

@@ -285,7 +285,7 @@ class HeadPruneIntegrationTests(unittest.TestCase):
                 contextlib.redirect_stdout(output),
             ):
                 self.assertEqual(audit.main(), 1)
-            self.assertIn("INDETERMINATE probes: 1", output.getvalue())
+            self.assertIn("INDETERMINATE pins: 1", output.getvalue())
 
             # A successful direct-SHA probe is exact evidence that an absent
             # object can be anchored; do not relabel it UNKNOWN merely because
@@ -313,6 +313,125 @@ class HeadPruneIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(failed_fetch.returncode, 1)
             self.assertIn("remote-head fetch failed", failed_fetch.stdout)
+
+
+class OrdinaryAuditRemoteEvidenceTests(unittest.TestCase):
+    """End-to-end runs of the shipped script, one real sibling and one real remote.
+
+    Measured 2026-08-26 against the nine live first-party siblings: the audit
+    called 58 pins UNRECOVERABLE, and 33 of them were held by an exact
+    refs/pins/<sha> on the canonical remote --- absent only from this clone.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.superproject = root / "super"
+        sibling = root / "sibling"
+        donor = root / "donor"
+        self.remote = root / "sibling.git"
+
+        _git("init", "-q", "-b", "main", str(sibling))
+        _identity(sibling)
+        (sibling / "value").write_text("main\n")
+        _git("-C", str(sibling), "add", "value")
+        _git("-C", str(sibling), "commit", "-qm", "main")
+        _git("init", "-q", "--bare", "--initial-branch=main", str(self.remote))
+        _git("-C", str(sibling), "remote", "add", "origin", str(self.remote))
+        _git("-C", str(sibling), "push", "-qu", "origin", "main")
+        main_tip = _git("-C", str(sibling), "rev-parse", "HEAD").stdout.strip()
+
+        _git("init", "-q", "-b", "main", str(self.superproject))
+        _identity(self.superproject)
+        (self.superproject / ".gitmodules").write_text(
+            "[submodule \"first-party/example\"]\n"
+            "\tpath = first-party/example\n"
+            f"\turl = {self.remote}\n"
+        )
+        _git("-C", str(self.superproject), "add", ".gitmodules")
+        _git(
+            "-C", str(self.superproject), "update-index", "--add", "--cacheinfo",
+            "160000", main_tip, "first-party/example",
+        )
+        _git("-C", str(self.superproject), "commit", "-qm", "pin main")
+        _git(
+            "-c", "protocol.file.allow=always", "-C", str(self.superproject),
+            "submodule", "update", "--init", "--checkout",
+        )
+
+        # A commit reachable ONLY from refs/pins/<sha> on the canonical remote.
+        # Built in a donor clone *after* the sibling exists: a local clone
+        # hardlinks the whole object store, so an earlier push would have
+        # handed the sibling the very object these tests need it to lack.
+        _git("clone", "-q", str(self.remote), str(donor))
+        _identity(donor)
+        (donor / "value").write_text("anchored\n")
+        _git("-C", str(donor), "commit", "-qam", "anchored")
+        self.anchored = _git("-C", str(donor), "rev-parse", "HEAD").stdout.strip()
+        _git(
+            "-C", str(donor), "push", "-q", str(self.remote),
+            f"{self.anchored}:refs/pins/{self.anchored}",
+        )
+
+    def _record_pin(self, sha: str) -> None:
+        """Pin a sha the superproject holds no object for, as history really does."""
+        _git(
+            "-C", str(self.superproject), "update-index", "--info-only",
+            "--cacheinfo", "160000", sha, "first-party/example",
+        )
+        _git("-C", str(self.superproject), "commit", "-qm", f"pin {sha}")
+
+    def _audit(self, *flags: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--repo", str(self.superproject), *flags],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_planted_lost_pin_fails_the_audit(self) -> None:
+        lost = "f" * 40  # in no object store and refused by the remote
+        self._record_pin(lost)
+
+        done = self._audit("--probe")
+
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f"MISSING {lost}", done.stdout)
+        self.assertIn("UNRECOVERABLE pins: 1", done.stdout)
+
+    def test_remotely_anchored_pin_is_durable_not_lost(self) -> None:
+        self._record_pin(self.anchored)
+
+        done = self._audit("--probe")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("REMOTE_PIN=1", done.stdout)
+        self.assertIn("ORPHAN=0", done.stdout)
+        self.assertNotIn("UNRECOVERABLE", done.stdout)
+
+    def test_local_absence_without_a_probe_is_unknown_not_unrecoverable(self) -> None:
+        self._record_pin(self.anchored)
+
+        done = self._audit()
+
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f"UNKNOWN {self.anchored}", done.stdout)
+        self.assertIn("no remote verdict", done.stdout)
+        self.assertNotIn("UNRECOVERABLE", done.stdout)
+
+    def test_probe_without_a_canonical_url_fails_closed(self) -> None:
+        (self.superproject / ".gitmodules").write_text(
+            "[submodule \"first-party/example\"]\n"
+            "\tpath = first-party/example\n"
+        )
+        _git("-C", str(self.superproject), "commit", "-qam", "drop url")
+        self._record_pin(self.anchored)
+
+        done = self._audit("--probe")
+
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("canonical submodule URL is missing", done.stdout)
 
 
 if __name__ == "__main__":

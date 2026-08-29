@@ -241,11 +241,7 @@ fn blast_mul(
         "width {width}: expected one XnorEq per result bit; ay emitted {}",
         outs.len()
     );
-    let lemmas = proof
-        .bit_lemmas
-        .iter()
-        .map(|l| (l.kind, l.out, l.ins.clone()))
-        .collect();
+    let lemmas = proof.bit_lemmas.iter().map(|l| (l.kind, l.out, l.ins.clone())).collect();
     // Only the GATE-DEFINITION clauses. The single `Disequality` clause encodes
     // `not(lhs == rhs)`, which is deliberately UNSAT here and must not be
     // required to hold under a satisfying gate assignment.
@@ -386,8 +382,7 @@ fn ay_blast_agrees_at_sampled_wide_widths() {
 
         for (av, bv) in pairs {
             let (a, b) = (bits(av, width), bits(bv, width));
-            let full = eval_full(&vars, &lemmas, &a, &b)
-                .expect("the sampled blast must evaluate");
+            let full = eval_full(&vars, &lemmas, &a, &b).expect("the sampled blast must evaluate");
             for lits in &gate_clauses {
                 assert!(
                     lits.iter().any(|l| full[l.var as usize] == Some(!l.neg)),
@@ -395,8 +390,8 @@ fn ay_blast_agrees_at_sampled_wide_widths() {
                      UNSATISFIED — the evaluator's gate semantics disagree with ay's CNF"
                 );
             }
-            let got = eval_blast(&vars, &lemmas, &outs, &a, &b)
-                .expect("the sampled blast must evaluate");
+            let got =
+                eval_blast(&vars, &lemmas, &outs, &a, &b).expect("the sampled blast must evaluate");
             assert_eq!(
                 got,
                 mul_ay_rust(&a, &b),

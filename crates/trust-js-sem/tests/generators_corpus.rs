@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -54,10 +55,7 @@ fn parse_frontmatter(body: &str) -> Frontmatter {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 includes.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             } else {
                 while let Some(next) = lines.peek() {
@@ -75,10 +73,7 @@ fn parse_frontmatter(body: &str) -> Frontmatter {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 flags.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             }
         }
@@ -103,9 +98,7 @@ fn collect_js_files(dir: &Path, cap: usize) -> Vec<PathBuf> {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|e| e == "js")
-                && !p
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().ends_with("_FIXTURE.js"))
+                && !p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_FIXTURE.js"))
             {
                 files.push(p);
             }
@@ -152,11 +145,7 @@ fn generators_corpus_vs_node() {
                 continue;
             };
             let fm = parse_frontmatter(&body);
-            if fm
-                .flags
-                .iter()
-                .any(|f| f == "async" || f == "module" || f == "CanBlockIsRequired")
-            {
+            if fm.flags.iter().any(|f| f == "async" || f == "module" || f == "CanBlockIsRequired") {
                 continue;
             }
             let raw = fm.flags.iter().any(|f| f == "raw");
@@ -167,11 +156,8 @@ fn generators_corpus_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".to_string(), "sta.js".to_string()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".to_string(), "sta.js".to_string()] };
             include_names.extend(fm.includes.iter().cloned());
             let mut include_srcs: Vec<String> = Vec::new();
             let mut include_paths: Vec<String> = Vec::new();
@@ -195,11 +181,8 @@ fn generators_corpus_vs_node() {
 
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict {
-                    format!("\"use strict\";\n{body}")
-                } else {
-                    body.clone()
-                };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let inc_refs: Vec<&str> = include_srcs.iter().map(String::as_str).collect();
                 let sem = evaluate_case_opts(&inc_refs, &sem_body, false);
                 let sem_trace = match sem {
@@ -207,9 +190,7 @@ fn generators_corpus_vs_node() {
                     SemOutcome::NoCoverage { reason } => {
                         refused += 1;
                         per_dir.entry(dir).or_default().1 += 1;
-                        let e = refusal_reasons
-                            .entry(reason)
-                            .or_insert_with(|| (0, rel.clone()));
+                        let e = refusal_reasons.entry(reason).or_insert_with(|| (0, rel.clone()));
                         e.0 += 1;
                         continue;
                     }
@@ -229,8 +210,7 @@ fn generators_corpus_vs_node() {
                 });
                 let manifest_path = tmp.path().join(format!("case-{case_no}.manifest.json"));
                 let mut mf = std::fs::File::create(&manifest_path).expect("create manifest");
-                mf.write_all(manifest.to_string().as_bytes())
-                    .expect("write manifest");
+                mf.write_all(manifest.to_string().as_bytes()).expect("write manifest");
                 drop(mf);
 
                 let out = Command::new(&node)
@@ -269,10 +249,8 @@ fn generators_corpus_vs_node() {
     for (dir, (c, r)) in &per_dir {
         eprintln!("  {dir}: covered {c} refused {r}");
     }
-    let mut reasons: Vec<(u64, String, String)> = refusal_reasons
-        .into_iter()
-        .map(|(k, (n, sample))| (n, k, sample))
-        .collect();
+    let mut reasons: Vec<(u64, String, String)> =
+        refusal_reasons.into_iter().map(|(k, (n, sample))| (n, k, sample)).collect();
     reasons.sort_by(|a, b| b.0.cmp(&a.0));
     eprintln!("== top refusal reasons ==");
     for (n, reason, sample) in reasons.iter().take(40) {

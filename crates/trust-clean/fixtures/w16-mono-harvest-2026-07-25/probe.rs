@@ -26,17 +26,23 @@ pub fn result_family(r: Result<i32, u8>, s: Result<u32, i16>) -> i64 {
     (a as i64) + (b as i64) + (c as i64)
 }
 
-pub fn generic_id<T>(t: T) -> T { t }
+pub fn generic_id<T>(t: T) -> T {
+    t
+}
 pub fn use_generic_id(a: i32, b: u64, c: i8) -> i64 {
     (generic_id(a) as i64) + (generic_id(b) as i64) + (generic_id(c) as i64)
 }
 
-pub fn generic_add<T: core::ops::Add<Output = T> + Copy>(a: T, b: T) -> T { a + b }
+pub fn generic_add<T: core::ops::Add<Output = T> + Copy>(a: T, b: T) -> T {
+    a + b
+}
 pub fn use_generic_add(a: i32, b: i32, c: u16, d: u16) -> i64 {
     (generic_add(a, b) as i64) + (generic_add(c, d) as i64)
 }
 
-pub fn slice_family(s: &[i32], t: &[u8]) -> usize { s.len() + t.len() }
+pub fn slice_family(s: &[i32], t: &[u8]) -> usize {
+    s.len() + t.len()
+}
 
 pub fn convert_family(a: i32, b: u8) -> i64 {
     let x: i64 = i64::from(a);

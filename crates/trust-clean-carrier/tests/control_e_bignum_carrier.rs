@@ -17,9 +17,7 @@
 //!    the fix (v7/D3): take the default carrier, with no source change.
 
 use clean_kernel::{Expr, Name};
-use trust_clean_carrier::{
-    carrier_at, carrier_for, carrier_signature_for, CarrierRefused,
-};
+use trust_clean_carrier::{CarrierRefused, carrier_at, carrier_for, carrier_signature_for};
 use trust_symbols::{CarrierEvidence, CarrierWidth};
 use trust_types::Ty;
 

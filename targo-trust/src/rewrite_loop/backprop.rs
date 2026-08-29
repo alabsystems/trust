@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use trust_backprop::file_io::{FileRewriteResult, apply_plan_to_files};
 use trust_backprop::{
-    ApprovalPolicy, ApprovalQueue, GovernancePolicy, PendingRewrite, RewriteCheckpoint, RewritePlan,
-    RewriteTracker, SourceRewrite, apply_plan, classify_rewrite, create_checkpoint, default_rules,
+    ApprovalPolicy, ApprovalQueue, GovernancePolicy, PendingRewrite, RewriteCheckpoint,
+    RewritePlan, RewriteTracker, SourceRewrite, apply_plan, classify_rewrite, create_checkpoint,
+    default_rules,
 };
 use trust_strengthen::Proposal;
 

@@ -27,8 +27,7 @@ use trust_convergence::{
 use trust_loop::{LoopConfig, TerminationReason, VerifyContext};
 use trust_strengthen::{
     ConcreteState, HoudiniConfig, HoudiniCounterexample, HoudiniError, HoudiniRefiner,
-    HoudiniVerifier, IceConfig, IceLearner, ImplicationExample, ProposalKind,
-    StrengthenConfig,
+    HoudiniVerifier, IceConfig, IceLearner, ImplicationExample, ProposalKind, StrengthenConfig,
 };
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Counterexample, CounterexampleValue,
@@ -808,8 +807,7 @@ fn test_m5_acceptance_three_ideas_compose() {
         total_from_notes: 0,
         total_with_assumptions: 0,
     };
-    let strengthen_out =
-        trust_strengthen::run(&iter1_results, &StrengthenConfig::default());
+    let strengthen_out = trust_strengthen::run(&iter1_results, &StrengthenConfig::default());
     assert!(strengthen_out.has_proposals);
 
     // Step 3: BACKPROP (Idea 3) - Convert all proposals to rewrites

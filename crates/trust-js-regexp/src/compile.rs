@@ -14,10 +14,10 @@
 //! Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 use crate::ast::*;
-use crate::classes::{complement_ranges, CharSet, MAX_CP};
+use crate::classes::{CharSet, MAX_CP, complement_ranges};
 use crate::generated::case_tables::SCF_SOURCES;
-use crate::unicode::{canonicalize, Fold, DIGIT_RANGES, WHITESPACE_RANGES, WORD_BASIC};
-use crate::vm::{patch, ClassTable, Insn, Program};
+use crate::unicode::{DIGIT_RANGES, Fold, WHITESPACE_RANGES, WORD_BASIC, canonicalize};
+use crate::vm::{ClassTable, Insn, Program, patch};
 use crate::{CompileError, Flags};
 
 const PATCH: u32 = u32::MAX;
@@ -31,19 +31,8 @@ struct Ctx {
 }
 
 pub(crate) fn compile(p: &Parsed, flags: Flags) -> Result<Program, CompileError> {
-    let mut c = C {
-        insns: Vec::new(),
-        classes: Vec::new(),
-        lists: Vec::new(),
-        n_loops: 0,
-        flags,
-    };
-    let ctx = Ctx {
-        i: flags.ignore_case,
-        m: flags.multiline,
-        s: flags.dot_all,
-        back: false,
-    };
+    let mut c = C { insns: Vec::new(), classes: Vec::new(), lists: Vec::new(), n_loops: 0, flags };
+    let ctx = Ctx { i: flags.ignore_case, m: flags.multiline, s: flags.dot_all, back: false };
     c.node(&p.root, ctx)?;
     c.insns.push(Insn::Accept);
     Ok(Program {
@@ -89,11 +78,7 @@ impl C {
             Node::Empty => {}
             Node::Literal(cp) => {
                 let fold = self.fold(ctx);
-                self.emit(Insn::Char {
-                    cp: canonicalize(*cp, fold),
-                    fold,
-                    back: ctx.back,
-                });
+                self.emit(Insn::Char { cp: canonicalize(*cp, fold), fold, back: ctx.back });
             }
             Node::Dot => {
                 self.emit(Insn::Dot { dot_all: ctx.s, back: ctx.back });
@@ -126,10 +111,7 @@ impl C {
                 for (k, alt) in alts.iter().enumerate() {
                     if k + 1 < alts.len() {
                         let split = self.emit(Insn::Split { prefer: 0, alt: PATCH });
-                        self.insns[split] = Insn::Split {
-                            prefer: split as u32 + 1,
-                            alt: PATCH,
-                        };
+                        self.insns[split] = Insn::Split { prefer: split as u32 + 1, alt: PATCH };
                         self.node(alt, ctx)?;
                         jmps.push(self.emit(Insn::Jmp { to: PATCH }));
                         let here = self.here();
@@ -144,11 +126,8 @@ impl C {
                 }
             }
             Node::Group { index, body } => {
-                let (first, second) = if ctx.back {
-                    (2 * index + 1, 2 * index)
-                } else {
-                    (2 * index, 2 * index + 1)
-                };
+                let (first, second) =
+                    if ctx.back { (2 * index + 1, 2 * index) } else { (2 * index, 2 * index + 1) };
                 self.emit(Insn::Save { slot: first });
                 self.node(body, ctx)?;
                 self.emit(Insn::Save { slot: second });
@@ -167,16 +146,9 @@ impl C {
                 self.quant(*min, *max, *greedy, body, ctx)?;
             }
             Node::Look { behind, negative, body } => {
-                let lp = self.emit(Insn::Look {
-                    negative: *negative,
-                    body: 0,
-                    next: PATCH,
-                });
-                self.insns[lp] = Insn::Look {
-                    negative: *negative,
-                    body: lp as u32 + 1,
-                    next: PATCH,
-                };
+                let lp = self.emit(Insn::Look { negative: *negative, body: 0, next: PATCH });
+                self.insns[lp] =
+                    Insn::Look { negative: *negative, body: lp as u32 + 1, next: PATCH };
                 self.node(body, Ctx { back: *behind, ..ctx })?;
                 self.emit(Insn::Accept);
                 let here = self.here();
@@ -184,19 +156,11 @@ impl C {
             }
             Node::Backref(n) => {
                 let list = self.add_list(vec![*n]);
-                self.emit(Insn::Backref {
-                    list,
-                    fold: self.fold(ctx),
-                    back: ctx.back,
-                });
+                self.emit(Insn::Backref { list, fold: self.fold(ctx), back: ctx.back });
             }
             Node::NamedBackref(groups) => {
                 let list = self.add_list(groups.clone());
-                self.emit(Insn::Backref {
-                    list,
-                    fold: self.fold(ctx),
-                    back: ctx.back,
-                });
+                self.emit(Insn::Backref { list, fold: self.fold(ctx), back: ctx.back });
             }
             Node::NamedBackrefRaw(_) => unreachable!("unresolved named backref"),
             Node::Class(cls) => self.class(cls, ctx)?,
@@ -220,29 +184,12 @@ impl C {
         self.n_loops += 1;
         let (cap_lo, cap_hi) = group_range(body).unwrap_or((1, 0));
         self.emit(Insn::LoopInit { id });
-        let decide = self.emit(Insn::LoopDecide {
-            id,
-            min,
-            max,
-            greedy,
-            enter: 0,
-            exit: PATCH,
-        });
-        self.insns[decide] = Insn::LoopDecide {
-            id,
-            min,
-            max,
-            greedy,
-            enter: decide as u32 + 1,
-            exit: PATCH,
-        };
+        let decide = self.emit(Insn::LoopDecide { id, min, max, greedy, enter: 0, exit: PATCH });
+        self.insns[decide] =
+            Insn::LoopDecide { id, min, max, greedy, enter: decide as u32 + 1, exit: PATCH };
         self.emit(Insn::LoopEnter { id, cap_lo, cap_hi });
         self.node(body, ctx)?;
-        self.emit(Insn::LoopEnd {
-            id,
-            head: decide as u32,
-            min,
-        });
+        self.emit(Insn::LoopEnd { id, head: decide as u32, min });
         let here = self.here();
         patch(&mut self.insns[decide], here);
         Ok(())
@@ -277,12 +224,7 @@ impl C {
                 }
                 let stored = set.fold_image(fold);
                 let idx = self.add_class(stored.ranges);
-                self.emit(Insn::Class {
-                    idx,
-                    invert: *negate,
-                    fold,
-                    back: ctx.back,
-                });
+                self.emit(Insn::Class { idx, invert: *negate, fold, back: ctx.back });
                 Ok(())
             }
             ClassAst::VMode { negate, expr } => self.v_class(*negate, expr, ctx),
@@ -332,11 +274,7 @@ impl C {
     /// AllCharacters(rer) for v mode: all code points, or (ignoreCase) the
     /// scf-fixed points only.
     fn v_universe(&self, ctx: Ctx) -> Vec<(u32, u32)> {
-        if ctx.i {
-            complement_ranges(SCF_SOURCES, 0, MAX_CP)
-        } else {
-            vec![(0, MAX_CP)]
-        }
+        if ctx.i { complement_ranges(SCF_SOURCES, 0, MAX_CP) } else { vec![(0, MAX_CP)] }
     }
 
     fn v_fold(&self, ctx: Ctx) -> Fold {
@@ -382,11 +320,7 @@ impl C {
                 // (CharacterComplement of MaybeSimpleCaseFolding), so e.g.
                 // /[\P{Lu}]/vi rejects "A" — unlike u mode's asymmetry.
                 let base = self.esc_base(e, ctx).fold_image(f);
-                if e.negated() {
-                    base.complement_within(&self.v_universe(ctx))
-                } else {
-                    base
-                }
+                if e.negated() { base.complement_within(&self.v_universe(ctx)) } else { base }
             }
             VOperand::Nested { negate, expr } => {
                 let s = self.eval_vexpr(expr, ctx);
@@ -416,12 +350,7 @@ impl C {
         }
         if set.strings.is_empty() {
             let idx = self.add_class(set.ranges);
-            self.emit(Insn::Class {
-                idx,
-                invert: false,
-                fold,
-                back: ctx.back,
-            });
+            self.emit(Insn::Class { idx, invert: false, fold, back: ctx.back });
             return Ok(());
         }
         // Class with strings: an alternation in the spec's preference order
@@ -447,31 +376,22 @@ impl C {
         if empty_present {
             branches.push(Br::Empty);
         }
-        let chars_idx = if set.ranges.is_empty() {
-            None
-        } else {
-            Some(self.add_class(set.ranges.clone()))
-        };
+        let chars_idx =
+            if set.ranges.is_empty() { None } else { Some(self.add_class(set.ranges.clone())) };
         let mut jmps = Vec::new();
         let n = branches.len();
         for (k, br) in branches.into_iter().enumerate() {
             let split = if k + 1 < n {
                 let split = self.emit(Insn::Split { prefer: 0, alt: PATCH });
-                self.insns[split] = Insn::Split {
-                    prefer: split as u32 + 1,
-                    alt: PATCH,
-                };
+                self.insns[split] = Insn::Split { prefer: split as u32 + 1, alt: PATCH };
                 Some(split)
             } else {
                 None
             };
             match br {
                 Br::Str(s) => {
-                    let cps: Vec<u32> = if ctx.back {
-                        s.iter().rev().copied().collect()
-                    } else {
-                        s.to_vec()
-                    };
+                    let cps: Vec<u32> =
+                        if ctx.back { s.iter().rev().copied().collect() } else { s.to_vec() };
                     for cp in cps {
                         // String members are pre-folded; fold the input.
                         self.emit(Insn::Char { cp, fold, back: ctx.back });

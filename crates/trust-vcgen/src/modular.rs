@@ -92,6 +92,24 @@ pub struct FunctionSummary {
     /// contract, and ANY plain `with_postcondition` on the same summary clears
     /// it permanently (mixed provenance fails closed).
     postconditions_are_definitional: bool,
+    /// PRIVATE (postcondition composition, slice 2): true iff every
+    /// postcondition on this summary was added through
+    /// [`Self::with_verified_callee_postcondition`] — the builder whose
+    /// authority contract is "the producer proved `preconditions -> this
+    /// clause`", NOT "this clause holds unconditionally".
+    ///
+    /// It is the ONE bit that says a postcondition must ride at a call site
+    /// UNDER THIS SUMMARY'S OWN PRECONDITIONS, as the implication the callee
+    /// actually proved, rather than as a free-standing fact. A summary carrying
+    /// it may therefore hand its clause to a caller even with a non-empty
+    /// `preconditions` (see `definitional_precondition_free_subset`), because
+    /// the value fact and its guard travel together in one formula.
+    ///
+    /// Deliberately not `pub` and not reachable from any public field write,
+    /// for the same reason as `postconditions_are_definitional`: without it, a
+    /// preconditioned summary's clause would be assumed UNCONDITIONALLY, which
+    /// is a false PROVE whenever the caller is out of the callee's contract.
+    postconditions_guarded_by_own_preconditions: bool,
 }
 
 impl FunctionSummary {
@@ -110,6 +128,7 @@ impl FunctionSummary {
             proof_evidence_id: None,
             proof_strength: None,
             postconditions_are_definitional: false,
+            postconditions_guarded_by_own_preconditions: false,
         }
     }
 
@@ -201,6 +220,84 @@ impl FunctionSummary {
         self.postconditions.push(formula);
         self.postconditions_are_definitional = pure;
         self
+    }
+
+    /// Trust (postcondition composition): add an authored `ensures` clause whose
+    /// OWN obligation the calling authority has ALREADY DISCHARGED in this same
+    /// compilation, so callers may ASSUME it at call sites.
+    ///
+    /// # The authority contract, which the caller asserts by calling this
+    ///
+    /// Same reuse bit, and therefore the same consequence, as
+    /// [`Self::with_definitional_postcondition`]: the clause is rebound
+    /// (formals→actuals, `_0`→dest), version-pinned to the dest's post-call SSA
+    /// token, and CONJOINED onto the caller's VCs. The two differ only in WHERE
+    /// the truth comes from — a definitional clause restates a body the producer
+    /// emitted, this one restates a body the producer PROVED.
+    ///
+    /// The caller of this builder asserts ALL of:
+    ///
+    ///  * the clause is the callee's own authored `ensures`, extracted from the
+    ///    callee's contract bundle at the same instantiation the call site uses;
+    ///  * the callee's `ensures` obligation was independently discharged in THIS
+    ///    compilation and every obligation of that callee is statically proved —
+    ///    an `ensures` that is merely DECLARED is the laundering channel this bit
+    ///    exists to keep shut (`ensures false` would otherwise let every caller
+    ///    inherit it and verify vacuously);
+    ///  * `self.preconditions` is the callee's COMPLETE authored `requires` set
+    ///    at that same instantiation — see the WHAT IS PROVED note below, which
+    ///    is why completeness (not emptiness) is the requirement;
+    ///  * the summary's NAME resolves to exactly one callee identity in the body
+    ///    being summarized — the DB is keyed by a string, and a collision would
+    ///    apply one callee's `ensures` at another's call site.
+    ///
+    /// # WHAT IS PROVED IS AN IMPLICATION, AND IT IS ASSUMED AS ONE
+    ///
+    /// A contract postcondition is guaranteed only WHERE THE PRECONDITION HELD:
+    /// the callee's proof discharges `requires -> ensures`, never `ensures`
+    /// alone. Slice 1 sidestepped that by refusing any callee with a `requires`
+    /// at all. This builder does not — it sets
+    /// `postconditions_guarded_by_own_preconditions`, and the call-site lane
+    /// then injects the clause as exactly the implication that was proved,
+    /// `pre[formals:=actuals] -> post[formals:=actuals, _0:=dest]`
+    /// ([`crate::generate::rebind_callee_postconditions`]).
+    ///
+    /// That is what ties the assumption to the DISCHARGE AT THIS CALL SITE. The
+    /// caller obtains the postcondition exactly when its own path context
+    /// entails the instantiated precondition, and obtains NOTHING when it does
+    /// not — in the same solver query, with no dependence on the separately
+    /// emitted (and, at `L0Safety`, level-FILTERED) `VcKind::Precondition` row.
+    /// Assuming the raw clause instead would be a false PROVE for every caller
+    /// that is out of the callee's contract.
+    ///
+    /// Do NOT call this with a contract that has only been PARSED. That is what
+    /// `with_postcondition` is for. Mixing is fail-closed in both orders, exactly
+    /// as for the definitional builder, and the GUARD bit is additionally STICKY:
+    /// once any clause has arrived under it, every clause on this summary rides
+    /// under the precondition antecedent. Guarding a clause that did not need it
+    /// only ever weakens the injected fact, so stickiness is the safe direction;
+    /// clearing it on a later `with_definitional_postcondition` would silently
+    /// un-guard the clause added here.
+    #[must_use]
+    pub fn with_verified_callee_postcondition(mut self, formula: Formula) -> Self {
+        let pure = self.postconditions.is_empty() || self.postconditions_are_definitional;
+        self.postconditions.push(formula);
+        self.postconditions_are_definitional = pure;
+        self.postconditions_guarded_by_own_preconditions = true;
+        self
+    }
+
+    /// Trust (postcondition composition, slice 2): whether this summary's
+    /// postconditions must ride at a call site UNDER its own preconditions.
+    ///
+    /// See the field doc and [`Self::with_verified_callee_postcondition`]. Read
+    /// by exactly two places, which must agree:
+    /// [`crate::generate::summary_postconditions_ride_with_their_guard`] (the
+    /// ADMIT side, consulted by `definitional_precondition_free_subset` and by
+    /// `callee_postcondition_is_injectable`) and
+    /// [`crate::generate::rebind_callee_postconditions`] (the EMIT side).
+    pub(crate) fn postconditions_guarded_by_own_preconditions(&self) -> bool {
+        self.postconditions_guarded_by_own_preconditions
     }
 
     /// Mark the summary as proved for modular precondition checking.
@@ -362,40 +459,26 @@ pub fn clean_origin_wrapping_binop_postconditions(
     }
     let operand_formula = |operand: ArithOperand| -> Option<Formula> {
         match operand {
-            ArithOperand::Param(i) => {
-                Some(Formula::var(param_names.get(i)?.as_str(), Sort::Int))
-            }
+            ArithOperand::Param(i) => Some(Formula::var(param_names.get(i)?.as_str(), Sort::Int)),
             // width <= 64 (checked above), so the shift cannot overflow and the
             // in-range value cannot exceed i128::MAX.
-            ArithOperand::Const(v) => {
-                (v < (1u128 << width)).then(|| Formula::Int(v as i128))
-            }
+            ArithOperand::Const(v) => (v < (1u128 << width)).then(|| Formula::Int(v as i128)),
         }
     };
     let x = operand_formula(left)?;
     let y = operand_formula(right)?;
-    let modulus = Formula::Int(1i128 << width);
-    // The combination term and the single-Ite modular reduction, mirroring
-    // `wrapping_call_assert_model`'s unsigned arms CONSTRUCTOR-FOR-CONSTRUCTOR
-    // (the pin tests compare the two outputs structurally).
-    let s = match op {
-        ArithBinOp::Add => Formula::Add(Box::new(x.clone()), Box::new(y.clone())),
-        ArithBinOp::Sub => Formula::Sub(Box::new(x.clone()), Box::new(y.clone())),
+    // The single-Ite modular reduction, via THE shared constructor
+    // (`generate::wrapping_binop_modular_ite`) — the same one
+    // `wrapping_call_assert_model` and the bare-`Rvalue::BinaryOp` statement
+    // model use, so this summary can never encode wrapping differently from
+    // the extractor (the pin tests additionally compare the outputs
+    // structurally against `wrapping_call_assert_model` itself).
+    let bin_op = match op {
+        ArithBinOp::Add => trust_types::BinOp::Add,
+        ArithBinOp::Sub => trust_types::BinOp::Sub,
         ArithBinOp::Mul => return None, // unreachable; kept fail-closed
     };
-    let ite = match op {
-        ArithBinOp::Add => Formula::Ite(
-            Box::new(Formula::Ge(Box::new(s.clone()), Box::new(modulus.clone()))),
-            Box::new(Formula::Sub(Box::new(s.clone()), Box::new(modulus))),
-            Box::new(s),
-        ),
-        // wrapping_sub unsigned: borrow when the difference goes negative.
-        _ => Formula::Ite(
-            Box::new(Formula::Lt(Box::new(s.clone()), Box::new(Formula::Int(0)))),
-            Box::new(Formula::Add(Box::new(s.clone()), Box::new(modulus))),
-            Box::new(s),
-        ),
-    };
+    let ite = crate::generate::wrapping_binop_modular_ite(bin_op, &x, &y, width, false)?;
     let def = Formula::Eq(Box::new(Formula::var("_0", Sort::Int)), Box::new(ite));
     // The extractor emits a range fact per OPERAND FORMULA, unconditionally for
     // both operands (a constant's range fact is ground and trivially true).
@@ -409,6 +492,165 @@ pub fn clean_origin_wrapping_binop_postconditions(
     Some(std::iter::once(def).chain(ranges).collect())
 }
 
+/// Trust (Clean-origin caller-side preconditions): the call-site obligations a
+/// minted Clean-origin `def` carries, rendered over the summary's formal
+/// parameter names.
+///
+/// This is the consuming half of the seam `fa788aab89` named: *"a caller-side
+/// precondition on the minted `DefId` … its discharge is an ordinary Rust
+/// obligation, never a `Faithful` token."* The producing half is
+/// `trust_clean_carrier`'s hypothesis lift, which reads an erased proof binder
+/// (`(h : b ≠ 0)`) off the Clean declaration's type. The two sides meet on
+/// `trust_types::clean_origin_precondition`, the only vocabulary they share.
+///
+/// The returned formulas are for [`FunctionSummary::with_precondition`], which
+/// is checked at every call site by the ordinary
+/// `generate_callsite_precondition_vcs` lane: formals substituted by the
+/// caller's actuals, caller path guards in scope, one `VcKind::Precondition`
+/// row per call. Nothing here is assumed, and nothing here is a proof claim —
+/// a precondition is a DEMAND on the caller.
+///
+/// # ALL OR NOTHING — the rule `650674bc71` restored
+///
+/// `None` is returned if **any single** obligation cannot be rendered, and the
+/// producer must then publish NO summary at all — not the value facts without
+/// the guard. That is the same rule the L0 subset enforces one layer up
+/// (`SummaryDatabase::definitional_precondition_free_subset`): *a fact that
+/// cannot travel with its guard must not travel at all*. Returning the
+/// renderable subset would be strictly worse than returning nothing, because a
+/// partially-guarded summary reads to every downstream consumer exactly like a
+/// fully-guarded one.
+///
+/// # Refusals
+///
+/// * **an `Argument(i)` with `i >= param_names.len()`** — the call site has no
+///   actual to substitute at that position, and a positional substitution would
+///   silently bind the obligation to the wrong value or leave the formal free
+///   (a free variable in `¬P[σ]` is spuriously SAT, which mints a VIOLATION row
+///   about a proposition nobody stated);
+/// * **`width` outside `1..=64`**, or a `Literal(v)` with `v >= 2^width` — the
+///   producer range-checks both, so any violation here means the two sides
+///   disagree, and a disagreement refuses rather than picks a reading;
+/// * **a `Literal` above `i128::MAX`** — `Formula::Int` is `i128`, and a
+///   numeral that does not fit it cannot be stated in this lane at all.
+#[must_use]
+pub fn clean_origin_declared_preconditions(
+    preconditions: &[CleanOriginPrecondition],
+    param_names: &[String],
+) -> Option<Vec<Formula>> {
+    let mut rendered = Vec::with_capacity(preconditions.len());
+    for precondition in preconditions {
+        rendered.push(clean_origin_declared_precondition(precondition, param_names)?);
+    }
+    Some(rendered)
+}
+
+/// One obligation, rendered. See [`clean_origin_declared_preconditions`] — this
+/// is its per-atom half and shares every refusal.
+#[must_use]
+pub fn clean_origin_declared_precondition(
+    precondition: &CleanOriginPrecondition,
+    param_names: &[String],
+) -> Option<Formula> {
+    let width = precondition.width();
+    if !(1..=64).contains(&width) {
+        return None;
+    }
+    // Checked ONCE, before either operand is spelled: an out-of-range argument
+    // index must refuse the whole atom, not produce half of one.
+    if let Some(max) = precondition.max_argument_index()
+        && max >= param_names.len()
+    {
+        return None;
+    }
+
+    let operand = |o: PreconditionOperand| -> Option<Formula> {
+        match o {
+            PreconditionOperand::Argument(i) => {
+                Some(Formula::var(param_names.get(i)?.as_str(), Sort::Int))
+            }
+            PreconditionOperand::Literal(v) => {
+                // Re-checked against the carrier width HERE rather than trusted
+                // from the producer — the two crates range-check independently
+                // on purpose, exactly as `carrier_for` and
+                // `RepresentationObligation` do.
+                if v >= (1u128 << width) {
+                    return None;
+                }
+                i128::try_from(v).ok().map(Formula::Int)
+            }
+        }
+    };
+
+    let left = operand(precondition.left())?;
+    let right = operand(precondition.right())?;
+
+    match precondition.relation() {
+        PreconditionRelation::NotEqual => {
+            Some(Formula::Not(Box::new(Formula::Eq(Box::new(left), Box::new(right)))))
+        }
+        // `PreconditionRelation` is `#[non_exhaustive]`. A relation this
+        // renderer has not grown an arm for withholds the WHOLE summary (the
+        // all-or-nothing rule above), which is the fail-closed direction: a new
+        // producer capability cannot reach a call site until the consumer can
+        // spell it.
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Trust (Clean-origin caller-side preconditions): build the whole caller-side
+/// summary for a minted Clean-origin `def` — its definitional value facts AND
+/// the caller obligations its erased hypothesis binders impose — or **nothing**.
+///
+/// # This function IS the "publish nothing" rule, made structural
+///
+/// `650674bc71` restored the rule for the DB layer: *"a summary whose guard
+/// cannot be carried must publish NO fact — never the fact without the guard."*
+/// One layer up, the producer can violate the same rule by a plain `?` in the
+/// wrong place: render the postconditions, fail to render a precondition,
+/// publish the postconditions anyway. Nothing downstream can see that happen —
+/// a summary with no preconditions is indistinguishable from a callee that
+/// never had any.
+///
+/// So the producer does not get the two halves separately. It gets this, which
+/// returns `Some` only when every obligation was rendered, and `None`
+/// otherwise. There is no argument order that publishes half.
+///
+/// # What the caller must still do with `None`
+///
+/// `None` means "this call is not modeled" — the caller keeps whatever
+/// fail-closed behaviour it has for an unmodeled Clean-origin callee (the
+/// compiler's absent-callee arm: result havocked, the v7/D3 note naming the
+/// callee). It does NOT mean "the callee has no contract", and it must never be
+/// turned into an empty summary.
+///
+/// `postconditions` are attached through
+/// [`FunctionSummary::with_definitional_postcondition`], whose authority
+/// contract the Clean-origin plan satisfies. The preconditions ride as ordinary
+/// [`FunctionSummary::with_precondition`] clauses — checked at every call site
+/// as an ordinary Rust obligation, never assumed, and never a `Faithful` token.
+#[must_use]
+pub fn clean_origin_summary(
+    name: &str,
+    param_names: Vec<String>,
+    definitional_postconditions: Vec<Formula>,
+    declared_preconditions: &[CleanOriginPrecondition],
+) -> Option<FunctionSummary> {
+    // The guard is rendered FIRST, on purpose. A `?` here cannot leave a
+    // half-built summary behind because nothing has been built yet.
+    let guards = clean_origin_declared_preconditions(declared_preconditions, &param_names)?;
+
+    let mut summary = FunctionSummary::new(name).with_param_names(param_names);
+    for guard in guards {
+        summary = summary.with_precondition(guard);
+    }
+    for post in definitional_postconditions {
+        summary = summary.with_definitional_postcondition(post);
+    }
+    Some(summary)
+}
+
 /// Trust: Database of function summaries for modular verification.
 ///
 /// Stores and retrieves function summaries keyed by function name.
@@ -417,6 +659,20 @@ pub fn clean_origin_wrapping_binop_postconditions(
 #[derive(Debug, Clone, Default)]
 pub struct SummaryDatabase {
     summaries: FxHashMap<String, FunctionSummary>,
+    /// PRIVATE (I5 cross-authority call modeling, L0 lane): callee name →
+    /// precondition count for every summary that [`Self::
+    /// definitional_precondition_free_subset`] REFUSED to carry into this DB
+    /// *because it declares preconditions*.
+    ///
+    /// Only that constructor ever writes this map; `new`/`insert` leave it
+    /// empty, so an ordinary DB (the L1 lane, every test DB, every producer)
+    /// is byte-identical to before this field existed. It exists because
+    /// dropping such a summary is fail-closed for the VALUE FACT but was
+    /// fail-OPEN for its GUARD: the call site then generated no row at all and
+    /// the caller could be reported CLEAN while violating the callee's
+    /// precondition. A withheld name makes the call sites emit a fail-closed
+    /// `UnsupportedMir` row instead (`l0_withheld_summary_vc`).
+    l0_withheld_preconditioned: FxHashMap<String, usize>,
 }
 
 impl SummaryDatabase {
@@ -448,10 +704,33 @@ impl SummaryDatabase {
         self.summaries.keys().map(String::as_str)
     }
 
-    /// Returns true when no summaries are stored.
+    /// Returns true when this DB carries NOTHING a caller lane must act on.
+    ///
+    /// A DB holding only WITHHELD names (`l0_withheld_preconditioned`) is NOT
+    /// empty: its call sites still owe the fail-closed row below. Consumers
+    /// use `is_empty()` as an "adds nothing to any caller VC" early-out (the
+    /// compiler's VC-artifact cache key, `build_callee_write_sets`), and
+    /// answering `true` there would skip generation of exactly the rows this
+    /// field exists to guarantee.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.summaries.is_empty()
+        self.summaries.is_empty() && self.l0_withheld_preconditioned.is_empty()
+    }
+
+    /// Trust (I5, L0 lane): the number of preconditions on the summary that
+    /// [`Self::definitional_precondition_free_subset`] withheld for `callee`,
+    /// or `None` when nothing was withheld for that name.
+    ///
+    /// Read-only. There is no public writer: a forged DB cannot claim a
+    /// withholding, and — more importantly — cannot clear one.
+    #[must_use]
+    pub fn l0_withheld_precondition_count(&self, callee: &str) -> Option<usize> {
+        self.l0_withheld_preconditioned.get(callee).copied()
+    }
+
+    /// Iterate the withheld callee names (diagnostics).
+    pub fn l0_withheld_names(&self) -> impl Iterator<Item = &str> {
+        self.l0_withheld_preconditioned.keys().map(String::as_str)
     }
 
     /// Trust (I5 cross-authority call modeling): the subset of summaries that
@@ -473,12 +752,79 @@ impl SummaryDatabase {
     /// callee body by construction. Both properties are enforced HERE, in the
     /// crate that owns the authority bit, so no consumer can widen the L0
     /// lane by passing a different filter.
+    ///
+    /// # Dropping a PRECONDITION-CARRYING definitional summary is not enough
+    ///
+    /// The precondition clause used to make such a summary vanish from the
+    /// returned DB *silently*. Half of that is right and stays: withholding
+    /// the summary withholds the VALUE FACT, and a fact that cannot travel
+    /// with its guard must not travel at all. The other half was FAIL-OPEN.
+    /// With no entry under the callee's name, `generate_callsite_precondition_
+    /// vcs` (and its attributed twin, and `modular_vcgen`) took the
+    /// `NO-SUMMARY` arm and emitted NOTHING for the call — so an L0 caller
+    /// that VIOLATES the callee's precondition was reported CLEAN. Nothing
+    /// downstream could see the difference between "this callee has no
+    /// contract" and "this callee's contract was dropped on the floor".
+    ///
+    /// So the refusal is now RECORDED (`l0_withheld_preconditioned`) and the
+    /// call-site producers turn each recorded name into a fail-closed
+    /// `UnsupportedMir` row ([`l0_withheld_summary_vc`]) at every call to it:
+    /// unknown, never proved, and carrying the v7/D3 fix (verify at
+    /// `L1Functional`, where the postcondition assumption and its
+    /// `VcKind::Precondition` check survive the level filter together).
+    ///
+    /// A summary WITHOUT definitional authority is not recorded, on purpose.
+    /// Those never rode the L0 lane in the first place — an ordinary
+    /// `#[requires]` is an L1 obligation checked on the L1 lane, and minting
+    /// an unknown for every L0 call to a contracted callee would be plain
+    /// over-rejection, not a soundness gain. The recorded set is exactly the
+    /// summaries that L0 WOULD have used but for their guard.
+    ///
+    /// NOTE (level inversion, unresolved and deliberately not decided here):
+    /// `VcKind::Precondition` is hardcoded `L1Functional` while the hazard a
+    /// Clean-origin precondition would guard is `L0Safety`/UB-class (a zero
+    /// divisor). Until that is settled, the honest L0 answer is "unknown",
+    /// not "checked". See
+    /// `reports/2026-08-20-r2-campaign-plan.md` § "FAIL-OPEN (a)/(b)".
+    ///
+    /// # The one preconditioned summary that DOES ride (postcondition
+    /// composition, slice 2)
+    ///
+    /// The refusal above rests on one premise, stated in its own words: "a fact
+    /// that cannot travel with its guard must not travel at all". A summary
+    /// carrying `postconditions_guarded_by_own_preconditions` is the case where
+    /// the fact DOES travel with its guard — the call-site lane injects it as
+    /// the implication the callee proved, `pre[actuals] -> post[actuals, dest]`
+    /// (see [`FunctionSummary::with_verified_callee_postcondition`]), so the
+    /// value fact and its precondition are one formula and cannot be separated
+    /// by a level filter. The caller derives the postcondition exactly when its
+    /// own context discharges the antecedent at that call site, and derives
+    /// nothing otherwise.
+    ///
+    /// So it is admitted rather than withheld, and — this is the part that must
+    /// stay true — the ADMIT test here is the SAME predicate the EMIT side
+    /// applies ([`crate::generate::summary_postconditions_ride_with_their_guard`]).
+    /// Admitting a summary the injector would then refuse to guard is precisely
+    /// how an unguarded preconditioned clause would reach an L0 caller, so the
+    /// two sides deliberately share one function rather than two spellings of
+    /// one rule. Everything else is unchanged: a preconditioned DEFINITIONAL
+    /// summary (no guard bit) is still withheld and still owes its call sites
+    /// the fail-closed row.
     #[must_use]
     pub fn definitional_precondition_free_subset(&self) -> SummaryDatabase {
         let mut subset = SummaryDatabase::new();
         for summary in self.summaries.values() {
-            if summary.preconditions.is_empty() && summary.has_reusable_postcondition_evidence() {
+            if !summary.has_reusable_postcondition_evidence() {
+                continue;
+            }
+            if summary.preconditions.is_empty()
+                || crate::generate::summary_postconditions_ride_with_their_guard(summary)
+            {
                 subset.insert(summary.clone());
+            } else {
+                subset
+                    .l0_withheld_preconditioned
+                    .insert(summary.name.clone(), summary.preconditions.len());
             }
         }
         subset
@@ -492,6 +838,51 @@ impl SummaryDatabase {
         // summary would be pure overhead: no public summary can carry the opaque,
         // replayed evidence required for authoritative export yet.
         let _ = spec_db;
+    }
+}
+
+/// Trust (I5, L0 lane): the ONE spelling of the fail-closed row a call site
+/// owes when its callee's definitional summary was withheld from the L0 DB
+/// because it declares preconditions
+/// (`SummaryDatabase::definitional_precondition_free_subset`).
+///
+/// `UnsupportedMir` (an `L0Safety` kind, so it SURVIVES
+/// `filter_vcs_by_level(_, L0Safety)` — a `VcKind::Precondition` row would
+/// not) with an always-SAT `Bool(true)` body: the exact shape the sibling
+/// `SummaryArityMismatch` refusal in this same lane already uses, which
+/// `preclassify_unsupported_mir_vcs` turns into `Unknown`. Unknown is the
+/// honest verdict — the verifier is not claiming the precondition is
+/// violated, it is refusing to claim the call site is clean while the guard
+/// is unchecked.
+///
+/// The detail text carries the fix, per v7/D3: raising the proof level to
+/// `L1Functional` keeps the postcondition assumption and its
+/// `VcKind::Precondition` check together on the same side of the level
+/// filter, which is exactly what makes the summary usable again.
+pub(crate) fn l0_withheld_summary_vc(
+    caller: &VerifiableFunction,
+    callee_name: &str,
+    span: &SourceSpan,
+    preconditions: usize,
+) -> VerificationCondition {
+    VerificationCondition {
+        kind: VcKind::UnsupportedMir {
+            kind: "L0WithheldPreconditionedSummary".to_string(),
+            detail: format!(
+                "callee `{callee_name}` has a definitional summary carrying \
+                 {preconditions} precondition(s), which cannot be checked at \
+                 L0Safety (`VcKind::Precondition` is L1Functional and is filtered \
+                 out), so neither its value fact nor its guard is applied here; \
+                 options: verify this function at L1Functional or above (a \
+                 contracted caller already is), or give the callee a \
+                 precondition-free definitional summary"
+            ),
+        },
+        function: caller.name.as_str().into(),
+        location: span.clone(),
+        formula: Formula::Bool(true),
+        contract_metadata: None,
+        obligation: None,
     }
 }
 
@@ -543,35 +934,63 @@ pub fn modular_vcgen(func: &VerifiableFunction, summaries: &SummaryDatabase) -> 
     let injection_active = !crate::generate::func_exceeds_vcgen_budget(func);
 
     for block in &func.body.blocks {
-        if let Terminator::Call { func: callee_name, args, dest, target, span, .. } =
-            &block.terminator
-        {
-            let summary = summaries.get(callee_name);
-            if let Some(summary) = summary {
-                precondition_vcs.extend(callsite_precondition_vcs(
-                    func,
-                    callee_name,
-                    args,
-                    span,
-                    summary,
-                ));
+        match &block.terminator {
+            Terminator::Call { func: callee_name, args, dest, target, span, .. } => {
+                let summary = summaries.get(callee_name);
+                // Trust (L0 withholding, fail-closed): the callee's definitional
+                // summary was refused entry to this DB because it declares
+                // preconditions. `summaries.get` therefore answers `None` and the
+                // arms below would emit nothing at all — the fail-OPEN this row
+                // closes. See `l0_withheld_summary_vc`.
+                if summary.is_none()
+                    && let Some(count) = summaries.l0_withheld_precondition_count(callee_name)
+                {
+                    precondition_vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
+                }
+                if let Some(summary) = summary {
+                    precondition_vcs.extend(callsite_precondition_vcs(
+                        func,
+                        callee_name,
+                        args,
+                        span,
+                        summary,
+                    ));
+                }
+                if injection_active
+                    && target.is_some()
+                    && summary.is_some_and(|s| {
+                        crate::generate::callee_postcondition_is_injectable(
+                            func,
+                            dest,
+                            s,
+                            args.len(),
+                        )
+                    })
+                {
+                    assumptions_injected += 1;
+                } else {
+                    havoced_calls += 1;
+                }
             }
-            // A proved postcondition that passes the injection gate is ASSUMED by
-            // the summary-aware body lane above (conjoined at the dominated
-            // successors); otherwise the call's result stays havoced. A DIVERGING
-            // call (`target: None`) has no dominated successor, so the injection
-            // never fires there — it is counted as havoced, matching the gate in
-            // `build_semantic_guard_map_impl` (which is nested under `target: Some`).
-            if injection_active
-                && target.is_some()
-                && summary.is_some_and(|s| {
-                    crate::generate::callee_postcondition_is_injectable(func, dest, s, args.len())
-                })
-            {
-                assumptions_injected += 1;
-            } else {
+            Terminator::TailCall { func: callee_name, args, span, .. } => {
+                if let Some(summary) = summaries.get(callee_name) {
+                    precondition_vcs.extend(callsite_precondition_vcs(
+                        func,
+                        callee_name,
+                        args,
+                        span,
+                        summary,
+                    ));
+                } else if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+                    // Same withholding row as the `Call` arm — a tail call is
+                    // still a call site that owes the callee's guard.
+                    precondition_vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
+                }
+                // There is no in-function successor at which a postcondition
+                // assumption could be injected; the requires rows stay public.
                 havoced_calls += 1;
             }
+            _ => {}
         }
     }
 
@@ -658,9 +1077,12 @@ pub fn generate_modular_vcs(
 
     // 1. Precondition checks at call sites
     for block in &func.body.blocks {
-        if let Terminator::Call { func: callee_name, args, span, .. } = &block.terminator
-            && let Some(summary) = summaries.get(callee_name)
-        {
+        let (callee_name, args, span) = match &block.terminator {
+            Terminator::Call { func, args, span, .. }
+            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+            _ => continue,
+        };
+        if let Some(summary) = summaries.get(callee_name) {
             vcs.extend(callsite_precondition_vcs(func, callee_name, args, span, summary));
             for i in 0..summary.preconditions.len() {
                 let _check = ContractCheck::PreConditionAtCallSite {
@@ -668,6 +1090,13 @@ pub fn generate_modular_vcs(
                     precondition_index: i,
                 };
             }
+        } else if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+            // Trust (L0 withholding, fail-closed): identical row to the one
+            // `modular_vcgen` and the two `generate_callsite_precondition_vcs`
+            // producers emit — every lane that reads a summary DB by name has
+            // to answer the withholding the same way. See
+            // `l0_withheld_summary_vc`.
+            vcs.push(l0_withheld_summary_vc(func, callee_name, span, count));
         }
     }
 
@@ -817,6 +1246,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "parse".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -1145,6 +1575,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "validate".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -1161,6 +1592,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "unknown_fn".to_string(),
                             args: vec![Operand::Copy(Place::local(2))],
@@ -1593,8 +2025,7 @@ mod tests {
         // defaults to absent so every non-verifier producer stays fail-closed.
         let summary = FunctionSummary::new("f");
         assert!(summary.extracted_body.is_none(), "default: no body attached");
-        let summary =
-            summary.with_extracted_body(std::sync::Arc::new(caller_with_arithmetic()));
+        let summary = summary.with_extracted_body(std::sync::Arc::new(caller_with_arithmetic()));
         assert!(summary.extracted_body.is_some());
         assert!(!summary.proved, "an extracted body must not mint proof status");
         assert!(!summary.has_reusable_postcondition_evidence());
@@ -1996,6 +2427,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "pick".to_string(),
                             args: vec![
@@ -2109,10 +2541,7 @@ mod tests {
 
     #[test]
     fn l0_subset_keeps_only_definitional_precondition_free_summaries() {
-        let pre = Formula::Ge(
-            Box::new(Formula::var("p", Sort::Int)),
-            Box::new(Formula::Int(0)),
-        );
+        let pre = Formula::Ge(Box::new(Formula::var("p", Sort::Int)), Box::new(Formula::Int(0)));
         let mut db = SummaryDatabase::new();
         // Kept: definitional, no preconditions.
         db.insert(definitional_parse_summary());
@@ -2226,6 +2655,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "wsum".to_string(),
                             args: vec![
@@ -2258,8 +2688,9 @@ mod tests {
         // The injected fact must pin the dest to the MODULAR-Ite value (which
         // grounds to 0 — the wrapped result), never to the unbounded `a0 + a1`
         // (which would ground to 2^64 and REFUTE a correct `assert!(s == 0)`).
-        use crate::generate::build_semantic_guard_map_with_summaries;
         use trust_types::admissible_body::{ArithBinOp, ArithOperand};
+
+        use crate::generate::build_semantic_guard_map_with_summaries;
         let caller = caller_of_wsum_consts();
         let posts = clean_origin_wrapping_binop_postconditions(
             ArithBinOp::Add,
@@ -2269,8 +2700,7 @@ mod tests {
             &wrapping_formals(),
         )
         .expect("u64 wrapping add over two params must be expressible");
-        let mut summary =
-            FunctionSummary::new("wsum").with_param_names(wrapping_formals());
+        let mut summary = FunctionSummary::new("wsum").with_param_names(wrapping_formals());
         for post in posts {
             summary = summary.with_definitional_postcondition(post);
         }
@@ -2292,11 +2722,8 @@ mod tests {
         let max = u64::MAX as i128;
         let s = || Box::new(Formula::Add(Box::new(Formula::Int(max)), Box::new(Formula::Int(1))));
         let m = || Box::new(Formula::Int(1i128 << 64));
-        let expected_rhs = Formula::Ite(
-            Box::new(Formula::Ge(s(), m())),
-            Box::new(Formula::Sub(s(), m())),
-            s(),
-        );
+        let expected_rhs =
+            Formula::Ite(Box::new(Formula::Ge(s(), m())), Box::new(Formula::Sub(s(), m())), s());
         let map = build_semantic_guard_map_with_summaries(&caller, &db);
         let bb1 = map.get(&BlockId(1)).cloned().unwrap_or_default();
         assert!(

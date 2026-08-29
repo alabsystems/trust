@@ -18,12 +18,13 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
-use crate::value::{
-    units_from_str, GenId, NativeErrorKind, ObjId, ObjKind, Object, Prop, PromiseId, Value,
-};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+use crate::interp::{Abrupt, ERes, Interp};
+use crate::value::{
+    GenId, NativeErrorKind, ObjId, ObjKind, Object, PromiseId, Prop, Value, units_from_str,
+};
 
 /// The driver's virtual-timer cap (TIMER_CAP): beyond it the drain records a
 /// `timer-cap` host event and stops, exactly like the driver.
@@ -99,7 +100,10 @@ pub(crate) enum NativeClosure {
     /// An async-function await resume handler (27.7.5.3 Await): resumes the
     /// suspended async execution with a normal (`is_throw` false) or throw
     /// completion.
-    AsyncResume { gid: GenId, is_throw: bool },
+    AsyncResume {
+        gid: GenId,
+        is_throw: bool,
+    },
     /// A Promise.all Resolve Element function (27.2.4.1.3).
     AllResolveElement {
         index: usize,
@@ -126,14 +130,20 @@ pub(crate) enum NativeClosure {
         already: Rc<Cell<bool>>,
     },
     /// A `then` finally / `catch` finally function (27.2.5.3.1-2).
-    ThenFinally { on_finally: Value },
-    CatchFinally { on_finally: Value },
+    ThenFinally {
+        on_finally: Value,
+    },
+    CatchFinally {
+        on_finally: Value,
+    },
     /// The finally value-thunk (returns the captured value) / thrower.
     FinallyValueThunk(Value),
     FinallyThrower(Value),
     /// A Proxy Revocation Function (28.2.2.1.1): revokes `proxy` by clearing
     /// its [[ProxyTarget]]/[[ProxyHandler]] to null (idempotent).
-    ProxyRevoke { proxy: ObjId },
+    ProxyRevoke {
+        proxy: ObjId,
+    },
 }
 
 /// One queued Promise-job / microtask.
@@ -146,11 +156,7 @@ pub(crate) enum Job {
         argument: Value,
     },
     /// A NewPromiseResolveThenableJob (27.2.2.2).
-    Thenable {
-        pid: PromiseId,
-        thenable: Value,
-        then: Value,
-    },
+    Thenable { pid: PromiseId, thenable: Value, then: Value },
     /// A `queueMicrotask(cb)` callback.
     Callback { func: Value },
 }
@@ -200,10 +206,8 @@ impl Interp {
     /// [[AlreadyResolved]] cell.
     pub(crate) fn create_resolving_functions(&mut self, pid: PromiseId) -> (Value, Value) {
         let already = Rc::new(Cell::new(false));
-        let resolve = self.alloc_native(NativeClosure::Resolve {
-            pid,
-            already: Rc::clone(&already),
-        });
+        let resolve =
+            self.alloc_native(NativeClosure::Resolve { pid, already: Rc::clone(&already) });
         let reject = self.alloc_native(NativeClosure::Reject { pid, already });
         (resolve, reject)
     }
@@ -246,11 +250,7 @@ impl Interp {
     pub(crate) fn new_promise_capability_default(&mut self) -> Capability {
         let (pid, oid) = self.alloc_promise(self.intr.promise_proto);
         let (resolve, reject) = self.create_resolving_functions(pid);
-        Capability {
-            promise: Value::Obj(oid),
-            resolve,
-            reject,
-        }
+        Capability { promise: Value::Obj(oid), resolve, reject }
     }
 
     // -- fulfil / reject / trigger -----------------------------------------
@@ -332,11 +332,7 @@ impl Interp {
             return Ok(());
         }
         // Schedule NewPromiseResolveThenableJob.
-        self.microtasks.push_back(Job::Thenable {
-            pid,
-            thenable: resolution,
-            then,
-        });
+        self.microtasks.push_back(Job::Thenable { pid, thenable: resolution, then });
         Ok(())
     }
 
@@ -392,20 +388,16 @@ impl Interp {
         } else {
             Handler::Empty
         };
-        let ret = capability
-            .as_ref()
-            .map_or(Value::Undefined, |c| c.promise.clone());
+        let ret = capability.as_ref().map_or(Value::Undefined, |c| c.promise.clone());
         let state = self.promises[pid.0 as usize].state;
         match state {
             PromiseSt::Pending => {
-                self.promises[pid.0 as usize].fulfill_reactions.push(Reaction {
-                    capability: capability.clone(),
-                    handler: fulfill_handler,
-                });
-                self.promises[pid.0 as usize].reject_reactions.push(Reaction {
-                    capability,
-                    handler: reject_handler,
-                });
+                self.promises[pid.0 as usize]
+                    .fulfill_reactions
+                    .push(Reaction { capability: capability.clone(), handler: fulfill_handler });
+                self.promises[pid.0 as usize]
+                    .reject_reactions
+                    .push(Reaction { capability, handler: reject_handler });
             }
             PromiseSt::Fulfilled => {
                 let value = self.promises[pid.0 as usize].result.clone();
@@ -436,17 +428,10 @@ impl Interp {
     /// reaction handler are captured into the result promise's rejection.
     fn run_job(&mut self, job: Job) -> Result<(), Abrupt> {
         match job {
-            Job::Reaction {
-                handler,
-                capability,
-                kind,
-                argument,
-            } => self.run_reaction_job(&handler, capability.as_ref(), kind, argument),
-            Job::Thenable {
-                pid,
-                thenable,
-                then,
-            } => self.run_thenable_job(pid, thenable, then),
+            Job::Reaction { handler, capability, kind, argument } => {
+                self.run_reaction_job(&handler, capability.as_ref(), kind, argument)
+            }
+            Job::Thenable { pid, thenable, then } => self.run_thenable_job(pid, thenable, then),
             Job::Callback { func } => {
                 // queueMicrotask(cb): a throw becomes an uncaught exception in
                 // the real host (process termination) — refuse rather than
@@ -549,13 +534,7 @@ impl Interp {
                 self.async_resume(*gid, r)?;
                 Ok(Value::Undefined)
             }
-            NativeClosure::AllResolveElement {
-                index,
-                values,
-                capability,
-                remaining,
-                already,
-            } => {
+            NativeClosure::AllResolveElement { index, values, capability, remaining, already } => {
                 if already.get() {
                     return Ok(Value::Undefined);
                 }
@@ -580,28 +559,17 @@ impl Interp {
                     self.obj_mut(obj)
                         .props
                         .insert(units_from_str("status"), Prop::data(Value::str_from("rejected")));
-                    self.obj_mut(obj)
-                        .props
-                        .insert(units_from_str("reason"), Prop::data(arg0));
+                    self.obj_mut(obj).props.insert(units_from_str("reason"), Prop::data(arg0));
                 } else {
-                    self.obj_mut(obj).props.insert(
-                        units_from_str("status"),
-                        Prop::data(Value::str_from("fulfilled")),
-                    );
                     self.obj_mut(obj)
                         .props
-                        .insert(units_from_str("value"), Prop::data(arg0));
+                        .insert(units_from_str("status"), Prop::data(Value::str_from("fulfilled")));
+                    self.obj_mut(obj).props.insert(units_from_str("value"), Prop::data(arg0));
                 }
                 values.borrow_mut()[*index] = Value::Obj(obj);
                 self.combinator_countdown_resolve(remaining, values, capability)
             }
-            NativeClosure::AnyRejectElement {
-                index,
-                errors,
-                capability,
-                remaining,
-                already,
-            } => {
+            NativeClosure::AnyRejectElement { index, errors, capability, remaining, already } => {
                 if already.get() {
                     return Ok(Value::Undefined);
                 }
@@ -662,9 +630,7 @@ impl Interp {
     pub(crate) fn array_from_values(&mut self, values: &[Value]) -> Value {
         let arr = self.new_array(0);
         for (i, v) in values.iter().enumerate() {
-            self.obj_mut(arr)
-                .props
-                .insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
+            self.obj_mut(arr).props.insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
         }
         #[allow(clippy::cast_precision_loss)]
         self.set_array_length_raw(arr, values.len() as f64);
@@ -700,7 +666,8 @@ impl Interp {
             self.job_steps += 1;
             if self.job_steps > JOB_BUDGET {
                 return Err(Abrupt::Fatal(
-                    "microtask/job budget exceeded (runaway rescheduling, out of slice)".to_string(),
+                    "microtask/job budget exceeded (runaway rescheduling, out of slice)"
+                        .to_string(),
                 ));
             }
             self.run_job(job)?;
@@ -717,9 +684,7 @@ impl Interp {
         let mut ran: u64 = 0;
         while !self.timers.is_empty() {
             if ran >= TIMER_CAP {
-                self.events.push(trust_js_trace::HostEvent::Host {
-                    v: "timer-cap".to_string(),
-                });
+                self.events.push(trust_js_trace::HostEvent::Host { v: "timer-cap".to_string() });
                 self.timers.clear();
                 break;
             }
@@ -944,9 +909,7 @@ impl Interp {
         }
         let (then_finally, catch_finally) = if self.is_callable_value(&on_finally) {
             (
-                self.alloc_native(NativeClosure::ThenFinally {
-                    on_finally: on_finally.clone(),
-                }),
+                self.alloc_native(NativeClosure::ThenFinally { on_finally: on_finally.clone() }),
                 self.alloc_native(NativeClosure::CatchFinally { on_finally }),
             )
         } else {
@@ -1144,13 +1107,7 @@ impl Interp {
         let extra: Vec<Value> = args.iter().skip(extra_start).cloned().collect();
         let interval = matches!(b, Builtin::SetInterval).then_some(offset);
         let seq = self.next_timer_seq();
-        self.timers.push(Timer {
-            seq,
-            time: self.virtual_now + offset,
-            cb,
-            args: extra,
-            interval,
-        });
+        self.timers.push(Timer { seq, time: self.virtual_now + offset, cb, args: extra, interval });
         #[allow(clippy::cast_precision_loss)]
         Ok(Value::Num(seq as f64))
     }

@@ -774,10 +774,9 @@ impl<'a> Parser<'a> {
             // Empty payload (`fn f() requires { .. }` parses `{` as the
             // terminator): an authored clause with no predicate is an error,
             // not a silent skip (design §1.2-6).
-            return Err(self.dcx().struct_span_err(
-                payload_lo,
-                "expected a predicate expression after the contract clause keyword",
-            ));
+            return Err(self
+                .dcx()
+                .struct_span_err(payload_lo, TRUST_EMPTY_CLAUSE_PAYLOAD_MSG));
         }
 
         // Consume exactly the payload walked by the lookahead. The query owns
@@ -893,10 +892,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 if later.token.ident().is_some()
-                    || matches!(
-                        later.token.kind,
-                        token::Dot | token::DotDot | token::DotDotDot
-                    )
+                    || matches!(later.token.kind, token::Dot | token::DotDot | token::DotDotDot)
                 {
                     later_saw_path_token = true;
                     later.bump();
@@ -939,8 +935,7 @@ impl<'a> Parser<'a> {
             TrustNativeClauseContext::Signature => {
                 tok.is_non_raw_ident_where(|id| {
                     matches!(id.name, sym::requires | sym::ensures | sym::decreases)
-                })
-                    || tok.is_keyword(kw::ContractRequires)
+                }) || tok.is_keyword(kw::ContractRequires)
                     || tok.is_keyword(kw::ContractEnsures)
                     || tok.is_keyword(kw::TrustContractRequires)
                     || tok.is_keyword(kw::TrustContractEnsures)
@@ -1460,4 +1455,69 @@ fn trust_ensures_payload_is_closure(expr: &rustc_ast::Expr) -> bool {
             _ => return false,
         }
     }
+}
+
+/// Trust: the single spelling of "you wrote a clause keyword and no predicate".
+///
+/// Both the native clause position and the attribute compat surface refuse an
+/// empty payload, and they must refuse it with the same words: the attribute
+/// spellings are a compat surface over the native grammar, not a second lane,
+/// so two texts for one rule would be two rules to a reader.
+const TRUST_EMPTY_CLAUSE_PAYLOAD_MSG: &str =
+    "expected a predicate expression after the contract clause keyword";
+
+/// Trust: turn one recognized `#[trust::loop_invariant(P)]` /
+/// `#[trust::decreases(e)]` attribute into the SAME [`ast::LoopClause`] the
+/// native `loop`/`while` clause position produces.
+///
+/// This is the whole of the attribute surface's meaning, and it is deliberately
+/// a thin wrapper rather than a second implementation. The payload is captured
+/// by [`Parser::parse_trust_native_clause`] — the identical routine the native
+/// grammar uses — so the attribute and the native clause cannot disagree about
+/// what the predicate IS. That matters concretely, not decoratively: that
+/// routine is where invisible macro-fragment boundaries are rendered as
+/// separators so two tokens can never glue into a different valid verifier
+/// name, where authored adjacency is preserved so `x'` survives, and where the
+/// optional `by <thm>` citation is canonicalized. A `TokenStream::to_string()`
+/// or a meta-item parse would silently differ on every one of those.
+///
+/// The `predicate` span it returns is exactly the payload tokens INSIDE the
+/// parentheses, which is what `trust_contract_query` reads back through the
+/// source map whenever the span is not from expansion; the surrounding
+/// `#[trust::…(` and `)]` are never part of it.
+///
+/// Fail-closed in three ways, each of which would otherwise be a dropped
+/// clause: an empty payload is an error raised below, at the attribute's own
+/// span; a payload the clause walk does not consume to the end leaves a
+/// non-`Eof` token and [`crate::parse_in`] raises `unexpected()`; and a
+/// `Delimiter` other than parentheses never reaches here (the caller rejects
+/// it).
+pub fn parse_trust_loop_clause_attr<'a>(
+    psess: &'a rustc_session::parse::ParseSess,
+    kind: ast::LoopClauseKind,
+    keyword_span: Span,
+    args: &ast::DelimArgs,
+) -> PResult<'a, ast::LoopClause> {
+    // Trust: `#[trust::loop_invariant()]` — the payload token stream is EMPTY,
+    // so the parser `parse_in` builds below opens on `Eof` and
+    // `parse_trust_native_clause`'s `payload_lo = self.token.span` is the
+    // synthesized end-of-stream span, which renders at the crate root (1:1).
+    // The refusal is correct; the position was not, and a diagnostic that
+    // points at a file rather than at the attribute cannot be acted on
+    // (DESIGN_PHILOSOPHY principle 10 / v7-D3: a refusal must carry the fix).
+    //
+    // The empty case is decided HERE, where the attribute's own span is in
+    // hand, so it lands on the same span as the sibling refusals raised by the
+    // caller in `rustc_expand` (`needs a parenthesized predicate`, `takes its
+    // predicate in parentheses`). The native clause position is untouched:
+    // there `payload_lo` is a real authored token span and already correct.
+    // The message is shared with that arm so the two spellings of one rule
+    // cannot drift apart.
+    if args.tokens.is_empty() {
+        return Err(psess.dcx().struct_span_err(keyword_span, TRUST_EMPTY_CLAUSE_PAYLOAD_MSG));
+    }
+    let clause = crate::parse_in(psess, args.tokens.clone(), "loop clause attribute", |p| {
+        p.parse_trust_native_clause(TrustNativeClauseContext::Loop)
+    })?;
+    Ok(ast::LoopClause { kind, keyword_span, clause })
 }

@@ -8,14 +8,20 @@
 The initial runner intentionally consumes a manifest plus committed fixture
 evidence. Later workers can replace individual checks with stable tool outputs
 without changing the report envelope consumed by dscan/dpub.
+
+Exit codes: 0 all cases passed; 1 a case failed; 2 manifest/output error (or
+--strict over an incomplete corpus); 3 no failures but a case ran zero checks.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,6 +33,12 @@ DEFAULT_MANIFEST = REPO_ROOT / "trust-conformance" / "manifest.json"
 
 MANIFEST_SCHEMA_VERSION = "trust-conformance-manifest/v1"
 REPORT_SCHEMA_VERSION = "trust-conformance-report/v1"
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_ERROR = 2
+# Distinct from pass and from fail: the corpus ran, but part of it was not evaluated.
+EXIT_INCOMPLETE = 3
 
 ALLOWED_CATEGORIES = {
     "deductive",
@@ -78,11 +90,11 @@ def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _load_json(path: Path) -> Any:
+def _load_json(path: Path, kind: str = "manifest") -> Any:
     try:
         return json.loads(path.read_text())
     except FileNotFoundError as exc:
-        raise ManifestError(f"manifest not found: {path}") from exc
+        raise ManifestError(f"{kind} not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise ManifestError(f"invalid JSON in {path}: {exc}") from exc
 
@@ -231,7 +243,7 @@ def _run_check(repo_root: Path, check: Mapping[str, Any]) -> CheckResult:
         pointer = str(check["pointer"])
         expected = check["expected"]
         try:
-            document = _load_json(path)
+            document = _load_json(path, kind="evidence file")
             actual = _json_pointer_get(document, pointer)
         except (ManifestError, KeyError) as exc:
             return CheckResult(
@@ -266,7 +278,7 @@ def _run_check(repo_root: Path, check: Mapping[str, Any]) -> CheckResult:
         raw_target_path = str(check["target_path"])
         target_path = _resolve_repo_path(repo_root, raw_target_path)
         try:
-            document = _load_json(path)
+            document = _load_json(path, kind="evidence file")
             actual = _json_pointer_get(document, pointer)
             expected_digest = _sha256_file(target_path)
         except (ManifestError, KeyError, FileNotFoundError) as exc:
@@ -365,6 +377,60 @@ def _run_case(repo_root: Path, case: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _categories_without_executed_checks(results: list[dict[str, Any]]) -> list[str]:
+    """`_validate_manifest` counts a blocked/waived case as category coverage, so a category can be
+    'covered' while running zero checks. Name those categories rather than let them read as covered."""
+    declared: set[str] = set()
+    executed: set[str] = set()
+    for result in results:
+        category = str(result["category"])
+        declared.add(category)
+        if result["checks"]:
+            executed.add(category)
+    return sorted(declared - executed)
+
+
+def _emit_failure_notice(report: Mapping[str, Any]) -> None:
+    """With --output the report leaves stdout entirely, so name the failures on stderr too."""
+    if not report["summary"]["fail"]:
+        return
+    print("trust-conformance FAILED:", file=sys.stderr)
+    for result in report["results"]:
+        if result["status"] != "fail":
+            continue
+        print(f"  {result['id']} [{result['category']}]", file=sys.stderr)
+        for check in result["checks"]:
+            if check["status"] == "fail":
+                detail = check.get("message") or "check failed"
+                print(f"    {check['kind']} {check.get('path', '')}: {detail}", file=sys.stderr)
+
+
+def _emit_incomplete_notice(report: Mapping[str, Any]) -> bool:
+    """Blocked/waived cases execute zero checks; staying silent is how a retired case reads as green."""
+    summary = report["summary"]
+    if not (summary["blocked"] or summary["waived"]):
+        return False
+    print(
+        "trust-conformance INCOMPLETE: the cases below executed ZERO checks "
+        "and prove nothing about their category.",
+        file=sys.stderr,
+    )
+    for result in report["results"]:
+        if result["status"] in {"blocked", "waived"}:
+            reason = result.get("reason") or "no reason recorded"
+            print(
+                f"  {result['status']}: {result['id']} [{result['category']}]: {reason}",
+                file=sys.stderr,
+            )
+    uncovered = report.get("categories_without_executed_checks") or []
+    if uncovered:
+        print(
+            "  categories with NO executed checks: " + ", ".join(uncovered),
+            file=sys.stderr,
+        )
+    return True
+
+
 def run_manifest(
     manifest_path: Path = DEFAULT_MANIFEST,
     *,
@@ -397,6 +463,7 @@ def run_manifest(
         "results": results,
         "blocked": [result["id"] for result in results if result["status"] == "blocked"],
         "waived": [result["id"] for result in results if result["status"] == "waived"],
+        "categories_without_executed_checks": _categories_without_executed_checks(results),
     }
 
 
@@ -440,6 +507,77 @@ def _write_report(
     output.write_text(text)
 
 
+def _planted_manifest(tmp_dir: Path, name: str, retire_key: str) -> Path:
+    """Retire every case: a zero-check corpus that still claims all six categories."""
+    manifest = json.loads(DEFAULT_MANIFEST.read_text())
+    for case in manifest["cases"]:
+        for key in ("checks", "blocked", "waiver"):
+            case.pop(key, None)
+        case[retire_key] = {"reason": "planted by --selftest"}
+    path = tmp_dir / name
+    path.write_text(json.dumps(manifest, indent=2))
+    return path
+
+
+def _run_cli(argv: list[str]) -> tuple[int, str]:
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = main(argv)
+    return code, err.getvalue()
+
+
+def run_selftest() -> int:
+    """Plant retired cases through main() and watch the silent-green path fail."""
+    failures = 0
+
+    def check(label: str, ok: bool, detail: str) -> None:
+        nonlocal failures
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label}: {detail}")
+        if not ok:
+            failures += 1
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+
+        for retire_key in ("blocked", "waiver"):
+            planted = _planted_manifest(tmp, f"all_{retire_key}.json", retire_key)
+            code, err = _run_cli(["--manifest", str(planted)])
+            check(
+                f"every case {retire_key} cannot exit 0",
+                code == EXIT_INCOMPLETE,
+                f"exit={code} (want {EXIT_INCOMPLETE})",
+            )
+            check(
+                f"every case {retire_key} prints the loud notice",
+                "INCOMPLETE" in err,
+                f"stderr={err.strip().splitlines()[0][:70]!r}" if err.strip() else "stderr EMPTY",
+            )
+            check(
+                f"every case {retire_key} names its uncovered categories",
+                "categories with NO executed checks" in err,
+                f"category line present={'categories with NO executed checks' in err}",
+            )
+
+        code, _ = _run_cli(["--manifest", str(tmp / "all_blocked.json"), "--strict"])
+        check("--strict keeps its exit 2", code == EXIT_ERROR, f"exit={code} (want {EXIT_ERROR})")
+
+        code, err = _run_cli(["--manifest", str(DEFAULT_MANIFEST)])
+        check(
+            "unretired corpus prints no INCOMPLETE notice",
+            "INCOMPLETE" not in err,
+            f"exit={code}",
+        )
+        check("unretired corpus never exits 3", code != EXIT_INCOMPLETE, f"exit={code}")
+        check(
+            "a failing corpus names its failures on stderr",
+            code != EXIT_FAILED or "trust-conformance FAILED:" in err,
+            f"exit={code}, notice present={'trust-conformance FAILED:' in err}",
+        )
+
+    print(f"selftest: {f'FAIL - {failures} check(s)' if failures else 'all checks passed'}")
+    return EXIT_FAILED if failures else EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run trust-conformance checks.")
     parser.add_argument(
@@ -467,15 +605,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Exit non-zero when cases are blocked or waived, not only failed.",
+        help="Report blocked/waived cases as exit 2 rather than the default exit 3.",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Plant retired cases through main() and assert they cannot exit 0.",
     )
     args = parser.parse_args(argv)
+
+    if args.selftest:
+        return run_selftest()
 
     try:
         report = run_manifest(args.manifest, repo_root=args.repo_root)
     except ManifestError as exc:
         print(f"trust-conformance manifest error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
 
     try:
         _write_report(
@@ -486,15 +632,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ManifestError as exc:
         print(f"trust-conformance output error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
     if args.output is not None:
         print(f"Wrote trust-conformance report: {args.output}", file=sys.stderr)
 
+    _emit_failure_notice(report)
+    incomplete = _emit_incomplete_notice(report)
+
     if report["summary"]["fail"] > 0:
-        return 1
-    if args.strict and (report["summary"]["blocked"] > 0 or report["summary"]["waived"] > 0):
-        return 2
-    return 0
+        return EXIT_FAILED
+    if args.strict and incomplete:
+        return EXIT_ERROR
+    # Both callers run bare (`fast.trust-conformance`; targo release_validate `fixed_args: &[]`),
+    # so exiting 0 here would let a waiver retire a whole category with a silent green.
+    if incomplete:
+        return EXIT_INCOMPLETE
+    return EXIT_OK
 
 
 if __name__ == "__main__":

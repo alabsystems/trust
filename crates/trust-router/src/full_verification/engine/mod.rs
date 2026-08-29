@@ -2,10 +2,8 @@
 
 mod batch;
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::Instant,
-};
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
 use rayon::prelude::*;
 use trust_ir_bridge::{NativeVerificationBundle, SourceGenerationAuthority};
@@ -279,7 +277,7 @@ impl FullVerificationEngine {
         verifier
     }
 
-    /// Build a verifier with the required native trust-wp/trust-vc/trust-mc/TY
+    /// Build a verifier with the required native trust-vc/trust-mc/TY
     /// engines at the `-Z trust-verify-timeout-ms` *default* budget.
     ///
     /// Session-less callers only. Compiler paths should use
@@ -317,10 +315,9 @@ impl FullVerificationEngine {
     /// Run full verification with a typed TrustIr native request bundle.
     ///
     /// The native bundle is not treated as proof by itself. It is an identity
-    /// and replay boundary for trust-vc, trust-mc, and trust_wp evidence: proof-grade
-    /// child evidence on those routes must be bound to a matching typed native
-    /// request/proof obligation artifact before the composite verifier accepts
-    /// it.
+    /// and replay boundary for active trust-vc/trust-mc evidence. Historical
+    /// TrustWP requests remain parseable but have no routed owner and cannot
+    /// become accepted child evidence.
     #[must_use]
     pub fn verify_bundle_with_native_trust_ir_bundle(
         &self,
@@ -529,7 +526,7 @@ impl FullVerificationEngine {
             let missing = &self.missing_required_engines;
             if !missing.is_empty() {
                 let reason = format!(
-                    "full verification requires native trust-wp, trust-vc, trust-mc, and TY engines; missing: {}",
+                    "full verification requires native trust-vc, trust-mc, and TY engines; missing: {}",
                     missing.join(", ")
                 );
                 let evidence = obligations
@@ -1553,10 +1550,8 @@ fn discard_live_receipt_sidecars<R, T>(result: R, receipts: BTreeMap<String, T>)
 
 #[cfg(test)]
 mod fresh_receipt_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -1800,7 +1795,7 @@ impl VerificationEngine for FullVerificationEngine {
             if !missing.is_empty() {
                 return SupportLevel::Unsupported {
                     reason: format!(
-                        "full verification requires native trust-wp, trust-vc, trust-mc, and TY engines; missing: {}",
+                        "full verification requires native trust-vc, trust-mc, and TY engines; missing: {}",
                         missing.join(", ")
                     ),
                 };

@@ -227,7 +227,9 @@ fn scan_statement(
             Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
                 check_operand(state, op, violations);
             }
-            Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+            Rvalue::BinaryOp(_, lhs, rhs)
+            | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+            | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
                 check_operand(state, lhs, violations);
                 check_operand(state, rhs, violations);
             }
@@ -309,10 +311,9 @@ fn scan_terminator(
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
     };
 
     use super::*;
@@ -427,7 +428,13 @@ mod tests {
             name: "test_fn".to_string(),
             def_path: "test::test_fn".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { arg_count: 0, return_ty: Ty::Unit, locals, blocks, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                locals,
+                blocks,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -554,6 +561,45 @@ mod tests {
             matches!(&violations[0], BorrowViolation::UseAfterMove { local: 1 }),
             "violation should be UseAfterMove on local 1: {:?}",
             violations[0]
+        );
+    }
+
+    #[test]
+    fn test_unchecked_binary_op_reads_participate_in_move_tracking() {
+        let func = make_func(
+            vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("moved".into()) },
+                LocalDecl { index: 3, ty: Ty::u32(), name: Some("rhs".into()) },
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Use(Operand::Move(Place::local(1))),
+                        span: SourceSpan::default(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::UncheckedBinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(3)),
+                        ),
+                        span: SourceSpan::default(),
+                    },
+                ],
+                terminator: Terminator::Return,
+            }],
+        );
+
+        let violations = scan_body(&func);
+        assert_eq!(
+            violations,
+            vec![BorrowViolation::UseAfterMove { local: 1 }],
+            "the newly admitted carrier must not bypass ownership reads"
         );
     }
 

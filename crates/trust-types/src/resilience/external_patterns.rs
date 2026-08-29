@@ -3,10 +3,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use super::types::{ExternalDependency, FailureMode, FailureModel};
 use crate::VerifiableFunction;
 use crate::utils::strip_generics;
-
-use super::types::{ExternalDependency, FailureMode, FailureModel};
 
 /// Known external call patterns for matching against MIR Call func names.
 ///
@@ -121,9 +120,12 @@ pub fn extract_failure_model(func: &VerifiableFunction) -> FailureModel {
     let mut model = FailureModel::new(&func.def_path);
 
     for block in &func.body.blocks {
-        if let crate::Terminator::Call { func: func_name, span, .. } = &block.terminator
-            && let Some((service, failure_modes)) = match_external_call(func_name)
-        {
+        let (func_name, span) = match &block.terminator {
+            crate::Terminator::Call { func, span, .. }
+            | crate::Terminator::TailCall { func, span, .. } => (func, span),
+            _ => continue,
+        };
+        if let Some((service, failure_modes)) = match_external_call(func_name) {
             model.dependencies.push(ExternalDependency {
                 name: service.to_string(),
                 failure_modes,

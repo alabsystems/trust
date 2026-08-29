@@ -38,6 +38,13 @@ extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_trait_selection;
+// Trust: `ast_utils`' Clean-island test builds a `rustc_ast::CleanIsland`, whose
+// `decls` field is a `ThinVec`. Only the `lib test` build names `thin_vec`, so
+// its absence here is invisible to an ordinary `x.py build` and surfaces only
+// under `x.py test src/tools/tippy` as `E0433: cannot find module or crate
+// `thin_vec``. Declared beside the sysroot crates for the same reason they are:
+// there is no way to opt into a sysroot crate without `extern crate`.
+extern crate thin_vec;
 
 pub mod ast_utils;
 #[deny(missing_docs)]

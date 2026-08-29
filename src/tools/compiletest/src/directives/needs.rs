@@ -165,12 +165,15 @@ impl PreparedNeedsConditions {
             // request is exactly the evidence wanted. The backend also rejects
             // target architectures it has not audited, so ask about the target
             // this suite runs against rather than the host.
-            rustc_query_succeeds(config, &[
-                "--print=supported-crate-types",
-                "-Zunstable-options",
-                "-Zcodegen-backend=trust-cg",
-                &format!("--target={}", config.target),
-            ])
+            rustc_query_succeeds(
+                config,
+                &[
+                    "--print=supported-crate-types",
+                    "-Zunstable-options",
+                    "-Zcodegen-backend=trust-cg",
+                    &format!("--target={}", config.target),
+                ],
+            )
         })
     }
 }

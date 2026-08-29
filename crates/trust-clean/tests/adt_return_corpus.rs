@@ -68,5 +68,8 @@ fn cast_fallible_impls_are_fully_faithful_real_mir() {
          MirSem lane exists for an ADT-typed return) — got {}",
         sc.fully_faithful_via_trustir
     );
-    assert_eq!(sc.fully_faithful_mirsem_fallback, 0, "no MirSem lane exists for an ADT-typed return");
+    assert_eq!(
+        sc.fully_faithful_mirsem_fallback, 0,
+        "no MirSem lane exists for an ADT-typed return"
+    );
 }

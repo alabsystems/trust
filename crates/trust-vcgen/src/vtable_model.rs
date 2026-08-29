@@ -853,8 +853,9 @@ fn conjunction(formulas: &[Formula]) -> Formula {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
-    use trust_types::{ConcreteTarget, MethodImpl, SourceSpan, TraitImpl, Ty, VTableSlot};
+    use trust_types::{
+        ConcreteTarget, MethodImpl, SourceSpan, TraitImpl, Ty, UnwindEdge, VTableSlot,
+    };
 
     use super::*;
 
@@ -1113,6 +1114,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "Compute::compute".to_string(),
                             args: vec![],

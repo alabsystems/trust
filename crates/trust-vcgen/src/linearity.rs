@@ -88,7 +88,9 @@ fn block_moves(block: &BasicBlock, local: usize) -> bool {
     );
     stmt_move
         || match &block.terminator {
-            Terminator::Call { args, .. } => args.iter().any(|a| op_consumes(a, local)),
+            Terminator::Call { args, .. } | Terminator::TailCall { args, .. } => {
+                args.iter().any(|a| op_consumes(a, local))
+            }
             Terminator::SwitchInt { discr, .. } => op_consumes(discr, local),
             _ => false,
         }
@@ -158,7 +160,9 @@ fn param_leaks(body: &VerifiableBody, local: usize) -> bool {
     }
 
     body.blocks.iter().any(|block| {
-        matches!(block.terminator, Terminator::Return) && live_in[&block.id] && !moves[&block.id]
+        matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. })
+            && live_in[&block.id]
+            && !moves[&block.id]
     })
 }
 
@@ -255,22 +259,30 @@ mod tests {
                     // An owned ADT parameter (the kind `must_consume` applies to).
                     LocalDecl {
                         index: 1,
-                        ty: Ty::Adt { adt_kind: None, layout: None, 
+                        ty: Ty::Adt {
+                            adt_kind: None,
+                            layout: None,
                             variants: Vec::new(),
                             name: "Token".into(),
                             fields: vec![],
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                        },
                         name: Some("r".into()),
                     },
                     LocalDecl {
                         index: 2,
-                        ty: Ty::Adt { adt_kind: None, layout: None, 
+                        ty: Ty::Adt {
+                            adt_kind: None,
+                            layout: None,
                             variants: Vec::new(),
                             name: "Token".into(),
                             fields: vec![],
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                        },
                         name: None,
                     },
                 ],
@@ -393,6 +405,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "drop".into(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -407,6 +420,34 @@ mod tests {
             1,
         );
         assert_eq!(check_must_consume(&func), MustConsume::Consumed);
+    }
+
+    #[test]
+    fn tail_call_is_a_terminal_handoff_only_when_it_consumes_the_parameter() {
+        let tail = |args| Terminator::TailCall {
+            func: "handoff".into(),
+            args,
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+        };
+        let consumed = func_with(
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: tail(vec![Operand::Move(Place::local(1))]),
+            }],
+            1,
+        );
+        assert_eq!(check_must_consume(&consumed), MustConsume::Consumed);
+
+        let leaked = func_with(
+            vec![BasicBlock { id: BlockId(0), stmts: vec![], terminator: tail(Vec::new()) }],
+            1,
+        );
+        assert_eq!(check_must_consume(&leaked), MustConsume::Leaked { param: 1 });
     }
 
     #[test]
@@ -449,6 +490,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "sink2".into(),
                         args: vec![Operand::Move(Place::local(1)), Operand::Move(Place::local(2))],
@@ -482,6 +524,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "sink".into(),
                         args: vec![Operand::Move(Place::local(1))], // the NEW _1

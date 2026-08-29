@@ -32,10 +32,9 @@
 //! size dimensions) requires a native runner on that architecture and is
 //! deliberately NOT asserted here.
 
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 

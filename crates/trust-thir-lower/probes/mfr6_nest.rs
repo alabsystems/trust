@@ -93,11 +93,7 @@ pub fn n05_if_inside_match_arm(c: bool, a: u32, b: u32) -> u32 {
 
 #[inline(never)]
 pub fn n06_if_inside_if(a: u32, b: u32, c: u32) -> u32 {
-    if a == b {
-        if b == c { a } else { b }
-    } else {
-        c
-    }
+    if a == b { if b == c { a } else { b } } else { c }
 }
 
 // --- C: GUARDS. A guard is a second `CondBr` whose operands built scopes differently. ----------
@@ -207,15 +203,7 @@ pub fn n17_match_three_arms_minting(k: u32, a: u32, b: u32) -> u32 {
 
 #[inline(never)]
 pub fn n18_deep_nest_three(t: Trio) -> u32 {
-    if t.x == t.y {
-        if t.y == t.z {
-            t.x
-        } else {
-            t.y
-        }
-    } else {
-        t.z
-    }
+    if t.x == t.y { if t.y == t.z { t.x } else { t.y } } else { t.z }
 }
 
 // --- F: SHORT-CIRCUIT `&&`/`||`, which lower to nested `CondBr` chains, not to a `BinOp`. ------

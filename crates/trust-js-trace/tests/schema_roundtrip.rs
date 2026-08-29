@@ -8,9 +8,9 @@
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 use trust_js_trace::{
-    extract_trace, explain_divergence, normalize_async_completion_markers, traces_equal,
-    Completion, HostEvent, ObservableTrace, ProjectedValue, PropKey, ThrownProjection,
-    ASYNC_FAILURE_MARKER_PREFIX, SCHEMA_VERSION, TRACE_SENTINEL,
+    ASYNC_FAILURE_MARKER_PREFIX, Completion, HostEvent, ObservableTrace, ProjectedValue, PropKey,
+    SCHEMA_VERSION, TRACE_SENTINEL, ThrownProjection, explain_divergence, extract_trace,
+    normalize_async_completion_markers, traces_equal,
 };
 
 const NORMAL_TRACE: &str = r#"{"schema":"trust.js.observable-trace.v1","caps":{"depth":8,"keys":64,"nodes":4096,"string":4096,"timers":10000},"events":[{"k":"stdout","v":[{"t":"str","v":"hello"},{"t":"num","v":"-0"}]},{"k":"host","v":"timer-cap"}],"completion":{"k":"normal","v":{"t":"undefined"}}}"#;
@@ -66,23 +66,11 @@ fn object_witness_preserves_order_symbols_and_cycles() {
     // NaN survives as canonical text.
     assert_eq!(props[0].1, ProjectedValue::Num { v: "NaN".into() });
     // Accessors are recorded, never invoked.
-    assert_eq!(
-        props[1].1,
-        ProjectedValue::Accessor {
-            get: true,
-            set: false
-        }
-    );
+    assert_eq!(props[1].1, ProjectedValue::Accessor { get: true, set: false });
     // Symbol key + non-enumerable data prop + cycle back-reference.
     match (&props[2].0, &props[2].1) {
         (PropKey::Sym { sym }, ProjectedValue::Nonenum { v }) => {
-            assert_eq!(
-                **sym,
-                ProjectedValue::Sym {
-                    wk: Some("Symbol.iterator".into()),
-                    v: None
-                }
-            );
+            assert_eq!(**sym, ProjectedValue::Sym { wk: Some("Symbol.iterator".into()), v: None });
             assert_eq!(**v, ProjectedValue::Circ { target: 0 });
         }
         other => panic!("wrong symbol prop: {other:?}"),
@@ -94,16 +82,16 @@ fn object_witness_preserves_order_symbols_and_cycles() {
 
 #[test]
 fn sentinel_extraction_takes_last_line_and_validates_schema() {
-    let stdout = format!(
-        "engine noise\nmore noise\n{TRACE_SENTINEL}{NORMAL_TRACE}\n"
-    );
+    let stdout = format!("engine noise\nmore noise\n{TRACE_SENTINEL}{NORMAL_TRACE}\n");
     let t = extract_trace(stdout.as_bytes()).unwrap();
     assert_eq!(t.schema, trust_js_trace::SCHEMA_VERSION);
 
     let err = extract_trace(b"no sentinel here").unwrap_err();
     assert!(err.to_string().contains("no trace sentinel"), "{err}");
 
-    let bad = format!("{TRACE_SENTINEL}{{\"schema\":\"wrong.v9\",\"events\":[],\"completion\":{{\"k\":\"normal\",\"v\":{{\"t\":\"undefined\"}}}}}}");
+    let bad = format!(
+        "{TRACE_SENTINEL}{{\"schema\":\"wrong.v9\",\"events\":[],\"completion\":{{\"k\":\"normal\",\"v\":{{\"t\":\"undefined\"}}}}}}"
+    );
     let err = extract_trace(bad.as_bytes()).unwrap_err();
     assert!(err.to_string().contains("schema mismatch"), "{err}");
 }
@@ -136,9 +124,7 @@ fn normal_completion_witness_is_optional() {
 // --- async-failure-marker normalization (projection_too_strong fix) ---
 
 fn stdout_str(s: &str) -> HostEvent {
-    HostEvent::Stdout {
-        v: vec![ProjectedValue::Str { v: s.to_string() }],
-    }
+    HostEvent::Stdout { v: vec![ProjectedValue::Str { v: s.to_string() }] }
 }
 
 fn trace_with_events(events: Vec<HostEvent>) -> ObservableTrace {
@@ -196,10 +182,7 @@ fn async_failure_normalization_is_idempotent_and_leaves_others_untouched() {
         "Test262:AsyncTestFailure:TypeError"
     );
     // The success marker is never a failure marker: untouched.
-    assert_eq!(
-        normalized_marker("Test262:AsyncTestComplete"),
-        "Test262:AsyncTestComplete"
-    );
+    assert_eq!(normalized_marker("Test262:AsyncTestComplete"), "Test262:AsyncTestComplete");
     // Ordinary user stdout is untouched.
     assert_eq!(normalized_marker("hello: world"), "hello: world");
     // Prefix constant matches the harness contract.
@@ -222,9 +205,7 @@ fn async_failure_normalization_makes_message_only_divergence_equal() {
     assert!(traces_equal(&a, &b), "post-normalization they must match");
 
     // But a genuine identity divergence (different .name) still diverges.
-    let mut c = trace_with_events(vec![stdout_str(
-        "Test262:AsyncTestFailure:RangeError: x",
-    )]);
+    let mut c = trace_with_events(vec![stdout_str("Test262:AsyncTestFailure:RangeError: x")]);
     normalize_async_completion_markers(&mut c);
     assert!(!traces_equal(&a, &c), "different error identity must still diverge");
 }
@@ -235,9 +216,7 @@ fn async_failure_normalization_only_touches_single_string_stdout() {
     // marker (the harness prints exactly one string) and is left untouched.
     let mut multi = trace_with_events(vec![HostEvent::Stdout {
         v: vec![
-            ProjectedValue::Str {
-                v: "Test262:AsyncTestFailure:TypeError: msg".to_string(),
-            },
+            ProjectedValue::Str { v: "Test262:AsyncTestFailure:TypeError: msg".to_string() },
             ProjectedValue::Num { v: "1".to_string() },
         ],
     }]);
@@ -247,9 +226,7 @@ fn async_failure_normalization_only_touches_single_string_stdout() {
 
     // A stderr event is never the async print channel.
     let mut err = trace_with_events(vec![HostEvent::Stderr {
-        v: vec![ProjectedValue::Str {
-            v: "Test262:AsyncTestFailure:TypeError: msg".to_string(),
-        }],
+        v: vec![ProjectedValue::Str { v: "Test262:AsyncTestFailure:TypeError: msg".to_string() }],
     }]);
     let before = err.clone();
     normalize_async_completion_markers(&mut err);
@@ -290,9 +267,8 @@ fn async_completion_truncation_preserves_precompletion_and_pass_fail_split() {
 
     // A genuine pass/fail split is at the FIRST marker, so it survives truncation.
     let mut pass = trace_with_events(vec![stdout_str("Test262:AsyncTestComplete")]);
-    let mut fail = trace_with_events(vec![stdout_str(
-        "Test262:AsyncTestFailure:Test262Error: assertion x",
-    )]);
+    let mut fail =
+        trace_with_events(vec![stdout_str("Test262:AsyncTestFailure:Test262Error: assertion x")]);
     normalize_async_completion_markers(&mut pass);
     normalize_async_completion_markers(&mut fail);
     assert!(!traces_equal(&pass, &fail), "pass vs fail must still diverge");
@@ -304,10 +280,7 @@ fn async_completion_truncation_preserves_precompletion_and_pass_fail_split() {
     ]);
     normalize_async_completion_markers(&mut fail_then_complete);
     assert_eq!(fail_then_complete.events.len(), 1);
-    assert_eq!(
-        fail_then_complete.events[0],
-        stdout_str("Test262:AsyncTestFailure:TypeError")
-    );
+    assert_eq!(fail_then_complete.events[0], stdout_str("Test262:AsyncTestFailure:TypeError"));
 }
 
 #[test]

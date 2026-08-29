@@ -1093,8 +1093,7 @@ fn test_select_backend_returns_none_when_all_invalid() {
 }
 
 // test_first_class_backend_families_are_selected_by_kind removed — it exercised
-// the v1 subprocess backends (trust_vc_backend, trust_wp_backend, trust_mc_backend)
-// which are dead code under pipeline-v2.
+// the removed v1 subprocess backends, which have no authority under pipeline-v2.
 
 // -----------------------------------------------------------------------
 // #426: HigherOrder variant exists and clean_backend uses it

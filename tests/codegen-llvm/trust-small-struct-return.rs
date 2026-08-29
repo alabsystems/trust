@@ -61,8 +61,5 @@ pub fn make_u64_pair(a: u64, b: u64) -> Pair<u64> {
 // CHECK: ret
 #[no_mangle]
 pub fn add_points(a: Point, b: Point) -> Point {
-    Point {
-        x: a.x.wrapping_add(b.x),
-        y: a.y.wrapping_add(b.y),
-    }
+    Point { x: a.x.wrapping_add(b.x), y: a.y.wrapping_add(b.y) }
 }

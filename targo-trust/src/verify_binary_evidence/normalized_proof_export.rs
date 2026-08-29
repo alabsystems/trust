@@ -1,7 +1,6 @@
 // Normalized solver proof export artifact: build, validate, persist, and load.
 
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use trust_proof_cert::SolverProofExport;
@@ -9,9 +8,6 @@ use trust_proof_cert::{
     CheckedBinaryCertificateSourceBackpropagationGate, digest_model_assumptions,
 };
 use trust_types::SolverDispatchRecord;
-
-use crate::durable_io::atomic_write_private;
-use crate::input_limits::{MAX_SAVED_PROOF_REPORT_BYTES, read_bounded_file};
 
 #[cfg(test)]
 use super::dispatch_binary_artifact_digest_identity_acceptance_blockers;
@@ -21,6 +17,8 @@ use super::{
     NormalizedSolverProofExportArtifactError, dispatch_canonical_binding, is_canonical_sha256_hex,
     stable_json_sha256,
 };
+use crate::durable_io::atomic_write_private;
+use crate::input_limits::{MAX_SAVED_PROOF_REPORT_BYTES, read_bounded_file};
 
 pub(crate) fn normalized_solver_proof_export_artifact_path(
     root: &Path,

@@ -1,10 +1,12 @@
-use super::*;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use std::env;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use tar::{Builder as TarBuilder, Header};
+
+use super::*;
 
 fn temp_dist_dir(test_name: &str) -> PathBuf {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();

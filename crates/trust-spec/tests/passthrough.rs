@@ -11,7 +11,19 @@ fn withdraw(balance: i32, amount: i32) -> i32 {
     balance - amount
 }
 
-#[trust::invariant(self.value >= 0 && self.value <= self.limit)]
+// Trust: this struct previously carried
+// `#[trust::invariant(self.value >= 0 && self.value <= self.limit)]`, and the
+// test below was named `passthrough_attributes_leave_struct_behavior_unchanged`
+// — i.e. the repo's own coverage ASSERTED that the erasure was intended
+// behaviour, and shipped the annotation as documented usage.
+//
+// It is removed deliberately. `#[trust::invariant(..)]` has no verified meaning
+// on any lane: under tRustc it is now a hard error (`ExpandTrustInvariant`), and
+// under stable Rust it is a no-op. A struct-position invariant in particular has
+// no program point at all. Keeping a passing test that exercised it would keep
+// advertising a guarantee-shaped annotation that guarantees nothing.
+//
+// The refusal itself is covered by `tests/ui/contracts/trust-spec-invariant-*`.
 struct Counter {
     value: i32,
     limit: i32,
@@ -35,7 +47,7 @@ fn passthrough_attributes_leave_function_behavior_unchanged() {
 }
 
 #[test]
-fn passthrough_attributes_leave_struct_behavior_unchanged() {
+fn passthrough_attributes_leave_method_behavior_unchanged() {
     let mut counter = Counter::new(1, 4);
     assert_eq!(counter.increment(), 2);
     assert_eq!(counter.limit, 4);

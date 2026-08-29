@@ -9,6 +9,40 @@
 //! All three functions below must be REFUSED. If any of them starts verifying
 //! again, this fixture goes red.
 //!
+//! ## THE CONTROL STOPPED CONTROLLING ON 2026-08-28 — CLOSED THE SAME DAY.
+//!
+//! Kept because the shape recurs and the diagnosis is the reusable part.
+//!
+//! `plain` below is annotated CONTROL and is documented as "correctly refused
+//! today, which is what proves the divisor is not the difficulty". For part of
+//! 2026-08-28 it was not refused: measured on stage1 `e845462a8`, `wrapping`
+//! and `wrapping_rem_` still ERRORed while `plain` reported
+//!
+//!     0 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked
+//!
+//! — two warnings, exit 0. No row was `Failed`, so
+//! `residual_gap_tolerance_denial` found nothing to deny and the default
+//! policy's gap-tolerance lane accepted the function. It was never specific to
+//! division: on a five-function probe `a / d`, `a % d`, `a + b` and `s[i]` ALL
+//! read `runtime-checked` and built clean by default, while
+//! `-Ztrust-policy=certify` still rejected them and a guarded divisor still
+//! PROVED — a lost refutation, not a lost analysis.
+//!
+//! CAUSE, measured with `TRUST_GROUND_DEBUG=1`: the refutation-grounding
+//! campaign put `composed_formula_is_caller_entry_grounded` on the generic
+//! ay/native bridge, and its `callee_temps_are_def_pinned` collected pinning
+//! conjuncts only from the DIRECT children of the formula's root `And`. The
+//! ordinary body VCs `generate_vcs` emits are NESTED conjunctions, so `a / d`'s
+//! `_3 == (d == 0)` sat two levels down and every Level-0 body VC carrying a
+//! MIR temp was judged ungrounded, and its refutation demoted to Unknown ->
+//! `runtime-checked`. Fixed by flattening the `And` spine, plus one extra rule
+//! for `_0` in the checked-add shape; the false refutations the campaign closed
+//! stay closed, because none of them is pinned by any conjunct at any depth.
+//!
+//! DO NOT bless this file if it goes red again. Blessing `plain` deletes the
+//! only thing separating "the refusal works" from "nothing refuses", which is
+//! the exact property the rest of this file exists to measure.
+//!
 //! ## THE DEFECT THAT WAS FIXED
 //!
 //! `u32::wrapping_div` panics on a zero divisor — it wraps only on

@@ -238,6 +238,28 @@ impl CleanOriginMints {
     }
 }
 
+/// The `rust_carrier` spelling every `Nat` position is admitted at.
+///
+/// Not a heuristic string: `trust_symbols`' `TRUSTED_RUNTIME_CARRIERS` pins the
+/// single row `("Nat", "trust_bignum::Nat")`, so this is the ONE wire spelling a
+/// [`CleanCarrierTy::Nat`] position can be encoded under, both in a local grant
+/// and in an imported verdict digest.
+const NAT_RUST_CARRIER: &str = "trust_bignum::Nat";
+
+/// Does this grant name `Nat` anywhere in its signature?
+fn carries_nat(mint: &CleanOriginMint) -> bool {
+    mint.result == CleanCarrierTy::Nat || mint.params.contains(&CleanCarrierTy::Nat)
+}
+
+/// Does one position of an IMPORTED verdict digest claim the `Nat` carrier?
+///
+/// A read of wire data, and nothing more: it decides only whether the carrier
+/// crate is worth loading. The import lane re-derives the carrier locally and
+/// refuses on any disagreement with what the digest claimed.
+fn position_claims_nat(position: &trust_clean_origin::CarrierPosition) -> bool {
+    position.rust_carrier() == NAT_RUST_CARRIER
+}
+
 /// One island as the checker needs to see it.
 struct IslandSource {
     content_span: Span,
@@ -360,7 +382,9 @@ pub(crate) fn decide(fragment: &AstFragment) -> CleanOriginMints {
 
             // Precondition 1: the kernel re-checked this declaration.
             let status = match trust_certify::clean_island::admit_certified_island_definition(
-                env, name_str, &mut facets,
+                env,
+                name_str,
+                &mut facets,
             ) {
                 Ok(admission) => admission.status().clone(),
                 // Fail-closed to the weakest status. `decide_mint` turns that
@@ -404,11 +428,7 @@ pub(crate) fn decide(fragment: &AstFragment) -> CleanOriginMints {
             match trust_clean_origin::decide_mint(name_str, &status, carrier) {
                 Ok(_grant) => {}
                 Err(refusal) => {
-                    decision.refused.push(CleanOriginRefusal {
-                        name,
-                        span,
-                        note: refusal.note(),
-                    });
+                    decision.refused.push(CleanOriginRefusal { name, span, note: refusal.note() });
                     continue;
                 }
             }
@@ -421,11 +441,7 @@ pub(crate) fn decide(fragment: &AstFragment) -> CleanOriginMints {
             let plan = match trust_clean_origin::plan_clean_origin_body(env, name_str) {
                 Ok(plan) => plan,
                 Err(refusal) => {
-                    decision.refused.push(CleanOriginRefusal {
-                        name,
-                        span,
-                        note: refusal.note(),
-                    });
+                    decision.refused.push(CleanOriginRefusal { name, span, note: refusal.note() });
                     continue;
                 }
             };
@@ -487,6 +503,15 @@ impl crate::Resolver<'_, '_> {
     /// named "any island present" as an acceptable conservative fallback; it
     /// was not needed, because the grants are already in hand here.)
     ///
+    /// # This is the DECLARE half only
+    ///
+    /// A crate that merely IMPORTS a `Nat`-carrying Clean-origin def has no
+    /// local grant, so nothing here fires — and no extern crate is loaded yet
+    /// at this seam anyway (measured: the carrier is `CrateNum` 1, the imported
+    /// crate is registered much later, out of `build_reduced_graph`). The
+    /// import half is [`Self::trust_resolve_imported_carrier_crates`], run
+    /// after late resolution.
+    ///
     /// # Demotion, not diagnosis (ruling v7/D3)
     ///
     /// A load failure does not report a loader error about a crate the user
@@ -507,15 +532,125 @@ impl crate::Resolver<'_, '_> {
     /// crate root during expansion is the resolver's ordinary practice — see
     /// `build_reduced_graph_external`.
     pub(crate) fn trust_resolve_carrier_crates(&mut self) {
-        use rustc_hir::def::{DefKind, Res};
-        use rustc_metadata::creader::TrustBignumLoadRefusal;
-
-        let carries_nat = |mint: &CleanOriginMint| {
-            mint.result == CleanCarrierTy::Nat || mint.params.contains(&CleanCarrierTy::Nat)
-        };
         if !self.clean_origin_mints.granted.iter().any(|(_, mint)| carries_nat(mint)) {
             return;
         }
+        self.trust_load_nat_carrier_of_record();
+    }
+
+    /// Trust (I6): the IMPORT half of the same decision — load the carrier for
+    /// a crate that never DECLARES a `Nat`-carrying Clean-origin def but does
+    /// name a crate that EXPORTS one.
+    ///
+    /// # Why this cannot be folded into the mint seam
+    ///
+    /// MEASURED: at the root-fragment seam where
+    /// [`Self::trust_resolve_carrier_crates`] runs, no extern crate of the
+    /// user's has been registered yet — `extern crate` items are processed out
+    /// of `build_reduced_graph`, long after. So "does this crate import a
+    /// `Nat`-carrying Clean-origin def" is not a question that can be asked
+    /// there, and an import-only crate used to reach MIR time with
+    /// `trust_bignum_nat` still `None`, where `carrier_to_rustc_ty`'s internal
+    /// span_fatal fired on a program that was in every way well-formed. That
+    /// fatal's "post-mint impossibility" reading held for the LOCAL lane only.
+    ///
+    /// Called from `Resolver::resolve_crate` after late resolution — every path
+    /// this crate resolved is on record, the `CStore` is still writable, and
+    /// `postprocess` has not run yet, which is the same window the mint seam
+    /// records in.
+    ///
+    /// # The trigger, and why it is a superset of nothing dangerous
+    ///
+    /// It fires iff some crate this crate resolved a path into lists a
+    /// Clean-origin export whose verdict digest claims a
+    /// [`NAT_RUST_CARRIER`] position. The digest is WIRE DATA and is treated
+    /// only as a hint about what to load: it grants nothing, it admits nothing,
+    /// and the import lane (`trust_clean_extern_readmission`) still re-derives
+    /// the carrier locally and refuses on any disagreement. A digest that lies
+    /// "yes" costs one sysroot rlib nobody calls; a digest that lies "no"
+    /// leaves the carrier absent and the MIR-time fatal fires, which is where
+    /// it was already.
+    ///
+    /// Nothing here can widen the local mint decision: no grant is created, and
+    /// the demotion arm below only ever REMOVES grants.
+    ///
+    /// # Cost, stated rather than hidden
+    ///
+    /// One `trust_clean_origin_exports` decode per distinct extern crate this
+    /// crate resolved a path into — an empty root array for every crate of
+    /// ordinary Rust — plus one digest decode per Clean-origin export of a
+    /// crate that has any. Nothing runs the kernel and nothing decodes a type,
+    /// which is what keeps this legal at resolve time: an extern `adt_def`
+    /// decode from inside resolution is the measured `lang_items` ->
+    /// `resolver_for_lowering` query cycle (see [`rustc_ty`]).
+    pub(crate) fn trust_resolve_imported_carrier_crates(&mut self) {
+        use rustc_data_structures::unord::UnordSet;
+        use rustc_hir::def_id::{CrateNum, DefId};
+
+        // Already settled at the mint seam: either the `DefId` is on record, or
+        // the load was attempted, memoized as a failure, and every local `Nat`
+        // grant demoted. Re-deciding it here could only reach the same answer.
+        if self.cstore().trust_bignum_nat().is_some() {
+            return;
+        }
+
+        let referenced: UnordSet<CrateNum> = self
+            .partial_res_map
+            .items()
+            // `base_res`, not `full_res`: a path with unresolved segments
+            // (`Nat::from_u64`) still names the crate it descends into.
+            .filter_map(|(_, res)| res.base_res().opt_def_id())
+            .filter(|def_id| !def_id.is_local())
+            .map(|def_id| def_id.krate)
+            .collect();
+        // Iterate in `CrateNum` order rather than hash order, and DO NOT
+        // short-circuit: which extern queries get forced must not depend on the
+        // iteration order of an unordered map.
+        let Some(highest) = referenced.items().copied().max() else {
+            return;
+        };
+
+        let tcx = self.tcx;
+        let mut imports_nat_carrier = false;
+        for raw in 1..=highest.as_u32() {
+            let krate = CrateNum::from_u32(raw);
+            if !referenced.contains(&krate) {
+                continue;
+            }
+            // Empty for every crate of ordinary Rust — this is the fast path.
+            for &index in tcx.trust_clean_origin_exports(krate) {
+                let def_id = DefId { krate, index };
+                // A listed def with no digest row, or one that does not decode,
+                // is refused by the import lane BEFORE it ever needs a carrier
+                // type. Loading nothing for it is the fail-closed answer, and
+                // the refusal the user sees stays the honest one.
+                let Some(bytes) = tcx.trust_clean_verdict_digest(def_id) else {
+                    continue;
+                };
+                let Ok(digest) = trust_clean_origin::VerdictDigest::decode(bytes) else {
+                    continue;
+                };
+                let carrier = digest.carrier();
+                if position_claims_nat(carrier.result())
+                    || carrier.arguments().iter().any(position_claims_nat)
+                {
+                    imports_nat_carrier = true;
+                }
+            }
+        }
+
+        if !imports_nat_carrier {
+            return;
+        }
+        self.trust_load_nat_carrier_of_record();
+    }
+
+    /// The load itself, shared by both triggers: resolve `trust_bignum`, verify
+    /// it exports exactly one root `struct Nat`, record that `DefId` — or demote
+    /// every local `Nat`-carrying grant to a v7/D3 refusal.
+    fn trust_load_nat_carrier_of_record(&mut self) {
+        use rustc_hir::def::{DefKind, Res};
+        use rustc_metadata::creader::TrustBignumLoadRefusal;
 
         // The write guard is a temporary of this statement; it is released
         // before the `module_children` query below.

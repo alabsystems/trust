@@ -131,8 +131,7 @@ fn main() -> std::io::Result<()> {
         *cluster_counts.entry(diag.cluster_tag()).or_default() += 1;
         // Trust: W2 INC2 — CLASS-NEUTRAL iterator-for-loop lane, against the same
         // callees-first `certified` registry (composition-aware, exactly like production).
-        let iter_recognized =
-            trust_clean::prove::iter_loop_projection_recognized(func, &certified);
+        let iter_recognized = trust_clean::prove::iter_loop_projection_recognized(func, &certified);
         if iter_recognized {
             iter_loop_recognized.push((
                 func.def_path.clone(),

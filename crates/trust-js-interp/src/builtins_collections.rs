@@ -13,10 +13,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
 use trust_js_value::{
     JsObject, JsValue, MapData, NativeFn, ObjId, ObjKind, PropKey, SetData, SymId,
 };
+
+use crate::interp::{Abrupt, ERes, Interp};
 
 /// CanonicalizeKeyedCollectionKey: -0 becomes +0.
 fn canon_key(k: JsValue) -> JsValue {
@@ -141,11 +142,7 @@ impl Interp {
         let Some(ntv) = new_target else {
             return Err(self.throw_type_error());
         };
-        let default_proto = if weak {
-            self.intr.weakmap_proto
-        } else {
-            self.intr.map_proto
-        };
+        let default_proto = if weak { self.intr.weakmap_proto } else { self.intr.map_proto };
         let proto = self.get_prototype_from_constructor(ntv, default_proto)?;
         let kind = if weak {
             ObjKind::WeakMapObj(MapData::default())
@@ -196,11 +193,7 @@ impl Interp {
         let Some(ntv) = new_target else {
             return Err(self.throw_type_error());
         };
-        let default_proto = if weak {
-            self.intr.weakset_proto
-        } else {
-            self.intr.set_proto
-        };
+        let default_proto = if weak { self.intr.weakset_proto } else { self.intr.set_proto };
         let proto = self.get_prototype_from_constructor(ntv, default_proto)?;
         let kind = if weak {
             ObjKind::WeakSetObj(SetData::default())
@@ -312,11 +305,7 @@ impl Interp {
                 while i < self.map_data(oid).entries.len() {
                     self.charge_loop()?;
                     if let Some((k, v)) = self.map_data(oid).entries[i].clone() {
-                        self.call_value(
-                            &cb,
-                            this_arg.clone(),
-                            vec![v, k, JsValue::Obj(oid)],
-                        )?;
+                        self.call_value(&cb, this_arg.clone(), vec![v, k, JsValue::Obj(oid)])?;
                     }
                     i += 1;
                 }
@@ -566,9 +555,7 @@ impl Interp {
                     None => Ok(JsValue::Bool(false)),
                 }
             }
-            _ => Err(Abrupt::Fatal(
-                "unrouted collection native (interpreter bug)".to_string(),
-            )),
+            _ => Err(Abrupt::Fatal("unrouted collection native (interpreter bug)".to_string())),
         }
     }
 }

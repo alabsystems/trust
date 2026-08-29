@@ -93,6 +93,12 @@ pub(crate) struct SubcommandArgs {
     pub(crate) proof_grade_release_transcript_out: Option<String>,
     /// Exact binary-address to source provenance artifacts to import into runtime rewrite mode.
     pub(crate) binary_source_provenance_artifacts: Vec<String>,
+    /// Trust (v6/D1): directory where the compiler must publish the
+    /// kernel-graded Clean goal artifact (`-Ztrust-dump=spec-clean:` for a
+    /// direct trustc invocation, the `TRUST_SPEC_EMIT_DIR` driver transport in
+    /// Cargo crate mode). Set by `targo trust spec --emit clean`, which reads
+    /// the artifact back; absolute path required.
+    pub(crate) spec_emit_dir: Option<String>,
 }
 
 impl SubcommandArgs {
@@ -208,6 +214,7 @@ pub(crate) fn parse_subcommand_args(args: &[String]) -> Result<SubcommandArgs> {
     let mut checked_certificate_checker: Option<String> = None;
     let mut proof_grade_release_transcript_out: Option<String> = None;
     let mut binary_source_provenance_artifacts = Vec::new();
+    let mut spec_emit_dir: Option<String> = None;
     // Single-file mode is selected only by the first child-facing positional.
     // Once an opaque Cargo/rustc argument has been seen, a later `.rs` token may
     // be that option's value (for example `--config custom.rs`) and must not
@@ -470,6 +477,18 @@ pub(crate) fn parse_subcommand_args(args: &[String]) -> Result<SubcommandArgs> {
                 let value = args.get(i).context("--report-dir requires a directory path")?;
                 report_dir = Some(value.clone());
             }
+            "--spec-emit-dir" => {
+                i += 1;
+                let value =
+                    args.get(i).context("--spec-emit-dir requires an absolute directory path")?;
+                validate_spec_emit_dir_value(value)?;
+                spec_emit_dir = Some(value.clone());
+            }
+            s if s.starts_with("--spec-emit-dir=") => {
+                let value = s.strip_prefix("--spec-emit-dir=").expect("invariant: prefix checked");
+                validate_spec_emit_dir_value(value)?;
+                spec_emit_dir = Some(value.to_string());
+            }
             s if s.starts_with("--report-dir=") => {
                 let value = s.strip_prefix("--report-dir=").expect("invariant: prefix checked");
                 report_dir = Some(value.to_string());
@@ -656,7 +675,24 @@ pub(crate) fn parse_subcommand_args(args: &[String]) -> Result<SubcommandArgs> {
         checked_certificate_checker,
         proof_grade_release_transcript_out,
         binary_source_provenance_artifacts,
+        spec_emit_dir,
     })
+}
+
+/// Trust (v6/D1): the spec-emit directory is handed to the compiler as an
+/// artifact sink, so it must never be resolved against ambient cwd — the same
+/// absolute-path rule `trust-proof-artifact-root` enforces compiler-side.
+fn validate_spec_emit_dir_value(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("--spec-emit-dir requires a non-empty absolute directory path");
+    }
+    if !std::path::Path::new(value).is_absolute() {
+        bail!(
+            "--spec-emit-dir requires an ABSOLUTE path (got `{value}`): the compiler refuses to \
+             publish a session artifact relative to ambient cwd"
+        );
+    }
+    Ok(())
 }
 
 fn validate_trust_profile_value(value: &str) -> Result<()> {
@@ -679,6 +715,7 @@ pub(crate) fn usage_text() -> String {
         "  targo trust check <file.lean>  Kernel-check standalone Clean/Lean with the linked CIC kernel",
         "  targo trust build [file]       Verify and build the crate or a single file",
         "  targo trust test               Verify and run tests with certified clause monitors",
+        "  targo trust spec --emit clean [-p <pkg>]  Print the Clean goals the kernel actually graded (compiler-authoritative, v6/D1)",
         "  targo trust version            Emit Trust product/toolchain identity",
         "  targo trust release check      Run Trust release evidence gates",
         "  targo trust release validate <gate>  Run release validation gates",

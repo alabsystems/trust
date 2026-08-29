@@ -11,10 +11,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::UnwindEdge;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, Formula, LocalDecl, Operand, Place, Projection,
-    Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,
+    Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody,
     VerifiableFunction,
 };
 
@@ -102,10 +101,7 @@ fn helper_callee() -> VerifiableFunction {
         contracts: vec![],
         preconditions: vec![
             // #[requires(i < 4)]
-            Formula::Lt(
-                Box::new(Formula::var("i", Sort::Int)),
-                Box::new(Formula::Int(4)),
-            ),
+            Formula::Lt(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(4))),
         ],
         postconditions: vec![],
         spec: Default::default(),
@@ -140,12 +136,10 @@ fn unguarded_caller() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "test::helper".to_string(),
-                        args: vec![
-                            Operand::Copy(Place::local(1)),
-                            Operand::Copy(Place::local(2)),
-                        ],
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
                         span: call_span(),
@@ -186,10 +180,7 @@ fn sigma_i_to_x() -> Vec<(String, Formula)> {
 #[test]
 fn filter_retains_fully_caller_scoped_violation() {
     // Callee violation `i >= 4` over the σ-mapped formal `i` → `x >= 4`.
-    let violation = Formula::Ge(
-        Box::new(Formula::var("i", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let violation = Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(4)));
     let out = replay_substituted_callee_violation(&violation, &sigma_i_to_x())
         .expect("formal-only violation must survive the filter");
     assert_eq!(
@@ -203,10 +194,7 @@ fn filter_retains_fully_caller_scoped_violation() {
 fn filter_drops_residual_callee_local() {
     // `_5 >= 4`: a callee temp with no σ entry. Left free it would either be
     // an unconstrained model dimension or be captured by the caller's `_5`.
-    let violation = Formula::Ge(
-        Box::new(Formula::var("_5", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let violation = Formula::Ge(Box::new(Formula::var("_5", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(
         replay_substituted_callee_violation(&violation, &sigma_i_to_x()).is_none(),
         "residual callee local must drop the candidate"
@@ -251,7 +239,10 @@ fn filter_renames_def_pinned_temps_into_replay_namespace() {
     assert!(fv.contains("x"), "σ image must appear: {fv:?}");
     assert!(fv.contains("__trust_replay___3"), "temp _3 renamed: {fv:?}");
     assert!(fv.contains("__trust_replay___4"), "temp _4 renamed: {fv:?}");
-    assert!(!fv.contains("_3") && !fv.contains("_4") && !fv.contains("i"), "no raw callee names: {fv:?}");
+    assert!(
+        !fv.contains("_3") && !fv.contains("_4") && !fv.contains("i"),
+        "no raw callee names: {fv:?}"
+    );
 }
 
 #[test]
@@ -297,10 +288,7 @@ fn filter_drops_sigma_opaque_replacement_values() {
         "i".to_string(),
         Formula::var_owned("__trust_sigma_opaque__i".to_string(), Sort::Int),
     )];
-    let violation = Formula::Ge(
-        Box::new(Formula::var("i", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let violation = Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(
         replay_substituted_callee_violation(&violation, &sigma).is_none(),
         "a σ-fresh opaque replacement must drop the candidate"
@@ -315,15 +303,10 @@ fn filter_drops_projected_formal_rebound_to_fresh_field_var() {
     // precondition lane; free model dimension here — must drop.
     let sigma = vec![(
         "self".to_string(),
-        Formula::Add(
-            Box::new(Formula::var("x", Sort::Int)),
-            Box::new(Formula::Int(1)),
-        ),
+        Formula::Add(Box::new(Formula::var("x", Sort::Int)), Box::new(Formula::Int(1))),
     )];
-    let violation = Formula::Ge(
-        Box::new(Formula::var("self.0", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let violation =
+        Formula::Ge(Box::new(Formula::var("self.0", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(
         replay_substituted_callee_violation(&violation, &sigma).is_none(),
         "a σ-field fresh rebind must drop the candidate"
@@ -335,10 +318,8 @@ fn filter_retains_projected_formal_rebound_to_bare_actual_place() {
     // `self.0` under `self -> a` reattaches to the caller's `a.0` — a real
     // caller place, fully scoped. Retained.
     let sigma = vec![("self".to_string(), Formula::var("a", Sort::Int))];
-    let violation = Formula::Ge(
-        Box::new(Formula::var("self.0", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let violation =
+        Formula::Ge(Box::new(Formula::var("self.0", Sort::Int)), Box::new(Formula::Int(4)));
     let out = replay_substituted_callee_violation(&violation, &sigma)
         .expect("bare-place projection rebind is caller-scoped");
     assert_eq!(
@@ -380,12 +361,8 @@ fn composed_candidate_carries_def_pinned_violation_over_caller_inputs() {
     let caller = unguarded_caller();
     let mut summaries = SummaryDatabase::new();
     summaries.insert(helper_summary_with_body());
-    let candidates = generate_callsite_l0_replay_candidates(
-        &caller,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let candidates =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
     assert_eq!(candidates.len(), 1);
     let Formula::And(conjuncts) = &candidates[0].formula else {
         panic!("composed candidate must be a flat And: {:?}", candidates[0].formula);
@@ -414,12 +391,8 @@ fn unguarded_caller_yields_l0_candidate_at_call_span() {
     let mut summaries = SummaryDatabase::new();
     summaries.insert(helper_summary_with_body());
 
-    let candidates = generate_callsite_l0_replay_candidates(
-        &caller,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let candidates =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
     assert_eq!(candidates.len(), 1, "exactly one composed bounds candidate: {candidates:#?}");
     let candidate = &candidates[0];
     assert!(
@@ -433,10 +406,7 @@ fn unguarded_caller_yields_l0_candidate_at_call_span() {
     // caller-namespace name (here the caller's own locals `a`/`i`; never the
     // callee temps `_3`/`_4`, which vcgen folds into the violation).
     for var in candidate.formula.free_variables() {
-        assert!(
-            !var.starts_with("__trust_sigma_"),
-            "no σ-fresh free var may survive: {var}"
-        );
+        assert!(!var.starts_with("__trust_sigma_"), "no σ-fresh free var may survive: {var}");
     }
 }
 
@@ -451,13 +421,8 @@ fn candidate_absent_when_extracted_body_missing() {
     summaries.insert(summary);
 
     assert!(
-        generate_callsite_l0_replay_candidates(
-            &caller,
-            &summaries,
-            "test::helper",
-            &call_span(),
-        )
-        .is_empty(),
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span(),)
+            .is_empty(),
         "no extracted body -> no replay candidates"
     );
 }
@@ -487,8 +452,9 @@ fn candidate_absent_at_wrong_span_or_callee() {
 
 #[test]
 fn candidate_absent_for_self_recursive_callee() {
-    // #5-PRE-A scoping: a self-call precondition belongs to the definition-
-    // entry assumption machinery, never to the replay lane.
+    // #5-PRE-A scoping: the self-call precondition remains an ordinary proof
+    // request, but this refutation-only helper must not recursively replay the
+    // caller body as its own callee. Candidate absence supplies no authority.
     let mut caller = unguarded_caller();
     // Make the call a self-call in both name spellings.
     if let Terminator::Call { func: callee, .. } = &mut caller.body.blocks[0].terminator {
@@ -500,13 +466,8 @@ fn candidate_absent_for_self_recursive_callee() {
     summaries.insert(summary);
 
     assert!(
-        generate_callsite_l0_replay_candidates(
-            &caller,
-            &summaries,
-            "test::caller",
-            &call_span(),
-        )
-        .is_empty(),
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::caller", &call_span(),)
+            .is_empty(),
         "self-recursive call sites are exempt from replay"
     );
 }
@@ -520,13 +481,8 @@ fn candidate_absent_on_arity_mismatch() {
     summaries.insert(summary);
 
     assert!(
-        generate_callsite_l0_replay_candidates(
-            &caller,
-            &summaries,
-            "test::helper",
-            &call_span(),
-        )
-        .is_empty(),
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span(),)
+            .is_empty(),
         "σ would be partial on arity mismatch — must decline"
     );
 }
@@ -584,17 +540,12 @@ fn solver_refutes_unguarded_and_never_guarded_composition() {
     summaries.insert(helper_summary_with_body());
 
     let caller = unguarded_caller();
-    let candidates = generate_callsite_l0_replay_candidates(
-        &caller,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let candidates =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
     assert_eq!(candidates.len(), 1);
     assert!(backend.can_handle(&candidates[0]), "ay must admit the composed L0 kind");
     let result = backend.verify(&candidates[0]);
-    let trust_types::VerificationResult::Failed { counterexample: Some(cex), .. } = &result
-    else {
+    let trust_types::VerificationResult::Failed { counterexample: Some(cex), .. } = &result else {
         panic!("unguarded composition must be SAT with a model, got {result:?}");
     };
     let index_witness = cex
@@ -607,12 +558,8 @@ fn solver_refutes_unguarded_and_never_guarded_composition() {
     }
 
     let guarded = guarded_caller();
-    let guarded_candidates = generate_callsite_l0_replay_candidates(
-        &guarded,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let guarded_candidates =
+        generate_callsite_l0_replay_candidates(&guarded, &summaries, "test::helper", &call_span());
     for candidate in &guarded_candidates {
         let result = backend.verify(candidate);
         assert!(
@@ -662,12 +609,8 @@ fn replay_regenerates_callee_vcs_without_the_requires_shield() {
     let mut summaries = SummaryDatabase::new();
     summaries.insert(helper_summary_with_body());
 
-    let candidates = generate_callsite_l0_replay_candidates(
-        &caller,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let candidates =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
     assert_eq!(candidates.len(), 1);
     let rendered = format!("{:?}", candidates[0].formula);
     assert!(
@@ -708,6 +651,7 @@ fn havoc_dest_caller() -> VerifiableFunction {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "ext::clamp3".to_string(),
                 args: vec![Operand::Copy(Place::local(2))],
@@ -729,10 +673,7 @@ fn caller_gate_rejects_havocd_call_dest_free_var() {
     // local whose value is chosen by the unmodeled callee, and no conjunct
     // pins it — an unconstrained dimension, so the gate must fail.
     let func = havoc_dest_caller();
-    let formula = Formula::Ge(
-        Box::new(Formula::var("j", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let formula = Formula::Ge(Box::new(Formula::var("j", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(
         !composed_formula_is_caller_entry_grounded(&func, &formula),
         "a havoc'd call-dest free var must fail the caller-side gate"
@@ -774,18 +715,13 @@ fn caller_gate_rejects_r1occ_freshened_opaque_vars() {
 fn caller_gate_retains_fully_entry_pinned_formulas() {
     let func = unguarded_caller();
     // Bare entry params (never written, no call-dest write, source-stable).
-    let over_params = Formula::Ge(
-        Box::new(Formula::var("i", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let over_params =
+        Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(composed_formula_is_caller_entry_grounded(&func, &over_params));
     // Entry-param projections and __slice_len companions are entry state too.
     let over_projections = Formula::And(vec![
         Formula::Ge(Box::new(Formula::var("a.0", Sort::Int)), Box::new(Formula::Int(1))),
-        Formula::Ge(
-            Box::new(Formula::var("a__slice_len", Sort::Int)),
-            Box::new(Formula::Int(4)),
-        ),
+        Formula::Ge(Box::new(Formula::var("a__slice_len", Sort::Int)), Box::new(Formula::Int(4))),
     ]);
     assert!(composed_formula_is_caller_entry_grounded(&func, &over_projections));
     // A non-entry name is admitted exactly when an Eq conjunct grounds it in
@@ -812,17 +748,209 @@ fn caller_gate_rejects_unpinned_versioned_and_unknown_names() {
     let func = unguarded_caller();
     // A residual versioned read of a (hypothetically reassigned) local: not a
     // caller place spelling, not pinned — unclassifiable.
-    let versioned = Formula::Ge(
-        Box::new(Formula::var("i#s0_t", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let versioned =
+        Formula::Ge(Box::new(Formula::var("i#s0_t", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(!composed_formula_is_caller_entry_grounded(&func, &versioned));
     // A name that resolves to no local at all, unpinned.
-    let unknown = Formula::Ge(
-        Box::new(Formula::var("ghost", Sort::Int)),
-        Box::new(Formula::Int(4)),
-    );
+    let unknown =
+        Formula::Ge(Box::new(Formula::var("ghost", Sort::Int)), Box::new(Formula::Int(4)));
     assert!(!composed_formula_is_caller_entry_grounded(&func, &unknown));
+}
+
+// ---------------------------------------------------------------------------
+// The ORDINARY BODY-VC shapes. `bridge_v1_ay_proofs_into_native_results` also
+// asks this gate about `generate_vcs` output, which is NOT the flat conjunction
+// the callsite composer emits. Measured 2026-08-28: every one of the four
+// shapes below was judged ungrounded, which silently deleted every Level-0
+// refutation the compiler had — `a / d`, `a % d`, `a + b` and `s[i]` all built
+// clean under the default policy. These pin the exact formulas the compiler
+// produced for those four programs.
+// ---------------------------------------------------------------------------
+
+/// `pub fn f(a: u64, d: u64) -> u64 { a / d }`, verbatim from
+/// `TRUST_GROUND_DEBUG=1` on stage1 `f402338a5`: a type-range block and a
+/// defs/violation block, conjoined — so `_3 == (d == 0)` is two `And` levels
+/// below the root.
+fn body_vc_two_param_caller() -> VerifiableFunction {
+    let mut func = unguarded_caller();
+    func.body.locals[1] =
+        LocalDecl { index: 1, ty: Ty::Int { width: 64, signed: false }, name: Some("a".into()) };
+    func.body.locals[2] =
+        LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: false }, name: Some("d".into()) };
+    func
+}
+
+fn u64_range(name: &str) -> Formula {
+    Formula::And(vec![
+        Formula::Ge(Box::new(Formula::var(name, Sort::Int)), Box::new(Formula::Int(0))),
+        Formula::Le(
+            Box::new(Formula::var(name, Sort::Int)),
+            Box::new(Formula::Int(18446744073709551615)),
+        ),
+    ])
+}
+
+#[test]
+fn caller_gate_admits_a_temp_pinned_in_a_NESTED_and_block() {
+    let func = body_vc_two_param_caller();
+    // The div-by-zero body VC exactly as emitted.
+    let div_by_zero = Formula::And(vec![
+        Formula::And(vec![u64_range("a"), u64_range("d")]),
+        Formula::And(vec![
+            u64_range("a"),
+            u64_range("d"),
+            Formula::And(vec![
+                Formula::Eq(
+                    Box::new(Formula::var("_3", Sort::Bool)),
+                    Box::new(Formula::Eq(
+                        Box::new(Formula::var("d", Sort::Int)),
+                        Box::new(Formula::Int(0)),
+                    )),
+                ),
+                Formula::var("_3", Sort::Bool),
+            ]),
+        ]),
+    ]);
+    assert!(
+        composed_formula_is_caller_entry_grounded(&func, &div_by_zero),
+        "`_3 == (d == 0)` pins `_3` in entry state; `∧` is associative, so nesting \
+         the conjunct cannot make a grounded refutation ungrounded"
+    );
+}
+
+#[test]
+fn caller_gate_admits_chained_nested_pins_through_a_slice_len() {
+    // `pub fn f(s: &[u64], i: usize) -> u64 { s[i] }`, as emitted: `_3` pins to
+    // the `__slice_len` companion and `_4` chains off `_3`.
+    let mut func = body_vc_two_param_caller();
+    func.body.locals[1] = LocalDecl {
+        index: 1,
+        ty: Ty::Array { elem: Box::new(Ty::u8()), len: 4 },
+        name: Some("s".into()),
+    };
+    func.body.locals[2] =
+        LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: false }, name: Some("i".into()) };
+    let bounds = Formula::And(vec![
+        u64_range("i"),
+        Formula::And(vec![
+            u64_range("i"),
+            Formula::And(vec![
+                Formula::Eq(
+                    Box::new(Formula::var("_3", Sort::Int)),
+                    Box::new(Formula::var("s__slice_len", Sort::Int)),
+                ),
+                Formula::Eq(
+                    Box::new(Formula::var("_4", Sort::Bool)),
+                    Box::new(Formula::Lt(
+                        Box::new(Formula::var("i", Sort::Int)),
+                        Box::new(Formula::var("_3", Sort::Int)),
+                    )),
+                ),
+                Formula::Ge(
+                    Box::new(Formula::var("i", Sort::Int)),
+                    Box::new(Formula::var("_3", Sort::Int)),
+                ),
+            ]),
+        ]),
+    ]);
+    assert!(composed_formula_is_caller_entry_grounded(&func, &bounds));
+}
+
+/// The `a + b` overflow shape: rustc conditions the destination definition on
+/// NOT overflowing, so `_0` is pinned only inside a disjunction — and nowhere
+/// else in the formula.
+fn overflow_add_body_vc() -> Formula {
+    let sum = || {
+        Formula::Add(
+            Box::new(Formula::var("a", Sort::Int)),
+            Box::new(Formula::var("b", Sort::Int)),
+        )
+    };
+    let overflowed = || {
+        Formula::Gt(Box::new(sum()), Box::new(Formula::Int(18446744073709551615)))
+    };
+    Formula::And(vec![
+        Formula::And(vec![u64_range("a"), u64_range("b")]),
+        Formula::And(vec![
+            Formula::Or(vec![
+                overflowed(),
+                Formula::Eq(Box::new(Formula::var("_0", Sort::Int)), Box::new(sum())),
+            ]),
+            Formula::Or(vec![
+                Formula::Lt(Box::new(sum()), Box::new(Formula::Int(0))),
+                overflowed(),
+            ]),
+        ]),
+    ])
+}
+
+#[test]
+fn caller_gate_admits_a_dest_pinned_only_under_its_non_overflow_disjunct() {
+    let func = body_vc_two_param_caller();
+    let mut func = func;
+    func.body.locals[2] =
+        LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: false }, name: Some("b".into()) };
+    assert!(
+        composed_formula_is_caller_entry_grounded(&func, &overflow_add_body_vc()),
+        "`_0` occurs in exactly one conjunct and is repairable to `a + b` there, \
+         so the model's input projection denotes a real execution"
+    );
+}
+
+#[test]
+fn caller_gate_still_rejects_a_disjunctively_pinned_temp_used_elsewhere() {
+    // Same disjunctive pin, but the temp is ALSO read by the violation. The
+    // repair would change that conjunct's truth value, so it must fail closed.
+    let mut func = body_vc_two_param_caller();
+    func.body.locals[2] =
+        LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: false }, name: Some("b".into()) };
+    let Formula::And(mut blocks) = overflow_add_body_vc() else { unreachable!() };
+    blocks.push(Formula::Gt(
+        Box::new(Formula::var("_0", Sort::Int)),
+        Box::new(Formula::Int(7)),
+    ));
+    assert!(!composed_formula_is_caller_entry_grounded(&func, &Formula::And(blocks)));
+}
+
+#[test]
+fn caller_gate_still_rejects_a_havocd_dest_pinned_by_no_disjunct() {
+    // The campaign's case, re-stated in the nested shape the flattening now
+    // walks: `j` is the unmodeled callee's return, so NO conjunct and no
+    // disjunct defines it. Flattening must not invent a pin for it.
+    let func = havoc_dest_caller();
+    let formula = Formula::And(vec![
+        Formula::And(vec![u64_range("i")]),
+        Formula::And(vec![Formula::Or(vec![
+            Formula::Ge(Box::new(Formula::var("i", Sort::Int)), Box::new(Formula::Int(0))),
+            Formula::Ge(Box::new(Formula::var("j", Sort::Int)), Box::new(Formula::Int(4))),
+        ])]),
+    ]);
+    assert!(
+        !composed_formula_is_caller_entry_grounded(&func, &formula),
+        "a havoc'd call-dest free var stays an unconstrained model dimension"
+    );
+}
+
+#[test]
+fn caller_gate_still_rejects_a_bare_eq_over_an_opaque_value() {
+    // `opaque_call_result == 0` as the WHOLE formula is the obligation's
+    // violation, not a definition of its subject. Reading it as a pin is the
+    // exact false refutation the campaign closed, so the top of the formula
+    // must still be required to be a conjunction.
+    let func = havoc_dest_caller();
+    let violation = Formula::Eq(
+        Box::new(Formula::var("j", Sort::Int)),
+        Box::new(Formula::Int(0)),
+    );
+    assert!(!composed_formula_is_caller_entry_grounded(&func, &violation));
+    // SCOPE, stated rather than implied: the fixpoint cannot tell `_3 == 4`
+    // (a legitimate constant block def, named as such in
+    // `callee_temps_are_def_pinned`'s own doc) from `j == 0` (a violation over
+    // an opaque value) once either is a conjunct, so `And([j == 0])` DOES
+    // ground `j` — and did before the flattening landed, one level up. That
+    // ambiguity is pre-existing and is deliberately not touched here; what this
+    // test pins is that the ROOT of the formula must still be a conjunction, so
+    // the campaign's `opaque_call_result == 0` case keeps failing closed.
 }
 
 // ---------------------------------------------------------------------------
@@ -841,12 +969,8 @@ fn safe_havoc_dest_caller_composition_is_dropped_by_the_gate() {
     let caller = havoc_dest_caller();
     let mut summaries = SummaryDatabase::new();
     summaries.insert(helper_summary_with_body()); // ext::clamp3 stays unmodeled
-    let candidates = generate_callsite_l0_replay_candidates(
-        &caller,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let candidates =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
     assert!(
         candidates.is_empty(),
         "a havoc'd-actual composition must be DROPPED (never reach a solver): {candidates:#?}"
@@ -862,12 +986,8 @@ fn genuine_violation_caller_composition_survives_gate_and_stays_sat() {
     let caller = unguarded_caller();
     let mut summaries = SummaryDatabase::new();
     summaries.insert(helper_summary_with_body());
-    let candidates = generate_callsite_l0_replay_candidates(
-        &caller,
-        &summaries,
-        "test::helper",
-        &call_span(),
-    );
+    let candidates =
+        generate_callsite_l0_replay_candidates(&caller, &summaries, "test::helper", &call_span());
     assert_eq!(candidates.len(), 1, "the genuine composition must survive the gate");
     let backend = InProcessAyBackend::new();
     let result = backend.verify(&candidates[0]);

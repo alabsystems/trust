@@ -52,14 +52,86 @@ mod call_graph;
 #[cfg(test)]
 mod cell_threading;
 pub mod contract_assumption_gate;
+/// Trust (LANE 1): the CTFE FREEZE — "this thread is inside `mir_built`, so forcing
+/// const-evaluation would close a rustc query cycle".
+///
+/// This extractor has two callers with opposite hazard profiles, and until now only one of them
+/// was reasoned about:
+///
+///   * the VERIFIER (`rustc_mir_transform::trust_verify`, at `optimized_mir` time) — CTFE here is
+///     both safe and load-bearing: it is how a const operand becomes a known value in an
+///     obligation instead of an opaque scalar. Nothing below may weaken that lane, and nothing
+///     does: the freeze is never entered on that path.
+///
+///   * the trust-ir producer's MIR-side ORACLE (`trust_thir_lower::differential` /
+///     `mir_differential`), which runs INSIDE the `mir_built` query hook
+///     (`rustc_mir_build::builder::build_mir_inner_impl`). Every `mir::Const::Unevaluated`
+///     operand it evaluates demands `mir_for_ctfe` -> `mir_borrowck` of the const, and borrowck
+///     descends into the const's nested closures, demanding THEIR `mir_built`. For a
+///     self-referential const pair that closes a cycle on rustc's own query stack — a hard
+///     `error[E0391]`, i.e. `-Ztrust-ir-lower` turning a program vanilla rustc compiles into a
+///     failing one. Measured on `core::task::wake`'s `RawWaker::NOOP`:
+///         const NOOP: RawWaker = { const VTABLE: VT = VT::new(|_| RawWaker::NOOP, ..); .. };
+///     one of the three E0391 cycles that made `library/core` produce ZERO obligations.
+///
+/// So one half of the rule is a property of WHERE we are, not of what we are looking at, and that
+/// half is entered once at the hook boundary rather than sprinkled over shapes. When a helper does
+/// decline it returns `None`, which is this extractor's existing, well-defined "value unavailable"
+/// answer (the same one a generic const gets): the operand stays opaque, the differential records
+/// incapacity, and no body reads as agreed on a value nobody computed.
+///
+/// **`frozen()` is NOT on its own the decline predicate — read
+/// `convert::frozen_ctfe_may_reach_local_body` before adding a call site.** Being inside
+/// `mir_built` is necessary for the hazard but not sufficient: the cycle needs the const's CTFE to
+/// actually demand a LOCAL `mir_built`. The first form of this guard skipped that second question
+/// and keyed on the MIR SPELLING instead (`Const::Unevaluated` vs `Const::Val`), which declined
+/// every foreign assoc const — `i8::MAX`, `u8::MIN`, `Assume::SAFETY` — whose provider is the
+/// metadata decoder and which can demand no local query at all. MEASURED cost on the 2000-file ui
+/// sample: **132 Agreed rows**, against **zero** prevented compile failures on that corpus
+/// (`file_outcomes` was byte-identical with the freeze present and absent). The sibling THIR
+/// producer lane never had this bug — it has always keyed on `def_id.is_local()` — so the two
+/// sides of one differential disagreed by construction on every non-local const.
+///
+/// Thread-local, matching `trust_thir_lower`'s `LOWERING_BODIES`: rustc builds MIR on parallel
+/// worker threads and each owns its own query stack, so a global would both mis-fire and
+/// mis-decline.
+pub mod ctfe_reentrancy {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Depth, not a bool: the hook can nest (a body lowered while another is in flight), and
+        /// a bool would be cleared by the inner frame's `Drop` while the outer frame is still
+        /// inside `mir_built`.
+        static FREEZE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// RAII: the freeze is released even if the producer returns early or unwinds.
+    pub struct Freeze;
+
+    /// Enter the freeze for the current thread. Held for as long as the returned value lives.
+    #[must_use]
+    pub fn enter() -> Freeze {
+        FREEZE_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Freeze
+    }
+
+    impl Drop for Freeze {
+        fn drop(&mut self) {
+            FREEZE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+
+    /// Must a forced const-evaluation be declined on this thread right now?
+    #[must_use]
+    pub fn frozen() -> bool {
+        FREEZE_DEPTH.with(|d| d.get() > 0)
+    }
+}
 mod convert;
-pub use convert::func_operand_name;
-pub use convert::is_derived_total_method;
-pub use convert::is_total_derived_trait_call;
-pub use convert::tcx_is_authenticated_core_integer_wrapping_method;
-pub use convert::trust_try_total_marker;
 pub use convert::{
     CertifiedPairedCondvarWaitCallSite, collect_certified_paired_condvar_wait_calls,
+    func_operand_name, is_derived_total_method, is_total_derived_trait_call,
+    tcx_is_authenticated_core_integer_wrapping_method, trust_try_total_marker,
 };
 // Research-only backward slicing for VC minimization. No production caller
 // consumes the sliced body yet, so compiling this sizeable analysis into
@@ -77,6 +149,8 @@ pub mod policy;
 mod ty_convert;
 mod verifier_api;
 
+use std::sync::Arc;
+
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_middle::mir;
@@ -88,9 +162,34 @@ use rustc_middle::ty::print::{
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_span::Symbol;
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
-use std::sync::Arc;
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::*;
+
+/// Invocation-scoped diagnostic identity for contract assumptions that were
+/// deliberately dropped.  One MIR body is extracted at several independent
+/// verifier seams (root verification, R1 analysis, and native bundling).  Those
+/// consumers must all recompute the fail-closed gate, but they must not each
+/// report the same source-level warning.  Compiletest deliberately disables the
+/// diagnostic engine's generic deduplication, so make this ownership explicit.
+///
+/// Session storage is load-bearing: a process embedding rustc may compile more
+/// than one crate, and a process-global cache could suppress a later Session's
+/// diagnostics.  Distinct reasons remain distinct; only an exact
+/// `(definition, reason)` replay is coalesced.
+#[derive(Default)]
+struct SessionContractAssumptionWarnings {
+    emitted: FxHashSet<(DefId, contract_assumption_gate::AssumeSkipReason)>,
+}
+
+fn first_contract_assumption_warning(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    reason: &contract_assumption_gate::AssumeSkipReason,
+) -> bool {
+    tcx.sess.with_trust_compiler_state::<SessionContractAssumptionWarnings, _>(|state| {
+        state.emitted.insert((def_id, reason.clone()))
+    })
+}
 #[allow(deprecated)]
 pub use verifier_api::{
     TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY, VerifierVcContentIdentity,
@@ -139,10 +238,12 @@ pub use verifier_api::{
 /// The namespace qualifier is load-bearing, not hedging.
 /// `DefPathData::TypeNs(sym)` and `DefPathData::ValueNs(sym)` are DIFFERENT
 /// variants and the disambiguator counter is keyed on `(parent, DefPathData)`,
-/// so a `fn S` and a `struct S` under one parent are BOTH `#0` and both still
-/// render `S`. That is MEASURED OPEN — two distinct bundled bodies under one
-/// `krate::go::S::m`, identically on this seam's build and on the pristine base
-/// — and it is §RESIDUAL 7, with its two consumer-level differentials.
+/// so a `fn S` and a `struct S` under one parent are BOTH `#0` and the
+/// DISAMBIGUATOR still renders both `S`. That class is §RESIDUAL 7 and it is
+/// CLOSED — not by the disambiguator, which cannot reach it, but one frame out
+/// by [`apply_cross_namespace_tag`], which is applied to the output of both
+/// renderers below. This paragraph said "MEASURED OPEN" for two days after the
+/// tag had landed; see the correction note on `apply_cross_namespace_tag`.
 ///
 /// # What moves, and what a consumer may rely on
 ///
@@ -151,7 +252,15 @@ pub use verifier_api::{
 /// sibling shares the same `(parent, DefPathData)`, and the `ty::ParamTy` marker
 /// fires only on a parameter whose name is a primitive. Note that the same
 /// sentence bounds what the disambiguator can REACH: siblings under different
-/// `DefPathData` variants are never counted together (§RESIDUAL 7).
+/// `DefPathData` variants are never counted together — that is §RESIDUAL 7, and
+/// it is handled by [`apply_cross_namespace_tag`], not by this closure.
+///
+/// There is a FOURTH mover, and it does NOT have that property either: the
+/// cross-namespace tag applied below is a suffix over the whole `DefPath` chain,
+/// so it moves an UNAMBIGUOUS local path whenever an ancestor segment is the
+/// non-`TypeNs` half of a collision (`k::go::S::Inner#ns1v`, measured against a
+/// one-identifier control's `k::go::S::Inner`). Read `apply_cross_namespace_tag`'s
+/// "What moves" before assuming a spelling survived.
 ///
 /// The `{{extern}}` closure does NOT have that property and must not be
 /// described as if it did. It renders a segment rustc dropped
@@ -191,6 +300,60 @@ pub fn safe_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     apply_cross_namespace_tag(tcx, def_id, rendered)
 }
 
+/// The DEFINITION-side [`trust_types::CalleeIdentity`] of `def_id` — the
+/// identity a CALL to this item carries when the call is the item itself rather
+/// than an instantiation of it.
+///
+/// This is the exact counterpart of the call-site identity the extractor stamps
+/// onto `Terminator::Call::callee_identity`, computed by the SAME function
+/// ([`convert::callee_identity_for`]) over the item's own
+/// `GenericArgs::identity_for_item`. Two consequences, both deliberate:
+///
+/// * **The `'a`/`'_` desync closes.** For an item whose only generic parameters
+///   are LIFETIMES — `impl<'a> Parser<'a> { fn peek(&self) }`, the measured R43
+///   blocker — the identity args are `['a]` and a call site's are `['_]`. Both
+///   erase to `[ReErased]`, so both sides produce the SAME digest and the same
+///   `DefId` halves. The two keys meet because they denote the same code, not
+///   because a string was rewritten.
+/// * **A type/const-generic item gets `None`, and must.** Its identity args
+///   mention a `ty::Param`, which `callee_identity_for` refuses. So a fact
+///   registered about the ONE pre-monomorphization body verified for a generic
+///   item can never be transferred to a concrete call `f::<u32>` by this route —
+///   "the generic body verified" does not imply "every instantiation is
+///   panic-free", and that distinction is exactly what the argument-free
+///   `safe_def_path_str` key lost.
+///
+/// Callers must treat `None` as "no identity-keyed decision is available",
+/// NEVER as a licence to compare rendered paths instead.
+pub fn item_identity(tcx: TyCtxt<'_>, def_id: DefId) -> Option<trust_types::CalleeIdentity> {
+    convert::callee_identity_for(
+        tcx,
+        def_id,
+        rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
+    )
+}
+
+/// The definition-side [`trust_types::CalleeIdentity`] of one fully resolved
+/// instantiation.
+///
+/// This is the instantiated counterpart of [`item_identity`].  It is exposed
+/// for compiler-owned provenance ledgers that already hold the exact
+/// [`rustc_middle::ty::Instance`] whose MIR they instantiated.  The same
+/// fail-closed rules as the call-site extractor apply: type/const parameters,
+/// inference variables, and placeholders return `None`; regions alone are
+/// erased before the substitution digest is minted.
+///
+/// Consumers must compare the result to a call's extracted
+/// `Terminator::{Call,TailCall}::callee_identity`; rendered function names are
+/// diagnostic labels and are not a fallback identity.
+pub fn instance_identity<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: rustc_middle::ty::GenericArgsRef<'tcx>,
+) -> Option<trust_types::CalleeIdentity> {
+    convert::callee_identity_for(tcx, def_id, args)
+}
+
 /// Like [`safe_def_path_str`] but renders the path with its CONCRETE
 /// monomorphized generic arguments (`std::vec::Vec::<[u8; 1099511627776]>::with_capacity`
 /// rather than the generic `Vec::<T>::with_capacity`). Used for bulk-allocation
@@ -201,9 +364,13 @@ pub fn safe_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// was reported proved — and kernel-certified — because `T` was erased to the
 /// generic param here).
 ///
-/// Discrimination (NOT injectivity): see [`safe_def_path_str`]. The flag reaches
+/// Discrimination (NOT injectivity): see [`safe_def_path_str`]. The FLAG reaches
 /// the nested types too (`args` and an impl's `Self`/trait ref all print through
-/// the same `print_path_with_simple`), which is what separates
+/// the same `print_path_with_simple`) — but read "the flag" literally: the
+/// cross-namespace TAG is not a flag, it is a suffix computed from this
+/// `def_id`'s own chain by [`apply_cross_namespace_tag`], and it does NOT reach
+/// the nested types (§RESIDUAL 7c there, with two measured witnesses). The flag
+/// is what separates
 /// `<krate::f::S as core::fmt::Write>::write_fmt` from its sibling — there the
 /// ambiguity is in the SELF TYPE, not in the callee's own segments. The self type
 /// is also where the residual lives: this function renders a CALL's key from the
@@ -260,25 +427,129 @@ pub fn safe_def_path_str_with_args<'tcx>(
 /// sibling index can be consulted. Only a segment with an actual cross-namespace
 /// sibling is tagged.
 ///
-/// # What moves
+/// # CORRECTION, 2026-08-21 — this tag has been LIVE since `12f3b32af9`
 ///
-/// Nothing, unless the crate being compiled declares a name in two namespaces
-/// under one parent. Of the colliding pair only the NON-`TypeNs` side is tagged,
-/// so `TypeNs` spellings — every module, every ADT, every trait, and therefore
-/// every `core::`/`alloc::`/`std::` prefix — are byte-identical to what they were.
+/// It landed on 2026-08-18 in `9440395b41`, was reverted with the assumption
+/// census in `16be43eca1`, and came back on 2026-08-19 12:55 in `12f3b32af9`,
+/// whose message is entirely about the census — the namespace half rode along
+/// unmentioned. Nothing was re-measured, so three neighbouring claims went on
+/// saying OPEN: this seam's own paragraph above, `direct_call_def_path`
+/// §RESIDUAL 7, and `reports/soundness-findings-status-2026-08-19.md`, written
+/// two hours after the tag was restored. Re-measured 2026-08-21 on the STAGE2
+/// `trustc` built from `ddb545d35b` (every number in this comment is from that
+/// binary unless it says otherwise), the shape §RESIDUAL 7 documents now renders
+/// FOUR bodies under FOUR paths where it rendered four under three, and its
+/// native-bundle keys separate:
+/// `vc:h0_nsclash__go__S__m_x23ns1v:trust_mc_default_function:0` against
+/// `vc:nsclash__go__S__m:arithmetic_safety:0`. Its consumer differential is
+/// gone: the clash and its one-identifier control both report `0 proved,
+/// 1 failed … out of 1 obligation(s)`.
+/// Pinned by `tests/ui/trust/cross_namespace_key_alias_stays_closed.rs`, watched
+/// red by renaming the `struct S` to `S2`.
+///
+/// # What moves — MEASURED, not argued
+///
 /// The tag is a SUFFIX (`#ns<depth><ns-letter>`, `.`-separated for more than one
 /// segment), so ROOT-anchored classifiers are untouched; `#` cannot occur in a
 /// Rust path, exactly as for the `{extern#N}` segment and the `@`-stamp.
 ///
-/// Both directions matter here and both were measured — a spelling change that
-/// stops matching an `EXACT_TOTAL` summary entry LOSES a sound recovery. Every
+/// The `letter == 't'` skip in `cross_namespace_tag` buys exactly one thing and
+/// it must not be over-read: of the colliding PAIR, the `TypeNs` half's OWN
+/// segment is never marked. It does NOT keep `TypeNs` spellings in general,
+/// because the tag is a suffix over the WHOLE `DefPath` CHAIN — so any LOCAL
+/// item, in ANY namespace, that sits UNDER a marked ancestor moves with it.
+/// MEASURED, same crate name `k`, one identifier apart (`struct S` renamed
+/// `S2`), a `mod M` with an ADT, a trait, a trait impl and a fn nested inside a
+/// `fn S` that collides with a sibling `struct S`:
+///
+/// ```text
+/// clash                                          control
+/// k::go::S::M::Ad#ns1v                           k::go::S::M::Ad
+/// k::go::S::M::mf#ns1v                           k::go::S::M::mf
+/// <k::go::S::M::Ad as k::go::S::M::Tr>::t#ns1v   <k::go::S::M::Ad as k::go::S::M::Tr>::t
+/// k::go::S::Inner#ns1v (a nested ADT)            k::go::S::Inner
+/// ```
+///
+/// An earlier revision of this comment claimed those spellings were
+/// byte-identical. They are not, and the claim was also load-bearing for the
+/// wrong reason: what actually keeps every `core::`/`alloc::`/`std::` spelling
+/// byte-identical is the `!def_id.is_local()` early return, and NOTHING else.
+/// MEASURED on the same clash/control pair, which allocates a `Vec<u8>` so the
+/// foreign surface is non-empty: all ten rendered `core::`/`alloc::` strings —
+/// `alloc::vec::Vec::<u8>::with_capacity::<__trust_elem_bytes@1>`,
+/// `core::hint::black_box::<&alloc::vec::Vec<u8>>`, `alloc::alloc::Global`,
+/// `core::ptr::non_null::NonNull` and the rest — are byte-identical across the
+/// two. Note the corollary for the other half of the pair: descendants of the
+/// `TypeNs` half do NOT move (a `pub mod S` beside a `pub fn S` renders its
+/// child `nsdep::S::inner` untagged), because the mod segment is the one the
+/// `'t'` skip declines to mark.
+///
+/// Sampled on the stage2 `trustc` from `ddb545d35b`, every body dumped by
+/// `-Ztrust-dump=mir`, one source file at a time:
+///
+/// | population | files | bodies | distinct paths | tagged paths |
+/// |---|---|---|---|---|
+/// | A — all of `tests/ui/trust`, top level + all six subdirs | 298 | 750 | 747 | **4 — all in this change's own 3 fixtures** |
+/// | B — rustc's `tests/ui/{generics,impl-trait,imports,macros,modules,structs,traits}` | 2876 | — | — | **17** |
+///
+/// **Population A moved by ZERO paths outside this change's own fixtures**, and by
+/// zero STRINGS: the only `#ns` occurrences `grep -r` finds anywhere in the dumps
+/// are the five in `cross_namespace_key_alias_stays_closed`,
+/// `…does_not_fire_on_a_macro_shadow` and `…does_not_fire_on_an_assoc_type_shadow`
+/// — nothing in any other fixture's def path, callee key, type name or `Self`
+/// type. Everything Trust graded before this change is untouched, so the
+/// `EXACT_TOTAL` lost-recovery direction is unreachable there.
+///
+/// The BODY and DISTINCT-PATH counts are a property of the harness, not of the
+/// tag, and are left out of B for that reason: they move with the dump directory
+/// layout, with which fixtures a run manages to compile, and — in B, which runs
+/// each file under a 30-second timeout — with machine load. Two sweeps of A
+/// reported 750/747 and 848/851; two of B reported 3624/3612 and 3411/3400. What
+/// REPRODUCES is the TAG SET, and that is what this table is for: A's "none
+/// outside the new fixtures", and B's 17 with the enumeration below, of which
+/// `tests/ui/imports` was re-swept here (265 files) and returned exactly its two,
+/// `imports::c::test#ns1v` and `imports::c::test::f#ns2v`.
+///
+/// Across both populations EVERY tag letter observed was `v`: no `#ns…t`,
+/// `#ns…m` or `#ns…l` occurs anywhere. That absence is the load-bearing
+/// measurement for the `MacroNs` narrowing below. Read it as an absence of
+/// `t`/`m`/`l` MARKS, NOT as an absence of movement in the `TypeNs` namespace —
+/// the four `#ns1v` paths above are all `TypeNs`-rooted and every one of them
+/// carries a `v` mark inherited from an ancestor.
+///
+/// Both directions matter here — a spelling change that stops matching an
+/// `EXACT_TOTAL` summary entry LOSES a sound recovery. Every
 /// `EXACT_TOTAL`/`def_path_pins`/`has_trusted_std_root` spelling names a
 /// `core`/`alloc`/`std` item, all of which are FOREIGN to any crate under
-/// verification and so cannot be tagged at all (see the residual below), and the
-/// definition path and the call key are rendered from the same `def_id` through
-/// these same two functions, so they move together or not at all.
+/// verification and so cannot be tagged at all — by the `is_local` return above,
+/// measured, not by the `'t'` skip.
 ///
-/// # RESIDUAL — a FOREIGN cross-namespace collision is not detected
+/// # RESIDUAL 7a — the tag STOPS AT THE CRATE BOUNDARY, and that is asymmetric
+///
+/// The sentence that used to close the paragraph above — "the definition path
+/// and the call key are rendered from the same `def_id` through these same two
+/// functions, so they move together or not at all" — is MEASURED FALSE. They
+/// move together only WITHIN one compilation. `cross_namespace_tag` returns
+/// early on `!def_id.is_local()`, so a tagged definition is unreachable by name
+/// from downstream: compiling `pub mod S { … } pub fn S(..)` renders the
+/// function `nsdep::S#ns0v`, and compiling a crate that calls it renders the
+/// SAME `DefId` as `nsdep::S`. One `DefId`, two keys, split by the crate
+/// boundary.
+///
+/// What that costs is bounded by measurement, not by argument: within any single
+/// compilation the whole identity space is rendered by the same crate, so the
+/// bundled body, the callee key and the contract-summary key agree, and no
+/// differential was found through the routes tried. Two of those routes are
+/// re-measured here — the downstream bundle carries NO foreign body (see 7b), and
+/// the two-crate probe above — and one is inherited without re-measurement: an
+/// `ensures`-bearing colliding callee consumed cross-crate was reported identical
+/// to its control, on a lane that is dark anyway
+/// (`modular_callee_postcondition_reuse.rs` is `//@ ignore-test`, verified).
+/// Stated as a gap because the serialized-artifact consumers are where it would
+/// bite. An ordinary `trait T { type A; fn A(); }` walks into this gap for free;
+/// see the over-decline recorded on `def_path_data_namespace`.
+///
+/// # RESIDUAL 7b — a FOREIGN cross-namespace collision is not detected
 ///
 /// The index is built from `tcx.hir_crate_items(())`, which enumerates the LOCAL
 /// crate only; there is no cross-crate query that enumerates the children of an
@@ -287,9 +558,48 @@ pub fn safe_def_path_str_with_args<'tcx>(
 /// A foreign `def_id` is therefore never tagged. This is stated as a gap, not
 /// argued away, and it is NOT failed closed: a renderer has no fail-closed
 /// channel — it must return a string — and turning every foreign path into a
-/// refusal is a lost recovery with no measured exploit behind it. The measured
-/// reproducer is local, and so is every `#[trust::assume_total]` declaration a
-/// crate under verification can write.
+/// refusal is a lost recovery with no measured exploit behind it. Probed, and
+/// NOT reached by the obvious route: the §RESIDUAL 7 shape moved into a generic
+/// `#[inline]` body in a dependency and instantiated downstream put NO foreign
+/// body in the consumer's bundle, so the alias had nothing to alias.
+///
+/// # RESIDUAL 7c — the tag covers `def_id`'s OWN chain, never a NESTED type
+///
+/// `cross_namespace_tag` walks the chain of the `def_id` it is handed and appends
+/// one suffix to the finished string. Types rendered INSIDE a path — the generic
+/// `args`, an impl's `Self` type, a trait ref — arrive through `def_path_str
+/// _with_args`'s own printer and are never passed to this function, so they are
+/// never tagged. [`safe_def_path_str_with_args`]'s doc says "the flag reaches the
+/// nested types too"; that is true of `with_def_path_disambiguators!`, which is a
+/// printer flag, and FALSE of this tag, which is not.
+///
+/// Two consequences, both MEASURED on `ddb545d35b`'s stage2 `trustc`, crate name
+/// `k` throughout.
+///
+/// 1. **One type gets TWO spellings in ONE bundle.** With `fn S`/`struct S`
+///    colliding under `go` and a `struct Inner` plus a generic `fn take<T>`
+///    inside `fn S`, one dump carries both
+///    `k::go::S::Inner#ns1v` (rendered standalone, as a type name) and
+///    `k::go::S::take::<k::go::S::Inner>#ns1v` (the call key) — the SAME `Inner`,
+///    spelled with the tag in one place and without it in the other. Any consumer
+///    that matches an args-embedded type name against a standalone type name must
+///    not assume the two spellings agree.
+///
+/// 2. **Two DISTINCT local types collapse to ONE args spelling.** `fn S(..) {
+///    struct Inner([u8; 1 << 40]); }` beside `mod S { pub struct Inner(pub u8); }`
+///    under one `go` — the `fn S`/`mod S` pair IS in the collision index and the
+///    `fn S` body's own path duly renders `k::go::S#ns1v` — yet the two `Inner`s
+///    are BOTH rendered `k::go::S::Inner` inside args. Measured, the two
+///    `Vec::with_capacity` calls come out as
+///    `alloc::vec::Vec::<k::go::S::Inner>::with_capacity::<__trust_elem_bytes@1>`
+///    and `…::<__trust_elem_bytes@1099511627776>`: DIFFERENT keys, but the
+///    difference is entirely `direct_call_def_path`'s separate
+///    `__trust_elem_bytes@N` stamp — the hunt-11 capacity lane survives on THAT
+///    and not on this tag. Strip the stamp and the two keys are equal. In the
+///    same dump the two `black_box` calls, which carry no stamp, DO collapse:
+///    `core::hint::black_box::<&alloc::vec::Vec<k::go::S::Inner>>` occurs twice,
+///    once per element type. I did NOT drive a false proof through either; this is
+///    recorded as a live alias with a measured witness, not as a safe class.
 fn apply_cross_namespace_tag(tcx: TyCtxt<'_>, def_id: DefId, rendered: String) -> String {
     match cross_namespace_tag(tcx, def_id) {
         Some(tag) => rendered + &tag,
@@ -300,13 +610,158 @@ fn apply_cross_namespace_tag(tcx: TyCtxt<'_>, def_id: DefId, rendered: String) -
 /// The namespace letter this `DefPathData` variant contributes to the index, and
 /// the symbol it is keyed by. `Impl`/`Ctor`/`Closure`/... carry no user-chosen
 /// name in a namespace and cannot participate.
+///
+/// # Why `MacroNs` and `LifetimeNs` are NOT here — an OVER-DECLINE, measured
+///
+/// They were, and it moved honest paths. A name only belongs in this index if
+/// this seam can RENDER it, because the index exists to decide whether two
+/// renderings collide; a namespace nothing renders into can only ever move its
+/// partner. Both absences are measured, not reasoned:
+///
+/// * `MacroNs`. A `macro_rules!` has no MIR body and is never a callee, a type
+///   or a `Self`, so it never reaches a renderer — MEASURED as an ABSENCE with
+///   teeth: in `tests/ui/macros/meta-variable-misuse.rs` the macros `a`/`b`/`c`
+///   collide with fns `a`/`b`/`c`, and the fns came back
+///   `meta_variable_misuse::{a,b,c}#ns0v` while the macros never appeared at
+///   all; across both sampled populations not one `#ns…m` was rendered. So the entry
+///   bought nothing and cost this: a crate with `#[macro_export] macro_rules!
+///   increment` beside `pub fn increment` — the ordinary Rust idiom, no
+///   ambiguity anywhere in the identity space — rendered its function
+///   `macro_crate_use::increment#ns0v`.
+///
+///   ELEVEN of the SEVENTEEN tags on population B are this shape and nothing
+///   else — `cfg_expr::{BAR,baz,quux}`, `cfg_select_expr::{BAR,baz,quux}`,
+///   `meta_variable_misuse::{a,b,c}`, `macro_crate_use::increment`,
+///   `macro_crate_nonterminal::increment`. The remaining SIX are genuine
+///   `TypeNs`/`ValueNs` pairs and MUST keep their tags:
+///   `imports::c::test` (`mod test` + `fn test`), `imports::c::test::f`
+///   (`pub mod f` + `pub fn f`), `special_module_name_ignore::main`
+///   (`mod main;` + `fn main`), `issue_2936::cbar` (`struct cbar` + `fn cbar`),
+///   `generic_impl_method_params_2311::foo` (`struct foo<A>` + `fn foo<A>`),
+///   `issue_114682_2_extern::d::max` (`pub fn max` + `pub(crate) mod max`).
+///   Nearly two thirds of every tag this seam emitted was noise, and each one put
+///   an exported function into §RESIDUAL 7a's asymmetric class for nothing.
+/// * `LifetimeNs`. A lifetime's `Symbol` carries its leading `'`, so it cannot
+///   equal a type or value symbol at all — MEASURED as a falsify-once PAIR, same
+///   shape, same compiler, the partner item the only difference:
+///   `fn f<'a>(r: &'a u32) { fn a(..) {} … }` puts `'a` and `a` under ONE parent
+///   and renders `k::f::a` UNTAGGED, while `fn f(..) { mod a {…} fn a(..) {} … }`
+///   — a genuine `TypeNs`/`ValueNs` pair in the same position — renders
+///   `k::f::a#ns1v`. The `l` entry could therefore never have fired on the first
+///   shape, and removing it cannot suppress the second.
+///
+/// NOT BUILT: this narrowing and the `DefKind::ExternCrate` filter in
+/// `local_cross_namespace_collisions` are the two edits in this change that a
+/// rebuilt `trustc` has not executed (`x.py` is not available to the author). What
+/// they have instead, and what they do not have, stated exactly:
+///
+/// * The selection logic above, the `def_kind` filter in
+///   `local_cross_namespace_collisions` and the mark loop in `cross_namespace_tag`
+///   were extracted into a standalone program with 9 cases, and EACH REMOVAL WAS
+///   WATCHED TO FAIL FIRST, on its own `cfg`. With the pre-change letter set
+///   `['t','v','m','l']` the macro-shadow case asserts `[(0,'v')]` where `[]` is
+///   required — exit 101. With `['t','v']` but no `def_kind` filter, the
+///   extern-crate-shadow case fails the same way — exit 101. With both, all 9 pass
+///   — exit 0. The cases cover the real `TypeNs`/`ValueNs` pair, the macro shadow,
+///   a three-way `m`+`t`+`v` (a macro must not be able to SUPPRESS a real tag), a
+///   lifetime shadow, the extern-crate shadow, an extern crate beside a real pair
+///   (it must not suppress that tag either), different parents, mark inheritance
+///   by a descendant, and `Impl`/`Ctor`/`Closure` non-participation.
+/// * Both narrowings are strictly subtractive — they can only remove entries from
+///   the collision index, hence only remove tags, never add one — and the graded
+///   corpus contains no tag to remove: 298 `tests/ui/trust` fixtures swept on the
+///   stage2 `trustc` from `ddb545d35b`, 750 dumped bodies, 747 distinct def paths,
+///   and the only `#ns` occurrences anywhere in the dumps are the four paths in the
+///   three fixtures this change adds. One of those four,
+///   `…_macro_shadow::increment#ns0v`, is precisely the tag the `MacroNs` removal
+///   deletes, which is why that fixture ships `//@ ignore-test`. So neither
+///   narrowing can disturb the suite.
+/// * Neither has been run inside a compiler. Falsify them there with three probes
+///   on `apply_cross_namespace_tag`: `macro_rules! foo` beside `pub fn foo` must
+///   render `k::foo`; `#![no_std] extern crate alloc;` beside `pub fn alloc` must
+///   render `k::alloc` (it renders `k::alloc#ns0v` today, measured); and `mod S`
+///   beside `fn S` must STILL render `k::S#ns0v`.
+///   `tests/ui/trust/cross_namespace_tag_does_not_fire_on_a_macro_shadow.rs` is the
+///   first as a fixture, `//@ ignore-test` until the first build; the third is
+///   `cross_namespace_key_alias_stays_closed.rs`, which is live and green.
+///
+/// # `TypeNs` names this seam cannot render — ONE FIXED, TWO RECORDED
+///
+/// The rule above ("a name belongs in this index only if this seam can RENDER
+/// it") is not satisfied by every `TypeNs` name, and the ones that fail it are
+/// reached by ordinary Rust idioms, not by contrived collisions.
+/// `rustc_hir/src/def.rs` maps `DefKind::ExternCrate`, `DefKind::TyAlias` and
+/// `DefKind::AssocTy` into the same `DefPathData::TypeNs` arm as `Mod`, so all
+/// three enter this index and tag their `ValueNs` partner. Three were PROBED and
+/// are listed below; that is what was probed, NOT a proof of exhaustiveness over
+/// that arm.
+///
+/// * **`ExternCrate` — FIXED**, in `local_cross_namespace_collisions`, because it
+///   has exactly the premise `MacroNs` has and the premise is measured: with
+///   `extern crate alloc as A;` the dumps render `alloc::vec::Vec`, never
+///   `A::vec::Vec`, and an extern-crate binding has no MIR body and is never a
+///   callee, a type, a `Self` or a rendered path prefix — so its entry could only
+///   ever move its partner. Falsify-once pair on `ddb545d35b`'s stage2, one
+///   identifier apart: `#![no_std] extern crate alloc; pub fn alloc(v: u32) -> u32`
+///   rendered `k::alloc#ns0v`, while `extern crate alloc as ax;` with the
+///   byte-identical function renders `k::alloc`. Two-crate consequence, straight
+///   into §RESIDUAL 7a: the defining crate rendered `ecdep::alloc#ns0v` and a
+///   consumer of it rendered `ecdep::alloc` — one `DefId`, two keys, on an EXPORTED
+///   function reached by ordinary `#![no_std]` Rust.
+/// * **`TyAlias` — RECORDED, not fixed.** `pub type S = u32; pub fn S(v: S) -> S`
+///   renders `k::S#ns0v` against the one-identifier control `pub type Q = u32;`,
+///   which renders `k::S`. It is left standing for the same reason as `AssocTy`
+///   below and no other: a type alias IS a type, so the non-renderability premise
+///   that licences the `ExternCrate` and `MacroNs` removals is NOT established for
+///   it.
+/// * **`AssocTy` — RECORDED, not fixed**, with its witness:
+///
+/// An associated TYPE and an associated FN with the same name are siblings under
+/// the SAME parent — the `impl` — so they enter the index as a `t`/`v` pair and
+/// the METHOD is tagged. MEASURED on `ddb545d35b`'s stage2 `trustc`, same crate
+/// name `k`, one identifier apart (`type A` renamed `type B`):
+///
+/// ```text
+/// pub trait T { type A; fn A(v: u32) -> u32; }   ->  <k::X as k::T>::A#ns1v
+/// pub trait T { type B; fn A(v: u32) -> u32; }   ->  <k::X as k::T>::A
+/// ```
+///
+/// That is a spelling move on an honest path, and on an EXPORTED one: it drops
+/// the method straight into §RESIDUAL 7a. MEASURED with a two-crate probe —
+/// compiling the dependency renders `<assocdep::X as assocdep::T>::A#ns1v`,
+/// while compiling a consumer that calls it renders the SAME `DefId` as
+/// `<assocdep::X as assocdep::T>::A`. One `DefId`, two keys, and no source-level
+/// ambiguity anywhere to justify either.
+///
+/// WHY IT IS NOT FIXED HERE, stated rather than glossed. The fix is mechanically
+/// available and the `ExternCrate` line above proves it — the loop has
+/// `tcx.def_kind` in hand, so `DefKind::AssocTy` is one more `matches!` arm — but
+/// it needs a premise this author cannot establish: that no associated type ever
+/// reaches this seam. `MacroNs` and `ExternCrate` have that premise structurally
+/// and measurably (no MIR body, not a type, never rendered — and for
+/// `extern crate alloc as A;` the seam was watched rendering `alloc::…`, never
+/// `A::…`); an associated type IS a type, so the argument does not transfer, and the
+/// evidence I have is one probe — a `P::Assoc`/`<X as Tr>::Assoc` signature pair
+/// that rustc normalized to `u32` and never rendered — against ~100 call sites
+/// of [`safe_def_path_str`]/[`safe_def_path_str_with_args`] across
+/// `trust-mir-extract`, `trust-thir-lower` and `rustc_mir_transform`, several of
+/// which take their `DefId` from an attribute or allocation scan rather than
+/// from a body. Dropping the entry on that evidence would create the alias in
+/// the fail-OPEN direction (both halves rendering `<X as T>::A`) to remove a
+/// lost recovery, which is the wrong trade to make blind. So it is recorded with
+/// its witness and left standing.
+///
+/// Pinned by `tests/ui/trust/cross_namespace_tag_does_not_fire_on_an_assoc_type
+/// _shadow.rs`, which is `//@ ignore-test` and RED ON PURPOSE: it asserts the
+/// spelling this seam OUGHT to produce. Un-ignore it in the same commit that
+/// drops `DefKind::AssocTy` from the index, and not before — and do not read that
+/// commit as closing the class: `TyAlias` would still be in the index, and these
+/// three names are what was probed, not an enumeration of `def.rs`'s `TypeNs` arm.
 fn def_path_data_namespace(data: rustc_hir::definitions::DefPathData) -> Option<(Symbol, char)> {
     use rustc_hir::definitions::DefPathData;
     match data {
         DefPathData::TypeNs(name) => Some((name, 't')),
         DefPathData::ValueNs(name) => Some((name, 'v')),
-        DefPathData::MacroNs(name) => Some((name, 'm')),
-        DefPathData::LifetimeNs(name) => Some((name, 'l')),
         _ => None,
     }
 }
@@ -345,8 +800,27 @@ fn local_cross_namespace_collisions(tcx: TyCtxt<'_>) -> CrossNamespaceIndex {
         let Some((name, letter)) = def_path_data_namespace(key.disambiguated_data.data) else {
             continue;
         };
-        let bit = 1u8 << (['t', 'v', 'm', 'l'].iter().position(|c| *c == letter).unwrap_or(0));
-        *namespaces.entry((parent.as_u32(), name.as_u32())).or_default() |= bit;
+        // `DefKind::ExternCrate` is a `DefPathData::TypeNs` (`rustc_hir/src/def.rs`,
+        // same arm as `Mod` and `TyAlias`), but an extern-crate BINDING is never
+        // rendered by this seam — with `extern crate alloc as A;` the dumps carry
+        // `alloc::vec::Vec`, never `A::vec::Vec` (measured) — so an entry for it can
+        // only ever move its ValueNs partner. That is the `MacroNs` premise exactly,
+        // and `#![no_std] extern crate alloc; pub fn alloc(..)` walks into it from
+        // ordinary Rust: it rendered `k::alloc#ns0v` against the one-identifier
+        // control's `k::alloc`, and cross-crate `ecdep::alloc#ns0v` at the definition
+        // against `ecdep::alloc` at the consumer (§RESIDUAL 7a) — one `DefId`, two
+        // keys, on an EXPORTED function nothing in the source made ambiguous.
+        if matches!(tcx.def_kind(local.to_def_id()), DefKind::ExternCrate) {
+            continue;
+        }
+        // `unwrap_or` would fold an unlisted letter onto `t`'s bit and hide it
+        // from `count_ones`; every letter `def_path_data_namespace` can return
+        // must be listed here, so an unlisted one is a bug, not a default.
+        let Some(shift) = ['t', 'v'].iter().position(|c| *c == letter) else {
+            debug_assert!(false, "namespace letter {letter:?} has no index bit");
+            continue;
+        };
+        *namespaces.entry((parent.as_u32(), name.as_u32())).or_default() |= 1u8 << shift;
     }
     let mut index = FxHashSet::default();
     #[allow(rustc::potential_query_instability)]
@@ -1199,37 +1673,89 @@ pub fn convert_trust_contract_bundle<'tcx>(
 /// A miss leaves the field empty and returns a stable blocker code. This is
 /// intentionally fail-closed and lets legacy single-loop bundles retain their
 /// existing span fallback without granting nested-loop authority.
+///
+/// # Cross-crate inlined scopes are a MISS, never a stamp
+///
+/// A body that is entirely local can still contain source scopes that came from
+/// another crate: the MIR inliner APPENDS the callee's `source_scopes` verbatim
+/// into the caller (`rustc_mir_transform::inline`), and a callee decoded from
+/// crate metadata carries `ClearCrossCrate::Clear` because crate-local scope
+/// data is deliberately never encoded cross-crate. Every backedge with such an
+/// endpoint is dropped here and counted; the count refines the blocker code so
+/// the resulting miss names the real cause instead of reading as "this HIR loop
+/// has no natural MIR loop". See [`ScopeLoopIdentity`] for why a cleared scope
+/// must not be flattened into the ordinary unstamped-scope case.
 pub fn stamp_loop_header_provenance(
     body: &mir::Body<'_>,
     bundle: &mut CompilerContractBundle,
 ) -> Vec<(u32, String)> {
     let dominators = body.basic_blocks.dominators();
     let mut backedges = Vec::new();
+    let mut cross_crate_opaque_backedges = 0usize;
     for (latch, block) in body.basic_blocks.iter_enumerated() {
         if !dominators.is_reachable(latch) {
             continue;
         }
         for header in block.terminator().successors() {
-            if dominators.dominates(header, latch) {
-                backedges.push(StampedNaturalBackedge {
-                    header: header.as_usize(),
-                    header_hir_local_id: source_loop_local_id(body, header),
-                    latch_hir_local_id: source_loop_local_id(body, latch),
-                });
+            if !dominators.dominates(header, latch) {
+                continue;
             }
+            let (
+                ScopeLoopIdentity::CrateLocal(header_hir_local_id),
+                ScopeLoopIdentity::CrateLocal(latch_hir_local_id),
+            ) = (source_loop_local_id(body, header), source_loop_local_id(body, latch))
+            else {
+                // Fail closed and stay countable: an endpoint whose scope data
+                // was cleared cross-crate can neither nominate a header nor be
+                // nominated as one, because this crate holds no HIR-loop
+                // identity for it and may not invent one.
+                cross_crate_opaque_backedges += 1;
+                continue;
+            };
+            backedges.push(StampedNaturalBackedge {
+                header: header.as_usize(),
+                header_hir_local_id,
+                latch_hir_local_id,
+            });
         }
     }
 
-    stamp_loop_header_provenance_from_backedges(&backedges, bundle)
+    stamp_loop_header_provenance_from_backedges(&backedges, cross_crate_opaque_backedges, bundle)
 }
 
-fn source_loop_local_id(body: &mir::Body<'_>, block: mir::BasicBlock) -> Option<u32> {
-    body.source_scopes[body.basic_blocks[block].terminator().source_info.scope]
-        .local_data
-        .as_ref()
-        .unwrap_crate_local()
-        .trust_loop_hir_local_id
-        .map(|local_id| local_id.as_u32())
+/// A backedge endpoint's Trust loop identity, as far as THIS crate can know it.
+///
+/// `SourceScopeData::local_data` is a `ClearCrossCrate`, and the two states are
+/// NOT interchangeable for provenance:
+///
+/// * `CrateLocal(None)` means this crate saw the scope and the scope carried no
+///   Trust loop stamp. The other endpoint of the backedge may still nominate
+///   the header — that is the documented one-sided-stamp rule above.
+/// * `ClearedCrossCrate` means this crate never had the data at all. Reading it
+///   as `CrateLocal(None)` would silently promote "unknown" to "known to carry
+///   no stamp" and let the opposite endpoint bind a block from inlined foreign
+///   MIR as an authored loop's header, which nothing here can substantiate.
+///
+/// Unwrapping the cleared case instead of matching it is what ICEd the whole
+/// third-party verification lane: `unwrap_crate_local` is `bug!("unwrapping
+/// cross-crate data")`.
+enum ScopeLoopIdentity {
+    /// This crate holds the scope's local data; the payload is the authored
+    /// loop's HIR-local id when the scope carries one.
+    CrateLocal(Option<u32>),
+    /// The scope arrived with cross-crate inlined MIR and its crate-local data
+    /// was cleared. No identity exists here.
+    ClearedCrossCrate,
+}
+
+fn source_loop_local_id(body: &mir::Body<'_>, block: mir::BasicBlock) -> ScopeLoopIdentity {
+    let scope = &body.source_scopes[body.basic_blocks[block].terminator().source_info.scope];
+    match scope.local_data.as_ref() {
+        mir::ClearCrossCrate::Set(local_data) => ScopeLoopIdentity::CrateLocal(
+            local_data.trust_loop_hir_local_id.map(|local_id| local_id.as_u32()),
+        ),
+        mir::ClearCrossCrate::Clear => ScopeLoopIdentity::ClearedCrossCrate,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1239,8 +1765,13 @@ struct StampedNaturalBackedge {
     latch_hir_local_id: Option<u32>,
 }
 
+/// `cross_crate_opaque_backedges` is the number of dominator-proved backedges
+/// that were DROPPED before candidacy because an endpoint's source-scope data
+/// was cleared by cross-crate MIR inlining. It never admits a header; it only
+/// makes the resulting refusal name its cause.
 fn stamp_loop_header_provenance_from_backedges(
     backedges: &[StampedNaturalBackedge],
+    cross_crate_opaque_backedges: usize,
     bundle: &mut CompilerContractBundle,
 ) -> Vec<(u32, String)> {
     // This function is also a restamping boundary for the public portable
@@ -1332,6 +1863,17 @@ fn stamp_loop_header_provenance_from_backedges(
         candidates.dedup();
         let decision = match candidates.as_slice() {
             [header] => Ok(*header),
+            // A miss in a body that also carries cross-crate-cleared backedges
+            // must not be reported as "this loop has no natural MIR header":
+            // the dropped edges are exactly the ones this crate could not read,
+            // so the honest verdict is that the mapping is UNAVAILABLE here.
+            // Still fail-closed — no header is bound either way.
+            [] if cross_crate_opaque_backedges > 0 => Err(format!(
+                "e45.loop-source.cross-crate-inlined-scope: HIR loop {hir_local_id} matched no \
+                 readable dominator-proved MIR header; {cross_crate_opaque_backedges} \
+                 dominator-proved backedge(s) in this body carry source-scope data cleared by \
+                 cross-crate MIR inlining and can authorize nothing"
+            )),
             _ => {
                 let code = if candidates.is_empty() {
                     "e45.loop-source.no-mir-header"
@@ -1504,8 +2046,9 @@ fn convert_trust_contract_predicate(
 pub fn trust_contract_proposition_to_formula(
     proposition: &rustc_trust_contract::TrustContractProposition,
 ) -> Formula {
-    use rustc_trust_contract::TrustContractProposition as Proposition;
-    use rustc_trust_contract::TrustContractPropositionDomain as Domain;
+    use rustc_trust_contract::{
+        TrustContractProposition as Proposition, TrustContractPropositionDomain as Domain,
+    };
 
     let boxed =
         |proposition: &Proposition| Box::new(trust_contract_proposition_to_formula(proposition));
@@ -1557,8 +2100,9 @@ pub fn trust_contract_proposition_to_formula_and_domains_for_class(
     proposition: &rustc_trust_contract::TrustContractProposition,
     expected_class: trust_types::CompilerContractExpressionClass,
 ) -> Result<(Formula, Vec<trust_types::CompilerContractVariableDomain>), String> {
-    use rustc_trust_contract::TrustContractProposition as Proposition;
-    use rustc_trust_contract::TrustContractPropositionDomain as Domain;
+    use rustc_trust_contract::{
+        TrustContractProposition as Proposition, TrustContractPropositionDomain as Domain,
+    };
     use trust_types::{CompilerContractValueDomain as ValueDomain, CompilerContractVariableDomain};
 
     fn collect(
@@ -1905,12 +2449,8 @@ pub fn faithful_principal_key<'tcx>(
         // recursively rendered arguments, which is injective where `Ty::Adt`'s erased
         // `name` was not. The closed grammar still runs first at every node, so every
         // spelling admitted before this slice is byte-identical.
-        let rendered = faithful_key_component(
-            tcx,
-            arg_ty,
-            owner,
-            trust_types::principal_arg_refusal_tag_for,
-        )?;
+        let rendered =
+            faithful_key_component(tcx, arg_ty, owner, trust_types::principal_arg_refusal_tag_for)?;
         args.push(dollar_free(rendered)?);
     }
 
@@ -1926,12 +2466,8 @@ pub fn faithful_principal_key<'tcx>(
         // rendering as a principal argument — `Item = Vec<i32>` and `Item = Vec<u64>` are
         // different types sharing one principal path AND one binding name, so the term is
         // the only thing that can separate them.
-        let term_key = faithful_key_component(
-            tcx,
-            term,
-            owner,
-            trust_types::assoc_binding_refusal_tag_for,
-        )?;
+        let term_key =
+            faithful_key_component(tcx, term, owner, trust_types::assoc_binding_refusal_tag_for)?;
         bindings.push(format!("{name}={}", dollar_free(term_key)?));
     }
     bindings.sort();
@@ -1968,8 +2504,6 @@ pub fn faithful_principal_key<'tcx>(
     }
     Ok(out)
 }
-
-
 
 pub fn extract_function<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) -> VerifiableFunction {
     extract_function_with_contract_bundle(tcx, body, None)
@@ -2104,13 +2638,15 @@ fn extract_function_with_purpose<'tcx>(
         hir_param_source_names.as_deref(),
     );
     for reason in &skipped {
-        tcx.sess.dcx().span_warn(
-            body.span,
-            format!(
-                "`#[trust::requires]` on `{name}` is not assumed for body verification: {}",
-                reason.describe()
-            ),
-        );
+        if first_contract_assumption_warning(tcx, body.source.def_id(), reason) {
+            tcx.sess.dcx().span_warn(
+                body.span,
+                format!(
+                    "`#[trust::requires]` on `{name}` is not assumed for body verification: {}",
+                    reason.describe()
+                ),
+            );
+        }
     }
 
     // Trust: attach always-true enum-discriminant range invariants so exhaustive
@@ -2217,7 +2753,7 @@ fn enum_discriminant_range_preconditions<'tcx>(
     // and turn a genuinely-reachable block UNSAT — a false-PROVE. rustc local
     // indices coincide with `vbody` local indices, so this map keys join with the
     // `vbody`-derived `d` in the switch loop below.
-    let mut discr_tags: FxHashMap<usize, Vec<u128>> = FxHashMap::default();
+    let mut discr_tags: FxHashMap<usize, Vec<i128>> = FxHashMap::default();
     for bb in body.basic_blocks.iter() {
         for stmt in &bb.statements {
             let mir::StatementKind::Assign(box (place, mir::Rvalue::Discriminant(src))) =
@@ -2419,11 +2955,20 @@ fn integer_param_range_preconditions(vbody: &VerifiableBody) -> Vec<Formula> {
 /// is not enum-typed. `Place::ty` walks the projection elems (`Downcast` /
 /// `Field` / `Deref`), so for a nested-enum payload read this returns the INNER
 /// enum's type — exactly the type whose tag the `Discriminant` rvalue observes.
+///
+/// The returned tags are DECODED (the same boundary as
+/// `ty_convert`'s `VariantDef::discriminant`): rustc's `Discr::val` is a raw
+/// two's-complement bit pattern at the discriminant type's width, so
+/// `Ordering::Less` arrives as `255` and must be read as `-1` before it can be
+/// stated about an `i8`-typed discriminant temp. Emitting the RAW set made
+/// `_d ∈ {255, 0, 1}` a FALSE fact about a local whose value is `-1` — and,
+/// once the matching `SwitchInt` guard is decoded, an UNSAT one, which would
+/// turn the `Less` arm vacuous and discharge every obligation on it.
 fn place_enum_tags<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mir::Body<'tcx>,
     place: &mir::Place<'tcx>,
-) -> Option<Vec<u128>> {
+) -> Option<Vec<i128>> {
     // Peel a single reference defensively: a by-`&Enum` match lowers to
     // `Discriminant((*r))`, which `Place::ty` already resolves to the enum, but a
     // bare reference source would otherwise be misread.
@@ -2433,7 +2978,15 @@ fn place_enum_tags<'tcx>(
     }
     if let rustc_middle::ty::TyKind::Adt(adt_def, _) = ty.kind() {
         if adt_def.is_enum() {
-            return Some(adt_def.discriminants(tcx).map(|(_, discr)| discr.val).collect());
+            // FAIL CLOSED on a tag with no `i128` denotation (a `#[repr(u128)]`
+            // tag above `i128::MAX`): emitting `val as i128` for it would state
+            // a NEGATIVE membership fact about a local that holds a huge
+            // unsigned value — a FALSE fact, and exactly the vacuity channel
+            // this decode exists to close. No fact at all is the safe answer.
+            return adt_def
+                .discriminants(tcx)
+                .map(|(_, discr)| crate::ty_convert::decode_discr_tag(discr.val, discr.ty, tcx))
+                .collect::<Option<Vec<i128>>>();
         }
     }
     None
@@ -2497,14 +3050,16 @@ const _: () = {
     );
 };
 
-/// Mirror `trust_vcgen::u128_to_formula` so the invariant's constant terms are
-/// byte-identical to the switch guard's, guaranteeing they cancel for exhaustive
-/// matches regardless of the discriminant's absolute (possibly signed) value.
-fn discriminant_tag_to_formula(value: u128) -> Formula {
-    match i128::try_from(value) {
-        Ok(n) => Formula::Int(n),
-        Err(_) => Formula::UInt(value),
-    }
+/// Render an already-DECODED enum tag (see [`place_enum_tags`]) as the constant
+/// term of the `_d ∈ {tags}` invariant.
+///
+/// The tags reaching here are mathematical integers, not raw bit patterns, so
+/// this is a plain `Formula::Int` — byte-identical to what the typed
+/// `SwitchInt`-label decode (`trust_vcgen::switch_label_to_formula`) produces
+/// for the matching arm, which is what lets the two cancel for an exhaustive
+/// match regardless of the discriminant's sign.
+fn discriminant_tag_to_formula(value: i128) -> Formula {
+    Formula::Int(value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3891,7 +4446,13 @@ fn extract_body<'tcx>(
     let return_ty =
         ty_convert::convert_ty_in_env(tcx, typing_env, body.local_decls[mir::RETURN_PLACE].ty);
 
-    let mut vbody = VerifiableBody { locals, blocks, arg_count: body.arg_count, return_ty, datatype_defs: Default::default() };
+    let mut vbody = VerifiableBody {
+        locals,
+        blocks,
+        arg_count: body.arg_count,
+        return_ty,
+        datatype_defs: Default::default(),
+    };
     if purpose == ExtractionPurpose::Verification {
         // These rewrites are proof-oriented normalizations. Even where they are
         // logically equivalent, they are not a one-to-one executable lowering,
@@ -4482,6 +5043,32 @@ fn validate_codegen_terminator<'tcx>(
                 return Err(unsupported(format!("call argument: {detail}")));
             }
         }
+        (
+            mir::TerminatorKind::TailCall { func, args, .. },
+            Terminator::TailCall { func: callee, args: ir_args, is_foreign, .. },
+        ) => {
+            if !matches!(func, mir::Operand::Constant(box constant)
+                if matches!(constant.const_.ty().kind(), rustc_middle::ty::TyKind::FnDef(..)))
+            {
+                return Err(unsupported(
+                    "indirect tail-call target has no executable callable representation"
+                        .to_string(),
+                ));
+            }
+            if *is_foreign {
+                return Err(unsupported(format!(
+                    "foreign tail call `{callee}` lacks exact ABI metadata"
+                )));
+            }
+            if args.len() != ir_args.len() {
+                return Err(abstraction(format!(
+                    "tail call `{callee}` arguments changed during extraction"
+                )));
+            }
+            if let Some(detail) = ir_args.iter().find_map(codegen_operand_issue) {
+                return Err(unsupported(format!("tail-call argument: {detail}")));
+            }
+        }
         (mir::TerminatorKind::Call { func, .. }, Terminator::Return) => {
             return Err(abstraction(format!(
                 "MIR Call `{func:?}` was rewritten into an ordinary Return (noreturn/exit semantics lost)"
@@ -4549,6 +5136,7 @@ fn codegen_terminator_name(terminator: &Terminator) -> &'static str {
         Terminator::SwitchInt { .. } => "SwitchInt",
         Terminator::Return => "Return",
         Terminator::Call { .. } => "Call",
+        Terminator::TailCall { .. } => "TailCall",
         Terminator::Assert { .. } => "Assert",
         Terminator::Drop { .. } => "Drop",
         Terminator::Opaque { .. } => "Opaque",
@@ -4598,7 +5186,7 @@ fn mark_exhaustive_enum_unreachable_switches<'tcx>(
     // (2) discriminant-temp tag sets — identical to
     // `enum_discriminant_range_preconditions`: `_d = Discriminant(src)` with a
     // whole-local dest maps `d` to the enum's full tag set.
-    let mut discr_tags: FxHashMap<usize, Vec<u128>> = FxHashMap::default();
+    let mut discr_tags: FxHashMap<usize, Vec<i128>> = FxHashMap::default();
     // Trust: piece #13 step-2 — locals `_d = Discriminant(coroutine_src)`. A
     // coroutine's resume-STATE discriminant switch has an `otherwise ->
     // Unreachable` arm that is genuinely infeasible; recognized STRUCTURALLY (no
@@ -4627,6 +5215,10 @@ fn mark_exhaustive_enum_unreachable_switches<'tcx>(
     // `vbody.locals` while `vbody.blocks` is mutably borrowed below).
     let int_locals: BTreeSet<usize> =
         vbody.locals.iter().filter(|l| matches!(&l.ty, Ty::Int { .. })).map(|l| l.index).collect();
+    // Same snapshot, keeping the declared TYPE: the discriminant temp's own
+    // width/signedness is what decodes the raw `SwitchInt` arm labels below.
+    let vbody_local_tys: FxHashMap<usize, Ty> =
+        vbody.locals.iter().map(|l| (l.index, l.ty.clone())).collect();
     // Otherwise-target reachability snapshot: which lowered blocks end in
     // `Unreachable`, keyed by the block's own `BlockId` (not its vec position,
     // so the `otherwise` BlockId lookup is correct even if blocks are reordered).
@@ -4678,8 +5270,24 @@ fn mark_exhaustive_enum_unreachable_switches<'tcx>(
             continue;
         }
         // (b) explicit case values == FULL valid tag set (equality, not subset).
-        let cases: BTreeSet<u128> = targets.iter().map(|(v, _)| *v).collect();
-        let full: BTreeSet<u128> = tags.iter().copied().collect();
+        //
+        // BOTH SIDES ARE DECODED. `tags` are decoded at the extraction boundary
+        // (`place_enum_tags`); the MIR arm labels are raw two's-complement bit
+        // patterns and are decoded HERE, under the discriminant temp's own
+        // declared width/signedness. This pair used to be raw-vs-raw, which
+        // agreed by accident; decoding only one side would silently stop this
+        // gate from ever firing on a negative-tag enum. A label the temp's type
+        // cannot represent aborts the whole comparison (fail closed — the
+        // switch is simply not marked exhaustive).
+        let Some(discr_ty) = vbody_local_tys.get(&d) else { continue };
+        let Some(cases) = targets
+            .iter()
+            .map(|(v, _)| discr_ty.decode_switch_label(*v))
+            .collect::<Option<BTreeSet<i128>>>()
+        else {
+            continue;
+        };
+        let full: BTreeSet<i128> = tags.iter().copied().collect();
         if cases != full {
             continue;
         }
@@ -6171,6 +6779,14 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
 
     struct LevelExtractionCallbacks {
         level_ty: Option<Ty>,
+        /// Trust: the DEFINITIONS collected while lowering. Since the
+        /// body-de-duplication landing (`ty_convert.rs`, "WHAT LANDED IS `Def1`
+        /// WITH THE BODY DE-DUPLICATED"), a canonical cut point is a by-name
+        /// marker at EVERY occurrence and its one definition is materialized
+        /// into `datatype_defs`. So the lowered `Ty` alone no longer carries the
+        /// variant list, and a test that reads only the `Ty` is asserting the
+        /// pre-landing shape.
+        level_defs: trust_types::DatatypeDefs,
         /// Diagnostic: every nominal-ADT type seen while scanning, so a miss
         /// surfaces the actual def paths instead of an opaque `None`.
         probe: Vec<String>,
@@ -6181,6 +6797,12 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     struct ExprExtractionCallbacks {
         exprkind_ty: Option<Ty>,
         expr_ty: Option<Ty>,
+        /// Trust: the definitions collected alongside. A canonical cut point
+        /// lowers to a by-name marker at every occurrence since the
+        /// body-de-duplication landing, so the lowered `Ty` alone no longer
+        /// carries its variants — same reason `extract_level_datatype_fixture`
+        /// returns them.
+        defs: trust_types::DatatypeDefs,
         /// Diagnostic: every nominal-ADT type seen while scanning.
         probe: Vec<String>,
     }
@@ -6227,11 +6849,13 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                         if matches!(path.as_str(), "expr::Expr" | "clean_kernel::expr::Expr")
                             && self.expr_ty.is_none()
                         {
+                            let _scope = ty_convert::DatatypeDefScope::begin();
                             self.expr_ty = Some(ty_convert::convert_ty_in_env(
                                 tcx,
                                 body.typing_env(tcx),
                                 local.ty,
                             ));
+                            self.defs.extend(ty_convert::collected_datatype_defs());
                         }
                     }
                 }
@@ -6269,11 +6893,16 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                         // Trust: M6 rung-7 sweep — use `body`'s own `typing_env`, same as
                         // the `ExprExtractionCallbacks` fix above.
                         if is_level && self.level_ty.is_none() {
+                            // Trust: collect inside a scope, then take the defs
+                            // with the type -- the definition lives in the side
+                            // table, not in the returned `Ty`.
+                            let _scope = ty_convert::DatatypeDefScope::begin();
                             self.level_ty = Some(ty_convert::convert_ty_in_env(
                                 tcx,
                                 body.typing_env(tcx),
                                 local.ty,
                             ));
+                            self.level_defs = ty_convert::collected_datatype_defs();
                         }
                     }
                 }
@@ -7130,8 +7759,18 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         callbacks.function.expect("option_value should be extracted")
     }
 
-    fn extract_level_datatype_fixture() -> Ty {
-        let mut callbacks = LevelExtractionCallbacks { level_ty: None, probe: Vec::new() };
+    /// Returns the lowered `Level` type AND the definitions collected with it.
+    ///
+    /// Trust: both, because since the body-de-duplication landing the lowered
+    /// `Ty` for a canonical cut point is a by-name marker and its variant list
+    /// lives in `datatype_defs`. A helper that returned only the `Ty` could only
+    /// support assertions about the pre-landing shape.
+    fn extract_level_datatype_fixture() -> (Ty, trust_types::DatatypeDefs) {
+        let mut callbacks = LevelExtractionCallbacks {
+            level_ty: None,
+            level_defs: Default::default(),
+            probe: Vec::new(),
+        };
         // no_core fixture: no `--sysroot` (no extern crates), `-Ainternal_features`
         // to allow `#![feature(lang_items, no_core)]` — mirrors the option-return
         // fixture's invocation, which compiles in-process where std fixtures ICE.
@@ -7159,20 +7798,54 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             });
         assert!(result.is_ok(), "failed to compile clean_kernel Level fixture");
 
-        callbacks.level_ty.unwrap_or_else(|| {
+        let level_ty = callbacks.level_ty.unwrap_or_else(|| {
             panic!(
                 "clean_kernel::level::Level should be extracted; ADT locals seen: {:?}",
                 callbacks.probe
             )
-        })
+        });
+        (level_ty, callbacks.level_defs)
+    }
+
+    /// Resolve a lowered type to the datatype whose variants it denotes.
+    ///
+    /// A cut point lowers to `Ty::Datatype { name, variants: [] }` -- the
+    /// definition is filed once under `name` in `defs`. This follows that one
+    /// hop, and is the shape every assertion about a recursive datatype's
+    /// constructors has to go through now.
+    fn resolve_datatype<'a>(
+        ty: &'a Ty,
+        defs: &'a trust_types::DatatypeDefs,
+    ) -> (&'a str, &'a Vec<(String, Vec<(String, Ty)>)>) {
+        let Ty::Datatype { name, variants } = ty else {
+            panic!("expected a Ty::Datatype, got {ty:?}");
+        };
+        if !variants.is_empty() {
+            return (name, variants);
+        }
+        let def = defs.get(name.as_str()).unwrap_or_else(|| {
+            panic!(
+                "`{name}` lowered to a by-name marker but no definition was filed for it; \
+                 defs present: {:?}",
+                defs.keys().collect::<Vec<_>>()
+            )
+        });
+        let Ty::Datatype { variants, .. } = def else {
+            panic!("the filed definition for `{name}` is not a Ty::Datatype: {def:?}");
+        };
+        (name, variants)
     }
 
     /// Lever A step 5 — compile the expr fixture in-process and return the
     /// extracted `(ExprKind, Expr)` types. Same embedded-no-evidence invocation
     /// as the Level fixture (`--crate-name clean_kernel`, `no_core`).
-    fn extract_expr_datatypes_fixture() -> (Ty, Ty) {
-        let mut callbacks =
-            ExprExtractionCallbacks { exprkind_ty: None, expr_ty: None, probe: Vec::new() };
+    fn extract_expr_datatypes_fixture() -> (Ty, Ty, trust_types::DatatypeDefs) {
+        let mut callbacks = ExprExtractionCallbacks {
+            exprkind_ty: None,
+            expr_ty: None,
+            defs: Default::default(),
+            probe: Vec::new(),
+        };
         let args = vec![
             "rustc".to_string(),
             EXPR_FIXTURE_PATH.to_string(),
@@ -7202,7 +7875,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
         let expr_ty = callbacks.expr_ty.unwrap_or_else(|| {
             panic!("clean_kernel::expr::Expr should be extracted; ADT locals seen: {probe:?}")
         });
-        (exprkind_ty, expr_ty)
+        (exprkind_ty, expr_ty, callbacks.defs)
     }
 
     /// Lever A step 3 — compile the Expr fixture and extract every free
@@ -7404,18 +8077,113 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     // serialization is pipeline plumbing, NOT TCB: the artifacts are the
     // post-conversion `VerifiableFunction` form (everything rustc-internal is
     // already gone by then), and the kernel check downstream remains the
-    // authority on every proof obligation.
+    // authority on every proof obligation. The sole canonicalization is the
+    // compiler-version salt in a single-crate fixture's `stable_crate_id`; see
+    // `canonicalize_extracted_fixture_callee_ids` below.
 
     /// The committed artifacts directory (inside trust-integration-tests).
     fn extracted_artifacts_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-integration-tests/fixtures/extracted")
     }
 
+    /// Synthetic, nonzero namespace assigned only in committed extracted
+    /// fixtures. Its ASCII bytes spell `TRUST_FX`; production extraction never
+    /// performs this substitution.
+    const EXTRACTED_FIXTURE_STABLE_CRATE_ID: u64 = 0x5452_5553_545f_4658;
+
+    /// Canonicalize the one value that cannot be committed byte-for-byte.
+    ///
+    /// Rustc deliberately salts every [`rustc_span::def_id::StableCrateId`]
+    /// with its full compiler version, including this repository's commit. As
+    /// soon as authenticated `callee_identity` became serialized, writing the
+    /// freshly extracted ID and committing it changed the compiler version and
+    /// therefore changed the ID again: the snapshot could never converge.
+    ///
+    /// These four fixtures currently contain direct identities from exactly
+    /// one synthetic crate. On a clone used only for the transport snapshot,
+    /// replace that crate component with a fixed fixture namespace while
+    /// preserving identity presence, `def_index`, and `substs_digest`. Refuse
+    /// more than one observed crate ID instead of collapsing local and foreign
+    /// identities if a fixture grows a cross-crate call. Production extraction
+    /// and every proof-authority consumer retain the compiler-authenticated ID.
+    fn canonicalize_extracted_fixture_callee_ids(
+        functions: &BTreeMap<String, VerifiableFunction>,
+    ) -> BTreeMap<String, VerifiableFunction> {
+        let mut canonical = functions.clone();
+        let mut raw_stable_crate_id = None;
+
+        for function in canonical.values_mut() {
+            for block in &mut function.body.blocks {
+                let callee_identity = match &mut block.terminator {
+                    Terminator::Call { callee_identity, .. }
+                    | Terminator::TailCall { callee_identity, .. } => callee_identity.as_mut(),
+                    _ => None,
+                };
+                let Some(callee_identity) = callee_identity else {
+                    continue;
+                };
+                canonicalize_extracted_fixture_callee_identity(
+                    &mut raw_stable_crate_id,
+                    callee_identity,
+                );
+            }
+        }
+
+        canonical
+    }
+
+    fn canonicalize_extracted_fixture_callee_identity(
+        raw_stable_crate_id: &mut Option<u64>,
+        callee_identity: &mut trust_types::CalleeIdentity,
+    ) {
+        if let Some(expected) = *raw_stable_crate_id {
+            assert_eq!(
+                callee_identity.stable_crate_id, expected,
+                "extracted fixture contains multiple authenticated crate identities; \
+                 do not collapse them into one snapshot namespace"
+            );
+        } else {
+            *raw_stable_crate_id = Some(callee_identity.stable_crate_id);
+        }
+        callee_identity.stable_crate_id = EXTRACTED_FIXTURE_STABLE_CRATE_ID;
+    }
+
+    #[test]
+    fn extracted_fixture_identity_canonicalization_preserves_exact_callee_components() {
+        let mut observed = None;
+        let mut identity = trust_types::CalleeIdentity {
+            stable_crate_id: 17,
+            def_index: 29,
+            substs_digest: [31, 37],
+        };
+
+        canonicalize_extracted_fixture_callee_identity(&mut observed, &mut identity);
+
+        assert_eq!(observed, Some(17));
+        assert_eq!(identity.stable_crate_id, EXTRACTED_FIXTURE_STABLE_CRATE_ID);
+        assert_eq!(identity.def_index, 29);
+        assert_eq!(identity.substs_digest, [31, 37]);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple authenticated crate identities")]
+    fn extracted_fixture_identity_canonicalization_refuses_multiple_crates() {
+        let mut observed = Some(17);
+        let mut foreign_identity = trust_types::CalleeIdentity {
+            stable_crate_id: 19,
+            def_index: 29,
+            substs_digest: [31, 37],
+        };
+
+        canonicalize_extracted_fixture_callee_identity(&mut observed, &mut foreign_identity);
+    }
+
     /// Canonical serialization of an extraction run: pretty JSON of the
     /// name -> `VerifiableFunction` map (BTreeMap: key order is stable;
     /// struct fields serialize in declaration order), trailing newline.
     fn serialize_extracted_functions(functions: &BTreeMap<String, VerifiableFunction>) -> String {
-        let mut json = serde_json::to_string_pretty(functions)
+        let canonical = canonicalize_extracted_fixture_callee_ids(functions);
+        let mut json = serde_json::to_string_pretty(&canonical)
             .expect("VerifiableFunction serialization is infallible");
         json.push('\n');
         json
@@ -7554,9 +8322,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             .unwrap_or_else(|| panic!("mirror not extracted; saw {:?}", bodies.keys()));
 
         // Return slot: the modeled 2-variant Level datatype.
-        let Ty::Datatype { name, variants } = &f.body.return_ty else {
-            panic!("mirror return type must be a modeled datatype, got {:?}", f.body.return_ty);
-        };
+        // Trust: through `datatype_defs` — `Level` is self-recursive, so it is a
+        // canonical cut point and its return slot is a by-name marker.
+        let (name, variants) = resolve_datatype(&f.body.return_ty, &f.body.datatype_defs);
         assert_eq!(name, "clean_kernel::level::Level");
         assert_eq!(
             variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
@@ -7699,9 +8467,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 .unwrap_or_else(|| panic!("{name} not extracted; saw {:?}", bodies.keys()));
 
             // Return slot + payload parameter: the modeled 2-variant ExprKind.
-            let Ty::Datatype { name: ret_name, variants } = &f.body.return_ty else {
-                panic!("{name} return type must be a modeled datatype, got {:?}", f.body.return_ty);
-            };
+            // Trust: through `datatype_defs` — a self-recursive return type is a
+            // canonical cut point, so this slot is a by-name marker.
+            let (ret_name, variants) = resolve_datatype(&f.body.return_ty, &f.body.datatype_defs);
             assert_eq!(ret_name, "clean_kernel::expr::kind::ExprKind");
             assert_eq!(
                 variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
@@ -7713,9 +8481,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             let Ty::Ref { inner, .. } = fuel_ty else {
                 panic!("{name} fuel param must be &Level, got {fuel_ty:?}");
             };
-            let Ty::Datatype { name: fuel_name, variants: fuel_variants } = inner.as_ref() else {
-                panic!("{name} fuel param must peel to a datatype, got {inner:?}");
-            };
+            // Trust: through `datatype_defs` — the nat-shaped fuel type is
+            // recursive, hence a cut point, hence a marker at this occurrence.
+            let (fuel_name, fuel_variants) =
+                resolve_datatype(inner.as_ref(), &f.body.datatype_defs);
             assert_eq!(fuel_name, "clean_kernel::level::Level");
             assert_eq!(
                 fuel_variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
@@ -7857,9 +8626,9 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
 
         for (name, f) in &bodies {
             // Return slot + payload parameter: the FULL modeled Level.
-            let Ty::Datatype { name: ret_name, variants } = &f.body.return_ty else {
-                panic!("{name} return type must be a modeled datatype, got {:?}", f.body.return_ty);
-            };
+            // Trust: through `datatype_defs` — a self-recursive return type is a
+            // canonical cut point, so this slot is a by-name marker.
+            let (ret_name, variants) = resolve_datatype(&f.body.return_ty, &f.body.datatype_defs);
             assert_eq!(ret_name, "clean_kernel::level::Level");
             assert_eq!(
                 variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
@@ -7882,9 +8651,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             let Ty::Ref { inner, .. } = fuel_ty else {
                 panic!("{name} fuel param must be &ExprKind, got {fuel_ty:?}");
             };
-            let Ty::Datatype { name: fuel_name, variants: fuel_variants } = inner.as_ref() else {
-                panic!("{name} fuel param must peel to a datatype, got {inner:?}");
-            };
+            // Trust: through `datatype_defs` — the nat-shaped fuel type is
+            // recursive, hence a cut point, hence a marker at this occurrence.
+            let (fuel_name, fuel_variants) =
+                resolve_datatype(inner.as_ref(), &f.body.datatype_defs);
             assert_eq!(fuel_name, "clean_kernel::expr::kind::ExprKind");
             assert_eq!(
                 fuel_variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
@@ -8067,9 +8837,10 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             let Ty::Ref { inner, .. } = fuel_param else {
                 panic!("{name} param _1 must be &Fuel, got {fuel_param:?}");
             };
-            let Ty::Datatype { name: fuel_name, variants: fuel_variants } = inner.as_ref() else {
-                panic!("{name} fuel param must peel to a datatype");
-            };
+            // Trust: through `datatype_defs` — the nat-shaped fuel type is
+            // recursive, hence a cut point, hence a marker at this occurrence.
+            let (fuel_name, fuel_variants) =
+                resolve_datatype(inner.as_ref(), &f.body.datatype_defs);
             assert_eq!(fuel_name, "clean_kernel::fuel::Fuel");
             assert_eq!(
                 fuel_variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
@@ -9664,6 +10435,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 header_hir_local_id: Some(10),
                 latch_hir_local_id: Some(20),
             }],
+            0,
             &mut bundle,
         );
 
@@ -9690,7 +10462,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
             let backedge =
                 StampedNaturalBackedge { header: 3, header_hir_local_id, latch_hir_local_id };
             let backedges = if duplicate_edge { vec![backedge, backedge] } else { vec![backedge] };
-            let failures = stamp_loop_header_provenance_from_backedges(&backedges, &mut bundle);
+            let failures = stamp_loop_header_provenance_from_backedges(&backedges, 0, &mut bundle);
 
             assert!(failures.is_empty(), "{label} compiler stamp must bind: {failures:?}");
             assert!(
@@ -9698,6 +10470,62 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 "{label}: every clause in one source group must receive the same exact header",
             );
         }
+    }
+
+    #[test]
+    fn loop_header_provenance_names_cross_crate_inlined_scopes_on_a_miss() {
+        // The MIR inliner appends an inlined callee's `source_scopes` verbatim,
+        // and a callee decoded from another crate's metadata carries
+        // `ClearCrossCrate::Clear`. Backedges with such an endpoint are dropped
+        // before candidacy; a resulting miss must SAY that rather than claim the
+        // authored loop had no natural MIR header at all.
+        let mut bundle =
+            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![portable_loop_spec(
+                LoopContractKind::Invariant,
+                0,
+                10,
+                Some(90),
+            )]);
+        let failures = stamp_loop_header_provenance_from_backedges(&[], 2, &mut bundle);
+
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].1.contains("e45.loop-source.cross-crate-inlined-scope"),
+            "a miss caused by cleared cross-crate scope data must name that cause: {failures:?}",
+        );
+        assert!(
+            failures[0].1.contains("2 dominator-proved backedge(s)"),
+            "the refusal must carry the dropped-backedge count: {failures:?}",
+        );
+        assert!(
+            bundle.loop_contracts.iter().all(|spec| spec.mir_header.is_none()),
+            "an unreadable mapping must clear every stale header, never mint one",
+        );
+    }
+
+    #[test]
+    fn cross_crate_opaque_backedges_never_grant_or_block_a_readable_binding() {
+        // The count is reporting only: a readable backedge still binds exactly
+        // as before, and the opaque ones contribute no candidate of their own.
+        let mut bundle =
+            CompilerContractBundle::new(vec![]).with_loop_contracts(vec![portable_loop_spec(
+                LoopContractKind::Invariant,
+                0,
+                10,
+                None,
+            )]);
+        let failures = stamp_loop_header_provenance_from_backedges(
+            &[StampedNaturalBackedge {
+                header: 3,
+                header_hir_local_id: Some(10),
+                latch_hir_local_id: Some(10),
+            }],
+            5,
+            &mut bundle,
+        );
+
+        assert!(failures.is_empty(), "a readable backedge must still bind: {failures:?}");
+        assert!(bundle.loop_contracts.iter().all(|spec| spec.mir_header == Some(3)));
     }
 
     #[test]
@@ -9722,6 +10550,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     latch_hir_local_id: Some(10),
                 },
             ],
+            0,
             &mut bundle,
         );
 
@@ -9748,6 +10577,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 header_hir_local_id: Some(10),
                 latch_hir_local_id: Some(10),
             }],
+            0,
             &mut duplicate_hir,
         );
         assert_eq!(failures.len(), 2);
@@ -9776,6 +10606,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     latch_hir_local_id: Some(20),
                 },
             ],
+            0,
             &mut duplicate_header,
         );
         assert_eq!(failures.len(), 2);
@@ -9797,7 +10628,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 10,
                 Some(99),
             )]);
-        let failures = stamp_loop_header_provenance_from_backedges(&[], &mut bundle);
+        let failures = stamp_loop_header_provenance_from_backedges(&[], 0, &mut bundle);
 
         assert_eq!(failures.len(), 1);
         assert!(failures[0].1.contains("e45.loop-source.no-mir-header"));
@@ -9988,10 +10819,42 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 .get(name)
                 .unwrap_or_else(|| panic!("{name}: loop contract bundle must be recorded"));
             assert_eq!(bundle.loop_contracts.len(), 1, "{name}: one authored invariant");
-            assert!(
-                bundle.typed_propositions.is_empty(),
-                "{name}: a loop-local collection shadow must remain opaque until exact HIR-to-MIR source-place provenance is transported",
-            );
+            // Trust: a typed proposition may now be RECORDED here, and recording is
+            // NOT authority. MEASURED, because the first reading of this failure was
+            // wrong: when this test began failing it looked like a false-accept, since
+            // `bind_compiler_loop_contract_bundle` stopped reporting a rejection (1 ->
+            // 0). It is not. Letting the two assertions below actually run shows the
+            // clause still acquires NO authority -- no E4 initiation/consecution row is
+            // minted, and the fail-closed row is still emitted. What moved is WHERE the
+            // refusal is reported, not WHETHER.
+            //
+            // Why the binder stopped counting it: acceptance there is
+            // `bundle.typed_proposition(..).is_some()` -- an EXISTENCE check. It asks
+            // whether a typed proposition was recorded, never whether that proposition
+            // can be grounded. Once the compiler began minting one for these clauses,
+            // the existence check passed. Grounding is still refused downstream, by the
+            // name-uniqueness guard in `read_only_collection_model_for_name`, which was
+            // written for this exact fixture: two locals render as `xs`, so the lookup
+            // is ambiguous and returns None rather than silently borrowing the outer
+            // argument's array identity.
+            //
+            // So the old `failures.len() == 1` assertion pinned the LOCATION of a
+            // refusal, not the safety property, and it is the assertions below that
+            // carry the property. They are what this test is named for.
+            //
+            // The recorded proposition's only collection leaf is OPAQUE: its name is
+            // the source text -- `Var("xs[0]")`, `Var("xs__len")` -- carrying no place
+            // provenance whatsoever. Nothing about the leaf itself says WHICH `xs` it
+            // names, which is the whole hazard these fixtures exist to trip: the inner
+            // shadow makes each invariant FALSE (`[0u32; 4][0] == first` for an
+            // arbitrary `first`; `[0u32; 2].len() == 4`) while the stable outer
+            // argument would make it TRUE. A name-only consumer that resolved such a
+            // leaf to the outer argument would prove a false invariant.
+            //
+            // If either assertion below moves, a wrong-place rebinding HAS acquired
+            // authority and that is a false verify, not a stale expectation. Do not
+            // relax them; find what started grounding the leaf.
+            let recorded_without_provenance = bundle.typed_propositions.len();
 
             let mut function = fixture
                 .functions
@@ -9999,11 +10862,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                 .unwrap_or_else(|| panic!("{name}: function must be extracted"))
                 .clone();
             let failures = trust_vcgen::bind_compiler_loop_contract_bundle(&mut function, bundle);
-            assert_eq!(
-                failures.len(),
-                1,
-                "{name}: the strict production binder must reject the opaque shadowed clause",
-            );
+            let binder_rejections = failures.len();
             let vcs = trust_vcgen::generate_vcs(&function);
             assert!(
                 !vcs.iter().any(|vc| matches!(
@@ -10011,7 +10870,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                     VcKind::LoopInvariantInitiation { .. }
                         | VcKind::LoopInvariantConsecution { .. }
                 )),
-                "{name}: wrong-place collection rebinding must not mint E4 rows: {vcs:#?}",
+                "{name}: AUTHORITY BREACH -- E4 rows minted for a wrong-place rebinding (binder_rejections={binder_rejections}, recorded={recorded_without_provenance}): {vcs:#?}",
             );
             assert!(
                 vcs.iter().any(|vc| matches!(
@@ -10020,7 +10879,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
                         if detail.contains("no unique exact compiler-typed proposition")
                             || detail.contains("unsupported or ambiguous MIR value")
                 )),
-                "{name}: the denied clause must remain a visible fail-closed row: {vcs:#?}",
+                "{name}: the denied clause must remain a visible fail-closed row (binder_rejections={binder_rejections}, recorded={recorded_without_provenance}): {vcs:#?}",
             );
         }
     }
@@ -10647,15 +11506,17 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     /// this crate emits for un-modeled recursive ADTs). Def-path gated to `Level`.
     #[test]
     fn real_mir_clean_kernel_level_lowers_to_datatype() {
-        let level_ty = extract_level_datatype_fixture();
+        let (level_ty, level_defs) = extract_level_datatype_fixture();
 
         assert!(
             !level_ty.is_unsupported(),
             "Level must not degrade to Unsupported, got {level_ty:?}"
         );
-        let Ty::Datatype { name, variants } = &level_ty else {
-            panic!("Level must lower to Ty::Datatype, got {level_ty:?}");
-        };
+        // Trust: resolve the by-name marker through `datatype_defs`. Before the
+        // body-de-duplication landing the variants were inline here; now the
+        // occurrence is a marker and the one definition is filed in the side
+        // table. Reading only the `Ty` asserts the pre-landing shape and fails.
+        let (name, variants) = resolve_datatype(&level_ty, &level_defs);
         // Def paths render without the crate-name prefix for the crate under
         // compilation (`level::Level`) and with it for an upstream dependency
         // (`clean_kernel::level::Level`); accept either via suffix match.
@@ -10716,7 +11577,7 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     /// by-name refs keep the produced tree O(variants), dodging the 464 MB blow-up).
     #[test]
     fn real_mir_clean_kernel_exprkind_lowers_to_datatype() {
-        let (exprkind_ty, _expr_ty) = extract_expr_datatypes_fixture();
+        let (exprkind_ty, _expr_ty, _defs) = extract_expr_datatypes_fixture();
 
         assert!(
             !exprkind_ty.is_unsupported(),
@@ -10834,12 +11695,12 @@ pub fn gr(fuel: &Fuel, e: &E) -> Res {
     /// the Expr↔ExprKind mutual recursion, both by-name so neither expands the other.
     #[test]
     fn real_mir_clean_kernel_expr_lowers_to_datatype() {
-        let (_exprkind_ty, expr_ty) = extract_expr_datatypes_fixture();
+        let (_exprkind_ty, expr_ty, defs) = extract_expr_datatypes_fixture();
 
         assert!(!expr_ty.is_unsupported(), "Expr must not degrade to Unsupported, got {expr_ty:?}");
-        let Ty::Datatype { name, variants } = &expr_ty else {
-            panic!("Expr must lower to Ty::Datatype, got {expr_ty:?}");
-        };
+        // Trust: resolve through `datatype_defs` — `Expr` is recursive, hence a
+        // canonical cut point, hence a by-name marker at this occurrence.
+        let (name, variants) = resolve_datatype(&expr_ty, &defs);
         assert!(name.ends_with("expr::Expr"), "unexpected Expr datatype name `{name}`");
 
         // A struct is a ONE-constructor ADT (named after the struct itself).

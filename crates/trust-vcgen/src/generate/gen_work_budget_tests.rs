@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 use trust_types::{
-    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan,
-    Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan, Statement,
+    Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 /// Serialize overrides on test-harness threads that may be reused.
@@ -200,11 +200,7 @@ fn gen_work_meter_trips_via_place_sort_sort_build() {
     let _budget = GenWorkBudgetGuard::new(GEN_WORK_TEST_BUDGET);
     let func = func_with_locals(
         "sort_explode",
-        vec![LocalDecl {
-            index: 0,
-            ty: fat_adt_ty(GEN_WORK_FAT_FIELDS),
-            name: Some("e".into()),
-        }],
+        vec![LocalDecl { index: 0, ty: fat_adt_ty(GEN_WORK_FAT_FIELDS), name: Some("e".into()) }],
         Ty::Unit,
     );
     {
@@ -445,11 +441,8 @@ fn func_exceeds_vcgen_budget_gates_aggregate_heavy_function() {
         "the fail-closed degrade formula must be Bool(true) (never provable)"
     );
     // A small function stays UNDER budget (gate is far above ordinary functions).
-    let small = func_with_locals(
-        "small",
-        vec![LocalDecl { index: 0, ty: Ty::u8(), name: None }],
-        Ty::Unit,
-    );
+    let small =
+        func_with_locals("small", vec![LocalDecl { index: 0, ty: Ty::u8(), name: None }], Ty::Unit);
     assert!(
         !super::func_exceeds_vcgen_budget(&small),
         "an ordinary small function must NOT be gated"
@@ -463,9 +456,7 @@ fn aggregate_block(id: usize, stmts: usize, ops_per_stmt: usize) -> BasicBlock {
         place: Place::local(0),
         rvalue: Rvalue::Aggregate(
             trust_types::AggregateKind::Tuple,
-            (0..ops_per_stmt)
-                .map(|_| Operand::Constant(trust_types::ConstValue::Unit))
-                .collect(),
+            (0..ops_per_stmt).map(|_| Operand::Constant(trust_types::ConstValue::Unit)).collect(),
         ),
         span: SourceSpan::default(),
     };
@@ -533,7 +524,9 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
     };
     assert_eq!(super::enum_variant_tag_set(&dt), Some(vec![0, 1, 2]));
     // #[repr] enum with explicit non-contiguous discriminants: tags are {5, 10}.
-    let adt = Ty::Adt { adt_kind: None, layout: None, 
+    let adt = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "Repr".into(),
         fields: vec![],
         variants: vec![
@@ -541,7 +534,9 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
             VariantDef { name: "B".into(), discriminant: 10, fields: vec![] },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     assert_eq!(
         super::enum_variant_tag_set(&adt),
         Some(vec![5, 10]),
@@ -551,12 +546,16 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
     // A struct (no variants), a by-name datatype reference (empty variants), and a
     // scalar are NOT enums — no tag set, so no (potentially-vacuous) bound.
     assert_eq!(
-        super::enum_variant_tag_set(&Ty::Adt { adt_kind: None, layout: None, 
+        super::enum_variant_tag_set(&Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "S".into(),
             fields: vec![("x".into(), Ty::Bool)],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
         None
     );
     assert_eq!(
@@ -572,7 +571,9 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
 /// a phantom tag outside the variant range.
 fn func_reading_enum_discriminant() -> VerifiableFunction {
     use trust_types::VariantDef;
-    let e = Ty::Adt { adt_kind: None, layout: None, 
+    let e = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "clean_kernel::Expr".into(),
         variants: vec![
             VariantDef { name: "App".into(), discriminant: 0, fields: vec![] },
@@ -581,17 +582,15 @@ fn func_reading_enum_discriminant() -> VerifiableFunction {
         ],
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let mut func = func_with_locals(
         "reads_discr",
         vec![
             LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: true }, name: None },
             LocalDecl { index: 1, ty: e, name: Some("e".into()) },
-            LocalDecl {
-                index: 2,
-                ty: Ty::Int { width: 64, signed: true },
-                name: Some("d".into()),
-            },
+            LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: Some("d".into()) },
         ],
         Ty::Int { width: 64, signed: true },
     );
@@ -622,12 +621,8 @@ fn discriminant_range_facts_bound_the_dest_to_variant_tags() {
         facts.iter().any(|fact| fact.free_variables().contains(&generated_name)),
         "the range fact must use the same generated discriminant name as CHC lowering: {s}"
     );
-    let has_membership =
-        facts.iter().any(|f| matches!(f, Formula::Or(cases) if cases.len() == 3));
-    assert!(
-        has_membership,
-        "expected a 3-way membership disjunction `d ∈ {{0,1,2}}`: {facts:?}"
-    );
+    let has_membership = facts.iter().any(|f| matches!(f, Formula::Or(cases) if cases.len() == 3));
+    assert!(has_membership, "expected a 3-way membership disjunction `d ∈ {{0,1,2}}`: {facts:?}");
 }
 
 /// SOUNDNESS: a `Discriminant` read whose source is NOT a modeled enum (a struct,
@@ -642,12 +637,16 @@ fn discriminant_range_facts_skip_non_enum_source() {
             // A struct ADT (variants: []) — its discriminant has no variant range.
             LocalDecl {
                 index: 1,
-                ty: Ty::Adt { adt_kind: None, layout: None, 
+                ty: Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
                     name: "S".into(),
                     fields: vec![("x".into(), Ty::Bool)],
                     variants: vec![],
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                },
                 name: Some("s".into()),
             },
         ],
@@ -674,7 +673,9 @@ fn discriminant_range_facts_skip_non_enum_source() {
 #[test]
 fn discriminant_range_facts_fold_tags_across_narrowing_cast() {
     use trust_types::VariantDef;
-    let e = Ty::Adt { adt_kind: None, layout: None, 
+    let e = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "t::E".into(),
         variants: vec![
             VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
@@ -683,7 +684,9 @@ fn discriminant_range_facts_fold_tags_across_narrowing_cast() {
         ],
         fields: vec![],
         disc_index_safe: true,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let mut func = func_with_locals(
         "narrow_cast",
         vec![
@@ -709,10 +712,7 @@ fn discriminant_range_facts_fold_tags_across_narrowing_cast() {
     });
     func.body.blocks[0].stmts.push(Statement::Assign {
         place: Place::local(3),
-        rvalue: Rvalue::Cast(
-            Operand::Copy(Place::local(2)),
-            Ty::Int { width: 8, signed: false },
-        ),
+        rvalue: Rvalue::Cast(Operand::Copy(Place::local(2)), Ty::Int { width: 8, signed: false }),
         span: SourceSpan::default(),
     });
     let facts = super::build_discriminant_variant_range_facts(&func);
@@ -777,15 +777,12 @@ fn truncate_nonneg_tag_as_int_matches_rust_as_semantics() {
 /// A `u32` FIELD read off a modeled `Ty::Datatype` value must be recorded with its
 /// `(32, unsigned)` range so `conjoin_datatype_field_ranges` can bound it. A bare
 /// `Field(0)` on a single-variant (struct-like) datatype selects variant 0's 0-th
-/// field via `resolve_field_int_ty`'s datatype-aware walk.
+/// field via `resolve_field_scalar_range`'s datatype-aware walk.
 #[test]
 fn datatype_field_range_map_records_u32_field() {
     let dt = Ty::Datatype {
         name: "Level".into(),
-        variants: vec![(
-            "Zero".into(),
-            vec![("0".into(), Ty::Int { width: 32, signed: false })],
-        )],
+        variants: vec![("Zero".into(), vec![("0".into(), Ty::Int { width: 32, signed: false })])],
     };
     let mut func = func_with_locals(
         "reads_field",
@@ -805,7 +802,75 @@ fn datatype_field_range_map_records_u32_field() {
     let key = crate::place_to_var_name(&func, &field_place);
     assert_eq!(
         map.get(&key),
-        Some(&(32u32, false)),
+        Some(&crate::range::RustScalarRange::Integer { width: 32, signed: false }),
         "a u32 field read off a modeled datatype must be recorded (32, unsigned): {map:?}"
+    );
+}
+
+#[test]
+fn datatype_field_range_map_preserves_char_identity() {
+    let dt = Ty::Datatype {
+        name: "Token".into(),
+        variants: vec![("Token".into(), vec![("value".into(), Ty::Char)])],
+    };
+    let mut func = func_with_locals(
+        "reads_char_field",
+        vec![
+            LocalDecl { index: 0, ty: Ty::Char, name: None },
+            LocalDecl { index: 1, ty: dt, name: Some("token".into()) },
+        ],
+        Ty::Char,
+    );
+    let field_place = Place { local: 1, projections: vec![trust_types::Projection::Field(0)] };
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(0),
+        rvalue: Rvalue::Use(Operand::Copy(field_place.clone())),
+        span: SourceSpan::default(),
+    });
+
+    let map = super::datatype_field_range_map(&func);
+    let key = crate::place_to_var_name(&func, &field_place);
+    assert_eq!(
+        map.get(&key),
+        Some(&crate::range::RustScalarRange::Char),
+        "a char field must not collapse to the wider u32 carrier: {map:?}"
+    );
+}
+
+/// SSA versioning must not disconnect a field read from its declared integer
+/// range. The range map is keyed by the unversioned place (`lv.0`), while the
+/// actual VC symbol is versioned (`lv.0#s3_1`); the bound must constrain that
+/// exact symbol rather than disappear at lookup time.
+#[test]
+fn datatype_field_range_conjoin_bounds_versioned_field_symbol() {
+    let dt = Ty::Datatype {
+        name: "Level".into(),
+        variants: vec![("Zero".into(), vec![("0".into(), Ty::Int { width: 32, signed: false })])],
+    };
+    let mut func = func_with_locals(
+        "reads_versioned_field",
+        vec![
+            LocalDecl { index: 0, ty: Ty::Int { width: 32, signed: false }, name: None },
+            LocalDecl { index: 1, ty: dt, name: Some("lv".into()) },
+        ],
+        Ty::Int { width: 32, signed: false },
+    );
+    let field_place = Place { local: 1, projections: vec![trust_types::Projection::Field(0)] };
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(0),
+        rvalue: Rvalue::Use(Operand::Copy(field_place.clone())),
+        span: SourceSpan::default(),
+    });
+
+    let versioned = format!("{}#s3_1", crate::place_to_var_name(&func, &field_place));
+    let field_var = Formula::Var(versioned, Sort::Int);
+    let expected = crate::range::input_range_constraint(&field_var, 32, false);
+    let bounded = super::conjoin_datatype_field_ranges(&func, field_var);
+    let Formula::And(parts) = bounded else {
+        panic!("a versioned u32 field must acquire its declared range")
+    };
+    assert!(
+        parts.contains(&expected),
+        "the range must constrain the exact SSA-versioned field symbol: {parts:?}"
     );
 }

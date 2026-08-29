@@ -77,11 +77,11 @@ mod arith;
 mod decimal;
 mod divmod;
 
-#[cfg_attr(feature = "rustc-dep-of-std", stable(feature = "trust_bignum", since = "1.0.0"))]
-pub use decimal::ParseNatError;
-
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+
+#[cfg_attr(feature = "rustc-dep-of-std", stable(feature = "trust_bignum", since = "1.0.0"))]
+pub use decimal::ParseNatError;
 
 /// An arbitrary-precision unsigned integer with Lean `Nat` semantics.
 ///
@@ -235,8 +235,9 @@ impl core::str::FromStr for Nat {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloc::vec;
+
+    use super::*;
 
     #[test]
     fn zero_is_the_empty_limb_vector() {
@@ -286,9 +287,6 @@ mod tests {
     #[test]
     fn debug_prints_the_decimal_value() {
         let two_128 = Nat::from_limbs(vec![0, 0, 1]);
-        assert_eq!(
-            std::format!("{two_128:?}"),
-            "Nat(340282366920938463463374607431768211456)"
-        );
+        assert_eq!(std::format!("{two_128:?}"), "Nat(340282366920938463463374607431768211456)");
     }
 }

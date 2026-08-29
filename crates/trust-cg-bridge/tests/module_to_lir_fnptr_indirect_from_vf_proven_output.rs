@@ -42,16 +42,13 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir_real_calls;
 use trust_disasm::{Instruction as DisasmInst, Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, Effect, Flags, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
+use trust_ir::Module;
 use trust_ir::inst::Inst;
 use trust_ir::value::FuncTyId;
-use trust_ir::Module;
-
+use trust_machine_sem::{Aarch64Semantics, Effect, Flags, MachineState, Semantics};
 use trust_types::{
-    AggregateKind, BasicBlock, BlockId as TBlockId, ConstValue, FnSig, LocalDecl,
-    Operand as TOperand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty as TTy,
+    AggregateKind, BasicBlock, BlockId as TBlockId, ConstValue, FnSig, Formula, LocalDecl,
+    Operand as TOperand, Place, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty as TTy,
     VerifiableBody, VerifiableFunction,
 };
 
@@ -97,7 +94,9 @@ fn build_callit_arg() -> VerifiableFunction {
             span: SourceSpan::default(),
             atomic: None,
             unwind: trust_types::UnwindEdge::Unreachable,
-            is_unsafe_sig: false, is_foreign: false,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
         },
     };
     let bb1 = BasicBlock {
@@ -154,7 +153,9 @@ fn build_callit(name: &str, return_call_result: bool) -> VerifiableFunction {
             span: SourceSpan::default(),
             atomic: None,
             unwind: trust_types::UnwindEdge::Unreachable,
-            is_unsafe_sig: false, is_foreign: false,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
         },
     };
     let ret_rvalue = if return_call_result {
@@ -708,7 +709,10 @@ fn negative_control_vf_fnptr_indirect_caller_vs_constant_8_is_sat() {
 fn vf_fnptr_indirect_dependent_return_is_not_provable_to_any_constant() {
     let module = lower_callit("callit_dep", /*return_call_result=*/ true);
     // Confirm the Module still carries the CallIndirect (the havoc-only shape).
-    assert!(call_indirect_of(&module).is_some(), "the dependent caller must still emit CallIndirect");
+    assert!(
+        call_indirect_of(&module).is_some(),
+        "the dependent caller must still emit CallIndirect"
+    );
 
     let obj = emit_caller_object(&module);
     let (code, base) = macho_text(&obj).expect("dependent caller __text");

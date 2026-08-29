@@ -833,8 +833,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // after name resolution and before expansion so the compiler-owned
         // contract lowering sees the original attribute payload. Resolver
         // metadata does not carry Cargo package identity, so the identity check
-        // accepts exactly the crate-root `requires`/`ensures` attribute proc
-        // macros of an external crate named `trust`.
+        // accepts exactly the crate-root `requires`/`ensures`/`decreases`
+        // attribute proc macros of an external crate named `trust`.
         //
         // Trust: the decision keys on the RESOLVED def, not the literal
         // invocation path — `use trust::requires; #[requires(..)]`,
@@ -1416,17 +1416,43 @@ fn trust_spec_contract_builtin_name_from_symbols(
     // spec-only syntax (`result`, `old()`, `forall`, `==>`) that must bypass
     // name resolution and typeck, while upstream `core::contracts` clauses
     // keep upstream's typed lowering unchanged.
+    //
+    // Trust: `invariant` is mapped too, but its builtin is a REFUSAL rather
+    // than a lowering (`ExpandTrustInvariant`). It must be listed here for the
+    // same fail-open reason the two clauses above are: an unmapped attribute
+    // falls through to trust-spec's passthrough proc macro and is erased with
+    // no diagnostic at all. Mapping it is what makes the refusal reachable.
+    // `decreases` is deliberately absent — trust-spec exports no `decreases`,
+    // so it is already E0433, and adding a mapping without a trust-spec export
+    // would be dead code while ADDING one to trust-spec would create a second
+    // silent erasure.
     let builtin = match attribute {
         sym::requires => sym::trust_contracts_requires,
         sym::ensures => sym::trust_contracts_ensures,
+        // Trust (D4): `decreases` has no upstream `core::contracts` spelling,
+        // so there is no typed lane for it to join and nothing to keep it
+        // distinguishable FROM. Its builtin desugars to the native `decreases
+        // e` clause verbatim. Without this arm the attribute reaches no
+        // builtin at all and trust-spec has no such proc macro, so linking the
+        // compat shim turned a clause that VERIFIES on the first-class and
+        // tool-attribute surfaces into E0433 -- measured on trust-e26541e3.
+        sym::decreases => sym::trust_contracts_decreases,
+        // Trust (D1): `invariant` maps onto a REFUSAL builtin. Without this arm
+        // the trust-spec passthrough proc macro runs and the annotation is
+        // ERASED with no diagnostic, and the function is then credited as
+        // verified -- measured on trust-e26541e3.
+        sym::invariant => sym::trust_contracts_invariant,
         _ => return None,
     };
     Some((attribute, builtin))
 }
 
 /// Trust: if `def_path` has the shape of a trust-spec contract proc macro —
-/// a single crate-root `MacroNs(requires|ensures)` component with
+/// a single crate-root `MacroNs(requires|ensures|decreases|invariant)` component with
 /// disambiguator 0 — return the attribute name.
+///
+/// `invariant` is included so its REFUSAL builtin is reachable; see
+/// `trust_spec_contract_builtin_name_from_symbols`.
 fn trust_spec_contract_def_path_attr(def_path: &DefPath) -> Option<Symbol> {
     let [component] = &def_path.data[..] else {
         return None;
@@ -1435,7 +1461,14 @@ fn trust_spec_contract_def_path_attr(def_path: &DefPath) -> Option<Symbol> {
         return None;
     }
     match component.data {
-        DefPathData::MacroNs(name) if name == sym::requires || name == sym::ensures => Some(name),
+        DefPathData::MacroNs(name)
+            if name == sym::requires
+                || name == sym::ensures
+                || name == sym::decreases
+                || name == sym::invariant =>
+        {
+            Some(name)
+        }
         _ => None,
     }
 }

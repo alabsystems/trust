@@ -42,7 +42,10 @@ pub struct OracleInsn {
 /// `None` means the oracle produced nothing for that slot — it could not
 /// disassemble those bytes. That is a legitimate answer and is counted, never
 /// treated as agreement.
-pub fn disassemble(candidates: &[Vec<u8>], workdir: &std::path::Path) -> Result<Vec<Option<OracleInsn>>, String> {
+pub fn disassemble(
+    candidates: &[Vec<u8>],
+    workdir: &std::path::Path,
+) -> Result<Vec<Option<OracleInsn>>, String> {
     let asm_path = workdir.join("candidates.s");
     let obj_path = workdir.join("candidates.o");
 
@@ -141,9 +144,9 @@ fn parse(text: &str, slots: usize) -> Vec<Option<OracleInsn>> {
         // `## 0x17 <_probe+0x17>` — the resolved RIP-relative target.
         let (operands, rip_target) = match operands.split_once("##") {
             Some((ops, comment)) => {
-                let target = comment
-                    .split_whitespace()
-                    .find_map(|t| t.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()));
+                let target = comment.split_whitespace().find_map(|t| {
+                    t.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok())
+                });
                 (ops.trim(), target)
             }
             None => (operands, None),

@@ -10,10 +10,10 @@
 //! addition without diffing a five-thousand-line file.
 
 use rustc_macros::{Decodable, Encodable, Walkable};
-use rustc_span::{Span, Symbol};
+use rustc_span::{Span, Symbol, sym};
 use thin_vec::ThinVec;
 
-use super::{Expr, FnContract};
+use super::{AttrArgs, AttrKind, AttrStyle, Attribute, DelimArgs, Expr, FnContract};
 
 /// Trust: one first-class native contract clause payload (two-language design
 /// D0/D1) with its optional `by <thm>` citation (E9). Both parts are verifier
@@ -363,5 +363,91 @@ impl FnContract {
             }
         }
         Ok(ordered)
+    }
+}
+
+/// Trust: the STOCK-SURVIVING transport for a first-class loop clause.
+///
+/// A crate that must build on BOTH stock rustc and tRustc out of one source
+/// tree cannot write the native grammar (`loop invariant P { .. }`): that is a
+/// hard parse error on stock, and `cfg` cannot hide it because `cfg` operates
+/// on an AST that has already been parsed. A direct expression attribute does
+/// not work either. MEASURED on stock rustc 1.97.1 (8bab26f4f 2026-07-14),
+/// ay's pinned channel:
+///
+/// ```text
+/// #[trust::loop_invariant(n <= limit)] loop { .. }
+///     -> error[E0658]: attributes on expressions are experimental
+///     -> error[E0433]: cannot find module or crate `trust` in this scope
+///
+/// #[cfg_attr(trust_verify, trust::loop_invariant(n <= limit))] loop { .. }
+///     -> compiles clean, exit 0, metadata emitted
+/// ```
+///
+/// The difference is that `cfg_attr` is stripped BEFORE expression-attribute
+/// feature gating, so with `trust_verify` unset nothing survives to be gated.
+/// It is the same transport ay already uses for its function contracts
+/// (`#[cfg_attr(trust_verify, trust::ensures(..))]`, 29 sites in `src/`), so
+/// this adds a clause position, not a convention.
+///
+/// The recognizer is deliberately EXACT and literal-path-keyed, which is the
+/// opposite of the rule `rustc_resolve` uses for `trust::requires` /
+/// `trust::ensures` (those key on the RESOLVED def, because an alias that fell
+/// through to the passthrough macro was fail-OPEN). The two rules differ
+/// because the failure directions differ: these attributes are consumed BEFORE
+/// name resolution, so a spelling this function does not recognize is never
+/// silently accepted — it stays on the expression, reaches attribute-macro
+/// collection, and dies as an unresolved attribute. Fail-closed by
+/// construction, with no `trust` crate export needed (and none added: nothing
+/// named `loop_invariant` exists in `crates/trust-spec`, so even the alias
+/// spellings cannot resolve).
+#[must_use]
+pub fn trust_loop_clause_attr_kind(attr: &Attribute) -> Option<LoopClauseKind> {
+    // Inner attributes (`#![..]`) decorate the enclosing construct, not the
+    // loop, so they are never a loop clause. An inner one inside a loop body
+    // belongs to the BLOCK and must not be silently reinterpreted as a header
+    // clause — that is the program-point fiction the statement-position macro
+    // surface was rejected for.
+    if attr.style != AttrStyle::Outer {
+        return None;
+    }
+    let AttrKind::Normal(normal) = &attr.kind else { return None };
+    let path = &normal.item.path;
+    if path.segments.len() != 2 {
+        return None;
+    }
+    // Exactly `#[trust::..]`. A leading `::` carries a `PathRoot` segment and
+    // so has three, and an aliased single-segment import has one; neither is
+    // recognized, and neither is silently dropped — an unrecognized spelling
+    // stays on the expression and dies as an unresolved attribute.
+    if path.segments[0].ident.name != sym::trust {
+        return None;
+    }
+    // Generic arguments on an attribute path are not a thing this vocabulary
+    // has; refusing them here keeps `trust::loop_invariant::<T>(..)` from
+    // being read as the bare clause.
+    if path.segments.iter().any(|seg| seg.args.is_some()) {
+        return None;
+    }
+    match path.segments[1].ident.name {
+        sym::loop_invariant => Some(LoopClauseKind::Invariant),
+        sym::decreases => Some(LoopClauseKind::Decreases),
+        _ => None,
+    }
+}
+
+/// The parenthesized payload of a recognized loop-clause attribute.
+///
+/// `None` for every other argument shape — `#[trust::loop_invariant]` (no
+/// payload), `#[trust::loop_invariant = "P"]`, and a brace/bracket delimiter.
+/// The caller MUST turn `None` into a hard error rather than dropping the
+/// attribute: an unparsed payload that vanishes is precisely the silent
+/// acceptance this surface exists to avoid.
+#[must_use]
+pub fn trust_loop_clause_attr_payload(attr: &Attribute) -> Option<&DelimArgs> {
+    let AttrKind::Normal(normal) = &attr.kind else { return None };
+    match normal.item.args.unparsed_ref()? {
+        AttrArgs::Delimited(args) => Some(args),
+        AttrArgs::Empty | AttrArgs::Eq { .. } => None,
     }
 }

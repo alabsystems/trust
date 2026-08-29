@@ -88,8 +88,9 @@ pub fn detect_format(data: &[u8]) -> Option<BinaryFormat> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::fx::FxHashSet;
+
+    use super::*;
 
     #[test]
     fn test_detect_elf() {

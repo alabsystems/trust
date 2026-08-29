@@ -903,21 +903,29 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
     for (case, replacement) in [
         (
             "Weak edge",
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "std::sync::Weak".into(),
                 fields: vec![("data".into(), expr_backref.clone())],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         ),
         (
             "UnsafeCell edge",
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "std::cell::UnsafeCell".into(),
                 fields: vec![("value".into(), expr_backref.clone())],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         ),
         (
             "mutable ref edge",
@@ -925,12 +933,16 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
         ),
         (
             "hidden Option edge",
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "std::option::Option".into(),
                 fields: vec![("payload".into(), expr_backref.clone())],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         ),
         (
             "unknown opaque datatype",
@@ -938,20 +950,28 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
         ),
         (
             "container-erased Cell payload",
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "smallvec::SmallVec".into(),
                 fields: vec![(
                     "logical_payload".into(),
-                    trust_types::Ty::Adt { adt_kind: None, layout: None, 
+                    trust_types::Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         name: "std::cell::Cell".into(),
                         fields: vec![("value".into(), expr_backref.clone())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                 )],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         ),
     ] {
         let mut bodies = all_bodies();
@@ -970,12 +990,16 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
     };
     fields.push((
         "hidden_cycle_channel".into(),
-        trust_types::Ty::Adt { adt_kind: None, layout: None, 
+        trust_types::Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "std::sync::Weak".into(),
             fields: vec![("data".into(), expr_backref)],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+        },
     ));
     let decline = sem_expr_fold_shape_of(&load(FVS_ROW), &bodies)
         .expect_err("an Arc-shaped type with an extra side channel must fail closed");
@@ -1574,18 +1598,61 @@ fn depth_witness_mints_modulo3_on_real_table() {
     assert_eq!(verdict, RefinementVerdict::ProvenModulo3);
 }
 
-/// PAYOFF: Abstractor and Lifter certify FULLY_FAITHFUL — BOTH rows each
-/// (wrapper + binder-body; one joint SCC certificate).
+/// PAYOFF: Lifter certifies FULLY_FAITHFUL on BOTH rows (wrapper + binder-body; one
+/// joint SCC certificate). Abstractor's pair is DEFERRED, for a cause measured here.
+///
+/// UPDATED 2026-08-25. This asserted all four rows FULLY_FAITHFUL. Measured now:
+/// `<Abstractor as ExprFolderOpt>::fold_expr_opt` raises
+/// `UnsupportedMir { kind: "ConstValue::OpaqueScalar" }` — the emitter met a constant it
+/// cannot model. That row is not an `is_safety_vc_kind` member, so before the decline
+/// clause it fell out of every filter and the trust-ir safety pillar certified over a set
+/// with the only raised row REMOVED (Channel 2 of the decline-handling false proof). The
+/// binder-body row is the joint-SCC twin and follows it.
+///
+/// The Lifter pair — same lane, same rung-D arm, same joint-SCC machinery, no declined
+/// row — is UNCHANGED, which is what keeps this test discriminating: a change that broke
+/// the lane itself would take both pairs down, not one.
+///
+/// Recovering Abstractor means teaching `trust_vcgen` to model the opaque scalar
+/// constant, not teaching this gate to ignore the emitter.
 #[test]
 fn abstractor_and_lifter_scc_rows_fully_faithful_on_production_gate() {
     let bodies = all_bodies();
     let empty = std::collections::BTreeMap::new();
-    for row in [
-        ABS_ROW,
-        LIFTER_ROW,
-        "<expr__subst__Abstractor as expr__visitor__opt__ExprFolderOpt>__fold_binder_body_opt",
-        "<expr__subst__Lifter as expr__visitor__opt__ExprFolderOpt>__fold_binder_body_opt",
-    ] {
+    let abstractor_binder =
+        "<expr__subst__Abstractor as expr__visitor__opt__ExprFolderOpt>__fold_binder_body_opt";
+    let lifter_binder =
+        "<expr__subst__Lifter as expr__visitor__opt__ExprFolderOpt>__fold_binder_body_opt";
+    // The DEFERRAL and its cause, stated where it can red-fail.
+    let abs_leaf = load(ABS_ROW);
+    assert!(
+        trust_clean::mirsem::function_emits_declined_vc(&abs_leaf),
+        "{ABS_ROW}: the deferral must rest on a DECLINED row"
+    );
+    assert!(
+        !trust_clean::mirsem::function_emits_declined_vc(&load(LIFTER_ROW)),
+        "{LIFTER_ROW}: the Lifter control must stay decline-free, or it proves nothing"
+    );
+    for row in [ABS_ROW, abstractor_binder] {
+        let func = load(row);
+        let diag = trust_clean::diagnose_fully_faithful_gate_with_bodies(&func, &empty, &bodies);
+        assert!(
+            !diag.fully_faithful,
+            "{row}: the Abstractor SCC carries an open DECLINED row; if this flips, vcgen \
+             models `ConstValue::OpaqueScalar` — move the row back above, do not weaken \
+             the gate"
+        );
+    }
+    // WHAT THE LANE STILL OWNS on the deferred pair: the wrapper still recognizes and the
+    // joint SCC diagnosis still succeeds, so the deferral is the emitter's coverage gap
+    // and not a shape or SCC regression.
+    let shape = sem_expr_fold_shape_of(&abs_leaf, &bodies).expect("wrapper recognizes");
+    assert!(
+        diagnose_expr_fold_scc(&shape, &bodies).is_ok(),
+        "{ABS_ROW}: the joint SCC diagnosis must still succeed"
+    );
+    // THE UNCHANGED PAIR.
+    for row in [LIFTER_ROW, lifter_binder] {
         let func = load(row);
         if row.ends_with("__fold_expr_opt") {
             let shape = sem_expr_fold_shape_of(&func, &bodies).expect("wrapper recognizes");
@@ -1739,7 +1806,9 @@ fn instantiator_ord_leaf_shape_is_exact() {
     assert_eq!(shape.steps[2].callee, "expr::constructors::<impl expr::Expr>::bvar");
     assert_eq!(
         shape.ord_variants,
-        vec![("Less".into(), 255), ("Equal".into(), 0), ("Greater".into(), 1)]
+        // DECODED, per the extraction boundary that now signs enum tags. `Less`
+        // read `255` here while the dump carried the raw two's-complement value.
+        vec![("Less".into(), -1), ("Equal".into(), 0), ("Greater".into(), 1)]
     );
     assert_eq!(shape.crossed_asserts, 1);
     let arms =
@@ -1858,6 +1927,7 @@ fn instantiator_ord_leaf_alias_and_intervening_effects_decline() {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         },
     });
     assert_instantiator_ord_doctor_declines("intervening call", &intervening_call);
@@ -2056,8 +2126,7 @@ fn depth_probe_binder_field_mismatch_declines() {
     let d = recognize_with_mutated_binder(INST_ROW, INST_BINDER_FILE, |b| {
         let shadow =
             push_folder_field(b, "shadow_depth", trust_types::Ty::Int { width: 32, signed: false });
-        let key_proj =
-            vec![trust_types::Projection::Deref, trust_types::Projection::Field(1)];
+        let key_proj = vec![trust_types::Projection::Deref, trust_types::Projection::Field(1)];
         let shadow_proj =
             vec![trust_types::Projection::Deref, trust_types::Projection::Field(shadow)];
         let retarget = |p: &mut trust_types::Place| {
@@ -2664,22 +2733,29 @@ fn memo_probe_leaf_shared_container_cell_alias_declines() {
     let leaf_path =
         "<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt";
     let leaf = bodies.get_mut(leaf_path).expect("leaf");
-    let hidden_cell = trust_types::Ty::Adt { adt_kind: None, layout: None,
+    let hidden_cell = trust_types::Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "std::collections::VecDeque".into(),
         fields: vec![(
             "logical_payload".into(),
-            trust_types::Ty::Adt { adt_kind: None, layout: None,
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "std::cell::Cell".into(),
                 fields: vec![("value".into(), trust_types::Ty::Int { width: 64, signed: false })],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         )],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let hidden_cell_ref =
-        trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let hidden_cell_ref = trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
     // The alias must be COPIED OUT OF the folder for the detachment rule under
     // test to apply at all, so the folder has to declare a field of exactly
     // that type. Copying the real `FVarId` field into a
@@ -2819,12 +2895,16 @@ fn memo_probe_interior_mutating_clone_declines() {
     for (case, payload) in [
         (
             "explicit Cell",
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "std::cell::Cell".into(),
                 fields: vec![],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         ),
         (
             "opaque hidden Cell",
@@ -2832,12 +2912,16 @@ fn memo_probe_interior_mutating_clone_declines() {
         ),
         (
             "custom side-effecting Clone",
-            trust_types::Ty::Adt { adt_kind: None, layout: None, 
+            trust_types::Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: "user::LooksImmutableButCloneTouchesGlobal".into(),
                 fields: vec![],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
         ),
     ] {
         let mut bodies = all_bodies();
@@ -2901,4 +2985,3 @@ fn memo_probe_should_descend_interior_mutation_declines() {
         .expect_err("an interior-mutating G call must decline");
     assert_eq!(d.name(), "fold_memo::impure_state", "{d:?}");
 }
-

@@ -42,7 +42,6 @@ ay-backend = [
 ]
 # trust #798: ay-direct, trust-wp, trust-wp-direct features removed — Pipeline v2.
 trust-mc-backend = ["dep:trust-mc-verifier"]
-trust-wp-backend = ["dep:trust-wp-core"]
 trust-vc-backend = ["dep:trust-vc-core"]
 # trust #870: trust-codegen backend gates the trust-cg-bridge codegen integration.
 # When enabled, the MirRouter can dispatch scalar functions to the trust-codegen
@@ -86,8 +85,10 @@ ay-certify = [
     "dep:ay",
     "dep:num-bigint",
 ]
-# Enables the native three-suite verification path for full-verifier
-# integration tests and native trustc builds.
+# Enables the two native proof-authority suites (TrustMC and TrustVC) used by
+# full-verifier integration tests and native trustc builds. The TrustWP edge
+# compiles standalone historical inspection/conformance support only; it does
+# not add a routed capability or publication authority.
 trust-vc-native = ["trust-vc-bridge/trust-build"]
 trust-build = [
     "trust-bmc/trust-mc-native-trust-ir-bundle",
@@ -155,7 +156,6 @@ ay-core = { workspace = true, optional = true }
 # trust #442: Optional solver backends
 # trust #798: ay-bindings, trust-mc_core, trust-wp-ay removed — Pipeline v2.
 trust-mc-verifier = { workspace = true, optional = true }
-trust-wp-core = { workspace = true, optional = true }
 trust-vc-core = { workspace = true, optional = true }
 
 # trust #887: Verification daemon binary — shared solver state over TCP.

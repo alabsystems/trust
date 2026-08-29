@@ -114,11 +114,7 @@ fn the_euclidean_identity_holds_for_every_divisor_including_zero() {
     for n in &dividends {
         for m in &divisors {
             let (q, r) = n.div_rem(m);
-            assert_eq!(
-                m.mul(&q).add(&r),
-                *n,
-                "m * (n/m) + n%m must equal n for n={n}, m={m}"
-            );
+            assert_eq!(m.mul(&q).add(&r), *n, "m * (n/m) + n%m must equal n for n={n}, m={m}");
             if !m.is_zero() {
                 assert!(r < *m, "n % m < m must hold for nonzero m (n={n}, m={m})");
             } else {

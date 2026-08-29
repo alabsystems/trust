@@ -7,10 +7,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::{ProofEvidence, ProofStrength};
-
 #[cfg(test)]
 use trust_types::{AssuranceLevel, ReasoningKind};
+use trust_types::{ProofEvidence, ProofStrength};
 
 /// Derive non-authoritative `ProofEvidence` from a public result record.
 ///

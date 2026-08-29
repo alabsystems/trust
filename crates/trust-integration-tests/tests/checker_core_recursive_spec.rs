@@ -88,7 +88,11 @@ fn checker_core_is_whnf_postcondition_emitted_and_shaped() {
                 assert_eq!(args[0].var_name(), Some("_0"), "applied to the return slot _0");
             }
         });
-        assert!(saw, "emitted Postcondition VC must carry the opaque `is_whnf` predicate: {:?}", vc.formula);
+        assert!(
+            saw,
+            "emitted Postcondition VC must carry the opaque `is_whnf` predicate: {:?}",
+            vc.formula
+        );
     }
 }
 
@@ -121,14 +125,8 @@ fn checker_core_is_whnf_postcondition_fails_closed_under_certify() {
 #[test]
 fn certify_violation_is_live_on_a_real_contradiction() {
     let contradiction = Formula::And(vec![
-        Formula::Ge(
-            Box::new(Formula::var("x", Sort::Int)),
-            Box::new(Formula::Int(5)),
-        ),
-        Formula::Le(
-            Box::new(Formula::var("x", Sort::Int)),
-            Box::new(Formula::Int(2)),
-        ),
+        Formula::Ge(Box::new(Formula::var("x", Sort::Int)), Box::new(Formula::Int(5))),
+        Formula::Le(Box::new(Formula::var("x", Sort::Int)), Box::new(Formula::Int(2))),
     ]);
     let evidence = trust_certify::certify_violation(&contradiction);
     assert!(

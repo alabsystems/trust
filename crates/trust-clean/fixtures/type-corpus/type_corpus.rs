@@ -65,10 +65,7 @@ fn container_adt(def_path: &str, elem: Ty) -> Ty {
     // `Vec`/`VecDeque` layout that `sequence_element_ty` walks.
     let buf = Ty::adt(
         "alloc::raw_vec::RawVec",
-        vec![(
-            "ptr".into(),
-            Ty::RawPtr { mutable: true, pointee: Box::new(elem) },
-        )],
+        vec![("ptr".into(), Ty::RawPtr { mutable: true, pointee: Box::new(elem) })],
     );
     Ty::adt(
         def_path,
@@ -81,10 +78,7 @@ fn container_adt(def_path: &str, elem: Ty) -> Ty {
 fn smart_ptr_adt(def_path: &str, inner: Ty) -> Ty {
     let nonnull = Ty::adt(
         "core::ptr::non_null::NonNull",
-        vec![(
-            "pointer".into(),
-            Ty::RawPtr { mutable: false, pointee: Box::new(inner) },
-        )],
+        vec![("pointer".into(), Ty::RawPtr { mutable: false, pointee: Box::new(inner) })],
     );
     Ty::adt(def_path, vec![("pointer".into(), nonnull)])
 }
@@ -96,10 +90,7 @@ fn smart_ptr_adt(def_path: &str, inner: Ty) -> Ty {
 fn slice_iter_adt(def_path: &str, elem: Ty) -> Ty {
     let nonnull = Ty::adt(
         "std::ptr::NonNull",
-        vec![(
-            "pointer".into(),
-            Ty::RawPtr { mutable: false, pointee: Box::new(elem.clone()) },
-        )],
+        vec![("pointer".into(), Ty::RawPtr { mutable: false, pointee: Box::new(elem.clone()) })],
     );
     Ty::adt(
         def_path,
@@ -141,10 +132,7 @@ fn map_adt(def_path: &str, k: Ty, v: Ty) -> Ty {
     let bucket = Ty::adt("hashbrown::raw::Bucket", vec![("ptr".into(), entry_ptr)]);
     let table = Ty::adt(
         "hashbrown::raw::RawTable",
-        vec![
-            ("bucket".into(), bucket),
-            ("items".into(), Ty::Int { width: 64, signed: false }),
-        ],
+        vec![("bucket".into(), bucket), ("items".into(), Ty::Int { width: 64, signed: false })],
     );
     Ty::adt(def_path, vec![("table".into(), table)])
 }
@@ -270,7 +258,11 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
         Ty::adt_enum(
             "MyEnum",
             vec![
-                VariantDef { name: "A".into(), discriminant: 0, fields: vec![("0".into(), param("T/#0"))] },
+                VariantDef {
+                    name: "A".into(),
+                    discriminant: 0,
+                    fields: vec![("0".into(), param("T/#0"))],
+                },
                 VariantDef { name: "B".into(), discriminant: 1, fields: vec![] },
             ],
         ),
@@ -349,7 +341,11 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
                         "core::option::Option",
                         vec![
                             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
-                            VariantDef { name: "Some".into(), discriminant: 1, fields: vec![("0".into(), u8_ty())] },
+                            VariantDef {
+                                name: "Some".into(),
+                                discriminant: 1,
+                                fields: vec![("0".into(), u8_ty())],
+                            },
                         ],
                     ),
                 ),
@@ -416,16 +412,15 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
     // `Trust.Adt.<Adapter>` over its RECOVERED source + closure/index, NOT the
     // opaque `ptr`/`end_or_len`/`_marker` internal layout.
     // `slice::Iter<i32>` → `{ source : Slice i32 }`.
-    c.push((
-        "slice_iter",
-        "std::slice::Iter<i32>  ({ source : Slice i32 })",
-        i32_slice_iter(),
-    ));
+    c.push(("slice_iter", "std::slice::Iter<i32>  ({ source : Slice i32 })", i32_slice_iter()));
     // `str::Chars` → `{ source : Slice u8 }` (a `slice::Iter<u8>` wrapper).
     c.push((
         "chars",
         "std::str::Chars  ({ source : Slice u8 })",
-        Ty::adt("std::str::Chars", vec![("iter".into(), slice_iter_adt("std::slice::Iter", u8_ty()))]),
+        Ty::adt(
+            "std::str::Chars",
+            vec![("iter".into(), slice_iter_adt("std::slice::Iter", u8_ty()))],
+        ),
     ));
     // `Map<slice::Iter<i32>, {closure}>` → `{ source : <Iter record>, f : <closure> }`.
     c.push((
@@ -527,7 +522,11 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
             "core::option::Option",
             vec![
                 VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
-                VariantDef { name: "Some".into(), discriminant: 1, fields: vec![("0".into(), i32_ty())] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), i32_ty())],
+                },
             ],
         ),
     ));
@@ -537,8 +536,16 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
         Ty::adt_enum(
             "core::result::Result",
             vec![
-                VariantDef { name: "Ok".into(), discriminant: 0, fields: vec![("0".into(), i32_ty())] },
-                VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), u8_ty())] },
+                VariantDef {
+                    name: "Ok".into(),
+                    discriminant: 0,
+                    fields: vec![("0".into(), i32_ty())],
+                },
+                VariantDef {
+                    name: "Err".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), u8_ty())],
+                },
             ],
         ),
     ));
@@ -550,7 +557,11 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
             "core::option::Option",
             vec![
                 VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
-                VariantDef { name: "Some".into(), discriminant: 1, fields: vec![("0".into(), param("T/#0"))] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), param("T/#0"))],
+                },
             ],
         ),
     ));
@@ -558,16 +569,16 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
     // --- sequences / tuples ---
     c.push(("array", "[i32; 4]", Ty::Array { elem: Box::new(i32_ty()), len: 4 }));
     c.push(("slice", "&[i32]", Ty::Slice { elem: Box::new(i32_ty()) }));
-    c.push((
-        "tuple3",
-        "(i32, u8, bool)",
-        Ty::Tuple(vec![i32_ty(), u8_ty(), Ty::Bool]),
-    ));
+    c.push(("tuple3", "(i32, u8, bool)", Ty::Tuple(vec![i32_ty(), u8_ty(), Ty::Bool])));
     // &str — a slice of u8 at the carrier level (str ≈ [u8]).
     c.push(("str", "&str", Ty::Slice { elem: Box::new(u8_ty()) }));
 
     // --- trait objects / functions / closures ---
-    c.push(("dyn_trait", "dyn Trait", Ty::Dynamic { trait_name: "Trait".into(), principal_key: Some("Trait".into()) }));
+    c.push((
+        "dyn_trait",
+        "dyn Trait",
+        Ty::Dynamic { trait_name: "Trait".into(), principal_key: Some("Trait".into()) },
+    ));
     c.push((
         "fn_ptr",
         "fn(i32) -> u8",
@@ -604,17 +615,9 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
     c.push(("assoc_type", "<T as Trait>::Out", param("Out/#0")));
     // const generic length parameter `N` appears as a `Ty::Array` len; the generic
     // element `[T; N]` carries the type var element.
-    c.push((
-        "const_generic_array",
-        "[T; N]",
-        Ty::Array { elem: Box::new(param("T/#0")), len: 8 },
-    ));
+    c.push(("const_generic_array", "[T; N]", Ty::Array { elem: Box::new(param("T/#0")), len: 8 }));
     // PhantomData<T> — a zero-field marker struct (no Int content).
-    c.push((
-        "phantom_data",
-        "PhantomData<T>",
-        Ty::adt("core::marker::PhantomData", vec![]),
-    ));
+    c.push(("phantom_data", "PhantomData<T>", Ty::adt("core::marker::PhantomData", vec![])));
 
     // ===================================================================
     // TYPE-ZOO CLOSE (additive) — the six remaining families as REAL Clean
@@ -680,10 +683,7 @@ pub(crate) fn type_corpus() -> Vec<(&'static str, &'static str, Ty)> {
     c.push((
         "gat_family",
         "<T as Iterator>::Item<'a> (GAT family)",
-        Ty::adt(
-            "@gat::core::iter::Iterator::Item",
-            vec![("__gat_param".into(), param("P/#0"))],
-        ),
+        Ty::adt("@gat::core::iter::Iterator::Item", vec![("__gat_param".into(), param("P/#0"))]),
     ));
 
     // TYPE-ZOO #6 — COROUTINE / async state machine: reflects to its state record
@@ -751,7 +751,10 @@ pub(crate) fn verification_type_corpus() -> Vec<VerificationTypeProbe> {
         carrier: reflect_refinement(
             "v",
             &u8_ty(),
-            &Formula::Lt(Box::new(Formula::Var("v".into(), Sort::Int)), Box::new(Formula::Int(128))),
+            &Formula::Lt(
+                Box::new(Formula::Var("v".into(), Sort::Int)),
+                Box::new(Formula::Int(128)),
+            ),
         ),
     });
 

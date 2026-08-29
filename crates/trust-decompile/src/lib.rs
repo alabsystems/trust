@@ -17,10 +17,10 @@ use thiserror::Error;
 use trust_binary_parse::{BinaryArtifactIdentity, parse_binary_with_identity};
 #[cfg(feature = "trust-cg")]
 use trust_cg_bridge::{
-    BinaryEntryBindings, BinaryEntryParam, BinaryTrustCgConversion,
-    BinaryTrustCgConversionError, BinaryTrustCgProofConsumerEvidence,
-    BinaryTrustCgProofConsumerStatus, BinaryTrustCgSymbolicFormula, BinaryTrustCgValidationBlocker,
-    BindingArch, lower_binary_decompiled_function_to_lir_with_entry_bindings,
+    BinaryEntryBindings, BinaryEntryParam, BinaryTrustCgConversion, BinaryTrustCgConversionError,
+    BinaryTrustCgProofConsumerEvidence, BinaryTrustCgProofConsumerStatus,
+    BinaryTrustCgSymbolicFormula, BinaryTrustCgValidationBlocker, BindingArch,
+    lower_binary_decompiled_function_to_lir_with_entry_bindings,
 };
 use trust_ir_bridge::{
     BridgeError as TrustIrBridgeError, TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_FEATURE,
@@ -42,8 +42,7 @@ use trust_types::{
     BinaryFactSubject, BinaryFunctionSignature, BinaryMemoryModel, BinaryOrigin, BinaryParameter,
     BinaryReturn, BinarySelectedImageIdentity, BinarySourceProvenanceDiagnostic,
     BinarySourceProvenanceSummary, BinaryStackBase, BinaryStorageFact, BinaryStorageLocation,
-    BinarySymbol,
-    BinarySymbolKind, BinaryVerificationSummary, ConstValue,
+    BinarySymbol, BinarySymbolKind, BinaryVerificationSummary, ConstValue,
     DecompileOptions as SharedDecompileOptions, DecompileTarget, DecompiledFunction,
     DecompiledOutput, Endianness, Formula, MemoryAccessFact, ModelAssumption, Operand,
     PreservedSymbolicFormula, ProofCertificateStatus, ReconstructionCandidateKind,
@@ -87,8 +86,7 @@ const TARGET_PROOF_CONSUMER_ARTIFACT_DIGEST_DIAGNOSTIC_PREFIX: &str =
 const RUST_COMPILE_BACK_EVIDENCE_ARTIFACT_SCHEMA: &str =
     "trust-decompile.RustCompileBackEvidenceArtifact@1";
 const TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER: &str = "trust-ir-target-lowering-failed";
-const TRUST_IR_UNCONSUMED_THREAD_LOCAL_ADDR_BLOCKER: &str =
-    "trust-ir-unconsumed-thread-local-addr";
+const TRUST_IR_UNCONSUMED_THREAD_LOCAL_ADDR_BLOCKER: &str = "trust-ir-unconsumed-thread-local-addr";
 
 #[derive(Debug, Clone)]
 enum ParserArtifactIdentityStatus {
@@ -3874,9 +3872,7 @@ fn statement_reads_local(statement: &Statement, local: usize) -> bool {
         Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => false,
         // A retag and an explicit mention both observe the place.
         Statement::Retag { place } | Statement::PlaceMention(place) => place.local == local,
-        Statement::Intrinsic { args, .. } => {
-            args.iter().any(|arg| operand_reads_local(arg, local))
-        }
+        Statement::Intrinsic { args, .. } => args.iter().any(|arg| operand_reads_local(arg, local)),
         Statement::CopyNonOverlapping { src, dst, count, .. } => {
             operand_reads_local(src, local)
                 || operand_reads_local(dst, local)
@@ -3985,7 +3981,6 @@ fn reconstruct_frame(body: &mut VerifiableBody, function: &str) -> Vec<BinarySto
         .collect()
 }
 
-
 /// Does this terminator ALREADY carry the control transfer its block's program-
 /// counter writes encode?
 ///
@@ -4078,8 +4073,9 @@ fn elide_control_flow_program_counter_writes(body: &mut VerifiableBody) -> usize
 
 #[cfg(test)]
 mod frame_reconstruction_tests {
-    use super::*;
     use trust_types::{BasicBlock, BlockId, LocalDecl, Place, Projection, Sort};
+
+    use super::*;
 
     const SP: usize = 32; // AArch64 `LocalLayout::sp_local`.
     const X0: usize = 1;
@@ -4142,7 +4138,6 @@ mod frame_reconstruction_tests {
             body.blocks[0].stmts
         );
     }
-
 
     /// THE POINT OF THE PASS, measured against the real consumer.
     ///
@@ -4324,7 +4319,11 @@ mod frame_reconstruction_tests {
     fn body_with(stmts: Vec<Statement>, terminator: Terminator) -> VerifiableBody {
         VerifiableBody {
             locals: vec![
-                LocalDecl { index: X0, ty: Ty::Int { width: 64, signed: false }, name: Some("X0".to_string()) },
+                LocalDecl {
+                    index: X0,
+                    ty: Ty::Int { width: 64, signed: false },
+                    name: Some("X0".to_string()),
+                },
                 LocalDecl {
                     index: SP,
                     ty: Ty::Int { width: 64, signed: false },
@@ -5362,10 +5361,9 @@ fn trust_ir_thread_local_addr_target_validation_blockers(
                 });
                 let canonical = decoded.is_ok() && node_shape_error.is_none();
                 let payload_detail = match (&decoded, &node_shape_error) {
-                    (Ok(spec), None) => format!(
-                        "canonical version-1 payload for TLS symbol {:?}",
-                        spec.symbol
-                    ),
+                    (Ok(spec), None) => {
+                        format!("canonical version-1 payload for TLS symbol {:?}", spec.symbol)
+                    }
                     (Ok(_), Some(error)) => error.clone(),
                     (Err(error), None) => format!("noncanonical payload: {error}"),
                     (Err(error), Some(shape_error)) => {
@@ -6966,8 +6964,7 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                 let validation_records = trust_ir_self_validation_records(functions);
                 let preserved_symbolic_formulas =
                     preserved_symbolic_formulas_for_target(DecompileTarget::TrustIr, functions);
-                let mut target_validation_blockers =
-                    trust_ir_target_validation_blockers(functions);
+                let mut target_validation_blockers = trust_ir_target_validation_blockers(functions);
                 target_validation_blockers.extend(symbolic_formula_target_validation_blockers(
                     DecompileTarget::TrustIr,
                     &preserved_symbolic_formulas,
@@ -7044,8 +7041,7 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                 let validation_records = trust_ir_self_validation_records(functions);
                 let preserved_symbolic_formulas =
                     preserved_symbolic_formulas_for_target(DecompileTarget::TrustIr, functions);
-                let mut target_validation_blockers =
-                    trust_ir_target_validation_blockers(functions);
+                let mut target_validation_blockers = trust_ir_target_validation_blockers(functions);
                 target_validation_blockers.extend(symbolic_formula_target_validation_blockers(
                     DecompileTarget::TrustIr,
                     &preserved_symbolic_formulas,
@@ -7184,21 +7180,19 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                 // re-listing them would resurrect the exact blocker their
                 // consumption discharged — so they are subtracted here; their
                 // disclosure lives in the conversion evidence rows.
-                let body_scan = preserved_symbolic_formulas_for_target(
-                    DecompileTarget::TrustCg,
-                    functions,
-                )
-                .into_iter()
-                .filter(|formula| {
-                    !conversion.consumed_symbolic_statements.iter().any(
-                        |(function, block, statement_index)| {
-                            formula.function.as_deref() == Some(function.as_str())
-                                && formula.block == Some(*block)
-                                && formula.statement_index == Some(*statement_index)
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
+                let body_scan =
+                    preserved_symbolic_formulas_for_target(DecompileTarget::TrustCg, functions)
+                        .into_iter()
+                        .filter(|formula| {
+                            !conversion.consumed_symbolic_statements.iter().any(
+                                |(function, block, statement_index)| {
+                                    formula.function.as_deref() == Some(function.as_str())
+                                        && formula.block == Some(*block)
+                                        && formula.statement_index == Some(*statement_index)
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
                 let preserved_symbolic_formulas =
                     if conversion.preserved_symbolic_formulas.is_empty() {
                         body_scan
@@ -7564,13 +7558,10 @@ fn trust_cg_conversion_for_functions(
                 // consumed is no longer awaiting target semantics; record it
                 // so the render layer's body scan cannot re-list it.
                 {
-                    let mut per_statement: BTreeMap<(String, usize, usize), bool> =
-                        BTreeMap::new();
+                    let mut per_statement: BTreeMap<(String, usize, usize), bool> = BTreeMap::new();
                     for row in &conversion.symbolic_formula_evidence {
-                        let key =
-                            (row.function.clone(), row.block, row.statement_index);
-                        let all_consumed =
-                            per_statement.entry(key).or_insert(true);
+                        let key = (row.function.clone(), row.block, row.statement_index);
+                        let all_consumed = per_statement.entry(key).or_insert(true);
                         *all_consumed &= row.target_semantics_consumed;
                     }
                     consumed_symbolic_statements.extend(
@@ -8735,6 +8726,7 @@ const RUST_KEYWORDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use trust_types::UnwindEdge;
+
     use super::*;
 
     #[test]
@@ -9519,10 +9511,7 @@ mod tests {
             diagnostic.contains("symbolic operand requires target-semantic lowering")
         }));
         assert!(
-            trust_cg
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic == "format=trust_cg-rejected")
+            trust_cg.diagnostics.iter().any(|diagnostic| diagnostic == "format=trust_cg-rejected")
         );
         assert!(trust_cg.diagnostics.iter().any(|diagnostic| diagnostic == "proof-grade=false"));
     }
@@ -10010,10 +9999,8 @@ mod tests {
     #[test]
     fn trust_ir_text_blocks_failed_tls_lowering_while_json_keeps_its_hard_error() {
         let mut malformed = thread_local_ref_trust_ir("tls_malformed");
-        let Statement::Assign {
-            rvalue: Rvalue::Unsupported { operands, .. },
-            ..
-        } = &mut malformed.body.blocks[0].stmts[0]
+        let Statement::Assign { rvalue: Rvalue::Unsupported { operands, .. }, .. } =
+            &mut malformed.body.blocks[0].stmts[0]
         else {
             panic!("TLS fixture assignment disappeared");
         };
@@ -10021,8 +10008,8 @@ mod tests {
 
         let mut lifted = synthetic_lifted_binary(&[("tls_malformed", 0x401000)]);
         lifted.functions[0].trust_ir_body = malformed.body;
-        let text_options = DecompileOptions::default()
-            .with_outputs([DecompileOutputKind::TrustIrText]);
+        let text_options =
+            DecompileOptions::default().with_outputs([DecompileOutputKind::TrustIrText]);
         let artifact = decompilation_artifact_from_lifted(16, &text_options, &lifted)
             .expect("TrustIr text should remain inspectable with an explicit lowering blocker");
         let output = artifact
@@ -10041,14 +10028,11 @@ mod tests {
         assert!(blocker.diagnostics.iter().any(|diagnostic| diagnostic == "fail-closed=true"));
         assert!(blocker.diagnostics.iter().any(|diagnostic| diagnostic == "proof-grade=false"));
         assert!(
-            blocker
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic == "target-validation=not-run")
+            blocker.diagnostics.iter().any(|diagnostic| diagnostic == "target-validation=not-run")
         );
 
-        let json_options = DecompileOptions::default()
-            .with_outputs([DecompileOutputKind::TrustIrJson]);
+        let json_options =
+            DecompileOptions::default().with_outputs([DecompileOutputKind::TrustIrJson]);
         let error = decompilation_artifact_from_lifted(16, &json_options, &lifted)
             .expect_err("TrustIr JSON must retain its existing canonical-lowering hard error");
         assert!(matches!(&error, DecompileError::TrustIrBridge(_)));
@@ -10124,12 +10108,7 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic == "dialect-payload=noncanonical")
         );
-        assert!(
-            blocker
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic == "node-result-count=0")
-        );
+        assert!(blocker.diagnostics.iter().any(|diagnostic| diagnostic == "node-result-count=0"));
         assert!(blocker.diagnostics.iter().any(|diagnostic| diagnostic == "fail-closed=true"));
         assert!(blocker.diagnostics.iter().any(|diagnostic| diagnostic == "proof-grade=false"));
     }
@@ -10525,6 +10504,7 @@ mod tests {
                             terminator: Terminator::Call {
                                 unwind: UnwindEdge::Unreachable,
                                 is_unsafe_sig: false,
+                                callee_identity: None,
                                 is_foreign: false,
                                 func: "callee".to_string(),
                                 args: vec![Operand::Copy(Place::local(0))],

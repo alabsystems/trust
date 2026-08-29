@@ -330,6 +330,13 @@ pub struct TrustDump {
     pub native_bundle: Option<PathBuf>,
     /// `ir:<dir>` — the assembled crate-level TrustIr lowering artifacts.
     pub ir: Option<PathBuf>,
+    // Trust (v6/D1): `spec-clean:<dir>` — one JSONL row per kernel-graded spec
+    // goal, rendered from the exact expression the discharge lane handed to the
+    // kernel grader (never an offline re-elaboration). This is the compiler
+    // half of `targo trust spec --emit clean`; the subcommand fails closed when
+    // no session wrote this artifact.
+    /// `spec-clean:<dir>` — the per-crate kernel-graded Clean goal ledger.
+    pub spec_clean: Option<PathBuf>,
 }
 
 impl TrustDump {
@@ -340,7 +347,9 @@ impl TrustDump {
 
     /// Every configured sink directory, for the shared non-empty-path check.
     pub fn paths(&self) -> impl Iterator<Item = &PathBuf> {
-        [self.mir.as_ref(), self.native_bundle.as_ref(), self.ir.as_ref()].into_iter().flatten()
+        [self.mir.as_ref(), self.native_bundle.as_ref(), self.ir.as_ref(), self.spec_clean.as_ref()]
+            .into_iter()
+            .flatten()
     }
 }
 

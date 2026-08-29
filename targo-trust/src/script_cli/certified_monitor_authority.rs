@@ -1,8 +1,9 @@
 //! Native authority binding for the certified-monitor Layer-3b payload.
 
-use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+
+use serde::Serialize;
 
 use super::{
     CERTIFIED_MONITOR_LOG_DIR_ENV, CERTIFIED_MONITOR_MAX_IDENTITY_BYTES,

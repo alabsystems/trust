@@ -198,7 +198,7 @@ use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{Formula, Rvalue, Statement, Terminator, Ty, VerifiableBody};
 
 /// Why contract-derived preconditions were not assumed for body verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssumeSkipReason {
     /// Predicate uses syntax outside the v1 integer/boolean fragment.
     UnsupportedSyntax,
@@ -1386,7 +1386,38 @@ fn collect_literals(formula: &Formula, out: &mut Vec<i128>) {
             }
         }
         Formula::Bool(_) | Formula::Var(..) | Formula::SymVar(..) => {}
-        Formula::Not(inner) | Formula::Neg(inner) => collect_literals(inner, out),
+        Formula::Not(inner) => collect_literals(inner, out),
+        // Trust: a negative literal parses as `Neg(Int(n))`, so recursing alone
+        // seeds the MAGNITUDE `n` and never the value `-n` the predicate names.
+        // `requires x == -3` therefore searched {0,±1,3} ±1 — which reaches -2
+        // but not -3 — and refused a plainly satisfiable precondition as
+        // "no satisfiable witness". Measured: `x == -1`/`x == -2` were admitted
+        // and everything from `x == -3` down was refused, purely because -1/-2
+        // fall inside the ±1 expansion of the {0,1,-1} seeds.
+        //
+        // Contribute the negation of each literal found under the `Neg`, which
+        // is the smallest set that fixes the actual defect: negating every
+        // literal unconditionally would roughly double each variable's
+        // candidate list, and the per-variable lists feed a cross product
+        // capped by `MAX_ASSIGNMENTS`, so it could push wide predicates over
+        // the cap and manufacture NEW spurious refusals.
+        //
+        // SOUNDNESS: this only ADDS candidates. Every accept still comes from
+        // evaluating the whole precondition set to `true` under one concrete
+        // assignment, so a found witness remains a genuine model and an
+        // unsatisfiable predicate can never be admitted.
+        Formula::Neg(inner) => {
+            let start = out.len();
+            collect_literals(inner, out);
+            // The range is built from the length BEFORE these pushes, so the
+            // negations appended below are not themselves re-negated.
+            for index in start..out.len() {
+                let value = out[index];
+                if let Some(negated) = value.checked_neg() {
+                    out.push(negated);
+                }
+            }
+        }
         Formula::And(items) | Formula::Or(items) => {
             for item in items {
                 collect_literals(item, out);
@@ -1553,8 +1584,9 @@ fn eval_int(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Option<i1
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::Sort;
+
+    use super::*;
 
     fn var(name: &str) -> Formula {
         Formula::Var(name.to_string(), Sort::Int)
@@ -1640,10 +1672,8 @@ mod tests {
         debug_name_locals: &FxHashMap<String, Vec<usize>>,
         hir: &[&str],
     ) -> Vec<AssumeSkipReason> {
-        let hir: Vec<Option<String>> = hir
-            .iter()
-            .map(|n| if n.is_empty() { None } else { Some((*n).to_string()) })
-            .collect();
+        let hir: Vec<Option<String>> =
+            hir.iter().map(|n| if n.is_empty() { None } else { Some((*n).to_string()) }).collect();
         super::gate_contract_preconditions(preconditions, body, debug_name_locals, Some(&hir))
     }
 
@@ -1755,6 +1785,57 @@ mod tests {
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert_eq!(reasons, vec![AssumeSkipReason::NoSatisfiableWitness]);
         assert!(pres.is_empty());
+    }
+
+    /// A negative literal parses as `Neg(Int(n))`. `collect_literals` used to
+    /// recurse through the `Neg` and seed only the MAGNITUDE, so the candidate
+    /// set for `x == -3` was {0, ±1, 3} expanded by ±1 — which contains -2 but
+    /// not -3 — and the gate refused a plainly satisfiable precondition.
+    ///
+    /// The boundary was measured end-to-end through `trustc -Ztrust-verify=on`:
+    /// `requires x == -1` and `x == -2` were admitted (they fall inside the ±1
+    /// expansion of the {0,1,-1} seeds) while everything from `x == -3` down
+    /// was refused. This pins several values on BOTH sides of that old cliff so
+    /// a regression cannot hide behind the two that always worked.
+    #[test]
+    fn negative_literal_equality_has_a_ground_witness() {
+        for value in [-1i128, -2, -3, -4, -7, -16, -100] {
+            let body = body_with_param_ty("x", trust_types::Ty::Int { width: 32, signed: true });
+            let names = multimap(&[("x", &[1])]);
+            // `x == -value`, spelled the way the contract lowerer builds it.
+            let mut pres = vec![Formula::Eq(
+                Box::new(var("x")),
+                Box::new(Formula::Neg(Box::new(int(-value)))),
+            )];
+            let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+            assert!(
+                !reasons.contains(&AssumeSkipReason::NoSatisfiableWitness),
+                "`x == {value}` is satisfiable and must not be refused for want of a witness; \
+                 got {reasons:?}"
+            );
+            assert!(
+                !pres.is_empty(),
+                "`x == {value}` must survive the gate and reach the body VCs"
+            );
+        }
+    }
+
+    /// The companion direction: widening the candidate set must not make the
+    /// gate admit something unsatisfiable. `x == -3 && x == -4` has no model,
+    /// and both literals are now in the candidate set, so this is exactly the
+    /// case where a careless "just add more candidates" fix would still be
+    /// caught by evaluation rather than by the search being too narrow.
+    #[test]
+    fn contradictory_negative_literals_still_have_no_witness() {
+        let body = body_with_param_ty("x", trust_types::Ty::Int { width: 32, signed: true });
+        let names = multimap(&[("x", &[1])]);
+        let mut pres = vec![
+            Formula::Eq(Box::new(var("x")), Box::new(Formula::Neg(Box::new(int(3))))),
+            Formula::Eq(Box::new(var("x")), Box::new(Formula::Neg(Box::new(int(4))))),
+        ];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert_eq!(reasons, vec![AssumeSkipReason::NoSatisfiableWitness]);
+        assert!(pres.is_empty(), "the impossible hypothesis must not reach any body VC");
     }
 
     #[test]
@@ -1911,17 +1992,27 @@ mod tests {
     fn mut_ref_deref_drops_assumption() {
         // `#[requires(*a <= 100)]` on `a: &mut u32` — the pointee CAN be mutated
         // in the body, so the entry fact may go stale. Assuming it is a false-
-        // PROVE hazard, so the gate must drop it (fail-closed). The raw base `a`
-        // aliases a parameter local, so the None-classification reports the
-        // sharper ShadowedParamName diagnostic (the `aliases_param` branch);
-        // either way the assumption set is dropped.
+        // PROVE hazard, so the gate must drop it (fail-closed).
+        //
+        // Trust: the diagnostic is `NonParamVariable("a*")`, NOT
+        // `ShadowedParamName("a")`. This comment used to claim the latter, and
+        // the guard at `aliases_param` now says why that is wrong in its own
+        // words: "If `raw_base` is already the parameter's canonical name,
+        // rejection came from the term shape (for example `a*` on `a: &mut T`),
+        // not from a debug-name alias." `a` IS the canonical parameter name, so
+        // this is a term-shape rejection and reporting a shadow would be the
+        // less precise answer.
+        //
+        // The property this test actually guards — the assumption set is dropped
+        // fail-closed — is unchanged, and is the `pres.is_empty()` assertion
+        // below. Only the label moved.
         let body = ref_param_body(true);
         let names = multimap(&[("a", &[1])]);
         let mut pres = vec![Formula::Le(Box::new(var("a*")), Box::new(int(100)))];
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert!(
-            reasons.iter().any(|r| matches!(r, AssumeSkipReason::ShadowedParamName(n) if n == "a")),
-            "mut-ref deref must NOT be assumed: {reasons:?}"
+            reasons.iter().any(|r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "a*")),
+            "mut-ref deref must NOT be assumed, and `a*` is a TERM-SHAPE rejection: {reasons:?}"
         );
         assert!(pres.is_empty());
     }

@@ -47,10 +47,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
+use trust_ir::Module;
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
 use trust_types::{Formula, Sort};
-
-use trust_ir::Module;
 
 // ---------------------------------------------------------------------------
 // Which 64-bit shape to build. Each is sourced from a REAL trust-types
@@ -106,7 +105,13 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 "add64".to_string(),
                 "i64::add64".to_string(),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
+                VerifiableBody {
+                    locals,
+                    blocks,
+                    arg_count: 2,
+                    return_ty: i64t(),
+                    datatype_defs: Default::default(),
+                },
             )
         }
         // ---- checked `a - b` / `a * b` : the MIR-faithful tuple idiom. ----
@@ -157,7 +162,13 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 nm.to_string(),
                 format!("i64::{nm}"),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
+                VerifiableBody {
+                    locals,
+                    blocks,
+                    arg_count: 2,
+                    return_ty: i64t(),
+                    datatype_defs: Default::default(),
+                },
             )
         }
         // ---- signed `a / b` : div-by-zero guard, i64::MIN/-1 guard, bare sdiv. ----
@@ -238,7 +249,13 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 "div64".to_string(),
                 "i64::div64".to_string(),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
+                VerifiableBody {
+                    locals,
+                    blocks,
+                    arg_count: 2,
+                    return_ty: i64t(),
+                    datatype_defs: Default::default(),
+                },
             )
         }
         // ---- `a << b` (i64): shift-amount-in-range guard, bare ishl. ----
@@ -289,7 +306,13 @@ fn make_bridge_module(shape: Shape) -> Module {
             (
                 "shl64".to_string(),
                 "i64::shl64".to_string(),
-                VerifiableBody { locals, blocks, arg_count: 2, return_ty: i64t(), datatype_defs: Default::default() },
+                VerifiableBody {
+                    locals,
+                    blocks,
+                    arg_count: 2,
+                    return_ty: i64t(),
+                    datatype_defs: Default::default(),
+                },
             )
         }
     };
@@ -705,11 +728,7 @@ fn mask_to_width(v: i128, width: u32) -> i128 {
 
 fn as_signed(v: i128, width: u32) -> i128 {
     let v = mask_to_width(v, width);
-    if width < 128 && (v & (1i128 << (width - 1))) != 0 {
-        v - (1i128 << width)
-    } else {
-        v
-    }
+    if width < 128 && (v & (1i128 << (width - 1))) != 0 { v - (1i128 << width) } else { v }
 }
 
 fn fold_consts(f: &Formula) -> Formula {
@@ -744,7 +763,9 @@ fn fold_consts(f: &Formula) -> Formula {
                 Formula::BvSignExt(Box::new(a), *bits)
             }
         }
-        Formula::BvOr(a, b, w) => fold_bin(a, b, *w, |x, y| x | y, |a, b, w| Formula::BvOr(a, b, w)),
+        Formula::BvOr(a, b, w) => {
+            fold_bin(a, b, *w, |x, y| x | y, |a, b, w| Formula::BvOr(a, b, w))
+        }
         Formula::BvAnd(a, b, w) => {
             fold_bin(a, b, *w, |x, y| x & y, |a, b, w| Formula::BvAnd(a, b, w))
         }
@@ -1057,7 +1078,8 @@ fn i64_shl_is_ishl_at_i64_with_guard() {
     use trust_cg_lower::instructions::Opcode as LO;
     use trust_cg_lower::types::Type as LT;
     let module = make_bridge_module(Shape::Shl);
-    let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("i64 shl lowers");
+    let lir =
+        lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("i64 shl lowers");
     assert!(lir.stack_slots.is_empty(), "i64 shl must materialize NO memory");
     let mut ishl = 0;
     let mut brif = 0;

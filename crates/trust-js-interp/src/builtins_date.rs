@@ -13,11 +13,12 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
 use trust_js_value::{
-    to_integer_or_infinity, DateField, DateSetKind, ErrKind, JsObject, JsValue, NativeFn, ObjId,
-    ObjKind, PropKey, Units,
+    DateField, DateSetKind, ErrKind, JsObject, JsValue, NativeFn, ObjId, ObjKind, PropKey, Units,
+    to_integer_or_infinity,
 };
+
+use crate::interp::{Abrupt, ERes, Interp};
 
 pub(crate) const MS_PER_DAY: f64 = 86_400_000.0;
 const MS_PER_HOUR: f64 = 3_600_000.0;
@@ -59,17 +60,12 @@ fn is_leap(y: i64) -> bool {
 }
 
 fn days_in_year(y: i64) -> i64 {
-    if is_leap(y) {
-        366
-    } else {
-        365
-    }
+    if is_leap(y) { 366 } else { 365 }
 }
 
 /// DayFromYear(y): day number of 1 January of year y.
 fn day_from_year(y: i64) -> i64 {
-    365 * (y - 1970) + floor_div(y - 1969, 4) - floor_div(y - 1901, 100)
-        + floor_div(y - 1601, 400)
+    365 * (y - 1970) + floor_div(y - 1969, 4) - floor_div(y - 1901, 100) + floor_div(y - 1601, 400)
 }
 
 /// YearFromTime as a year number, from a day number.
@@ -176,19 +172,14 @@ fn make_full_year(y: f64) -> f64 {
         return f64::NAN;
     }
     let yi = to_integer_or_infinity(y);
-    if (0.0..=99.0).contains(&yi) {
-        1900.0 + yi
-    } else {
-        y
-    }
+    if (0.0..=99.0).contains(&yi) { 1900.0 + yi } else { y }
 }
 
 // -- string formats ---------------------------------------------------------
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
+const MONTHS: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 fn pad(n: i64, width: usize) -> String {
     format!("{:0width$}", n, width = width)
@@ -500,43 +491,15 @@ impl Interp {
     fn date_from_fields(&mut self, args: &[JsValue], as_utc: bool) -> Result<f64, Abrupt> {
         let arg = |i: usize| args.get(i).cloned().unwrap_or(JsValue::Undefined);
         let y = self.to_number(&arg(0))?;
-        let m = if args.len() > 1 {
-            self.to_number(&arg(1))?
-        } else {
-            0.0
-        };
-        let dt = if args.len() > 2 {
-            self.to_number(&arg(2))?
-        } else {
-            1.0
-        };
-        let h = if args.len() > 3 {
-            self.to_number(&arg(3))?
-        } else {
-            0.0
-        };
-        let min = if args.len() > 4 {
-            self.to_number(&arg(4))?
-        } else {
-            0.0
-        };
-        let s = if args.len() > 5 {
-            self.to_number(&arg(5))?
-        } else {
-            0.0
-        };
-        let milli = if args.len() > 6 {
-            self.to_number(&arg(6))?
-        } else {
-            0.0
-        };
+        let m = if args.len() > 1 { self.to_number(&arg(1))? } else { 0.0 };
+        let dt = if args.len() > 2 { self.to_number(&arg(2))? } else { 1.0 };
+        let h = if args.len() > 3 { self.to_number(&arg(3))? } else { 0.0 };
+        let min = if args.len() > 4 { self.to_number(&arg(4))? } else { 0.0 };
+        let s = if args.len() > 5 { self.to_number(&arg(5))? } else { 0.0 };
+        let milli = if args.len() > 6 { self.to_number(&arg(6))? } else { 0.0 };
         let yr = make_full_year(y);
         let final_date = make_date(make_day(yr, m, dt), make_time(h, min, s, milli));
-        Ok(if as_utc {
-            time_clip(final_date)
-        } else {
-            time_clip(utc_from_local(final_date))
-        })
+        Ok(if as_utc { time_clip(final_date) } else { time_clip(utc_from_local(final_date)) })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -592,9 +555,9 @@ impl Interp {
                 Ok(JsValue::Obj(oid))
             }
             N::DateNow => Ok(JsValue::Num(self.tick_now())),
-            N::DateRealNow => Err(Abrupt::Fatal(
-                "real Date.now (real clock, engine-divergent)".to_string(),
-            )),
+            N::DateRealNow => {
+                Err(Abrupt::Fatal("real Date.now (real clock, engine-divergent)".to_string()))
+            }
             N::DateParse => {
                 let s = self.to_string_units(&arg(0))?;
                 match parse_iso(&s) {
@@ -740,11 +703,7 @@ impl Interp {
                 }
                 let new_date =
                     make_date(make_day(year, month, date), make_time(hour, min, sec, milli));
-                let v = if utc {
-                    time_clip(new_date)
-                } else {
-                    time_clip(utc_from_local(new_date))
-                };
+                let v = if utc { time_clip(new_date) } else { time_clip(utc_from_local(new_date)) };
                 self.set_date_value(&this, v);
                 Ok(JsValue::Num(v))
             }
@@ -767,11 +726,8 @@ impl Interp {
                         return Ok(JsValue::Null);
                     }
                 }
-                let iso = self.get_from_object(
-                    o,
-                    &PropKey::from_str("toISOString"),
-                    JsValue::Obj(o),
-                )?;
+                let iso =
+                    self.get_from_object(o, &PropKey::from_str("toISOString"), JsValue::Obj(o))?;
                 self.call_value(&iso, JsValue::Obj(o), vec![])
             }
             N::DateToUtcString => {
@@ -833,9 +789,7 @@ impl Interp {
                     return Ok(JsValue::Num(f64::NAN));
                 }
                 #[allow(clippy::cast_precision_loss)]
-                Ok(JsValue::Num(
-                    year_from_day(day_i(local_time(tv))) as f64 - 1900.0,
-                ))
+                Ok(JsValue::Num(year_from_day(day_i(local_time(tv))) as f64 - 1900.0))
             }
             N::DateSetYear => {
                 // B.2.3.2.
@@ -847,11 +801,7 @@ impl Interp {
                     return Ok(JsValue::Num(f64::NAN));
                 }
                 let yi = to_integer_or_infinity(y);
-                let yyyy = if (0.0..=99.0).contains(&yi) {
-                    yi + 1900.0
-                } else {
-                    y
-                };
+                let yyyy = if (0.0..=99.0).contains(&yi) { yi + 1900.0 } else { y };
                 let d = day_i(t);
                 let (m, dt) = month_date_from_day(d);
                 #[allow(clippy::cast_precision_loss)]
@@ -899,10 +849,7 @@ mod tests {
     fn make_day_time_clip_vectors() {
         assert_eq!(make_date(make_day(1970.0, 0.0, 1.0), 0.0), 0.0);
         // Rollover: month 13 / day 32 / hour 25 wrap forward.
-        let t = make_date(
-            make_day(2023.0, 13.0, 32.0),
-            make_time(25.0, 61.0, 61.0, 1001.0),
-        );
+        let t = make_date(make_day(2023.0, 13.0, 32.0), make_time(25.0, 61.0, 61.0, 1001.0));
         assert_eq!(iso_string(t).unwrap(), "2024-03-04T02:02:02.001Z");
         assert!(time_clip(MAX_TIME + 1.0).is_nan());
         assert_eq!(time_clip(MAX_TIME), MAX_TIME);
@@ -928,10 +875,7 @@ mod tests {
         assert_eq!(utc_string(t), "Tue, 14 Nov 2023 22:13:20 GMT");
         assert_eq!(iso_string(t).unwrap(), "2023-11-14T22:13:20.123Z");
         assert_eq!(to_date_string(f64::NAN), "Invalid Date");
-        assert_eq!(
-            iso_string(-62_198_755_200_000.0).unwrap(),
-            "-000001-01-01T00:00:00.000Z"
-        );
+        assert_eq!(iso_string(-62_198_755_200_000.0).unwrap(), "-000001-01-01T00:00:00.000Z");
         assert_eq!(iso_string(MAX_TIME).unwrap(), "+275760-09-13T00:00:00.000Z");
     }
 
@@ -953,10 +897,21 @@ mod tests {
         assert_eq!(p("2023-11-14T22:13").unwrap(), 1_699_999_980_000.0);
         // Outside the exact grammar: refuse (never guess).
         for bad in [
-            "2023-13-01", "2023-00-01", "2023-01-00", "2023-11-14T25:00:00",
-            "2023-11-14T24:30:00", "2023-11-14T23:59:60", "2023-11-14 22:13:20",
-            "2023-11-14T22:13:20.1Z", "nonsense", "", "-000000", "2023-11-14t22:13",
-            "2023-11-14T22:13:20z", " 2023", "2023 ",
+            "2023-13-01",
+            "2023-00-01",
+            "2023-01-00",
+            "2023-11-14T25:00:00",
+            "2023-11-14T24:30:00",
+            "2023-11-14T23:59:60",
+            "2023-11-14 22:13:20",
+            "2023-11-14T22:13:20.1Z",
+            "nonsense",
+            "",
+            "-000000",
+            "2023-11-14t22:13",
+            "2023-11-14T22:13:20z",
+            " 2023",
+            "2023 ",
         ] {
             assert!(p(bad).is_err(), "should refuse: {bad}");
         }

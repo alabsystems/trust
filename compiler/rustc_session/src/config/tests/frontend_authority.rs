@@ -7,14 +7,12 @@ use super::{
     AutoDiff, BACKEND_AFTER_EVIDENCE_INERT, CG_OPTIONS, CodegenOptions, CompilerBackendRoute,
     CompilerBackendRouteState, EVIDENCE_INERT_AFTER_BACKEND, EVIDENCE_INERT_PROCESS_REUSE,
     LEGACY_TRUST_SEMANTIC_ENV_VARS, Options, TargetTuple, TrustAuthorityClass,
-    TrustFrontendAuthoritySnapshot,
-    TrustVerify, UNTRACKED_TRUST_CODEGEN_ENV_PREFIXES, UnstableOptions, Z_OPTIONS,
-    authenticated_target_llvm_args_error, enter_compiler_backend_route_with_state,
-    evidence_inert_llvm_control, evidence_inert_target_llvm_args_error,
-    target_is_exact_builtin,
-    forbidden_no_official_evidence_environment_key, forbidden_trust_environment_key,
-    is_legacy_trust_semantic_env_with_windows_semantics,
-    is_untracked_trust_codegen_env_with_windows_semantics,
+    TrustFrontendAuthoritySnapshot, TrustVerify, UNTRACKED_TRUST_CODEGEN_ENV_PREFIXES,
+    UnstableOptions, Z_OPTIONS, authenticated_target_llvm_args_error,
+    enter_compiler_backend_route_with_state, evidence_inert_llvm_control,
+    evidence_inert_target_llvm_args_error, forbidden_no_official_evidence_environment_key,
+    forbidden_trust_environment_key, is_legacy_trust_semantic_env_with_windows_semantics,
+    is_untracked_trust_codegen_env_with_windows_semantics, target_is_exact_builtin,
 };
 
 fn isolated_compiler_backend_route_state() -> &'static Mutex<CompilerBackendRouteState> {
@@ -74,7 +72,21 @@ fn authority_inventory_covers_the_complete_trust_option_table() {
         .collect::<Vec<_>>();
     assert_eq!(
         top_level_trust_fields,
-        ["trust_solver_content_fingerprint"],
+        // Trust: `trust_verify_explicit_off` (added f64af71895b) belongs here, and
+        // its presence is NOT missing authority coverage — checked rather than
+        // assumed, because that is exactly what this test exists to catch.
+        //
+        // Its ONLY consumer is a `dcx().note("compiled WITHOUT Trust verification
+        // — 0 obligations checked")` (rustc_mir_transform/src/trust_verify.rs), so
+        // it can alter a message and nothing else: no obligation, no verdict, no
+        // routing. And `TrustFrontendAuthoritySnapshot::deauthorize` already
+        // clears it (config.rs), so a deauthorized frontend cannot use it to claim
+        // the explicit off-switch spelling.
+        //
+        // A future `trust_*` field that DOES carry authority must not simply be
+        // appended here. The question this list asks is "is this state covered by
+        // the snapshot"; answer it, then extend.
+        ["trust_solver_content_fingerprint", "trust_verify_explicit_off"],
         "new top-level Trust state must be added to TrustFrontendAuthoritySnapshot",
     );
 }
@@ -129,13 +141,35 @@ fn mutate_trust_control(opts: &mut UnstableOptions, field: &str) {
         "trust_cg_output_gate" => opts.trust_cg_output_gate = "allow-unknown".to_string(),
         "trust_certified_test_monitors" => opts.trust_certified_test_monitors = true,
         "trust_ctfe_trivial_probe" => opts.trust_ctfe_trivial_probe = true,
+        // Trust: both carry `{ TRUST_AUTHORITY: EvidenceControl }`, which auto-enrols
+        // them in `UnstableOptions::TRUST_AUTHORITY_CONTROLS`, so this match must
+        // observe them or the probe below panics. Added here together on purpose:
+        // 31 options carry the marker and this match had 29 arms, so fixing only
+        // the one a failure log names just re-reds on the other.
+        "trust_clean_origin_mutate_emitter" => opts.trust_clean_origin_mutate_emitter = true,
+        "trust_instance_flip_probe" => {
+            opts.trust_instance_flip_probe = Some("callback-probe".to_string())
+        }
         "trust_dump" => {
             opts.trust_dump = TrustDump {
                 mir: Some(PathBuf::from("callback-dump-mir")),
                 mir_only: true,
                 native_bundle: Some(PathBuf::from("callback-dump-native")),
                 ir: Some(PathBuf::from("callback-ir-dump")),
+                spec_clean: Some(PathBuf::from("callback-spec-clean-dump")),
             }
+        }
+        // Trust (wall A): the instance-flip lane's three controls. `trust_instance_flip_probe`
+        // was left unwired when the MEASUREMENT probe landed (5e99e9a47b), which makes
+        // `every_classified_control_is_observed_at_both_boundaries` panic on `no authority probe
+        // for classified control` — a pre-existing RED at this base, repaired here alongside the
+        // two controls the production seam adds.
+        "trust_instance_flip" => opts.trust_instance_flip = false,
+        "trust_instance_flip_mutate" => {
+            opts.trust_instance_flip_mutate = Some("abi-swap".to_string())
+        }
+        "trust_instance_flip_probe" => {
+            opts.trust_instance_flip_probe = Some("callback-probe".to_string())
         }
         "trust_ir_flip" => opts.trust_ir_flip = false,
         "trust_ir_lower" => opts.trust_ir_lower = Some(crate::config::TrustIrLower::On),
@@ -157,12 +191,8 @@ fn mutate_trust_control(opts: &mut UnstableOptions, field: &str) {
         "trust_verify_package_name" => {
             opts.trust_verify_package_name = Some("callback-package".to_string())
         }
-        "trust_verify_profile" => {
-            opts.trust_verify_profile = Some("callback-profile".to_string())
-        }
-        "trust_verify_session" => {
-            opts.trust_verify_session = Some("callback-session".to_string())
-        }
+        "trust_verify_profile" => opts.trust_verify_profile = Some("callback-profile".to_string()),
+        "trust_verify_session" => opts.trust_verify_session = Some("callback-session".to_string()),
         "trust_verify_target_spec_sha256" => {
             opts.trust_verify_target_spec_sha256 = Some("a".repeat(64))
         }
@@ -242,20 +272,14 @@ fn backend_capable_routes_repeat_and_permanently_exclude_evidence_inert() {
     let mut state = CompilerBackendRouteState::Pristine;
     assert_eq!(state.enter(CompilerBackendRoute::BackendCapable), Ok(()));
     assert_eq!(state.enter(CompilerBackendRoute::BackendCapable), Ok(()));
-    assert_eq!(
-        state.enter(CompilerBackendRoute::EvidenceInert),
-        Err(EVIDENCE_INERT_AFTER_BACKEND),
-    );
+    assert_eq!(state.enter(CompilerBackendRoute::EvidenceInert), Err(EVIDENCE_INERT_AFTER_BACKEND),);
 }
 
 #[test]
 fn evidence_inert_route_is_a_process_dedication_not_a_reentrant_lock() {
     let mut state = CompilerBackendRouteState::Pristine;
     assert_eq!(state.enter(CompilerBackendRoute::EvidenceInert), Ok(()));
-    assert_eq!(
-        state.enter(CompilerBackendRoute::EvidenceInert),
-        Err(EVIDENCE_INERT_PROCESS_REUSE),
-    );
+    assert_eq!(state.enter(CompilerBackendRoute::EvidenceInert), Err(EVIDENCE_INERT_PROCESS_REUSE),);
     assert_eq!(
         state.enter(CompilerBackendRoute::BackendCapable),
         Err(BACKEND_AFTER_EVIDENCE_INERT),
@@ -265,15 +289,13 @@ fn evidence_inert_route_is_a_process_dedication_not_a_reentrant_lock() {
 #[test]
 fn evidence_inert_guard_is_structural_and_blocks_concurrent_backend_routes() {
     let state = isolated_compiler_backend_route_state();
-    let guard =
-        enter_compiler_backend_route_with_state(CompilerBackendRoute::EvidenceInert, state)
-            .expect("first evidence-inert route must dedicate a pristine process");
+    let guard = enter_compiler_backend_route_with_state(CompilerBackendRoute::EvidenceInert, state)
+        .expect("first evidence-inert route must dedicate a pristine process");
     assert!(guard.validates(CompilerBackendRoute::EvidenceInert));
     assert!(!guard.validates(CompilerBackendRoute::BackendCapable));
 
     let error = thread::spawn(move || {
-        enter_compiler_backend_route_with_state(CompilerBackendRoute::BackendCapable, state)
-            .err()
+        enter_compiler_backend_route_with_state(CompilerBackendRoute::BackendCapable, state).err()
     })
     .join()
     .expect("route-checking thread must not panic");
@@ -285,11 +307,9 @@ fn fatal_unwind_does_not_release_evidence_inert_process_dedication() {
     let state = isolated_compiler_backend_route_state();
     assert!(
         catch_unwind(|| {
-            let _guard = enter_compiler_backend_route_with_state(
-                CompilerBackendRoute::EvidenceInert,
-                state,
-            )
-            .expect("first evidence-inert route must dedicate a pristine process");
+            let _guard =
+                enter_compiler_backend_route_with_state(CompilerBackendRoute::EvidenceInert, state)
+                    .expect("first evidence-inert route must dedicate a pristine process");
             panic!("model a fatal diagnostic unwind");
         })
         .is_err()
@@ -299,8 +319,7 @@ fn fatal_unwind_does_not_release_evidence_inert_process_dedication() {
         CompilerBackendRouteState::EvidenceInertDedicated,
     );
     assert_eq!(
-        enter_compiler_backend_route_with_state(CompilerBackendRoute::EvidenceInert, state)
-            .err(),
+        enter_compiler_backend_route_with_state(CompilerBackendRoute::EvidenceInert, state).err(),
         Some(EVIDENCE_INERT_PROCESS_REUSE),
     );
 }
@@ -362,9 +381,7 @@ fn codegen_prefix_inventory_is_future_proof() {
 fn windows_environment_case_folding_cannot_bypass_rejection() {
     for key in ["tcg_future_semantic_gate", "TrUsT_cG_FUTURE_BYTE_REWRITE"] {
         assert!(is_untracked_trust_codegen_env_with_windows_semantics(OsStr::new(key), true,));
-        assert!(
-            !is_untracked_trust_codegen_env_with_windows_semantics(OsStr::new(key), false,)
-        );
+        assert!(!is_untracked_trust_codegen_env_with_windows_semantics(OsStr::new(key), false,));
     }
     assert!(is_legacy_trust_semantic_env_with_windows_semantics(
         OsStr::new("trust_verify_policy"),
@@ -375,7 +392,6 @@ fn windows_environment_case_folding_cannot_bypass_rejection() {
         false,
     ));
 }
-
 
 #[test]
 fn builtin_target_llvm_args_survive_the_authenticated_lane() {

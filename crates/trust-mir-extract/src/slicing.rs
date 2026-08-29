@@ -470,7 +470,9 @@ fn terminator_reads(term: &Terminator) -> Vec<usize> {
     match term {
         Terminator::SwitchInt { discr, .. } => operand_reads(discr),
         Terminator::Assert { cond, .. } => operand_reads(cond),
-        Terminator::Call { args, .. } => args.iter().flat_map(operand_reads).collect(),
+        Terminator::Call { args, .. } | Terminator::TailCall { args, .. } => {
+            args.iter().flat_map(operand_reads).collect()
+        }
         Terminator::Drop { place, .. } => place_reads(place),
         Terminator::Goto(_)
         | Terminator::Opaque { .. }
@@ -484,6 +486,8 @@ fn terminator_reads(term: &Terminator) -> Vec<usize> {
 fn terminator_writes(term: &Terminator) -> Vec<usize> {
     match term {
         Terminator::Call { dest, .. } => vec![dest.local],
+        // A TailCall writes its result directly into the implicit return place.
+        Terminator::TailCall { .. } => vec![0],
         _ => vec![],
     }
 }
@@ -497,7 +501,7 @@ fn successor_blocks(term: &Terminator) -> Vec<usize> {
             succs.push(otherwise.0);
             succs
         }
-        Terminator::Return | Terminator::Unreachable => vec![],
+        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => vec![],
         Terminator::Call { target, .. } => target.iter().map(|BlockId(b)| *b).collect(),
         Terminator::Assert { target: BlockId(b), .. } => vec![*b],
         Terminator::Drop { target: BlockId(b), .. } => vec![*b],
@@ -937,6 +941,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "f".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1165,6 +1170,7 @@ mod tests {
         let term = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "foo".to_string(),
             args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(2))],
@@ -1176,6 +1182,22 @@ mod tests {
         let reads = terminator_reads(&term);
         assert!(reads.contains(&1));
         assert!(reads.contains(&2));
+    }
+
+    #[test]
+    fn test_tail_call_reads_arguments_writes_return_and_has_no_successor() {
+        let term = Terminator::TailCall {
+            func: "foo".to_string(),
+            args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(2))],
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+        };
+        assert_eq!(terminator_reads(&term), vec![1, 2]);
+        assert_eq!(terminator_writes(&term), vec![0]);
+        assert!(successor_blocks(&term).is_empty());
     }
 
     #[test]
@@ -1202,6 +1224,7 @@ mod tests {
         let term = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],
@@ -1252,6 +1275,7 @@ mod tests {
         let term = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],
@@ -1268,6 +1292,7 @@ mod tests {
         let term = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],

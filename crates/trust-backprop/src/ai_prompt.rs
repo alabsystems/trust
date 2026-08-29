@@ -200,8 +200,9 @@ pub fn print_ai_repair_prompts(contexts: &[RepairPromptContext<'_>]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::{Counterexample, CounterexampleValue, SourceSpan};
+
+    use super::*;
 
     fn span(file: &str, line: u32, col: u32) -> SourceSpan {
         SourceSpan {

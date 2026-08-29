@@ -16,13 +16,12 @@
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use std::fmt::Write;
 
     use trust_types::{
         BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Projection, ProofLevel, Rvalue,
-        SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
-        VerificationCondition,
+        SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody,
+        VerifiableFunction, VerificationCondition,
     };
 
     use crate::separation_logic::unsafe_ops::UnsafeOpKind;
@@ -267,6 +266,7 @@ mod tests {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "std::mem::transmute".to_string(),
                 args: vec![],
@@ -295,6 +295,7 @@ mod tests {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "libc::ffi::malloc".to_string(),
                 args: vec![],
@@ -323,6 +324,7 @@ mod tests {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "std::ptr::read".to_string(),
                 args: vec![],
@@ -398,6 +400,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "std::mem::transmute".to_string(),
                     args: vec![],
@@ -428,6 +431,7 @@ mod tests {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "std::ptr::write".to_string(),
                 args: vec![],
@@ -452,6 +456,7 @@ mod tests {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "std::vec::Vec::push".to_string(),
                 args: vec![],

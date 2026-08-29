@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -31,12 +32,8 @@ const S0_COUNT: usize = 35_346;
 const S0_SHA256: &str = "8fe0ce3162fbd899bd7eb61531bd32ae2d7eab2f6ddc4a7909e03675cc0ac342";
 
 const INCLUDE_PREFIXES: &[&str] = &["test/language/", "test/built-ins/"];
-const EXCLUDE_PREFIXES: &[&str] = &[
-    "test/intl402/",
-    "test/staging/",
-    "test/annexB/",
-    "test/built-ins/Temporal/",
-];
+const EXCLUDE_PREFIXES: &[&str] =
+    &["test/intl402/", "test/staging/", "test/annexB/", "test/built-ins/Temporal/"];
 const EXCLUDE_SUFFIXES: &[&str] = &["_FIXTURE.js"];
 const EXCLUDE_FLAGS: &[&str] = &["async", "module", "CanBlockIsTrue", "CanBlockIsFalse"];
 const EXCLUDE_CONTENT: &[&str] = &["$262."];
@@ -52,9 +49,7 @@ const EXCLUDE_FEATURES: &[&str] = &[
 const EXCLUDE_FEATURE_SUBSTRINGS: &[&str] = &["Intl"];
 
 fn fm_block(body: &str) -> &str {
-    body.split_once("/*---")
-        .and_then(|(_, rest)| rest.split_once("---*/"))
-        .map_or("", |(fm, _)| fm)
+    body.split_once("/*---").and_then(|(_, rest)| rest.split_once("---*/")).map_or("", |(fm, _)| fm)
 }
 
 /// A YAML-lite list field: `key: [a, b]` or block-style `- a` lines.
@@ -69,10 +64,7 @@ fn fm_list(fm: &str, key: &str) -> Vec<String> {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 out.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             } else {
                 while let Some(next) = lines.peek() {
@@ -169,12 +161,9 @@ fn full_s0_sem_coverage_estimate() {
             }
         }
         for inc in fm_list(fm, "includes") {
-            let content = include_content_cache
-                .entry(inc.clone())
-                .or_insert_with(|| {
-                    std::fs::read_to_string(corpus.join("harness").join(&inc))
-                        .unwrap_or_default()
-                });
+            let content = include_content_cache.entry(inc.clone()).or_insert_with(|| {
+                std::fs::read_to_string(corpus.join("harness").join(&inc)).unwrap_or_default()
+            });
             if EXCLUDE_CONTENT.iter().any(|s| content.contains(s)) {
                 continue 'file;
             }
@@ -228,24 +217,14 @@ fn full_s0_sem_coverage_estimate() {
             includes.push(assert_src.clone());
             includes.push(sta_src.clone());
             for inc in fm_list(fm, "includes") {
-                includes.push(
-                    include_content_cache
-                        .get(&inc)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            std::fs::read_to_string(corpus.join("harness").join(&inc))
-                                .unwrap_or_default()
-                        }),
-                );
+                includes.push(include_content_cache.get(&inc).cloned().unwrap_or_else(|| {
+                    std::fs::read_to_string(corpus.join("harness").join(&inc)).unwrap_or_default()
+                }));
             }
         }
         let inc_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
         for &strict in modes {
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             match evaluate_case_opts(&inc_refs, &sem_body, false) {
                 SemOutcome::Trace(sem_trace) => {
                     covered += 1;
@@ -257,8 +236,7 @@ fn full_s0_sem_coverage_estimate() {
                     verified += 1;
                     let mut include_paths: Vec<String> = Vec::new();
                     if !raw {
-                        include_paths
-                            .push(corpus.join("harness/assert.js").display().to_string());
+                        include_paths.push(corpus.join("harness/assert.js").display().to_string());
                         include_paths.push(corpus.join("harness/sta.js").display().to_string());
                         for inc in fm_list(fm, "includes") {
                             include_paths

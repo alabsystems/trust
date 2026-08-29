@@ -31,9 +31,7 @@ pub fn js_number_to_string(x: f64) -> String {
     }
     // Shortest round-trip decimal digits and exponent.
     let sci = format!("{x:e}");
-    let (mant, exp_s) = sci
-        .split_once('e')
-        .expect("LowerExp always contains an exponent");
+    let (mant, exp_s) = sci.split_once('e').expect("LowerExp always contains an exponent");
     let exp: i32 = exp_s.parse().expect("LowerExp exponent is an integer");
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
     let digits = digits.trim_end_matches('0');
@@ -76,20 +74,15 @@ pub fn projection_number_repr(x: f64) -> String {
 fn is_js_ws(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\u{b}'
-            | '\u{c}'
-            | ' '
-            | '\u{a0}'
-            | '\u{feff}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\n'
-            | '\r'
-            | '\u{2028}'
-            | '\u{2029}'
+        '\t' | '\u{b}' | '\u{c}' | ' ' | '\u{a0}' | '\u{feff}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\n'
+                | '\r'
+                | '\u{2028}'
+                | '\u{2029}'
     )
 }
 
@@ -138,9 +131,7 @@ fn radix_int(digits: &str, radix: u32) -> Result<f64, String> {
         // u128→f64 casts are correctly rounded (round-to-nearest-even).
         #[allow(clippy::cast_precision_loss)]
         Ok(v) => Ok(v as f64),
-        Err(_) => Err(format!(
-            "radix-{radix} literal beyond exact 128-bit accumulation"
-        )),
+        Err(_) => Err(format!("radix-{radix} literal beyond exact 128-bit accumulation")),
     }
 }
 
@@ -215,9 +206,7 @@ fn exact_radix_literal(digits: &str, radix: u32) -> Result<f64, String> {
     match u128::from_str_radix(digits, radix) {
         #[allow(clippy::cast_precision_loss)]
         Ok(v) => Ok(v as f64),
-        Err(_) => Err(format!(
-            "radix-{radix} literal beyond exact 128-bit accumulation"
-        )),
+        Err(_) => Err(format!("radix-{radix} literal beyond exact 128-bit accumulation")),
     }
 }
 

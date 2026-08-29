@@ -7,9 +7,8 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::{FxHashMap, FxHashSet};
-
 use thiserror::Error;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{Formula, Sort, infer_sort};
 
 /// Errors that can occur during formula substitution.

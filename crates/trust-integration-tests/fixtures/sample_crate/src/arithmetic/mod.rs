@@ -36,27 +36,15 @@ pub fn saturating_mul(a: u32, b: u32) -> u32 {
 }
 
 pub fn safe_divide(dividend: u32, divisor: u32) -> Option<u32> {
-    if divisor == 0 {
-        None
-    } else {
-        Some(dividend / divisor)
-    }
+    if divisor == 0 { None } else { Some(dividend / divisor) }
 }
 
 pub fn safe_rem(n: u32, m: u32) -> Option<u32> {
-    if m == 0 {
-        None
-    } else {
-        Some(n % m)
-    }
+    if m == 0 { None } else { Some(n % m) }
 }
 
 pub fn abs_diff(a: i64, b: i64) -> u64 {
-    if a > b {
-        (a - b) as u64
-    } else {
-        (b - a) as u64
-    }
+    if a > b { (a - b) as u64 } else { (b - a) as u64 }
 }
 
 pub fn midpoint(a: usize, b: usize) -> usize {

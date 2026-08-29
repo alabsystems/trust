@@ -45,7 +45,8 @@ fn midpoint_function() -> VerifiableFunction {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                    terminator: Terminator::Assert {
+                        unwind: trust_types::UnwindEdge::Unreachable,
                         cond: Operand::Copy(Place::field(3, 1)),
                         expected: false,
                         msg: AssertMessage::Overflow(BinOp::Add),
@@ -782,7 +783,11 @@ fn test_level_filter_l1_keeps_safety_and_functional() {
         make_vc(VcKind::DivisionByZero, "f", Formula::Bool(false)),
         make_vc(VcKind::Postcondition, "f", Formula::Bool(false)),
         make_vc(VcKind::Deadlock, "f", Formula::Bool(false)),
-        make_vc(VcKind::Temporal { property: "liveness".to_string(), machine: None }, "f", Formula::Bool(false)),
+        make_vc(
+            VcKind::Temporal { property: "liveness".to_string(), machine: None },
+            "f",
+            Formula::Bool(false),
+        ),
     ];
 
     let filtered = filter_vcs_by_level(vcs, ProofLevel::L1Functional);

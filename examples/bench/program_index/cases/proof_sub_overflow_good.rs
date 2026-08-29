@@ -4,11 +4,7 @@
 // arithmetic proof surface without std I/O noise.
 
 fn subtract_guarded(a: u32, b: u32) -> u32 {
-    if a >= b {
-        a - b
-    } else {
-        0
-    }
+    if a >= b { a - b } else { 0 }
 }
 
 fn main() {

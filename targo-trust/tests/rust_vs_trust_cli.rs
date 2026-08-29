@@ -364,6 +364,16 @@ fn rust_vs_trust_cli_domination_upstream_tests_dispatches_to_rust_porting_front_
     ];
     let expected_manifest = workspace_root().join("crates/trust-upstream-compat/Cargo.toml");
     let expected_args = vec![
+        // f234ea5a0c: `run` is a COMPILATION command, and a bare `targo run`
+        // refuses rather than create an implicitly unverified artifact. The
+        // porting engine is build infrastructure, not a proof subject, so the
+        // honest lane is `--unverified`, injected at the run dispatch and only
+        // there — the `--locked` metadata preflight shares this driver and
+        // `targo --unverified metadata` is itself an error, so the flag cannot
+        // ride the driver string. It is injected only for targo drivers; this
+        // fake tool is named `targo`, and the plain-`cargo` half of the
+        // contract is covered by the `--release` ambient-cargo test below.
+        "--unverified",
         "run",
         "--manifest-path",
         expected_manifest.to_str().expect("manifest path should be utf-8"),

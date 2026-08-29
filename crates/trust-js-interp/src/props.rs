@@ -9,13 +9,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
 use std::rc::Rc;
+
 use trust_js_value::{
-    array_index_of, exact_uint32, js_number_to_string, to_number_str, to_uint32, units_eq_ascii,
-    units_from_str, units_to_lossy, ErrKind, JsObject, JsValue, ObjId, ObjKind, PropKey, PropValue,
-    Property, Units, WrapperPrim, ERROR_INSTANCE_DANGER,
+    ERROR_INSTANCE_DANGER, ErrKind, JsObject, JsValue, ObjId, ObjKind, PropKey, PropValue,
+    Property, Units, WrapperPrim, array_index_of, exact_uint32, js_number_to_string, to_number_str,
+    to_uint32, units_eq_ascii, units_from_str, units_to_lossy,
 };
+
+use crate::interp::{Abrupt, ERes, Interp};
 
 /// CanonicalNumericIndexString (7.1.21): `Some(n)` iff `u` is the canonical
 /// string form of the Number `n` (including `"-0"` → -0, `"NaN"`, `"Infinity"`,
@@ -28,11 +30,7 @@ pub(crate) fn canonical_numeric_index(u: &Units) -> Option<f64> {
     }
     let s = units_to_lossy(u);
     let n = to_number_str(&s).ok()?;
-    if units_from_str(&js_number_to_string(n)) == *u {
-        Some(n)
-    } else {
-        None
-    }
+    if units_from_str(&js_number_to_string(n)) == *u { Some(n) } else { None }
 }
 
 /// A partial property descriptor (spec Property Descriptor record).
@@ -49,10 +47,7 @@ pub struct PartialDesc {
 impl PartialDesc {
     #[must_use]
     pub fn value_only(v: JsValue) -> PartialDesc {
-        PartialDesc {
-            value: Some(v),
-            ..PartialDesc::default()
-        }
+        PartialDesc { value: Some(v), ..PartialDesc::default() }
     }
 
     #[must_use]
@@ -322,11 +317,7 @@ impl Interp {
                     let is_own = units_eq_ascii(u, "length")
                         || array_index_of(u).is_some_and(|i| (i as usize) < s.len());
                     if is_own {
-                        return if strict {
-                            Err(self.throw_type_error())
-                        } else {
-                            Ok(())
-                        };
+                        return if strict { Err(self.throw_type_error()) } else { Ok(()) };
                     }
                 }
                 let proto = self.intr.string_proto;
@@ -394,11 +385,7 @@ impl Interp {
         }
         // Data property (or nothing) found: CreateDataProperty on a
         // primitive receiver fails.
-        if strict {
-            Err(self.throw_type_error())
-        } else {
-            Ok(())
-        }
+        if strict { Err(self.throw_type_error()) } else { Ok(()) }
     }
 
     /// OrdinarySet(O, P, V, Receiver=O) with exotic define routing.
@@ -512,11 +499,7 @@ impl Interp {
                 };
             }
         }
-        if let Some(Property {
-            v: PropValue::Data { writable: false, .. },
-            ..
-        }) = &holder
-        {
+        if let Some(Property { v: PropValue::Data { writable: false, .. }, .. }) = &holder {
             return Ok(false);
         }
         let JsValue::Obj(rec) = receiver else {
@@ -760,12 +743,7 @@ impl Interp {
                     }
                 }
                 // Apply: kind change or field merge, preserving slot order.
-                let p = self
-                    .heap
-                    .obj_mut(oid)
-                    .props
-                    .get_mut(key)
-                    .expect("own prop present");
+                let p = self.heap.obj_mut(oid).props.get_mut(key).expect("own prop present");
                 if desc.is_accessor() && c.is_data() {
                     p.v = PropValue::Accessor {
                         get: desc.get.unwrap_or(None),
@@ -827,10 +805,7 @@ impl Interp {
 
     fn array_length_writable(&self, oid: ObjId) -> bool {
         match &self.heap.obj(oid).props.get(&PropKey::from_str("length")) {
-            Some(Property {
-                v: PropValue::Data { writable, .. },
-                ..
-            }) => *writable,
+            Some(Property { v: PropValue::Data { writable, .. }, .. }) => *writable,
             _ => true,
         }
     }
@@ -885,9 +860,9 @@ impl Interp {
             .props
             .keys()
             .filter_map(|k| match k {
-                PropKey::Str(u) => array_index_of(u)
-                    .filter(|i| *i >= new_len_u)
-                    .map(|i| (i, u.clone())),
+                PropKey::Str(u) => {
+                    array_index_of(u).filter(|i| *i >= new_len_u).map(|i| (i, u.clone()))
+                }
                 PropKey::Sym(_) => None,
             })
             .collect();
@@ -896,12 +871,7 @@ impl Interp {
         let mut ok = true;
         for (i, u) in doomed {
             let key = PropKey::Str(u);
-            let configurable = self
-                .heap
-                .obj(oid)
-                .props
-                .get(&key)
-                .is_some_and(|p| p.configurable);
+            let configurable = self.heap.obj(oid).props.get(&key).is_some_and(|p| p.configurable);
             if configurable {
                 self.heap.obj_mut(oid).props.shift_remove(&key);
             } else {
@@ -1234,10 +1204,7 @@ impl Interp {
                 true,
             );
             p.synthetic = true;
-            self.heap
-                .obj_mut(oid)
-                .props
-                .insert(PropKey::from_str("message"), p);
+            self.heap.obj_mut(oid).props.insert(PropKey::from_str("message"), p);
         }
         Ok(oid)
     }

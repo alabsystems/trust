@@ -10,11 +10,11 @@
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 // dead_code audit: crate-level suppression removed
 
-#[cfg(test)]
-pub mod framework;
 pub mod ay_test_support;
 pub mod clean_test_support;
 pub mod extracted;
+#[cfg(test)]
+pub mod framework;
 
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula,

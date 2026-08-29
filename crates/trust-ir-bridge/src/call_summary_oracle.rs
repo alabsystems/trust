@@ -39,12 +39,12 @@ const PANICKING: &[&str] = &[
     // panic", so the oracle was demanding a summary that would have been FALSE.
     // The element type does not rescue it: the overflow path is in the
     // allocator, not in element code, so the primitive spelling panics too.
-    "alloc::vec::Vec::<u32>::push",            // capacity overflow -> capacity_overflow()
+    "alloc::vec::Vec::<u32>::push", // capacity overflow -> capacity_overflow()
     "<alloc::vec::Vec<u32> as core::ops::index::Index<usize>>::index", // Vec[i] OOB panic
     "<[u32] as core::ops::index::Index<usize>>::index", // slice[i] OOB panic
-    "core::option::Option::<u32>::map",        // runs a user closure
+    "core::option::Option::<u32>::map", // runs a user closure
     "core::option::Option::<u32>::unwrap_or_else", // runs a user closure
-    "alloc::string::ToString::to_string",      // dispatches to Display::fmt (user)
+    "alloc::string::ToString::to_string", // dispatches to Display::fmt (user)
     "std::collections::hash::map::HashMap::<u32, u32>::get", // Hash+Eq on key (user)
     // `<[T]>::contains` is total or not DEPENDING ON THE ELEMENT TYPE, so the pin has
     // to name a USER element — the same convention this list already uses for
@@ -63,13 +63,13 @@ const PANICKING: &[&str] = &[
     // distinction instead of only forbidding the union.
     "core::slice::<impl [ElemT]>::contains", // Eq on elements (user)
     "core::slice::<impl [mycrate::Widget]>::contains", // ditto, spelled-out user path
-    "core::num::<impl i32>::saturating_div",   // hunt-9: still panics on div-by-zero
-    "core::num::<impl i32>::saturating_rem",   // hunt-9: still panics on rem-by-zero
-    "core::num::<impl i32>::wrapping_div",     // wraps only MIN/-1; panics on div-by-zero
-    "core::num::<impl i32>::wrapping_rem",     // wraps only MIN/-1; panics on rem-by-zero
+    "core::num::<impl i32>::saturating_div", // hunt-9: still panics on div-by-zero
+    "core::num::<impl i32>::saturating_rem", // hunt-9: still panics on rem-by-zero
+    "core::num::<impl i32>::wrapping_div",   // wraps only MIN/-1; panics on div-by-zero
+    "core::num::<impl i32>::wrapping_rem",   // wraps only MIN/-1; panics on rem-by-zero
     "core::num::<impl i64>::wrapping_div_euclid", // euclid twin: same zero-divisor panic
-    "core::num::<impl i32>::overflowing_div",  // (val, bool) pair; panics on div-by-zero
-    "core::num::<impl i32>::overflowing_rem",  // (val, bool) pair; panics on rem-by-zero
+    "core::num::<impl i32>::overflowing_div", // (val, bool) pair; panics on div-by-zero
+    "core::num::<impl i32>::overflowing_rem", // (val, bool) pair; panics on rem-by-zero
     // SUBTLE traps (the class that makes rung-1 recovery dangerous — encoded as guards so a
     // future "obviously total" addition that overlooks them is caught):
     "core::result::Result::<u32, ErrT>::unwrap_or", // consumes self; DROPS the Err payload

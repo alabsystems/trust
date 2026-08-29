@@ -62,7 +62,12 @@ fn counted_loop() -> VerifiableFunction {
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Add,
                             Operand::Copy(Place::local(2)),
-                            Operand::Constant(ConstValue::Int(1)),
+                            // Extractor-faithful MIR: rustc spells the u32
+                            // increment as `const 1_u32`, which trust-mir-extract
+                            // carries width-tagged as `Uint(1, 32)`. The audited
+                            // unsigned destination admits no signed widthless
+                            // literal.
+                            Operand::Constant(ConstValue::Uint(1, 32)),
                         ),
                         span: span(13, 13),
                     }],
@@ -219,7 +224,8 @@ fn nested_spanless_header_loops() -> VerifiableFunction {
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Add,
                             Operand::Copy(Place::local(2)),
-                            Operand::Constant(ConstValue::Int(1)),
+                            // Extractor-faithful `const 1_u32` — see counted_loop.
+                            Operand::Constant(ConstValue::Uint(1, 32)),
                         ),
                         span: span(30, 30),
                     }],

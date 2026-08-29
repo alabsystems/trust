@@ -39,13 +39,14 @@ pub(crate) mod spec_proposal;
 pub(crate) mod spec_quality;
 pub(crate) mod strategy;
 pub(crate) mod structural_gate;
-// trust-wp-direct verification oracle for CEGIS loop.
-#[cfg(feature = "trust-wp")]
-pub(crate) mod trust_wp_oracle;
 pub(crate) mod template_match;
 pub(crate) mod templates;
+// Fail-closed compatibility shim for the retired direct TrustWP CEGIS oracle.
+#[cfg(feature = "trust-wp")]
+pub(crate) mod trust_wp_oracle;
 pub(crate) mod weakest_precondition;
-// Loop invariant feedback from trust_wp via MIR router.
+// Standalone conversion for historical TrustWP invariant diagnostics; the MIR
+// router does not feed this module into proof authority.
 pub(crate) mod invariant_feedback;
 
 // Re-export abstract domain hierarchy types.
@@ -145,16 +146,16 @@ pub use spec_quality::{
 };
 pub use strategy::{Strategy, StrategyRecord, StrategySelector, StrategySummary};
 pub use structural_gate::{GateConfig, GateResult, ScopedVar, StructuralGate};
-#[cfg(feature = "trust-wp")]
-pub use trust_wp_oracle::{
-    TrustWpDirectOracle, VerificationOracle, VerifyOutcome, import_stdlib_seed_specs,
-};
 pub use template_match::{
     FunctionCategory, TemplateMatchResult, classify_function, match_and_propose,
     proposal_from_template,
 };
 pub use templates::{SpecTemplate, SpecTemplateKind, instantiate_template, standard_templates};
 use trust_types::{CrateVerificationResult, VerificationResult};
+#[cfg(feature = "trust-wp")]
+pub use trust_wp_oracle::{
+    TrustWpDirectOracle, VerificationOracle, VerifyOutcome, import_stdlib_seed_specs,
+};
 pub use weakest_precondition::{Statement, compute_weakest_precondition, substitute, wp_transform};
 
 /// Configuration for the strengthen pass.

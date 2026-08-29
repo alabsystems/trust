@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/abstract_interp/tests.rs: Tests for abstract interpretation framework
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>

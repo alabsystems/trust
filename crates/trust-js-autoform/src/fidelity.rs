@@ -140,15 +140,13 @@ fn load() -> Result<FidelityPin, String> {
         return Err("this floor admits no fidelity waivers".to_string());
     }
 
-    let scalar = manifest
-        .select(FidelityAxis::InputDomain, SCALAR_DOMAIN)
-        .map_err(|e| e.to_string())?;
+    let scalar =
+        manifest.select(FidelityAxis::InputDomain, SCALAR_DOMAIN).map_err(|e| e.to_string())?;
     let base_samples = read_samples(&scalar.payload["samples"])?;
     let max_samples = read_cap(&scalar.payload["max_samples"])?;
 
-    let arrays = manifest
-        .select(FidelityAxis::InputDomain, ARRAY_DOMAIN)
-        .map_err(|e| e.to_string())?;
+    let arrays =
+        manifest.select(FidelityAxis::InputDomain, ARRAY_DOMAIN).map_err(|e| e.to_string())?;
     let fold_max_samples = read_cap(&arrays.payload["max_samples"])?;
     let shapes = arrays.payload["shapes"]
         .as_array()

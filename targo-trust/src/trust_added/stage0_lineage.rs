@@ -787,7 +787,6 @@ fn require_json_str(value: &Value, field: &str, expected: &str, source: &str) ->
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

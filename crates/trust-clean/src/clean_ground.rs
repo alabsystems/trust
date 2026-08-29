@@ -240,7 +240,10 @@ fn decode_el_code(code: &ProofTerm) -> Option<Expr> {
 ///   * any other concrete `Trust.SortTy` code → the ordinary `El`-decode (so
 ///     `Vec<u32>` → `List Int`, unchanged behavior).
 /// Returns `None` (fail closed) on a malformed/non-decodable carrier.
-fn carrier_binding_to_kernel_type(code: &ProofTerm) -> Option<Expr> {
+// Trust: widened to `pub(crate)` (2026-08-28) so the passthrough-return witness can
+// build a kernel type for a NON-ADT carrier (`&[T]`, `&str`, arrays) instead of routing
+// every carrier through the ADT-only `reflect_struct`, which returns `None` for them.
+pub(crate) fn carrier_binding_to_kernel_type(code: &ProofTerm) -> Option<Expr> {
     match code {
         // A bound `(T : Type)` de-Bruijn — the abstracted type variable.
         ProofTerm::Var(i) => Some(Expr::bvar(u32::try_from(*i).ok()?)),
@@ -741,7 +744,7 @@ pub(crate) fn carrier_code_to_kernel_type(carrier: &ProofTerm) -> Option<Expr> {
 /// A generic field decodes to that bound `Type` variable (`bvar`); a concrete
 /// field decodes through the ordinary scalar/composite path (params don't occur
 /// in a concrete field, so its kernel type is depth-independent).
-fn ctor_field_type(
+pub(crate) fn ctor_field_type(
     carrier: &reflect::AdtCarrier,
     field_carrier: &ProofTerm,
     depth_above_field: u32,
@@ -1133,6 +1136,46 @@ fn collect_closure_carriers(
 /// inner inductive the outer constructor's applied-inductive field type
 /// references. Bounded by the structural recursion of `Ty` (MIR field trees have
 /// no cycles).
+/// Trust: NESTED-CARRIER CLOSURE (2026-08-25) — the carrier list to hand
+/// [`register_adt_carriers`] for a single ADT: every nested carrier reachable from `ty`
+/// in post-order, with `carrier` itself appended if the walk did not already produce it.
+///
+/// Appending rather than assuming keeps this a strict superset of the previous
+/// `std::slice::from_ref(&carrier)` behaviour: whatever registered before still
+/// registers, and a nested inductive that used to be missing is now present.
+#[must_use]
+pub(crate) fn carrier_closure_for(
+    ty: &trust_types::Ty,
+    carrier: &reflect::AdtCarrier,
+) -> Vec<reflect::AdtCarrier> {
+    let mut out = adt_carriers_of_ty(ty);
+    if !out.iter().any(|c| c.name == carrier.name) {
+        out.push(carrier.clone());
+    }
+    out
+}
+
+/// Trust: NESTED-CARRIER CLOSURE (2026-08-25) — every named ADT carrier reachable from
+/// `ty`, in POST-ORDER so a nested inductive is registered before the one that mentions
+/// it.
+///
+/// Registering a single carrier in isolation is what
+/// `std::slice::from_ref(&carrier)` does, and the kernel then rejects the declaration
+/// with `UnknownConst` the moment a field mentions another named ADT. Measured
+/// out-of-sample 2026-08-25: EVERY carrier that built but failed to register failed
+/// exactly this way — `Color` needing `AnsiColor`, `Enumerate` needing `slice::Iter`,
+/// `SmallVecData` needing `MaybeUninit`, `Result` needing `Trust.Ptr`.
+///
+/// This is the `Ty`-rooted sibling of [`reachable_adt_carriers`], which needs a whole
+/// `VerifiableFunction`; the refinement builders have only the return type.
+#[must_use]
+pub(crate) fn adt_carriers_of_ty(ty: &trust_types::Ty) -> Vec<reflect::AdtCarrier> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    collect_adt_carriers_recursive(ty, &mut seen, &mut out);
+    out
+}
+
 fn collect_adt_carriers_recursive(
     ty: &trust_types::Ty,
     seen: &mut std::collections::HashSet<String>,
@@ -1373,6 +1416,45 @@ pub fn register_adt_carriers(
     use clean_kernel::{Constructor, InductiveDecl, InductiveType};
     let mut registry = AdtRegistry::default();
 
+    // Trust: BASE CARRIERS (2026-08-25) — `Trust.ArrayN` and `Trust.Ptr` are the two
+    // built-in inductives a user carrier can REFERENCE without ever mentioning them as
+    // a nested ADT, so the nested-carrier closure cannot bring them in. Measured on a
+    // 12,880-body corpus AFTER that closure landed: of the remaining registration
+    // failures, 14 were `UnknownConst(Trust.ArrayN)` and 10 `UnknownConst(Trust.Ptr)`
+    // — 24 of 32, the largest remaining cause.
+    //
+    // `register_arrayn_carrier` already existed and was called ONLY from tests; the
+    // production path never registered either one. Registered lazily (skipped when
+    // already present) and gated exactly like any other carrier: both are documented
+    // axiom-free, and if either failed its gate it would simply stay absent and the
+    // dependent carrier would decline as it does today.
+    if env.get_inductive(&Name::from_string(reflect::CARRIER_ARRAYN)).is_none() {
+        let _ = register_arrayn_carrier(env);
+    }
+    if env.get_inductive(&Name::from_string(reflect::PTR_INDUCTIVE)).is_none() {
+        let ptr = reflect::reflect_ptr();
+        // Registered through the ordinary single-carrier path below by recursion — a
+        // direct call would re-enter this same guard, so build its declaration inline
+        // via the same helper every other carrier uses.
+        if let Some(expected) = adt_expected_kernel_ctors(&ptr) {
+            let bd = || BinderData::from(BinderInfo::Default);
+            let _ = bd;
+            let decl = InductiveDecl {
+                level_params: vec![],
+                num_params: 0,
+                types: vec![InductiveType {
+                    name: Name::from_string(&ptr.name),
+                    type_: Expr::type_(),
+                    constructors: expected
+                        .into_iter()
+                        .map(|(name, type_)| Constructor { name, type_ })
+                        .collect(),
+                }],
+            };
+            let _ = env.add_inductive(decl);
+        }
+    }
+
     for carrier in carriers {
         // Skip a name already registered (idempotent across functions sharing a
         // struct); a re-registration would be a duplicate-name kernel error.
@@ -1539,6 +1621,93 @@ fn adt_matches_declared_shape(env: &Environment, carrier: &reflect::AdtCarrier) 
 /// implementation — the registration path and the collision check can never
 /// silently drift apart. `None` (→ skip / fail-closed) on any non-decodable
 /// field.
+/// Trust: DIAGNOSTIC (2026-08-25) — WHY did this carrier fail to register?
+///
+/// `register_adt_carriers` fails by `continue`, so a dropped carrier is silent and the
+/// three distinct causes look identical from outside. This runs the same steps on a
+/// FRESH environment and names the one that stopped it. Diagnostic only: it registers
+/// into its own `env` and returns a string.
+#[must_use]
+pub(crate) fn why_carrier_failed_to_register_with(
+    ty: &trust_types::Ty,
+    carrier: &reflect::AdtCarrier,
+) -> &'static str {
+    let Ok(mut env) = crate::trustir_anchor::trustir_env() else { return "env unavailable" };
+    let registry = register_adt_carriers(&mut env, &carrier_closure_for(ty, carrier));
+    if registry.get(&carrier.name).is_some() {
+        return "registers fine";
+    }
+    if adt_expected_kernel_ctors(carrier).is_none() {
+        return "a FIELD does not decode to a kernel type";
+    }
+    let name = Name::from_string(&carrier.name);
+    let Some(info) = env.inductive_info(&name) else {
+        // Rebuild the SAME declaration and capture the kernel's own error, so the
+        // rejection has a reason rather than a category.
+        if let Some(expected) = adt_expected_kernel_ctors(carrier) {
+            use clean_kernel::{Constructor, InductiveDecl, InductiveType};
+            let bd = || BinderData::from(BinderInfo::Default);
+            let k = carrier.type_params.len() as u32;
+            let mut ind_type = Expr::type_();
+            for _ in 0..k {
+                ind_type = Expr::pi(bd(), Expr::type_(), ind_type);
+            }
+            let decl = InductiveDecl {
+                level_params: vec![],
+                num_params: k,
+                types: vec![InductiveType {
+                    name: name.clone(),
+                    type_: ind_type,
+                    constructors: expected
+                        .into_iter()
+                        .map(|(name, type_)| Constructor { name, type_ })
+                        .collect(),
+                }],
+            };
+            let mut probe = match crate::trustir_anchor::trustir_env() {
+                Ok(e) => e,
+                Err(_) => return "add_inductive REJECTED (env unavailable for probe)",
+            };
+            // Bring the nested carriers in first, so the probe reports the failure the
+            // production path would hit rather than a self-inflicted `UnknownConst`.
+            let nested: Vec<reflect::AdtCarrier> = carrier_closure_for(ty, carrier)
+                .into_iter()
+                .filter(|c| c.name != carrier.name)
+                .collect();
+            let _ = register_adt_carriers(&mut probe, &nested);
+            if let Err(e) = probe.add_inductive(decl) {
+                let msg: &'static str = Box::leak(format!("{e:?}").into_boxed_str());
+                return msg;
+            }
+        }
+        return "add_inductive REJECTED the declaration (no inductive_info)";
+    };
+    match env.axiom_deps(&info.name) {
+        Some(r) if r.is_empty() => {}
+        Some(_) => return "the INDUCTIVE carries axiom residue beyond the 3",
+        None => return "the inductive has no axiom_deps entry",
+    }
+    let Some(rec) = &info.recursor_name else {
+        return "NO RECURSOR was derived — the structure is not a complete inductive";
+    };
+    match env.axiom_deps(rec) {
+        Some(r) if r.is_empty() => "registers fine (unexpected)",
+        Some(_) => "the RECURSOR carries axiom residue beyond the 3",
+        None => "the recursor has no axiom_deps entry",
+    }
+}
+
+/// Trust: DIAGNOSTIC (2026-08-25) — expose [`adt_expected_kernel_ctors`] so a caller can
+/// distinguish the two ways registration fails: a field that does not decode to a kernel
+/// type (this returns `None`) versus a declaration the kernel rejects. Registration
+/// itself is a silent `continue`, so without this the two are indistinguishable.
+#[must_use]
+pub(crate) fn adt_expected_kernel_ctors_for_test(
+    carrier: &reflect::AdtCarrier,
+) -> Option<Vec<(Name, Expr)>> {
+    adt_expected_kernel_ctors(carrier)
+}
+
 fn adt_expected_kernel_ctors(carrier: &reflect::AdtCarrier) -> Option<Vec<(Name, Expr)>> {
     let bd = || BinderData::from(BinderInfo::Default);
     let k = carrier.type_params.len() as u32;
@@ -4968,12 +5137,7 @@ fn resolve_slice_addr_of_base(
 /// Name the Iter PARAMETER as a `Formula::Var` (its declared name, or `_<idx>`),
 /// the argument to `iter_region(param)`.
 fn iter_param_formula(body: &trust_types::VerifiableBody, param: usize) -> Option<Formula> {
-    let name = body
-        .locals
-        .get(param)?
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("_{param}"));
+    let name = body.locals.get(param)?.name.clone().unwrap_or_else(|| format!("_{param}"));
     Some(Formula::Var(name, trust_types::Sort::Int))
 }
 
@@ -5420,7 +5584,8 @@ fn folded_reachable_avoiding(
     target: trust_types::BlockId,
     avoid: trust_types::BlockId,
 ) -> bool {
-    let mut seen: std::collections::HashSet<trust_types::BlockId> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<trust_types::BlockId> =
+        std::collections::HashSet::new();
     let mut stack = vec![start];
     while let Some(id) = stack.pop() {
         if id == avoid || !live.contains(&id) || !seen.insert(id) {
@@ -5661,7 +5826,8 @@ fn write_value_chases_to_offset(
     if value_local == offset_local {
         return true;
     }
-    let Some((rvalue, def_block, def_stmt)) = sole_dominating_assign_raw(body, value_local, use_site)
+    let Some((rvalue, def_block, def_stmt)) =
+        sole_dominating_assign_raw(body, value_local, use_site)
     else {
         return false;
     };
@@ -5972,7 +6138,13 @@ fn live_slice_addr_of_root(
         }
         // PASSTHROUGH: a bare copy/move, chased at this definition's site.
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) if p.projections.is_empty() => {
-            live_slice_addr_of_root(body, live, p.local, Some((def_block, Some(def_stmt))), depth + 1)
+            live_slice_addr_of_root(
+                body,
+                live,
+                p.local,
+                Some((def_block, Some(def_stmt))),
+                depth + 1,
+            )
         }
         // PASSTHROUGH: a POINTER-IDENTITY cast (pointerish source AND destination).
         Rvalue::Cast(Operand::Copy(p) | Operand::Move(p), target) if p.projections.is_empty() => {
@@ -5980,7 +6152,13 @@ fn live_slice_addr_of_root(
             if !is_pointerish(source_ty) || !is_pointerish(target) {
                 return None;
             }
-            live_slice_addr_of_root(body, live, p.local, Some((def_block, Some(def_stmt))), depth + 1)
+            live_slice_addr_of_root(
+                body,
+                live,
+                p.local,
+                Some((def_block, Some(def_stmt))),
+                depth + 1,
+            )
         }
         _ => None,
     }
@@ -6044,14 +6222,26 @@ fn resolve_record_ptr_field(
     match rvalue {
         // PASSTHROUGH casts / copies (pointer-identity).
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) if p.projections.is_empty() => {
-            resolve_record_ptr_field(body, live, p.local, Some((def_block, Some(def_stmt))), depth + 1)
+            resolve_record_ptr_field(
+                body,
+                live,
+                p.local,
+                Some((def_block, Some(def_stmt))),
+                depth + 1,
+            )
         }
         Rvalue::Cast(Operand::Copy(p) | Operand::Move(p), target) if p.projections.is_empty() => {
             let source_ty = &body.locals.get(p.local)?.ty;
             if !is_pointerish(source_ty) || !is_pointerish(target) {
                 return None;
             }
-            resolve_record_ptr_field(body, live, p.local, Some((def_block, Some(def_stmt))), depth + 1)
+            resolve_record_ptr_field(
+                body,
+                live,
+                p.local,
+                Some((def_block, Some(def_stmt))),
+                depth + 1,
+            )
         }
         // START: `&raw const (*s)` — the slice data pointer.
         Rvalue::AddressOf(false, place) if place.projections.as_slice() == [Projection::Deref] => {
@@ -6275,8 +6465,7 @@ pub(crate) fn sem_struct_return_folded_shape_of(
             if !place.projections.is_empty() {
                 return None;
             }
-            let resolved =
-                resolve_record_ptr_field(body, &live, place.local, agg_use_site, 0)?;
+            let resolved = resolve_record_ptr_field(body, &live, place.local, agg_use_site, 0)?;
             match resolved {
                 RecordPtrField::Start { param_local } => {
                     let p = param_index(param_local)?;
@@ -6353,8 +6542,11 @@ fn local_is_read_anywhere(body: &trust_types::VerifiableBody, local: usize) -> b
             R::BinaryOp(_, a, b) | R::CheckedBinaryOp(_, a, b) => {
                 place_reads(a, local) || place_reads(b, local)
             }
-            R::Ref { place, .. } | R::AddressOf(_, place) | R::Discriminant(place)
-            | R::Len(place) | R::CopyForDeref(place) => place.local == local,
+            R::Ref { place, .. }
+            | R::AddressOf(_, place)
+            | R::Discriminant(place)
+            | R::Len(place)
+            | R::CopyForDeref(place) => place.local == local,
             R::PtrOffset { ptr, count } => place_reads(ptr, local) || place_reads(count, local),
             R::Aggregate(_, ops) | R::Unsupported { operands: ops, .. } => {
                 ops.iter().any(|o| place_reads(o, local))
@@ -6574,7 +6766,8 @@ pub(crate) fn sem_iter_next_shape_of(
     // different block ⇒ folded domination; same block ⇒ earlier statement.
     for &(rb, ri) in &reads {
         for &(wb, wi) in &writes {
-            let strict = if rb == wb { ri < wi } else { folded_block_dominates(body, &live, rb, wb) };
+            let strict =
+                if rb == wb { ri < wi } else { folded_block_dominates(body, &live, rb, wb) };
             if !strict {
                 return None;
             }
@@ -6583,7 +6776,8 @@ pub(crate) fn sem_iter_next_shape_of(
 
     // ARMS (over the FOLDED live CFG): the None arm on the `==`-edge, the Some arm on the
     // `!=`-edge (both may converge at the unique Return via DIFFERENT intermediate blocks).
-    let (some_block, some_rv) = first_live_zero_assign_on_folded_path(body, &live, not_equal_target)?;
+    let (some_block, some_rv) =
+        first_live_zero_assign_on_folded_path(body, &live, not_equal_target)?;
     let (none_block, none_rv) = first_live_zero_assign_on_folded_path(body, &live, equal_target)?;
     if some_block == none_block {
         return None;
@@ -6640,11 +6834,8 @@ pub(crate) fn sem_iter_next_shape_of(
     if !pp.projections.is_empty() {
         return None;
     }
-    let (ref_rvalue, ref_block, ref_stmt) = sole_dominating_assign_raw(
-        body,
-        pp.local,
-        Some((some_block, None)),
-    )?;
+    let (ref_rvalue, ref_block, ref_stmt) =
+        sole_dominating_assign_raw(body, pp.local, Some((some_block, None)))?;
     let Rvalue::Ref { mutable: false, place: referent } = ref_rvalue else { return None };
     if !matches!(referent.projections.as_slice(), [Projection::Deref]) {
         return None;
@@ -6658,7 +6849,8 @@ pub(crate) fn sem_iter_next_shape_of(
         return None;
     }
     // Belt-and-suspenders: the cursor base resolves to the iter_region-at-0 model.
-    let model = resolve_iter_cursor_base(body, referent.local, Some((ref_block, Some(ref_stmt))), 0)?;
+    let model =
+        resolve_iter_cursor_base(body, referent.local, Some((ref_block, Some(ref_stmt))), 0)?;
     if model.index != Formula::Int(0) {
         return None;
     }
@@ -7034,10 +7226,7 @@ pub(crate) fn sem_iter_step_shape_of(
         return None;
     }
 
-    Some(crate::mirsem::SemIterStep {
-        recv_param: param as u64,
-        element_ty: shape.element_ty,
-    })
+    Some(crate::mirsem::SemIterStep { recv_param: param as u64, element_ty: shape.element_ty })
 }
 
 /// Trust: W19 mutators inc-1 (2026-07-24) — the FIELD-SETTER MINT GATE for the
@@ -7181,7 +7370,9 @@ pub(crate) fn sem_field_set_shape_of(
         for stmt in &block.stmts {
             if let Statement::Assign { rvalue, .. } = stmt {
                 let leaks = match rvalue {
-                    Rvalue::Use(o) | Rvalue::UnaryOp(_, o) | Rvalue::Cast(o, _)
+                    Rvalue::Use(o)
+                    | Rvalue::UnaryOp(_, o)
+                    | Rvalue::Cast(o, _)
                     | Rvalue::Repeat(o, _) => is_bare(o, recv_param),
                     Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                         is_bare(a, recv_param) || is_bare(b, recv_param)
@@ -7527,7 +7718,9 @@ pub(crate) fn sem_field_rmw_shape_of(
                 }
                 Statement::Assign { rvalue, .. } => {
                     let leaks = match rvalue {
-                        Rvalue::Use(o) | Rvalue::UnaryOp(_, o) | Rvalue::Cast(o, _)
+                        Rvalue::Use(o)
+                        | Rvalue::UnaryOp(_, o)
+                        | Rvalue::Cast(o, _)
                         | Rvalue::Repeat(o, _) => leaks_any(o),
                         Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                             leaks_any(a) || leaks_any(b)
@@ -7832,12 +8025,28 @@ fn iter_dist_init_try(
     into_iter_dump_digest: u64,
     loop_elem: &trust_types::Ty,
 ) -> Result<DistInitPremiseInstance, &'static str> {
+    iter_dist_init_try_inner(into_iter_body, def_path, into_iter_dump_digest, loop_elem, true)
+}
+
+/// [`iter_dist_init_try`] with the D2 conjunct made explicit. `require_d2 == true` is the
+/// ONLY value production uses; `false` exists so the D-1/D-3..D-8 + theorem probe suite
+/// can keep exercising ingredients (3)-(6) on the real `into_iter` dump while D2 itself is
+/// deferred by the emitter's declined `Rvalue::Cast` rows. The production entry point's
+/// dependence on D2 is pinned by
+/// `w_addr_dist_init_probes::production_mint_requires_the_d2_record_lane`.
+fn iter_dist_init_try_inner(
+    into_iter_body: &trust_types::VerifiableFunction,
+    def_path: &str,
+    into_iter_dump_digest: u64,
+    loop_elem: &trust_types::Ty,
+    require_d2: bool,
+) -> Result<DistInitPremiseInstance, &'static str> {
     use trust_types::{Operand, Rvalue, Statement, Ty};
     // (1) D4 whole-slice MINT structural observation.
     let mint = sem_into_iter_mint_shape_of(into_iter_body).ok_or("dist_init::d4_mint_shape")?;
     // (2) D2 record-lane certificate EXACT-only + the SEPARATE raw-CFG offset-discharge conjunct
     //     (the discharge is consumed ONLY through this existing D2 role, never re-cited).
-    if !crate::prove::struct_return_fully_faithful_via_trustir(into_iter_body) {
+    if require_d2 && !crate::prove::struct_return_fully_faithful_via_trustir(into_iter_body) {
         return Err("dist_init::d2_record_lane");
     }
     if !crate::prove::function_ptr_offsets_all_discharged(into_iter_body) {
@@ -7927,6 +8136,33 @@ pub(crate) fn iter_dist_init_premise_instance(
     iter_dist_init_try(into_iter_body, def_path, into_iter_dump_digest, loop_elem).ok()
 }
 
+/// The NAMED decline reason on the D2-SKIPPING path — test-only, so a probe about a LATER
+/// ingredient reads the reason for THAT ingredient rather than for the separately-deferred
+/// D2 conjunct. See [`iter_dist_init_try_inner`].
+#[cfg(test)]
+#[must_use]
+pub(crate) fn iter_dist_init_try_inner_decline_reason_without_d2(
+    into_iter_body: &trust_types::VerifiableFunction,
+    def_path: &str,
+    into_iter_dump_digest: u64,
+    loop_elem: &trust_types::Ty,
+) -> Option<&'static str> {
+    iter_dist_init_try_inner(into_iter_body, def_path, into_iter_dump_digest, loop_elem, false).err()
+}
+
+/// The DIST-INIT instance with the D2 record-lane conjunct SKIPPED — test-only scaffold
+/// for the D-1/D-3..D-8 + theorem probes. See [`iter_dist_init_try_inner`].
+#[cfg(test)]
+#[must_use]
+pub(crate) fn iter_dist_init_premise_instance_without_d2(
+    into_iter_body: &trust_types::VerifiableFunction,
+    def_path: &str,
+    into_iter_dump_digest: u64,
+    loop_elem: &trust_types::Ty,
+) -> Option<DistInitPremiseInstance> {
+    iter_dist_init_try_inner(into_iter_body, def_path, into_iter_dump_digest, loop_elem, false).ok()
+}
+
 /// Trust: W-ADDR increment 1 — the NAMED decline reason for a DIST-INIT recognizer miss
 /// (`Some("dist_init::…")`), or `None` when the instance mints. Mirrors the P-ITER-COUNT
 /// decline-reason pattern; consumed by the forgery-probe suite (test-only today).
@@ -7952,17 +8188,71 @@ mod w_addr_dist_init_probes {
     use clean_kernel::{BinderData, BinderInfo, Expr, Level, Name, TypeChecker};
 
     use crate::trustir_anchor::{
-        cst, int_lit, int_ty, trustir_env, TRUSTIR_PTR_OFFSET, TRUSTIR_SLICE_LEN,
-        TRUSTIR_SLICE_START,
+        TRUSTIR_PTR_OFFSET, TRUSTIR_SLICE_LEN, TRUSTIR_SLICE_START, cst, int_lit, int_ty,
+        trustir_env,
     };
 
-    const INTO_ITER: &str =
-        "fixtures/w2-iter-offset-modeled-2026-07-20/dumps/trust-mir-7db23535628cc69f-faba7f7af518f3ec.json";
+    const INTO_ITER: &str = "fixtures/w2-iter-offset-modeled-2026-07-20/dumps/trust-mir-7db23535628cc69f-faba7f7af518f3ec.json";
 
     fn load_into_iter() -> trust_types::VerifiableFunction {
         let bytes = std::fs::read(INTO_ITER).expect("into_iter dump readable");
         crate::prove::decode_verifiable_function_with_authenticated_legacy_metadata(&bytes)
             .expect("into_iter dump decodes")
+    }
+
+    /// TEST SCAFFOLD (2026-08-25) — the D-1/D-3..D-8 + theorem probes mint through the
+    /// D2-SKIPPING entry point, because D2 (the record-lane certificate) is currently
+    /// DEFERRED for this dump and for a reason none of these probes is about: `into_iter`
+    /// raises `UnsupportedMir { kind: "Rvalue::Cast" }` rows for its `usize -> *const i32`,
+    /// `*[i32] -> NonNull`, `NonNull -> *[i32]` and fat->thin provenance casts, and a
+    /// DECLINED row now fails `function_safety_vcs_all_discharged` closed instead of
+    /// falling out of the `is_safety_vc_kind` filter (Channel 2 of the decline-handling
+    /// false proof). The runtime oracle measures no panic in this body (slice
+    /// `into_iter`/`next`/`fold` 0/5), so the deferral is a FAITHFULNESS gap.
+    ///
+    /// `production_mint_requires_the_d2_record_lane` pins that the PRODUCTION entry point
+    /// still requires D2, so this scaffold cannot become a claim. When vcgen learns to
+    /// model those casts, that pin red-fails and every call here goes back to
+    /// `iter_dist_init_premise_instance`.
+    fn mint_modulo_d2(
+        func: &trust_types::VerifiableFunction,
+        elem: &trust_types::Ty,
+        digest: u64,
+    ) -> Option<super::DistInitPremiseInstance> {
+        super::iter_dist_init_premise_instance_without_d2(func, &func.def_path, digest, elem)
+    }
+
+    /// THE SCAFFOLD PIN — the production mint DOES require D2, and D2 is what is deferred.
+    #[test]
+    fn production_mint_requires_the_d2_record_lane() {
+        let func = load_into_iter();
+        assert!(
+            crate::mirsem::function_emits_declined_vc(&func),
+            "the deferral must rest on a DECLINED row"
+        );
+        assert!(
+            crate::prove::function_ptr_offsets_all_discharged(&func),
+            "the OFFSET half still discharges — the cast rows are the whole of the gap"
+        );
+        assert_eq!(
+            super::iter_dist_init_premise_instance_decline_reason(
+                &func,
+                &func.def_path,
+                0,
+                &i32_elem()
+            ),
+            Some("dist_init::d2_record_lane"),
+            "the production mint must refuse, naming D2; if this stops being the reason \
+             the scaffold below is measuring the wrong thing"
+        );
+        // ... and D2 is refused by the DECLINED row, not by a shape miss: the folded
+        // record recognizer still fires and its refinement still closes modulo 3.
+        let shape = super::sem_struct_return_folded_shape_of(&func)
+            .expect("the folded record recognizer must still fire");
+        assert_eq!(
+            crate::trustir_adt::check_struct_return_refinement(&shape),
+            crate::trustir_anchor::RefinementVerdict::ProvenModulo3
+        );
     }
     fn i32_elem() -> trust_types::Ty {
         trust_types::Ty::Int { width: 32, signed: true }
@@ -8010,8 +8300,7 @@ mod w_addr_dist_init_probes {
 
     fn inject_receiver_field_write(body: &mut trust_types::VerifiableBody) {
         use trust_types::{Operand, Place, Projection, Rvalue, Statement};
-        let place =
-            Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] };
+        let place = Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] };
         let stmt = Statement::Assign {
             place,
             rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
@@ -8043,9 +8332,8 @@ mod w_addr_dist_init_probes {
         );
         // premise_citations byte-equal on a minted instance.
         let func = load_into_iter();
-        let inst =
-            super::iter_dist_init_premise_instance(&func, &func.def_path, 0xD15D, &i32_elem())
-                .expect("mints on the honest into_iter");
+        let inst = mint_modulo_d2(&func, &i32_elem(), 0xD15D)
+            .expect("mints on the honest into_iter (modulo the deferred D2 conjunct)");
         assert_eq!(
             inst.premise_citations,
             vec![
@@ -8074,8 +8362,7 @@ mod w_addr_dist_init_probes {
         // ptr!=end gate either — role distinction is by SLOT, not value distinctness.
         assert!(crate::trustir_anchor::iter_dist_init_theorem_checks());
         let func = load_into_iter();
-        assert!(super::iter_dist_init_premise_instance(&func, &func.def_path, 0, &i32_elem())
-            .is_some());
+        assert!(mint_modulo_d2(&func, &i32_elem(), 0).is_some());
     }
 
     // ---- premise honesty: the len=0 dangling base ships an HONEST citation ----
@@ -8099,8 +8386,7 @@ mod w_addr_dist_init_probes {
         // (c) the Vec::new()/NonNull::dangling falsifier: the len=0 case is admitted (∀ s,
         //     non-strict hLen) while citing P-ADDR-ALLOC verbatim — an HONEST citation.
         let func = load_into_iter();
-        let inst = super::iter_dist_init_premise_instance(&func, &func.def_path, 0, &i32_elem())
-            .expect("mints");
+        let inst = mint_modulo_d2(&func, &i32_elem(), 0).expect("mints");
         assert!(inst.premise_citations.contains(&crate::mirsem::P_ADDR_ALLOC));
         assert!(crate::trustir_anchor::iter_dist_init_theorem_checks());
     }
@@ -8113,15 +8399,21 @@ mod w_addr_dist_init_probes {
         // ...but ingredient (4) — the D6 element cross-check — must ALSO hold. A mismatched loop
         // element yields None (no distance instance exists in the bundle).
         let i64_elem = trust_types::Ty::Int { width: 64, signed: true };
-        assert!(super::iter_dist_init_premise_instance(&func, &func.def_path, 0, &i64_elem)
-            .is_none());
+        assert!(mint_modulo_d2(&func, &i64_elem, 0).is_none());
+        // The D6 miss must be reached ON ITS OWN — D2 is separately deferred today (see
+        // `production_mint_requires_the_d2_record_lane`), so the reason is read off the
+        // D2-skipping path where D6 is the FIRST failing ingredient.
         assert_eq!(
-            super::iter_dist_init_premise_instance_decline_reason(&func, &func.def_path, 0, &i64_elem),
+            super::iter_dist_init_try_inner_decline_reason_without_d2(
+                &func,
+                &func.def_path,
+                0,
+                &i64_elem
+            ),
             Some("dist_init::elem_ty_mismatch_d6")
         );
         // positive control: the honest element type DOES mint.
-        assert!(super::iter_dist_init_premise_instance(&func, &func.def_path, 0, &i32_elem())
-            .is_some());
+        assert!(mint_modulo_d2(&func, &i32_elem(), 0).is_some());
     }
 
     // ---- D-2: a pointee-recast base declines; the byte-arithmetic inversion is underivable ----
@@ -8135,7 +8427,7 @@ mod w_addr_dist_init_probes {
             pointee: Box::new(trust_types::Ty::Int { width: 64, signed: true }),
         };
         assert!(
-            super::iter_dist_init_premise_instance(&func, &func.def_path, 0, &i32_elem()).is_none(),
+            mint_modulo_d2(&func, &i32_elem(), 0).is_none(),
             "a pointee-recast base must decline the dist_init instance"
         );
     }
@@ -8181,8 +8473,7 @@ mod w_addr_dist_init_probes {
             "an injected `(*recv).Field(_)` write must trip the D-5 gate"
         );
         assert!(
-            super::iter_dist_init_premise_instance(&mutated, &mutated.def_path, 0, &i32_elem())
-                .is_none(),
+            mint_modulo_d2(&mutated, &i32_elem(), 0).is_none(),
             "a receiver/cursor-field write must decline the dist_init instance (GATE-ITER-REGION)"
         );
     }
@@ -8204,9 +8495,12 @@ mod w_addr_dist_init_probes {
         // STRUCTURAL: a DistInitPremiseInstance carries ZERO cross-handle content — ONE
         // slice_param, exactly the three P-ADDR citations, no second-handle field.
         let func = load_into_iter();
-        let inst = super::iter_dist_init_premise_instance(&func, &func.def_path, 0, &i32_elem())
-            .expect("mints");
-        assert_eq!(inst.premise_citations.len(), 3, "exactly the P-ADDR-* family; no cross-handle citation");
+        let inst = mint_modulo_d2(&func, &i32_elem(), 0).expect("mints");
+        assert_eq!(
+            inst.premise_citations.len(),
+            3,
+            "exactly the P-ADDR-* family; no cross-handle citation"
+        );
         let _one_handle: usize = inst.slice_param; // a single usize cannot name a second handle
     }
 
@@ -8315,8 +8609,11 @@ pub(crate) fn sem_adt_return_carries_entry_iter_handle(r: &crate::mirsem::SemAdt
     fn op_has_iter_region(op: &SemOperand) -> bool {
         match op {
             SemOperand::IterRegion(_) => true,
-            SemOperand::Move(b) | SemOperand::Len(b) | SemOperand::Field(b, _)
-            | SemOperand::Discriminant(b) | SemOperand::Cast(b, _, _)
+            SemOperand::Move(b)
+            | SemOperand::Len(b)
+            | SemOperand::Field(b, _)
+            | SemOperand::Discriminant(b)
+            | SemOperand::Cast(b, _, _)
             | SemOperand::PreOp(b, _) => op_has_iter_region(b),
             SemOperand::Index(a, b) => op_has_iter_region(a) || op_has_iter_region(b),
             SemOperand::Var(_) | SemOperand::Const(_) => false,
@@ -8336,9 +8633,18 @@ pub(crate) fn sem_adt_return_carries_entry_iter_handle(r: &crate::mirsem::SemAdt
         Some(SemAdtPayload::IntCast { source, .. }) => op_has_iter_region(source),
         // Trust: RECORD-WITNESS inc-2 — a `DowncastField` (ok/err `Some(x)`) payload roots
         // at a `self` parameter downcast, never an iter-region handle.
-        Some(SemAdtPayload::NullaryNested { .. } | SemAdtPayload::DowncastField { .. }) | None => {
-            false
-        }
+        // A downcast payload (scalar or opaque) roots at a `self` parameter downcast,
+        // never an iter-region handle.
+        // A NESTED-CTOR payload is built from an Aggregate's own operands, which the
+        // resolver admits only as scalars/units/further nested ctors — never an
+        // iter-region handle.
+        Some(
+            SemAdtPayload::NullaryNested { .. }
+            | SemAdtPayload::NestedCtor { .. }
+            | SemAdtPayload::DowncastField { .. }
+            | SemAdtPayload::DowncastOpaque { .. },
+        )
+        | None => false,
     };
     cond_has_iter_has_next(&r.cond) || arm_has(&r.then_arm) || arm_has(&r.else_arm)
 }
@@ -8710,6 +9016,124 @@ pub(crate) fn ground_int(
             Some(crate::mirsem::bool_as_int(ground_bool(f, params)?))
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BITVECTOR-ENABLED grounding (Trust, 2026-08-21) — the trust-ir SAFETY tier's
+// opt-in extension of the live grounder.
+//
+// WHY IT IS AN OPT-IN AND NOT AN EXTRA ARM ON `ground_int`.
+// `ground_int`/`ground_prop` are consumed by EVERY tier (mirsem safety, contract
+// grounding, postcondition proving, …). Today every `Formula::Bv*` / `Formula::
+// BitVec` shape falls through to `None`, and several of those consumers rely on
+// that decline as their fail-closed edge. Turning a `None` into a `Some` in the
+// shared entry point silently widens all of them at once. So the BV shapes get a
+// SEPARATE entry point that DELEGATES every non-BV shape to the live `ground_int`
+// / `ground_prop` — an Int-only formula grounds BYTE-IDENTICALLY through the same
+// code (pinned by `trustir_safety::bv_denotation_tests::
+// the_bv_grounder_agrees_with_the_int_grounder_on_an_int_only_core`),
+// and only the caller that has argued the BV reading is the right one opts in.
+//
+// THE DENOTATION (this is a DEFINITION — see `trustir_safety::bv_mul_body` /
+// `bv_udiv_body` for the bodies these names unfold to):
+//   * a width-`W` bitvector VALUE is its UNSIGNED reading, an `Int` in `[0, 2^W)`;
+//   * `Formula::BitVec { value, width }` is the low `width` bits of `value` read
+//     unsigned (the emitter stores the bit pattern in an `i128`);
+//   * `Formula::BvMul(a,b,W)` ↦ `Trust.TrustIr.bvMulU{W} a b`  (`(a·b) mod 2^W`);
+//   * `Formula::BvUDiv(a,b,W)` ↦ `Trust.TrustIr.bvUDivU{W} a b` (SMT-LIB `bvudiv`,
+//     INCLUDING its all-ones-at-zero-divisor convention).
+// Nothing else is admitted: any other BV operator declines, so a formula outside
+// this exact fragment fails closed rather than grounding to an approximation.
+// ---------------------------------------------------------------------------
+
+/// The UNSIGNED `Int` value a `Formula::BitVec { value, width }` literal denotes:
+/// the low `width` bits of the stored `i128` bit pattern, read unsigned.
+///
+/// Declines `width == 0` (no value) and `width > 127` (the `1i128 << width` mask
+/// would overflow, and a masked `i128` cannot represent `2^128 − 1` anyway). The
+/// modeled safety widths are 8/16/32/64, so the decline is not reachable from the
+/// umul lane; it exists so a future caller cannot get a silently-truncated mask.
+pub(crate) fn bv_literal_unsigned(value: i128, width: u32) -> Option<i128> {
+    // OFF BY ONE, CAUGHT BY REVIEW: the bound must EXCLUDE 127, not admit it.
+    // `1i128 << 127` is `i128::MIN`, so the `- 1` below overflows and panics in every
+    // debug/test build. The doc comment above already described the intended rule
+    // ("the mask would overflow"); the code admitted the exact width it describes.
+    // Computed with checked arithmetic as well, so a future edit to this bound cannot
+    // reintroduce the panic silently — a declined literal is fail-closed, a panic is not.
+    if width == 0 || width >= 127 {
+        return None;
+    }
+    let mask = 1i128.checked_shl(width)?.checked_sub(1)?;
+    Some(value & mask)
+}
+
+/// Whether `bits` is a width the trust-ir safety tier registers BV denotations for
+/// (`u8`/`u16`/`u32`/`u64`). A width outside that set declines rather than emitting
+/// an unregistered constant name.
+fn bv_width_is_modeled(bits: u32) -> bool {
+    matches!(bits, 8 | 16 | 32 | 64)
+}
+
+/// BITVECTOR-ENABLED [`ground_int`]. Handles exactly the three BV shapes the
+/// unsigned-multiply overflow core is built from and DELEGATES everything else to
+/// the live `ground_int`, so an Int-only formula grounds to the identical term.
+pub(crate) fn ground_int_bv(
+    f: &Formula,
+    params: &std::collections::HashMap<String, Expr>,
+) -> Option<Expr> {
+    use trust_types::Formula as F;
+    let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
+    match f {
+        F::BitVec { value, width } => int_lit_to_expr_checked(bv_literal_unsigned(*value, *width)?),
+        F::BvMul(a, b, w) if bv_width_is_modeled(*w) => Some(Expr::apps(
+            cst(&crate::trustir_safety::bv_mul_ir_name(*w)),
+            [ground_int_bv(a, params)?, ground_int_bv(b, params)?],
+        )),
+        F::BvUDiv(a, b, w) if bv_width_is_modeled(*w) => Some(Expr::apps(
+            cst(&crate::trustir_safety::bv_udiv_ir_name(*w)),
+            [ground_int_bv(a, params)?, ground_int_bv(b, params)?],
+        )),
+        // Every other shape — including every OTHER BV operator — is the live Int
+        // grounder's business. `Formula::Var` is sort-blind there, so a BV-sorted
+        // operand leaf binds to its de-Bruijn binder exactly as an Int one does.
+        other => ground_int(other, params),
+    }
+}
+
+/// BITVECTOR-ENABLED [`ground_prop`], over the `And`/`Not`/`Eq` skeleton the BV
+/// overflow core is built from. Every other connective DELEGATES to the live
+/// `ground_prop` (which recurses through the Int-only grounder), so the admitted
+/// BV fragment is exactly: `And` of `Not` of `Eq` over `ground_int_bv` terms.
+pub(crate) fn ground_prop_bv(
+    f: &Formula,
+    params: &std::collections::HashMap<String, Expr>,
+) -> Option<Expr> {
+    use trust_types::Formula as F;
+    let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
+    match f {
+        F::Not(a) => Some(Expr::app(cst("Not"), ground_prop_bv(a, params)?)),
+        F::And(v) => fold_prop_bv(v, params),
+        F::Eq(a, b) => Some(Expr::apps(
+            Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+            [cst("Int"), ground_int_bv(a, params)?, ground_int_bv(b, params)?],
+        )),
+        other => ground_prop(other, params),
+    }
+}
+
+/// The `And` fold of [`ground_prop_bv`] — the SAME right-nested `And head tail`
+/// shape (and the same `True` unit) `fold_prop` produces, so a BV-free conjunction
+/// grounds byte-identically.
+fn fold_prop_bv(v: &[Formula], params: &std::collections::HashMap<String, Expr>) -> Option<Expr> {
+    let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
+    match v {
+        [] => Some(cst("True")),
+        [single] => ground_prop_bv(single, params),
+        [head, tail @ ..] => Some(Expr::apps(
+            cst("And"),
+            [ground_prop_bv(head, params)?, fold_prop_bv(tail, params)?],
+        )),
     }
 }
 
@@ -10069,9 +10493,19 @@ pub fn inhabit_verifiable_function(func: &VerifiableFunction) -> InhabitOutcome 
 
     use clean_kernel::ExprKind;
 
-    if trust_vcgen::validate_function(func).is_err()
-        || !crate::assignment_types::all_assignments_match(&func.body)
-    {
+    if trust_vcgen::validate_function(func).is_err() {
+        return InhabitOutcome::NotGrounded;
+    }
+
+    // Clean's mature MIR recognizers are phrased in the ordinary Call + Return
+    // vocabulary.  Use the shared semantic projection before any proof-capable
+    // body scan so a TailCall cannot disappear behind a wildcard arm.  The
+    // projection preserves the callee, actuals, compiler-authenticated safety
+    // metadata, and implicit return-place write; unsupported call shapes still
+    // decline through the existing ordinary-call gates.
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+    if !crate::assignment_types::all_assignments_match(&func.body) {
         return InhabitOutcome::NotGrounded;
     }
 
@@ -10448,6 +10882,7 @@ mod tests {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
             },
         };
         let ret = BasicBlock {
@@ -10670,12 +11105,16 @@ mod tests {
     /// projection `Expr::proj("Trust.Adt.Wrapper", 0, p)` — NOT `Prod.fst`.
     #[test]
     fn struct_grounds_to_named_inductive_with_named_projection_modulo_3() {
-        let ty = Ty::Adt { adt_kind: None, layout: None,
+        let ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Wrapper".into(),
             fields: vec![("value".into(), Ty::Int { width: 32, signed: true })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let carrier =
             reflect_struct(&ty).expect("non-generic struct reflects to a named inductive");
         assert_eq!(carrier.name, "Trust.Adt.Wrapper");
@@ -10768,7 +11207,9 @@ mod tests {
     #[test]
     fn field_grounds_structurally_certificate_non_generic_and_parameterized() {
         // Non-generic `Point { x:i32, y:i32 }`.
-        let point = Ty::Adt { adt_kind: None, layout: None,
+        let point = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Point".into(),
             fields: vec![
@@ -10776,10 +11217,14 @@ mod tests {
                 ("y".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let pc = reflect_struct(&point).expect("Point reflects");
         // Parameterized `Wrapper<T> { value:T, count:u32 }`.
-        let wrapper = Ty::Adt { adt_kind: None, layout: None,
+        let wrapper = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Wrapper".into(),
             fields: vec![
@@ -10793,7 +11238,9 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let wc = reflect_struct(&wrapper).expect("Wrapper<T> reflects parameterized");
 
         let mut env = Environment::with_prelude();
@@ -10819,7 +11266,9 @@ mod tests {
     /// the caller keeps the `Prod` floor.
     #[test]
     fn non_reflectable_field_struct_falls_back_to_prod() {
-        let ty = Ty::Adt { adt_kind: None, layout: None,
+        let ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Mixed".into(),
             fields: vec![
@@ -10827,7 +11276,9 @@ mod tests {
                 ("bad".into(), Ty::Never),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         assert_eq!(reflect_struct(&ty), None, "a never field must not register structurally");
     }
 
@@ -10838,7 +11289,9 @@ mod tests {
     /// nested float decodes to a real kernel type, modulo 3.
     #[test]
     fn struct_with_float_field_registers_modulo_3() {
-        let ty = Ty::Adt { adt_kind: None, layout: None,
+        let ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "WithFloat".into(),
             fields: vec![
@@ -10846,7 +11299,9 @@ mod tests {
                 ("weight".into(), Ty::Float { width: 32 }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let carrier =
             reflect_struct(&ty).expect("a struct with a float field now reflects structurally");
         let mut env = Environment::with_prelude();
@@ -11306,7 +11761,13 @@ mod tests {
             name: "probe".into(),
             def_path: "crate::probe".into(),
             span: Default::default(),
-            body: VerifiableBody { locals, blocks: vec![], arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks: vec![],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -11350,11 +11811,7 @@ mod tests {
         let mut env = Environment::with_prelude();
         let reg = register_dyn_carriers(&mut env, &[bare.clone(), with_send.clone()]);
         for carrier in [&bare, &with_send] {
-            assert!(
-                reg.get(&carrier.name).is_some(),
-                "{} registers modulo 3",
-                carrier.name
-            );
+            assert!(reg.get(&carrier.name).is_some(), "{} registers modulo 3", carrier.name);
             for n in [carrier.vtable_name.as_str(), carrier.name.as_str()] {
                 assert!(
                     env.axiom_deps(&Name::from_string(n)).expect("declared").is_empty(),
@@ -11465,7 +11922,9 @@ mod tests {
     #[test]
     fn generic_bare_field_struct_registers_parameterized() {
         // `Trust.Param.T/#0` is how trust-mir-extract stamps a generic param.
-        let ty = Ty::Adt { adt_kind: None, layout: None,
+        let ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Holder".into(),
             fields: vec![(
@@ -11476,7 +11935,9 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let carrier =
             reflect_struct(&ty).expect("a bare-generic-field struct now reflects parameterized");
         assert_eq!(carrier.type_params, vec!["T/#0".to_string()]);
@@ -12627,12 +13088,16 @@ mod tests {
         use trust_types::{
             BasicBlock, BlockId, LocalDecl, Terminator, Ty, VerifiableBody, VerifiableFunction,
         };
-        let unit_struct = Ty::Adt { adt_kind: None, layout: None,
+        let unit_struct = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Empty".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let h_param = Ty::Unsupported {
             kind: "TyKind::Param".into(),
             detail: "generic parameter H/#0 needs monomorphization".into(),
@@ -12772,7 +13237,10 @@ mod tests {
                         index: 1,
                         ty: Ty::Ref {
                             mutable: true,
-                            inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+                            inner: Box::new(Ty::Dynamic {
+                                trait_name: "core::fmt::Write".into(),
+                                principal_key: Some("core::fmt::Write".into()),
+                            }),
                         },
                         name: Some("w".into()),
                     },
@@ -12922,7 +13390,9 @@ mod tests {
         use trust_types::{
             BasicBlock, BlockId, LocalDecl, Terminator, Ty, VerifiableBody, VerifiableFunction,
         };
-        let result_ty = Ty::Adt { adt_kind: None, layout: None,
+        let result_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "core::result::Result".into(),
             fields: vec![
@@ -12930,25 +13400,38 @@ mod tests {
                 ("ok".into(), Ty::Unit),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
-        let formatter = Ty::Adt { adt_kind: None, layout: None,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let formatter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
                 "inner".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+                    inner: Box::new(Ty::Dynamic {
+                        trait_name: "core::fmt::Write".into(),
+                        principal_key: Some("core::fmt::Write".into()),
+                    }),
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
-        let self_struct = Ty::Adt { adt_kind: None, layout: None,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let self_struct = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "MyType".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = VerifiableFunction {
             name: "fmt".into(),
             def_path: "crate::MyType::fmt".into(),
@@ -13018,12 +13501,16 @@ mod tests {
         };
         // `Abstractor`/`FoldMemo`-shaped: a plain struct whose fields reach the
         // recursive datatype (one full defining occurrence, one back-reference).
-        let holder = Ty::Adt { adt_kind: None, layout: None,
+        let holder = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::Holder".into(),
             fields: vec![("memo".into(), tree_full), ("r".into(), tree_backref)],
             variants: Vec::new(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = VerifiableFunction {
             name: "should_descend".into(),
             def_path: "crate::Holder::should_descend".into(),
@@ -13528,7 +14015,10 @@ mod tests {
                     },
                     LocalDecl {
                         index: 1,
-                        ty: Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) },
+                        ty: Ty::Dynamic {
+                            trait_name: "core::fmt::Write".into(),
+                            principal_key: Some("core::fmt::Write".into()),
+                        },
                         name: Some("w".into()),
                     },
                 ],
@@ -13569,18 +14059,25 @@ mod tests {
     #[test]
     fn opaque_composite_param_blocks_integer_fact_parametricity() {
         use trust_types::{Formula, LocalDecl, Ty, VerifiableBody, VerifiableFunction};
-        let formatter = Ty::Adt { adt_kind: None, layout: None,
+        let formatter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
                 "inner".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "Write".into(), principal_key: Some("Write".into()) }),
+                    inner: Box::new(Ty::Dynamic {
+                        trait_name: "Write".into(),
+                        principal_key: Some("Write".into()),
+                    }),
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = VerifiableFunction {
             name: "f".into(),
             def_path: "crate::f".into(),
@@ -13726,7 +14223,9 @@ mod tests {
     /// `Wrapper<T> { value: T, count: u32 }` as `trust-mir-extract` emits it: the
     /// struct IS resolved (`Ty::Adt`) but a field is the generic param.
     fn wrapper_t_generic_ty() -> Ty {
-        Ty::Adt { adt_kind: None, layout: None,
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Wrapper".into(),
             fields: vec![
@@ -13740,7 +14239,9 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
     }
 
     /// PHASE 2 GATE 1 — a GENERIC struct `Wrapper<T>{value:T, count:u32}` registers
@@ -13835,12 +14336,16 @@ mod tests {
             kind: "TyKind::Param".into(),
             detail: "generic parameter T/#0 needs monomorphization".into(),
         };
-        let ty = Ty::Adt { adt_kind: None, layout: None,
+        let ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Holder".into(),
             fields: vec![("items".into(), Ty::Slice { elem: Box::new(t_param()) })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         // The struct now reflects STRUCTURALLY (was `None`/Prod before).
         let carrier = reflect::reflect_struct(&ty)
             .expect("a sequence-over-type-var field now reflects STRUCTURALLY (was opaque before)");
@@ -13930,12 +14435,16 @@ mod tests {
         // projects to a kernel type whose head application is `expected_head`. Inner
         // ADTs (a nested `Wrapper`/enum) are collected post-order automatically.
         let assert_field_grounds = |name: &str, fty: Ty, expected_head: &str| {
-            let outer = Ty::Adt { adt_kind: None, layout: None,
+            let outer = Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 variants: Vec::new(),
                 name: name.into(),
                 fields: vec![("f".into(), fty.clone())],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, };
+                faithful_enum_repr: None,
+                enum_layout: None,
+            };
             // The struct now reflects STRUCTURALLY (was `None`/Prod before).
             let carrier = reflect::reflect_struct(&outer)
                 .unwrap_or_else(|| panic!("{name} now reflects STRUCTURALLY (was opaque before)"));
@@ -14011,7 +14520,9 @@ mod tests {
         );
         // (5) a nested generic ENUM field `inner: Opt<T> { Some(T), None }` →
         // the enum inductive applied to the bound `T`: field head is `Trust.Adt.Opt`.
-        let opt_t = Ty::Adt { adt_kind: None, layout: None,
+        let opt_t = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "Opt".into(),
             fields: Vec::new(),
             variants: vec![
@@ -14023,7 +14534,9 @@ mod tests {
                 VariantDef { name: "None".into(), discriminant: 1, fields: Vec::new() },
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         assert_field_grounds("EnumHolder", opt_t, "Trust.Adt.Opt");
     }
 
@@ -14043,7 +14556,9 @@ mod tests {
         };
         // Holder<T> { items: Vec<(T, !)> } — the tuple element nests the non-reflectable
         // `never`, so the whole field (and struct) fails closed to the Prod floor.
-        let never_nested = Ty::Adt { adt_kind: None, layout: None,
+        let never_nested = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "NeverHolder".into(),
             fields: vec![(
@@ -14051,7 +14566,9 @@ mod tests {
                 Ty::Slice { elem: Box::new(Ty::Tuple(vec![t_param(), Ty::Never])) },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         assert!(
             reflect::reflect_struct(&never_nested).is_none(),
             "a sequence whose element nests a non-reflectable `never` must fall back to Prod (deferred)"
@@ -14059,7 +14576,9 @@ mod tests {
         // Holder<T> { items: Vec<dyn Trait> } — a `dyn`-trait element (NOT the
         // writer-sink shim shape, which only collapses a `dyn` FIELD, not a sequence
         // element) is non-carriable in element position, so it fails closed too.
-        let dyn_nested = Ty::Adt { adt_kind: None, layout: None,
+        let dyn_nested = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "DynHolder".into(),
             fields: vec![(
@@ -14072,7 +14591,9 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         assert!(
             reflect::reflect_struct(&dyn_nested).is_none(),
             "a sequence element nesting a bare `dyn` trait object must fall back to Prod (deferred)"
@@ -14087,7 +14608,9 @@ mod tests {
     /// `Wrapper T` (the inner inductive applied to the bound `T`), and the concrete
     /// `tag` field still grounds over its NAMED projection.
     fn outer_nested_generic_ty() -> Ty {
-        Ty::Adt { adt_kind: None, layout: None,
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Outer".into(),
             fields: vec![
@@ -14095,7 +14618,9 @@ mod tests {
                 ("tag".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
     }
 
     /// UNIVERSE-CORRECT DEPENDENT CARRIER (goal bullet 2) — the FIELD-POSITION
@@ -14834,7 +15359,9 @@ mod tests {
     #[test]
     fn struct_with_dyn_sink_return_inhabits_modulo_3() {
         use trust_types::Ty;
-        let holder = Ty::Adt { adt_kind: None, layout: None,
+        let holder = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "crate::Holder".into(),
             fields: vec![
@@ -14842,13 +15369,18 @@ mod tests {
                     "sink".into(),
                     Ty::Ref {
                         mutable: true,
-                        inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+                        inner: Box::new(Ty::Dynamic {
+                            trait_name: "core::fmt::Write".into(),
+                            principal_key: Some("core::fmt::Write".into()),
+                        }),
                     },
                 ),
                 ("count".into(), Ty::Int { width: 32, signed: true }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = trivial_returning("make_holder", holder);
         assert_eq!(
             inhabit_verifiable_function(&func),
@@ -14869,18 +15401,25 @@ mod tests {
     #[test]
     fn sink_shimmed_formatter_blocks_value_fact_soundness() {
         use trust_types::{Formula, LocalDecl, Ty, VerifiableBody, VerifiableFunction};
-        let formatter = Ty::Adt { adt_kind: None, layout: None,
+        let formatter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
                 "buf".into(),
                 Ty::Ref {
                     mutable: true,
-                    inner: Box::new(Ty::Dynamic { trait_name: "core::fmt::Write".into(), principal_key: Some("core::fmt::Write".into()) }),
+                    inner: Box::new(Ty::Dynamic {
+                        trait_name: "core::fmt::Write".into(),
+                        principal_key: Some("core::fmt::Write".into()),
+                    }),
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = VerifiableFunction {
             name: "f".into(),
             def_path: "crate::f".into(),
@@ -16888,17 +17427,23 @@ mod rustc_mir_three_way_differential {
             // They are call-argument carriers, never produced inside a straight-line
             // body, so reaching this arm is a harness-scope bug — panic loudly rather
             // than fabricate a placeholder value.
+            // Trust: FLOAT-CAST leaf — `CastF` joins the SAME arm: `floatOfInt` is an
+            // uninterpreted opaque with no LEG-B bytecode lowering, and it is produced
+            // only by the cast-then-return recognizer, never inside this harness's
+            // i32-arithmetic corpus.
             IrOperand::Field(..)
             | IrOperand::Index(..)
             | IrOperand::Len(_)
             | IrOperand::PreOpNotAt(..)
             | IrOperand::CastU(..)
             | IrOperand::CastS(..)
+            | IrOperand::CastF { .. }
+            | IrOperand::CastFF { .. }
             | IrOperand::Discr(_) => panic!(
-                "emit_operand: `Field`/`Index`/`Len`/`PreOpNotAt`/`CastU`/`CastS`/`Discr` have no \
-                 LEG-B trust-ir bytecode interpretation (uninterpreted or call-arg-only \
-                 carriers, MODEL-ONLY) — the M3 i32-arithmetic corpus should never reach \
-                 this arm"
+                "emit_operand: `Field`/`Index`/`Len`/`PreOpNotAt`/`CastU`/`CastS`/`CastF`/`CastFF`/`Discr` \
+                 have no LEG-B trust-ir bytecode interpretation (uninterpreted or \
+                 call-arg-only carriers, MODEL-ONLY) — the M3 i32-arithmetic corpus should \
+                 never reach this arm"
             ),
         }
     }
@@ -17087,8 +17632,7 @@ mod rustc_mir_three_way_differential {
             env!("CARGO_MANIFEST_DIR")
         );
         let bytes = std::fs::read(&path).expect("committed set_bit dump");
-        let func: trust_types::VerifiableFunction =
-            serde_json::from_slice(&bytes).expect("parse");
+        let func: trust_types::VerifiableFunction = serde_json::from_slice(&bytes).expect("parse");
         let open_cfg = crate::prove::divergence_guarded_rmw_mutator_ir_cfg(&func)
             .expect("the M1 walk must mint");
 
@@ -17210,9 +17754,8 @@ mod rustc_mir_three_way_differential {
                 for v in [0i128, 1] {
                     let closed = close(&open_cfg, p, b, v);
                     let module = emit_closed(&closed, ty);
-                    let got = leg_b_exec(&module, ty, &[]).unwrap_or_else(|e| {
-                        panic!("LEG B failed at {ty:?} ({p},{b},{v}): {e}")
-                    });
+                    let got = leg_b_exec(&module, ty, &[])
+                        .unwrap_or_else(|e| panic!("LEG B failed at {ty:?} ({p},{b},{v}): {e}"));
                     let want = mirror(p, b, v, *width, *signed);
                     assert_eq!(
                         got, want,
@@ -17330,8 +17873,12 @@ mod rustc_mir_three_way_differential {
             let open_cfg = mint(shape);
             for (ty, width) in &widths {
                 for (p, v) in [(0u64, 0u64), (7, 9), (100, 27), (1, 1)] {
-                    let got = leg_b_exec(&emit_closed(&close(&open_cfg, p as i128, v as i128), ty), ty, &[])
-                        .unwrap_or_else(|e| panic!("LEG B {shape}@{ty:?} ({p},{v}): {e}"));
+                    let got = leg_b_exec(
+                        &emit_closed(&close(&open_cfg, p as i128, v as i128), ty),
+                        ty,
+                        &[],
+                    )
+                    .unwrap_or_else(|e| panic!("LEG B {shape}@{ty:?} ({p},{v}): {e}"));
                     assert_eq!(
                         got,
                         mirror(shape, p, v, *width),
@@ -18222,6 +18769,7 @@ mod ptr_intrinsic_model {
             span: SourceSpan::default(),
             atomic: None,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
         }
     }
@@ -19048,7 +19596,10 @@ mod ptr_intrinsic_model {
         let injected = Statement::Assign {
             place: Place {
                 local: 1,
-                projections: vec![trust_types::Projection::Deref, trust_types::Projection::Field(0)],
+                projections: vec![
+                    trust_types::Projection::Deref,
+                    trust_types::Projection::Field(0),
+                ],
             },
             rvalue: Rvalue::Use(copy(2)),
             span: SourceSpan::default(),
@@ -19247,7 +19798,10 @@ mod ptr_intrinsic_model {
         let new_local = func.body.locals.len();
         func.body.locals.push(LocalDecl {
             index: new_local,
-            ty: Ty::RawPtr { mutable: true, pointee: Box::new(Ty::Int { width: 32, signed: true }) },
+            ty: Ty::RawPtr {
+                mutable: true,
+                pointee: Box::new(Ty::Int { width: 32, signed: true }),
+            },
             name: None,
         });
         let block =
@@ -19580,7 +20134,10 @@ mod ptr_intrinsic_model {
                 a: SemOperand::Var(0),
                 b: SemOperand::Const(0),
             }),
-            then_arm: SemAdtArm { variant: 1, payload: Some(SemAdtPayload::Scalar(SemOperand::Var(0))) },
+            then_arm: SemAdtArm {
+                variant: 1,
+                payload: Some(SemAdtPayload::Scalar(SemOperand::Var(0))),
+            },
             else_arm: SemAdtArm { variant: 0, payload: None },
             enum_name: "core::result::Result".to_string(),
         };
@@ -19651,7 +20208,10 @@ mod ptr_intrinsic_model {
             trust_types::Symbol::intern("Trust.MirSem.iter_region"),
             vec![Formula::Var("_1".into(), trust_types::Sort::Int)],
         );
-        assert!(ground_int(&region, &params).is_none(), "iter_region must not ground (MirSem lane)");
+        assert!(
+            ground_int(&region, &params).is_none(),
+            "iter_region must not ground (MirSem lane)"
+        );
         let has_next = Formula::Pred(
             trust_types::Symbol::intern("Trust.MirSem.iter_has_next"),
             vec![Formula::Var("_1".into(), trust_types::Sort::Int)],
@@ -19838,7 +20398,10 @@ mod ptr_intrinsic_model {
                 }
             }
         }
-        assert!(super::sem_iter_next_step_shape_of(&func).is_none(), "D3 declines a stride-2 advance");
+        assert!(
+            super::sem_iter_next_step_shape_of(&func).is_none(),
+            "D3 declines a stride-2 advance"
+        );
         assert!(
             super::sem_iter_step_shape_of(&func).is_none(),
             "the T-STEP mint inherits the D3 stride-2 decline (F-STRIDE2 dump tier)"
@@ -19961,7 +20524,10 @@ mod ptr_intrinsic_model {
         let func = synth_setter(Some(trust_types::AdtKind::Union), 0);
         // Every OTHER gate passes — flip ONLY the kind to Struct and it mints, proving the
         // decline is attributable to G-STRUCT-KIND alone.
-        assert!(super::sem_field_set_shape_of(&synth_setter(Some(trust_types::AdtKind::Struct), 0)).is_some());
+        assert!(
+            super::sem_field_set_shape_of(&synth_setter(Some(trust_types::AdtKind::Struct), 0))
+                .is_some()
+        );
         assert!(
             super::sem_field_set_shape_of(&func).is_none(),
             "a union setter MUST decline (G-STRUCT-KIND) — its per-field frame is false"
@@ -19985,7 +20551,10 @@ mod ptr_intrinsic_model {
     /// single-anonymous-constructor fragment).
     #[test]
     fn field_set_synthetic_enum_declines() {
-        assert!(super::sem_field_set_shape_of(&synth_setter(Some(trust_types::AdtKind::Enum), 0)).is_none());
+        assert!(
+            super::sem_field_set_shape_of(&synth_setter(Some(trust_types::AdtKind::Enum), 0))
+                .is_none()
+        );
     }
 
     /// F-TWOFIELD (G1) — a `set_both`-shaped body with two `[Deref, Field]` writes DECLINES
@@ -20032,13 +20601,18 @@ mod ptr_intrinsic_model {
     /// two-block shape exercised by `field_rmw_synthetic_struct_mints_and_proves_modulo3`.
     #[test]
     fn field_set_unchecked_wrapping_binaryop_still_declines() {
-        use trust_types::{BinOp, ConstValue, Operand, Place, Projection, Rvalue, SourceSpan, Statement};
+        use trust_types::{
+            BinOp, ConstValue, Operand, Place, Projection, Rvalue, SourceSpan, Statement,
+        };
         let mut func = synth_setter(Some(trust_types::AdtKind::Struct), 0);
         func.body.blocks[0].stmts[0] = Statement::Assign {
             place: Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] },
             rvalue: Rvalue::BinaryOp(
                 BinOp::Add,
-                Operand::Copy(Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] }),
+                Operand::Copy(Place {
+                    local: 1,
+                    projections: vec![Projection::Deref, Projection::Field(0)],
+                }),
                 Operand::Constant(ConstValue::Int(1)),
             ),
             span: SourceSpan::default(),
@@ -20054,7 +20628,9 @@ mod ptr_intrinsic_model {
     /// mutate) DECLINES (zero live Calls + no bare-recv capture).
     #[test]
     fn field_set_live_call_escape_declines() {
-        use trust_types::{BasicBlock, BlockId, Operand, Place, SourceSpan, Terminator, UnwindEdge};
+        use trust_types::{
+            BasicBlock, BlockId, Operand, Place, SourceSpan, Terminator, UnwindEdge,
+        };
         let mut func = synth_setter(Some(trust_types::AdtKind::Struct), 0);
         func.body.blocks[0].terminator = Terminator::Call {
             func: "SYNTH::helper".into(),
@@ -20065,6 +20641,7 @@ mod ptr_intrinsic_model {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         };
         func.body.blocks.push(BasicBlock {
@@ -20130,7 +20707,10 @@ mod ptr_intrinsic_model {
                 span: SourceSpan::default(),
             },
         );
-        assert!(super::sem_field_set_shape_of(&func).is_none(), "a receiver reborrow declines (G2)");
+        assert!(
+            super::sem_field_set_shape_of(&func).is_none(),
+            "a receiver reborrow declines (G2)"
+        );
     }
 
     /// F-EXTRADEREFWRITE (G2 whole-body alias-closure) — a `&mut *self` reborrow in a
@@ -20325,8 +20905,10 @@ mod ptr_intrinsic_model {
     #[test]
     fn field_rmw_non_struct_kinds_decline() {
         use trust_types::{AdtKind, BinOp};
-        assert!(super::sem_field_rmw_shape_of(&synth_rmw(Some(AdtKind::Struct), 0, BinOp::Add, 1))
-            .is_some());
+        assert!(
+            super::sem_field_rmw_shape_of(&synth_rmw(Some(AdtKind::Struct), 0, BinOp::Add, 1))
+                .is_some()
+        );
         for kind in [Some(AdtKind::Union), Some(AdtKind::Enum), None] {
             assert!(
                 super::sem_field_rmw_shape_of(&synth_rmw(kind, 0, BinOp::Add, 1)).is_none(),
@@ -20508,7 +21090,8 @@ mod ptr_intrinsic_model {
         {
             *r = Operand::Constant(ConstValue::Uint(u128::from(u64::MAX), 64));
         }
-        let rmw = super::sem_field_rmw_shape_of(&func).expect("u64::MAX is in range for a u64 field");
+        let rmw =
+            super::sem_field_rmw_shape_of(&func).expect("u64::MAX is in range for a u64 field");
         assert_eq!(rmw.rhs, SemRmwRhs::Const(i128::from(u64::MAX)));
         assert_eq!(
             crate::trustir_adt::check_field_rmw_refinement(&rmw),
@@ -20640,15 +21223,18 @@ mod ptr_intrinsic_model {
     fn field_rmw_rewritten_temp_declines() {
         use trust_types::{BinOp, ConstValue, Operand, Place, Rvalue, SourceSpan, Statement};
         let mut func = synth_rmw(Some(trust_types::AdtKind::Struct), 0, BinOp::Add, 1);
-        func.body.blocks[1].stmts.insert(0, Statement::Assign {
-            place: Place::local(2),
-            rvalue: Rvalue::CheckedBinaryOp(
-                BinOp::Add,
-                Operand::Constant(ConstValue::Int(0)),
-                Operand::Constant(ConstValue::Int(0)),
-            ),
-            span: SourceSpan::default(),
-        });
+        func.body.blocks[1].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::CheckedBinaryOp(
+                    BinOp::Add,
+                    Operand::Constant(ConstValue::Int(0)),
+                    Operand::Constant(ConstValue::Int(0)),
+                ),
+                span: SourceSpan::default(),
+            },
+        );
         assert!(
             super::sem_field_rmw_shape_of(&func).is_none(),
             "a multiply-written temp declines (G-TEMP)"
@@ -20700,13 +21286,16 @@ mod ptr_intrinsic_model {
     #[test]
     fn field_rmw_extra_deref_write_in_dead_block_declines() {
         use trust_types::{
-            BasicBlock, BinOp, BlockId, LocalDecl, Place, Projection, Rvalue, SourceSpan, Statement,
-            Terminator, Ty,
+            BasicBlock, BinOp, BlockId, LocalDecl, Place, Projection, Rvalue, SourceSpan,
+            Statement, Terminator, Ty,
         };
         let mut func = synth_rmw(Some(trust_types::AdtKind::Struct), 0, BinOp::Add, 1);
         func.body.locals.push(LocalDecl {
             index: 3,
-            ty: Ty::Ref { mutable: true, inner: Box::new(setter_adt(Some(trust_types::AdtKind::Struct))) },
+            ty: Ty::Ref {
+                mutable: true,
+                inner: Box::new(setter_adt(Some(trust_types::AdtKind::Struct))),
+            },
             name: None,
         });
         func.body.blocks.push(BasicBlock {
@@ -20784,11 +21373,8 @@ mod ptr_intrinsic_model {
         func.body.arg_count = 2;
         // Params are locals 1..=arg_count, so re-index: make the receiver local 1 and
         // the value local 2 by SWAPPING the temp to local 3.
-        func.body.locals[2] = LocalDecl {
-            index: 2,
-            ty: Ty::Int { width: 64, signed: true },
-            name: Some("v".into()),
-        };
+        func.body.locals[2] =
+            LocalDecl { index: 2, ty: Ty::Int { width: 64, signed: true }, name: Some("v".into()) };
         func.body.locals[3] = LocalDecl {
             index: 3,
             ty: Ty::Tuple(vec![Ty::Int { width: 64, signed: true }, Ty::Bool]),
@@ -21108,7 +21694,10 @@ mod ptr_intrinsic_model {
         assert!(super::ty_definitely_non_zst(&Ty::Bool));
         assert!(!super::ty_definitely_non_zst(&Ty::Unit), "Unit is ZST");
         assert!(
-            !super::ty_definitely_non_zst(&Ty::Array { elem: Box::new(Ty::Int { width: 32, signed: true }), len: 0 }),
+            !super::ty_definitely_non_zst(&Ty::Array {
+                elem: Box::new(Ty::Int { width: 32, signed: true }),
+                len: 0
+            }),
             "a zero-length array is ZST"
         );
     }
@@ -21126,18 +21715,15 @@ mod ptr_intrinsic_model {
 #[cfg(test)]
 mod record_inc3_tests {
     use trust_types::{
-        BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
-        VerifiableFunction,
+        BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty, VerifiableFunction,
     };
 
     use super::sem_struct_return_folded_shape_of;
     use crate::mirsem::{SemOperand, SemStructField, SemStructReturn};
     use crate::trustir_anchor::{RefinementVerdict, TRUSTIR_PTR_OFFSET, TRUSTIR_SLICE_START};
 
-    const INTO_ITER: &str =
-        "fixtures/w2-iter-offset-modeled-2026-07-20/dumps/trust-mir-7db23535628cc69f-faba7f7af518f3ec.json";
-    const ITER_NEW: &str =
-        "fixtures/w2-iter-offset-modeled-2026-07-20/dumps/trust-mir-346606973b92d64f-d16141677b1dfda5.json";
+    const INTO_ITER: &str = "fixtures/w2-iter-offset-modeled-2026-07-20/dumps/trust-mir-7db23535628cc69f-faba7f7af518f3ec.json";
+    const ITER_NEW: &str = "fixtures/w2-iter-offset-modeled-2026-07-20/dumps/trust-mir-346606973b92d64f-d16141677b1dfda5.json";
 
     fn load(path: &str) -> VerifiableFunction {
         let bytes = std::fs::read(path).expect("dump readable");
@@ -21183,10 +21769,32 @@ mod record_inc3_tests {
                 "{} record refinement must close modulo 3",
                 func.def_path
             );
-            // And the full funnel flips it to FULLY-FAITHFUL.
+            // And the funnel's own conjuncts still hold: the record refinement above
+            // closed modulo 3, and the SEPARATE raw-CFG offset obligation discharges.
             assert!(
-                crate::prove::struct_return_recognized(&func),
-                "{} must be recognized fully-faithful",
+                crate::prove::function_ptr_offsets_all_discharged(&func),
+                "{}: the raw-CFG `Rvalue::PtrOffset` in-bounds obligation must discharge",
+                func.def_path
+            );
+            // UPDATED 2026-08-25 — the WHOLE-FUNCTION funnel now refuses, and not because
+            // of anything above. `trust_vcgen` raises `UnsupportedMir { kind:
+            // "Rvalue::Cast" }` rows for this body's `usize -> *const i32`,
+            // `*[i32] -> NonNull`, `NonNull -> *[i32]` and fat->thin provenance casts, and
+            // `struct_return_fully_faithful_via_trustir`'s safety conjunct no longer lets
+            // a DECLINED row fall out of the `is_safety_vc_kind` filter (Channel 2 of the
+            // decline-handling false proof). The runtime oracle measures no panic here
+            // (slice `into_iter`/`next`/`fold` 0/5), so this is a FAITHFULNESS deferral —
+            // but a verdict reached by dropping the only rows the emitter raised is not
+            // evidence either way. Teaching vcgen to model those casts flips this back;
+            // teaching this gate to ignore the emitter is not the recovery.
+            assert!(
+                crate::mirsem::function_emits_declined_vc(&func),
+                "{}: the deferral must rest on a DECLINED row",
+                func.def_path
+            );
+            assert!(
+                !crate::prove::struct_return_recognized(&func),
+                "{}: an open DECLINED row must keep the record funnel closed",
                 func.def_path
             );
         }
@@ -21214,7 +21822,11 @@ mod record_inc3_tests {
         // applications, so the self-consistent swap is caught (non-vacuous now).
         let swapped = SemStructReturn {
             struct_ty: honest.struct_ty.clone(),
-            fields: vec![honest.fields[1].clone(), honest.fields[0].clone(), honest.fields[2].clone()],
+            fields: vec![
+                honest.fields[1].clone(),
+                honest.fields[0].clone(),
+                honest.fields[2].clone(),
+            ],
         };
         let claim = crate::trustir_adt::honest_value_for_test(&swapped).expect("swap claim builds");
         assert!(matches!(
@@ -21380,10 +21992,8 @@ mod record_inc3_tests {
         // equal the count slice's element sort. Recast `_7`'s pointee to `i64` while the
         // slice is `&[i32]` — the offset units and length units disagree, so it DECLINES.
         let mut func = load(INTO_ITER);
-        func.body.locals[7].ty = Ty::RawPtr {
-            mutable: true,
-            pointee: Box::new(Ty::Int { width: 64, signed: true }),
-        };
+        func.body.locals[7].ty =
+            Ty::RawPtr { mutable: true, pointee: Box::new(Ty::Int { width: 64, signed: true }) };
         assert!(
             sem_struct_return_folded_shape_of(&func).is_none(),
             "an offset pointee that disagrees with the slice element must decline"

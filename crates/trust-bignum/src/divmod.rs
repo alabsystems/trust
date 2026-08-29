@@ -172,8 +172,9 @@ impl Nat {
 
 #[cfg(test)]
 mod tests {
-    use crate::Nat;
     use alloc::vec;
+
+    use crate::Nat;
 
     #[test]
     fn division_by_zero_is_zero_and_mod_by_zero_is_the_dividend() {
@@ -244,9 +245,6 @@ mod tests {
         assert_eq!(Nat::one().shl_bits(0), Nat::one());
         assert_eq!(Nat::ZERO.shl_bits(1000), Nat::ZERO);
         // (2^64 - 1) << 1 = 2^65 - 2.
-        assert_eq!(
-            Nat::from_u64(u64::MAX).shl_bits(1),
-            Nat::from_limbs(vec![u64::MAX - 1, 1])
-        );
+        assert_eq!(Nat::from_u64(u64::MAX).shl_bits(1), Nat::from_limbs(vec![u64::MAX - 1, 1]));
     }
 }

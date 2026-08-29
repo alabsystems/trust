@@ -18,12 +18,13 @@
 
 mod common;
 
-use common::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use common::*;
 use trust_js_reactor::Completion;
-use trust_js_trace::{extract_trace, HostEvent, ObservableTrace, ProjectedValue};
+use trust_js_trace::{HostEvent, ObservableTrace, ProjectedValue, extract_trace};
 
 /// One program in the battery.
 struct Program {
@@ -33,7 +34,12 @@ struct Program {
     golden: &'static [&'static str],
 }
 
-fn p(name: &'static str, js: &'static str, build: fn(&mut Rt), golden: &'static [&'static str]) -> Program {
+fn p(
+    name: &'static str,
+    js: &'static str,
+    build: fn(&mut Rt),
+    golden: &'static [&'static str],
+) -> Program {
     Program { name, js, build, golden }
 }
 
@@ -433,7 +439,9 @@ struct NodeEnv {
 
 fn node_env_or_skip() -> Option<NodeEnv> {
     let Ok(node) = std::env::var("TRUST_JS_NODE") else {
-        eprintln!("SKIP ordering_oracle_differential: set TRUST_JS_NODE to a node binary to run the differential");
+        eprintln!(
+            "SKIP ordering_oracle_differential: set TRUST_JS_NODE to a node binary to run the differential"
+        );
         return None;
     };
     let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -468,7 +476,10 @@ fn node_markers(env: &NodeEnv, tag: &str, body: &str) -> Vec<String> {
         .output()
         .expect("spawn node driver");
     let trace = extract_trace(&out.stdout).unwrap_or_else(|e| {
-        panic!("trace extraction failed for {tag}: {e} (stderr: {})", String::from_utf8_lossy(&out.stderr))
+        panic!(
+            "trace extraction failed for {tag}: {e} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        )
     });
     markers(&trace)
 }
@@ -511,9 +522,16 @@ fn ordering_oracle_differential() {
         if reactor == node && node == golden {
             agree += 1;
         } else {
-            disagree.push(format!("  {}: reactor={reactor:?} node={node:?} golden={golden:?}", prog.name));
+            disagree.push(format!(
+                "  {}: reactor={reactor:?} node={node:?} golden={golden:?}",
+                prog.name
+            ));
         }
     }
-    eprintln!("ordering-oracle: {} programs / {agree} agree / {} disagree", progs.len(), disagree.len());
+    eprintln!(
+        "ordering-oracle: {} programs / {agree} agree / {} disagree",
+        progs.len(),
+        disagree.len()
+    );
     assert!(disagree.is_empty(), "ordering disagreements:\n{}", disagree.join("\n"));
 }

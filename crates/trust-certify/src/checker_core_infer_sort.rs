@@ -55,16 +55,12 @@ pub struct InferSortFixture {
 }
 
 /// `infer(Sort 0) = Sort 1`.
-pub const INFER_SORT0: InferSortFixture = InferSortFixture {
-    label: "infer(Sort 0) = Sort 1",
-    level_src: "Level.zero",
-};
+pub const INFER_SORT0: InferSortFixture =
+    InferSortFixture { label: "infer(Sort 0) = Sort 1", level_src: "Level.zero" };
 
 /// `infer(Sort 1) = Sort 2`.
-pub const INFER_SORT1: InferSortFixture = InferSortFixture {
-    label: "infer(Sort 1) = Sort 2",
-    level_src: "Level.succ Level.zero",
-};
+pub const INFER_SORT1: InferSortFixture =
+    InferSortFixture { label: "infer(Sort 1) = Sort 2", level_src: "Level.succ Level.zero" };
 
 struct LinkedInferSort {
     evidence: Expr,
@@ -177,17 +173,8 @@ mod tests {
         })
         .expect("spec build + certification must complete on the large stack");
 
-        assert!(
-            sort0,
-            "infer(Sort 0) = Sort 1 must discharge and reject the wrong result"
-        );
-        assert!(
-            sort1,
-            "infer(Sort 1) = Sort 2 must discharge and reject the wrong result"
-        );
-        assert!(
-            non_sort_closed,
-            "a non-sort head must fail closed at LINK"
-        );
+        assert!(sort0, "infer(Sort 0) = Sort 1 must discharge and reject the wrong result");
+        assert!(sort1, "infer(Sort 1) = Sort 2 must discharge and reject the wrong result");
+        assert!(non_sort_closed, "a non-sort head must fail closed at LINK");
     }
 }

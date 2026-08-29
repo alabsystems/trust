@@ -15,7 +15,11 @@ fn guarded_index_bounds_vc_formula_carries_dominating_guard() {
         body: VerifiableBody {
             locals: vec![
                 LocalDecl { index: 0, ty: Ty::u32(), name: None },
-                LocalDecl { index: 1, ty: Ty::Array { elem: Box::new(Ty::u32()), len: 16 }, name: Some("palette".into()) },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Array { elem: Box::new(Ty::u32()), len: 16 },
+                    name: Some("palette".into()),
+                },
                 LocalDecl { index: 2, ty: Ty::usize(), name: Some("i".into()) },
                 LocalDecl { index: 3, ty: Ty::Bool, name: None },
                 LocalDecl { index: 4, ty: Ty::Bool, name: None },
@@ -51,7 +55,8 @@ fn guarded_index_bounds_vc_formula_carries_dominating_guard() {
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                    terminator: Terminator::Assert {
+                        unwind: trust_types::UnwindEdge::Unreachable,
                         cond: Operand::Copy(Place::local(4)),
                         expected: true,
                         msg: AssertMessage::BoundsCheck,

@@ -75,9 +75,9 @@ pub fn default_profiles() -> Vec<Profile> {
         0x7FFF_FFFF_FFFF_FFFF,
         0, // rsp, set below
         1,
-        0,             // rsi, set below
-        0xFFFF_FFFF,   // rdi: 32-bit boundary
-        0x8000_0000,   // r8: sign bit of the 32-bit half
+        0,           // rsi, set below
+        0xFFFF_FFFF, // rdi: 32-bit boundary
+        0x8000_0000, // r8: sign bit of the 32-bit half
         u64::from(u32::MAX),
         2,
         0x55AA_55AA_55AA_55AA,

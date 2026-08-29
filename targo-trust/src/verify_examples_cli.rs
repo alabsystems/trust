@@ -881,8 +881,11 @@ fn run_example(
     // Strict verification is batteries-on. This is a raw compiler invocation,
     // so the default `unscoped` role is in scope and no Cargo-owned scope
     // metadata is synthesized. `--allow-l0-gaps` selects allow_l0_gaps (warnings).
-    let advisory_lane: Vec<String> =
-        if allow_l0_gaps { vec!["-Z".to_string(), "trust-policy=advisory".to_string()] } else { Vec::new() };
+    let advisory_lane: Vec<String> = if allow_l0_gaps {
+        vec!["-Z".to_string(), "trust-policy=advisory".to_string()]
+    } else {
+        Vec::new()
+    };
     let mut command = Command::new(trustc);
     command
         .env_remove("TRUST_VERIFY")

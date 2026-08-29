@@ -48,13 +48,7 @@ fn build(host: &mut TestHost) {
 
     // entry: pulls everything together with mixed import forms
     let mut main = logger("main", &["left", "right", "p", "re"]);
-    main.requested = vec![
-        "left".into(),
-        "right".into(),
-        "p".into(),
-        "re".into(),
-        "lib".into(),
-    ];
+    main.requested = vec!["left".into(), "right".into(), "p".into(), "re".into(), "lib".into()];
     main.imports = vec![
         import_named("re", "x", "x"),
         import_named("lib", "default", "d"),

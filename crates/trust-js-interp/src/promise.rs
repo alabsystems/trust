@@ -17,15 +17,17 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::host::{JobFn, ResolveEntry};
-use crate::interp::{Abrupt, ERes, Interp};
 use std::cell::RefCell;
 use std::rc::Rc;
+
 use trust_js_reactor::{Capability, PromiseId};
 use trust_js_value::{
-    units_from_str, ErrKind, FnData, JsObject, JsValue, NativeFn, ObjId, ObjKind, PropKey, PropValue,
-    Property, SymId, WkSym,
+    ErrKind, FnData, JsObject, JsValue, NativeFn, ObjId, ObjKind, PropKey, PropValue, Property,
+    SymId, WkSym, units_from_str,
 };
+
+use crate::host::{JobFn, ResolveEntry};
+use crate::interp::{Abrupt, ERes, Interp};
 
 /// Cap on a combinator iterable's element count (totality bound).
 const MAX_COMBINATOR_ELEMS: usize = 1_000_000;
@@ -185,11 +187,7 @@ impl Interp {
         match self.thunk_values.get(&fid) {
             Some((v, throw)) => {
                 let v = v.clone();
-                if *throw {
-                    Err(Abrupt::Throw(v))
-                } else {
-                    Ok(v)
-                }
+                if *throw { Err(Abrupt::Throw(v)) } else { Ok(v) }
             }
             None => Ok(JsValue::Undefined),
         }
@@ -262,10 +260,7 @@ impl Interp {
         };
         let o = self.new_plain()?;
         for (key, val) in [("promise", promise), ("resolve", resolve), ("reject", reject)] {
-            self.heap
-                .obj_mut(o)
-                .props
-                .insert(PropKey::from_str(key), Property::data(val));
+            self.heap.obj_mut(o).props.insert(PropKey::from_str(key), Property::data(val));
         }
         Ok(JsValue::Obj(o))
     }
@@ -361,7 +356,8 @@ impl Interp {
         // (to spy on or alter them) the reactor path would diverge — refuse.
         if !self.combinator_protocol_intact() {
             return Err(Abrupt::Fatal(
-                "Promise combinator with a patched resolve/then protocol (out of slice)".to_string(),
+                "Promise combinator with a patched resolve/then protocol (out of slice)"
+                    .to_string(),
             ));
         }
         let elems = match self.iterate_to_vec(&iterable) {
@@ -517,12 +513,12 @@ impl Interp {
         self.wrap_promise(dep)
     }
 
-    pub(crate) fn make_resolving_fn(&mut self, cap: Capability, reject: bool) -> Result<ObjId, Abrupt> {
-        let nf = if reject {
-            NativeFn::PromiseRejectFn
-        } else {
-            NativeFn::PromiseResolveFn
-        };
+    pub(crate) fn make_resolving_fn(
+        &mut self,
+        cap: Capability,
+        reject: bool,
+    ) -> Result<ObjId, Abrupt> {
+        let nf = if reject { NativeFn::PromiseRejectFn } else { NativeFn::PromiseResolveFn };
         let f = self.alloc_obj(JsObject::new(
             ObjKind::Function(FnData::Native(nf)),
             Some(self.intr.function_proto),
@@ -540,11 +536,7 @@ impl Interp {
     }
 
     fn make_value_thunk(&mut self, value: JsValue, throw: bool) -> Result<ObjId, Abrupt> {
-        let nf = if throw {
-            NativeFn::PromiseThrowThunk
-        } else {
-            NativeFn::PromiseValueThunk
-        };
+        let nf = if throw { NativeFn::PromiseThrowThunk } else { NativeFn::PromiseValueThunk };
         let f = self.alloc_obj(JsObject::new(
             ObjKind::Function(FnData::Native(nf)),
             Some(self.intr.function_proto),
@@ -594,10 +586,10 @@ impl Interp {
         let oid = self.make_native_error_with_proto(ErrKind::Aggregate, false, proto)?;
         // [[AggregateErrors]] surfaces as the own data prop `errors`
         // {w:true, e:false, c:true}.
-        self.heap.obj_mut(oid).props.insert(
-            PropKey::from_str("errors"),
-            Property::with_attrs(errs, true, false, true),
-        );
+        self.heap
+            .obj_mut(oid)
+            .props
+            .insert(PropKey::from_str("errors"), Property::with_attrs(errs, true, false, true));
         Ok(JsValue::Obj(oid))
     }
 
@@ -658,11 +650,7 @@ impl Interp {
         matches!(self.heap.obj(*o).kind, ObjKind::Promise(_))
             && self.heap.obj(*o).proto == Some(self.intr.promise_proto)
             && !self.heap.obj(*o).props.contains_key(&PropKey::from_str("then"))
-            && !self
-                .heap
-                .obj(*o)
-                .props
-                .contains_key(&PropKey::from_str("constructor"))
+            && !self.heap.obj(*o).props.contains_key(&PropKey::from_str("constructor"))
     }
 
     /// Is `obj`'s own data property `key` the given native function intrinsic?
@@ -676,11 +664,7 @@ impl Interp {
     }
 
     fn callable_handle(&self, v: &JsValue) -> Option<JobFn> {
-        if self.is_callable_value(v) {
-            Some(JobFn::Call(v.clone()))
-        } else {
-            None
-        }
+        if self.is_callable_value(v) { Some(JobFn::Call(v.clone())) } else { None }
     }
 
     /// `this` must be a Promise instance; return its reactor id.
@@ -882,11 +866,7 @@ impl Interp {
             count += 1;
             let next_promise = self.call_value(promise_resolve, c.clone(), vec![next_value])?;
             let then = self.get_prop(&next_promise, &PropKey::from_str("then"))?;
-            self.call_value(
-                &then,
-                next_promise,
-                vec![cap.resolve.clone(), cap.reject.clone()],
-            )?;
+            self.call_value(&then, next_promise, vec![cap.resolve.clone(), cap.reject.clone()])?;
         }
     }
 
@@ -1002,15 +982,8 @@ impl Interp {
         shared: &Rc<RefCell<CombShared>>,
     ) -> Result<ObjId, Abrupt> {
         let f = self.make_anon_native(nf, 1.0)?;
-        self.comb_elements.insert(
-            f,
-            CombElement {
-                already_called,
-                index,
-                is_reject,
-                shared: shared.clone(),
-            },
-        );
+        self.comb_elements
+            .insert(f, CombElement { already_called, index, is_reject, shared: shared.clone() });
         Ok(f)
     }
 
@@ -1089,8 +1062,6 @@ impl Interp {
         if !self.is_constructor(&species) {
             return Err(self.throw_type_error());
         }
-        Err(Abrupt::Fatal(
-            "Promise subclass @@species (out of slice)".to_string(),
-        ))
+        Err(Abrupt::Fatal("Promise subclass @@species (out of slice)".to_string()))
     }
 }

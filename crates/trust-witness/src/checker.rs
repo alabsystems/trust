@@ -27,12 +27,12 @@
 //! Driver-only bits of the prototype (the `fail_notes` Vec and the residue
 //! `HashMap` printing) are dropped; a failing rule is logged at `debug` level.
 
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_middle::middle::region;
 use rustc_middle::thir::{self, ExprId, ExprKind, LocalVarId, PatKind, StmtKind, Thir};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 /// The outcome of a linear check over one root's THIR.
 ///
@@ -431,7 +431,9 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     let lt = self.ety(*lhs);
                     let c = match lt.kind() {
                         ty::Adt(def, args) => {
-                            let fty = def.variant(*variant_index).fields[*name].ty(self.tcx, args).skip_normalization();
+                            let fty = def.variant(*variant_index).fields[*name]
+                                .ty(self.tcx, args)
+                                .skip_normalization();
                             self.teq(fty, ty)
                         }
                         ty::Tuple(elts) => {
@@ -493,8 +495,9 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                 ExprKind::Adt(adt) => {
                     let hd = matches!(ty.kind(), ty::Adt(def, args) if *def == adt.adt_def && *args == adt.args);
                     let flds = adt.fields.iter().all(|f| {
-                        let decl =
-                            adt.adt_def.variant(adt.variant_index).fields[f.name].ty(self.tcx, adt.args).skip_normalization();
+                        let decl = adt.adt_def.variant(adt.variant_index).fields[f.name]
+                            .ty(self.tcx, adt.args)
+                            .skip_normalization();
                         self.teq_nv(self.ety(f.expr), decl)
                     });
                     self.ok(hd && flds, idx, "adt-ctor")
@@ -506,7 +509,10 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     match fty.kind() {
                         ty::FnDef(did, gargs) => {
                             let sig = self.tcx.instantiate_bound_regions_with_erased(
-                                self.tcx.fn_sig(*did).instantiate(self.tcx, gargs).skip_normalization(),
+                                self.tcx
+                                    .fn_sig(*did)
+                                    .instantiate(self.tcx, gargs)
+                                    .skip_normalization(),
                             );
                             let inputs = sig.inputs();
                             let arity = if sig.c_variadic() {
@@ -579,7 +585,10 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     self.ok(c, idx, "const-block")
                 }
                 ExprKind::ConstParam { def_id, .. } => {
-                    let c = self.teq(self.tcx.type_of(*def_id).instantiate_identity().skip_normalization(), ty);
+                    let c = self.teq(
+                        self.tcx.type_of(*def_id).instantiate_identity().skip_normalization(),
+                        ty,
+                    );
                     self.ok(c, idx, "const-param")
                 }
 
@@ -600,15 +609,12 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                 }
                 ExprKind::Match { scrutinee, arms, .. } => {
                     let st = self.ety(*scrutinee);
-                    let pats_ok = arms
+                    let pats_ok = arms.iter().all(|a| self.teq(self.thir.arms[*a].pattern.ty, st));
+                    let bodies_ok =
+                        arms.iter().all(|a| self.teq_nv(self.ety(self.thir.arms[*a].body), ty));
+                    let guards_ok = arms
                         .iter()
-                        .all(|a| self.teq(self.thir.arms[*a].pattern.ty, st));
-                    let bodies_ok = arms
-                        .iter()
-                        .all(|a| self.teq_nv(self.ety(self.thir.arms[*a].body), ty));
-                    let guards_ok = arms.iter().all(|a| {
-                        self.thir.arms[*a].guard.map_or(true, |g| self.ety(g).is_bool())
-                    });
+                        .all(|a| self.thir.arms[*a].guard.map_or(true, |g| self.ety(g).is_bool()));
                     self.ok(pats_ok && bodies_ok && guards_ok, idx, "match")
                 }
                 ExprKind::Block { block } => {
@@ -640,9 +646,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                 // ---- casts ----
                 ExprKind::Cast { source } => {
                     let st = self.ety(*source);
-                    let num = |t: Ty<'tcx>| {
-                        t.is_numeric() || t.is_char() || t.is_bool()
-                    };
+                    let num = |t: Ty<'tcx>| t.is_numeric() || t.is_char() || t.is_bool();
                     if num(st) && ty.is_numeric() {
                         // numeric-family cast: bool/char/int/float -> int/float
                         self.ok(true, idx, "cast-numeric")
@@ -668,7 +672,10 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                             let c = match (st.kind(), ty.kind()) {
                                 (ty::FnDef(did, gargs), ty::FnPtr(sig_tys, hdr)) => {
                                     let src_sig = self.tcx.instantiate_bound_regions_with_erased(
-                                        self.tcx.fn_sig(*did).instantiate(self.tcx, gargs).skip_normalization(),
+                                        self.tcx
+                                            .fn_sig(*did)
+                                            .instantiate(self.tcx, gargs)
+                                            .skip_normalization(),
                                     );
                                     let dst_sig = self
                                         .tcx
@@ -770,10 +777,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     };
                     let uv = cl.args.upvar_tys();
                     let upvars_ok = uv.len() == cl.upvars.len()
-                        && uv
-                            .iter()
-                            .zip(cl.upvars.iter())
-                            .all(|(t, u)| self.teq(t, self.ety(*u)));
+                        && uv.iter().zip(cl.upvars.iter()).all(|(t, u)| self.teq(t, self.ety(*u)));
                     self.ok(head_ok && upvars_ok, idx, "closure")
                 }
 
@@ -782,9 +786,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                 ExprKind::UpvarRef { .. } => self.counts.unchecked_class("upvar-ref"),
                 ExprKind::PlaceUnwrapUnsafeBinder { .. }
                 | ExprKind::ValueUnwrapUnsafeBinder { .. }
-                | ExprKind::WrapUnsafeBinder { .. } => {
-                    self.counts.unchecked_class("unsafe-binder")
-                }
+                | ExprKind::WrapUnsafeBinder { .. } => self.counts.unchecked_class("unsafe-binder"),
                 ExprKind::InlineAsm(..) => self.counts.unchecked_class("inline-asm"),
                 ExprKind::ThreadLocalRef(..) => self.counts.unchecked_class("thread-local"),
                 ExprKind::Yield { .. } => self.counts.unchecked_class("yield"),

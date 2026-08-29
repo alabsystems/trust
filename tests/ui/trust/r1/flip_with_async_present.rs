@@ -3,7 +3,7 @@
 //@ compile-flags: -Ztrust-verify=on
 //@ compile-flags: --crate-type=lib
 //@ dont-check-compiler-stderr
-// R1 REGRESSION PIN: the crate-wide caller scan must survive an `async fn`.
+// R1 REGRESSION PIN, strict lane, with a coroutine body present in the crate.
 //
 // An `async fn`'s coroutine body (`helper::{closure#0}`) has its elaborated MIR
 // stolen at ANALYSIS phase — computing the coroutine's layout forces
@@ -13,19 +13,25 @@
 // containing an `async fn`. The scan now routes coroutine bodies by IDENTITY
 // through `optimized_mir`, the steal consumer.
 //
-// DISCRIMINATION, updated for the strict coroutine policy (the ay-0.4.0-era pin
-// set stopped discharging the compiler-generated ResumedAfterReturn/Panic/Drop
-// sentinels, so strict policy now REFUSES every coroutine body as
-// conditional-on-executor — a deliberate fail-closed ruling, not a bug). This
-// test therefore expects EXACTLY ONE error: the coroutine executor-protocol
-// premise on `helper`.
+// RE-PINNED 2026-08-22 for `0e9090f03b` ("D2"), which made `PublishContractRow`
+// unreachable under strict and so restored the coroutine refusal on this lane.
+// MEASURED on stage2 `ec4783d80` with this file's own flags: exit 1 and THREE
+// errors, all on `helper::{closure#0}`, alongside a raw
+// `Trust: ASSUMPTION [coroutine]` row. The text this replaces had retargeted the
+// file onto a `CONTRACT [coroutine-resume-state]` row and a passing lane; at this
+// HEAD the compiler emits neither. All three errors and the assumption row are
+// pinned below, so a silent compiler still fails this file.
 //
-// MEASURED 2026-08-15: that refusal aborts the run before `scaled` is verified,
-// so THIS file can no longer observe the R1 arm — under strict, an R1-poisoned
-// compiler is silent about `scaled` rather than emitting a second error. The
-// live R1 discrimination therefore moved to the advisory sibling
-// `flip_with_async_present_advisory.rs`, where `scaled` is actually reached.
-// Keep this file as the strict-refusal pin; keep that one as the R1 pin.
+// THE R1 ARM IS NOT OBSERVABLE ON THIS LANE — RECORDED, NOT PAPERED OVER.
+// MEASURED falsification: with `scaled(x, x)` in place of `scaled(x, 4)` the
+// strict output does not mention `scaled` anywhere — the same three coroutine
+// errors, exit 1, and nothing to tell a poisoned scan from a healthy one. Nothing
+// downstream of the coroutine body gets verified here. The live R1
+// discrimination is therefore the advisory sibling
+// `flip_with_async_present_advisory.rs`, where that same poisoned variant DOES
+// emit a second warning naming `scaled` (measured). What this file still pins is
+// the strict refusal in the R1 crate shape: an `async fn` sitting next to
+// R1-eligible code is fail-closed, never silent.
 fn scaled(x: u32, divisor: u32) -> u32 {
     x / divisor
 }
@@ -35,37 +41,11 @@ pub fn api(x: u32) -> u32 {
     scaled(x, 4)
 }
 
-// The poison trigger: mere PRESENCE of a coroutine body in the crate. Its own
-// strict-lane refusal is the expected error below — and must stay the ONLY one.
-//
-// RE-PIN 2026-08-20 (D2), STRICTLY STRONGER. The ERROR — the strict coroutine
-// refusal this file pins — is RESTORED and still the only error. `ca53846043`
-// had suppressed it by publishing a CONTRACT row in the fail-closed lane, and
-// never measured the flip.
-//
-// The two WARN pins were deleted and REPLACED by the RAW assumption pin below,
-// which is a tighter guarantee. Their "1 obligation(s)" counts described the
-// inventory from when the coroutine body's sole row was the authority-less
-// panic-freedom aggregate; sentinels are now separate rows, so no correct
-// behaviour reproduces that count. Measured for this body now: "2 conditionally
-// discharged (NOT proved), … 1 skipped out of 3 obligation(s)" — the word
-// "proved" does not appear — plus the assumption row pinned below.
-//
-// RE-PIN 2026-08-15, STRICTLY STRONGER: the two WARN rows are new, and they
-// disclose a proof this compiler deliberately no longer mints. The coroutine
-// body's ONLY obligation row is the synthesized whole-function
-// `assertion:panic-freedom:0` aggregate. Upstream 1ab7ee48f2 and then
-// 983bc1a3b6 deleted `apply_whole_function_panic_freedom_subsumption`, which
-// used to hand that row a `WholeFunctionPanicFreedomSubsumption` authority off
-// a conjunction over the function's OTHER rows — and here there are none, so
-// that conjunction was empty and the discharge vacuous: precisely the false
-// proof 1ab7ee48f2 closes. The row is now Proved-but-authorityless, so
-// `permits_static_proved_transport_for` (collapsed to `is_static_proof_for`)
-// refuses it and both policy lanes report it unproved. The ERROR is unchanged
-// and still the only error: no refutation lost, no verdict downgraded — a
-// vacuous proof was withdrawn and the gap is now stated out loud.
+// The poison trigger: mere PRESENCE of a coroutine body in the crate.
 pub async fn helper(x: u32) -> u32 {
-    //~^ ERROR coroutine executor-protocol premise is unproved
+    //~^ ERROR Trust Level 0 safety verification incomplete for `flip_with_async_present::helper::{closure#0}`
+    //~| ERROR Trust strict verification failed for `flip_with_async_present::helper::{closure#0}`: coroutine executor-protocol premise is unproved
+    //~| ERROR Trust strict verification failed for `flip_with_async_present::helper::{closure#0}`: 3 obligation(s) were not fully verified
     x
 }
-//~? RAW Trust: ASSUMPTION [coroutine]
+//~? RAW Trust: ASSUMPTION [coroutine] `flip_with_async_present::helper::{closure#0}`

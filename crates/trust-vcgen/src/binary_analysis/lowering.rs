@@ -336,6 +336,7 @@ fn lower_instruction(
 
             Some(Terminator::Call {
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: func.clone(),
                 args: args.iter().map(|arg| abstract_value_to_operand(arg, context)).collect(),

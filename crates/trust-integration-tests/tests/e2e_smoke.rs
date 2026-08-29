@@ -440,7 +440,9 @@ fn test_e2e_real_mir_m2_demonstration() {
 
     eprintln!("\n=== E2E REAL MIR: Full pipeline M2 demonstration ===\n");
     eprintln!("Source: fn checked_add(a: u32, b: u32) -> u32 {{ a + b }}");
-    eprintln!("Origin: fixtures/real_mir/src/test_functions.rs (compiled via -Ztrust-dump=mir:<dir>)");
+    eprintln!(
+        "Origin: fixtures/real_mir/src/test_functions.rs (compiled via -Ztrust-dump=mir:<dir>)"
+    );
     eprintln!();
 
     let ay = require_ay();

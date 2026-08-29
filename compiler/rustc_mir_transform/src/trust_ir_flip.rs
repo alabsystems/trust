@@ -277,7 +277,10 @@ pub(crate) fn try_flip_ctfe<'tcx>(
 /// Replay the built body's pass pipeline over the derived body: `mir_built` tail →
 /// `mir_promoted` stage → `run_analysis_to_runtime_passes` (the same public entry the normal
 /// path uses). Lint passes skipped (see module docs). Errors are returned, never emitted.
-fn advance_built_to_runtime<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<(), String> {
+pub(crate) fn advance_built_to_runtime<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mut Body<'tcx>,
+) -> Result<(), String> {
     if body.phase != MirPhase::Built {
         return Err(format!("derived body at {:?}, expected Built", body.phase));
     }

@@ -65,7 +65,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
+use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{
     AggregateKind, AssertKind, BasicBlock, Body, BorrowKind, CastKind, Local, Location, Operand,
     Place, ProjectionElem, RETURN_PLACE, Rvalue, START_BLOCK, Statement, StatementKind,
@@ -306,7 +306,7 @@ pub fn derive_flip_body<'tcx>(
 
 /// Reject the flip when any potentially trapping instruction has statically-constant deciding
 /// operands (see module docs: `KnownPanicsLint` would fire twice, at a coarser span).
-fn const_trap_gate(module: &Module) -> Result<(), String> {
+pub(crate) fn const_trap_gate(module: &Module) -> Result<(), String> {
     let Some(func) = module.function_by_id(FuncId::new(0)) else {
         return Err("module has no FuncId(0) function".to_string());
     };
@@ -576,6 +576,17 @@ struct RefArgForwardGuard<'a> {
     // forward-only property, and for the same reason: what is stored in `_b` is a borrow of the
     // REFERENT's field, not the reference value `_arg`.
     relay_srcs: &'a HashSet<Local>,
+    // Trust (wave-FR): call-forward reborrow temps `_t = &[mut] (*_arg); f(move _t)` — the
+    // `_arg`-as-borrow-base is admitted on the same footing as the wave-30 interior borrow:
+    // what is stored in `_t` is built's own reborrow of the REFERENT, `call_fwd_reborrow_temps`
+    // proved (mentions == 2) its only other appearance is one bare call-argument move, and the
+    // callee receives exactly what forwarding `_arg` bare (the wave-8a form) already hands it.
+    call_fwd_temps: &'a HashSet<Local>,
+    // Trust (lane S1F): explicit-borrow pair INNER locals `_u = &((*_arg).0)` — the same
+    // interior borrow place as wave-AF's, the same forward-only property for the same reason
+    // (what is stored in `_u` is a borrow of the REFERENT's field), and `field_pair_temps`
+    // proved (mentions == 2) its only other appearance is the pair's own `_t = &(*_u)`.
+    field_pair_inners: &'a HashSet<Local>,
     violation: Option<Local>,
 }
 impl<'tcx> Visitor<'tcx> for RefArgForwardGuard<'_> {
@@ -707,7 +718,8 @@ impl<'tcx> Visitor<'tcx> for RefArgForwardGuard<'_> {
                 if !self.ref_args.contains(&place.local)
                     && place.projection.is_empty()
                     && (self.addr_fwd_temps.contains(&place.local)
-                        || self.relay_srcs.contains(&place.local))
+                        || self.relay_srcs.contains(&place.local)
+                        || self.field_pair_inners.contains(&place.local))
                     && self.ref_args.contains(&src.local)
                     && matches!(
                         src.projection.as_slice(),
@@ -718,6 +730,25 @@ impl<'tcx> Visitor<'tcx> for RefArgForwardGuard<'_> {
                                 ProjectionElem::Field(..)
                             ]
                     )
+                {
+                    return;
+                }
+            }
+            // Trust (wave-FR): the CALL-FORWARD REBORROW `_t = &[mut] (*_p)` — `_t` a certified
+            // `call_fwd_reborrow_temps` local (single def, single bare call-arg move, total
+            // mentions == 2), source projection EXACTLY `[Deref]` on a ref arg, destination not
+            // itself a ref arg. The reference VALUE `_p` does not escape: what is stored in `_t`
+            // is built's own reborrow of the referent, and `_t`'s only other mention is the one
+            // `Move` the call consumes — the same handing-through the wave-8a bare forward
+            // already performs. Anything longer, shorter or differently shaped still walks and
+            // flags.
+            if let Rvalue::Ref(_, _, src) = rvalue {
+                if !self.ref_args.contains(&place.local)
+                    && place.projection.is_empty()
+                    && self.call_fwd_temps.contains(&place.local)
+                    && self.ref_args.contains(&src.local)
+                    && src.projection.len() == 1
+                    && matches!(src.projection[0], ProjectionElem::Deref)
                 {
                     return;
                 }
@@ -881,6 +912,800 @@ fn interior_arg_temps<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
         .collect()
 }
 
+/// Trust (wave-FR, 2026-08-21): the CALL-FORWARD REBORROW TEMPS — the `&T`/`&mut T` ARGUMENT
+/// temps the shim's call-forward marker plan mints for a single-block tail call
+/// (`to_mir::plan_call_fwd_markers`): `StorageLive(_t); _t = &(*_p); f(move _t); StorageDead(_t)`,
+/// byte-for-byte built's own `as_operand` -> `as_temp` reborrow of a forwarded reference
+/// parameter (measured verbatim with `-Zdump-mir=built` on
+/// `fn a_def_eq(s: &C, a: &E, b: &E) -> bool { s.imp3(a, b) }`:
+/// `_4 = &(*_1); _5 = &(*_2); _6 = &(*_3); _0 = C::imp3(move _4, move _5, move _6)`).
+///
+/// This is the flip gate's INDEPENDENT admission of that shape, on the standing pattern of
+/// [`interior_arg_temps`]. "Plan-minted" is the EMITTER's side of the bargain (only
+/// `to_mir`'s `mf_mark_call_fwd` can open the pair, and it refuses any value its plan does
+/// not name); the two structural clauses are re-proven HERE, from the finished body alone:
+///
+///   * **the single def is `_t = &(*_p)` / `_t = &mut (*_p)`** — a `Rvalue::Ref` whose
+///     borrowed place is projection EXACTLY `[Deref]` on an ARG local (`1..=arg_count`),
+///     whose borrow kind MATCHES `_t`'s own declared mutability (`Shared` for `&T`,
+///     `Mut { Default }` for `&mut T` — a one-sided mismatch is refused), and whose base
+///     `_p` is declared at exactly `_t`'s own region-erased type (the emitter minted `_t`
+///     at the callee's declared input type and separately proved the forwarded place
+///     already had it; requiring it here makes the gate's proof independent of the
+///     emitter's). The pointee must be CONCRETE and THIN ([`thin_shared_pointee_ok`]) —
+///     the clause wave-AF owed and for the same reason: an unsized pointee makes `_t` a
+///     WIDE `(data, metadata)` pair and the fragment models pointer metadata nowhere. A
+///     fat `&str` reborrow stays refused (measured refusals: `mode::{impl#3,4}::fmt`).
+///   * **the single use is ONE bare `Operand::Move(_t)` CALL argument, and TOTAL
+///     value-mentions == 2** (the def dest + that one move; storage markers are `NonUse`
+///     and uncounted, exactly as in [`interior_arg_temps`]). The mentions clause is the
+///     airtight single-use guarantee: a temp that is read through, stored through,
+///     re-borrowed, returned, or consumed twice appears a 3rd time and is REFUSED — the
+///     same posture as [`is_ref_enum_payload_read`]: an address in transit, provably never
+///     observed by this body beyond the one move, never reachable by a store.
+///
+/// PASS-TOTALITY is wave-30's argument unchanged: `&T`/`&mut T` is `!needs_drop` and a
+/// borrow mints no move path (`ElaborateDrops` finds nothing to elaborate), `PromoteTemps`
+/// finds ZERO candidates (the borrow is through a runtime param, not a const), and
+/// mentions == 2 means no replayed pass can observe a shape the shim did not emit. The
+/// `&mut` reborrow adds no new obligation HERE: this body neither reads nor writes through
+/// `_t` (mentions == 2), and the referent mutation happens in the CALLEE — exactly as it
+/// already does when the same body forwards `_p` bare, the wave-8a form this emission
+/// replaces, whose `&mut` forward [`ref_args_forward_only`] already admits.
+fn call_fwd_reborrow_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
+    // Total VALUE mentions per local (storage markers / debuginfo are NonUse and uncounted).
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    // The reborrow def `_t = &[mut] (*_p)`; the single use, a bare `Operand::Move` call argument.
+    let mut borrow_def: HashMap<Local, u32> = HashMap::new();
+    let mut callarg_move: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (place, rvalue) = &**assign;
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                let l = place.local;
+                let is_arg = |x: Local| x.as_usize() >= 1 && x.as_usize() <= body.arg_count;
+                if l == RETURN_PLACE || is_arg(l) {
+                    continue;
+                }
+                let ty::Ref(_, pointee, m) = *body.local_decls[l].ty.kind() else {
+                    continue;
+                };
+                let Rvalue::Ref(_, bk, borrowed) = rvalue else {
+                    continue;
+                };
+                // Borrow kind must MATCH the temp's own declared mutability — one-sided
+                // mismatches (a `Mut` borrow into a `&T` temp, or vice versa) are refused.
+                let kind_matches = match bk {
+                    BorrowKind::Shared => m.is_not(),
+                    BorrowKind::Mut { kind: rustc_middle::mir::MutBorrowKind::Default } => {
+                        m.is_mut()
+                    }
+                    _ => false,
+                };
+                if !kind_matches {
+                    continue;
+                }
+                if borrowed.projection.len() == 1
+                    && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                    && is_arg(borrowed.local)
+                    // `_p`'s declared type must BE `_t`'s (region-erased): the reborrow
+                    // reproduces the parameter's own reference, nothing narrower or wider.
+                    && tcx.erase_and_anonymize_regions(body.local_decls[borrowed.local].ty)
+                        == tcx.erase_and_anonymize_regions(body.local_decls[l].ty)
+                    // Concrete + THIN pointee — the wave-AF clause, owed identically here.
+                    && thin_shared_pointee_ok(tcx, pointee)
+                {
+                    *borrow_def.entry(l).or_default() += 1;
+                }
+            }
+        }
+        if let Some(term) = &data.terminator {
+            if let TerminatorKind::Call { args, .. } = &term.kind {
+                for arg in args.iter() {
+                    if let Operand::Move(p) = &arg.node {
+                        if p.projection.is_empty() {
+                            *callarg_move.entry(p.local).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    borrow_def
+        .iter()
+        .filter(|(l, &d)| {
+            // EXACTLY one reborrow def, TOTAL value-mentions == 2, and the one use is a bare
+            // call-argument move. Any store / second use / projected use / re-borrow adds a
+            // 3rd mention and REFUSES the local — fail closed.
+            d == 1 && mentions.get(l) == Some(&2) && callarg_move.get(l) == Some(&1)
+        })
+        .map(|(l, _)| *l)
+        .collect()
+}
+
+/// Trust (lane EM, 2026-08-21): facts certifying one `&str`-LITERAL ARGUMENT PAIR — the two
+/// locals built mints for a `&str` literal call argument, and the shim's CF_STR emission
+/// (`to_mir`'s `mf_mark_call_fwd_lit` leg) now reproduces:
+///
+/// ```text
+/// _u = const "lit";    // the literal's own local            (&str, shared)
+/// _t = &(*_u);         // the argument temp: a FAT reborrow  (&str, shared)
+/// f(.., move _t, ..);  // the one use: a bare call-argument move
+/// ```
+///
+/// Keeping the facts as one value makes the production predicate directly executable in unit
+/// tests, exactly as `CallDestFwdFacts` and `RelayPairFacts` do — the `mentions == 2` walls
+/// are not left as uncommitted producer observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StrLitPairFacts {
+    /// `_t = &(*_u)` SHARED borrow defs of the arg temp (its ONLY admitted def kind).
+    borrow_defs: u32,
+    /// `_u = const "..."` (`&str`-typed constant) defs of the literal local (its ONLY admitted
+    /// def kind).
+    const_defs: u32,
+    /// TOTAL value-mentions of `_t` (storage markers are `NonUse` and uncounted).
+    t_mentions: u32,
+    /// TOTAL value-mentions of `_u`.
+    u_mentions: u32,
+    /// Bare `Operand::Move` call-argument uses of `_t`.
+    t_callarg_moves: u32,
+    /// `_t` and `_u` are the SAME local (`_t = &(*_t)`) — refused explicitly rather than
+    /// assumed absent, on the pattern of wave-FR's self-referential clause.
+    self_pair: bool,
+}
+
+fn str_lit_pair_admits(f: StrLitPairFacts) -> bool {
+    f.borrow_defs == 1
+        && f.const_defs == 1
+        && f.t_mentions == 2
+        && f.u_mentions == 2
+        && f.t_callarg_moves == 1
+        && !f.self_pair
+}
+
+/// Trust (lane EM, 2026-08-21): the `&str`-LITERAL ARGUMENT PAIRS — the wave-WB deferred
+/// admission, taken now that the CF_STR emission fires (the `call_fwd_arg_admits` literal
+/// clause demanded an adjustment-free `&str` literal, a shape built never mints temps for; see
+/// the corrected clause in `to_mir.rs`). Byte-for-byte built's own two-local spelling, measured
+/// verbatim with `-Zdump-mir=built` on `fn e3(f: &mut Formatter<'_>) -> fmt::Result
+/// { f.write_str("hello") }`:
+///
+/// ```text
+/// StorageLive(_3); StorageLive(_4); _4 = const "hello"; _3 = &(*_4);
+/// _0 = Formatter::<'_>::write_str(move _2, move _3) -> bb1;
+/// bb1: StorageDead(_3); StorageDead(_2); StorageDead(_4);
+/// ```
+///
+/// This is the ONE place the fragment admits a fat `&str` BORROW DEF, and the walls are the
+/// same two the wave-WB `str_fat` call-dest class already carries, plus the pair link:
+///
+///   * **the arg temp's single def is `_t = &(*_u)`** — a SHARED `Rvalue::Ref`, projection
+///     EXACTLY `[Deref]`, whose base `_u` is a NON-arg local declared at exactly `_t`'s own
+///     region-erased `&str` type;
+///   * **the literal local's single def is `_u = const "..."`** — a `&str`-typed
+///     `Operand::Constant`, the exact constant `operand_ok`'s wave-str arm already admits
+///     (read-only rodata, `PromoteTemps`-inert, no drop glue);
+///   * **TOTAL value-mentions == 2 on BOTH locals**: `_u` is the const def + the one borrow
+///     base; `_t` is the borrow def + ONE bare `Operand::Move` call argument. A deref-read, a
+///     store, a re-borrow, a second forward, a projected use — each is a THIRD mention on its
+///     local and REFUSES the pair, fail closed. So the fat `(ptr, len)` pair rides only in
+///     transit: it is never split, inspected or stored, and the pointee `str` produces no
+///     value in this body (wave-AF's argument, verbatim; `&str` is `Copy` + `!needs_drop`, so
+///     `ElaborateDrops` finds nothing). `PromoteTemps` is the one pass with an opinion on a
+///     borrow-of-const shape, and it requires the borrow base to be a promotable CONST PLACE —
+///     `_u` is a runtime local with a non-promotable sibling use (the call move via `_t`), and
+///     the differential separately re-checks the finished body against built, so a promotion
+///     divergence can only cost the flip, never ship.
+///
+/// `&[T]`, `&dyn Trait`, `&mut str` and every other wide pointee stay refused: this set admits
+/// `str` SHARED, both locals, pair-linked, and nothing else.
+#[derive(Default)]
+struct StrLitPairs {
+    /// The argument temps `_t = &(*_u); f(move _t)`.
+    args: HashSet<Local>,
+    /// The literal locals `_u = const "..."`.
+    lits: HashSet<Local>,
+}
+
+impl StrLitPairs {
+    fn contains(&self, l: &Local) -> bool {
+        self.args.contains(l) || self.lits.contains(l)
+    }
+}
+
+fn str_lit_pair_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> StrLitPairs {
+    // Total VALUE mentions per local (storage markers / debuginfo are NonUse and uncounted).
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let is_arg = |x: Local| x.as_usize() >= 1 && x.as_usize() <= body.arg_count;
+    let is_shared_str = |l: Local| {
+        matches!(*body.local_decls[l].ty.kind(), ty::Ref(_, pointee, m)
+            if m.is_not() && pointee.is_str())
+    };
+    // The candidate defs: `_t = &(*_u)` pair links, `_u = const "..."` literal defs, and the
+    // bare call-argument moves.
+    let mut borrow_def: HashMap<Local, (u32, Local)> = HashMap::new();
+    let mut const_def: HashMap<Local, u32> = HashMap::new();
+    let mut callarg_move: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (place, rvalue) = &**assign;
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                let l = place.local;
+                if l == RETURN_PLACE || is_arg(l) || !is_shared_str(l) {
+                    continue;
+                }
+                match rvalue {
+                    Rvalue::Ref(_, BorrowKind::Shared, borrowed)
+                        if borrowed.projection.len() == 1
+                            && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                            && !is_arg(borrowed.local)
+                            && borrowed.local != RETURN_PLACE
+                            // `_u`'s declared type must BE `_t`'s (region-erased): the
+                            // reborrow reproduces the literal's own `&str`, nothing else.
+                            && tcx.erase_and_anonymize_regions(
+                                body.local_decls[borrowed.local].ty,
+                            ) == tcx.erase_and_anonymize_regions(body.local_decls[l].ty) =>
+                    {
+                        let e = borrow_def.entry(l).or_insert((0, borrowed.local));
+                        e.0 += 1;
+                        e.1 = borrowed.local;
+                    }
+                    Rvalue::Use(Operand::Constant(c), _)
+                        if matches!(c.const_.ty().kind(), ty::Ref(_, inner, m)
+                            if m.is_not() && inner.is_str()) =>
+                    {
+                        *const_def.entry(l).or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(term) = &data.terminator {
+            if let TerminatorKind::Call { args, .. } = &term.kind {
+                for arg in args.iter() {
+                    if let Operand::Move(p) = &arg.node {
+                        if p.projection.is_empty() {
+                            *callarg_move.entry(p.local).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = StrLitPairs::default();
+    for (t, &(defs, u)) in borrow_def.iter() {
+        let facts = StrLitPairFacts {
+            borrow_defs: defs,
+            const_defs: const_def.get(&u).copied().unwrap_or(0),
+            t_mentions: mentions.get(t).copied().unwrap_or(0),
+            u_mentions: mentions.get(&u).copied().unwrap_or(0),
+            t_callarg_moves: callarg_move.get(t).copied().unwrap_or(0),
+            self_pair: *t == u,
+        };
+        if str_lit_pair_admits(facts) {
+            out.args.insert(*t);
+            out.lits.insert(u);
+        }
+    }
+    out
+}
+
+/// Trust (lane S1F, 2026-08-22): facts certifying one EXPLICIT-BORROW FIELD PAIR — the two
+/// locals built mints for `&p.0` passed under the reborrow coercion (the derived `Ord::cmp`'s
+/// `::core::cmp::Ord::cmp(&self.0, &other.0)`), which the call-forward plan's pair form now
+/// reproduces with built's own storage spans:
+///
+/// ```text
+/// _u = &((*_p).0: F);   // the field borrow's own local: an interior borrow of a ref ARG
+/// _t = &(*_u);          // the argument temp: a bare reborrow of `_u`
+/// f(.., move _t, ..);   // the one use: a bare call-argument move
+/// ```
+///
+/// Kept as one value so the production predicate is directly executable in unit tests, exactly
+/// as `StrLitPairFacts` and `RelayPairFacts` are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FieldPairFacts {
+    /// `_u = &((*_p).k)` interior-borrow defs of the inner local (its ONLY admitted def kind).
+    u_borrow_defs: u32,
+    /// TOTAL value-mentions of `_u` (storage markers are `NonUse` and uncounted).
+    u_mentions: u32,
+    /// `_t = &(*_u)` SHARED reborrow defs of the arg temp (its ONLY admitted def kind).
+    t_reborrow_defs: u32,
+    /// TOTAL value-mentions of `_t`.
+    t_mentions: u32,
+    /// Bare `Operand::Move` call-argument uses of `_t`.
+    t_callarg_moves: u32,
+    /// `_t` and `_u` are the SAME local — refused explicitly rather than assumed absent.
+    self_pair: bool,
+}
+
+fn field_pair_admits(f: FieldPairFacts) -> bool {
+    f.u_borrow_defs == 1
+        && f.u_mentions == 2
+        && f.t_reborrow_defs == 1
+        && f.t_mentions == 2
+        && f.t_callarg_moves == 1
+        && !f.self_pair
+}
+
+/// Trust (lane S1F): the admitted explicit-borrow field pairs, as two linked sets.
+#[derive(Default)]
+struct FieldPairs {
+    /// The argument temps `_t = &(*_u); f(move _t)`.
+    args: HashSet<Local>,
+    /// The inner locals `_u = &((*_p).k)`.
+    inners: HashSet<Local>,
+}
+
+impl FieldPairs {
+    fn contains(&self, l: &Local) -> bool {
+        self.args.contains(l) || self.inners.contains(l)
+    }
+}
+
+/// Trust (lane S1F, 2026-08-22): the EXPLICIT-BORROW FIELD PAIRS — `_u = &((*_p).k: F)` (the
+/// wave-AF address-forward def, verbatim: a NON-arg, non-`_0` local declared `&F` SHARED with
+/// [`thin_shared_pointee_ok`], borrowing an [`interior_field_ty`] place of a ref ARG whose field
+/// type equals `F`) whose SINGLE use is the bare reborrow `_t = &(*_u)` into a NON-arg, non-`_0`
+/// local declared at `_u`'s exact region-erased type, whose SINGLE use is ONE bare
+/// `Operand::Move` call argument — TOTAL value-mentions == 2 on BOTH locals. This is
+/// [`str_lit_pair_temps`]' pair-linked discipline with [`addr_forward_temps`]' def in the inner
+/// slot: the address rides `_u` -> `_t` -> the callee and is never dereferenced, stored or split
+/// in this body; `&F` is `Copy` and `!needs_drop`; `PromoteTemps` finds no candidate (the borrow
+/// is through a runtime param). FAIL-CLOSED: any third mention on either local refuses both.
+fn field_pair_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FieldPairs {
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let is_arg = |x: Local| x.as_usize() >= 1 && x.as_usize() <= body.arg_count;
+    let mut inner_def: HashMap<Local, u32> = HashMap::new();
+    let mut reborrow_def: HashMap<Local, (u32, Local)> = HashMap::new();
+    let mut callarg_move: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            let StatementKind::Assign(assign) = &stmt.kind else { continue };
+            let (place, rvalue) = &**assign;
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let l = place.local;
+            if l == RETURN_PLACE || is_arg(l) {
+                continue;
+            }
+            let ty::Ref(_, pointee, m) = *body.local_decls[l].ty.kind() else { continue };
+            if !m.is_not() || !thin_shared_pointee_ok(tcx, pointee) {
+                continue;
+            }
+            let Rvalue::Ref(_, BorrowKind::Shared, borrowed) = rvalue else { continue };
+            if borrowed.projection.len() == 1
+                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                && !is_arg(borrowed.local)
+                && borrowed.local != RETURN_PLACE
+                && tcx.erase_and_anonymize_regions(body.local_decls[borrowed.local].ty)
+                    == tcx.erase_and_anonymize_regions(body.local_decls[l].ty)
+            {
+                let e = reborrow_def.entry(l).or_insert((0, borrowed.local));
+                e.0 += 1;
+                e.1 = borrowed.local;
+            } else if is_arg(borrowed.local) && interior_field_ty(body, borrowed) == Some(pointee) {
+                *inner_def.entry(l).or_default() += 1;
+            }
+        }
+        if let Some(term) = &data.terminator {
+            if let TerminatorKind::Call { args, .. } = &term.kind {
+                for arg in args.iter() {
+                    if let Operand::Move(p) = &arg.node {
+                        if p.projection.is_empty() {
+                            *callarg_move.entry(p.local).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = FieldPairs::default();
+    for (t, &(defs, u)) in reborrow_def.iter() {
+        let facts = FieldPairFacts {
+            u_borrow_defs: inner_def.get(&u).copied().unwrap_or(0),
+            u_mentions: mentions.get(&u).copied().unwrap_or(0),
+            t_reborrow_defs: defs,
+            t_mentions: mentions.get(t).copied().unwrap_or(0),
+            t_callarg_moves: callarg_move.get(t).copied().unwrap_or(0),
+            self_pair: *t == u,
+        };
+        if field_pair_admits(facts) {
+            out.args.insert(*t);
+            out.inners.insert(u);
+        }
+    }
+    out
+}
+
+/// Trust (wave-WB8, 2026-08-21): facts certifying one CHAIN IN-TRANSIT REBORROW PAIR — the
+/// two locals the chain-forward emission (`to_mir::plan_chain_fwd_markers`) mints for a
+/// REFERENCE-returning inner call whose result feeds the final call:
+///
+/// ```text
+/// _u = name(move _w);  // the inner call's destination      (&str / &Level, shared)
+/// _t = &(*_u);         // the outer argument temp: a reborrow, at the successor's entry
+/// f(.., move _t, ..);  // the one use: a bare call-argument move
+/// ```
+///
+/// Keeping the facts as one value makes the production predicate directly executable in unit
+/// tests, exactly as `StrLitPairFacts` and `CallDestFwdFacts` do — the `mentions == 2` walls
+/// are not left as uncommitted producer observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransitPairFacts {
+    /// `_t = &(*_u)` SHARED borrow defs of the arg temp (its ONLY admitted def kind).
+    borrow_defs: u32,
+    /// Bare call-DESTINATION defs of the transit local (its ONLY admitted def kind).
+    u_calldest_defs: u32,
+    /// TOTAL value-mentions of `_t` (storage markers are `NonUse` and uncounted).
+    t_mentions: u32,
+    /// TOTAL value-mentions of `_u`.
+    u_mentions: u32,
+    /// Bare `Operand::Move` call-argument uses of `_t`.
+    t_callarg_moves: u32,
+    /// `_t` and `_u` are the SAME local (`_t = &(*_t)`) — refused explicitly rather than
+    /// assumed absent, on the pattern of wave-FR's self-referential clause.
+    self_pair: bool,
+}
+
+fn transit_pair_admits(f: TransitPairFacts) -> bool {
+    f.borrow_defs == 1
+        && f.u_calldest_defs == 1
+        && f.t_mentions == 2
+        && f.u_mentions == 2
+        && f.t_callarg_moves == 1
+        && !f.self_pair
+}
+
+/// Trust (wave-WB8, 2026-08-21): the CHAIN IN-TRANSIT REBORROW PAIRS — wave-WB's lone
+/// call-dest forward temp with the forward link REPLACED by built's own reborrow, which is
+/// what the chain-forward marker emission now reproduces (measured verbatim,
+/// `-Zdump-mir=built`, probes/em3.rs `Ax::fmt`:
+/// `_5 = Ax::name(move _6) -> bb1; bb1: _4 = &(*_5); …; _0 = write_str(move _3, move _4)`).
+///
+/// The soundness argument is the two parents' arguments, composed, with the pair link making
+/// each half's base the other half:
+///
+///   * **`_u`'s single def is a bare CALL DESTINATION and its single use is the reborrow
+///     base** — wave-WB's `calldest_forward_temps` admits the same def kind with a
+///     call-argument use; here the use is the borrow base of `_t`'s def, and the
+///     `mentions == 2` wall proves there is no other observation of `_u` in the body.
+///   * **`_t`'s single def is `_t = &(*_u)` SHARED and its single use is ONE bare
+///     `Operand::Move` call argument** — wave-FR's `call_fwd_reborrow_temps` admits the same
+///     shape with an ARG base; the base here is the pair's own certified `_u`, declared at
+///     exactly `_t`'s region-erased type.
+///
+/// So both locals are an address in transit: no value of the pointee is ever materialised in
+/// this body, its drop glue and width are not this fragment's business (`&T` is `Copy` +
+/// `!needs_drop`, `ElaborateDrops` finds nothing), and `PromoteTemps` finds no candidate (the
+/// borrow base is a runtime call result, never a const place). TWO POINTEE CLASSES, exactly
+/// wave-WB's: THIN concrete (`&Level`), and EXACTLY `str` (`<AxiomId as Display>::fmt`'s
+/// `&str` in transit) — the fat `(ptr, len)` pair rides as an opaque immediate the
+/// `mentions == 2` walls prove is never split, inspected or stored. `&[T]`, `&dyn Trait`,
+/// `&mut` anything and every other pointee stay refused.
+#[derive(Default)]
+struct TransitPairs {
+    /// The outer argument temps `_t = &(*_u); f(move _t)`.
+    args: HashSet<Local>,
+    /// The in-transit call destinations `_u = g(..)`.
+    dests: HashSet<Local>,
+}
+
+impl TransitPairs {
+    fn contains(&self, l: &Local) -> bool {
+        self.args.contains(l) || self.dests.contains(l)
+    }
+}
+
+fn transit_pair_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> TransitPairs {
+    // Total VALUE mentions per local (storage markers / debuginfo are NonUse and uncounted).
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let is_arg = |x: Local| x.as_usize() >= 1 && x.as_usize() <= body.arg_count;
+    // A shared reference whose pointee is concrete THIN, or exactly `str` — the two measured
+    // classes, the same split wave-WB's call-dest set carries.
+    let pointee_ok = |l: Local| match *body.local_decls[l].ty.kind() {
+        ty::Ref(_, pointee, m) if m.is_not() => {
+            thin_shared_pointee_ok(tcx, pointee) || matches!(pointee.kind(), ty::Str)
+        }
+        _ => false,
+    };
+    let mut borrow_def: HashMap<Local, (u32, Local)> = HashMap::new();
+    let mut calldest_def: HashMap<Local, u32> = HashMap::new();
+    let mut callarg_move: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            if let StatementKind::Assign(assign) = &stmt.kind {
+                let (place, rvalue) = &**assign;
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                let l = place.local;
+                if l == RETURN_PLACE || is_arg(l) || !pointee_ok(l) {
+                    continue;
+                }
+                if let Rvalue::Ref(_, BorrowKind::Shared, borrowed) = rvalue {
+                    if borrowed.projection.len() == 1
+                        && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                        && !is_arg(borrowed.local)
+                        && borrowed.local != RETURN_PLACE
+                        // `_u`'s declared type must BE `_t`'s (region-erased): the reborrow
+                        // reproduces the inner call's own reference, nothing else.
+                        && tcx.erase_and_anonymize_regions(body.local_decls[borrowed.local].ty)
+                            == tcx.erase_and_anonymize_regions(body.local_decls[l].ty)
+                    {
+                        let e = borrow_def.entry(l).or_insert((0, borrowed.local));
+                        e.0 += 1;
+                        e.1 = borrowed.local;
+                    }
+                }
+            }
+        }
+        if let Some(term) = &data.terminator {
+            if let TerminatorKind::Call { args, destination, .. } = &term.kind {
+                if destination.projection.is_empty()
+                    && destination.local != RETURN_PLACE
+                    && !is_arg(destination.local)
+                {
+                    *calldest_def.entry(destination.local).or_default() += 1;
+                }
+                for arg in args.iter() {
+                    if let Operand::Move(p) = &arg.node {
+                        if p.projection.is_empty() {
+                            *callarg_move.entry(p.local).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = TransitPairs::default();
+    for (t, &(defs, u)) in borrow_def.iter() {
+        let facts = TransitPairFacts {
+            borrow_defs: defs,
+            u_calldest_defs: calldest_def.get(&u).copied().unwrap_or(0),
+            t_mentions: mentions.get(t).copied().unwrap_or(0),
+            u_mentions: mentions.get(&u).copied().unwrap_or(0),
+            t_callarg_moves: callarg_move.get(t).copied().unwrap_or(0),
+            self_pair: *t == u,
+        };
+        if transit_pair_admits(facts) {
+            out.args.insert(*t);
+            out.dests.insert(u);
+        }
+    }
+    out
+}
+
+/// Trust (wave-WB, 2026-08-21): facts certifying one LONE CALL-DESTINATION FORWARD temp — the
+/// call-dest sibling of the wave-FR reborrow admission, and the "lone source" the W3 relay
+/// refuses BY DESIGN (`relay_pair_admits` requires a forward reborrow PAIR with
+/// `source_callarg_uses == 0`; this class has NO forward and EXACTLY ONE call-arg use, so the
+/// two sets are disjoint by construction). Keeping the facts as one value makes the production
+/// predicate directly executable in unit tests, exactly as `RelayPairFacts` does — the
+/// `mentions == 2` wall is not left as an uncommitted producer observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CallDestFwdFacts {
+    /// Bare call-DESTINATION defs of the local (its ONLY admitted def kind — a borrow def or a
+    /// plain-assign def lands the local in a different set or in the fail-closed arm).
+    calldest_defs: u32,
+    /// TOTAL value-mentions (storage markers are `NonUse` and uncounted, exactly as in
+    /// [`interior_arg_temps`]).
+    mentions: u32,
+    /// Bare `Operand::Copy|Move` call-argument uses.
+    callarg_uses: u32,
+    /// The local appears as an ARGUMENT of the very call that defines it (`_t = f(move _t)`) —
+    /// a shape real MIR cannot produce initialized (the argument is read before the destination
+    /// is written), REFUSED explicitly rather than assumed absent, on the pattern of wave-FR's
+    /// self-referential `_f = &(*_f)` clause.
+    self_feed: bool,
+}
+
+fn calldest_fwd_admits(f: CallDestFwdFacts) -> bool {
+    f.calldest_defs == 1 && f.mentions == 2 && f.callarg_uses == 1 && !f.self_feed
+}
+
+/// Trust (wave-WB, 2026-08-21): the LONE CALL-DEST FORWARD temps — NON-arg, non-`_0` locals
+/// declared `&P` SHARED whose SINGLE def is a bare CALL DESTINATION and whose SINGLE use is ONE
+/// bare `Copy|Move` CALL ARGUMENT, with TOTAL value-mentions == 2:
+///
+/// ```text
+/// _t = f(..);          // the only def: a bare call destination
+/// g(move _t);          // the only use: a bare call argument
+/// ```
+///
+/// This is `<LevelArc as PartialEq>::eq` (`%2 = deref(self); %3 = deref(other);
+/// Level::eq(%2, %3)`), `<LevelArc as Debug>::fmt`, and `expr::kind::arc_eq` — the wall-B
+/// "lone-source relay" class of the never-flip partition
+/// (`data/crystal_never_flip_partition_2026-08-20.json`, clean 5bdb4ee6a).
+///
+/// The soundness argument is wave-W3's accessor-destination argument with the forward link
+/// REPLACED by a use kind two older waves already admit:
+///   * the DEF is the `Call` arm's bare-local destination — the exact def kind the W3 relay
+///     already admits for its source (`root_def`, call-destination arm), certified by
+///     `place_ok`'s empty-projection arm on the destination;
+///   * the USE is a bare call argument — the exact use kind wave-30/wave-AF/wave-FR already
+///     admit for their ref temps (`operand_ok` on a bare local place);
+///   * **TOTAL value-mentions == 2 is the load-bearing wall**: a deref-read, a store through,
+///     a re-borrow, a second forward, a projected use — each is a THIRD mention and REFUSES,
+///     fail closed. So `_t` is an address in transit: no value of `P` is ever materialised in
+///     this body, which is why `P`'s drop glue and width are not this fragment's business
+///     (wave-AF's argument, verbatim). `&P` is `Copy` + `!needs_drop`, so
+///     `ElaborateDrops`/`AbortUnwindingCalls` are no-ops over it, and `PromoteTemps` finds no
+///     candidate (the def is a call, not a borrow — there is NO `Rvalue::Ref` to promote).
+///
+/// TWO POINTEE CLASSES, held as separate sets so each carries its own measured census:
+///   * `thin` — pointee CONCRETE and THIN ([`thin_shared_pointee_ok`]), the wave-AF clause;
+///   * `str_fat` — pointee EXACTLY `str` (`ty::Str`), the ONE wide pointee this fragment
+///     admits, and ONLY in this in-transit shape (`<AxiomId as Display>::fmt`'s
+///     `_t = name(_1); Formatter::write_str(_f, move _t)`). The fat `(ptr, len)` pair rides as
+///     an opaque immediate the body provably never inspects: the mentions == 2 wall proves no
+///     deref, no projection, no store, no re-borrow — so the metadata is never split,
+///     reconstructed or minted here (both producer and consumer are CALLEES, pinned by the
+///     comparator's raw-call channel before this gate runs). Every borrow-MINTING path
+///     (wave-29b/30/AF/W3/FR `Rvalue::Ref` arms) keeps its THIN clause untouched: nothing in
+///     this set admits a borrow def, so no fat borrow can be minted through it. `&[T]`,
+///     `&dyn Trait`, `&mut str` and every other wide pointee stay refused.
+///
+/// FAIL-CLOSED and NARROWING-ONLY: a local not in this set keeps every refusal it had. The
+/// differential independently re-checked the derived body against built (`DerivedAgreed` is
+/// required before any flip attempt), so a wrong callee or wrong value can only cost the flip,
+/// never ship.
+#[derive(Default)]
+struct CallDestFwd {
+    /// Concrete + THIN pointee (`&Level`, `&Expr`).
+    thin: HashSet<Local>,
+    /// Pointee EXACTLY `str` — the in-transit fat-pointer class (`&str`).
+    str_fat: HashSet<Local>,
+}
+
+impl CallDestFwd {
+    fn contains(&self, l: &Local) -> bool {
+        self.thin.contains(l) || self.str_fat.contains(l)
+    }
+}
+
+fn calldest_forward_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> CallDestFwd {
+    // Total VALUE mentions per local (storage markers / debuginfo are NonUse and uncounted).
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let mut calldest_def: HashMap<Local, u32> = HashMap::new();
+    let mut callarg_use: HashMap<Local, u32> = HashMap::new();
+    let mut self_feed: HashSet<Local> = HashSet::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        let Some(term) = &data.terminator else { continue };
+        let TerminatorKind::Call { args, destination, .. } = &term.kind else { continue };
+        let dest_admissible = destination.projection.is_empty()
+            && destination.local != RETURN_PLACE
+            && destination.local.as_usize() > body.arg_count
+            && matches!(body.local_decls[destination.local].ty.kind(), ty::Ref(_, _, m) if m.is_not());
+        if dest_admissible {
+            *calldest_def.entry(destination.local).or_default() += 1;
+        }
+        for arg in args.iter() {
+            if let Operand::Copy(p) | Operand::Move(p) = &arg.node {
+                if p.projection.is_empty() {
+                    *callarg_use.entry(p.local).or_default() += 1;
+                    if dest_admissible && p.local == destination.local {
+                        self_feed.insert(p.local);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = CallDestFwd::default();
+    for (&l, &d) in calldest_def.iter() {
+        let facts = CallDestFwdFacts {
+            calldest_defs: d,
+            mentions: mentions.get(&l).copied().unwrap_or_default(),
+            callarg_uses: callarg_use.get(&l).copied().unwrap_or_default(),
+            self_feed: self_feed.contains(&l),
+        };
+        if !calldest_fwd_admits(facts) {
+            continue;
+        }
+        let ty::Ref(_, pointee, _) = *body.local_decls[l].ty.kind() else { continue };
+        if thin_shared_pointee_ok(tcx, pointee) {
+            out.thin.insert(l);
+        } else if matches!(pointee.kind(), ty::Str) {
+            out.str_fat.insert(l);
+        }
+        // Any other pointee (slice, dyn, non-str unsized, non-concrete): NOT admitted —
+        // the local keeps its fail-closed refusal.
+    }
+    out
+}
+
 fn ref_args_forward_only<'tcx>(
     body: &Body<'tcx>,
     ref_args: &HashSet<Local>,
@@ -888,6 +1713,8 @@ fn ref_args_forward_only<'tcx>(
     payload_temps: &HashSet<Local>,
     addr_fwd_temps: &HashSet<Local>,
     relay_srcs: &HashSet<Local>,
+    call_fwd_temps: &HashSet<Local>,
+    field_pair_inners: &HashSet<Local>,
 ) -> Result<(), String> {
     let mut g = RefArgForwardGuard {
         ref_args,
@@ -895,6 +1722,8 @@ fn ref_args_forward_only<'tcx>(
         payload_temps,
         addr_fwd_temps,
         relay_srcs,
+        call_fwd_temps,
+        field_pair_inners,
         violation: None,
     };
     for (bb, data) in body.basic_blocks.iter_enumerated() {
@@ -1009,10 +1838,26 @@ impl<'tcx> Visitor<'tcx> for StructTempGuard<'_> {
         if self.struct_temps.contains(&place.local) {
             let is_call_dest = place.projection.is_empty()
                 && matches!(ctx, PlaceContext::MutatingUse(MutatingUseContext::Call));
+            // Trust (wave-MC, 2026-08-20): a BARE WHOLE-VALUE STORE `_t = <rvalue>` at empty
+            // projection, which is the by-value call-chain class's ARGUMENT temp
+            // (`_t = copy _param; f(move _t)` — built's own `as_operand` -> `as_temp`, measured
+            // verbatim in `crates/trust-thir-lower/probes/mc_call.rs`).
+            //
+            // This is the SAME footing as `is_call_dest`, not a new one: both are the local's
+            // single definition writing a WHOLE value of the local's own declared type, and
+            // `temp_struct_ty_ok` has already required that type to be a concrete, `Copy`,
+            // Drop-free struct. What makes a mention dangerous here is a PROJECTED write
+            // (`(_t.k) = v`), a `Drop`, or a mutable borrow — each of which reads or invalidates
+            // part of a value the shim did not write — and every one of those still records a
+            // violation, because each is either non-empty-projection or a different
+            // `MutatingUseContext`. `ElaborateDrops`/`AbortUnwindingCalls` stay no-ops over a
+            // `!needs_drop` local however it was written, so pass-totality is untouched.
+            let is_bare_store = place.projection.is_empty()
+                && matches!(ctx, PlaceContext::MutatingUse(MutatingUseContext::Store));
             let is_whole_read = place.projection.is_empty() && !ctx.is_mutating_use();
             let is_field_read = matches!(place.projection.first(), Some(ProjectionElem::Field(..)))
                 && !ctx.is_mutating_use();
-            if !is_call_dest && !is_whole_read && !is_field_read {
+            if !is_call_dest && !is_bare_store && !is_whole_read && !is_field_read {
                 self.violation.get_or_insert(place.local);
             }
         }
@@ -1030,8 +1875,81 @@ fn struct_temps_confined<'tcx>(
     }
     match g.violation {
         Some(l) => Err(format!(
-            "struct temp {l:?} used outside call-dest / whole read / scalar field read"
+            "struct temp {l:?} used outside call-dest / bare store / whole read / scalar field read"
         )),
+        None => Ok(()),
+    }
+}
+
+/// Trust (wave-WB, 2026-08-21, enum call-result TEMP): a NON-arg local the flip may declare for
+/// a FIELDLESS enum value produced by one call and consumed whole — wave-GH2's call-result-temp
+/// discipline extended from `Copy` Drop-free STRUCTS to `Copy` Drop-free FIELDLESS enums
+/// (`ConstantOrigin::needs_recheck`'s `_t: OriginTrust = trust(_1); needs_recheck(move _t)`,
+/// `<BinderData as Default>::default`'s `_t: BinderInfo = default()` consumed by the aggregate
+/// return — the wall-B "enum temps" class of the never-flip partition).
+///
+/// STRICTLY TIGHTER than [`temp_struct_ty_ok`] in shape: FIELDLESS only (every variant
+/// field-free — the wave-V ARG restriction, kept verbatim), so the enum's layout is its bare
+/// discriminant scalar and no payload/niche layout is ever reconstructed here. `Copy` +
+/// `!needs_drop` keep `ElaborateDrops`/`AbortUnwindingCalls` no-ops (pass-totality — the
+/// wave-GH2 argument, verbatim); concrete-only as everywhere in the fragment. The paired
+/// [`enum_temps_confined`] guard is TIGHTER than [`StructTempGuard`] too: a mention is admitted
+/// ONLY as (a) the bare CALL-DESTINATION write or (b) a bare whole `Copy`/`Move` OPERAND read —
+/// no bare store, no field read (ill-typed on an enum without a downcast), no discriminant read
+/// (that stays wave-V's ARG-only shape; a `Discriminant(_t)` rvalue on a temp additionally
+/// fails the gate's rvalue arm, which pins its source to an `enum_val_args` member).
+fn temp_enum_ty_ok<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    if ty.has_non_region_param() || ty.has_non_region_infer() {
+        return false;
+    }
+    let te = ty::TypingEnv::fully_monomorphized();
+    matches!(ty.kind(), ty::Adt(adt, _)
+        if adt.is_enum()
+            && !adt.variants().is_empty()
+            && adt.variants().iter().all(|v| v.fields.is_empty()))
+        && tcx.type_is_copy_modulo_regions(te, ty)
+        && !ty.needs_drop(tcx, te)
+}
+
+/// Trust (wave-WB): verify every mention of an `enum_temps` local (admitted by
+/// [`temp_enum_ty_ok`]) is one of the TWO shapes the derived body carries for a call-result
+/// fieldless-enum temp: the bare call-destination write, or a bare whole `Copy`/`Move` operand
+/// read (a call argument or an aggregate field operand). Any OTHER context — a bare `Store`
+/// def, a projected use, a `Discriminant` inspect, a borrow, a Drop — records a violation → no
+/// flip (clean-only preserved). Deliberately NARROWER than [`StructTempGuard`]: no bare-store
+/// arm (no admitted body defines an enum temp by plain assign) and no field-read arm (ill-typed
+/// on an enum base without a downcast).
+struct EnumTempGuard<'a> {
+    enum_temps: &'a HashSet<Local>,
+    violation: Option<Local>,
+}
+impl<'tcx> Visitor<'tcx> for EnumTempGuard<'_> {
+    fn visit_place(&mut self, place: &Place<'tcx>, ctx: PlaceContext, loc: Location) {
+        if self.enum_temps.contains(&place.local) {
+            let is_call_dest = place.projection.is_empty()
+                && matches!(ctx, PlaceContext::MutatingUse(MutatingUseContext::Call));
+            let is_whole_operand = place.projection.is_empty()
+                && matches!(
+                    ctx,
+                    PlaceContext::NonMutatingUse(
+                        NonMutatingUseContext::Copy | NonMutatingUseContext::Move
+                    )
+                );
+            if !is_call_dest && !is_whole_operand {
+                self.violation.get_or_insert(place.local);
+            }
+        }
+        self.super_place(place, ctx, loc);
+    }
+}
+
+fn enum_temps_confined<'tcx>(body: &Body<'tcx>, enum_temps: &HashSet<Local>) -> Result<(), String> {
+    let mut g = EnumTempGuard { enum_temps, violation: None };
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        g.visit_basic_block_data(bb, data);
+    }
+    match g.violation {
+        Some(l) => Err(format!("enum temp {l:?} used outside call-dest / bare whole operand read")),
         None => Ok(()),
     }
 }
@@ -1868,6 +2786,174 @@ fn term_name(kind: &TerminatorKind<'_>) -> &'static str {
 /// body outside the loop plan has no such local, so no body admitted today changes. The oracle
 /// re-checks the marker sequence against built regardless, so a wrong span can only cost the
 /// flip, never ship.
+/// Trust (lane S1F, 2026-08-22): facts certifying one UNIT CALL-DESTINATION temp — the `()`
+/// local `rustc_mir_build::stmt_expr` mints for a unit call in STATEMENT position
+/// (`{ f(self); }`), which the call-forward plan's unit-statement form now reproduces with
+/// built's own storage span around it:
+///
+/// ```text
+/// StorageLive(_2);            // opened before every argument temp
+/// _2 = f(move _3) -> bb1;     // the ONLY mention: a bare call destination
+/// bb1: StorageDead(_3); StorageDead(_2); _0 = const (); return;
+/// ```
+///
+/// Kept as one value so the production predicate is directly executable in unit tests, exactly
+/// as `CallDestFwdFacts` and `StrLitPairFacts` are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnitCallDestFacts {
+    /// Bare call-DESTINATION defs of the local (its ONLY admitted def kind).
+    calldest_defs: u32,
+    /// TOTAL value-mentions (storage markers are `NonUse` and uncounted).
+    mentions: u32,
+}
+
+fn unit_calldest_admits(f: UnitCallDestFacts) -> bool {
+    f.calldest_defs == 1 && f.mentions == 1
+}
+
+/// Trust (lane S1F, 2026-08-22): the UNIT CALL-DESTINATION temps — NON-arg, non-`_0` locals
+/// declared `()` whose SINGLE value mention is ONE bare `Call` destination. The argument is
+/// [`unit_region_temps`]' made one notch weaker and then recovered by the type: the one mention
+/// is a WRITE of a `()` — a ZST, `Copy`, `!needs_drop` — so no value is ever read out of the
+/// local, `ElaborateDrops` finds nothing to elaborate, `RemoveStorageMarkers` deletes the pair
+/// at `-O0`, and the `llvm.lifetime` intrinsics codegen emits at `-O` describe an empty range.
+/// Every pass between `Built` and `Runtime(Optimized)` is total over it exactly as over a
+/// scalar temp. FAIL-CLOSED and NARROWING-ONLY: a `()` local with any second mention (a read,
+/// a second write, a projection) is not in the set and keeps every refusal it had.
+fn unit_calldest_temps<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let mut calldest_defs: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        let Some(term) = &data.terminator else { continue };
+        let TerminatorKind::Call { destination, .. } = &term.kind else { continue };
+        if destination.projection.is_empty() {
+            *calldest_defs.entry(destination.local).or_default() += 1;
+        }
+    }
+    calldest_defs
+        .iter()
+        .filter(|(l, &d)| {
+            **l != RETURN_PLACE
+                && l.as_usize() > body.arg_count
+                && body.local_decls[**l].ty.is_unit()
+                && unit_calldest_admits(UnitCallDestFacts {
+                    calldest_defs: d,
+                    mentions: mentions.get(l).copied().unwrap_or(0),
+                })
+        })
+        .map(|(l, _)| *l)
+        .collect()
+}
+
+/// Trust (lane S1F, 2026-08-22): facts certifying one REBORROWED-RETURN CALL-DESTINATION temp —
+/// the `&P` local built routes a tail call into when its reference result is reborrowed into
+/// `_0` (`fn deref(&self) -> &R { self.resources() }`, and the overloaded-`Deref` coercion of a
+/// bare `self`), which the call-forward plan's reborrowed-return form reproduces with built's
+/// own storage span:
+///
+/// ```text
+/// StorageLive(_2);                 // opened before every argument temp
+/// _2 = f(move _3) -> bb1;          // the ONLY def: a bare call destination
+/// bb1: _0 = &(*_2); StorageDead(_3); StorageDead(_2); return;   // the ONLY use
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CallDestRetFacts {
+    /// Bare call-DESTINATION defs of the local (its ONLY admitted def kind).
+    calldest_defs: u32,
+    /// TOTAL value-mentions (storage markers are `NonUse` and uncounted).
+    mentions: u32,
+    /// `_0 = &(*_d)` SHARED reborrows of the local into bare `_0` (its ONLY admitted use).
+    ret_reborrows: u32,
+}
+
+fn calldest_ret_admits(f: CallDestRetFacts) -> bool {
+    f.calldest_defs == 1 && f.mentions == 2 && f.ret_reborrows == 1
+}
+
+/// Trust (lane S1F, 2026-08-22): the REBORROWED-RETURN CALL-DESTINATION temps — NON-arg,
+/// non-`_0` locals declared `&P` SHARED with [`thin_shared_pointee_ok`], whose SINGLE def is a
+/// bare `Call` destination and whose SINGLE use is the shared reborrow `_0 = &(*_d)` into bare
+/// `_0`, TOTAL value-mentions == 2. This is [`calldest_forward_temps`]' discipline with
+/// wave-29b's return-getter USE (`_0 = &(*_t)`) in place of the call-argument one: the address
+/// rides the call's return slot into `_0` and is never dereferenced, stored or split in this
+/// body; `&P` is `Copy` and `!needs_drop`; `PromoteTemps` finds no candidate. FAIL-CLOSED: any
+/// third mention refuses the local.
+fn calldest_ret_reborrow_temps<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> HashSet<Local> {
+    let mut mentions: HashMap<Local, u32> = HashMap::new();
+    struct MentionCounter<'a> {
+        m: &'a mut HashMap<Local, u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for MentionCounter<'_> {
+        fn visit_local(&mut self, l: Local, ctx: PlaceContext, _loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            *self.m.entry(l).or_default() += 1;
+        }
+    }
+    {
+        let mut c = MentionCounter { m: &mut mentions };
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            c.visit_basic_block_data(bb, data);
+        }
+    }
+    let mut calldest_defs: HashMap<Local, u32> = HashMap::new();
+    let mut ret_reborrows: HashMap<Local, u32> = HashMap::new();
+    for (_bb, data) in body.basic_blocks.iter_enumerated() {
+        for stmt in &data.statements {
+            let StatementKind::Assign(assign) = &stmt.kind else { continue };
+            let (place, rvalue) = &**assign;
+            if place.local != RETURN_PLACE || !place.projection.is_empty() {
+                continue;
+            }
+            if let Rvalue::Ref(_, BorrowKind::Shared, borrowed) = rvalue {
+                if borrowed.projection.len() == 1
+                    && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                {
+                    *ret_reborrows.entry(borrowed.local).or_default() += 1;
+                }
+            }
+        }
+        let Some(term) = &data.terminator else { continue };
+        let TerminatorKind::Call { destination, .. } = &term.kind else { continue };
+        if destination.projection.is_empty() {
+            *calldest_defs.entry(destination.local).or_default() += 1;
+        }
+    }
+    calldest_defs
+        .iter()
+        .filter(|(l, &d)| {
+            **l != RETURN_PLACE
+                && l.as_usize() > body.arg_count
+                && matches!(*body.local_decls[**l].ty.kind(), ty::Ref(_, pointee, m)
+                    if m.is_not() && thin_shared_pointee_ok(tcx, pointee))
+                && calldest_ret_admits(CallDestRetFacts {
+                    calldest_defs: d,
+                    mentions: mentions.get(l).copied().unwrap_or(0),
+                    ret_reborrows: ret_reborrows.get(l).copied().unwrap_or(0),
+                })
+        })
+        .map(|(l, _)| *l)
+        .collect()
+}
+
 fn unit_region_temps<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
     let mut mentions: HashMap<Local, u32> = HashMap::new();
     struct MentionCounter<'a> {
@@ -1906,7 +2992,7 @@ fn unit_region_temps<'tcx>(body: &Body<'tcx>) -> HashSet<Local> {
         .collect()
 }
 
-fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), String> {
+pub(crate) fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), String> {
     if body.coroutine.is_some() {
         return Err("derived body carries coroutine info".to_string());
     }
@@ -1939,11 +3025,42 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
     // Trust (lane L9): the loop plan's two `()` REGION locals — value-mentions == 0, so the local
     // is a storage span and nothing else. See [`unit_region_temps`].
     let unit_regions = unit_region_temps(body);
+    // Trust (lane S1F): the call-forward unit-statement form's `()` call-destination temp —
+    // one bare `Call` destination write, no other value mention. See [`unit_calldest_temps`].
+    let unit_calldest = unit_calldest_temps(body);
+    // Trust (lane S1F): the reborrowed-return call-destination temps `_d = f(..); _0 = &(*_d)`
+    // — one bare call-destination write, one shared reborrow into `_0`. See
+    // [`calldest_ret_reborrow_temps`].
+    let calldest_ret = calldest_ret_reborrow_temps(tcx, body);
     // Trust (wave-AF): shared-ref temps holding the ADDRESS of a NON-scalar interior place,
     // forwarded whole into one call and NEVER dereferenced (`_t = &((*_p).k); g(copy _t)` and its
     // enum-payload twin) — admitted below by their single-def / single-call-arg-use shape
     // (`addr_forward_temps` proves total place-mentions == 2, so no other observation exists).
     let addr_fwd_temps = addr_forward_temps(tcx, body);
+    // Trust (wave-FR): the call-forward reborrow temps `_t = &[mut] (*_p); f(move _t)` — the
+    // argument temps `to_mir`'s call-forward marker plan mints for a single-block tail call,
+    // admitted by their single-def / single-call-arg-move shape (`call_fwd_reborrow_temps`
+    // proves total value-mentions == 2, so no other observation exists).
+    let call_fwd_temps = call_fwd_reborrow_temps(tcx, body);
+    // Trust (lane EM): the `&str`-LITERAL argument pairs `_u = const "lit"; _t = &(*_u);
+    // f(move _t)` — the two locals the CF_STR emission mints for a `&str` literal call
+    // argument, admitted by their pair-linked single-def / mentions == 2 shape
+    // (`str_lit_pair_temps` proves the fat pointer rides only in transit).
+    let str_lit_pairs = str_lit_pair_temps(tcx, body);
+    // Trust (lane S1F): the explicit-borrow field pairs `_u = &((*_p).0); _t = &(*_u);
+    // f(move _t)` — the derived `Ord::cmp`'s two locals per argument, admitted by their
+    // pair-linked single-def / mentions == 2 shape (`field_pair_temps`).
+    let field_pairs = field_pair_temps(tcx, body);
+    // Trust (wave-WB8): the chain in-transit reborrow pairs `_u = g(..); _t = &(*_u);
+    // f(move _t)` — the two locals the chain-forward marker emission mints for a
+    // reference-returning inner call, admitted by their pair-linked single-def /
+    // mentions == 2 shape (`transit_pair_temps` proves the address rides only in transit).
+    let transit_pairs = transit_pair_temps(tcx, body);
+    // Trust (wave-WB): the lone call-dest forward temps `_t = f(..); g(move _t)` — the wall-B
+    // "lone-source relay" class (thin pointee) and its in-transit `&str` sibling, admitted below
+    // by their single-calldest-def / single-call-arg-use shape (`calldest_forward_temps` proves
+    // total value-mentions == 2, so no other observation exists).
+    let calldest_fwd = calldest_forward_temps(tcx, body);
     // Trust (wave-W3): the deref-recursion reference relay — the arm binding, its argument
     // reborrow, the accessor's destination and its autoref, each proven (mentions == 2) to be an
     // address in transit that this body never dereferences. See [`deref_relay_temps`].
@@ -1952,6 +3069,10 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
     // (`_2 = Arguments::from_str(..); _print(move _2)`). Copy + Drop-free + concrete only
     // (`temp_struct_ty_ok`); every mention confined by `struct_temps_confined` below.
     let mut struct_val_temps: HashSet<Local> = HashSet::new();
+    // Trust (wave-WB): NON-arg FIELDLESS-enum temps holding a call result consumed whole
+    // (`_t = trust(_1); needs_recheck(move _t)`). Copy + Drop-free + concrete + fieldless only
+    // (`temp_enum_ty_ok`); every mention confined by `enum_temps_confined` below.
+    let mut enum_val_temps: HashSet<Local> = HashSet::new();
     for (l, decl) in body.local_decls.iter_enumerated() {
         if local_ty_ok(decl.ty) {
             continue;
@@ -1988,6 +3109,61 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
         // names it. `deref_relay_temps` proved it is used ONLY there (mentions == 2), so `_t` is
         // never dereferenced and no value of `P` is ever produced in this body.
         if relay.contains(&l) {
+            continue;
+        }
+        // Trust (wave-FR): a call-forward reborrow temp `_t: &T` / `&mut T` — the tail call's
+        // argument temp. Its def is admitted by the `Rvalue::Ref` arms (shared and mut), its
+        // one use by `operand_ok` (a bare local place moved as a call argument);
+        // `call_fwd_reborrow_temps` proved it is used ONLY there (mentions == 2), so `_t` is
+        // NEVER DEREFERENCED, never stored through and never re-borrowed in this body — an
+        // address in transit, on wave-30's exact footing, with the pointee separately pinned
+        // concrete + THIN.
+        if call_fwd_temps.contains(&l) {
+            continue;
+        }
+        // Trust (lane EM): a `&str`-literal argument pair member — the literal's own local
+        // `_u = const "..."` or the argument temp `_t = &(*_u)`. `str_lit_pair_temps` proved
+        // the pair-linked single-def / mentions == 2 shape: `_u` is the const def + the one
+        // borrow base, `_t` is the borrow def + one bare call-argument move — so the fat
+        // `(ptr, len)` pair is never split, stored, re-borrowed or dereferenced here, and no
+        // value of `str` is ever produced in this body.
+        if str_lit_pairs.contains(&l) {
+            continue;
+        }
+        // Trust (wave-WB8): a chain in-transit pair member — the inner call's destination
+        // `_u` or the outer argument temp `_t = &(*_u)`. `transit_pair_temps` proved the
+        // pair-linked single-def / mentions == 2 shape: `_u` is the call-dest write + the one
+        // borrow base, `_t` is the borrow def + one bare call-argument move — so the address
+        // (thin, or the one admitted `str` fat pair) is never split, stored, re-borrowed or
+        // dereferenced here, and no value of the pointee is ever produced in this body.
+        if transit_pairs.contains(&l) {
+            continue;
+        }
+        // Trust (lane S1F): an explicit-borrow field pair member — the inner local
+        // `_u = &((*_p).0)` or the argument temp `_t = &(*_u)`. `field_pair_temps` proved the
+        // pair-linked single-def / mentions == 2 shape on both, so the address is never
+        // dereferenced, stored, re-borrowed or split here, and no value of the pointee is ever
+        // produced in this body — wave-AF's footing, pair-linked as lane EM's.
+        if field_pairs.contains(&l) {
+            continue;
+        }
+        // Trust (lane S1F): a reborrowed-return call-destination temp `_d: &P`. Its def is
+        // admitted by the `Call` arm's bare-local destination, its one use by the `Rvalue::Ref`
+        // arm's `_0 = &(*_d)` clause; `calldest_ret_reborrow_temps` proved it is used ONLY
+        // there (mentions == 2), so `_d` is never dereferenced, stored through or re-borrowed
+        // elsewhere — an address in transit on wave-WB's exact footing.
+        if calldest_ret.contains(&l) {
+            continue;
+        }
+        // Trust (wave-WB): a lone call-dest forward temp `_t: &P` (thin class) or `_t: &str`
+        // (in-transit fat class). Its def is admitted by the `Call` arm's bare-local
+        // destination (`place_ok` empty-projection), its one use by `operand_ok` (a bare local
+        // place as a call argument); `calldest_forward_temps` proved it is used ONLY there
+        // (mentions == 2), so `_t` is NEVER DEREFERENCED, never stored through and never
+        // re-borrowed in this body — an address in transit on wave-AF's exact footing. The
+        // `str` class additionally rides its `(ptr, len)` metadata as an opaque immediate this
+        // body provably never splits (see `calldest_forward_temps`).
+        if calldest_fwd.contains(&l) {
             continue;
         }
         // Trust (wave-15): the RETURN local `_0` of a SHARED-ref identity return
@@ -2028,6 +3204,14 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
             // proves EVERY mention is such a bare discriminant read, so the shim never emits an
             // ill-typed whole-enum `Copy`/`Move` or a field/downcast read.
             enum_val_args.insert(l);
+        } else if !is_arg && l.as_usize() != 0 && temp_enum_ty_ok(tcx, decl.ty) {
+            // Trust (wave-WB): a NON-arg FIELDLESS-enum TEMP holding a call result consumed
+            // whole — `ConstantOrigin::needs_recheck`'s `_t: OriginTrust`, `BinderData::
+            // default`'s `_t: BinderInfo`. `enum_temps_confined` (below) proves every mention
+            // is the bare call-dest write or a bare whole Copy/Move operand read — nothing a
+            // replayed pass could act on beyond ordinary total MIR (the wave-GH2 argument over
+            // a strictly simpler layout: a bare discriminant scalar).
+            enum_val_temps.insert(l);
         } else if !is_arg && l.as_usize() != 0 && temp_struct_ty_ok(tcx, decl.ty) {
             // Trust (wave-GH2): a NON-arg struct TEMP holding a call result consumed whole by a
             // later call — the `println!` desugar's `_2: Arguments<'_>` (the wave-J callee-return
@@ -2058,6 +3242,8 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
             &payload_temps,
             &addr_fwd_temps,
             &relay.srcs,
+            &call_fwd_temps,
+            &field_pairs.inners,
         )?;
     }
     // Trust (wave-S → B10 stage 2, RETIRED): the read+write order-mix fail-close that stood here
@@ -2084,6 +3270,11 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
     // call-destination write, a whole non-mutating use (call-arg move), or a scalar field read.
     if !struct_val_temps.is_empty() {
         struct_temps_confined(body, &struct_val_temps)?;
+    }
+    // Trust (wave-WB): every fieldless-enum call-result temp admitted above must appear ONLY as
+    // the bare call-destination write or a bare whole Copy/Move operand read.
+    if !enum_val_temps.is_empty() {
+        enum_temps_confined(body, &enum_val_temps)?;
     }
     let n_blocks = body.basic_blocks.len();
     let target_ok = |bb: BasicBlock| -> Result<(), String> {
@@ -2148,7 +3339,11 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                                     || interior_arg_temps.contains(&place.local)
                                     || payload_temps.contains(&place.local)
                                     || addr_fwd_temps.contains(&place.local)
-                                    || relay.contains(&place.local)) =>
+                                    || relay.contains(&place.local)
+                                    || call_fwd_temps.contains(&place.local)
+                                    || str_lit_pairs.args.contains(&place.local)
+                                    || transit_pairs.args.contains(&place.local)
+                                    || field_pairs.contains(&place.local)) =>
                         {
                             // The `_0 = &(*_t)` reborrow of an interior temp (wave-29b): `[Deref]` on a
                             // certified interior temp is total (a plain deref of a `&FieldTy` temp the
@@ -2180,14 +3375,102 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                             // here, on the borrow path, for `place_ok`'s own stated reason: it is
                             // direction-blind, so neither shape may become an arm of it.
                             let is_relay = is_relay_borrow(body, &relay, place, borrowed);
+                            // Trust (wave-FR): the call-forward reborrow def `_t = &(*_p)` — a
+                            // bare `[Deref]` of a SHARED ref ARG into a certified
+                            // `call_fwd_reborrow_temps` local. `place_ok`'s `[Deref]` arm pins
+                            // its pointee to a fragment SCALAR (it certifies a READ, which
+                            // produces a value); this borrow produces only the ADDRESS, the
+                            // scan proved `_t` is never dereferenced here, and the pointee is
+                            // separately pinned concrete + THIN — so the admission is spelled
+                            // HERE, on the borrow path only, where a store can never reach it
+                            // (wave-AF's own siting argument, verbatim).
+                            let is_call_fwd_borrow = call_fwd_temps.contains(&place.local)
+                                && borrowed.projection.len() == 1
+                                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                                && borrowed.local.as_usize() >= 1
+                                && borrowed.local.as_usize() <= body.arg_count;
+                            // Trust (lane EM): the `&str`-literal pair's borrow def
+                            // `_t = &(*_u)` — a bare `[Deref]` of the pair's own LITERAL
+                            // local into its certified arg temp. This is the fragment's ONE
+                            // fat borrow def, and it is pair-pinned on BOTH sides:
+                            // `str_lit_pair_temps` certified `_t`'s set membership AND that
+                            // `_u` is `_t`'s one linked base (const-defed, mentions == 2), so
+                            // a borrow of any OTHER local into `_t` — or of `_u` into any
+                            // other destination — still lands in `place_ok` and is refused.
+                            // Spelled here, on the borrow path only, where a store can never
+                            // reach it (wave-AF's siting argument, verbatim).
+                            let is_str_lit_pair_borrow = str_lit_pairs.args.contains(&place.local)
+                                && borrowed.projection.len() == 1
+                                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                                && str_lit_pairs.lits.contains(&borrowed.local);
+                            // Trust (wave-WB8): the chain pair's borrow def `_t = &(*_u)` —
+                            // a bare `[Deref]` of the pair's own certified in-transit call
+                            // destination into its certified arg temp, pair-pinned on BOTH
+                            // sides exactly as the `&str`-literal pair is: a borrow of any
+                            // OTHER local into `_t`, or of `_u` into any other destination,
+                            // still lands in `place_ok` and is refused. Spelled here, on the
+                            // borrow path only, where a store can never reach it (wave-AF's
+                            // siting argument, verbatim).
+                            let is_transit_pair_borrow = transit_pairs.args.contains(&place.local)
+                                && borrowed.projection.len() == 1
+                                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                                && transit_pairs.dests.contains(&borrowed.local);
+                            // Trust (lane S1F): the explicit-borrow field pair's two defs —
+                            // the INNER `_u = &((*_p).0: F)` (wave-AF's interior place, field
+                            // type not required to be a fragment scalar, into a certified
+                            // inner local) and the OUTER `_t = &(*_u)` (a bare `[Deref]` of
+                            // the pair's own certified inner into its certified arg temp,
+                            // pair-pinned on BOTH sides exactly as the `&str`-literal pair
+                            // is). Spelled here, on the borrow path only (wave-AF's siting
+                            // argument, verbatim).
+                            let is_field_pair_inner_borrow =
+                                field_pairs.inners.contains(&place.local)
+                                    && interior_field_ty(body, borrowed).is_some();
+                            let is_field_pair_reborrow = field_pairs.args.contains(&place.local)
+                                && borrowed.projection.len() == 1
+                                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                                && field_pairs.inners.contains(&borrowed.local);
+                            // Trust (lane S1F): the reborrowed return `_0 = &(*_d)` — a bare
+                            // `[Deref]` of a certified call-destination temp into bare `_0`,
+                            // wave-29b's return-getter use with the call-destination def.
+                            let is_calldest_ret_reborrow = place.local == RETURN_PLACE
+                                && borrowed.projection.len() == 1
+                                && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                                && calldest_ret.contains(&borrowed.local);
                             if !is_temp_reborrow
                                 && !is_payload_borrow
                                 && !is_addr_fwd_borrow
                                 && !is_relay
+                                && !is_call_fwd_borrow
+                                && !is_str_lit_pair_borrow
+                                && !is_transit_pair_borrow
+                                && !is_field_pair_inner_borrow
+                                && !is_field_pair_reborrow
+                                && !is_calldest_ret_reborrow
                             {
                                 place_ok(body, borrowed)?;
                             }
                         }
+                        // Trust (wave-FR): the MUT call-forward reborrow def `_t = &mut (*_p)`
+                        // — the `&mut T` argument temp of the same tail-call class, admitted
+                        // ONLY into a certified `call_fwd_reborrow_temps` local (whose scan
+                        // already pinned the borrow kind to `Mut { Default }` MATCHING the
+                        // temp's own declared mutability, the base to an ARG declared at `_t`'s
+                        // exact region-erased type, and the pointee concrete + THIN). No other
+                        // destination may take a `&mut` borrow: anything outside the set still
+                        // lands in the fail-closed `other =>` arm below. The referent mutation
+                        // happens in the CALLEE, exactly as it already does when this body
+                        // forwards `_p` bare — the wave-8a form this emission replaces.
+                        Rvalue::Ref(
+                            _,
+                            BorrowKind::Mut { kind: rustc_middle::mir::MutBorrowKind::Default },
+                            borrowed,
+                        ) if place.projection.is_empty()
+                            && call_fwd_temps.contains(&place.local)
+                            && borrowed.projection.len() == 1
+                            && matches!(borrowed.projection[0], ProjectionElem::Deref)
+                            && borrowed.local.as_usize() >= 1
+                            && borrowed.local.as_usize() <= body.arg_count => {}
                         // Trust (wave-D, Drop-free aggregate constructor-return FLIP): the single
                         // `_0 = Rvalue::Aggregate(Adt(did, 0, args), [scalar fields])` the shim emits
                         // for a constructor return. Admitted ONLY into the bare RETURN_PLACE, variant
@@ -2317,11 +3600,104 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                     // markers are here. The argument is wave-29b's, unchanged: the mentions == 2
                     // scan proved the local is used ONLY as its def + one use, so every pass is
                     // total over the marker exactly as over a scalar one.
+                    // Trust (wave-MC, 2026-08-20): a FIFTH admitted non-scalar marked local —
+                    // the by-value CALL-ARGUMENT temp `_t: S` of `StorageLive(_t);
+                    // _t = copy _param; f(move _t); StorageDead(_t)`, which is byte-for-byte
+                    // built's own `as_operand` -> `as_temp` (measured verbatim in
+                    // `crates/trust-thir-lower/probes/mc_call.rs`, and quoted on
+                    // `to_mir::plan_call_markers`).
+                    //
+                    // The argument is wave-29b's, and it is STRONGER here rather than weaker:
+                    //   * `temp_struct_ty_ok` already required `S` to be a CONCRETE struct that is
+                    //     `Copy` AND `!needs_drop`, so `ElaborateDrops`/`AbortUnwindingCalls` find
+                    //     nothing to elaborate on it — the property wave-29b had to argue from the
+                    //     mention count, this one has from the TYPE;
+                    //   * `struct_temps_confined` has ALREADY RUN (above, before this loop) and
+                    //     proved every mention of `_t` is the bare whole-value store that defines
+                    //     it, a whole non-mutating read, a scalar field read, or a call-destination
+                    //     write — so no pass can observe a shape the shim did not emit;
+                    //   * and the two marker SEQUENCES coincide by construction, which
+                    //     `markers_exact` then verifies against built. At `-O0`
+                    //     `RemoveStorageMarkers` deletes them; at `-O` codegen emits matching
+                    //     `llvm.lifetime` intrinsics precisely because the sequences agree.
+                    //
+                    // WITHOUT THIS the class is unreachable and the refusal is loud rather than
+                    // silent: `reason="storage marker on non-scalar local _3"`, measured on
+                    // `clean_kernel::expr::meta::ExprMeta::has_loose_bvars` with
+                    // `markers_exact: true` and `4 marker line(s) identical` already in hand.
                     if !scalar_ok(body.local_decls[*l].ty)
                         && !interior_arg_temps.contains(l)
                         && !payload_temps.contains(l)
                         && !unit_regions.contains(l)
                         && !relay.contains(l)
+                        && !struct_val_temps.contains(l)
+                        && !call_fwd_temps.contains(l)
+                        // Trust (wave-WB): the lone call-dest forward temps and the fieldless-
+                        // enum call-result temps carry built's own storage spans; the mentions
+                        // == 2 scan (calldest) / the confinement guard (enum, Copy + Drop-free
+                        // by type) prove every pass is total over the marker exactly as over a
+                        // scalar one — wave-29b's argument, unchanged.
+                        && !calldest_fwd.contains(l)
+                        && !enum_val_temps.contains(l)
+                        // Trust (lane EM): the `&str`-literal pair's two locals carry built's
+                        // own storage spans (`StorageLive(_3); StorageLive(_4); ...;
+                        // StorageDead(_3); ...; StorageDead(_4)`, measured verbatim on
+                        // `f.write_str("hello")`); the pair-linked mentions == 2 scan proved
+                        // every pass is total over the markers exactly as over a scalar one —
+                        // wave-29b's argument, unchanged.
+                        && !str_lit_pairs.contains(l)
+                        // Trust (wave-WB8): the chain pair's two locals carry built's own
+                        // storage spans (`StorageLive(_4); StorageLive(_5); …;
+                        // StorageDead(_4); …; StorageDead(_5)`, measured verbatim on
+                        // `f.write_str(self.name())`); the pair-linked mentions == 2 scan
+                        // proved every pass is total over the markers exactly as over a
+                        // scalar one — wave-29b's argument, unchanged.
+                        && !transit_pairs.contains(l)
+                        // Trust (lane S1F, 2026-08-22): the ADDRESS-FORWARD temp `_t: &F` with
+                        // `F` NOT a fragment scalar — `StorageLive(_t); _t = &((*_p).0: F);
+                        // g(move _t); StorageDead(_t)`, the call-forward plan's FIELD-projection
+                        // class, byte-for-byte built's own `as_operand` -> `as_temp` interior
+                        // borrow of a `self.map.len()` receiver (measured verbatim,
+                        // `probes/s1f.rs` a1: `_2 = &((*_1).0: HashMap<u64, u64>)`). The set
+                        // itself is wave-AF's, unchanged; what is new is ONLY that its members
+                        // may carry the pair. The argument is wave-FR's for the bare reborrow,
+                        // and it is the same argument because it rests on the same facts:
+                        // `addr_forward_temps` proved (value-mentions == 2) that `_t` is its one
+                        // borrow def and its one call-argument use and NOTHING else — never
+                        // dereferenced, never stored, never reborrowed — so no value of `F` is
+                        // produced in this body and `F`'s width and drop glue are not its
+                        // business; `&F` is `Copy` and `!needs_drop` by construction, so
+                        // `ElaborateDrops` finds nothing to elaborate; and the pointee is
+                        // separately pinned concrete + THIN (`thin_shared_pointee_ok`). Storage
+                        // markers are `NonUse` and do not enter the mention count, so the set
+                        // admits the marked and the unmarked temp alike; `RemoveStorageMarkers`
+                        // deletes the pair at `-O0` and codegen emits matching `llvm.lifetime`
+                        // intrinsics at `-O` precisely because the sequences agree — which
+                        // `markers_exact` verifies against built regardless.
+                        //
+                        // WITHOUT THIS the class is unreachable and the refusal is loud rather
+                        // than silent: `reason="storage marker on non-scalar local _2"` on
+                        // every `&HashMap`/`&Vec` forwarder the plan admits.
+                        && !addr_fwd_temps.contains(l)
+                        // Trust (lane S1F): the unit-statement form's `()` call-destination
+                        // temp carries built's own storage span (`StorageLive(_2); …;
+                        // StorageDead(_2); _0 = const ()`, measured verbatim on `{ f(self); }`);
+                        // `unit_calldest_temps` proved its one mention is the call's write of
+                        // a ZST, so every pass is total over the marker exactly as over a
+                        // scalar one — wave-29b's argument, with the type doing the work.
+                        && !unit_calldest.contains(l)
+                        // Trust (lane S1F): the explicit-borrow field pair's two locals carry
+                        // built's own storage spans (`live _3; live _4; …; dead _4; dead _3`,
+                        // measured verbatim on the derived `Ord::cmp`); the pair-linked
+                        // mentions == 2 scan proved every pass is total over the markers
+                        // exactly as over a scalar one — wave-29b's argument, unchanged.
+                        && !field_pairs.contains(l)
+                        // Trust (lane S1F): the reborrowed-return destination temp carries
+                        // built's own storage span (`live _2; …; _0 = &(*_2); dead _3;
+                        // dead _2`, measured verbatim on `{ self.resources() }`); the mentions
+                        // == 2 scan proved every pass is total over the marker exactly as over
+                        // a scalar one — wave-29b's argument, unchanged.
+                        && !calldest_ret.contains(l)
                     {
                         return Err(format!(
                             "storage marker on non-scalar local _{}",
@@ -2428,7 +3804,13 @@ fn gate_derived_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<(), S
                     if let Operand::Copy(p) = &a.node {
                         if p.projection.is_empty() {
                             let aty = body.local_decls[p.local].ty;
-                            if matches!(aty.kind(), ty::Adt(adt, _) if adt.is_struct()) {
+                            // Trust (wave-WB): the same parity hazard applies to a whole-
+                            // ENUM `Copy` arg (wave-WB admits enum call-result temps as whole
+                            // call args). A fieldless enum is an Immediate scalar and never
+                            // trips this, but the gate checks the layout rather than assume
+                            // the set stayed fieldless — fail closed on any memory-ABI Adt.
+                            if matches!(aty.kind(), ty::Adt(adt, _) if adt.is_struct() || adt.is_enum())
+                            {
                                 if !crate::layout_query_is_reentrant_safe(aty) {
                                     return Err(format!(
                                         "whole-struct Copy call arg with memory ABI \
@@ -2621,7 +4003,10 @@ fn assert_key<'tcx>(kind: &TerminatorKind<'tcx>) -> Result<(AssertClass, bool), 
 /// honest. The parity checks stay because they are evidence, not metadata: `DerivedAgreed`
 /// proved the sequences identical in canonical order, and this re-checks it at the seam
 /// anyway — any mismatch rejects the flip. Returns the number of verified asserts.
-fn verify_assert_parity<'tcx>(derived: &Body<'tcx>, normal: &Body<'tcx>) -> Result<usize, String> {
+pub(crate) fn verify_assert_parity<'tcx>(
+    derived: &Body<'tcx>,
+    normal: &Body<'tcx>,
+) -> Result<usize, String> {
     let d_asserts = asserts_in_dfs_order(derived)?;
     let n_asserts = asserts_in_dfs_order(normal)?;
     if d_asserts.len() != n_asserts.len() {
@@ -2727,10 +4112,327 @@ mod w3_regression_tests {
         )));
     }
 
+    const ACCEPT_CALLDEST: CallDestFwdFacts =
+        CallDestFwdFacts { calldest_defs: 1, mentions: 2, callarg_uses: 1, self_feed: false };
+
+    /// Trust (lane S1F): the storage-marker arm admits the address-forward set — and ONLY by
+    /// membership in that set, whose mentions == 2 clause is the proof. The needle is BUILT
+    /// FROM PARTS so this test's own source never contains it.
+    #[test]
+    fn s1f_storage_markers_are_admitted_on_address_forward_temps() {
+        let src = include_str!("flip.rs");
+        let needle = format!("&& !{}.contains(l)", "addr_fwd_temps");
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            1,
+            "the field-projection class rides the wave-AF set's proof, in the marker arm, once"
+        );
+        let set = format!("let {} = {}(tcx, body);", "addr_fwd_temps", "addr_forward_temps");
+        assert_eq!(src.matches(set.as_str()).count(), 1, "one set, one constructor");
+    }
+
+    const ACCEPT_FIELD_PAIR: FieldPairFacts = FieldPairFacts {
+        u_borrow_defs: 1,
+        u_mentions: 2,
+        t_reborrow_defs: 1,
+        t_mentions: 2,
+        t_callarg_moves: 1,
+        self_pair: false,
+    };
+
+    #[test]
+    fn s1f_exact_field_pair_admits() {
+        assert!(
+            field_pair_admits(ACCEPT_FIELD_PAIR),
+            "a gate which refuses the exact two-local explicit-borrow pair would make the \
+             pair class vacuous",
+        );
+    }
+
+    #[test]
+    fn s1f_any_forbidden_field_pair_shape_is_refused() {
+        for (i, mutate) in [
+            (&|f: &mut FieldPairFacts| f.u_mentions = 3) as &dyn Fn(&mut FieldPairFacts),
+            &|f| f.t_mentions = 3,
+            &|f| f.u_borrow_defs = 0,
+            &|f| f.u_borrow_defs = 2,
+            &|f| f.t_reborrow_defs = 2,
+            &|f| f.t_callarg_moves = 0,
+            &|f| f.t_callarg_moves = 2,
+            &|f| f.self_pair = true,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut f = ACCEPT_FIELD_PAIR;
+            mutate(&mut f);
+            assert!(!field_pair_admits(f), "mutant {i} must be refused: {f:?}");
+        }
+        let src = include_str!("flip.rs");
+        let needle = format!("&& !{}.contains(l)", "field_pairs");
+        assert_eq!(src.matches(needle.as_str()).count(), 1, "admitted in the marker arm, once");
+    }
+
+    const ACCEPT_CALLDEST_RET: CallDestRetFacts =
+        CallDestRetFacts { calldest_defs: 1, mentions: 2, ret_reborrows: 1 };
+
+    #[test]
+    fn s1f_exact_calldest_ret_reborrow_admits() {
+        assert!(
+            calldest_ret_admits(ACCEPT_CALLDEST_RET),
+            "a gate which refuses the exact reborrowed-return destination shape would make the \
+             class vacuous",
+        );
+    }
+
+    #[test]
+    fn s1f_any_forbidden_calldest_ret_shape_is_refused() {
+        for (i, mutate) in [
+            (&|f: &mut CallDestRetFacts| f.mentions = 3) as &dyn Fn(&mut CallDestRetFacts),
+            &|f| f.calldest_defs = 2,
+            &|f| f.ret_reborrows = 0,
+            &|f| f.ret_reborrows = 2,
+            &|f| {
+                f.calldest_defs = 0;
+                f.mentions = 1;
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut f = ACCEPT_CALLDEST_RET;
+            mutate(&mut f);
+            assert!(!calldest_ret_admits(f), "mutant {i} must be refused: {f:?}");
+        }
+        let src = include_str!("flip.rs");
+        let needle = format!("&& !{}.contains(l)", "calldest_ret");
+        assert_eq!(src.matches(needle.as_str()).count(), 1, "admitted in the marker arm, once");
+    }
+
+    const ACCEPT_UNIT_CALLDEST: UnitCallDestFacts =
+        UnitCallDestFacts { calldest_defs: 1, mentions: 1 };
+
+    #[test]
+    fn s1f_exact_unit_calldest_admits() {
+        assert!(
+            unit_calldest_admits(ACCEPT_UNIT_CALLDEST),
+            "a gate which refuses the exact unit call-destination shape would make the \
+             unit-statement class vacuous",
+        );
+    }
+
+    #[test]
+    fn s1f_any_forbidden_unit_calldest_shape_is_refused() {
+        let mut read_back = ACCEPT_UNIT_CALLDEST;
+        read_back.mentions = 2;
+        assert!(!unit_calldest_admits(read_back), "a second mention is a read or a second write");
+        let mut double_def = ACCEPT_UNIT_CALLDEST;
+        double_def.calldest_defs = 2;
+        double_def.mentions = 2;
+        assert!(!unit_calldest_admits(double_def));
+        let mut never_written = ACCEPT_UNIT_CALLDEST;
+        never_written.calldest_defs = 0;
+        never_written.mentions = 0;
+        assert!(
+            !unit_calldest_admits(never_written),
+            "a never-written `()` local is `unit_region_temps`' business, not this set's"
+        );
+        let src = include_str!("flip.rs");
+        let needle = format!("&& !{}.contains(l)", "unit_calldest");
+        assert_eq!(src.matches(needle.as_str()).count(), 1, "admitted in the marker arm, once");
+    }
+
+    #[test]
+    fn wb_exact_lone_calldest_forward_admits() {
+        assert!(
+            calldest_fwd_admits(ACCEPT_CALLDEST),
+            "a gate which refuses the exact lone call-dest forward shape would make wave-WB vacuous",
+        );
+    }
+
+    #[test]
+    fn wb_any_forbidden_calldest_shape_is_refused() {
+        let mut third_mention = ACCEPT_CALLDEST;
+        third_mention.mentions = 3;
+        assert!(
+            !calldest_fwd_admits(third_mention),
+            "a deref-read, store, re-borrow, second forward or projected use is a third mention \
+             and must close the lane",
+        );
+
+        let mut no_use = ACCEPT_CALLDEST;
+        no_use.callarg_uses = 0;
+        no_use.mentions = 2;
+        assert!(
+            !calldest_fwd_admits(no_use),
+            "two defs / a non-call-arg second mention must not ride the mentions count alone",
+        );
+
+        let mut double_def = ACCEPT_CALLDEST;
+        double_def.calldest_defs = 2;
+        assert!(!calldest_fwd_admits(double_def));
+
+        let mut double_use = ACCEPT_CALLDEST;
+        double_use.callarg_uses = 2;
+        assert!(!calldest_fwd_admits(double_use));
+
+        let mut self_feed = ACCEPT_CALLDEST;
+        self_feed.self_feed = true;
+        assert!(
+            !calldest_fwd_admits(self_feed),
+            "`_t = f(move _t)` reads an uninitialized local and must be refused explicitly",
+        );
+    }
+
     #[test]
     fn w3b_legacy_continue_only_mutant_is_killed() {
         let continue_only = |unwind: &UnwindAction| matches!(unwind, UnwindAction::Continue);
         assert!(!continue_only(&UnwindAction::Unreachable));
         assert!(span_stitch_call_unwind_admits(&UnwindAction::Unreachable));
+    }
+
+    const ACCEPT_STR_LIT_PAIR: StrLitPairFacts = StrLitPairFacts {
+        borrow_defs: 1,
+        const_defs: 1,
+        t_mentions: 2,
+        u_mentions: 2,
+        t_callarg_moves: 1,
+        self_pair: false,
+    };
+
+    #[test]
+    fn em_exact_str_lit_pair_admits() {
+        assert!(
+            str_lit_pair_admits(ACCEPT_STR_LIT_PAIR),
+            "a gate which refuses the exact two-local `&str`-literal pair would make the lane-EM \
+             admission vacuous",
+        );
+    }
+
+    #[test]
+    fn em_any_forbidden_str_lit_pair_shape_is_refused() {
+        let mut t_third_mention = ACCEPT_STR_LIT_PAIR;
+        t_third_mention.t_mentions = 3;
+        assert!(
+            !str_lit_pair_admits(t_third_mention),
+            "a deref-read, store, re-borrow, second forward or projected use of the arg temp is \
+             a third mention and must close the lane",
+        );
+
+        let mut u_third_mention = ACCEPT_STR_LIT_PAIR;
+        u_third_mention.u_mentions = 3;
+        assert!(
+            !str_lit_pair_admits(u_third_mention),
+            "a second use of the literal local (a second reborrow, a call arg, a store) is a \
+             third mention and must close the lane",
+        );
+
+        let mut no_const_def = ACCEPT_STR_LIT_PAIR;
+        no_const_def.const_defs = 0;
+        no_const_def.u_mentions = 2;
+        assert!(
+            !str_lit_pair_admits(no_const_def),
+            "a base whose def is NOT the `&str` constant (a call dest, a borrow, an arg copy) \
+             must not ride the mentions count alone",
+        );
+
+        let mut double_borrow_def = ACCEPT_STR_LIT_PAIR;
+        double_borrow_def.borrow_defs = 2;
+        assert!(!str_lit_pair_admits(double_borrow_def));
+
+        let mut double_const_def = ACCEPT_STR_LIT_PAIR;
+        double_const_def.const_defs = 2;
+        assert!(!str_lit_pair_admits(double_const_def));
+
+        let mut no_callarg = ACCEPT_STR_LIT_PAIR;
+        no_callarg.t_callarg_moves = 0;
+        assert!(
+            !str_lit_pair_admits(no_callarg),
+            "an arg temp whose one use is not a bare call-argument move (a return, a store \
+             source) must be refused",
+        );
+
+        let mut double_callarg = ACCEPT_STR_LIT_PAIR;
+        double_callarg.t_callarg_moves = 2;
+        assert!(!str_lit_pair_admits(double_callarg));
+
+        let mut self_pair = ACCEPT_STR_LIT_PAIR;
+        self_pair.self_pair = true;
+        assert!(
+            !str_lit_pair_admits(self_pair),
+            "`_t = &(*_t)` reads an uninitialized local and must be refused explicitly",
+        );
+    }
+
+    const ACCEPT_TRANSIT_PAIR: TransitPairFacts = TransitPairFacts {
+        borrow_defs: 1,
+        u_calldest_defs: 1,
+        t_mentions: 2,
+        u_mentions: 2,
+        t_callarg_moves: 1,
+        self_pair: false,
+    };
+
+    #[test]
+    fn wb8_exact_transit_pair_admits() {
+        assert!(
+            transit_pair_admits(ACCEPT_TRANSIT_PAIR),
+            "a gate which refuses the exact two-local chain in-transit pair would make the \
+             wave-WB8 admission vacuous",
+        );
+    }
+
+    #[test]
+    fn wb8_any_forbidden_transit_pair_shape_is_refused() {
+        let mut t_third_mention = ACCEPT_TRANSIT_PAIR;
+        t_third_mention.t_mentions = 3;
+        assert!(
+            !transit_pair_admits(t_third_mention),
+            "a deref-read, store, re-borrow, second forward or projected use of the arg temp is \
+             a third mention and must close the lane",
+        );
+
+        let mut u_third_mention = ACCEPT_TRANSIT_PAIR;
+        u_third_mention.u_mentions = 3;
+        assert!(
+            !transit_pair_admits(u_third_mention),
+            "a second use of the in-transit local (a second reborrow, a call arg, a store) is a \
+             third mention and must close the lane",
+        );
+
+        let mut no_calldest_def = ACCEPT_TRANSIT_PAIR;
+        no_calldest_def.u_calldest_defs = 0;
+        assert!(
+            !transit_pair_admits(no_calldest_def),
+            "a base whose def is NOT a bare call destination (a const, a borrow, an arg copy) \
+             must not ride the mentions count alone",
+        );
+
+        let mut double_borrow_def = ACCEPT_TRANSIT_PAIR;
+        double_borrow_def.borrow_defs = 2;
+        assert!(!transit_pair_admits(double_borrow_def));
+
+        let mut double_calldest_def = ACCEPT_TRANSIT_PAIR;
+        double_calldest_def.u_calldest_defs = 2;
+        assert!(!transit_pair_admits(double_calldest_def));
+
+        let mut no_callarg = ACCEPT_TRANSIT_PAIR;
+        no_callarg.t_callarg_moves = 0;
+        assert!(
+            !transit_pair_admits(no_callarg),
+            "an arg temp whose one use is not a bare call-argument move (a return, a store \
+             source) must be refused",
+        );
+
+        let mut double_callarg = ACCEPT_TRANSIT_PAIR;
+        double_callarg.t_callarg_moves = 2;
+        assert!(!transit_pair_admits(double_callarg));
+
+        let mut self_pair = ACCEPT_TRANSIT_PAIR;
+        self_pair.self_pair = true;
+        assert!(
+            !transit_pair_admits(self_pair),
+            "`_t = &(*_t)` reads an uninitialized local and must be refused explicitly",
+        );
     }
 }

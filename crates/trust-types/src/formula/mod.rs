@@ -31,19 +31,17 @@ pub use pred_vocab::{
     checker_core_semantics, is_checker_core_pred, is_valid_pred, pred_arg_sorts,
 };
 pub use refute_only::{RefuteOnlyOutcome, RefuteOnlyProvenance, RefuteOnlyVc};
+use serde::{Deserialize, Serialize};
 pub use smtlib::escape_smtlib_symbol;
 pub use sort::{RoundingMode, Sort, SortFromTy, sort_from_ty_with_defs};
 pub use temporal::*;
-pub use vc::*;
-pub use vc_kind::*;
-
-use serde::{Deserialize, Serialize};
-
 // The SMT formula AST lives in trust-ir-contract (cross-repo shared vocabulary).
 // Re-exported so `trust_types::Formula` and `trust_types::formula::Formula` are
 // unchanged. Its inherent methods (constructors, visitors, `to_smtlib`) ride
 // along on the re-exported type.
 pub use trust_ir_contract::Formula;
+pub use vc::*;
+pub use vc_kind::*;
 
 /// Whether a formula carries any bitvector-theory structure — a `Bv*` node, a
 /// `BitVec` literal, an `Int`↔BV conversion, or a `BitVec`-sorted variable.

@@ -205,7 +205,11 @@ pub(super) fn vc_peel_reference_prefixes(ty: &str) -> &str {
 ///
 /// NAME-ONLY: every caller keeps its own receiver/aggregate trace as the
 /// load-bearing soundness gate, exactly as before.
-pub(super) fn vc_callee_is_std_iter_trait_method(callee: &str, trait_last: &str, method: &str) -> bool {
+pub(super) fn vc_callee_is_std_iter_trait_method(
+    callee: &str,
+    trait_last: &str,
+    method: &str,
+) -> bool {
     let normalized = vc_strip_generics(callee);
     let suffix = format!("::{method}");
     if let Some(trait_path) = normalized.strip_suffix(&suffix)
@@ -218,8 +222,7 @@ pub(super) fn vc_callee_is_std_iter_trait_method(callee: &str, trait_last: &str,
         let trait_path = vc_strip_generics(&trait_path);
         let m = vc_strip_generics(&m);
         return m == method
-            && (trait_path.starts_with("core::iter::")
-                || trait_path.starts_with("std::iter::"))
+            && (trait_path.starts_with("core::iter::") || trait_path.starts_with("std::iter::"))
             && trait_path.rsplit("::").next() == Some(trait_last);
     }
     false
@@ -440,14 +443,19 @@ pub(super) fn next_call_range_operands(
 /// `end` is a local defined by `PtrMetadata(s)`/`Len(s)`; resolve it to the SAME
 /// `slice_len_formula(s)` term the index VC uses. Otherwise fall back to the
 /// operand's own formula (sound; connects when the bound is a shared param/const).
-pub(super) fn resolve_range_bound_formula(func: &VerifiableFunction, operand: &Operand, fuel: u32) -> Formula {
+pub(super) fn resolve_range_bound_formula(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    fuel: u32,
+) -> Formula {
     if fuel > 0
         && let Operand::Copy(p) | Operand::Move(p) = operand
         && p.projections.is_empty()
     {
         match crate::unique_whole_local_def(func, p.local) {
             Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => {
-                if let Some(len) = crate::slice_len_formula(func, inner) {
+                if let crate::PtrMetadataModel::Length(len) = crate::ptr_metadata_model(func, inner)
+                {
                     return len;
                 }
             }
@@ -520,7 +528,9 @@ pub(super) fn block_mentions_local(block: &trust_types::BasicBlock, local: usize
 /// every block that references `_p`. Independent of the BFS guard map so the
 /// loop-join weakening cannot drop the fact. See the module banner above for the
 /// soundness argument.
-pub(super) fn build_range_yield_guard_map(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn build_range_yield_guard_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     const TRACE_FUEL: u32 = 16;
     let mut payloads: Vec<(usize, Formula, Formula)> = Vec::new();
     for block in &func.body.blocks {
@@ -673,7 +683,9 @@ pub(super) fn next_call_enumerated_slice(
 /// `i = (next(&mut enumerate_iter) as Some).0.0`, attach `0 <= i < s.len()` to
 /// every block referencing `i`. Computed independently of the BFS guard map, like
 /// the range-yield fact, so loop-join weakening cannot drop it.
-pub(super) fn build_enumerate_yield_guard_map(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn build_enumerate_yield_guard_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     const TRACE_FUEL: u32 = 16;
     let mut payloads: Vec<(usize, Formula)> = Vec::new();
     for block in &func.body.blocks {
@@ -791,7 +803,10 @@ pub(super) fn local_has_projected_write(func: &VerifiableFunction, local: usize)
 /// whole-local Use-copies and `&(*x)` shared reborrows, then gate the root:
 /// `&str`/`&[T]`-typed (shared `Ref` to `Slice`), a parameter or single-def, never
 /// `&mut`/`&raw`-borrowed, never projection-written. Returns the root local.
-pub(super) fn charindices_shared_slice_root(func: &VerifiableFunction, op: &Operand) -> Option<usize> {
+pub(super) fn charindices_shared_slice_root(
+    func: &VerifiableFunction,
+    op: &Operand,
+) -> Option<usize> {
     let (Operand::Copy(p) | Operand::Move(p)) = op else { return None };
     if !p.projections.is_empty() {
         return None;
@@ -828,7 +843,10 @@ pub(super) fn charindices_shared_slice_root(func: &VerifiableFunction, op: &Oper
 /// True iff every `&mut`/`&raw` borrow of `iter_local` is a single-def temp used
 /// ONLY as the receiver (arg 0) of an `Iterator::next` call — the conduit
 /// discipline that forbids `mem::swap`/`replace` re-seating the iterator.
-pub(super) fn iter_mut_borrows_only_feed_next(func: &VerifiableFunction, iter_local: usize) -> bool {
+pub(super) fn iter_mut_borrows_only_feed_next(
+    func: &VerifiableFunction,
+    iter_local: usize,
+) -> bool {
     let mut conduits: Vec<usize> = Vec::new();
     for b in &func.body.blocks {
         for s in &b.stmts {
@@ -924,7 +942,10 @@ pub(super) fn for_each_rvalue_operand_place(rvalue: &Rvalue, f: &mut impl FnMut(
 /// The `CharIndices` iterator local's SOURCE STRING root: `iter_local` must be
 /// single-def by a std/core `char_indices` call whose receiver roots via
 /// [`charindices_shared_slice_root`].
-pub(super) fn charindices_iter_string_root(func: &VerifiableFunction, iter_local: usize) -> Option<usize> {
+pub(super) fn charindices_iter_string_root(
+    func: &VerifiableFunction,
+    iter_local: usize,
+) -> Option<usize> {
     if guards::whole_local_def_count(func, iter_local) != 1
         || local_has_projected_write(func, iter_local)
         || !iter_mut_borrows_only_feed_next(func, iter_local)

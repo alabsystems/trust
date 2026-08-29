@@ -74,7 +74,10 @@ fn repo_root() -> PathBuf {
 }
 
 fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("obligation-key-divergence")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("obligation-key-divergence")
 }
 
 /// One MIR-lane public result row, projected to its identity components.
@@ -150,7 +153,11 @@ fn direct_asserts() -> Vec<DirectAssert> {
         let loc_part = t.split("; #loc: ").nth(1).expect("assert carries a #loc");
         let nums: Vec<u64> =
             loc_part.split_whitespace().take(3).map(|n| n.parse().expect("loc number")).collect();
-        out.push(DirectAssert { function: function.clone(), proof_tag, loc: (nums[0], nums[1], nums[2]) });
+        out.push(DirectAssert {
+            function: function.clone(),
+            proof_tag,
+            loc: (nums[0], nums[1], nums[2]),
+        });
     }
     out
 }
@@ -161,16 +168,56 @@ fn direct_asserts() -> Vec<DirectAssert> {
 fn mir_lane_rows_are_exactly_the_frozen_table() {
     let expect: Vec<(&str, &str, &str, (u64, u64, u64, u64))> = vec![
         // function, obligation_id, kind, span
-        ("fixture::contract_div_index", "obligation:fixture__contract_div_index:precondition:0", "assumption:requires", (4, 13, 4, 18)),
-        ("fixture::contract_div_index", "obligation:fixture__contract_div_index:postcondition:1", "postcond", (5, 12, 5, 23)),
-        ("fixture::contract_div_index", "vc:fixture__contract_div_index:bounds_check:0", "slice", (7, 4, 7, 9)),
-        ("fixture::contract_div_index", "vc:fixture__contract_div_index:arithmetic_safety:1", "divzero", (7, 4, 7, 13)),
-        ("fixture::contract_div_index", "vc:fixture__contract_div_index:postcondition:2", "postcond", (7, 4, 7, 9)),
-        ("fixture::contract_div_index", "vc:fixture__contract_div_index:arithmetic_safety:3", "divzero", (7, 4, 7, 13)),
+        (
+            "fixture::contract_div_index",
+            "obligation:fixture__contract_div_index:precondition:0",
+            "assumption:requires",
+            (4, 13, 4, 18),
+        ),
+        (
+            "fixture::contract_div_index",
+            "obligation:fixture__contract_div_index:postcondition:1",
+            "postcond",
+            (5, 12, 5, 23),
+        ),
+        (
+            "fixture::contract_div_index",
+            "vc:fixture__contract_div_index:bounds_check:0",
+            "slice",
+            (7, 4, 7, 9),
+        ),
+        (
+            "fixture::contract_div_index",
+            "vc:fixture__contract_div_index:arithmetic_safety:1",
+            "divzero",
+            (7, 4, 7, 13),
+        ),
+        (
+            "fixture::contract_div_index",
+            "vc:fixture__contract_div_index:postcondition:2",
+            "postcond",
+            (7, 4, 7, 9),
+        ),
+        (
+            "fixture::contract_div_index",
+            "vc:fixture__contract_div_index:arithmetic_safety:3",
+            "divzero",
+            (7, 4, 7, 13),
+        ),
         ("fixture::add3", "vc:fixture__add3:arithmetic_safety:0", "overflow:add", (15, 4, 15, 4)),
         ("fixture::add3", "vc:fixture__add3:arithmetic_safety:1", "overflow:add", (15, 4, 15, 4)),
-        ("fixture::macro_div", "vc:fixture__macro_div:arithmetic_safety:0", "divzero", (26, 4, 26, 4)),
-        ("fixture::macro_div", "vc:fixture__macro_div:arithmetic_safety:1", "divzero", (26, 4, 26, 4)),
+        (
+            "fixture::macro_div",
+            "vc:fixture__macro_div:arithmetic_safety:0",
+            "divzero",
+            (26, 4, 26, 4),
+        ),
+        (
+            "fixture::macro_div",
+            "vc:fixture__macro_div:arithmetic_safety:1",
+            "divzero",
+            (26, 4, 26, 4),
+        ),
     ];
     let rows = mir_rows();
     let got: Vec<(&str, &str, &str, (u64, u64, u64, u64))> = rows
@@ -206,7 +253,11 @@ fn safety_ordinals_are_carrier_relative_not_per_kind() {
         .filter(|r| r.obligation_id.starts_with("vc:"))
         .map(|r| r.kind.as_str())
         .collect();
-    assert_eq!(f1_kinds, ["slice", "divzero", "postcond", "divzero"], "kinds interleave in the same space");
+    assert_eq!(
+        f1_kinds,
+        ["slice", "divzero", "postcond", "divzero"],
+        "kinds interleave in the same space"
+    );
 }
 
 /// Pin 2 — the §3.2.1 ordinal-collision class is ALREADY POPULATED: in every
@@ -224,9 +275,18 @@ fn same_kind_same_span_duplicates_exist_in_every_function() {
         let pair: Vec<&MirRow> =
             rows.iter().filter(|r| r.function == function && r.kind == kind).collect();
         assert_eq!(pair.len(), 2, "{function}: exactly two {kind} rows");
-        assert_eq!(pair[0].span, pair[1].span, "{function}: the two {kind} rows share one stored span");
-        assert_ne!(pair[0].claim_digest, pair[1].claim_digest, "{function}: but they are distinct propositions");
-        assert_ne!(pair[0].obligation_id, pair[1].obligation_id, "{function}: only the carrier index separates them");
+        assert_eq!(
+            pair[0].span, pair[1].span,
+            "{function}: the two {kind} rows share one stored span"
+        );
+        assert_ne!(
+            pair[0].claim_digest, pair[1].claim_digest,
+            "{function}: but they are distinct propositions"
+        );
+        assert_ne!(
+            pair[0].obligation_id, pair[1].obligation_id,
+            "{function}: only the carrier index separates them"
+        );
     }
 }
 
@@ -243,8 +303,7 @@ fn checked_add_and_macro_rows_have_collapsed_spans_macro_at_callsite() {
     let rows = mir_rows();
     for r in &rows {
         let degenerate = r.span.0 == r.span.2 && r.span.1 == r.span.3;
-        let expect_degenerate =
-            r.function == "fixture::add3" || r.function == "fixture::macro_div";
+        let expect_degenerate = r.function == "fixture::add3" || r.function == "fixture::macro_div";
         assert_eq!(
             degenerate, expect_degenerate,
             "span degeneracy is exactly the checked-add + macro classes; row {}",
@@ -266,23 +325,36 @@ fn checked_add_and_macro_rows_have_collapsed_spans_macro_at_callsite() {
 fn direct_lane_births_exactly_the_four_known_asserts_and_no_contracts() {
     let asserts = direct_asserts();
     let expect = vec![
-        DirectAssert { function: "contract_div_index".into(), proof_tag: "div_nonzero".into(), loc: (0, 7, 4) },
+        DirectAssert {
+            function: "contract_div_index".into(),
+            proof_tag: "div_nonzero".into(),
+            loc: (0, 7, 4),
+        },
         DirectAssert { function: "add3".into(), proof_tag: "no_overflow".into(), loc: (0, 15, 4) },
         DirectAssert { function: "add3".into(), proof_tag: "no_overflow".into(), loc: (0, 15, 4) },
-        DirectAssert { function: "macro_div".into(), proof_tag: "div_nonzero".into(), loc: (0, 26, 4) },
+        DirectAssert {
+            function: "macro_div".into(),
+            proof_tag: "div_nonzero".into(),
+            loc: (0, 26, 4),
+        },
     ];
-    assert_eq!(asserts, expect, "the direct lane's obligation surface moved: re-take BOTH lane artifacts");
+    assert_eq!(
+        asserts, expect,
+        "the direct lane's obligation surface moved: re-take BOTH lane artifacts"
+    );
 
     let text = std::fs::read_to_string(fixture_dir().join("direct-lane.trust-ir.txt")).unwrap();
     assert!(!text.contains("requires"), "no contract obligation is born in the direct lane today");
     assert!(!text.contains("ensures"), "no contract obligation is born in the direct lane today");
-    assert!(!text.contains("bounds"), "no slice bounds obligation is born in the direct lane today");
+    assert!(
+        !text.contains("bounds"),
+        "no slice bounds obligation is born in the direct lane today"
+    );
 
     // The lane's own self-declaration, read live from the producer source.
-    let crate_module = std::fs::read_to_string(
-        repo_root().join("crates/trust-thir-lower/src/crate_module.rs"),
-    )
-    .expect("crate_module.rs readable");
+    let crate_module =
+        std::fs::read_to_string(repo_root().join("crates/trust-thir-lower/src/crate_module.rs"))
+            .expect("crate_module.rs readable");
     assert!(
         crate_module.contains("structural-parity-only-v1"),
         "trust-thir-lower no longer declares structural-parity-only-v1: the direct lane's \
@@ -339,8 +411,9 @@ fn lo_triples_agree_across_lanes_but_do_not_separate_obligations() {
 /// changes, the frozen artifacts above are stale evidence — re-take them.
 #[test]
 fn mint_sites_still_have_the_pinned_shape() {
-    let api = std::fs::read_to_string(repo_root().join("crates/trust-mir-extract/src/verifier_api.rs"))
-        .expect("verifier_api.rs readable");
+    let api =
+        std::fs::read_to_string(repo_root().join("crates/trust-mir-extract/src/verifier_api.rs"))
+            .expect("verifier_api.rs readable");
     let vc_mints = api.matches(r#""vc:{}:{}:{}""#).count();
     assert_eq!(
         vc_mints, 3,

@@ -244,17 +244,51 @@ require_version_prefix() {
     esac
 }
 
-# The rustc-derived binaries keep the upstream version banner and carry their
-# Trust identity in a trailing "(trustc)" / "(trustdoc)" marker, so match the
-# marker rather than a leading token.
-require_version_marker() {
+# The rustc-derived binaries keep the upstream version banner — the leading
+# `rustc` token is untouchable, because the ecosystem's version-sniffing build
+# scripts assert it — and carry their Trust identity in a trailing parenthetical
+# instead. So match the parenthetical rather than a leading token.
+#
+# THE PARENTHETICAL HAS TWO LEGITIMATE SHAPES, and this check used to accept
+# only one. rustc_driver_impl builds it as
+#
+#     format!(" ({display_binary} {trust_version})")   // CFG_TRUST_VERSION set
+#     format!(" ({display_binary})")                   // otherwise
+#
+# (compiler/rustc_driver_impl/src/lib.rs:2382-2389), so an ordinary build says
+# `(trustc 0.1.0)` and only a build without CFG_TRUST_VERSION says `(trustc)`.
+# Matching the literal string "(trustc)" therefore REJECTED every real toolchain
+# built since the version was threaded through: measured 2026-08-22 against
+# build/aarch64-apple-darwin/stage1 of a tree that passes
+# tools/verify-toolchain.sh in full —
+#
+#   error: trustc --version must contain '(trustc)' for a Trust link,
+#   got: rustc 1.99.0-dev (52e0a7031 2026-08-22) (trustc 0.1.0)
+#
+# — while the bare form is not a relic of one artifact. Re-derived 2026-08-23:
+#
+#   git grep -lF '(trustc)' | wc -l              -> 353 tracked files
+#   git grep -lE 'rustc [0-9][^ ]* \([0-9a-f]{7,} [0-9-]{10}\) \(trustc\)' | wc -l
+#                                                -> 303 of them are a RECORDED
+#                                                   version banner in the bare
+#                                                   shape, dated 2026-06-22
+#                                                   through 2026-07-28
+#
+# i.e. essentially every banner captured before `CFG_TRUST_VERSION` was threaded
+# through bootstrap (a81c07e1d6, 2026-07-24); the versioned banner appears in 5
+# files, dated 2026-07-30 onward. Both shapes are real history, a toolchain built
+# without CFG_TRUST_VERSION still emits the bare one today, and this check must
+# link either. So accept exactly the two shapes the emitter can produce and
+# nothing looser: `(name)` or `(name <version>)`. A stock rustc, which prints no
+# parenthetical at all, still fails, which is the property this check exists for.
+require_trust_brand() {
     tool="$1"
-    marker="$2"
+    brand="$2"
     version="$("$TOOLCHAIN_DIR/bin/$tool" --version 2>&1 || true)"
     case "$version" in
-        *"$marker"*) ;;
+        *"($brand)"*|*"($brand "*) ;;
         *)
-            echo "error: $tool --version must contain '$marker' for a Trust link, got: $version" >&2
+            echo "error: $tool --version must carry the Trust brand '($brand)' or '($brand <version>)' for a Trust link, got: $version" >&2
             exit 1
             ;;
     esac
@@ -324,14 +358,21 @@ if [ "$STAGE" = "stage2" ] \
     && { [ -e "$TOOLCHAIN_DIR/bin/cargo" ] || [ -L "$TOOLCHAIN_DIR/bin/cargo" ]; }; then
     require_same_artifact targo cargo
 fi
+# `rustdoc` joined the admitted names in 76d408e1cd: cargo spawns a binary of
+# that name for its doctest phase, so bootstrap emits it into every stage >= 1
+# sysroot. Hold it to the same binding rule as the other two when it is there.
+if [ -e "$TOOLCHAIN_DIR/bin/rustdoc" ] || [ -L "$TOOLCHAIN_DIR/bin/rustdoc" ]; then
+    require_same_artifact trustdoc rustdoc
+fi
 
-# Rust tooling needs exactly the two admitted compatibility names. Repair those
+# Rust tooling needs exactly the three admitted compatibility names. Repair those
 # names only when the caller explicitly requests it, and leave every secondary
 # tool Trust-only.
 if [ "$REPAIR_ALIASES" = "1" ]; then
     link_missing_alias rustc trustc
     if [ "$STAGE" = "stage2" ]; then
         link_missing_alias cargo targo
+        link_missing_alias rustdoc trustdoc
     fi
 elif [ -n "$EXTERNAL_SYSROOT" ]; then
     echo "alias repair: forbidden for external --sysroot (validation only)" >&2
@@ -385,10 +426,10 @@ if [ "$STAGE" = "stage2" ]; then
     fi
 
     require_dir "$TOOLCHAIN_DIR/lib/rustlib/src/rust/library"
-    require_version_marker trustc "(trustc)"
+    require_trust_brand trustc trustc
     require_version_prefix targo "targo "
     require_version_prefix trustd "trustd "
-    require_version_marker trustdoc "(trustdoc)"
+    require_trust_brand trustdoc trustdoc
 fi
 
 rustup toolchain link "$TOOLCHAIN_NAME" "$TOOLCHAIN_DIR"
@@ -409,10 +450,37 @@ else
     echo "    rustup run $TOOLCHAIN_NAME trustc --version"
 fi
 echo
-if [ "$STAGE" = "stage1" ]; then
-    echo "stage1 is developer-only; do not make it the daily-driver/default toolchain"
-    echo "or use it as release evidence."
-else
-    echo "make default in this shell:"
-    echo "    rustup default $TOOLCHAIN_NAME"
+# Closing guidance follows the sysroot, not $STAGE. With --sysroot, STAGE is
+# forced to "stage2" above as a VALIDATION LEVEL — the full same-surface contract
+# an external root must already satisfy — and that is not a claim about how the
+# root was produced. Reading it as one printed daily-driver advice for a stage1
+# tree: `install-trust-toolchain.sh --stage 1` links
+# build/<triple>/stage1 through --sysroot, so a single run said "make default in
+# this shell: rustup default trust" here and "stage1 is a DEVELOPER artifact and
+# `rustup default` should not point at it" in the installer's own summary. When
+# the sysroot names its stage, believe the name; when it does not, say what is
+# unknown rather than recommending a default (docs/rustup-toolchain-link.md).
+GUIDANCE_STAGE="$STAGE"
+if [ -n "$EXTERNAL_SYSROOT" ]; then
+    case "${TOOLCHAIN_DIR##*/}" in
+        stage1) GUIDANCE_STAGE="stage1" ;;
+        stage2) GUIDANCE_STAGE="stage2" ;;
+        *)      GUIDANCE_STAGE="unknown" ;;
+    esac
 fi
+case "$GUIDANCE_STAGE" in
+    stage1)
+        echo "stage1 is developer-only; do not make it the daily-driver/default toolchain"
+        echo "or use it as release evidence."
+        ;;
+    stage2)
+        echo "make default in this shell:"
+        echo "    rustup default $TOOLCHAIN_NAME"
+        ;;
+    *)
+        echo "this sysroot was supplied with --sysroot and its path does not name a stage,"
+        echo "so this script validated its SURFACE but cannot tell a complete stage2 from a"
+        echo "stage1 developer tree. Do not make it the default, and do not cite it as"
+        echo "release evidence, until you know which it is (docs/rustup-toolchain-link.md)."
+        ;;
+esac

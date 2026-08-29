@@ -5,86 +5,158 @@
 // ---- Set 1: fully-qualified Result::<T,E>::unwrap_or, T x E = {i8,i16,i64,u16,u32,u128,isize} x {u8,i32}
 
 #[inline(never)]
-fn uo_i8_u8(r: Result<i8, u8>, d: i8) -> i8 { Result::<i8, u8>::unwrap_or(r, d) }
+fn uo_i8_u8(r: Result<i8, u8>, d: i8) -> i8 {
+    Result::<i8, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_i8_i32(r: Result<i8, i32>, d: i8) -> i8 { Result::<i8, i32>::unwrap_or(r, d) }
+fn uo_i8_i32(r: Result<i8, i32>, d: i8) -> i8 {
+    Result::<i8, i32>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_i16_u8(r: Result<i16, u8>, d: i16) -> i16 { Result::<i16, u8>::unwrap_or(r, d) }
+fn uo_i16_u8(r: Result<i16, u8>, d: i16) -> i16 {
+    Result::<i16, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_i16_i32(r: Result<i16, i32>, d: i16) -> i16 { Result::<i16, i32>::unwrap_or(r, d) }
+fn uo_i16_i32(r: Result<i16, i32>, d: i16) -> i16 {
+    Result::<i16, i32>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_i64_u8(r: Result<i64, u8>, d: i64) -> i64 { Result::<i64, u8>::unwrap_or(r, d) }
+fn uo_i64_u8(r: Result<i64, u8>, d: i64) -> i64 {
+    Result::<i64, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_i64_i32(r: Result<i64, i32>, d: i64) -> i64 { Result::<i64, i32>::unwrap_or(r, d) }
+fn uo_i64_i32(r: Result<i64, i32>, d: i64) -> i64 {
+    Result::<i64, i32>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_u16_u8(r: Result<u16, u8>, d: u16) -> u16 { Result::<u16, u8>::unwrap_or(r, d) }
+fn uo_u16_u8(r: Result<u16, u8>, d: u16) -> u16 {
+    Result::<u16, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_u16_i32(r: Result<u16, i32>, d: u16) -> u16 { Result::<u16, i32>::unwrap_or(r, d) }
+fn uo_u16_i32(r: Result<u16, i32>, d: u16) -> u16 {
+    Result::<u16, i32>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_u32_u8(r: Result<u32, u8>, d: u32) -> u32 { Result::<u32, u8>::unwrap_or(r, d) }
+fn uo_u32_u8(r: Result<u32, u8>, d: u32) -> u32 {
+    Result::<u32, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_u32_i32(r: Result<u32, i32>, d: u32) -> u32 { Result::<u32, i32>::unwrap_or(r, d) }
+fn uo_u32_i32(r: Result<u32, i32>, d: u32) -> u32 {
+    Result::<u32, i32>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_u128_u8(r: Result<u128, u8>, d: u128) -> u128 { Result::<u128, u8>::unwrap_or(r, d) }
+fn uo_u128_u8(r: Result<u128, u8>, d: u128) -> u128 {
+    Result::<u128, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_u128_i32(r: Result<u128, i32>, d: u128) -> u128 { Result::<u128, i32>::unwrap_or(r, d) }
+fn uo_u128_i32(r: Result<u128, i32>, d: u128) -> u128 {
+    Result::<u128, i32>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_isize_u8(r: Result<isize, u8>, d: isize) -> isize { Result::<isize, u8>::unwrap_or(r, d) }
+fn uo_isize_u8(r: Result<isize, u8>, d: isize) -> isize {
+    Result::<isize, u8>::unwrap_or(r, d)
+}
 #[inline(never)]
-fn uo_isize_i32(r: Result<isize, i32>, d: isize) -> isize { Result::<isize, i32>::unwrap_or(r, d) }
+fn uo_isize_i32(r: Result<isize, i32>, d: isize) -> isize {
+    Result::<isize, i32>::unwrap_or(r, d)
+}
 
 // ---- Set 2: is_ok / is_err at 6 more (T,E) combos
 
 #[inline(never)]
-fn isok_u8_u8(r: Result<u8, u8>) -> bool { r.is_ok() }
+fn isok_u8_u8(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
 #[inline(never)]
-fn iserr_u8_u8(r: Result<u8, u8>) -> bool { r.is_err() }
+fn iserr_u8_u8(r: Result<u8, u8>) -> bool {
+    r.is_err()
+}
 #[inline(never)]
-fn isok_i32_i64(r: Result<i32, i64>) -> bool { r.is_ok() }
+fn isok_i32_i64(r: Result<i32, i64>) -> bool {
+    r.is_ok()
+}
 #[inline(never)]
-fn iserr_i32_i64(r: Result<i32, i64>) -> bool { r.is_err() }
+fn iserr_i32_i64(r: Result<i32, i64>) -> bool {
+    r.is_err()
+}
 #[inline(never)]
-fn isok_u64_u16(r: Result<u64, u16>) -> bool { r.is_ok() }
+fn isok_u64_u16(r: Result<u64, u16>) -> bool {
+    r.is_ok()
+}
 #[inline(never)]
-fn iserr_u64_u16(r: Result<u64, u16>) -> bool { r.is_err() }
+fn iserr_u64_u16(r: Result<u64, u16>) -> bool {
+    r.is_err()
+}
 #[inline(never)]
-fn isok_i128_u32(r: Result<i128, u32>) -> bool { r.is_ok() }
+fn isok_i128_u32(r: Result<i128, u32>) -> bool {
+    r.is_ok()
+}
 #[inline(never)]
-fn iserr_i128_u32(r: Result<i128, u32>) -> bool { r.is_err() }
+fn iserr_i128_u32(r: Result<i128, u32>) -> bool {
+    r.is_err()
+}
 #[inline(never)]
-fn isok_usize_i8(r: Result<usize, i8>) -> bool { r.is_ok() }
+fn isok_usize_i8(r: Result<usize, i8>) -> bool {
+    r.is_ok()
+}
 #[inline(never)]
-fn iserr_usize_i8(r: Result<usize, i8>) -> bool { r.is_err() }
+fn iserr_usize_i8(r: Result<usize, i8>) -> bool {
+    r.is_err()
+}
 #[inline(never)]
-fn isok_u16_isize(r: Result<u16, isize>) -> bool { r.is_ok() }
+fn isok_u16_isize(r: Result<u16, isize>) -> bool {
+    r.is_ok()
+}
 #[inline(never)]
-fn iserr_u16_isize(r: Result<u16, isize>) -> bool { r.is_err() }
+fn iserr_u16_isize(r: Result<u16, isize>) -> bool {
+    r.is_err()
+}
 
 // ---- Set 3: ok() / err() — Option-returning
 
 #[inline(never)]
-fn ok_i32_u8(r: Result<i32, u8>) -> Option<i32> { r.ok() }
+fn ok_i32_u8(r: Result<i32, u8>) -> Option<i32> {
+    r.ok()
+}
 #[inline(never)]
-fn err_i32_u8(r: Result<i32, u8>) -> Option<u8> { r.err() }
+fn err_i32_u8(r: Result<i32, u8>) -> Option<u8> {
+    r.err()
+}
 #[inline(never)]
-fn ok_u64_i16(r: Result<u64, i16>) -> Option<u64> { r.ok() }
+fn ok_u64_i16(r: Result<u64, i16>) -> Option<u64> {
+    r.ok()
+}
 #[inline(never)]
-fn err_u64_i16(r: Result<u64, i16>) -> Option<i16> { r.err() }
+fn err_u64_i16(r: Result<u64, i16>) -> Option<i16> {
+    r.err()
+}
 #[inline(never)]
-fn ok_usize_i64(r: Result<usize, i64>) -> Option<usize> { r.ok() }
+fn ok_usize_i64(r: Result<usize, i64>) -> Option<usize> {
+    r.ok()
+}
 #[inline(never)]
-fn err_usize_i64(r: Result<usize, i64>) -> Option<i64> { r.err() }
+fn err_usize_i64(r: Result<usize, i64>) -> Option<i64> {
+    r.err()
+}
 
 // ---- Set 4: method-call syntax r.unwrap_or(d), 4 combos
 
 #[inline(never)]
-fn uom_i8_u8(r: Result<i8, u8>, d: i8) -> i8 { r.unwrap_or(d) }
+fn uom_i8_u8(r: Result<i8, u8>, d: i8) -> i8 {
+    r.unwrap_or(d)
+}
 #[inline(never)]
-fn uom_i64_i32(r: Result<i64, i32>, d: i64) -> i64 { r.unwrap_or(d) }
+fn uom_i64_i32(r: Result<i64, i32>, d: i64) -> i64 {
+    r.unwrap_or(d)
+}
 #[inline(never)]
-fn uom_u32_u8(r: Result<u32, u8>, d: u32) -> u32 { r.unwrap_or(d) }
+fn uom_u32_u8(r: Result<u32, u8>, d: u32) -> u32 {
+    r.unwrap_or(d)
+}
 #[inline(never)]
-fn uom_isize_i32(r: Result<isize, i32>, d: isize) -> isize { r.unwrap_or(d) }
+fn uom_isize_i32(r: Result<isize, i32>, d: isize) -> isize {
+    r.unwrap_or(d)
+}
 
 fn main() {
     let n = std::env::args().count(); // >= 1 at runtime, unknown statically

@@ -8,9 +8,5 @@
 // real 203 GB OOM that killed the host) into a mechanically-flagged obligation.
 // Pairs with mutant/bounded_alloc.rs (the bound guard removed).
 pub fn bounded_alloc(n: usize) -> Vec<u8> {
-    if n <= 1024 {
-        Vec::with_capacity(n)
-    } else {
-        Vec::new()
-    }
+    if n <= 1024 { Vec::with_capacity(n) } else { Vec::new() }
 }

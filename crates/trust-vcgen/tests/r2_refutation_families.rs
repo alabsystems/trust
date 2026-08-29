@@ -196,10 +196,7 @@ fn get_some_poisoned_index_fact_is_dropped() {
         // proof. Accept the fact appearing on a DIFFERENT (stale, name-disjoint)
         // version — assert only that no fact names the write's own token spelling
         // that the obligation reads.
-        assert!(
-            !f.contains("Bool(false)"),
-            "the poisoned overflow VC must stay refutable: {f}"
-        );
+        assert!(!f.contains("Bool(false)"), "the poisoned overflow VC must stay refutable: {f}");
     }
 }
 

@@ -1,9 +1,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
+use trust_temporal::ltl::parse_ltl;
 use trust_temporal::{
     BmcEngine, BmcResult, CtlFormula, CtlModelChecker, LtlFormula, SafetyProperty, State, StateId,
     StateMachine, StateMachineBuilder, TemporalProperty, TemporalSpec, Trace, Transition,
-    ltl::parse_ltl,
 };
 
 fn sample_machine() -> StateMachine {

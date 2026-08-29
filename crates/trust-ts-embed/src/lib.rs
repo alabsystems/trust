@@ -43,12 +43,13 @@ pub use crate::escape::{FragmentEscape, UnsupportedTsConstruct};
 pub use crate::inline::inline_calls;
 pub use crate::interp::{eval, eval_module, eval_with_arrays};
 pub use crate::lower::lower_function;
-pub use crate::parse::{parse_function, parse_module, ParseError};
+pub use crate::parse::{ParseError, parse_function, parse_module};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::BinOp;
+
+    use super::*;
 
     fn u16t() -> TsTy {
         TsTy::uint(16)

@@ -29,11 +29,7 @@ pub fn alloc_unguarded(n: usize) -> Vec<u8> {
 /// This is what AY's fixed, budget-checked allocation path looks like to the
 /// verifier: it fails closed (returns early) instead of allocating past budget.
 pub fn alloc_guarded(n: usize) -> Vec<u8> {
-    if n <= 268435456 {
-        Vec::with_capacity(n)
-    } else {
-        Vec::new()
-    }
+    if n <= 268435456 { Vec::with_capacity(n) } else { Vec::new() }
 }
 
 /// CONSTANT: a fixed, trivially-bounded size — Trust emits no obligation at all.

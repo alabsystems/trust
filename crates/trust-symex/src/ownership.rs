@@ -487,10 +487,11 @@ pub fn check_static_ownership(
 
 #[cfg(test)]
 mod tests {
+    use trust_types::Ty;
+
     use super::*;
     use crate::region::RegionMap;
     use crate::state::SymbolicValue;
-    use trust_types::Ty;
 
     fn i32_ty() -> Ty {
         Ty::i32()

@@ -2408,7 +2408,7 @@ pub struct IntervalBackend;
 /// interval-provable arithmetic violation, so it is NOT classified here and stays
 /// flagged. Returns `None` for every non-arithmetic callee.
 #[derive(Clone, Copy)]
-enum HardenedMirAssertGoal {
+pub(crate) enum HardenedMirAssertGoal {
     Arithmetic,
     Bounds,
     Divisor,
@@ -2418,7 +2418,12 @@ enum HardenedMirAssertGoal {
 /// by its `callee` string. Returns `None` for every other VcKind and every other
 /// hardened category/callee — including `unwrap`/`expect`/policy panic boundaries
 /// and the non-arithmetic hardened categories — so those are never routed here.
-fn hardened_mir_assert_goal(vc: &VerificationCondition) -> Option<HardenedMirAssertGoal> {
+/// Trust: `pub(crate)` so the in-process ay backend admits exactly the same
+/// formula-bearing twin population (one recognizer, two callers — the SMT lane
+/// the comments below fall through to).
+pub(crate) fn hardened_mir_assert_goal(
+    vc: &VerificationCondition,
+) -> Option<HardenedMirAssertGoal> {
     let VcKind::HardenedBoundary { category: HardenedVcCategory::PanicBoundary, callee, .. } =
         &vc.kind
     else {

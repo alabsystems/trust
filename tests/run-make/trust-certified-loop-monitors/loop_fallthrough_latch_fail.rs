@@ -1,6 +1,9 @@
 fn bad_fallthrough_latch(mut n: u32) {
     let mut stalled = false;
-    while n > 0 invariant n <= 2 decreases n {
+    while n > 0
+        invariant n <= 2
+        decreases n
+    {
         if n == 2 {
             // The continue latch descends correctly.
             n -= 1;

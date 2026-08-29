@@ -7,7 +7,7 @@
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 mod common;
-use common::{log_reaction, void, Rt, TestVal};
+use common::{Rt, TestVal, log_reaction, void};
 
 /// A single rich program touching every observable path: sync logs, microtasks,
 /// nested microtasks, promise chains, combinators, timers at several deadlines
@@ -34,24 +34,36 @@ fn run_once() -> Vec<String> {
 
     // timers at distinct deadlines, each recording the clock it fired at
     rt.timer_fn(3, void(|rx, host| host.log.push(format!("t3@{}", rx.now() - common::EPOCH))));
-    rt.timer_fn(1, void(|rx, host| {
-        host.log.push(format!("t1@{}", rx.now() - common::EPOCH));
-        // a promise scheduled from inside a timer
-        let q = rx.promise_resolve(host, TestVal::Undefined);
-        rx.then(host, q, Some(log_reaction("t1-micro")), None);
-    }));
-    rt.timer_fn(2, void(|rx, host| {
-        host.log.push(format!("t2@{}", rx.now() - common::EPOCH));
-        // a nested timer
-        rx.set_timeout(void(|rx, host| host.log.push(format!("t2-nested@{}", rx.now() - common::EPOCH))), 5);
-    }));
+    rt.timer_fn(
+        1,
+        void(|rx, host| {
+            host.log.push(format!("t1@{}", rx.now() - common::EPOCH));
+            // a promise scheduled from inside a timer
+            let q = rx.promise_resolve(host, TestVal::Undefined);
+            rx.then(host, q, Some(log_reaction("t1-micro")), None);
+        }),
+    );
+    rt.timer_fn(
+        2,
+        void(|rx, host| {
+            host.log.push(format!("t2@{}", rx.now() - common::EPOCH));
+            // a nested timer
+            rx.set_timeout(
+                void(|rx, host| host.log.push(format!("t2-nested@{}", rx.now() - common::EPOCH))),
+                5,
+            );
+        }),
+    );
 
     // an interval that fires twice then is cleared
     let id = rt.interval(4, "iv");
-    rt.timer_fn(10, void(move |rx, host| {
-        host.log.push(format!("stop@{}", rx.now() - common::EPOCH));
-        rx.clear_timer(id);
-    }));
+    rt.timer_fn(
+        10,
+        void(move |rx, host| {
+            host.log.push(format!("stop@{}", rx.now() - common::EPOCH));
+            rx.clear_timer(id);
+        }),
+    );
 
     rt.log("end");
     rt.drain().expect("no runaway");

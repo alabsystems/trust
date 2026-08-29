@@ -1,8 +1,9 @@
-use super::*;
 use trust_types::{
     BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
     VerifiableFunction,
 };
+
+use super::*;
 
 fn load_result_dump(name: &str) -> VerifiableFunction {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

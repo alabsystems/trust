@@ -46,8 +46,8 @@
 
 use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level, Name};
 use trust_clean_origin::{
-    admit_lowering, check_faithful, plan_clean_origin_body, CleanOriginShape, EmitRefusal,
-    GateRefusal,
+    CleanOriginShape, EmitRefusal, GateRefusal, admit_lowering, check_faithful,
+    plan_clean_origin_body,
 };
 use trust_types::admissible_body::{ArithBinOp, ArithExpr, ArithOperand};
 use trust_types::{
@@ -175,6 +175,7 @@ fn emitted_chain(
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 unwind: UnwindEdge::Unreachable,
             },
         })

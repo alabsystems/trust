@@ -48,3 +48,24 @@
 # is therefore no longer an open question for the pin gate.
 #
 # No active rows. That is the intended steady state: every drift blocks.
+
+# --- Opened 2026-08-21 ---------------------------------------------------------
+# CLOSED 2026-08-22. The row that stood here waived first-party/clean as PIN-DIRTY for
+# one untracked test file (crates/clean-elab/tests/recursion_refusal_diagnostic_e2e.rs)
+# plus a stash (r0-wip-spincheck) belonging to the in-flight R0 diagnostic lane. Neither
+# is there any more: `git -C first-party/clean status --untracked-files=all` is empty,
+# no r0-wip-spincheck stash remains, the submodule is at its recorded pin
+# (b4808f00c845e13eaf6de572ad4f3f1643dbfd0e) and scripts/check_pin_coherence.sh reports
+# every submodule OK. So the hook's own rule fired on a real push attempt:
+#
+#     FAIL: a pin waiver is no longer needed.
+#       x first-party/clean is at its recorded pin again — delete its line from
+#         scripts/hooks-pin/pin-waivers.txt
+#     PIN GATE: RED.
+#
+# Deleted here rather than silently dropped, per the convention the two closures above
+# established, so the next reader can see this waiver expired by being RESOLVED and not
+# by timing out. Removing it strictly TIGHTENS the gate: first-party/clean drift blocks
+# again from this commit on.
+#
+# No active rows. That is the intended steady state: every drift blocks.

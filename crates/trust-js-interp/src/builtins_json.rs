@@ -10,13 +10,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_value::{
+    ErrKind, JsValue, ObjId, ObjKind, PropKey, Property, Units, WrapperPrim, js_number_to_string,
+    to_integer_or_infinity, units_from_str,
+};
+
 use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 use crate::props::PartialDesc;
-use std::rc::Rc;
-use trust_js_value::{
-    js_number_to_string, to_integer_or_infinity, units_from_str, ErrKind, JsValue, ObjId,
-    ObjKind, PropKey, Property, Units, WrapperPrim,
-};
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -51,11 +53,7 @@ impl JNode {
 
     fn child_key(&self, key: &Units) -> Option<&JNode> {
         match self {
-            JNode::Obj { props, .. } => props
-                .iter()
-                .rev()
-                .find(|(k, _)| k == key)
-                .map(|(_, n)| n),
+            JNode::Obj { props, .. } => props.iter().rev().find(|(k, _)| k == key).map(|(_, n)| n),
             _ => None,
         }
     }
@@ -187,41 +185,26 @@ impl JParser<'_, '_> {
                 // '"'
                 let v = self.parse_string_body()?;
                 let src = self.s[start..self.i].to_vec();
-                Ok(JNode::Prim {
-                    v: JsValue::Str(Rc::new(v)),
-                    src,
-                })
+                Ok(JNode::Prim { v: JsValue::Str(Rc::new(v)), src })
             }
             0x74 => {
                 // true
                 self.expect_word(&[0x74, 0x72, 0x75, 0x65])?;
-                Ok(JNode::Prim {
-                    v: JsValue::Bool(true),
-                    src: self.s[start..self.i].to_vec(),
-                })
+                Ok(JNode::Prim { v: JsValue::Bool(true), src: self.s[start..self.i].to_vec() })
             }
             0x66 => {
                 // false
                 self.expect_word(&[0x66, 0x61, 0x6c, 0x73, 0x65])?;
-                Ok(JNode::Prim {
-                    v: JsValue::Bool(false),
-                    src: self.s[start..self.i].to_vec(),
-                })
+                Ok(JNode::Prim { v: JsValue::Bool(false), src: self.s[start..self.i].to_vec() })
             }
             0x6e => {
                 // null
                 self.expect_word(&[0x6e, 0x75, 0x6c, 0x6c])?;
-                Ok(JNode::Prim {
-                    v: JsValue::Null,
-                    src: self.s[start..self.i].to_vec(),
-                })
+                Ok(JNode::Prim { v: JsValue::Null, src: self.s[start..self.i].to_vec() })
             }
             _ => {
                 let n = self.parse_number()?;
-                Ok(JNode::Prim {
-                    v: JsValue::Num(n),
-                    src: self.s[start..self.i].to_vec(),
-                })
+                Ok(JNode::Prim { v: JsValue::Num(n), src: self.s[start..self.i].to_vec() })
             }
         }
     }
@@ -330,8 +313,7 @@ impl JParser<'_, '_> {
             .iter()
             .map(|&c| char::from(u8::try_from(c).expect("ascii number chars")))
             .collect();
-        text.parse::<f64>()
-            .map_err(|e| Abrupt::Fatal(format!("JSON number parse: {e}")))
+        text.parse::<f64>().map_err(|e| Abrupt::Fatal(format!("JSON number parse: {e}")))
     }
 }
 
@@ -351,12 +333,7 @@ impl Interp {
         let arg = |i: usize| args.get(i).cloned().unwrap_or(JsValue::Undefined);
         let text = self.to_string_units(&arg(0))?;
         let root = {
-            let mut p = JParser {
-                s: &text,
-                i: 0,
-                it: self,
-                depth: 0,
-            };
+            let mut p = JParser { s: &text, i: 0, it: self, depth: 0 };
             let root = p.parse_value()?;
             p.ws();
             if p.i != p.s.len() {
@@ -396,9 +373,7 @@ impl Interp {
         if depth > 600 {
             // Reviver-injected nesting beyond the parse cap: engines fail
             // with an implementation-defined stack RangeError — refuse.
-            return Err(Abrupt::Fatal(
-                "JSON reviver walk nesting cap exceeded".to_string(),
-            ));
+            return Err(Abrupt::Fatal("JSON reviver walk nesting cap exceeded".to_string()));
         }
         let key = PropKey::Str(name.clone());
         let val = self.get_from_object(holder, &key, JsValue::Obj(holder))?;
@@ -406,9 +381,7 @@ impl Interp {
         // the parsed one (identity for containers, SameValue for
         // primitives) — engine-verified drop semantics.
         let snap = snap.filter(|n| match n {
-            JNode::Prim { v, .. } => {
-                !val.is_object() && crate::ops::same_value(v, &val)
-            }
+            JNode::Prim { v, .. } => !val.is_object() && crate::ops::same_value(v, &val),
             JNode::Arr { oid, .. } | JNode::Obj { oid, .. } => {
                 matches!(&val, JsValue::Obj(o) if o == oid)
             }
@@ -420,9 +393,8 @@ impl Interp {
                 for i in 0..len {
                     self.charge_loop()?;
                     let iname = units_from_str(&i.to_string());
-                    let child = snap.and_then(|n| {
-                        usize::try_from(i).ok().and_then(|ix| n.child_index(ix))
-                    });
+                    let child =
+                        snap.and_then(|n| usize::try_from(i).ok().and_then(|ix| n.child_index(ix)));
                     let newel = self.internalize(vo, &iname, child, reviver, depth + 1)?;
                     let ikey = PropKey::Str(iname);
                     if matches!(newel, JsValue::Undefined) {
@@ -438,8 +410,7 @@ impl Interp {
             } else {
                 if !self.own_surface_complete(vo) {
                     return Err(Abrupt::Fatal(
-                        "JSON reviver walk over an object with unmodeled own surface"
-                            .to_string(),
+                        "JSON reviver walk over an object with unmodeled own surface".to_string(),
                     ));
                 }
                 let keys: Vec<Units> = trust_js_value::ordered_own_keys(self.heap.obj(vo))
@@ -478,19 +449,15 @@ impl Interp {
         let context = self.new_plain()?;
         if let Some(JNode::Prim { src, .. }) = snap {
             let src = src.clone();
-            self.heap.obj_mut(context).props.insert(
-                PropKey::from_str("source"),
-                Property::data(JsValue::Str(Rc::new(src))),
-            );
+            self.heap
+                .obj_mut(context)
+                .props
+                .insert(PropKey::from_str("source"), Property::data(JsValue::Str(Rc::new(src))));
         }
         self.call_value(
             &reviver.clone(),
             JsValue::Obj(holder),
-            vec![
-                JsValue::Str(Rc::new(name.clone())),
-                val,
-                JsValue::Obj(context),
-            ],
+            vec![JsValue::Str(Rc::new(name.clone())), val, JsValue::Obj(context)],
         )
     }
 
@@ -596,9 +563,7 @@ impl Interp {
         if st.depth > 600 {
             // Engines fail deep nesting with an implementation-defined stack
             // RangeError — refuse rather than guess the depth.
-            return Err(Abrupt::Fatal(
-                "JSON.stringify nesting cap exceeded".to_string(),
-            ));
+            return Err(Abrupt::Fatal("JSON.stringify nesting cap exceeded".to_string()));
         }
         st.depth += 1;
         let r = self.serialize_property_inner(st, key, holder);

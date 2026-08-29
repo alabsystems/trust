@@ -9,10 +9,10 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{strict_eq, Abrupt, Interp};
+use crate::interp::{Abrupt, Interp, strict_eq};
 use crate::value::{
-    array_index_of, units_eq_ascii, units_from_str, units_to_lossy, ObjId, ObjKind, Object, Prop,
-    PropDesc, PropVal, Units, Value,
+    ObjId, ObjKind, Object, Prop, PropDesc, PropVal, Units, Value, array_index_of, units_eq_ascii,
+    units_from_str, units_to_lossy,
 };
 
 /// ECMA-262 ToUint32 (7.1.7) on an already-ToNumber'd value: total, exact.
@@ -36,7 +36,11 @@ impl Interp {
     // -- arguments-object mapping helpers ------------------------------------
 
     /// The (env, param-name) a still-mapped arguments index aliases.
-    pub(crate) fn args_mapped_name(&self, oid: ObjId, key: &Units) -> Option<(crate::value::EnvId, String)> {
+    pub(crate) fn args_mapped_name(
+        &self,
+        oid: ObjId,
+        key: &Units,
+    ) -> Option<(crate::value::EnvId, String)> {
         let ObjKind::Arguments(am) = &self.obj(oid).kind else {
             return None;
         };
@@ -86,10 +90,7 @@ impl Interp {
             if let Some(n) = crate::typedarray::canonical_numeric_index(key) {
                 let f = self.ta_fields(oid).expect("typed array");
                 return self.ta_valid_index(f, n).map(|_| Prop {
-                    val: PropVal::Data {
-                        value: self.ta_element_get(oid, n),
-                        writable: true,
-                    },
+                    val: PropVal::Data { value: self.ta_element_get(oid, n), writable: true },
                     enumerable: true,
                     configurable: true,
                     synthetic: false,
@@ -265,10 +266,7 @@ impl Interp {
             }
             let prop = if desc.is_accessor() {
                 Prop {
-                    val: PropVal::Accessor {
-                        get: desc.get.flatten(),
-                        set: desc.set.flatten(),
-                    },
+                    val: PropVal::Accessor { get: desc.get.flatten(), set: desc.set.flatten() },
                     enumerable: desc.enumerable.unwrap_or(false),
                     configurable: desc.configurable.unwrap_or(false),
                     synthetic: false,
@@ -347,11 +345,7 @@ impl Interp {
 
         // Apply.
         let is_args_mapped = self.args_mapped_name(oid, key);
-        let p = self
-            .obj_mut(oid)
-            .props
-            .get_mut(key)
-            .expect("current exists");
+        let p = self.obj_mut(oid).props.get_mut(key).expect("current exists");
         if desc.is_accessor() && p.is_data() {
             p.val = PropVal::Accessor {
                 get: desc.get.clone().flatten(),
@@ -398,7 +392,12 @@ impl Interp {
     }
 
     /// Arguments exotic [[DefineOwnProperty]] (10.4.4.2).
-    fn args_define_own(&mut self, oid: ObjId, key: &Units, desc: &PropDesc) -> Result<bool, Abrupt> {
+    fn args_define_own(
+        &mut self,
+        oid: ObjId,
+        key: &Units,
+        desc: &PropDesc,
+    ) -> Result<bool, Abrupt> {
         let mapped = self.args_mapped_name(oid, key);
         let mut new_desc = desc.clone();
         if let Some((env, name)) = &mapped {
@@ -426,7 +425,12 @@ impl Interp {
     }
 
     /// Array exotic [[DefineOwnProperty]] (10.4.2.1).
-    fn array_define_own(&mut self, oid: ObjId, key: &Units, desc: &PropDesc) -> Result<bool, Abrupt> {
+    fn array_define_own(
+        &mut self,
+        oid: ObjId,
+        key: &Units,
+        desc: &PropDesc,
+    ) -> Result<bool, Abrupt> {
         if units_eq_ascii(key, "length") {
             return self.array_set_length(oid, desc);
         }
@@ -450,10 +454,9 @@ impl Interp {
     /// The array's (length value, length writable) pair.
     pub(crate) fn array_length_state(&self, oid: ObjId) -> (u32, bool) {
         match self.obj(oid).props.get(&units_from_str("length")) {
-            Some(Prop {
-                val: PropVal::Data { value: Value::Num(n), writable },
-                ..
-            }) => (crate::number::exact_uint32(*n).unwrap_or(0), *writable),
+            Some(Prop { val: PropVal::Data { value: Value::Num(n), writable }, .. }) => {
+                (crate::number::exact_uint32(*n).unwrap_or(0), *writable)
+            }
             _ => (0, true),
         }
     }
@@ -484,11 +487,7 @@ impl Interp {
         let n1 = self.to_number(&v)?;
         let new_len = to_uint32(n1);
         let n2 = self.to_number(&v)?;
-        let matches = if n2.is_nan() {
-            false
-        } else {
-            f64::from(new_len) == n2
-        };
+        let matches = if n2.is_nan() { false } else { f64::from(new_len) == n2 };
         if !matches {
             return Err(self.throw_native(crate::value::NativeErrorKind::RangeError));
         }
@@ -505,8 +504,7 @@ impl Interp {
         if !new_writable {
             new_len_desc.writable = Some(true); // deferred per step 12
         }
-        let succeeded =
-            self.ordinary_define_own(oid, &units_from_str("length"), &new_len_desc)?;
+        let succeeded = self.ordinary_define_own(oid, &units_from_str("length"), &new_len_desc)?;
         if !succeeded {
             return Ok(false);
         }
@@ -516,15 +514,13 @@ impl Interp {
             .obj(oid)
             .props
             .iter()
-            .filter_map(|(k, _)| array_index_of(k).filter(|i| *i >= new_len).map(|i| (i, k.clone())))
+            .filter_map(|(k, _)| {
+                array_index_of(k).filter(|i| *i >= new_len).map(|i| (i, k.clone()))
+            })
             .collect();
         doomed.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, k) in doomed {
-            let configurable = self
-                .obj(oid)
-                .props
-                .get(&k)
-                .map_or(true, |p| p.configurable);
+            let configurable = self.obj(oid).props.get(&k).map_or(true, |p| p.configurable);
             if !configurable {
                 self.array_write_length_value(oid, f64::from(i) + 1.0);
                 if !new_writable {
@@ -646,16 +642,8 @@ impl Interp {
                 put(self, "writable", Value::Bool(*writable));
             }
             PropVal::Accessor { get, set } => {
-                put(
-                    self,
-                    "get",
-                    get.map_or(Value::Undefined, Value::Obj),
-                );
-                put(
-                    self,
-                    "set",
-                    set.map_or(Value::Undefined, Value::Obj),
-                );
+                put(self, "get", get.map_or(Value::Undefined, Value::Obj));
+                put(self, "set", set.map_or(Value::Undefined, Value::Obj));
             }
         }
         put(self, "enumerable", Value::Bool(p.enumerable));

@@ -181,10 +181,7 @@ fn write_manifest(root: &Path, pin: &str, clean_pin: &str) {
 }
 
 fn stage_gitlink(root: &Path, gitlink: &str, pin: &str) {
-    git(
-        root,
-        &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},{gitlink}")],
-    );
+    git(root, &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},{gitlink}")]);
 }
 
 fn git(root: &Path, args: &[&str]) {

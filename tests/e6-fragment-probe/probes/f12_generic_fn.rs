@@ -11,7 +11,11 @@
 //@ probe-note:   stolen value: rustc_middle::thir::Thir
 //@ probe-note: Program 1 owns that file; see docs/exec/2026-07-25-note-flip-ice-on-generics.md
 clean { def ident_isl (x : UInt64) : UInt64 := x }
-pub fn idg<T>(x: T) -> T { x }
+pub fn idg<T>(x: T) -> T {
+    x
+}
 pub fn use_it(x: u64) -> u64
     ensures result == ident_isl(x)
-{ idg(x) }
+{
+    idg(x)
+}

@@ -544,12 +544,18 @@ fn ordering_type(ty: &Ty) -> bool {
     if !matches!(name.as_str(), "cmp::Ordering" | "core::cmp::Ordering" | "std::cmp::Ordering") {
         return false;
     }
+    // `VariantDef::discriminant` is DECODED at the extraction boundary, so
+    // `Less` is `-1` — the value this predicate was written against. The
+    // former `|| (name == "Less" && variant.discriminant == 255)` disjunct
+    // tolerated the RAW `repr(i8)` bit pattern that the boundary used to emit;
+    // keeping it now would let a stale raw spelling be recognized as `Ordering`
+    // while every other lane reads its tag as `-1`, so it is gone with the
+    // convention it existed for.
     let expected = [("Less", -1_i128), ("Equal", 0), ("Greater", 1)];
     variants.len() == expected.len()
         && variants.iter().zip(expected).all(|(variant, (name, discriminant))| {
             variant.name == name
-                && (variant.discriminant == discriminant
-                    || (name == "Less" && variant.discriminant == 255))
+                && variant.discriminant == discriminant
                 && variant.fields.is_empty()
         })
 }
@@ -775,11 +781,7 @@ fn cast_pair_supported(source: &Ty, destination: &Ty) -> bool {
         // `NonNull` (NOT arbitrary Adt); the semantic iter lane still applies its own
         // `is_pointerish` provenance proof (`clean_ground::iter_field_root`) before any
         // witness.
-        (Ty::RawPtr { .. }, Ty::Adt { name, .. })
-            if name == "core::ptr::non_null::NonNull" =>
-        {
-            true
-        }
+        (Ty::RawPtr { .. }, Ty::Adt { name, .. }) if name == "core::ptr::non_null::NonNull" => true,
         (Ty::RawPtr { .. }, destination) => int_like(destination).is_some(),
         (
             Ty::Ref { mutable: source_mutable, inner: source_inner },
@@ -1084,6 +1086,210 @@ pub(crate) fn assigned_local_rvalue<'a>(
 /// Whole-body admission check used by certificate entry points. Call-result
 /// destinations are terminators rather than `Statement::Assign`; every statement
 /// assignment that a later recognizer may chase must be well typed here.
+/// Diagnostic re-export of [`assignment_types_match`] so an instrument can locate the
+/// offending statement without duplicating the predicate.
+#[must_use]
+pub(crate) fn assignment_types_match_for_test(
+    body: &VerifiableBody,
+    place: &Place,
+    rvalue: &Rvalue,
+) -> bool {
+    assignment_types_match(body, place, rvalue)
+}
+
+/// Trust: DECLINE LABELLING, ONE LAYER DOWN (2026-08-26) — the OPERAND KIND and the two
+/// type spellings that the first failing assignment actually compares.
+///
+/// The previous instrument reported `operand[0] ty : None`, which its own code returns
+/// for a CONSTANT operand — so it distinguished nothing, and the `datatype_defs`
+/// hypothesis (that two spellings of one rustc type compare unequal) stayed unconfirmed.
+/// This reports the operand KIND explicitly, so "constant" and "place with no computable
+/// type" cannot be conflated again.
+#[must_use]
+pub(crate) fn first_assignment_mismatch_kind(body: &VerifiableBody) -> Option<&'static str> {
+    for st in body.blocks.iter().flat_map(|b| &b.stmts) {
+        let Statement::Assign { place, rvalue, .. } = st else { continue };
+        if assignment_types_match(body, place, rvalue) {
+            continue;
+        }
+        let Some(expected) = place_type(body, place) else {
+            return Some("the PLACE has no computable type");
+        };
+        let Rvalue::Aggregate(kind, operands) = rvalue else {
+            // Trust: NON-AGGREGATE SPLIT (2026-08-26) — "non-Aggregate rvalue mismatch" was
+            // the single largest decline bucket in the ADT mass (1,159 bodies, 2x
+            // over-represented on generics) and as one label it names a dozen unrelated
+            // rvalues. Each wants different work, so each gets its own label.
+            let place_kind = match &expected {
+                Ty::Int { .. } => "Int",
+                Ty::Bool => "Bool",
+                Ty::Adt { variants, .. } if variants.is_empty() => "struct",
+                Ty::Adt { .. } => "enum",
+                Ty::Ref { .. } => "Ref",
+                Ty::RawPtr { .. } => "RawPtr",
+                Ty::Tuple(..) => "Tuple",
+                _ => "other",
+            };
+            return Some(match (rvalue, place_kind) {
+                (Rvalue::Use(_), "enum") => "USE into an enum place",
+                (Rvalue::Use(_), "struct") => "USE into a struct place",
+                (Rvalue::Use(_), _) => "USE into a scalar/other place",
+                // Trust: CAST SPLIT (2026-08-26) — 452 bodies, 9x over-represented on
+                // generic bodies and the largest generic-specific NON-refusal bucket left
+                // after `format!`'s FnPtr was ruled a correct refusal. The cast's declared
+                // destination type against the place type is what says whether this is a
+                // modelling gap or a coercion the model has no business claiming.
+                (Rvalue::Cast(_, dest), _) => {
+                    let d = match dest {
+                        Ty::Int { .. } => "Int",
+                        Ty::Bool => "Bool",
+                        Ty::Float { .. } => "Float",
+                        Ty::Ref { .. } => "Ref",
+                        Ty::RawPtr { .. } => "RawPtr",
+                        Ty::Adt { .. } => "Adt",
+                        Ty::Slice { .. } => "Slice",
+                        Ty::FnPtr { .. } => "FnPtr",
+                        Ty::Unsupported { .. } => "Unsupported",
+                        _ => "other",
+                    };
+                    match (d, place_kind) {
+                        ("RawPtr", "RawPtr") => "CAST RawPtr -> RawPtr (ptr cast)",
+                        ("RawPtr", _) => "CAST to RawPtr into a non-ptr place",
+                        ("Ref", _) | (_, "Ref") => "CAST involving a REFERENCE",
+                        ("Int", "Int") => "CAST Int -> Int (width/sign)",
+                        ("Int", _) => "CAST to Int into a non-Int place",
+                        ("Unsupported", _) => "CAST to an UNSUPPORTED destination type",
+                        ("Adt", _) | (_, "struct") | (_, "enum") => "CAST involving an ADT",
+                        _ => "CAST rvalue mismatch (other)",
+                    }
+                }
+                (Rvalue::Ref { .. }, _) => "REF rvalue mismatch",
+                (Rvalue::AddressOf { .. }, _) => "ADDRESS-OF rvalue mismatch",
+                (Rvalue::Discriminant(..), _) => "DISCRIMINANT rvalue mismatch",
+                (Rvalue::BinaryOp(..) | Rvalue::UncheckedBinaryOp(..), _) => "BINARY-OP mismatch",
+                (Rvalue::CheckedBinaryOp(..), _) => "CHECKED-BINARY-OP mismatch",
+                (Rvalue::UnaryOp(..), _) => "UNARY-OP mismatch",
+                (Rvalue::Len(..), _) => "LEN rvalue mismatch",
+                (Rvalue::Repeat(..), _) => "REPEAT rvalue mismatch",
+                (Rvalue::CopyForDeref(..), _) => "COPY-FOR-DEREF mismatch",
+                (Rvalue::PtrOffset { .. }, _) => "PTR-OFFSET mismatch",
+                (Rvalue::Unsupported { .. }, _) => "UNSUPPORTED rvalue (extractor gap)",
+                _ => "non-Aggregate rvalue mismatch (unclassified)",
+            });
+        };
+        // Find the operand the aggregate check would reject, and say what it is.
+        let fields: Vec<Ty> = match (kind, &expected) {
+            (
+                AggregateKind::Adt { variant, .. },
+                Ty::Adt { fields, variants, .. },
+            ) => {
+                if let Some(v) = variants.get(usize::try_from(*variant).unwrap_or(usize::MAX)) {
+                    v.fields.iter().map(|(_, t)| t.clone()).collect()
+                } else {
+                    fields.iter().map(|(_, t)| t.clone()).collect()
+                }
+            }
+            (AggregateKind::Tuple, Ty::Tuple(fs)) => fs.clone(),
+            _ => return Some("aggregate kind/head does not match the place type"),
+        };
+        if fields.len() != operands.len() {
+            return Some("aggregate ARITY differs from the variant's field count");
+        }
+        for (op, want) in operands.iter().zip(&fields) {
+            if operand_matches_type(body, op, want) {
+                continue;
+            }
+            return Some(match op {
+                // Name the CONSTANT kind against the FIELD kind — "a constant does not
+                // match" is where the previous layer stopped, and the two halves want
+                // different fixes.
+                Operand::Constant(c) => {
+                    let ck = match c {
+                        ConstValue::Int(_) => "Int",
+                        ConstValue::Uint(..) => "Uint",
+                        ConstValue::Bool(_) => "Bool",
+                        ConstValue::Unit => "Unit",
+                        ConstValue::Float(_) | ConstValue::FloatBits { .. } => "Float",
+                        ConstValue::Str { .. } => "Str",
+                        ConstValue::OpaqueConst => "OpaqueConst",
+                        _ => "other-const",
+                    };
+                    let fk = match want {
+                        Ty::Int { .. } => "Int",
+                        Ty::Bool => "Bool",
+                        Ty::Unit => "Unit",
+                        Ty::Adt { .. } => "Adt",
+                        Ty::Ref { .. } => "Ref",
+                        Ty::RawPtr { .. } => "RawPtr",
+                        Ty::Tuple(..) => "Tuple",
+                        Ty::Float { .. } => "Float",
+                        _ => "other-ty",
+                    };
+                    return Some(match (ck, fk) {
+                        ("OpaqueConst", "Adt") => "CONST(OpaqueConst) vs field Adt",
+                        ("Str", "Adt") => "CONST(Str) vs field Adt",
+                        ("other-const", "Adt") => "CONST(other) vs field Adt",
+                        ("OpaqueConst" | "Str" | "other-const", _) => "CONST(non-scalar) vs a non-Adt field",
+                        ("Unit", "Adt") => "CONST(Unit) vs field Adt",
+                        ("Int" | "Uint", "Adt") => "CONST(Int) vs field Adt",
+                        ("Int" | "Uint", "Int") => "CONST(Int) vs field Int (width/sign)",
+                        _ => "CONST vs field, other combination",
+                    });
+                }
+                Operand::Copy(place) | Operand::Move(place) => {
+                    if place_type(body, place).is_none() {
+                        "a PLACE operand has no computable type"
+                    } else {
+                        "a PLACE operand's type differs from its field type"
+                    }
+                }
+                _ => "an operand of another kind does not match",
+            });
+        }
+        return Some("aggregate mismatch with every operand matching (head/arity)");
+    }
+    None
+}
+
+/// Trust: DECLINE LABELLING (2026-08-26) — which of [`all_assignments_match`]'s four
+/// clauses fails. That check stops 56 of the 152 rejected 2-arm-shaped bodies on `fp4`
+/// at the recognizer's FIRST gate, which no earlier instrument surfaced, and "a write
+/// does not match its place type" was a guess at which clause was responsible.
+#[must_use]
+pub(crate) fn all_assignments_match_reason(body: &VerifiableBody) -> &'static str {
+    if !body.locals.first().is_some_and(|r| ty_eq(&r.ty, &body.return_ty)) {
+        return "locals[0].ty != return_ty";
+    }
+    if body.arg_count >= body.locals.len() {
+        return "arg_count >= locals.len()";
+    }
+    if !body.locals.iter().enumerate().all(|(position, local)| local.index == position) {
+        return "local.index does not equal its position";
+    }
+    if let Some(st) = body.blocks.iter().flat_map(|b| &b.stmts).find(|st| match st {
+        Statement::Assign { place, rvalue, .. } => !assignment_types_match(body, place, rvalue),
+        _ => false,
+    }) {
+        // Name the RVALUE KIND that mismatches — this check is a first gate shared by
+        // several recognizers, so which shape it rejects matters beyond one lane.
+        let Statement::Assign { rvalue, .. } = st else { return "mismatch (unreachable)" };
+        return match rvalue {
+            Rvalue::Use(..) => "mismatch: Use",
+            Rvalue::Aggregate(..) => "mismatch: Aggregate",
+            Rvalue::Cast(..) => "mismatch: Cast",
+            Rvalue::Ref { .. } => "mismatch: Ref",
+            Rvalue::AddressOf(..) => "mismatch: AddressOf",
+            Rvalue::BinaryOp(..) => "mismatch: BinaryOp",
+            Rvalue::CheckedBinaryOp(..) => "mismatch: CheckedBinaryOp",
+            Rvalue::UnaryOp(..) => "mismatch: UnaryOp",
+            Rvalue::Discriminant(..) => "mismatch: Discriminant",
+            Rvalue::Len(..) => "mismatch: Len",
+            _ => "mismatch: other rvalue",
+        };
+    }
+    "all four clauses pass"
+}
+
 pub(crate) fn all_assignments_match(body: &VerifiableBody) -> bool {
     body.locals.first().is_some_and(|return_local| ty_eq(&return_local.ty, &body.return_ty))
         && body.arg_count < body.locals.len()
@@ -1117,16 +1323,8 @@ mod tests {
     #[test]
     fn unit_constant_requires_the_exact_canonical_marker_type() {
         let empty_adt = |name: &str| Ty::adt(name, vec![]);
-        assert!(constant_matches_type(
-            &ConstValue::Unit,
-            &empty_adt("core::marker::PhantomData")
-        ));
-        for forged in [
-            "T",
-            "user::Marker",
-            "user::Never",
-            "user::core::marker::PhantomData",
-        ] {
+        assert!(constant_matches_type(&ConstValue::Unit, &empty_adt("core::marker::PhantomData")));
+        for forged in ["T", "user::Marker", "user::Never", "user::core::marker::PhantomData"] {
             assert!(
                 !constant_matches_type(&ConstValue::Unit, &empty_adt(forged)),
                 "empty ADT shape alone must not authorize Unit for `{forged}`"
@@ -1229,18 +1427,26 @@ mod tests {
             discriminant: 0,
             fields: vec![("0".into(), i32_ty.clone())],
         };
-        let legacy = Ty::Adt { adt_kind: None, layout: None, 
+        let legacy = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::Legacy".into(),
             fields: vec![("__v0_0".into(), i32_ty.clone())],
             variants: vec![variant.clone()],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
-        let first_class = Ty::Adt { adt_kind: None, layout: None,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let first_class = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::FirstClass".into(),
             fields: vec![("0".into(), i32_ty.clone())],
             variants: vec![variant],
             disc_index_safe: true,
-            faithful_enum_repr: Some(None), enum_layout: None, };
+            faithful_enum_repr: Some(None),
+            enum_layout: None,
+        };
         let datatype = Ty::Datatype {
             name: "demo::Record".into(),
             variants: vec![("mk".into(), vec![("value".into(), i32_ty.clone())])],
@@ -1253,7 +1459,9 @@ mod tests {
 
     #[test]
     fn legacy_payloadless_aggregate_ignores_flattened_variant_storage() {
-        let legacy_option = Ty::Adt { adt_kind: None, layout: None, 
+        let legacy_option = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::OptionBool".into(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -1261,7 +1469,9 @@ mod tests {
             ],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let body = body(vec![legacy_option]);
         assert!(assignment_types_match(
             &body,
@@ -1307,12 +1517,16 @@ mod tests {
     #[test]
     fn legacy_flattened_downcast_requires_one_canonical_payload_layout() {
         let tag = || ("__tag".into(), Ty::Int { width: 64, signed: true });
-        let legacy = |fields| Ty::Adt { adt_kind: None, layout: None, 
+        let legacy = |fields| Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::OptionPair".into(),
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let valid = legacy(vec![
             tag(),
             ("__v1_0".into(), Ty::Tuple(vec![Ty::Bool, Ty::Int { width: 32, signed: false }])),
@@ -1362,12 +1576,16 @@ mod tests {
 
     #[test]
     fn tag_only_aggregate_requires_first_class_variant_metadata() {
-        let legacy = |name: &str, fields| Ty::Adt { adt_kind: None, layout: None, 
+        let legacy = |name: &str, fields| Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: name.into(),
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let exact_tag = || vec![("__tag".into(), Ty::Int { width: 64, signed: true })];
         let first_class_error = Ty::adt_enum(
             "Error",
@@ -1496,12 +1714,16 @@ mod tests {
     #[test]
     fn legacy_discriminant_requires_one_exactly_typed_flattened_tag() {
         let discr_ty = Ty::Int { width: 64, signed: true };
-        let legacy = |fields| Ty::Adt { adt_kind: None, layout: None, 
+        let legacy = |fields| Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::LegacyEither".into(),
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let valid = legacy(vec![
             ("__tag".into(), discr_ty.clone()),
             ("__v0_0".into(), Ty::Unit),
@@ -1555,12 +1777,16 @@ mod tests {
     #[test]
     fn fieldless_ordering_discriminant_requires_first_class_variant_metadata() {
         let i8_ty = Ty::Int { width: 8, signed: true };
-        let ordering = |name: &str, fields| Ty::Adt { adt_kind: None, layout: None, 
+        let ordering = |name: &str, fields| Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: name.into(),
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let exact_fields = || vec![("__tag".into(), Ty::Int { width: 64, signed: true })];
         let first_class = Ty::adt_enum(
             "cmp::Ordering",
@@ -1723,12 +1949,16 @@ mod tests {
         let i32_ty = Ty::Int { width: 32, signed: true };
         let bool_ref = Ty::Ref { mutable: false, inner: Box::new(Ty::Bool) };
         let i32_ref = Ty::Ref { mutable: false, inner: Box::new(i32_ty.clone()) };
-        let fake_ordering = Ty::Adt { adt_kind: None, layout: None, 
+        let fake_ordering = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "user::Ordering".into(),
             fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let closure = Ty::Closure { name: "demo::call".into(), upvars: vec![], call: None };
         let body = body(vec![
             Ty::Bool,
@@ -2039,8 +2269,16 @@ mod tests {
                 ("__v2_1".into(), arc()),
             ],
             variants: vec![
-                VariantDef { name: "Leaf".into(), discriminant: 0, fields: vec![("0".into(), i64_ty())] },
-                VariantDef { name: "One".into(), discriminant: 1, fields: vec![("0".into(), arc())] },
+                VariantDef {
+                    name: "Leaf".into(),
+                    discriminant: 0,
+                    fields: vec![("0".into(), i64_ty())],
+                },
+                VariantDef {
+                    name: "One".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), arc())],
+                },
                 VariantDef {
                     name: "Two".into(),
                     discriminant: 2,
@@ -2060,9 +2298,8 @@ mod tests {
             local: 1,
             projections: vec![Projection::Deref, Projection::Downcast(2), Projection::Field(0)],
         };
-        let markers_everywhere = || {
-            body(vec![Ty::Unit, Ty::Ref { mutable: false, inner: Box::new(marker("Tree")) }])
-        };
+        let markers_everywhere =
+            || body(vec![Ty::Unit, Ty::Ref { mutable: false, inner: Box::new(marker("Tree")) }]);
         let with_table = |defs: DatatypeDefs| {
             let mut b = markers_everywhere();
             b.datatype_defs = defs;
@@ -2075,9 +2312,7 @@ mod tests {
         //    definitional shapes must do it: the ADT one is what the producer
         //    actually files for `Tree`, and it is the shape the narrow carrier
         //    could not hold at all.
-        for (label, def) in
-            [("Ty::Datatype", &tree_datatype_def), ("Ty::Adt", &tree_adt_def)]
-        {
+        for (label, def) in [("Ty::Datatype", &tree_datatype_def), ("Ty::Adt", &tree_adt_def)] {
             let defs = DatatypeDefs::from([("Tree".to_string(), def.clone())]);
             assert_eq!(
                 place_type(&with_table(defs.clone()), &two_field_0),
@@ -2229,9 +2464,7 @@ mod tests {
                     })
                     .collect(),
             },
-            Ty::Ref { mutable, inner } => {
-                Ty::Ref { mutable: *mutable, inner: Box::new(go(inner)) }
-            }
+            Ty::Ref { mutable, inner } => Ty::Ref { mutable: *mutable, inner: Box::new(go(inner)) },
             Ty::RawPtr { mutable, pointee } => {
                 Ty::RawPtr { mutable: *mutable, pointee: Box::new(go(pointee)) }
             }
@@ -2285,20 +2518,19 @@ mod tests {
             local: 1,
             projections: vec![Projection::Deref, Projection::Downcast(2), Projection::Field(0)],
         };
-        let (dest, rvalue) = shipped
-            .body
-            .blocks
-            .iter()
-            .flat_map(|b| &b.stmts)
-            .find_map(|s| match s {
-                Statement::Assign { place, rvalue: rv @ Rvalue::Ref { place: p, .. }, .. }
-                    if *p == two_field_0 =>
-                {
-                    Some((place.clone(), rv.clone()))
-                }
-                _ => None,
-            })
-            .expect("the shipped fixture carries `_6 = &((*_1) as Two).0`");
+        let (dest, rvalue) =
+            shipped
+                .body
+                .blocks
+                .iter()
+                .flat_map(|b| &b.stmts)
+                .find_map(|s| match s {
+                    Statement::Assign {
+                        place, rvalue: rv @ Rvalue::Ref { place: p, .. }, ..
+                    } if *p == two_field_0 => Some((place.clone(), rv.clone())),
+                    _ => None,
+                })
+                .expect("the shipped fixture carries `_6 = &((*_1) as Two).0`");
         assert_eq!(dest.local, 6, "the shipped destination is local 6");
 
         // ── The cut point is a MARKER at the walk root, not a definition ─────
@@ -2335,8 +2567,8 @@ mod tests {
         // `Arc<Tree>` as `Tree`'s own field and `Arc<Tree>` as local 6's pointee
         // are the two positions that disagreed under R0. They are now equal, and
         // the assignment that used to decline now types.
-        let field_arc = place_type(&shipped.body, &two_field_0)
-            .expect("the downcast types through the table");
+        let field_arc =
+            place_type(&shipped.body, &two_field_0).expect("the downcast types through the table");
         let Ty::Ref { inner: local6_arc, .. } = &shipped.body.locals[6].ty else {
             panic!("local 6 is `&Arc<Tree>`");
         };
@@ -2440,10 +2672,7 @@ mod tests {
     // all of them compared equal, which is the defect.
 
     fn dyn_pointee(principal_key: &str) -> Ty {
-        Ty::Dynamic {
-            trait_name: "krate::Trait".into(),
-            principal_key: Some(principal_key.into()),
-        }
+        Ty::Dynamic { trait_name: "krate::Trait".into(), principal_key: Some(principal_key.into()) }
     }
 
     fn unkeyed_dyn_pointee() -> Ty {

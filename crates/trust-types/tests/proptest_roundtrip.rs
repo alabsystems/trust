@@ -74,14 +74,18 @@ fn arb_ty() -> impl Strategy<Value = Ty> {
                 prop::collection::vec(inner.clone(), 0..4).prop_map(Ty::Tuple),
                 // Adt (1-3 fields)
                 ("[a-z]{1,8}", prop::collection::vec(("[a-z]{1,6}", inner), 1..3)).prop_map(
-                    |(name, fields)| Ty::Adt { adt_kind: None, layout: None, 
+                    |(name, fields)| Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name,
                         fields,
                         disc_index_safe: false,
                         // Trust (B3-1 field completion): missed by 11598e13fe;
                         // kept the trust-types test suite uncompilable since B3-1.
-                        faithful_enum_repr: None, enum_layout: None, }
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    }
                 ),
             ]
         },

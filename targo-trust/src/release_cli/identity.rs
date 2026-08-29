@@ -7,13 +7,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use trust_version::{
     BoundToolIdentity, BoundTools, DEFAULT_VERSION_SOURCE_PATH, Stage0Info, TrustVersionIdentity,
-    VersionRuntime, parse_version_source,
+    VersionRuntime, parse_version_source, rust_compat_release, trust_archive_version,
 };
 
+use super::types::CANDIDATE_COMMAND_VERSION;
 use crate::bounded_process;
 use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
-
-use super::types::CANDIDATE_COMMAND_VERSION;
 
 pub(super) fn build_version_identity(
     explicit_root: Option<&Path>,
@@ -26,12 +25,26 @@ pub(super) fn build_version_identity(
     let source = parse_version_source(&source_text)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
+    // Trust states its two version lines in two files, and each one has exactly
+    // one authority (`crates/trust-version` proves they agree with
+    // `release/trust-version.toml` in `the_three_checked_in_version_files_agree`):
+    //
+    //   src/rust-compat-version  the Rust release the `-V` protocol reports
+    //   src/version              Trust's own major.minor.dev
+    //
+    // The bound-tool surface below measures every tool by the line it PRINTS for
+    // `--version`, which bootstrap stamps from the compat file; reading Trust's
+    // own version here instead is what made a correct `trustd 1.99.0-dev` fail
+    // its identity binding against an expected `trustd 0.1.0-dev`. Archives keep
+    // being named from Trust's own version, which is the other half of the split.
     let rust_upstream_version =
+        read_trimmed(root.join("src/rust-compat-version")).unwrap_or_else(|| "unknown".to_string());
+    let trust_product_version =
         read_trimmed(root.join("src/version")).unwrap_or_else(|| "unknown".to_string());
     let bootstrap_channel =
         read_trimmed(root.join("src/ci/channel")).unwrap_or_else(|| "unknown".to_string());
-    let rust_compat_version = rust_compat_version(&rust_upstream_version, &bootstrap_channel);
-    let archive_version = archive_version(&rust_upstream_version, &bootstrap_channel);
+    let rust_compat_version = rust_compat_release(&rust_upstream_version, &bootstrap_channel);
+    let archive_version = trust_archive_version(&trust_product_version, &bootstrap_channel);
     let candidate_commit = crate::controlled_git::canonical_head(
         &root,
         "release repository HEAD probe",
@@ -49,7 +62,7 @@ pub(super) fn build_version_identity(
             rust_upstream_version,
             bootstrap_channel,
             rust_compat_version,
-            rust_compat_source: "src/version + src/ci/channel".to_string(),
+            rust_compat_source: "src/rust-compat-version + src/ci/channel".to_string(),
             archive_version,
             candidate_commit,
             commit_date,
@@ -526,22 +539,6 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     )
     .ok()
     .filter(|text| !text.is_empty())
-}
-
-fn rust_compat_version(rust_upstream_version: &str, bootstrap_channel: &str) -> String {
-    match bootstrap_channel {
-        "stable" => rust_upstream_version.to_string(),
-        "trust" => format!("{rust_upstream_version}-dev"),
-        channel => format!("{rust_upstream_version}-{channel}"),
-    }
-}
-
-fn archive_version(rust_upstream_version: &str, bootstrap_channel: &str) -> String {
-    match bootstrap_channel {
-        "trust" => format!("{rust_upstream_version}-trust"),
-        "stable" => rust_upstream_version.to_string(),
-        channel => format!("{rust_upstream_version}-{channel}"),
-    }
 }
 
 fn runner_kind(current_exe: Option<&Path>) -> String {

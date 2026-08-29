@@ -1854,7 +1854,9 @@ mod tests {
                 Formula::Var("pid".into(), Sort::Int),
                 Formula::Var("status".into(), Sort::Int),
                 Formula::Int(0),
-            ], &Default::default());
+            ],
+            &Default::default(),
+        );
         assert!(vcs.is_empty(), "waitpid must impose no call-site demands, got {vcs:?}");
     }
 

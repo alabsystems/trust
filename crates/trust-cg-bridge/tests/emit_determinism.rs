@@ -406,7 +406,12 @@ fn emit_suite() -> BTreeMap<String, Vec<u8>> {
             .emit_object(&[lir])
             .unwrap_or_else(|e| panic!("emit_object failed for {}: {e:?}", func.name));
         assert!(!bytes.is_empty(), "{}: emitted object must be non-empty", func.name);
-        assert_eq!(&bytes[..4], &[0xCF, 0xFA, 0xED, 0xFE], "{}: must be 64-bit LE Mach-O", func.name);
+        assert_eq!(
+            &bytes[..4],
+            &[0xCF, 0xFA, 0xED, 0xFE],
+            "{}: must be 64-bit LE Mach-O",
+            func.name
+        );
         out.insert(func.name.clone(), bytes);
     }
     out
@@ -508,7 +513,8 @@ fn emit_determinism_in_process_floor() {
     for (name, abytes) in &a {
         let bbytes = &b[name];
         assert_eq!(
-            abytes, bbytes,
+            abytes,
+            bbytes,
             "{name}: in-process emit-twice produced DIFFERENT object bytes (len {} vs {})",
             abytes.len(),
             bbytes.len()

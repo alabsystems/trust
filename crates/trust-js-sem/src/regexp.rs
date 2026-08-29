@@ -12,14 +12,16 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::builtins::{to_length_u64, WK_MATCH, WK_SPECIES};
+use std::rc::Rc;
+
+use trust_js_regexp::{CompileError, ExecError, Pattern};
+
+use crate::builtins::{WK_MATCH, WK_SPECIES, to_length_u64};
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::value::{
-    units_from_str, NativeErrorKind, ObjId, ObjKind, Object, Prop, RegExpFlag, RegExpProtoOp,
-    Units, Value,
+    NativeErrorKind, ObjId, ObjKind, Object, Prop, RegExpFlag, RegExpProtoOp, Units, Value,
+    units_from_str,
 };
-use std::rc::Rc;
-use trust_js_regexp::{CompileError, ExecError, Pattern};
 
 /// The runtime record behind a RegExp object: the compiled matcher
 /// ([[RegExpMatcher]]) plus [[OriginalSource]] and [[OriginalFlags]] (the
@@ -109,8 +111,8 @@ pub(crate) fn escape_regexp_pattern(p: &[u16]) -> Units {
 /// otherwise break the single-line `/…/` form).
 fn push_lt_escaped(out: &mut Units, c: u16) {
     match c {
-        0x0a => out.extend_from_slice(&[0x5c, 0x6e]),           // \n
-        0x0d => out.extend_from_slice(&[0x5c, 0x72]),           // \r
+        0x0a => out.extend_from_slice(&[0x5c, 0x6e]), // \n
+        0x0d => out.extend_from_slice(&[0x5c, 0x72]), // \r
         0x2028 => out.extend_from_slice(&units_from_str("\\u2028")),
         0x2029 => out.extend_from_slice(&units_from_str("\\u2029")),
         _ => out.push(c),
@@ -140,11 +142,8 @@ impl Interp {
         let flags_str = crate::value::units_to_lossy(flags);
         match trust_js_regexp::compile(source, &flags_str) {
             Ok(pattern) => {
-                let data = Rc::new(RegExpData {
-                    pattern,
-                    source: source.clone(),
-                    flags: flags.clone(),
-                });
+                let data =
+                    Rc::new(RegExpData { pattern, source: source.clone(), flags: flags.clone() });
                 let oid = self.alloc(Object::new(ObjKind::RegExpObj(data), Some(proto)));
                 // [[lastIndex]]: writable, non-enumerable, non-configurable, +0.
                 self.obj_mut(oid).props.insert(
@@ -244,16 +243,10 @@ impl Interp {
         };
 
         let proto = self.proto_from_new_target(new_target, self.intr.regexp_proto)?;
-        let p_units = if matches!(p, Value::Undefined) {
-            Vec::new()
-        } else {
-            self.to_string_units(&p)?
-        };
-        let f_units = if matches!(f, Value::Undefined) {
-            Vec::new()
-        } else {
-            self.to_string_units(&f)?
-        };
+        let p_units =
+            if matches!(p, Value::Undefined) { Vec::new() } else { self.to_string_units(&p)? };
+        let f_units =
+            if matches!(f, Value::Undefined) { Vec::new() } else { self.to_string_units(&f)? };
         let oid = self.regexp_from_source(&p_units, &f_units, proto)?;
         Ok(Value::Obj(oid))
     }
@@ -388,11 +381,8 @@ impl Interp {
         let exec = self.get_from_object(rid, &units_from_str("exec"))?;
         if let Value::Obj(f) = &exec {
             if self.obj(*f).is_callable() {
-                let result = self.call_value(
-                    &exec,
-                    Value::Obj(rid),
-                    vec![Value::Str(Rc::new(s.to_vec()))],
-                )?;
+                let result =
+                    self.call_value(&exec, Value::Obj(rid), vec![Value::Str(Rc::new(s.to_vec()))])?;
                 if !matches!(result, Value::Obj(_) | Value::Null) {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
@@ -471,22 +461,18 @@ impl Interp {
                 Some((st, en)) => Value::Str(Rc::new(s[st..en].to_vec())),
                 None => Value::Undefined,
             };
-            self.obj_mut(arr)
-                .props
-                .insert(units_from_str(&g.to_string()), Prop::data(v));
+            self.obj_mut(arr).props.insert(units_from_str(&g.to_string()), Prop::data(v));
         }
         #[allow(clippy::cast_precision_loss)]
         self.set_array_length_raw(arr, (n + 1) as f64);
         // "index", "input" (spec order after the integer keys, before groups).
         #[allow(clippy::cast_precision_loss)]
-        self.obj_mut(arr).props.insert(
-            units_from_str("index"),
-            Prop::data(Value::Num(m.index as f64)),
-        );
-        self.obj_mut(arr).props.insert(
-            units_from_str("input"),
-            Prop::data(Value::Str(Rc::new(s.to_vec()))),
-        );
+        self.obj_mut(arr)
+            .props
+            .insert(units_from_str("index"), Prop::data(Value::Num(m.index as f64)));
+        self.obj_mut(arr)
+            .props
+            .insert(units_from_str("input"), Prop::data(Value::Str(Rc::new(s.to_vec()))));
         // "groups".
         let groups_val = if has_groups {
             let groups = self.alloc(Object::new(ObjKind::Plain, None));
@@ -498,8 +484,8 @@ impl Interp {
                 };
                 let key = units_from_str(name);
                 // Duplicate names (ES2025): the participating capture wins.
-                let overwrite = !matches!(v, Value::Undefined)
-                    || !self.obj(groups).props.contains_key(&key);
+                let overwrite =
+                    !matches!(v, Value::Undefined) || !self.obj(groups).props.contains_key(&key);
                 if overwrite {
                     self.obj_mut(groups).props.insert(key, Prop::data(v));
                 }
@@ -508,15 +494,11 @@ impl Interp {
         } else {
             Value::Undefined
         };
-        self.obj_mut(arr)
-            .props
-            .insert(units_from_str("groups"), Prop::data(groups_val.clone()));
+        self.obj_mut(arr).props.insert(units_from_str("groups"), Prop::data(groups_val.clone()));
         // "indices" (the `d` flag).
         if flags.has_indices {
             let indices = self.make_indices_array(s, &m, groups_val)?;
-            self.obj_mut(arr)
-                .props
-                .insert(units_from_str("indices"), Prop::data(indices));
+            self.obj_mut(arr).props.insert(units_from_str("indices"), Prop::data(indices));
         }
         Ok(Value::Obj(arr))
     }
@@ -543,9 +525,7 @@ impl Interp {
         }
         let arr = self.new_array(n + 1);
         for (i, v) in group_vals.iter().enumerate() {
-            self.obj_mut(arr)
-                .props
-                .insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
+            self.obj_mut(arr).props.insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
         }
         #[allow(clippy::cast_precision_loss)]
         self.set_array_length_raw(arr, (n + 1) as f64);
@@ -557,17 +537,15 @@ impl Interp {
             for (name, gnum) in &m.named {
                 let v = group_vals.get(*gnum).cloned().unwrap_or(Value::Undefined);
                 let key = units_from_str(name);
-                let overwrite = !matches!(v, Value::Undefined)
-                    || !self.obj(groups).props.contains_key(&key);
+                let overwrite =
+                    !matches!(v, Value::Undefined) || !self.obj(groups).props.contains_key(&key);
                 if overwrite {
                     self.obj_mut(groups).props.insert(key, Prop::data(v));
                 }
             }
             Value::Obj(groups)
         };
-        self.obj_mut(arr)
-            .props
-            .insert(units_from_str("groups"), Prop::data(groups_val));
+        self.obj_mut(arr).props.insert(units_from_str("groups"), Prop::data(groups_val));
         Ok(Value::Obj(arr))
     }
 
@@ -575,13 +553,9 @@ impl Interp {
     fn index_pair(&mut self, st: usize, en: usize) -> Value {
         let a = self.new_array(2);
         #[allow(clippy::cast_precision_loss)]
-        self.obj_mut(a)
-            .props
-            .insert(units_from_str("0"), Prop::data(Value::Num(st as f64)));
+        self.obj_mut(a).props.insert(units_from_str("0"), Prop::data(Value::Num(st as f64)));
         #[allow(clippy::cast_precision_loss)]
-        self.obj_mut(a)
-            .props
-            .insert(units_from_str("1"), Prop::data(Value::Num(en as f64)));
+        self.obj_mut(a).props.insert(units_from_str("1"), Prop::data(Value::Num(en as f64)));
         self.set_array_length_raw(a, 2.0);
         Value::Obj(a)
     }
@@ -638,12 +612,7 @@ impl Interp {
         let result = self.regexp_exec(rid, &s)?;
         let current = self.get_from_object(rid, &units_from_str("lastIndex"))?;
         if !crate::props::same_value(self, &current, &previous) {
-            self.set_prop_value(
-                &Value::Obj(rid),
-                &units_from_str("lastIndex"),
-                previous,
-                true,
-            )?;
+            self.set_prop_value(&Value::Obj(rid), &units_from_str("lastIndex"), previous, true)?;
         }
         if matches!(result, Value::Null) {
             return Ok(Value::Num(-1.0));
@@ -661,11 +630,8 @@ impl Interp {
         let s = self.to_string_units(s_arg)?;
         let length_s = s.len();
         let functional = matches!(replace_value, Value::Obj(f) if self.obj(*f).is_callable());
-        let replace_str = if functional {
-            Vec::new()
-        } else {
-            self.to_string_units(replace_value)?
-        };
+        let replace_str =
+            if functional { Vec::new() } else { self.to_string_units(replace_value)? };
         // NOTE: @@replace reads `global` and (if global) `unicode` DIRECTLY via
         // [[Get]] — NOT the "flags" string. This is the behavior the reference
         // engine (V8) ships and the differential oracle enforces (test262's
@@ -890,10 +856,8 @@ impl Interp {
             f.push(u16::from(b'y'));
             f
         };
-        let splitter = self.construct(
-            &Value::Obj(c),
-            vec![Value::Obj(rxid), Value::Str(Rc::new(new_flags))],
-        )?;
+        let splitter =
+            self.construct(&Value::Obj(c), vec![Value::Obj(rxid), Value::Str(Rc::new(new_flags))])?;
         let Value::Obj(spid) = splitter else {
             return Err(Abrupt::Fatal("RegExp @@split splitter not an object".to_string()));
         };
@@ -972,10 +936,8 @@ impl Interp {
             ));
         }
         let flags = self.regexp_read_flags(this)?;
-        let matcher = self.construct(
-            &Value::Obj(c),
-            vec![Value::Obj(rid), Value::Str(Rc::new(flags.clone()))],
-        )?;
+        let matcher = self
+            .construct(&Value::Obj(c), vec![Value::Obj(rid), Value::Str(Rc::new(flags.clone()))])?;
         let Value::Obj(mid) = matcher else {
             return Err(Abrupt::Fatal("RegExp @@matchAll matcher not an object".to_string()));
         };
@@ -1005,13 +967,9 @@ impl Interp {
         };
         let oid = *oid;
         let (regexp, s, global, unicode, done) = match &self.obj(oid).kind {
-            ObjKind::RegExpStringIterator {
-                regexp,
-                string,
-                global,
-                unicode,
-                done,
-            } => (*regexp, string.clone(), *global, *unicode, *done),
+            ObjKind::RegExpStringIterator { regexp, string, global, unicode, done } => {
+                (*regexp, string.clone(), *global, *unicode, *done)
+            }
             _ => return Err(self.throw_native(NativeErrorKind::TypeError)),
         };
         if done {
@@ -1098,9 +1056,7 @@ impl Interp {
     /// CreateDataPropertyOrThrow(arr, ToString(i), v) with the array length
     /// bumped to i+1.
     fn create_array_element(&mut self, arr: ObjId, i: u64, v: Value) {
-        self.obj_mut(arr)
-            .props
-            .insert(units_from_str(&i.to_string()), Prop::data(v));
+        self.obj_mut(arr).props.insert(units_from_str(&i.to_string()), Prop::data(v));
         #[allow(clippy::cast_precision_loss)]
         self.set_array_length_raw(arr, (i + 1) as f64);
     }

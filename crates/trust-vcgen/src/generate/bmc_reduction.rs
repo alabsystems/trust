@@ -44,10 +44,10 @@
 //       reachable terminator is on a tiny allowlist, every reachable `Assert`
 //       is either the accumulator's own overflow assert or has a statically
 //       constant-true condition, and the only `SwitchInt` is the iterator's own
-//       `Option` discriminant test. Reachability is `bmc_terminator_succs`,
-//       which prunes ONLY the `otherwise` edge of a switch carrying rustc's
-//       `exhaustive_enum_unreachable` certificate (re-checked locally); a
-//       genuinely reachable `Unreachable` still refuses.
+//       `Option` discriminant test. Reachability follows every public TrustIR
+//       successor; the caller-constructible `exhaustive_enum_unreachable` bit
+//       never prunes an edge or grants proof authority. Consequently an
+//       `Unreachable` successor makes this optional refutation lane decline.
 //
 // Any doubt about any of the three ⇒ NO CANDIDATE. Withholding a candidate leaves
 // the build at exactly today's (already fail-closed) `incomplete` verdict.
@@ -187,83 +187,22 @@ fn fold_const_bool(func: &VerifiableFunction, op: &Operand, fuel: u32) -> Option
     }
 }
 
-/// CFG successors for THIS module's reachability walk: `terminator_succs` minus
-/// the statically dead `otherwise` edge of an exhaustive-enum `SwitchInt`.
-///
-/// WHY A LOCAL OVERRIDE. `for &x in <array>` lowers to
-/// `SwitchInt(Discriminant(next_result)) { 0 -> exit, 1 -> body, otherwise -> bbU }`
-/// with `bbU: Unreachable` — rustc's spelling of "the `Option` tag is 0 or 1".
-/// `terminator_succs` chains `otherwise` unconditionally, so `bbU` lands in the
-/// reachable set and `body_is_straight_line_reduction`'s allowlist rejects it.
-/// That refusal is right in general (a `Terminator::Unreachable` is normally a
-/// partial match closed with `unreachable_unchecked()` — genuine UB that CAN be
-/// reached, which would falsify P3) but wrong here: the edge is provably dead.
-///
-/// The certificate is `exhaustive_enum_unreachable`, set by
-/// `trust-mir-extract::mark_exhaustive_enum_unreachable_switches`. It is
-/// `#[serde(default)] = false`, so hand-built and legacy-serialized bodies keep
-/// today's refusal.
-///
-/// DO NOT strengthen the following into "the certificate implies the case values
-/// are the enum's full tag set" — an earlier draft of this comment said exactly
-/// that and it is FALSE. That function has TWO lanes: the enum lane does check
-/// case-set equality, but the COROUTINE lane sets the flag with NO tag-set check,
-/// because computing the tag set needs the coroutine layout query, which cycles
-/// inside that MIR pass (E0391) — its own comment says so. Case-set exhaustiveness
-/// is therefore precisely the property the certificate may NOT carry, and it is
-/// the property that makes pruning safe.
-///
-/// So THREE belts are re-derived here rather than taken on trust:
-///   * the `otherwise` block must REALLY end in `Terminator::Unreachable`;
-///   * that block must NOT also be a live case target, since then it is genuinely
-///     reached and pruning the edge would hide real UB;
-///   * the case values must be literally `{0, 1}` — the `Option` tag set of the
-///     `for` desugar this lane exists for. This one does not depend on the
-///     extractor at all, so the coroutine lane's missing check cannot leak in.
-///
-/// This is deliberately NOT a change to the shared `loop_bounds::terminator_succs`:
-/// that function feeds `count_back_edges`, `block_is_on_cycle` and
-/// `total_loop_iterations` for every PROVING-side consumer, and this module has
-/// no business changing the discharge path.
-fn bmc_terminator_succs(func: &VerifiableFunction, t: &Terminator) -> Vec<usize> {
-    let mut succs = terminator_succs(t);
-    let Terminator::SwitchInt { targets, otherwise, exhaustive_enum_unreachable: true, .. } = t
-    else {
-        return succs;
-    };
-    let otherwise_really_unreachable = func
-        .body
-        .blocks
-        .iter()
-        .any(|b| b.id == *otherwise && matches!(b.terminator, Terminator::Unreachable));
-    let also_a_live_case_target = targets.iter().any(|(_, b)| b == otherwise);
-    // The certificate ALONE is not enough, and the reason is specific.
-    // `mark_exhaustive_enum_unreachable_switches` (trust-mir-extract lib.rs) has TWO
-    // lanes. The enum lane does check case-set equality (`if cases != full { continue }`),
-    // but the COROUTINE lane (~lib.rs:4044) sets the flag with NO tag-set check at all —
-    // its own comment says computing the tag set needs the coroutine LAYOUT query, which
-    // cycles inside that MIR pass (E0391). So case-set exhaustiveness — the one condition
-    // that makes pruning the `otherwise` edge safe — is exactly what the certificate may
-    // NOT carry. Re-derive it here instead of delegating: this lane only ever prunes the
-    // `Option` tag switch of a `for` desugar, whose case values are literally {0, 1}, so
-    // require that set verbatim. Any other switch keeps its `otherwise` edge and, if that
-    // block is an `Unreachable`, the terminator allowlist then refuses the function.
-    let cases_are_the_option_tag_set = {
-        let mut vals: Vec<u128> = targets.iter().map(|(v, _)| *v).collect();
-        vals.sort_unstable();
-        vals.dedup();
-        vals == [0, 1]
-    };
-    if otherwise_really_unreachable && !also_a_live_case_target && cases_are_the_option_tag_set {
-        succs.retain(|b| *b != otherwise.0);
-    }
-    succs
+/// CFG successors for this refutation-only module. Public serialized hints do
+/// not remove successors; any future pruning must be based on locally rederived,
+/// subject-bound datatype/layout evidence rather than a boolean field.
+fn bmc_terminator_succs(_func: &VerifiableFunction, t: &Terminator) -> Vec<usize> {
+    // `exhaustive_enum_unreachable` is serialized public input, not proof
+    // authority. Even the old `{0,1}` structural recheck could be forged on an
+    // ordinary integer switch whose default remains reachable. BMC therefore
+    // follows every ordinary successor. A future optimization may prune only
+    // from locally rederived, subject-bound type/layout evidence; this public
+    // hint alone can never erase an edge.
+    terminator_succs(t)
 }
 
 /// Blocks reachable from the entry block along ORDINARY successors
 /// (`bmc_terminator_succs`, which excludes unwind/cleanup edges — an unwind sink
-/// is only entered from a panic that has already violated something — and the
-/// certified-dead `otherwise` edge of an exhaustive-enum switch).
+/// is only entered from a panic that has already violated something).
 fn reachable_blocks(func: &VerifiableFunction) -> FxHashSet<usize> {
     let succ: FxHashMap<usize, Vec<usize>> = func
         .body
@@ -347,6 +286,11 @@ fn body_is_straight_line_reduction(
                     return false;
                 }
             }
+            // An arbitrary tail callee can panic or diverge before returning to
+            // the original caller, exactly like an unmodelled ordinary call.
+            // This refutation-only lane must not assume the full unroll reaches
+            // its modeled overflow site, so TailCall is an explicit decline.
+            Terminator::TailCall { .. } => return false,
             Terminator::SwitchInt { discr, .. } => {
                 if !is_iterator_option_switch(func, discr, next_dest) {
                     return false;
@@ -372,41 +316,16 @@ fn body_is_straight_line_reduction(
                 if fold_const_bool(func, cond, 8) == Some(*expected) {
                     continue;
                 }
-                // (c) the overflow flag of a CONSTANT-amount `CheckedBinaryOp(Shl)`
-                //     — the alternative extraction spelling of the same
-                //     shift-amount check. `k < width(shifted operand)` makes the
-                //     flag provably false, so `assert(!flag)` provably holds.
-                if !*expected && checked_shift_flag_provably_clear(func, cond) {
-                    continue;
-                }
+                // No lane for a `CheckedBinaryOp(Shl|Shr)` overflow flag: that
+                // spelling is structurally rejected as MalformedTrustIr by
+                // `validate_function` before this walk (only Add/Sub/Mul are
+                // admitted checked carriers), so it can never reach here.
                 return false;
             }
             _ => return false,
         }
     }
     next_calls == 1
-}
-
-/// Is `cond` the `.1` overflow flag of a `CheckedBinaryOp(Shl|Shr, base, k)`
-/// whose amount `k` is a CONSTANT strictly inside `[0, width(base))`? Then the
-/// flag is provably `false` and the `assert(!flag)` guarding it cannot fire, so
-/// it cannot cut the unrolled prefix short. Anything non-constant (a variable
-/// shift amount) is refused: that assert CAN fire and would stop the loop.
-fn checked_shift_flag_provably_clear(func: &VerifiableFunction, cond: &Operand) -> bool {
-    let (Operand::Copy(p) | Operand::Move(p)) = cond else { return false };
-    if p.projections.as_slice() != [trust_types::Projection::Field(1)] {
-        return false;
-    }
-    let Some(Rvalue::CheckedBinaryOp(BinOp::Shl | BinOp::Shr, base, amount)) =
-        crate::unique_whole_local_def(func, p.local)
-    else {
-        return false;
-    };
-    let Some(k) = operand_const_int(amount) else { return false };
-    let Some(width) = crate::operand_ty(func, base).and_then(|ty| ty.int_width()) else {
-        return false;
-    };
-    k >= 0 && k < i128::from(width)
 }
 
 // ── P2's precondition channel ───────────────────────────────────────────────
@@ -439,8 +358,11 @@ fn formula_var_name(f: &Formula) -> Option<&str> {
     }
 }
 
-/// An integer literal, in either spelling the extractor's facts can mint
-/// (`discriminant_tag_to_formula` falls back to `UInt` above `i128::MAX`).
+/// An integer literal, in either spelling the extractor's facts can mint. The
+/// enum tag facts are now `Formula::Int` throughout (`discriminant_tag_to_formula`
+/// renders an already-DECODED `i128` tag), but the `UInt` arm stays: the
+/// `switch_label_to_formula` decode still mints `UInt` for a `u128` label above
+/// `i128::MAX`, and other fact producers use the spelling too.
 fn formula_const_int(f: &Formula) -> Option<i128> {
     match f {
         Formula::Int(n) => Some(*n),

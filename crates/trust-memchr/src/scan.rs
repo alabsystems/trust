@@ -53,10 +53,7 @@ pub(crate) struct Cursor<'h> {
 /// `Iterator::size_hint` for a byte iterator: at most one match per remaining
 /// byte, and no lower bound.
 #[inline]
-pub(crate) fn cursor_size_hint(
-    start: usize,
-    end: usize,
-) -> (usize, Option<usize>) {
+pub(crate) fn cursor_size_hint(start: usize, end: usize) -> (usize, Option<usize>) {
     let remaining = if end > start { end - start } else { 0 };
     (0, Some(remaining))
 }
@@ -69,11 +66,7 @@ pub(crate) fn cursor_size_hint(
 /// bare `at + 1`.
 #[inline]
 pub(crate) fn step_past(at: usize) -> usize {
-    if at < usize::MAX {
-        at + 1
-    } else {
-        usize::MAX
-    }
+    if at < usize::MAX { at + 1 } else { usize::MAX }
 }
 
 /// `a + b`, saturating. Hand-inlined `saturating_add` for the same reason as
@@ -81,21 +74,12 @@ pub(crate) fn step_past(at: usize) -> usize {
 #[inline]
 pub(crate) fn add_saturating(a: usize, b: usize) -> usize {
     let room = usize::MAX - b;
-    if a > room {
-        usize::MAX
-    } else {
-        a + b
-    }
+    if a > room { usize::MAX } else { a + b }
 }
 
 /// First offset in `[start, end)` whose byte is `n1`.
 #[inline]
-pub(crate) fn find1(
-    haystack: &[u8],
-    start: usize,
-    end: usize,
-    n1: u8,
-) -> Option<usize> {
+pub(crate) fn find1(haystack: &[u8], start: usize, end: usize, n1: u8) -> Option<usize> {
     let len = haystack.len();
     let stop = if end < len { end } else { len };
     let mut i = start;
@@ -110,12 +94,7 @@ pub(crate) fn find1(
 
 /// Last offset in `[start, end)` whose byte is `n1`.
 #[inline]
-pub(crate) fn rfind1(
-    haystack: &[u8],
-    start: usize,
-    end: usize,
-    n1: u8,
-) -> Option<usize> {
+pub(crate) fn rfind1(haystack: &[u8], start: usize, end: usize, n1: u8) -> Option<usize> {
     let len = haystack.len();
     let stop = if end < len { end } else { len };
     let mut i = stop;
@@ -130,12 +109,7 @@ pub(crate) fn rfind1(
 
 /// Number of offsets in `[start, end)` whose byte is `n1`.
 #[inline]
-pub(crate) fn count1(
-    haystack: &[u8],
-    start: usize,
-    end: usize,
-    n1: u8,
-) -> usize {
+pub(crate) fn count1(haystack: &[u8], start: usize, end: usize, n1: u8) -> usize {
     let len = haystack.len();
     let stop = if end < len { end } else { len };
     let mut found = 0usize;
@@ -151,13 +125,7 @@ pub(crate) fn count1(
 
 /// First offset in `[start, end)` whose byte is `n1` or `n2`.
 #[inline]
-pub(crate) fn find2(
-    haystack: &[u8],
-    start: usize,
-    end: usize,
-    n1: u8,
-    n2: u8,
-) -> Option<usize> {
+pub(crate) fn find2(haystack: &[u8], start: usize, end: usize, n1: u8, n2: u8) -> Option<usize> {
     let len = haystack.len();
     let stop = if end < len { end } else { len };
     let mut i = start;
@@ -173,13 +141,7 @@ pub(crate) fn find2(
 
 /// Last offset in `[start, end)` whose byte is `n1` or `n2`.
 #[inline]
-pub(crate) fn rfind2(
-    haystack: &[u8],
-    start: usize,
-    end: usize,
-    n1: u8,
-    n2: u8,
-) -> Option<usize> {
+pub(crate) fn rfind2(haystack: &[u8], start: usize, end: usize, n1: u8, n2: u8) -> Option<usize> {
     let len = haystack.len();
     let stop = if end < len { end } else { len };
     let mut i = stop;
@@ -281,10 +243,7 @@ fn matches_at(haystack: &[u8], needle: &[u8], at: usize, n: usize) -> bool {
 /// speed obligation, not a correctness one, and closing it is a separate,
 /// separately-verified step. Correctness first.
 #[inline]
-pub(crate) fn find_substring(
-    haystack: &[u8],
-    needle: &[u8],
-) -> Option<usize> {
+pub(crate) fn find_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let n = needle.len();
     let h = haystack.len();
     if n == 0 {
@@ -314,10 +273,7 @@ pub(crate) fn find_substring(
 ///
 /// Same complexity note as [`find_substring`].
 #[inline]
-pub(crate) fn rfind_substring(
-    haystack: &[u8],
-    needle: &[u8],
-) -> Option<usize> {
+pub(crate) fn rfind_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let n = needle.len();
     let h = haystack.len();
     if n == 0 {

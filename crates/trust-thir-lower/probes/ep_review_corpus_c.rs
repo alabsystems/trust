@@ -215,7 +215,13 @@ impl E {
     }
     /// C14 — `if let` with the arms inverted by a negation.
     pub fn if_let_else(&self) -> u32 {
-        if let E::N = self { 0 } else if let E::V(h) = self { *h } else { 0 }
+        if let E::N = self {
+            0
+        } else if let E::V(h) = self {
+            *h
+        } else {
+            0
+        }
     }
     /// C15 — a `match` with a REDUNDANT guard that is always true (an extra `falseEdge`).
     pub fn guarded(&self) -> u32 {

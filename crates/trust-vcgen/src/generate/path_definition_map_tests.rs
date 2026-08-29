@@ -1,15 +1,15 @@
-use trust_types::UnwindEdge;
 use std::collections::BTreeSet;
 
 use trust_types::fx::FxHashSet;
 use trust_types::{
     AggregateKind, AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl,
-    Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VariantDef,
-    VcKind, VerifiableBody, VerifiableFunction,
+    Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnwindEdge,
+    VariantDef, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{
-    StmtVersionCtx, VersionCtx, accumulator_init_const, block_def_establish_subsumes_kill,
+    StmtVersionCtx, VersionCtx, accumulator_bound_init_const, accumulator_init_const,
+    block_def_establish_subsumes_kill,
     build_semantic_guard_map, flip_matches_kill_stmt, flip_token_distinctness_violations,
     formula_survives_redefs, generate_full_assert_refutation_vcs, reaching_def_versions,
     shadow_parity_disagreements, shadow_parity_disagreements_overlap, stmt_writes_name,
@@ -236,6 +236,7 @@ fn probe_call_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         unwind: UnwindEdge::Cleanup(cleanup),
                     },
@@ -367,6 +368,7 @@ fn overflow_cleanup_asserts_wrapped_result() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         unwind: UnwindEdge::Terminate,
                     },
@@ -383,10 +385,7 @@ fn overflow_cleanup_asserts_wrapped_result() -> VerifiableFunction {
                 Box::new(Formula::Var("a".into(), Sort::Int)),
                 Box::new(Formula::Int(u32::MAX as i128)),
             ),
-            Formula::Eq(
-                Box::new(Formula::Var("b".into(), Sort::Int)),
-                Box::new(Formula::Int(1)),
-            ),
+            Formula::Eq(Box::new(Formula::Var("b".into(), Sort::Int)), Box::new(Formula::Int(1))),
         ],
         postconditions: vec![],
         spec: Default::default(),
@@ -1070,9 +1069,7 @@ fn enum_construction_demux_routes_payload_to_matching_arm() {
         "Err arm bb5 must carry routed payload `r@1.0 == 20`; got {err_arm:?}"
     );
     assert!(
-        !err_arm
-            .iter()
-            .any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("r@0.0"))),
+        !err_arm.iter().any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("r@0.0"))),
         "Err arm bb5 must NOT carry the other variant's payload `r@0.0`; got {err_arm:?}"
     );
 }
@@ -1202,9 +1199,7 @@ fn enum_construction_demux_skips_nonunique_variant_payload() {
     // both, vacuously discharging a real overflow on the matched value.
     let some_arm = demux.get(&BlockId(4)).cloned().unwrap_or_default();
     assert!(
-        !some_arm
-            .iter()
-            .any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("r@0.0"))),
+        !some_arm.iter().any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("r@0.0"))),
         "Some arm bb4 must NOT carry a routed payload for the non-unique variant 0; \
          got {some_arm:?}"
     );
@@ -1349,11 +1344,7 @@ fn enum_demux_guarded_some_fn() -> VerifiableFunction {
                     }],
                     terminator: Terminator::Return,
                 },
-                BasicBlock {
-                    id: BlockId(7),
-                    stmts: vec![],
-                    terminator: Terminator::Unreachable,
-                },
+                BasicBlock { id: BlockId(7), stmts: vec![], terminator: Terminator::Unreachable },
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
@@ -1377,9 +1368,7 @@ fn enum_construction_demux_routes_edge_guard_to_matching_arm() {
     // leave x unconstrained and false-FAIL.
     let some_arm = demux.get(&BlockId(6)).cloned().unwrap_or_default();
     assert!(
-        some_arm
-            .iter()
-            .any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("opt@1.0"))),
+        some_arm.iter().any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("opt@1.0"))),
         "Some arm bb6 must carry routed payload `opt@1.0 == v`; got {some_arm:?}"
     );
     assert!(
@@ -1512,11 +1501,7 @@ fn enum_demux_multipred_some_fn() -> VerifiableFunction {
                     }],
                     terminator: Terminator::Return,
                 },
-                BasicBlock {
-                    id: BlockId(8),
-                    stmts: vec![],
-                    terminator: Terminator::Unreachable,
-                },
+                BasicBlock { id: BlockId(8), stmts: vec![], terminator: Terminator::Unreachable },
             ],
             arg_count: 2,
             return_ty: Ty::u32(),
@@ -1537,9 +1522,7 @@ fn enum_construction_demux_skips_guard_for_multipred_constructor() {
 
     // Payload still routes (does not depend on the constructor's pred count).
     assert!(
-        some_arm
-            .iter()
-            .any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("opt@1.0"))),
+        some_arm.iter().any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("opt@1.0"))),
         "Some arm bb7 must still carry routed payload `opt@1.0 == v`; got {some_arm:?}"
     );
     // Soundness: the Some constructor bb4 has two predecessors, so NO edge guard
@@ -1699,11 +1682,7 @@ fn enum_demux_tuple_payload_fn() -> VerifiableFunction {
                     }],
                     terminator: Terminator::Return,
                 },
-                BasicBlock {
-                    id: BlockId(7),
-                    stmts: vec![],
-                    terminator: Terminator::Unreachable,
-                },
+                BasicBlock { id: BlockId(7), stmts: vec![], terminator: Terminator::Unreachable },
             ],
             arg_count: 3,
             return_ty: Ty::u32(),
@@ -1724,9 +1703,7 @@ fn enum_construction_demux_expands_nested_tuple_payload_leaf() {
 
     // The whole-tuple equality is kept (additive)...
     assert!(
-        some_arm
-            .iter()
-            .any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("opt@1.0"))),
+        some_arm.iter().any(|f| matches!(f, Formula::Eq(l, _) if l.var_name() == Some("opt@1.0"))),
         "Some arm bb6 should keep the whole-tuple payload `opt@1.0 == _6`; got {some_arm:?}"
     );
     // ...AND the nested leaf `opt@1.0.0 == a` is synthesized so the arm read of
@@ -1824,10 +1801,7 @@ fn stale_comparison_dies_when_operand_reassigned_in_later_block() {
          got {downstream:?}"
     );
     // The live reassignment is still available.
-    assert!(
-        defines(&downstream, "m"),
-        "bb2 must retain the live `m == big`; got {downstream:?}"
-    );
+    assert!(defines(&downstream, "m"), "bb2 must retain the live `m == big`; got {downstream:?}");
 }
 
 // Trust: regression for the build_semantic_guard_map stale-fact false-PROVE
@@ -1957,11 +1931,7 @@ fn sem_reseat_havoc_fn(reseat: bool) -> VerifiableFunction {
                 },
             ],
             blocks: vec![
-                BasicBlock {
-                    id: BlockId(0),
-                    stmts: bb0,
-                    terminator: Terminator::Goto(BlockId(1)),
-                },
+                BasicBlock { id: BlockId(0), stmts: bb0, terminator: Terminator::Goto(BlockId(1)) },
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
@@ -2014,6 +1984,14 @@ fn semantic_guard_map_keeps_block_def_single_borrow_store() {
 /// fail-closing on any `&mut` / `&raw` of the accumulator (the only way a
 /// `*p = huge` could violate the bound). Locks that gate.
 fn accumulator_fn(escape: bool) -> VerifiableFunction {
+    accumulator_fn_with_arg_count(escape, 1)
+}
+
+/// `accumulator_fn` with `arg_count` chosen by the caller. At `1` the accumulator local `_1`
+/// is a by-value PARAMETER; at `0` it is an ordinary local — the shape real extracted MIR
+/// gives `wide_unsigned_accumulator.rs::u64_acc`, whose accumulator is `_2` under
+/// `arg_count == 1`. The bodies are byte-identical, so `arg_count` is the ONLY variable.
+fn accumulator_fn_with_arg_count(escape: bool, arg_count: usize) -> VerifiableFunction {
     let mut stmts = vec![
         Statement::Assign {
             place: Place::local(1),
@@ -2066,7 +2044,7 @@ fn accumulator_fn(escape: bool) -> VerifiableFunction {
                 },
             ],
             blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
-            arg_count: 1,
+            arg_count,
             return_ty: Ty::Unit,
             datatype_defs: Default::default(),
         },
@@ -2075,6 +2053,40 @@ fn accumulator_fn(escape: bool) -> VerifiableFunction {
         postconditions: vec![],
         spec: Default::default(),
     }
+}
+
+/// A PARAMETER accumulator must not yield a BOUND init: its ENTRY value is a third value no
+/// block statement defines, so `acc <= C + K*M` would be asserted over a value the CALLER
+/// chooses. Without the charge in `accumulator_bound_init_const` this returns `Some(0)` and
+/// the fact lanes emit that false bound — the parameter-accumulator false proof, in which
+/// `u64_acc_param` certified 2/2 (both rows kernel-certified) while a stock-rustc oracle
+/// panics on 5 of 48 swept inputs.
+///
+/// The three assertions are a matched triple over ONE body: only `arg_count` moves.
+#[test]
+fn accumulator_bound_withheld_when_accumulator_is_a_parameter() {
+    assert_eq!(
+        accumulator_bound_init_const(&accumulator_fn_with_arg_count(false, 1), 1, 3),
+        None,
+        "a PARAMETER accumulator carries an unconstrained entry value, so no bound lane may \
+         take a const init from it"
+    );
+    // CONTROL 1: the byte-identical body with `_1` a NON-parameter is still recognized, so
+    // the withholding above is the entry definition — not a structural miss that would also
+    // have cost the ordinary local accumulator (`wide_unsigned_accumulator.rs`) its bound.
+    assert_eq!(
+        accumulator_bound_init_const(&accumulator_fn_with_arg_count(false, 0), 1, 3),
+        Some(0),
+        "a non-parameter const-init self-add accumulator must still yield its bound init"
+    );
+    // CONTROL 2: the RAW recognizer is deliberately NOT tightened. The BMC lane refutes by
+    // exhibiting an input, and `0` remains a value this accumulator can hold at loop entry,
+    // so tightening here would only cost that lane refutations it is entitled to.
+    assert_eq!(
+        accumulator_init_const(&accumulator_fn_with_arg_count(false, 1), 1, 3),
+        Some(0),
+        "the raw recognizer must keep serving the refutation lane unchanged"
+    );
 }
 
 #[test]
@@ -2139,6 +2151,7 @@ fn term_call_dest_fn(call_dest: bool) -> VerifiableFunction {
         Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "make".to_string(),
             args: vec![Operand::Copy(Place::local(1))],
@@ -2231,6 +2244,7 @@ fn term_call_projected_dest_fn() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "make".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -2276,9 +2290,8 @@ fn semantic_guard_map_kills_projected_terminator_call_dest() {
     );
     // And the stale fact, if threaded, must carry its pre-terminator establish
     // token (NOT the terminator token) — i.e. it is present-but-disconnected.
-    let has_stale_disjoint = bb1
-        .iter()
-        .any(|f| f.free_variables().iter().any(|v| v.starts_with("s.0#") && *v != live));
+    let has_stale_disjoint =
+        bb1.iter().any(|f| f.free_variables().iter().any(|v| v.starts_with("s.0#") && *v != live));
     assert!(
         has_stale_disjoint
             || bb1.iter().all(|f| !f.free_variables().iter().any(|v| v.starts_with("s.0"))),
@@ -2303,7 +2316,7 @@ fn path_def_map_kills_projected_terminator_call_dest() {
 //   requires hi <= 1000 {
 //     s.0 = hi;            // fact: s.0 == hi
 //     s.0 = make(hi);      // Call { dest: s.0 } — s.0 is now make()'s arbitrary u32
-//     let r = s.0 + 1;     // CheckedAdd + Assert(Overflow) on the POST-call s.0
+//     let r = s.0 + 1;     // ordinary Add overflow VC on the POST-call s.0
 //   }
 // The post-call `s.0` is unconstrained (make() may return u32::MAX), so the add
 // can genuinely overflow. But the stale fact `s.0 == hi` survives the projected
@@ -2320,12 +2333,7 @@ fn projected_call_then_overflow_fn() -> VerifiableFunction {
                 LocalDecl { index: 0, ty: Ty::u32(), name: Some("ret".into()) },
                 LocalDecl { index: 1, ty: Ty::u32(), name: Some("hi".into()) },
                 LocalDecl { index: 2, ty: Ty::Tuple(vec![Ty::u32()]), name: Some("s".into()) },
-                // checked-add result tuple (value, overflow-bit)
-                LocalDecl {
-                    index: 3,
-                    ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]),
-                    name: Some("r".into()),
-                },
+                LocalDecl { index: 3, ty: Ty::u32(), name: Some("r".into()) },
             ],
             blocks: vec![
                 BasicBlock {
@@ -2338,6 +2346,7 @@ fn projected_call_then_overflow_fn() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "make".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -2349,24 +2358,17 @@ fn projected_call_then_overflow_fn() -> VerifiableFunction {
                 },
                 BasicBlock {
                     id: BlockId(1),
-                    // r = CheckedAdd(s.0, 1)
+                    // r = s.0 + 1
                     stmts: vec![Statement::Assign {
                         place: Place::local(3),
-                        rvalue: Rvalue::CheckedBinaryOp(
+                        rvalue: Rvalue::BinaryOp(
                             BinOp::Add,
                             Operand::Copy(Place::field(2, 0)),
-                            Operand::Constant(ConstValue::Int(1)),
+                            Operand::Constant(ConstValue::Uint(1, 32)),
                         ),
                         span: SourceSpan::default(),
                     }],
-                    terminator: Terminator::Assert {
-                        unwind: UnwindEdge::Unreachable,
-                        cond: Operand::Copy(Place::field(3, 1)),
-                        expected: false,
-                        msg: AssertMessage::Overflow(BinOp::Add),
-                        target: BlockId(2),
-                        span: SourceSpan::default(),
-                    },
+                    terminator: Terminator::Goto(BlockId(2)),
                 },
                 BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
             ],
@@ -2612,12 +2614,16 @@ fn kill_oracle_covers_whole_local_store() {
 fn kill_oracle_covers_set_discriminant() {
     let x = LocalDecl {
         index: 1,
-        ty: Ty::Adt { adt_kind: None, layout: None, 
+        ty: Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "E".into(),
             fields: vec![("__tag".into(), Ty::i64())],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+        },
         name: Some("x".into()),
     };
     assert!(
@@ -2646,6 +2652,7 @@ fn kill_oracle_covers_call_dest_and_mut_arg() {
                 span: SourceSpan::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         ),
@@ -2674,6 +2681,7 @@ fn kill_oracle_covers_call_dest_and_mut_arg() {
                 span: SourceSpan::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         ),
@@ -2746,11 +2754,7 @@ fn kill_oracle_covers_opaque_deref_store_channels() {
         },
     ];
     assert!(
-        kill_drops_x_fact(
-            vec![ret_unit(), x_u32(), tmp, p],
-            cast,
-            Terminator::Goto(BlockId(1))
-        ),
+        kill_drops_x_fact(vec![ret_unit(), x_u32(), tmp, p], cast, Terminator::Goto(BlockId(1))),
         "channel: cast-laundered `*p = v` must be captured (deref-pointer-is-opaque)"
     );
 }
@@ -2871,8 +2875,8 @@ fn kill_oracle_channel_coverage_report() {
 #[test]
 fn write_completeness_lemma_holds_for_captured_channels() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
-        Statement, Terminator, Ty, VerifiableBody, VerifiableFunction, WriteEffect,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction, WriteEffect,
     };
     // For each `Captured` statement channel, block_written_names must actually
     // capture the written name `x` — closing the loop between the compile-time
@@ -2938,6 +2942,7 @@ fn write_completeness_lemma_holds_for_captured_channels() {
             span: SourceSpan::default(),
             atomic: None,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
         }
         .write_effect(),
@@ -3026,8 +3031,8 @@ fn freshness_theorem_holds_on_loop_carried_counter() {
     // to bb1. `i` is loop-carried — single-def-point versioning fails here, but
     // reaching-def-SET versioning gives the header version {-1, bb2} ≠ {-1}.
     use trust_types::{
-        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let func = VerifiableFunction {
         name: "loop_counter".into(),
@@ -3233,9 +3238,7 @@ fn freshness_and_parity_hold_on_generated_battery() {
             }
         }
     }
-    eprintln!(
-        "FRESHNESS-BATTERY checked {checked} (CFG-shape × write-pattern × back-edge) cases"
-    );
+    eprintln!("FRESHNESS-BATTERY checked {checked} (CFG-shape × write-pattern × back-edge) cases");
     assert!(checked >= 150, "battery too small: {checked}");
 }
 
@@ -3247,8 +3250,7 @@ fn versioning_is_a_sound_replacement_for_the_kill() {
     // never DROPS one the kill keeps at the entry-establish point (no precision
     // loss vs the kill). Divergence either way is a finding.
     let entry_only = BTreeSet::from([-1i64]);
-    for func in
-        [sem_stale_blockdef_fn(true), sem_reseat_havoc_fn(true), precond_reassign_fn(true)]
+    for func in [sem_stale_blockdef_fn(true), sem_reseat_havoc_fn(true), precond_reassign_fn(true)]
     {
         let kill = v2_may_reassigned_per_block(&func);
         let ver = reaching_def_versions(&func);
@@ -3304,11 +3306,8 @@ fn shadow_parity_holds_across_generated_battery() {
     for k in 2..=5usize {
         for mask in 0u32..(1u32 << k) {
             let writes: Vec<usize> = (0..k).filter(|b| mask & (1 << b) != 0).collect();
-            let edges: Vec<Option<(usize, usize)>> = if k >= 3 {
-                vec![None, Some((k - 1, 1)), Some((k - 1, 0))]
-            } else {
-                vec![None]
-            };
+            let edges: Vec<Option<(usize, usize)>> =
+                if k >= 3 { vec![None, Some((k - 1, 1)), Some((k - 1, 0))] } else { vec![None] };
             for be in edges {
                 assert_eq!(
                     shadow_parity_disagreements(&chain_fn(k, &writes, be)),
@@ -3419,8 +3418,8 @@ fn overlap_aware_query_closes_projection_gap() {
 /// right: `x` is unversioned (None) at stmt0, versioned only AFTER stmt1.
 fn read_before_same_block_write() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     VerifiableFunction {
         name: "read_before_write".into(),
@@ -3448,10 +3447,7 @@ fn read_before_same_block_write() -> trust_types::VerifiableFunction {
                     // stmt1: x = 4e9  (WRITES x — AFTER the read)
                     Statement::Assign {
                         place: Place::local(1),
-                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(
-                            4_000_000_000,
-                            32,
-                        ))),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(4_000_000_000, 32))),
                         span: SourceSpan::default(),
                     },
                 ],
@@ -3505,8 +3501,8 @@ fn stmt_oracle_distinguishes_read_before_and_after_write() {
 /// reads interleaved.
 fn intra_block_battery() -> Vec<trust_types::VerifiableFunction> {
     use trust_types::{
-        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let mk = |stmts: Vec<Statement>| VerifiableFunction {
         name: "intra".into(),
@@ -3691,8 +3687,8 @@ fn pa_two_same_block_writes_get_distinct_tokens() {
     // DISTINCT version tokens (else two intermediate values collapse, defeating
     // the statement-granular oracle the block-def/guard kills will rely on).
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
-        Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction,
     };
     let asn = |v: u128| Statement::Assign {
         place: Place::local(1),
@@ -3737,8 +3733,8 @@ fn stmt_oracle_versions_after_a_prior_write() {
     // point `x` IS versioned (the entry value is dead). Mirror of the blind-spot
     // case, confirming the oracle is order-sensitive in both directions.
     use trust_types::{
-        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BinOp, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let func = VerifiableFunction {
         name: "write_before_read".into(),
@@ -3794,8 +3790,7 @@ fn overlap_parity_holds_on_corpus_and_battery() {
     // The OVERLAP-AWARE audit (projected probes included) must report ZERO
     // disagreements across the corpus + the generated battery — versioning is
     // drop-equivalent to the kill for projected facts too.
-    for func in
-        [sem_stale_blockdef_fn(true), sem_reseat_havoc_fn(true), precond_reassign_fn(true)]
+    for func in [sem_stale_blockdef_fn(true), sem_reseat_havoc_fn(true), precond_reassign_fn(true)]
     {
         assert_eq!(
             shadow_parity_disagreements_overlap(&func),

@@ -1,18 +1,17 @@
 //! Durable publication for machine-readable evidence files without following
 //! caller-writable symlink components.
 
-use std::fs;
-use std::io::{self, Write as _};
-use std::path::Path;
-#[cfg(not(unix))]
-use std::path::PathBuf;
-
 #[cfg(unix)]
 use std::ffi::CString;
+use std::fs;
+use std::io::{self, Write as _};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
 /// Atomically publish owner-private bytes in the destination directory.
 /// Existing regular files may be replaced; symlinks and non-files fail closed.

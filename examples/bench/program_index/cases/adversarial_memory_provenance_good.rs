@@ -4,11 +4,7 @@
 // the corpus without relying on compiler or solver internals.
 
 fn byte_at(data: &[u8], idx: usize) -> u8 {
-    if idx < data.len() {
-        unsafe { *data.as_ptr().add(idx) }
-    } else {
-        0
-    }
+    if idx < data.len() { unsafe { *data.as_ptr().add(idx) } } else { 0 }
 }
 
 fn main() {

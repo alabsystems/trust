@@ -16,18 +16,24 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_value::{
+    JsObject, JsValue, ObjId, ObjKind, PropKey, PropValue, Property, ProxyData, units_from_str,
+};
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::props::PartialDesc;
-use std::rc::Rc;
-use trust_js_value::{
-    units_from_str, JsObject, JsValue, ObjId, ObjKind, PropKey, PropValue, Property, ProxyData,
-};
 
 impl Interp {
     // -- construction --------------------------------------------------------
 
     /// ProxyCreate (10.5.14): both operands must be objects.
-    pub(crate) fn proxy_create(&mut self, target: &JsValue, handler: &JsValue) -> Result<ObjId, Abrupt> {
+    pub(crate) fn proxy_create(
+        &mut self,
+        target: &JsValue,
+        handler: &JsValue,
+    ) -> Result<ObjId, Abrupt> {
         let (JsValue::Obj(t), JsValue::Obj(h)) = (target, handler) else {
             return Err(self.throw_type_error());
         };
@@ -112,7 +118,8 @@ impl Interp {
         let Some(trap) = self.proxy_trap(handler, "getPrototypeOf")? else {
             return self.im_get_prototype_of(target);
         };
-        let handler_proto = self.call_value(&trap, JsValue::Obj(handler), vec![JsValue::Obj(target)])?;
+        let handler_proto =
+            self.call_value(&trap, JsValue::Obj(handler), vec![JsValue::Obj(target)])?;
         let result = match handler_proto {
             JsValue::Obj(o) => Some(o),
             JsValue::Null => None,
@@ -328,7 +335,8 @@ impl Interp {
                     PropValue::Data { value, writable: false } => {
                         if td.synthetic {
                             return Err(Abrupt::Fatal(
-                                "proxy invariant against engine-specific synthetic text".to_string(),
+                                "proxy invariant against engine-specific synthetic text"
+                                    .to_string(),
                             ));
                         }
                         if !crate::ops::same_value(&trap_result, value) {
@@ -374,7 +382,8 @@ impl Interp {
                     PropValue::Data { value, writable: false } => {
                         if td.synthetic {
                             return Err(Abrupt::Fatal(
-                                "proxy invariant against engine-specific synthetic text".to_string(),
+                                "proxy invariant against engine-specific synthetic text"
+                                    .to_string(),
                             ));
                         }
                         if !crate::ops::same_value(&v, value) {
@@ -420,7 +429,8 @@ impl Interp {
         let Some(trap) = self.proxy_trap(handler, "ownKeys")? else {
             return self.im_own_property_keys(target);
         };
-        let trap_array = self.call_value(&trap, JsValue::Obj(handler), vec![JsValue::Obj(target)])?;
+        let trap_array =
+            self.call_value(&trap, JsValue::Obj(handler), vec![JsValue::Obj(target)])?;
         let JsValue::Obj(arr) = trap_array else {
             return Err(self.throw_type_error());
         };
@@ -476,11 +486,7 @@ impl Interp {
             return self.call_obj(target, this, args, None);
         };
         let arg_array = self.create_array_from_list(args)?;
-        self.call_value(
-            &trap,
-            JsValue::Obj(handler),
-            vec![JsValue::Obj(target), this, arg_array],
-        )
+        self.call_value(&trap, JsValue::Obj(handler), vec![JsValue::Obj(target), this, arg_array])
     }
 
     /// [[Construct]] (10.5.13).
@@ -597,10 +603,7 @@ impl Interp {
     fn from_partial_descriptor(&mut self, d: &PartialDesc) -> ERes {
         let oid = self.new_plain()?;
         let set = |it: &mut Interp, k: &str, v: JsValue| {
-            it.heap
-                .obj_mut(oid)
-                .props
-                .insert(PropKey::from_str(k), Property::data(v));
+            it.heap.obj_mut(oid).props.insert(PropKey::from_str(k), Property::data(v));
         };
         if let Some(v) = &d.value {
             set(self, "value", v.clone());
@@ -628,10 +631,10 @@ impl Interp {
         let arr = self.new_array(0)?;
         let mut n: u32 = 0;
         for v in list {
-            self.heap.obj_mut(arr).props.insert(
-                PropKey::Str(units_from_str(&n.to_string())),
-                Property::data(v),
-            );
+            self.heap
+                .obj_mut(arr)
+                .props
+                .insert(PropKey::Str(units_from_str(&n.to_string())), Property::data(v));
             n += 1;
         }
         self.set_array_length_raw(arr, f64::from(n));
@@ -685,10 +688,7 @@ impl Interp {
 fn complete_property_descriptor(d: &PartialDesc) -> Property {
     if d.is_accessor() {
         Property {
-            v: PropValue::Accessor {
-                get: d.get.unwrap_or(None),
-                set: d.set.unwrap_or(None),
-            },
+            v: PropValue::Accessor { get: d.get.unwrap_or(None), set: d.set.unwrap_or(None) },
             enumerable: d.enumerable.unwrap_or(false),
             configurable: d.configurable.unwrap_or(false),
             synthetic: false,
@@ -706,10 +706,7 @@ fn complete_property_descriptor(d: &PartialDesc) -> Property {
     } else {
         // Generic descriptor completes to a data descriptor.
         Property {
-            v: PropValue::Data {
-                value: JsValue::Undefined,
-                writable: false,
-            },
+            v: PropValue::Data { value: JsValue::Undefined, writable: false },
             enumerable: d.enumerable.unwrap_or(false),
             configurable: d.configurable.unwrap_or(false),
             synthetic: false,

@@ -1,0 +1,58 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-sha2 — the Trust-owned SHA-2 family (FIPS PUB 180-4).
+#
+# WHY THIS CRATE EXISTS.
+# Every certificate identity, cache key, proof-bundle name and release
+# provenance record in this tree is a SHA-256 of something. Today those digests
+# are produced by the third-party `sha2` crate, which the verified lane reports
+# as `dependency-policy-excluded`: every proof that names a digest is therefore
+# conditional on the correctness of a compilation unit Trust does not own. That
+# is the exact conditionality `docs/DESIGN_PHILOSOPHY.md` ("own the supply
+# chain") exists to remove.
+#
+# THE EMPTY DEPENDENCY LIST IS THE POINT.
+# A dependency here is another excluded unit and defeats the purpose. There are
+# no dependencies, and there is no `[features]` table that could add one. The
+# only entries below are DEV-dependencies used by `tests/differential_sha2.rs`,
+# which cross-checks this implementation against the incumbent crates while
+# both still exist. Nothing that ships links them.
+#
+# `#![no_std]`, no `alloc`: a digest routine that a verified user binary may
+# link must not drag std onto a no_std target.
+
+[package]
+name = "trust-sha2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned SHA-224/256/384/512 per FIPS PUB 180-4. Zero dependencies, no_std."
+
+[lints]
+workspace = true
+
+[features]
+# `std` exists ONLY to provide `impl std::io::Write for Sha*`, so a hasher can
+# be an `io::copy` sink (six `targo-trust` sites, one in `build-manifest`).
+# It adds no dependency and never will — see the header. Default-on because
+# every consumer in this tree is a std crate; a no_std consumer writes
+# `default-features = false` and loses nothing but the `Write` impl.
+default = ["std"]
+std = []
+
+[dependencies]
+# NONE, by design. Read the header before adding one. Note that `[features]`
+# above is empty of optional dependencies for the same reason.
+
+[dev-dependencies]
+# TEST-ONLY. The acceptance gate for replacing the incumbent is a differential
+# against the incumbent, so the incumbent must be linkable by the test binary
+# and by nothing else. Delete these two lines on the day the `[patch.crates-io]`
+# redirect lands and the incumbent leaves the graph.
+## NOT `workspace = true`: the workspace `sha2` name now resolves to THIS crate,
+## so inheriting it would be a self-dependency. The differential needs the real
+## incumbent, named explicitly.
+sha2 = "0.10"

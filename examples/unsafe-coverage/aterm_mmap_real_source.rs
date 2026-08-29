@@ -65,10 +65,7 @@ impl MmapMut {
     pub unsafe fn map_mut(file: &File) -> io::Result<Self> {
         let len = file.metadata()?.len();
         if len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot mmap an empty file",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot mmap an empty file"));
         }
         let len = usize::try_from(len).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "file size overflows usize")
@@ -90,10 +87,7 @@ impl MmapMut {
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self {
-            ptr: ptr.cast::<u8>(),
-            len,
-        })
+        Ok(Self { ptr: ptr.cast::<u8>(), len })
     }
 
     /// Returns a shared slice over the mapped region.
@@ -162,11 +156,7 @@ impl MmapMut {
         // SAFETY: `ptr` and `len` describe a valid mmap'd region.
         // MS_SYNC performs a synchronous flush.
         let ret = unsafe { libc::msync(self.ptr.cast(), self.len, libc::MS_SYNC) };
-        if ret != 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        if ret != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 }
 

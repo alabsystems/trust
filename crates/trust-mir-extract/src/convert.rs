@@ -142,9 +142,7 @@ fn convert_nondiverging_intrinsic<'tcx>(
                 .and_then(|ptr_ty| ptr_ty.builtin_deref(true))
                 .map(|pointee| convert_ty_with_env(tcx, typing_env, pointee));
             match elem_ty {
-                Some(elem_ty) => {
-                    Statement::CopyNonOverlapping { src, dst, count, elem_ty, span }
-                }
+                Some(elem_ty) => Statement::CopyNonOverlapping { src, dst, count, elem_ty, span },
                 None => Statement::Unsupported {
                     kind: "NonDivergingIntrinsic::CopyNonOverlapping".to_string(),
                     detail: "memory copy side effects require explicit memory-model lowering"
@@ -170,28 +168,180 @@ pub(crate) use trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL;
 ///
 /// Printed crate names and def paths are diagnostics, not identities: a dependency
 /// compiled with `--crate-name core`, `alloc`, or `std` can reproduce those strings.
-/// Bind name-prefiltered recognizers to StableCrateIds obtained from compiler-owned
-/// lang/diagnostic items instead. Missing anchors fail closed.
-pub(crate) fn is_real_sysroot_crate(
-    tcx: TyCtxt<'_>,
-    krate: rustc_span::def_id::CrateNum,
-) -> bool {
-    let target = tcx.stable_crate_id(krate).as_u64();
-    let anchors: [Option<DefId>; 6] = [
-        // core
-        tcx.get_diagnostic_item(rustc_span::sym::Option),
-        tcx.lang_items().clone_trait(),
-        // alloc
-        tcx.get_diagnostic_item(rustc_span::sym::Vec),
-        tcx.lang_items().owned_box(),
-        // std
-        tcx.get_diagnostic_item(rustc_span::sym::HashMap),
-        tcx.get_diagnostic_item(rustc_span::sym::HashSet),
-    ];
-    anchors
-        .into_iter()
-        .flatten()
-        .any(|did| tcx.stable_crate_id(did.krate).as_u64() == target)
+/// DIVERGENCE FROM origin/main (2026-08-21), deliberate. Upstream replaced this
+/// body with anchor identity: it collects `get_diagnostic_item(Option|Vec|
+/// HashMap|HashSet)` plus `lang_items().{clone_trait,owned_box}` and accepts
+/// `krate` when ANY anchor's StableCrateId matches. That is the design an
+/// adversarial review already refuted on this tree: a diagnostic item is
+/// SOURCE-DECLARABLE, so a forged crate carrying `#[rustc_diagnostic_item =
+/// "Vec"]` becomes the answer to `get_diagnostic_item(Vec)` — and with `any`,
+/// one self-declared anchor authenticates the forgery. In a `#![no_std]` graph
+/// the real `alloc` is not loaded to contest it.
+///
+/// Residency is not source-declarable: it asks where rustc LOADED the artifact
+/// from. Keeping this body, and this note, so the divergence is reconciled
+/// deliberately rather than by whichever side merges last.
+/// For an EXTERNAL crate the answer is ARTIFACT RESIDENCY — did rustc load this
+/// crate out of its own target library directory — plus one command-line escape
+/// hatch for the lane that legitimately has no sysroot to be resident in. Neither
+/// input is a function of the crate graph, which is the property the 2026-08-21
+/// injection rule lost; the argument is at
+/// [`trust_types::sysroot_crate_is_compiler_authenticated`].
+///
+/// NAME-GATED FIRST, and that gate is load-bearing rather than cosmetic. Several
+/// callers below combine this predicate with an ITEM name only (`Extend`,
+/// `HashMap`, `Vec`), so a residency test on its own would start accepting
+/// `hashbrown` — which ships in the sysroot's own library directory and has both
+/// a `HashMap` and `Extend` impls. Gating on the crate name keeps the predicate's
+/// extension exactly what the anchor version's was (`core`/`alloc`/`std` and
+/// nothing else) and changes only HOW those three are recognised.
+///
+/// # THE RULE IS NOT SPELLED HERE — it is DELEGATED, whole
+///
+/// All three arms (name gate, LOCAL, EXTERNAL) live in
+/// [`trust_types::crate_is_the_compilers_own_sysroot_crate`], which is where the
+/// truth table is unit-tested: this crate needs a full compiler build to run a
+/// test at all, so an arm re-spelled here would make every one of those tests
+/// measure a COPY of the rule rather than the one the compiler runs. That is not
+/// a hypothetical — it is the drift this factoring exists to cure, and
+/// `trust_types`'s `the_extractor_delegates_the_whole_rule_to_this_crate` reads
+/// THIS FILE and refuses it. What is left below is the only job this side has:
+/// read the four facts off `TyCtxt`.
+///
+/// # THE LOCAL ARM, and why it reads so little
+///
+/// The compiler holds no loader record about the crate it is compiling — there is
+/// no `used_crate_source` for it — so the residency fact the external arm uses is
+/// not a fact about that crate at all. The command line is the only remaining
+/// input that satisfies the invariant this whole function is bound by
+/// (`trust_types`: no input may be a function of WHICH CRATES THE GRAPH
+/// CONTAINS), so that arm asks "am I the compilation that is building the
+/// sysroot", never "do I look like the sysroot".
+///
+/// R2 CLOSED. Until 2026-08-23 the local arm called a private helper here that
+/// answered from the crate's own lang/diagnostic-item ownership. Those anchors
+/// are ATTRIBUTES — `#[rustc_diagnostic_item = "HashMap"]` under
+/// `#![feature(rustc_attrs)]` — resolved through a graph-wide registry, so the
+/// arm violated BOTH halves of the invariant at once. rustc's
+/// duplicate-registration error was the only thing standing in the way, and
+/// `#![no_std]` removes it by keeping the real owner out of the graph. A crate
+/// compiled `--crate-name std` therefore authenticated ITSELF on one attribute,
+/// went unstamped, and its own `std::vec::Endless` was read as genuine sysroot by
+/// every consumer lane that trusts a `core::`/`alloc::`/`std::` path root. The
+/// retired helper's identifier is deliberately not spelled anywhere in this file:
+/// the delegation guard above also refuses ANY occurrence of that name, so a
+/// rewire that delegates one arm while keeping the anchor arm alive cannot pass.
+/// `trust_types`'s own module names it if you need to grep for the history.
+pub(crate) fn is_real_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    // Every argument is evaluated eagerly, which is behaviour-identical to the
+    // short-circuited spelling this replaced because both helpers are TOTAL:
+    // `crate_is_sysroot_resident` answers `false` for `LOCAL_CRATE` before it
+    // touches `used_crate_source` (and the local arm ignores the fact anyway),
+    // and `invocation_is_building_the_sysroot` is a plain options read. Do not
+    // re-introduce a guard like `wears_the_name && resident` to skip the query:
+    // that is an arm of the rule spelled on this side again.
+    trust_types::crate_is_the_compilers_own_sysroot_crate(
+        trust_types::crate_name_wears_sysroot_spelling(tcx.crate_name(krate).as_str()),
+        // `DefId::is_local()` at CrateNum granularity. SELECTS an arm; never a
+        // grant — an exemption keyed on locality is exactly the R2 shape.
+        krate == LOCAL_CRATE,
+        crate_is_sysroot_resident(tcx, krate),
+        invocation_is_building_the_sysroot(tcx),
+    )
+}
+
+/// Every artifact rustc loaded `krate` from sits DIRECTLY in this compiler's own
+/// target library directory (`sess.target_tlib_path.dir`).
+///
+/// `used_crate_source` records the `dylib`/`rlib`/`rmeta` paths the loader
+/// actually opened. When the locator finds a crate on a search path it builds the
+/// path as `search_path.dir.join(file_name)` (`rustc_session::search_paths::
+/// SearchPathFile::path`), so a parent-directory comparison against the same
+/// `SearchPath` is exact and needs no canonicalisation. A crate supplied by
+/// `--extern name=<path>` keeps the caller's path, which is what makes this the
+/// discriminator the `--extern` map cannot forge — an adversary who can write
+/// into the compiler's own library directory already owns the toolchain.
+///
+/// An empty path set (no artifact at all) is NOT residency; it fails closed.
+///
+/// LOCAL_CRATE has no `used_crate_source` provider, so it is answered `false`
+/// before the query is asked. That guard is what makes this function TOTAL, and
+/// totality is what lets [`is_real_sysroot_crate`] hand all four facts to
+/// `trust_types` in one call instead of re-spelling the arm that selects between
+/// them. The local arm ignores this fact regardless — pinned on the rule's side
+/// by `the_local_arm_answers_from_the_command_line_alone`, which sweeps
+/// `resident` in both states rather than trusting this caller to pass `false`.
+fn crate_is_sysroot_resident(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    if krate == LOCAL_CRATE {
+        return false;
+    }
+    let sysroot_lib_dir = tcx.sess.target_tlib_path.dir.as_path();
+    let source = tcx.used_crate_source(krate);
+    let mut saw_one = false;
+    for path in source.paths() {
+        saw_one = true;
+        if path.parent() != Some(sysroot_lib_dir) {
+            return false;
+        }
+    }
+    saw_one
+}
+
+/// This INVOCATION declared that it is building a sysroot, so its
+/// `core`/`alloc`/`std` legitimately arrive by `--extern` and residency cannot
+/// hold for any of them.
+///
+/// # Why a command-line fact, and why this one
+///
+/// [`crate_is_sysroot_resident`] alone over-declines in the lanes whose genuine
+/// `core`/`alloc`/`std` live in a build directory rather than in a sysroot. The
+/// carve-out for them must be keyed on something the ADVERSARY CANNOT SET, and
+/// the adversary here is a dependency author whose crate arrives through
+/// `--extern`. That rules out every fact about the crate graph — the graph is
+/// what the adversary supplies. It leaves the command line, which is spelled by
+/// whoever invokes rustc: the same trust boundary `--sysroot` already sits on,
+/// and the one residency itself already depends on.
+///
+/// `-Zforce-unstable-if-unmarked` is that flag, and it is exactly the marker the
+/// two sysroot-building lanes already carry:
+///
+/// * BOOTSTRAP sets it for `Mode::Std | Mode::Codegen | Mode::Rustc`
+///   (`src/bootstrap/src/core/builder/cargo.rs`, via `RUSTC_FORCE_UNSTABLE` ->
+///   `src/bootstrap/src/bin/rustc.rs`), and the in-tree `library/` verification
+///   opt-in (`TRUST_BOOTSTRAP_VERIFY_LIBRARY`) is confined to `Mode::Std` units,
+///   so every compilation that lane can produce carries it. Corroborated in-tree
+///   by an unrelated author: `crates/trust-bignum/src/lib.rs` documents that "the
+///   std build passes `-Zforce-unstable-if-unmarked`" and works around it.
+/// * `cargo -Zbuild-std` — MEASURED on cargo 1.98.0-nightly (a335d47ff),
+///   `-Zbuild-std=core,alloc,std,panic_abort --target aarch64-apple-darwin -v`:
+///   21 rustc invocations, 20 of them carrying `-Z force-unstable-if-unmarked`,
+///   including `core`, `alloc`, `std`, `hashbrown`, `libc` and
+///   `rustc_std_workspace_core`. The one invocation without it is the USER's own
+///   crate — see the over-decline below.
+///
+/// MEASURED in the negative direction too, which is the one that decides whether
+/// this branch is a hole: of all 298 `.rs` files under `tests/ui/trust` (the whole tree, not just
+/// its 258 top-level files — six subdirectories hold the other 40), ZERO pass this
+/// flag, and neither does any reproducer in this round's evidence. A `cargo`
+/// build script cannot add it either — MEASURED on the same cargo: a dependency
+/// emitting `cargo::rustc-flags=-Zforce-unstable-if-unmarked` fails the build
+/// outright, "only -l and -L flags are allowed in build script of dep v0.1.0".
+/// An accepted directive would in any case apply to the emitting package's own
+/// compilation, never to a dependent's.
+///
+/// # OVER-DECLINE, disclosed rather than closed
+///
+/// The USER's own crate under `cargo -Zbuild-std` is the one unit in that lane
+/// with no flag: MEASURED, it receives
+/// `--extern 'noprelude,nounused:core=<target-dir>/…/libcore-….rmeta'` (and the
+/// same for `alloc`/`std`) and no `-Z force-unstable-if-unmarked`. Those crates
+/// are therefore neither resident nor covered here, and their paths get stamped.
+/// That is a precision loss — visible unproved obligations — in the fail-CLOSED
+/// direction, and it is the deliberate choice: the alternative that would have
+/// covered it is a fact about the crate graph, and this is the round that
+/// measured what those cost.
+fn invocation_is_building_the_sysroot(tcx: TyCtxt<'_>) -> bool {
+    tcx.sess.opts.unstable_opts.force_unstable_if_unmarked
 }
 
 /// A crate that WEARS a sysroot name (`core`/`alloc`/`std`) without BEING one.
@@ -209,44 +359,59 @@ pub(crate) fn is_real_sysroot_crate(
 /// `std`, was emitted UNSTAMPED, and its `std::vec::Vec::<u8>::iter` returning an
 /// endless iterator collected with zero obligations (measured: exit 0, no
 /// diagnostics; byte-identical aux named `mycrate` gives exit 1 and two errors).
-/// [`is_real_sysroot_crate`] answers the identity question instead, from
-/// compiler-owned lang/diagnostic-item anchors that no source-spellable name can
-/// move.
+/// [`is_real_sysroot_crate`] answers the identity question instead.
 ///
-/// NO LOCAL EXEMPTION, deliberately, and the discriminator is the same anchor
-/// set: the real `core`/`alloc`/`std` each OWN one of the anchors
-/// (`Option`/`clone`, `Vec`/`owned_box`, `HashMap`/`HashSet`) and therefore
-/// authenticate themselves while they are the crate under compilation, whereas a
-/// crate that merely calls itself `std` owns none and is stamped even for its own
-/// items — which is what stops it self-verifying with sysroot grants. Missing
-/// anchors mean "not authenticated", so an anchorless graph fails CLOSED (stamped
-/// ⇒ grants refused ⇒ visible unproved obligations).
-///
-/// # WHAT THIS DOES NOT AUTHENTICATE — residual R2, MEASURED 2026-08-17
-///
-/// [`is_real_sysroot_crate`]'s anchors are ATTRIBUTES, and
+/// IDENTITY IS ARTIFACT RESIDENCY, NOT AN ATTRIBUTE — the 2026-08-17 rule read
+/// the compiler's lang/diagnostic-item anchors, and those are ATTRIBUTES:
 /// `#[rustc_diagnostic_item]` is spellable by any crate that writes
 /// `#![feature(rustc_attrs)]`. rustc hard-errors on a duplicate registration
 /// (MEASURED: `error: duplicate diagnostic item in crate 'std': 'Vec'` when the
-/// real `alloc` is also loaded), so the forgery is possible only for a name whose
-/// REAL owner is absent from the graph — but that is exactly the `#![no_std]`
-/// case this predicate exists for: an aux built `--crate-name std` carrying
-/// `#[rustc_diagnostic_item = "HashMap"]` compiles, its consumer compiles, and no
-/// duplicate error fires (MEASURED on `stage2` at `0a3cd0152`), so
-/// `get_diagnostic_item(HashMap)` resolves INTO it and this predicate answers
-/// `false`.
+/// real `alloc` is also loaded), so the forgery needed the real owner to be
+/// absent — which is exactly the `#![no_std]` case this predicate exists for. An
+/// aux built `--crate-name std` carrying `#[rustc_diagnostic_item = "HashMap"]`
+/// compiled, its consumer compiled, no duplicate error fired,
+/// `get_diagnostic_item(HashMap)` resolved INTO the aux and the anchor rule
+/// answered "real". That was residual R2. For an EXTERNAL crate it is answered
+/// here by not consulting attributes at all: authentication is
+/// [`crate_is_sysroot_resident`] — which artifact the loader opened — or
+/// [`invocation_is_building_the_sysroot`], a fact of the command line.
 ///
-/// The closure is PROVENANCE, not attributes: `tcx.used_crate_source(krate)`
-/// yields the `dylib`/`rlib`/`rmeta` paths the crate was actually loaded from,
-/// and `tcx.sess.opts.sysroot` says which of them is the compiler's own. That
-/// conjunct is NOT applied here because it is not sound as a REQUIREMENT in two
-/// configurations this crate must keep working: `cargo -Zbuild-std` puts a
-/// genuine `core`/`alloc`/`std` in the target directory rather than the sysroot,
-/// and the bootstrap library lane supplies them by `--extern` from the build
-/// directory. Requiring residency would stamp the real sysroot in both, which is
-/// fail-CLOSED but a silent precision loss for exactly the `no_std` population
-/// this lane serves. This bound is PRE-EXISTING and shared by all 20 existing
-/// [`is_real_sysroot_crate`] call sites; the identity rule does not widen it.
+/// # AND NOT A FACT ABOUT THE CRATE GRAPH — REFUTED 2026-08-21, MEASURED
+///
+/// A same-day revision authenticated on
+/// `resident || (injected && !sysroot_supplied_a_sysroot_named_crate)`, where
+/// `injected` was rustc's std-imports record and `supplied` was "some loaded
+/// crate named `core`/`alloc`/`std` is resident". Both are facts about the crate
+/// graph, and the adversary supplies the crate graph. MEASURED on
+/// `trustc 1.99.0-dev (ddb545d35 2026-08-21)`: a forged `std` declaring
+/// `#![no_core]` + `#![compiler_builtins]` suppresses `inject_compiler_builtins`
+/// (`rustc_metadata/src/creader.rs`), so a victim compiled
+/// `--crate-type lib --emit=metadata --extern std=<forgery>` reads NOTHING from
+/// the target library directory — `supplied` is false, the injected
+/// `extern crate std;` resolves to the forgery, and that rule authenticates it.
+/// It also authenticated a forgery carrying NO forged attribute, which the
+/// 2026-08-17 anchor rule refuses today (measured: exit 1, callee rendered
+/// `__trust_crate@e22d88b308847231::<u32 as std::convert::From<u8>>::from`). The
+/// disjunct is gone; the rule fails closed and the honest lane it protected is
+/// carved out on the command line instead.
+///
+/// NO LOCAL EXEMPTION, deliberately. A crate built `--crate-name std` must not
+/// self-verify with sysroot grants for its own items, so the local crate is put
+/// through the same predicate — but the compiler holds no loader record about the
+/// crate it is compiling, so that arm answers from
+/// [`invocation_is_building_the_sysroot`] alone. R2, the self-authentication
+/// route through lang/diagnostic-item anchors, is CLOSED as of 2026-08-23.
+///
+/// # WHAT THIS DOES NOT AUTHENTICATE — the residency bound
+///
+/// Residency is relative to `sess.opts.sysroot`, and
+/// [`invocation_is_building_the_sysroot`] waives it outright. Both are decided by
+/// whoever spells the rustc command line, so neither defends against that party;
+/// they defend against the party this stamp is about — an author whose crate
+/// arrives through `--extern`. The lane that pays for the change is
+/// `cargo -Zbuild-std`, whose user units get a `core`/`alloc`/`std` that is
+/// neither resident nor flagged and is therefore stamped: fail-CLOSED precision
+/// loss, disclosed at [`invocation_is_building_the_sysroot`].
 pub(crate) fn impersonates_sysroot_crate(
     tcx: TyCtxt<'_>,
     krate: rustc_span::def_id::CrateNum,
@@ -788,7 +953,8 @@ fn is_total_collection_extend_call<'tcx>(
     });
     // `Extend` is not a diagnostic item, so combine its name with sysroot identity.
     match trait_did {
-        Some(t) if tcx.item_name(t).as_str() == "Extend" && is_real_sysroot_crate(tcx, t.krate) => {}
+        Some(t) if tcx.item_name(t).as_str() == "Extend" && is_real_sysroot_crate(tcx, t.krate) => {
+        }
         _ => return false,
     }
     // `<C as Extend<T>>::extend` — Self (the collection `C`) is the first type arg.
@@ -1154,6 +1320,11 @@ fn convert_terminator<'tcx>(
                     // `func_operand_is_unsafe_sig` cannot see this: it only reads a
                     // `FnDef` constant.
                     is_unsafe_sig: matches!(sig.safety(), rustc_hir::Safety::Unsafe),
+                    // No `DefId` exists to identify: the callee is a runtime
+                    // fn-pointer VALUE, recorded as `args[0]`. `None` is the
+                    // honest answer and the fail-closed one — this call already
+                    // carries an unprovable panic-freedom marker on every path.
+                    callee_identity: None,
                     unwind: convert_unwind_action(*unwind),
                 };
             }
@@ -1230,11 +1401,62 @@ fn convert_terminator<'tcx>(
                 // name heuristic that falsely demanded SAFETY comments on safe
                 // std::ffi paths (OsStr::to_str & friends).
                 is_unsafe_sig: func_operand_is_unsafe_sig(tcx, func),
+                // Trust: the callee's NON-FORGEABLE `DefId`+substs identity,
+                // taken from the SAME `func` operand and the SAME `TyCtxt` that
+                // rendered `func_name` above — so the display spelling and the
+                // decision key can never be derived from different things. See
+                // `callee_identity_for` for the fail-closed admission rule and
+                // `trust_types::CalleeIdentity` for false proof #14.
+                callee_identity: func_operand_callee_identity(tcx, func),
                 // Faithfully record the cleanup/unwind successor (see comment
                 // above): a `Cleanup(bb)` edge keeps the cleanup block reachable so
                 // its live-local drops are verified; a sound over-approximation that
                 // never masks an obligation.
                 unwind: convert_unwind_action(*unwind),
+            }
+        }
+        mir::TerminatorKind::TailCall { func, args, .. } => {
+            // A tail call has no MIR destination or continuation: its result is
+            // returned directly from the current function. Preserve its exact
+            // direct callee and arguments so caller preconditions and direct-self
+            // E5 cannot disappear behind `Opaque`.
+            let func_name = func_operand_name(tcx, func);
+            let successors: Vec<BlockId> =
+                terminator.kind.successors().map(|bb| BlockId(bb.as_usize())).collect();
+            if func_name == "<indirect>" {
+                return opaque_terminator("TailCall(indirect)", successors, span);
+            }
+
+            let converted_args: Vec<Operand> = args
+                .iter()
+                .map(|spanned| convert_operand(tcx, &spanned.node, typing_env))
+                .collect();
+            let implicit_return = Place::local(0);
+            let atomic = match parse_atomic_intrinsic_metadata(
+                &func_name,
+                &converted_args,
+                &implicit_return,
+                &span,
+            ) {
+                AtomicIntrinsicMetadata::Parsed(op) => Some(op),
+                AtomicIntrinsicMetadata::NotAtomic => None,
+                AtomicIntrinsicMetadata::Malformed { detail } => {
+                    return opaque_terminator(
+                        format!("TailCall::{func_name}::{detail}"),
+                        successors,
+                        span,
+                    );
+                }
+            };
+
+            Terminator::TailCall {
+                func: func_name,
+                args: converted_args,
+                span,
+                atomic,
+                is_foreign: func_operand_is_foreign(tcx, func),
+                is_unsafe_sig: func_operand_is_unsafe_sig(tcx, func),
+                callee_identity: func_operand_callee_identity(tcx, func),
             }
         }
         // Trust: CRITICAL — Assert terminators encode rustc's overflow checks,
@@ -1931,8 +2153,10 @@ fn convert_rvalue<'tcx>(
                     // is address-preserving — the same class as the thin-pointer legs
                     // above; only the type label changes, and the deref's own validity
                     // obligation covers pointee validity separately. Gated on BOTH the
-                    // pointer source AND the std `NonNull` target (a value transmute
-                    // into NonNull, e.g. `usize -> NonNull<T>`, stays fail-closed).
+                    // pointer source AND the std `NonNull` target. (The ONE value
+                    // transmute into NonNull admitted is the exact `usize -> NonNull<T>`
+                    // thin-pointee bit identity below — `fmt::Arguments` packing;
+                    // every other value->NonNull transmute stays fail-closed.)
                     let ptr_to_nonnull = src_ty.as_ref().is_some_and(|t| t.is_any_ptr())
                         && ty.ty_adt_def().is_some_and(|def| {
                             tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
@@ -2029,9 +2253,8 @@ fn convert_rvalue<'tcx>(
                                 // the chase died fail-closed on its motivating case.
                                 // Concreteness was gated above, so normalization is
                                 // safe (the E0275 hazard is param-bearing input).
-                                let fty = tcx
-                                    .try_normalize_erasing_regions(te, f.ty(tcx, args))
-                                    .ok()?;
+                                let fty =
+                                    tcx.try_normalize_erasing_regions(te, f.ty(tcx, args)).ok()?;
                                 let is_1zst = tcx
                                     .layout_of(te.as_query_input(fty))
                                     .is_ok_and(|l| l.is_1zst());
@@ -2075,7 +2298,43 @@ fn convert_rvalue<'tcx>(
                             }
                         }
                     }
-                    if ty.is_any_ptr() || ty.is_box() || ptr_to_int || ptr_to_nonnull {
+                    // Trust (close-gap): the `fmt::Arguments` bit-packing
+                    // (`from_str` packs `len << 1 | 1` into `NonNull<rt::Argument>`;
+                    // `as_str` unpacks it) transmutes `usize <-> NonNull<T>`. At the
+                    // pinned 64-bit target both sides are the SAME 64 address bits
+                    // (`NonNull<T>` is #[repr(transparent)] over `*const T` — a std
+                    // layout GUARANTEE), so each direction is a value-preserving bit
+                    // identity — the same class as the ptr_to_int/ptr_to_nonnull legs
+                    // above. No validity or provenance is claimed: the bridge lowers
+                    // both to the newtype pack/unpack Bitcast whose CHC semantics are
+                    // exact, and any deref carries its own separate obligation. Gated
+                    // on BOTH ends: `usize` exactly on the integer side (a narrower
+                    // int is a genuine value reinterpretation and stays fail-closed)
+                    // and the std `NonNull` diagnostic item with a SIZED pointee on
+                    // the pointer side (a fat `NonNull<[T]>` is a 128-bit value).
+                    let nonnull_thin = |t: ty::Ty<'tcx>| {
+                        t.ty_adt_def().is_some_and(|def| {
+                            tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
+                        }) && match t.kind() {
+                            ty::TyKind::Adt(_, args) => {
+                                typing_env.is_some_and(|env| args.type_at(0).is_sized(tcx, env))
+                            }
+                            _ => false,
+                        }
+                    };
+                    let usize_to_nonnull = src_ty
+                        .as_ref()
+                        .is_some_and(|t| matches!(t.kind(), ty::TyKind::Uint(ty::UintTy::Usize)))
+                        && nonnull_thin(*ty);
+                    let nonnull_to_usize = src_ty.as_ref().is_some_and(|t| nonnull_thin(*t))
+                        && matches!(ty.kind(), ty::TyKind::Uint(ty::UintTy::Usize));
+                    if ty.is_any_ptr()
+                        || ty.is_box()
+                        || ptr_to_int
+                        || ptr_to_nonnull
+                        || usize_to_nonnull
+                        || nonnull_to_usize
+                    {
                         Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty))
                     } else {
                         unsupported_rvalue(
@@ -2557,6 +2816,162 @@ fn const_param_identity<'tcx>(
     }
 }
 
+/// Trust (LANE 1, NARROWING): can forcing CTFE of this unevaluated const, from inside
+/// `mir_built`, demand a LOCAL `mir_built` — i.e. close the `error[E0391]` query cycle the
+/// [`crate::ctfe_reentrancy`] freeze exists to break?
+///
+/// The freeze answers only half the question — *"am I inside `mir_built`"* — and its first
+/// form answered the other half by proxy, keying on the MIR **spelling** (`Const::Unevaluated`
+/// vs `Const::Val`). That proxy is wrong in both directions and cost measured coverage:
+///
+/// * `pub const BITS: usize = 8` folds to `Const::Val` in built MIR, so `try_to_bits` reads it
+///   with no query traffic and the freeze never sees it — it survived for a reason that has
+///   nothing to do with cycles.
+/// * `pub const MAX: i8 = i8::MAX` stays `Const::Unevaluated`, so the freeze declined it — even
+///   though `core::num::<impl i8>::MAX` is a FOREIGN def whose `mir_for_ctfe` comes from the
+///   metadata decoder and can demand no local query at all.
+///
+/// The cycle class is about REACHABILITY, not spelling, and the sibling THIR producer lane in
+/// `trust_thir_lower` has always keyed on exactly that (`lib.rs`'s `lower_named_const` and
+/// `eval_nonlocal_scalar_const`: `if def_id.is_local() { … }`, consulting `frozen()` nowhere).
+/// Keying the MIR-side oracle on the spelling therefore manufactured a disagreement between the
+/// two sides of the SAME differential on every non-local const: the THIR side computed `127` for
+/// `i8::MAX` while this side emitted an `Inst::Undef` the oracle then reports as a live havoc.
+///
+/// # The two clauses
+///
+/// 1. **`def.is_local()`** — the direct half, and the half both measured cycle edges live in
+///    (`core::task::wake`'s `static VTABLE` and `RawWaker::NOOP` are LOCAL when compiling
+///    `library/core`). Unchanged behaviour for those: still declined.
+/// 2. **args mention any local def** ([`generic_arg_mentions_local_def`], over `uv.args`) — the
+///    indirect half. A FOREIGN const's CTFE still *interprets* its body, and the interpreter
+///    resolves calls through `Instance::resolve`,
+///    which can land on a LOCAL impl when the generic arguments name a local type:
+///    `<LocalTy as ForeignTrait>::ASSOC` with a foreign default body that calls
+///    `Self::something()` demands local `mir_for_ctfe` -> `mir_borrowck` -> `mir_built`, which
+///    is precisely the measured cycle topology. `const_operand_value`'s existing
+///    `has_non_region_param` gate excludes UNSUBSTITUTED generics, not concrete local types.
+///
+///    MEASURED that this clause is load-bearing rather than decorative: built MIR keeps the
+///    UNRESOLVED use-site projection, so `<LocalTy as ForeignTrait>::ASSOC` really does arrive
+///    here as a non-local `def` with `LocalTy` in `args` (probed on the stage1 driver: a built-MIR
+///    dump of `<LocalTy as Marker>::N` prints the projection form, and a foreign generic assoc
+///    const prints `std::num::NonZero::<u32>::BITS` — def and use-site args, unresolved).
+///    Clause 1 alone would let that through.
+///
+///    Its **COMPLETENESS is an ARGUMENT, not a measurement**, and is recorded as such: *a foreign
+///    body cannot name a downstream item, so CTFE of a foreign const can reach local code only
+///    through argument-driven dispatch, and those arguments are exactly `uv.args`.* That is a
+///    claim about `Instance::resolve` that has not been probed. If it is wrong, the narrowing can
+///    reintroduce an E0391 on a shape neither `library/core` nor the ui corpus contains — and an
+///    E0391 is a HARD ERROR, strictly worse than the coverage it buys. Everything below therefore
+///    fails CLOSED: any structure this predicate cannot decide answers "may reach local".
+///
+/// # Two properties this predicate must have, and does
+///
+/// * **It issues NO query.** `DefId::is_local` is a `CrateNum` comparison and `GenericArg::walk`
+///   is pure structural iteration. A guard that had to ask the query system whether it was safe
+///   to ask the query system would defeat itself.
+/// * **Its empty case is the load-bearing one, and it is deliberately PERMISSIVE.**
+///   `args.iter().any(..)` over EMPTY args is `false` — not declined. That is not an oversight:
+///   `i8::MAX`, `u8::MIN`, `std::mem::Assume::SAFETY` and essentially the whole recovered
+///   population are non-generic foreign assoc consts with no args at all, and with no arguments
+///   there is no argument-driven dispatch, so `Instance::resolve` on a foreign def resolves to
+///   that foreign body and CTFE cannot reach this crate. (Note the direction: the `.any()`
+///   empty case ALLOWS. An `.all()` here would be vacuously true and would decline everything,
+///   which is the opposite mistake.)
+fn frozen_ctfe_may_reach_local_body(uv: mir::UnevaluatedConst<'_>) -> bool {
+    uv.def.is_local() || uv.args.iter().any(generic_arg_mentions_local_def)
+}
+
+/// Does `arg`, anywhere in its structure, name a def owned by the crate being compiled?
+///
+/// `GenericArg::walk` supplies the traversal (it descends into ADT/closure/coroutine/fn-def args,
+/// array lengths, tuple/ref/ptr/slice pointees, fn-ptr signatures, alias args, `dyn` predicate
+/// args and const-expr args); the two `*_names_local_def` helpers only inspect the node itself.
+/// Both are exhaustive matches whose unresolved/undecidable arms answer `true` — fail-closed.
+fn generic_arg_mentions_local_def(arg: ty::GenericArg<'_>) -> bool {
+    arg.walk().any(|inner| match inner.kind() {
+        // A region can never drive dispatch: CTFE runs region-erased.
+        ty::GenericArgKind::Lifetime(_) => false,
+        ty::GenericArgKind::Type(t) => ty_names_local_def(t),
+        ty::GenericArgKind::Const(c) => const_names_local_def(c),
+    })
+}
+
+/// SHALLOW: does this one type node name a local def? Children are the walker's job.
+fn ty_names_local_def(t: ty::Ty<'_>) -> bool {
+    // `impl Into<DefId>` so each arm stays correct whether rustc models these ids as plain
+    // `DefId` or as newtypes; a future newtype without the `From` impl is a COMPILE error here,
+    // which is the safe way for this to break.
+    fn local(d: impl Into<DefId>) -> bool {
+        d.into().is_local()
+    }
+    // `Ty::kind()` returns `&TyKind`, so bindings below are references; the `*d` derefs are load-
+    // bearing, not noise.
+    match t.kind() {
+        // Primitives: no def at all.
+        ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Str | ty::Never => {
+            false
+        }
+        // Purely structural nodes — every def they can carry is in a child the walker visits.
+        ty::Array(..)
+        | ty::Slice(_)
+        | ty::RawPtr(..)
+        | ty::Ref(..)
+        | ty::Tuple(_)
+        | ty::FnPtr(..)
+        | ty::Pat(..)
+        | ty::UnsafeBinder(_) => false,
+        // Def-carrying nodes.
+        ty::Adt(adt, _) => local(adt.did()),
+        ty::Foreign(d) => local(*d),
+        ty::FnDef(d, _) => local(*d),
+        ty::Closure(d, _) => local(*d),
+        ty::CoroutineClosure(d, _) => local(*d),
+        ty::Coroutine(d, _) => local(*d),
+        ty::CoroutineWitness(d, _) => local(*d),
+        ty::Alias(_, alias) => {
+            let def_id: DefId = match alias.kind {
+                ty::AliasTyKind::Projection { def_id } => def_id.into(),
+                ty::AliasTyKind::Inherent { def_id } => def_id.into(),
+                ty::AliasTyKind::Opaque { def_id } => def_id.into(),
+                ty::AliasTyKind::Free { def_id } => def_id.into(),
+            };
+            def_id.is_local()
+        }
+        // `dyn Trait + Proj = T + Send`: the walker pushes each predicate's ARGS but never the
+        // predicate's own def id, so `dyn LocalTrait` would otherwise be invisible here.
+        ty::Dynamic(preds, _) => preds.iter().any(|p| local(p.def_id())),
+        // FAIL CLOSED. A parameter/inference/placeholder/bound/error type is not a decidable
+        // answer to "which crate owns this", so treat it as possibly-local. This costs nothing
+        // at either call site: both already return `None` on `has_non_region_param()` before
+        // reaching this predicate, so a `Param` cannot arrive here in practice.
+        ty::Param(_) | ty::Bound(..) | ty::Placeholder(..) | ty::Infer(_) | ty::Error(_) => true,
+    }
+}
+
+/// SHALLOW: does this one const node name a local def? Children are the walker's job.
+fn const_names_local_def(c: ty::Const<'_>) -> bool {
+    match c.kind() {
+        // A valtree is pure data; the walker pushes its type.
+        ty::ConstKind::Value(_) => false,
+        // A const expression's operands are its args, which the walker pushes.
+        ty::ConstKind::Expr(_) => false,
+        ty::ConstKind::Alias(_, alias) => match alias.kind.opt_def_id() {
+            Some(def_id) => def_id.is_local(),
+            // FAIL CLOSED: an alias const we cannot name.
+            None => true,
+        },
+        // FAIL CLOSED, for the same reason as the type case above.
+        ty::ConstKind::Param(_)
+        | ty::ConstKind::Bound(..)
+        | ty::ConstKind::Placeholder(_)
+        | ty::ConstKind::Infer(_)
+        | ty::ConstKind::Error(_) => true,
+    }
+}
+
 // Trust: eval a MIR const to bits ONLY when it is actually monomorphic.
 // A generic body can carry `<<F as Trait>::Assoc as Trait2>::CONST` whose
 // projection args don't normalize under reveal-all; forcing eval routes into
@@ -2566,6 +2981,20 @@ fn const_param_identity<'tcx>(
 // const has no single value). `try_eval_bits` derives its size internally.
 fn try_eval_bits_mono<'tcx>(c: mir::Const<'tcx>, tcx: TyCtxt<'tcx>) -> Option<u128> {
     if c.has_non_region_param() {
+        return None;
+    }
+    // Trust (LANE 1): inside `mir_built`, an UNEVALUATED const must not be forced — see
+    // `crate::ctfe_reentrancy`. Only the unevaluated spelling can demand a query; a
+    // `Const::Val`/`Const::Ty` already holds its value and is read without touching the
+    // query system, so the freeze must not cost those.
+    //
+    // Trust (LANE 1, NARROWING): and of the unevaluated ones, only those whose CTFE can
+    // actually reach a LOCAL body — see `frozen_ctfe_may_reach_local_body`. This is the same
+    // locality question the sibling THIR lane has always asked; asking it here is what stops
+    // the two sides of one differential from disagreeing by construction on `i8::MAX`.
+    if crate::ctfe_reentrancy::frozen()
+        && matches!(c, mir::Const::Unevaluated(uv, _) if frozen_ctfe_may_reach_local_body(uv))
+    {
         return None;
     }
     c.try_eval_bits(tcx, ty::TypingEnv::fully_monomorphized())
@@ -2693,35 +3122,52 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
             // exact-or-None; any miss degrades to the pre-existing
             // fresh-symbolic `OpaqueConst` below, never to a guessed value.
             // (edition 2021 — no let-chains: nested ifs.)
+            // Trust: the `u8` test SELECTS the byte-array lane; it must not RETURN.
+            //
+            // This was `if *elem != tcx.types.u8 { return OpaqueConst; }`, which
+            // made the `&[&str; N]` pieces lane below unreachable for the ARRAY
+            // form — the only form it targets, per its own comment. The pieces
+            // lane landed 2026-07-13 (1bcd6aa5848); this early return landed
+            // 2026-07-15 (fd5cd5167fe4) and has kept it dead since.
+            //
+            // The consequence was not one test: every formatted
+            // `panic!("… {x} …")` template was invisible to trust-vcgen's
+            // contract-panic matcher on this toolchain, which is precisely the
+            // capability the 07-13 commit existed to add.
+            //
+            // Falling through is SOUND — the pieces lane is exact-or-None and
+            // ends in the same `OpaqueConst` this used to return early, so a
+            // non-`&str` element table reaches an identical verdict by a longer
+            // path. Nothing is guessed either way.
+            // (edition 2021 — no let-chains: nested ifs, as elsewhere in this fn.)
             if let TyKind::Array(elem, len) = inner.kind() {
-                if *elem != tcx.types.u8 {
-                    return Operand::Constant(ConstValue::OpaqueConst);
-                }
-                // Optimized MIR commonly materializes a promoted byte string as
-                // `Const::Val` scalar pointer rather than a type-level valtree.
-                // Read exactly the statically-sized initialized allocation
-                // range and reject provenance/uninit instead of using rustc's
-                // slice diagnostic helper (which deliberately bug!s for sized
-                // array references).
-                if let Some(byte_len) = len.try_to_target_usize(tcx) {
-                    if let mir::Const::Val(value, _) = c {
-                        if let Some(bytes) =
-                            byte_array_ref_bytes_from_const_value(tcx, value, byte_len)
-                        {
+                if *elem == tcx.types.u8 {
+                    // Optimized MIR commonly materializes a promoted byte string as
+                    // `Const::Val` scalar pointer rather than a type-level valtree.
+                    // Read exactly the statically-sized initialized allocation
+                    // range and reject provenance/uninit instead of using rustc's
+                    // slice diagnostic helper (which deliberately bug!s for sized
+                    // array references).
+                    if let Some(byte_len) = len.try_to_target_usize(tcx) {
+                        if let mir::Const::Val(value, _) = c {
+                            if let Some(bytes) =
+                                byte_array_ref_bytes_from_const_value(tcx, value, byte_len)
+                            {
+                                return Operand::Constant(ConstValue::Str { bytes });
+                            }
+                        }
+                    }
+                    if let Some(value) = const_operand_value(tcx, const_op) {
+                        if let Some(bytes) = str_ref_bytes_from_value(tcx, value) {
                             return Operand::Constant(ConstValue::Str { bytes });
                         }
                     }
-                }
-                if let Some(value) = const_operand_value(tcx, const_op) {
-                    if let Some(bytes) = str_ref_bytes_from_value(tcx, value) {
+                    // Directly-evaluated (`Const::Val`) byte template — the dominant
+                    // `Arguments::new` format-template form, which `const_operand_value` returns
+                    // `None` for; read the array bytes from its allocation.
+                    if let Some(bytes) = array_ref_u8_const_bytes(tcx, &const_op.const_) {
                         return Operand::Constant(ConstValue::Str { bytes });
                     }
-                }
-                // Directly-evaluated (`Const::Val`) byte template — the dominant
-                // `Arguments::new` format-template form, which `const_operand_value` returns
-                // `None` for; read the array bytes from its allocation.
-                if let Some(bytes) = array_ref_u8_const_bytes(tcx, &const_op.const_) {
-                    return Operand::Constant(ConstValue::Str { bytes });
                 }
             }
             // THIS toolchain's `Arguments::new(pieces, args)` format template is a `&[&str; N]`
@@ -3280,6 +3726,27 @@ fn const_operand_value<'tcx>(
         mir::Const::Ty(_, ty_const) => ty_const.try_to_value(),
         mir::Const::Unevaluated(unevaluated, ty) => {
             if ty.has_non_region_param() || unevaluated.args.has_non_region_param() {
+                return None;
+            }
+            // Trust (LANE 1): the measured `library/core` cycle site.
+            // `const_eval_global_id_for_typeck`
+            // below demands `mir_for_ctfe` of this const, whose borrowck descends into its nested
+            // closures and demands their `mir_built` — and inside the producer's oracle we ARE a
+            // `mir_built`. See `crate::ctfe_reentrancy` for the shape and the measurement. `None`
+            // is this function's existing "value unavailable" answer, so the operand simply stays
+            // opaque; the verifier lane never enters the freeze and is unaffected.
+            //
+            // Trust (LANE 1, NARROWING): decline only when the CTFE can actually reach a LOCAL
+            // body — `frozen_ctfe_may_reach_local_body`, which is where the reasoning lives.
+            // This site MUST move in lockstep with `try_eval_bits_mono`'s: they are the two
+            // halves of ONE operand path, and narrowing only the scalar half would recover the
+            // int/uint consts while leaving every float, `Assume`-style struct and promoted
+            // const still declined (they reach a value only through this function, including via
+            // the `OpaqueConst` rescue below). The `discharge_provably_safe_pointer_asserts`
+            // guard is deliberately NOT part of that set: it runs only under
+            // `ExtractionPurpose::Verification`, never on the oracle path, and declining there
+            // KEEPS an assert, so narrowing it would remove obligations rather than recover rows.
+            if crate::ctfe_reentrancy::frozen() && frozen_ctfe_may_reach_local_body(unevaluated) {
                 return None;
             }
             let typing_env = ty::TypingEnv::fully_monomorphized();
@@ -4064,9 +4531,38 @@ fn source_is_pointer_like<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
     }
     if let Some(adt) = ty.ty_adt_def() {
         let path = crate::safe_def_path_str(tcx, adt.did());
-        return path.contains("ptr::NonNull") || path.contains("ptr::Unique");
+        return is_core_ptr_wrapper_name(&path);
     }
     false
+}
+
+/// Is `name` the `safe_def_path_str` of `core::ptr::NonNull` or `core::ptr::Unique`?
+///
+/// Trust: `safe_def_path_str` is pinned to `with_no_visible_paths!`, so it prints
+/// the DEFINITIONAL path. Both types live in PRIVATE modules — `mod non_null;`
+/// and `mod unique;` in `library/core/src/ptr/mod.rs` — and are re-exported, so
+/// they render `core::ptr::non_null::NonNull` and `core::ptr::unique::Unique`.
+///
+/// This used to test `path.contains("ptr::NonNull") || path.contains("ptr::Unique")`,
+/// which is the RE-EXPORTED spelling and therefore matched NEITHER rendering: both
+/// clauses were dead and the arm could never fire. `is_io_error_ty_name` 170 lines
+/// below documents this exact trap for `std::io::error::Error` and handles it; this
+/// function did not.
+///
+/// Consequence, measured on `box_assert_eval_discharges_both` at
+/// `-Zmir-opt-level=3`: GVN hoists the box-deref into a bare `NonNull` temp and the
+/// address trace in `received_box_facts` must hop through the
+/// address-preserving-cast arm, whose third conjunct is this predicate. With it
+/// dead the hop fails, no `BoxAllocFacts` is produced, and BOTH box derefs keep a
+/// Misalign assert that should have been discharged. FAIL-CLOSED — asserts are
+/// kept, never wrongly discharged — so this is a capability gap, not a false prove.
+///
+/// Gated on a `core::`/`std::`/`alloc::` origin and an `::ptr::` segment so a
+/// same-named USER type cannot match, mirroring `is_io_error_ty_name`'s discipline.
+fn is_core_ptr_wrapper_name(name: &str) -> bool {
+    (name.starts_with("core::") || name.starts_with("std::") || name.starts_with("alloc::"))
+        && name.contains("::ptr::")
+        && (name.ends_with("::NonNull") || name.ends_with("::Unique"))
 }
 
 /// Address-preserving casts: the destination's address bits equal the source's.
@@ -4187,7 +4683,26 @@ pub(crate) fn discharge_provably_safe_pointer_asserts<'tcx>(
         let discharge = match &**msg {
             mir::AssertKind::MisalignedPointerDereference { required, found } => {
                 let Some(req) = (match required {
-                    mir::Operand::Constant(box c) => {
+                    // Trust (LANE 1): same freeze as `try_eval_bits_mono` — an UNEVALUATED const
+                    // must not be forced from inside `mir_built` (`crate::ctfe_reentrancy`).
+                    // Declining here KEEPS the assert, which is the fail-closed direction: the
+                    // obligation is retained rather than discharged from a value nobody computed.
+                    //
+                    // Trust (LANE 1, NARROWING): this site is DELIBERATELY NOT narrowed by
+                    // `frozen_ctfe_may_reach_local_body`, and that is not an oversight. The other
+                    // two sites were widened by the spelling proxy in the COVERAGE direction (a
+                    // declined const became an `Inst::Undef` the oracle reports as a live havoc);
+                    // this one is a DISCHARGE, so relaxing it would remove obligations rather than
+                    // recover rows. It is also unreachable from the producer: its sole caller in
+                    // `lib.rs`'s `extract_body` is gated on `purpose == ExtractionPurpose::
+                    // Verification`, while the MIR oracle arrives via `extract_function_faithful`
+                    // — and the verifier lane never enters the freeze in the first place. Leaving
+                    // it at its strictest reading costs nothing measurable and
+                    // keeps the relaxation confined to the operand path it was measured on.
+                    mir::Operand::Constant(box c)
+                        if !(matches!(c.const_, mir::Const::Unevaluated(..))
+                            && crate::ctfe_reentrancy::frozen()) =>
+                    {
                         c.const_.try_eval_target_usize(tcx, typing_env)
                     }
                     _ => None,
@@ -4325,9 +4840,8 @@ fn error_local_has_os_provenance<'tcx>(
         if let Some(mir::TerminatorKind::Call { func, .. }) =
             unique_call_def_for_local(mir_body, local)
         {
-            let sysroot_callee = func
-                .const_fn_def()
-                .is_some_and(|(did, _)| is_real_sysroot_crate(tcx, did.krate));
+            let sysroot_callee =
+                func.const_fn_def().is_some_and(|(did, _)| is_real_sysroot_crate(tcx, did.krate));
             return sysroot_callee && is_os_error_constructor(&func_operand_name(tcx, func));
         }
         return false;
@@ -6330,7 +6844,10 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 /// same-namespace siblings, and the disambiguator counts siblings per `(parent,
 /// DefPathData)`.  `DefPathData::TypeNs(sym)` and `DefPathData::ValueNs(sym)` are
 /// DIFFERENT variants, so two same-named siblings in DIFFERENT namespaces are
-/// each `#0` and both still render the bare name — §RESIDUAL 7, MEASURED OPEN.
+/// each `#0` and neither the disambiguator nor any other closure inside the
+/// printer can separate them — that is §RESIDUAL 7, and it is closed one frame
+/// OUT of the printer by `crate::apply_cross_namespace_tag`, which is applied to
+/// the output of both seam renderers.
 ///
 /// One thing this function's own `@`-stamp is NOT: an authenticator.
 /// `ambiguous_callee` below is `local_has_same_name || another_external_has_same
@@ -6413,14 +6930,18 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 ///    an `[overflow:add]` obligation reported PROVED).  The disambiguator cannot
 ///    express this class at all: the two items have DIFFERENT `DefPath` parents.
 ///
-/// 7. **Same-named siblings in DIFFERENT NAMESPACES still alias — MEASURED
-///    OPEN.**  This is the limit of residual 5's disambiguator, and it is the
-///    reason the closure above must not be described as removing "same-named
-///    sibling definitions" without qualification.  A
-///    `DisambiguatedDefPathData` disambiguator counts siblings per `(parent,
-///    DefPathData)`, and `TypeNs(sym)` and `ValueNs(sym)` are DIFFERENT
-///    `DefPathData` VARIANTS — so a `fn S` and a `struct S` under one parent
-///    are BOTH `#0` and both still render `S` under this seam.
+/// 7. Closed, and recorded because it was mis-recorded for two days:
+///    **same-named siblings in DIFFERENT NAMESPACES.**  This is the limit of
+///    residual 5's disambiguator, and it is the reason the closure above must
+///    not be described as removing "same-named sibling definitions" without
+///    qualification.  A `DisambiguatedDefPathData` disambiguator counts siblings
+///    per `(parent, DefPathData)`, and `TypeNs(sym)` and `ValueNs(sym)` are
+///    DIFFERENT `DefPathData` VARIANTS — so a `fn S` and a `struct S` under one
+///    parent are BOTH `#0` and neither still renders separably from inside the
+///    printer.  `crate::apply_cross_namespace_tag` decides one frame OUT, at the
+///    seam's two entry points, where the `DefId` is in hand and the local
+///    sibling set can be consulted, and tags ONLY a segment that has an actual
+///    cross-namespace sibling.
 ///    Reproducer (`#![no_std]`, `core` only), one function, two blocks:
 ///
 ///    ```text
@@ -6431,39 +6952,62 @@ fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> 
 ///    }
 ///    ```
 ///
-///    `-Ztrust-dump=mir` emits FOUR bundled bodies under THREE def paths: two
-///    DISTINCT bodies both keyed `krate::go::S::m` (3925 and 1972 bytes; only
-///    the `impl` one contains the `Add`).  MEASURED byte-identically on the
-///    seam's own build AND on the pristine base, so this is PRE-EXISTING — the
-///    `{{extern}}` closure neither causes it nor closes it.  Renaming one `S`
-///    splits the four bodies into four distinct paths.
+///    BEFORE (pristine `a27d636271`, and the seam's own build at the time):
+///    `-Ztrust-dump=mir` emitted FOUR bundled bodies under THREE def paths — two
+///    DISTINCT bodies both keyed `krate::go::S::m`, distinguishable only by
+///    content (just one of them contains the `Add`) — and the two native-bundle
+///    modules
+///    carried `vc:t_nsclash__go__S__m:trust_mc_default_function:0` and
+///    `vc:t_nsclash__go__S__m:arithmetic_safety:0`: ONE key.  It was NOT inert:
+///    the aliased program reported 2 obligations where its one-identifier
+///    control reported 1, and a `#[trust::assume_total]` donation row read
+///    `compiler retained the existing assertion because the proof is not yet
+///    static` where the control read `solver trust-assumed-total reported
+///    Proved`.  Both shapes fail CLOSED — the alias COST credit — but the
+///    fail-OPEN direction of this same one-string-two-`DefId`s key is what the
+///    three witnesses at the top of this comment were, in three independent
+///    consumers.
 ///
-///    It is NOT inert.  Two consumer-level differentials, each one identifier
-///    apart from its control, MEASURED on both builds:
-///      * obligation COUNT — the aliased program reports 2 obligations (the
-///        extra one an `[assert] runtime-checked` carrying the absent-callee
-///        note) where the renamed control reports 1;
-///      * `#[trust::assume_total]` DONATION — the control's discharge row reads
-///        `solver trust-assumed-total reported Proved without exact
-///        kernel/native proof authority`, and under the alias that same row
-///        reads `compiler retained the existing assertion because the proof is
-///        not yet static`: the declared verdict is not spent.
+///    AFTER (re-measured on the stage2 `trustc` built from `ddb545d35b`, crate
+///    name `nsclash`): FOUR bodies under FOUR paths.  The fn-scoped `m` renders
+///    `nsclash::go::S::m#ns1v` and the `impl` one keeps `nsclash::go::S::m`, and
+///    the native bundles separate into
+///    `vc:h0_nsclash__go__S__m_x23ns1v:trust_mc_default_function:0` and
+///    `vc:nsclash__go__S__m:arithmetic_safety:0`: TWO keys where there was one.
+///    The consumer differential is gone: clash and control both report
+///    `0 proved, 1 failed … out of 1 obligation(s)`.
 ///
-///    Both shapes fail CLOSED — the alias COSTS credit rather than granting it,
-///    which is a lost recovery, itself a defect.  That is exactly what is
-///    claimed here and no more: TWO SHAPES MEASURED, no shape driven to a false
-///    proof.  It is NOT a claim that the class is safe.  The fail-OPEN direction
-///    of this same one-string-two-`DefId`s key is what the three witnesses at
-///    the top of this comment were, in three independent consumers, so treat a
-///    granting cross-namespace instance as reachable until someone measures
-///    otherwise.
+///    Earlier revisions of this paragraph sized those bodies in bytes.  Do not
+///    reintroduce that: a dump embeds the absolute source path in every span, so
+///    the sizes move with the checkout.  MEASURED on one program, one binary —
+///    3956 B / 1992 B compiled from `/tmp/nsA`, 4244 B / 2136 B from an 80-char
+///    path, 3928 B / 1978 B when the file is named relatively.  The stable
+///    observable is the PATH SET, which is what the fixture pins.
 ///
-///    Not closed here because the only rendering that separates the namespaces
-///    is a namespace tag on EVERY named segment — modules are `TypeNs` too, so
-///    every path in the identity space moves, including the ROOT+TAIL and
-///    LAST-SEGMENT matches enumerated on [`crate::safe_def_path_str`].  That
-///    blast radius is not measured by this change's evidence, and the seam's
-///    rule is that an unmeasured move is not shipped.
+///    Pinned by `tests/ui/trust/cross_namespace_key_alias_stays_closed.rs`,
+///    which annotates the TAGGED spelling in the diagnostic — removing the tag
+///    changes that text back to `…::go::S::m` (observed, by renaming the
+///    `struct S`) and the fixture goes red.
+///
+///    The objection recorded here while it was open — that separating the
+///    namespaces means tagging EVERY named segment, modules included, so every
+///    path in the identity space moves, including the ROOT+TAIL and LAST-SEGMENT
+///    matches enumerated on [`crate::safe_def_path_str`] — is correct for a
+///    printer-internal hook, which is handed a `DisambiguatedDefPathData` and no
+///    `DefId`.  It does not apply IN THAT FORM to a decision taken at the seam's
+///    entry points, where the sibling set is computable — but a WEAKER form of it
+///    is true and is now recorded at the tag: because the mark is a suffix over
+///    the whole `DefPath` chain, a local module, ADT or trait declared UNDER a
+///    marked segment moves with it (`k::go::S::M::Ad#ns1v`, measured against a
+///    one-identifier control).  Foreign paths are held byte-identical by the
+///    `!def_id.is_local()` return, not by the `TypeNs` skip.  Blast radius on the
+///    graded corpus, MEASURED on stage2: 298 `tests/ui/trust` fixtures, 848
+///    dumped bodies, 851 distinct def paths, and NOT ONE `#ns` occurrence
+///    anywhere in the dumps — not in a def path, a callee key, a type name or a
+///    `Self` type.  See `apply_cross_namespace_tag` for the full sample and for
+///    residuals 7a (the tag stops at the crate boundary), 7b (a foreign collision
+///    is not detected) and 7c (the tag never reaches a type rendered INSIDE a
+///    path, so two distinct local types can still share one `args` spelling).
 ///
 /// The two `CallKeyLedger`-based group decisions in
 /// `trust_verify::dyn_dispatch_reliance` and `static_str_write_fmt` are kept as
@@ -6526,6 +7070,103 @@ fn generic_args_fingerprint<'tcx>(
         });
         hasher.finish()
     })
+}
+
+/// Trust — mint the NON-FORGEABLE [`trust_types::CalleeIdentity`] for a direct
+/// call's `(DefId, GenericArgs)`, or refuse.
+///
+/// This is the producer half of the fix for FALSE PROOF #14 (see
+/// [`trust_types::CalleeIdentity`] for the attack and the measured `'a`/`'_`
+/// desync). It records what rustc knows and a source spelling cannot reach: the
+/// callee's `StableCrateId`, its `DefIndex`, and a fingerprint of its generic
+/// arguments.
+///
+/// # The two properties the digest must have, and how each is obtained
+///
+/// **A lifetime-only difference must NOT distinguish.** `tcx.
+/// erase_and_anonymize_regions` is applied BEFORE hashing — the same erasure
+/// rustc's own `Instance`/codegen path applies, so two instantiations that
+/// differ only in a region are literally the same code and hash the same. This
+/// is what makes the R43 desync (`Parser::<'a>::peek` registered,
+/// `Parser::<'_>::peek` queried) close for the RIGHT reason, rather than by
+/// normalizing yet another string spelling.
+///
+/// **A type/const difference MUST distinguish.** Nothing beyond regions is
+/// erased, so `f::<u32>` and `f::<[u8; 1 << 40]>` get different digests and a
+/// fact proven about one can never be transferred to the other. (That erasure
+/// direction is not hypothetical: erasing `T` from a rendered path is how a
+/// `Vec::<[u8; 1<<40]>::with_capacity` overflow was once reported proved — see
+/// [`crate::safe_def_path_str_with_args`].)
+///
+/// # Fail-closed admission
+///
+/// `None` unless the instantiation is FULLY CONCRETE modulo regions. The three
+/// refusals are rustc's own — the same triple `trust_verify`'s monomorphic lanes
+/// use before they will treat an instantiated body as "the body this call
+/// reaches":
+///
+/// * `has_non_region_param` — the args still mention a `ty::Param` /
+///   `ConstKind::Param`. This is the arm that makes the forgery inert:
+///   `fn attack<u64: TryFrom<u32>>(..)` calls `<u64 as TryFrom<u32>>::try_from`
+///   with `u64` a TYPE PARAMETER, so the call carries NO identity at all and can
+///   reach no identity-keyed decision, whatever it renders as. It is also what
+///   keeps "the generic body verified" from being read as "every instantiation
+///   is panic-free": a call `f::<T>` from inside a generic body is unidentified,
+///   so the generic definition's own registration can never discharge it.
+/// * `has_non_region_infer` — an inference variable is not an instantiation.
+/// * `has_non_region_placeholders` — a placeholder is not an instantiation.
+///
+/// An absent identity must NEVER be answered by comparing the rendered path;
+/// that is precisely the decision procedure this exists to retire.
+pub(crate) fn callee_identity_for<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    generic_args: ty::GenericArgsRef<'tcx>,
+) -> Option<trust_types::CalleeIdentity> {
+    if generic_args.has_non_region_param()
+        || generic_args.has_non_region_infer()
+        || generic_args.has_non_region_placeholders()
+    {
+        return None;
+    }
+    let erased = tcx.erase_and_anonymize_regions(generic_args);
+    let (lo, hi) = generic_args_fingerprint(tcx, erased).split();
+    let (lo, hi) = (lo.as_u64(), hi.as_u64());
+    Some(trust_types::CalleeIdentity {
+        // `StableCrateId`, not `CrateNum`: the latter is an index into THIS
+        // compilation's crate list and means nothing across a serialized
+        // artifact or a second session.
+        stable_crate_id: tcx.stable_crate_id(def_id.krate).as_u64(),
+        def_index: def_id.index.as_u32(),
+        substs_digest: [lo, hi],
+    })
+}
+
+/// The [`trust_types::CalleeIdentity`] of the function a call's `func` operand
+/// names, when that operand is a direct `FnDef` constant.
+///
+/// Every other operand shape — an indirect `fn`-pointer call, a `dyn` dispatch,
+/// a call through a local — yields `None`, which is the honest answer: there is
+/// no single statically-known callee to identify, and the modeling of those
+/// calls (open-dispatch havoc plus an unprovable panic-freedom marker) already
+/// assumes exactly that.
+fn func_operand_callee_identity<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+) -> Option<trust_types::CalleeIdentity> {
+    match func {
+        mir::Operand::Constant(box const_op) => match const_op.const_.ty().kind() {
+            rustc_middle::ty::TyKind::FnDef(def_id, generic_args) => {
+                callee_identity_for(tcx, *def_id, generic_args)
+            }
+            _ => None,
+        },
+        // EXHAUSTIVE on purpose (no wildcard): a new `mir::Operand` variant must
+        // fail to compile here rather than silently acquire the `None` default,
+        // because "no identity" is a decision this gate is entitled to make only
+        // for operand shapes that genuinely name no single `DefId`.
+        mir::Operand::Copy(_) | mir::Operand::Move(_) | mir::Operand::RuntimeChecks(_) => None,
+    }
 }
 
 fn disambiguate_generic_call_path(path: String, args_fingerprint: Option<Fingerprint>) -> String {
@@ -6742,9 +7383,7 @@ fn is_pinned_total_std_primitive_cmp_call<'tcx>(
 
     // (2) STRONG crate-of-DefId authentication: the resolved method is DEFINED in
     // `core` (the pinned std sources).
-    if tcx.crate_name(resolved.krate) != sym::core
-        || !is_real_sysroot_crate(tcx, resolved.krate)
-    {
+    if tcx.crate_name(resolved.krate) != sym::core || !is_real_sysroot_crate(tcx, resolved.krate) {
         return false;
     }
 
@@ -7019,6 +7658,87 @@ pub(crate) fn convert_span(tcx: TyCtxt<'_>, span: Span) -> SourceSpan {
 // and do not require a rustc TyCtxt.
 #[cfg(test)]
 mod tests {
+    use rustc_middle::{mir, ty};
+    use rustc_span::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE};
+
+    /// A `DefId` in the crate being compiled — `RawWaker::NOOP` when compiling `library/core`.
+    fn local_def() -> DefId {
+        DefId { krate: LOCAL_CRATE, index: DefIndex::from_u32(7) }
+    }
+
+    /// A `DefId` in an upstream crate — `core::num::<impl i8>::MAX` when compiling anything else.
+    fn foreign_def() -> DefId {
+        DefId { krate: CrateNum::from_u32(2), index: DefIndex::from_u32(7) }
+    }
+
+    fn uneval(def: DefId, promoted: Option<mir::Promoted>) -> mir::UnevaluatedConst<'static> {
+        // `List::empty()` is the one args list constructible without a `TyCtxt`, and it is also
+        // the one this lane most needs pinned: every const in the recovered population
+        // (`i8::MAX`, `u8::MIN`, `std::mem::Assume::SAFETY`) is a NON-GENERIC assoc const whose
+        // args really are empty.
+        mir::UnevaluatedConst { def, args: ty::List::empty(), promoted }
+    }
+
+    /// The regression this predicate exists for, at predicate level.
+    ///
+    /// The freeze used to key on the MIR SPELLING (`Const::Unevaluated` vs `Const::Val`), which
+    /// is why `pub const BITS: usize = 8` survived (rustc folds a literal to `Const::Val`, so the
+    /// guard never sees it) while `pub const MAX: i8 = i8::MAX` was declined (a path stays
+    /// `Const::Unevaluated`). Those two differ in how rustc spelled the initializer, NOT in
+    /// whether evaluating them can demand a local `mir_built` — and `i8::MAX` cannot, because its
+    /// provider is the metadata decoder.
+    ///
+    /// `BITS` itself cannot appear in this test: it never reaches the predicate at all, because
+    /// `try_eval_bits_mono` only consults it under `Const::Unevaluated`. That asymmetry IS the
+    /// witness pair, and the executable half of it lives in
+    /// `tests/ui/trust/trust_ir_lower_nonlocal_const_no_havoc.rs`.
+    #[test]
+    fn frozen_ctfe_decline_keys_on_def_locality_not_on_mir_spelling() {
+        // `i8::MAX` — foreign def, no args. RECOVERED: its CTFE cannot reach this crate.
+        assert!(
+            !super::frozen_ctfe_may_reach_local_body(uneval(foreign_def(), None)),
+            "a foreign assoc const with no args must NOT be declined: its `mir_for_ctfe` comes \
+             from the metadata decoder and can demand no local query"
+        );
+        // `RawWaker::NOOP` when compiling `library/core` — the measured E0391 cycle edge.
+        // STILL DECLINED. If this flips, the cycle is back and it is a hard compiler error.
+        assert!(
+            super::frozen_ctfe_may_reach_local_body(uneval(local_def(), None)),
+            "a LOCAL const must stay declined inside `mir_built` — this is the measured cycle edge"
+        );
+    }
+
+    /// The empty-args case is PERMISSIVE, deliberately, and it is the case the whole recovery
+    /// rides on. Pinned as its own test because the opposite reading is an easy mistake: an
+    /// `.all(..)` here would be vacuously TRUE on empty args and would decline everything, i.e.
+    /// measure exactly +0 while reading like a working narrowing.
+    ///
+    /// Why permissive is correct: with no generic arguments there is no argument-driven dispatch,
+    /// so `Instance::resolve` on a foreign def resolves to that foreign body, and a foreign body
+    /// cannot name an item in the crate being compiled.
+    #[test]
+    fn frozen_ctfe_decline_empty_args_allows_a_foreign_const() {
+        let uv = uneval(foreign_def(), None);
+        assert!(uv.args.is_empty(), "fixture must exercise the EMPTY-args degeneracy");
+        assert!(
+            !super::frozen_ctfe_may_reach_local_body(uv),
+            "empty args must read as `no local mention` (any() over empty == false), not as \
+             `undecidable`"
+        );
+        // ... and locality still dominates, so "empty args" is never a blanket allow.
+        assert!(super::frozen_ctfe_may_reach_local_body(uneval(local_def(), None)));
+    }
+
+    /// The predicate keys on `def`, never on `promoted`. A promoted fragment belongs to the body
+    /// that promoted it, so its locality is already the `def`'s locality; testing `promoted`
+    /// would be a second, weaker proxy of exactly the kind this change removed.
+    #[test]
+    fn frozen_ctfe_decline_ignores_the_promoted_slot() {
+        let promoted = Some(mir::Promoted::from_u32(0));
+        assert!(!super::frozen_ctfe_may_reach_local_body(uneval(foreign_def(), promoted)));
+        assert!(super::frozen_ctfe_may_reach_local_body(uneval(local_def(), promoted)));
+    }
+
     fn mock_paired_condvar_certificate(
         session_seal: std::sync::Arc<()>,
         certificate_seal: std::sync::Arc<()>,
@@ -7831,7 +8551,9 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             }
 
             for (name, terminator) in synthetic_metadata_terminators() {
-                self.results.terminators.insert(name, convert_terminator(tcx, &terminator, None, None));
+                self.results
+                    .terminators
+                    .insert(name, convert_terminator(tcx, &terminator, None, None));
             }
 
             for item_id in tcx.hir_free_items() {
@@ -8511,9 +9233,12 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
     ) -> Option<Vec<Operand>> {
         body.basic_blocks.iter().find_map(|bb| {
             let terminator = bb.terminator();
-            let Terminator::Call { args, .. } =
-                convert_terminator(tcx, terminator, Some(&body.local_decls), Some(body.typing_env(tcx)))
-            else {
+            let Terminator::Call { args, .. } = convert_terminator(
+                tcx,
+                terminator,
+                Some(&body.local_decls),
+                Some(body.typing_env(tcx)),
+            ) else {
                 return None;
             };
             Some(args)
@@ -10604,9 +11329,26 @@ pub fn recv_mixed(a: Box<u128>, p: *mut u128, c: bool) -> u128 {
         ];
         args.push("--sysroot".to_string());
         args.push(compiler_sysroot());
-        if let Ok(backend) = std::env::var("RUSTC_CODEGEN_BACKEND") {
-            args.push(format!("-Zcodegen-backend={backend}"));
-        }
+        // Trust: PIN the dummy backend, as every sibling fixture in this file does
+        // (`-Zcodegen-backend=dummy`, e.g. convert.rs:8830). This was the only
+        // fixture that instead added a backend flag ONLY when
+        // `RUSTC_CODEGEN_BACKEND` happened to be set in the environment, so with
+        // that variable unset it asked for the default LLVM backend.
+        //
+        // That fails here and nowhere else because this test runs INSIDE the
+        // rustc_private test binary: the `librustc_driver` it links carries ZERO
+        // `rustc_codegen_llvm` symbols (the stage1 sysroot driver has 461), so
+        // `builtin_codegen_backend("llvm")` returns None and the loader falls
+        // through to `find_codegen_backend_in_sysroot`, which finds no
+        // `codegen-backends` folder under `build/` at all. All six
+        // `convert::tests::box_assert_*` then die on
+        // "failed to find a `codegen-backends` folder in the sysroot candidates"
+        // before reaching any assertion — the assert message they print is a red
+        // herring. Six occurrences in every extract log going back.
+        //
+        // `-Zno-codegen` above means no backend is ever invoked; the pin only has
+        // to name one that LOADS.
+        args.push("-Zcodegen-backend=dummy".to_string());
 
         let result =
             rustc_driver::catch_fatal_errors(|| -> rustc_interface::interface::Result<()> {

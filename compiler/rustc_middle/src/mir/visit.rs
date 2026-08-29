@@ -412,7 +412,10 @@ macro_rules! make_mir_visitor {
                 statement: & $($mutability)? Statement<'tcx>,
                 location: Location
             ) {
-                let Statement { source_info, kind, debuginfos } = statement;
+                // Trust: `trust_modular_arith` is a provenance flag, not a
+                // visitable MIR node — it carries no place, operand or type.
+                let Statement { source_info, kind, debuginfos, trust_modular_arith: _ } =
+                    statement;
 
                 self.visit_source_info(source_info);
                 for debuginfo in debuginfos as & $($mutability)? [_] {

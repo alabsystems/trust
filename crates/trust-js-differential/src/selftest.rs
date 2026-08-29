@@ -20,11 +20,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use trust_js_trace::{extract_trace, traces_equal, Completion, HostEvent, ObservableTrace};
+use trust_js_trace::{Completion, HostEvent, ObservableTrace, extract_trace, traces_equal};
 
 use crate::heads::{
-    last_sentinel_line, write_driver, AssembledCase, BunHead, EngineHead, HeadResult, NodeHead,
-    ProcessHead, RunMode,
+    AssembledCase, BunHead, EngineHead, HeadResult, NodeHead, ProcessHead, RunMode,
+    last_sentinel_line, write_driver,
 };
 
 pub struct SelftestOpts {
@@ -39,8 +39,10 @@ struct MiniCase {
     with_harness: bool,
 }
 
-const FIREWALL_BODY: &str = "console.log(Date.now(), Math.random(), Date.now(), new Date().getTime());\n'firewall';";
-const GETTER_BODY: &str = "const o = { get x() { throw new Error('boom'); } };\nconsole.log(o);\n'getter-not-invoked';";
+const FIREWALL_BODY: &str =
+    "console.log(Date.now(), Math.random(), Date.now(), new Date().getTime());\n'firewall';";
+const GETTER_BODY: &str =
+    "const o = { get x() { throw new Error('boom'); } };\nconsole.log(o);\n'getter-not-invoked';";
 
 const MINI_CASES: &[MiniCase] = &[
     MiniCase {
@@ -168,7 +170,9 @@ pub fn run_selftest(opts: &SelftestOpts) -> anyhow::Result<i32> {
                                 .to_string(),
                         );
                     } else {
-                        println!("  B stdout-bytes corruption (last sentinel wins) flagged UNEQUAL OK");
+                        println!(
+                            "  B stdout-bytes corruption (last sentinel wins) flagged UNEQUAL OK"
+                        );
                     }
                 }
                 Err(e) => failures.push(format!("leg B: forged stdout failed to parse: {e}")),
@@ -243,7 +247,8 @@ fn determinism_lines(
         if out.timed_out {
             return Err(format!("run {i}: timeout"));
         }
-        let line = last_sentinel_line(&out.stdout).ok_or_else(|| format!("run {i}: no sentinel"))?;
+        let line =
+            last_sentinel_line(&out.stdout).ok_or_else(|| format!("run {i}: no sentinel"))?;
         lines.push(line);
     }
     Ok(lines)

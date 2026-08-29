@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 
-use trust_js_regexp::{compile, CompileError, ExecError, Pattern};
+use trust_js_regexp::{CompileError, ExecError, Pattern, compile};
 
 // ---------------------------------------------------------------------------
 // Battery
@@ -161,7 +161,19 @@ const FAMILIES: &[(&str, &str, &[&str])] = &[
     // -- \d \s \w exact sets ----------------------------------------------
     ("\\d+", "", &["042", "٤٢", "４２"]), // ASCII only: arabic/fullwidth digits excluded
     ("\\D+", "", &["abc٤", "42"]),
-    ("\\s+", "", &[" \t\r\n\u{b}\u{c}", "\u{a0}\u{feff}", "\u{2028}\u{2029}", "\u{1680}", "\u{180e}", "\u{85}", "a"]),
+    (
+        "\\s+",
+        "",
+        &[
+            " \t\r\n\u{b}\u{c}",
+            "\u{a0}\u{feff}",
+            "\u{2028}\u{2029}",
+            "\u{1680}",
+            "\u{180e}",
+            "\u{85}",
+            "a",
+        ],
+    ),
     ("\\S+", "", &["\u{180e}\u{85}", " "]),
     ("\\w+", "", &["a_Z9", "é"]),
     ("\\W+", "", &["é!", "a"]),
@@ -381,13 +393,7 @@ fn battery() -> Vec<Triple> {
         (u16v("\\uDE00"), "u", vec![0xD83D, 0xDE00]),
     ];
     for (pattern, f, input) in lone_cases {
-        v.push(Triple {
-            pattern,
-            flags: f.to_string(),
-            input,
-            start: 0,
-            origin: "family",
-        });
+        v.push(Triple { pattern, flags: f.to_string(), input, start: 0, origin: "family" });
     }
     // Corpus-derived triples (best-effort test262 scrape), if generated.
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/corpus_triples.json");
@@ -396,11 +402,7 @@ fn battery() -> Vec<Triple> {
         for row in val.as_array().expect("corpus array") {
             let row = row.as_array().unwrap();
             let units = |v: &serde_json::Value| -> Vec<u16> {
-                v.as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|x| x.as_u64().unwrap() as u16)
-                    .collect()
+                v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u16).collect()
             };
             v.push(Triple {
                 pattern: units(&row[0]),
@@ -479,12 +481,14 @@ function runCase(p, f, inp, start) {
     js
 }
 
-fn run_node_chunk(node: &str, driver: &std::path::Path, chunk: &[&Triple], tag: usize) -> Vec<NodeOut> {
-    let dir = std::env::temp_dir().join(format!(
-        "trust-js-regexp-diff-{}-{}",
-        std::process::id(),
-        tag
-    ));
+fn run_node_chunk(
+    node: &str,
+    driver: &std::path::Path,
+    chunk: &[&Triple],
+    tag: usize,
+) -> Vec<NodeOut> {
+    let dir =
+        std::env::temp_dir().join(format!("trust-js-regexp-diff-{}-{}", std::process::id(), tag));
     std::fs::create_dir_all(&dir).unwrap();
     let js_path = dir.join("cases.js");
     std::fs::write(&js_path, gen_js(chunk)).unwrap();
@@ -496,8 +500,7 @@ fn run_node_chunk(node: &str, driver: &std::path::Path, chunk: &[&Triple], tag: 
         "kind": "script",
     });
     let mut f = std::fs::File::create(&manifest_path).unwrap();
-    f.write_all(serde_json::to_string(&manifest).unwrap().as_bytes())
-        .unwrap();
+    f.write_all(serde_json::to_string(&manifest).unwrap().as_bytes()).unwrap();
     drop(f);
 
     let out = Command::new(node)
@@ -549,26 +552,16 @@ fn parse_node_out(v: &serde_json::Value) -> NodeOut {
         if v.is_null() {
             None
         } else {
-            Some(
-                v.as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|x| x.as_u64().unwrap() as u16)
-                    .collect(),
-            )
+            Some(v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u16).collect())
         }
     };
-    let groups = r["a"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(&units)
-        .collect::<Vec<_>>();
+    let groups = r["a"].as_array().unwrap().iter().map(&units).collect::<Vec<_>>();
     let named = if r["g"].is_null() {
         None
     } else {
         Some(
-            r["g"].as_array()
+            r["g"]
+                .as_array()
                 .unwrap()
                 .iter()
                 .map(|pair| {
@@ -578,11 +571,7 @@ fn parse_node_out(v: &serde_json::Value) -> NodeOut {
                 .collect(),
         )
     };
-    NodeOut::Match {
-        index: r["i"].as_u64().unwrap() as usize,
-        groups,
-        named,
-    }
+    NodeOut::Match { index: r["i"].as_u64().unwrap() as usize, groups, named }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,11 +596,8 @@ fn run_ours(t: &Triple) -> OurOut {
         Err(CompileError::Unsupported(m)) => return OurOut::Refused(m),
     };
     let sticky = t.flags.contains('y');
-    let r = if sticky {
-        pat.exec_sticky_at(&t.input, t.start)
-    } else {
-        pat.exec_at(&t.input, t.start)
-    };
+    let r =
+        if sticky { pat.exec_sticky_at(&t.input, t.start) } else { pat.exec_at(&t.input, t.start) };
     match r {
         Err(ExecError::Budget) => OurOut::Refused("budget".into()),
         Err(ExecError::Unsupported(m)) => OurOut::Refused(m),
@@ -640,11 +626,7 @@ fn run_ours(t: &Triple) -> OurOut {
                 }
                 Some(named)
             };
-            OurOut::Match {
-                index: m.index,
-                groups,
-                named,
-            }
+            OurOut::Match { index: m.index, groups, named }
         }
     }
 }
@@ -674,11 +656,7 @@ fn differential_against_node() {
         .expect("trace driver path");
 
     let triples = battery();
-    assert!(
-        triples.len() >= 800,
-        "battery too small: {} triples",
-        triples.len()
-    );
+    assert!(triples.len() >= 800, "battery too small: {} triples", triples.len());
 
     let mut node_outs: Vec<NodeOut> = Vec::new();
     let refs: Vec<&Triple> = triples.iter().collect();
@@ -742,11 +720,7 @@ fn differential_against_node() {
     for d in disagreements.iter().take(40) {
         eprintln!("  DISAGREEMENT: {d}");
     }
-    assert!(
-        disagreements.is_empty(),
-        "{} differential disagreements",
-        disagreements.len()
-    );
+    assert!(disagreements.is_empty(), "{} differential disagreements", disagreements.len());
 }
 
 fn named_eq(

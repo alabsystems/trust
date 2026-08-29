@@ -127,6 +127,7 @@ required_set() {
 2|targo-trust|bin|run `targo trust` — the verifier frontend|tool.rs:801 install_bin(targo-trust)|tools
 2|trustd|bin|start the coordination daemon `targo trust` spawns on demand|tool.rs:807 install_bin(trustd), unconditional inside the targo-trust block, same-sysroot by design|alias
 2|trustdoc|bin|build documentation|tool.rs:929 bins.push(("rustdoc_tool_binary","trustdoc")); gate tool_enabled_for_tool_settings(...,"trustdoc")|tools
+2|rustdoc|bin|run doctests at all — cargo spawns a binary named `rustdoc` for its doctest phase, and rustup's proxy refuses a linked toolchain without it|tool.rs:1676 rustdoc_sysroot_bins installs both names at every stage >= 1 ((rustdoc,[trustdoc]) at stage1, (trustdoc,[rustdoc]) at stage2+); 76d408e1cd; dist.rs:98 trustdoc_dist_bin_names ships the same pair|alias
 2|trustfmt|bin|format sources|tool.rs:999 bins.push(("rustfmt","trustfmt"))|tools
 2|targo-fmt|bin|run `targo fmt`|tool.rs:990 bins.push(("cargo-fmt","targo-fmt"))|tools
 2|tippy|bin|lint|tool.rs:971 bins.push(("cargo-clippy","tippy"))|tools
@@ -148,6 +149,13 @@ source_manifest_for() {
     esac
 }
 
+# `rustdoc` above is an ALIAS, not a second tool: it is the same artifact as
+# `trustdoc`, and the SAME-SURFACE ALIASES section below proves that byte for
+# byte. It was on the forbidden list until 76d408e1cd made bootstrap emit it
+# into every stage >= 1 sysroot; a complete root that still lacked it broke
+# `cargo +trust test` at its doctest phase, so absence is now the failure and
+# presence is the contract.
+#
 # Deliberately NOT required: trust-miri / targo-miri. They are the only entries
 # built through extended_rustc_tool_is_default_step_for_tool_settings with
 # stable=false (tool.rs:1004-1021), and bootstrap.toml's tools list does not
@@ -502,7 +510,7 @@ fi
 
 if [ "$CHECK_ALIASES" = 1 ]; then
     printf '\nSAME-SURFACE ALIASES\n'
-    for pair in 'trustc rustc' 'targo cargo'; do
+    for pair in 'trustc rustc' 'targo cargo' 'trustdoc rustdoc'; do
         # shellcheck disable=SC2086
         set -- $pair
         if err=$(trust_toolchain_alias_pair_error "$BIN_DIR" "$1" "$2"); then
@@ -514,6 +522,11 @@ if [ "$CHECK_ALIASES" = 1 ]; then
     done
 fi
 
+# The forbidden inventory covers stock/retired entrypoints only. The three
+# admitted compatibility names (rustc, cargo, rustdoc) are not on it because
+# absence is the wrong test for them — they are REQUIRED above and their
+# identity is proven by the byte-identity check immediately above this one, so a
+# stock binary wearing one of those names still fails.
 if [ "$CHECK_FORBIDDEN" = 1 ]; then
     printf '\nFORBIDDEN STOCK / RETIRED NAMES\n'
     if err=$(trust_toolchain_forbidden_entry_error "$BIN_DIR"); then

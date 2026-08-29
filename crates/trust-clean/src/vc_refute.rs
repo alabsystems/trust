@@ -14,7 +14,8 @@
 // producer (Farkas combinations) generalizes.
 
 use clean_kernel::{
-    BinderData, BinderInfo, Declaration, Environment, Expr, Level, LevelVec, Name, TypeChecker,
+    BinderData, BinderInfo, Declaration, Environment, Expr, ExprKind, Level, LevelVec, Name,
+    TypeChecker,
 };
 
 fn cst(s: &str) -> Expr {
@@ -1003,8 +1004,299 @@ fn abstract_opaque_int(f: &Formula) -> Formula {
     go(f, &mut HashMap::new())
 }
 
+/// Trust: LITERAL FOLD + CONJUNCT DEDUPE (2026-08-24).
+///
+/// Fold literal-vs-literal comparisons (`Ge(8, 0)` → `true`) and drop duplicate or
+/// trivially-true conjuncts from an `And`. Both rewrites are SOUND and COMPLETE —
+/// `8 >= 0` IS `true`, a repeated hypothesis adds nothing, and neither direction
+/// loses information — so this can only make the search cheaper, never stronger in
+/// a way that could mint a verdict.
+///
+/// WHY IT MATTERS, measured: adjudicating the undischarged obligations with a
+/// complete solver found 18 that are UNSAT — genuinely TRUE obligations the
+/// refutation fragment missed. Their formulas are long conjunctions of range bounds
+/// carrying exactly this noise: `Ge(8, 0)` literal comparisons and the same bound
+/// (`Ge(src, 0)`) repeated. The search prices its fuel by carried-term size and runs
+/// an O(n²) propositional clash loop, so noise conjuncts cost real budget.
+///
+/// It runs inside `preprocess_vc`, so the REWRITTEN formula is what everything
+/// downstream sees — `ground_formula_prop`'s hypothesis type and `build_false`'s
+/// `and_projection` indices are derived from the same term and cannot desync.
+fn fold_literals_and_dedupe(f: &Formula) -> Formula {
+    use trust_types::Formula as F;
+    // Trust: REFLEXIVITY AND STRICT INCREMENT (2026-08-24).
+    //
+    // `x <= x` and `x = x` are TRUE, `x < x` is FALSE, and for a literal `k`,
+    // `x < x + k` is true exactly when `k > 0` (`x <= x + k` when `k >= 0`). These
+    // hold over the Int carrier unconditionally -- the model is mathematical `Int`,
+    // not a wrapping machine word, so there is no overflow caveat.
+    //
+    // CAUTION, and why the rule set is this small: unlike a bound DERIVATION (whose
+    // proof term the kernel re-checks), a formula rewrite is TRUSTED -- the kernel
+    // validates the proof of the REWRITTEN statement, so an unsound rewrite would not
+    // be caught here. Only unambiguous equivalences belong in this function.
+    //
+    // Motivated by measurement: two of the four gaps surviving the literal fold are
+    // `NOT(AND[base <= base & base < base + 8])`, whose inner conjunction is
+    // therefore TRUE and whose negation is FALSE.
+    fn same_term(a: &F, b: &F) -> bool {
+        a == b
+    }
+    fn refl_or_increment(f: &F) -> Option<bool> {
+        let (op, a, b) = match f {
+            F::Le(a, b) => ("le", a, b),
+            F::Lt(a, b) => ("lt", a, b),
+            F::Ge(a, b) => ("ge", a, b),
+            F::Gt(a, b) => ("gt", a, b),
+            F::Eq(a, b) => ("eq", a, b),
+            _ => return None,
+        };
+        if same_term(a, b) {
+            return Some(matches!(op, "le" | "ge" | "eq"));
+        }
+        // `x <op> x + k` / `x + k <op> x` for a literal k.
+        let offset = |lhs: &F, rhs: &F| -> Option<i128> {
+            if let F::Add(base, k) = rhs
+                && let F::Int(k) = &**k
+                && same_term(lhs, base)
+            {
+                return Some(*k);
+            }
+            None
+        };
+        if let Some(k) = offset(a, b) {
+            return Some(match op {
+                "lt" => k > 0,
+                "le" => k >= 0,
+                "gt" => false,
+                "ge" => k <= 0,
+                _ => k == 0,
+            });
+        }
+        if let Some(k) = offset(b, a) {
+            return Some(match op {
+                "gt" => k > 0,
+                "ge" => k >= 0,
+                "lt" => false,
+                "le" => k <= 0,
+                _ => k == 0,
+            });
+        }
+        None
+    }
+    /// Trust: CONSTANT ARITHMETIC FOLD (2026-08-25) — evaluate a variable-free integer
+    /// term to its literal value.
+    ///
+    /// `lit_cmp` below decides only `Int ⋈ Int`, so a comparison whose sides are
+    /// variable-free ARITHMETIC (`16 + 16 <= 255`) was left undecided. That shape is
+    /// exactly what the definitional-substitution fallback PRODUCES: substituting
+    /// `_3 = 16` and `_6 = 16` into `_3 + _6 <= 255` yields constant arithmetic, and
+    /// without this the fallback stops one step short of a decision.
+    ///
+    /// SOUND OVER THE MODEL. The carrier is mathematical `Int`, not a wrapping machine
+    /// word (the same premise the reflexivity rules above rely on), so `a + b` really is
+    /// the mathematical sum. Every operation is CHECKED and returns `None` on i128
+    /// overflow, and division/remainder return `None` on a zero divisor, so a term this
+    /// cannot evaluate exactly is left alone rather than approximated. Division
+    /// truncates toward zero, matching `Int.div`'s Rust semantics.
+    fn const_int(f: &F) -> Option<i128> {
+        match f {
+            F::Int(k) => Some(*k),
+            F::Neg(a) => const_int(a)?.checked_neg(),
+            F::Add(a, b) => const_int(a)?.checked_add(const_int(b)?),
+            F::Sub(a, b) => const_int(a)?.checked_sub(const_int(b)?),
+            F::Mul(a, b) => const_int(a)?.checked_mul(const_int(b)?),
+            F::Div(a, b) => const_int(a)?.checked_div(const_int(b)?),
+            F::Rem(a, b) => const_int(a)?.checked_rem(const_int(b)?),
+            _ => None,
+        }
+    }
+    fn lit_cmp(f: &F) -> Option<bool> {
+        // Constant-fold both sides first, so a variable-free arithmetic comparison is
+        // decided here rather than surviving as an opaque atom.
+        if let Some(decided) = match f {
+            F::Ge(a, b) => Some((const_int(a), const_int(b), "ge")),
+            F::Le(a, b) => Some((const_int(a), const_int(b), "le")),
+            F::Gt(a, b) => Some((const_int(a), const_int(b), "gt")),
+            F::Lt(a, b) => Some((const_int(a), const_int(b), "lt")),
+            F::Eq(a, b) => Some((const_int(a), const_int(b), "eq")),
+            _ => None,
+        }
+        .and_then(|(x, y, op)| {
+            let (x, y) = (x?, y?);
+            Some(match op {
+                "ge" => x >= y,
+                "le" => x <= y,
+                "gt" => x > y,
+                "lt" => x < y,
+                _ => x == y,
+            })
+        }) {
+            return Some(decided);
+        }
+        if let Some(b) = refl_or_increment(f) {
+            return Some(b);
+        }
+        match f {
+            F::Ge(a, b) => match (&**a, &**b) {
+                (F::Int(x), F::Int(y)) => Some(x >= y),
+                _ => None,
+            },
+            F::Le(a, b) => match (&**a, &**b) {
+                (F::Int(x), F::Int(y)) => Some(x <= y),
+                _ => None,
+            },
+            F::Gt(a, b) => match (&**a, &**b) {
+                (F::Int(x), F::Int(y)) => Some(x > y),
+                _ => None,
+            },
+            F::Lt(a, b) => match (&**a, &**b) {
+                (F::Int(x), F::Int(y)) => Some(x < y),
+                _ => None,
+            },
+            F::Eq(a, b) => match (&**a, &**b) {
+                (F::Int(x), F::Int(y)) => Some(x == y),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    match f {
+        _ if lit_cmp(f).is_some() => F::Bool(lit_cmp(f).unwrap_or(false)),
+        // Trust: PUSH THROUGH `Not` (2026-08-24). A violation spelled
+        // `Not(0 = 0)` is literally FALSE, and folding it exposes that to the
+        // `Bool(false)` hypothesis rule — which proves `False` outright — instead of
+        // leaving an opaque `Not` atom the linear engine cannot read. One of the six
+        // gaps left after the literal-bound fix is exactly this shape.
+        F::Not(inner) => match fold_literals_and_dedupe(inner) {
+            F::Bool(b) => F::Bool(!b),
+            // The `And` fold keeps an `And([Bool(true)])` wrapper for an emptied
+            // conjunction (so the TOP-level shape stays stable). Under a `Not` that
+            // wrapper hides a decided value, so see through it: an all-true
+            // conjunction IS `true`, and its negation is `false`.
+            F::And(ref cs) if !cs.is_empty() && cs.iter().all(|c| matches!(c, F::Bool(true))) => {
+                F::Bool(false)
+            }
+            folded => F::Not(Box::new(folded)),
+        },
+        F::And(cs) => {
+            let mut out: Vec<F> = Vec::with_capacity(cs.len());
+            for c in cs {
+                let c = fold_literals_and_dedupe(c);
+                match &c {
+                    // A `false` conjunct makes the whole conjunction false; keep it,
+                    // it is the strongest hypothesis there is.
+                    F::Bool(false) => return F::Bool(false),
+                    // `true` adds nothing.
+                    F::Bool(true) => continue,
+                    _ => {}
+                }
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+            // An empty conjunction is `true`; preserve the `And` wrapper so the
+            // downstream shape is unchanged for a single surviving conjunct.
+            if out.is_empty() { F::And(vec![F::Bool(true)]) } else { F::And(out) }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Trust: DEFINITIONAL SUBSTITUTION (2026-08-25) — propagate `t = <literal or term>`
+/// conjuncts into the rest of the conjunction so the literal fold can decide what they
+/// make decidable.
+///
+/// FOUND BY READING THE COMPILER'S OWN CONTRACT SUGGESTIONS. Three of the four
+/// obligations it offered a contract for were, once their definitional equalities were
+/// substituted, LITERALLY FALSE — `adler2::Adler32::from_checksum` reduces to a
+/// conjunction containing `!(16 < 32)`, `core::intrinsics::rotate_right` to one
+/// containing `!(0 == 0)`. Both are refuted instantly by the existing fold
+/// (`a_literally_false_violation_condition_is_refuted` pins that). They stayed
+/// undischarged only because the refuter never propagated `_3 = 16` into `!(_3 < 32)`.
+///
+/// SOUNDNESS. `preprocess_vc` rewrites are TRUSTED — the kernel validates the proof of
+/// the REWRITTEN statement — so only unambiguous equivalences belong here. This one
+/// keeps the defining equality and rewrites only the OTHER conjuncts, which is exactly
+/// the equivalence `(t = e) ∧ P(t) ≡ (t = e) ∧ P(e)`. Nothing is dropped, so it is an
+/// equivalence in both directions and not a projection.
+///
+/// FAIL-CLOSED. The `Formula` match below is not exhaustive over every variant, so a
+/// substitution could silently miss an occurrence — harmless here, because the equality
+/// is RETAINED (an un-substituted occurrence just stays un-decided). Self-referential
+/// equalities (`t = t + 1`) are rejected by the occurrence check on the right-hand side.
+fn substitute_definitional_equalities(f: &Formula) -> Formula {
+    use trust_types::Formula as F;
+
+    fn mentions(f: &F, name: &str) -> bool {
+        fn walk(v: &serde_json::Value, name: &str) -> bool {
+            match v {
+                serde_json::Value::String(s) => s == name,
+                serde_json::Value::Array(a) => a.iter().any(|x| walk(x, name)),
+                serde_json::Value::Object(o) => o.values().any(|x| walk(x, name)),
+                _ => false,
+            }
+        }
+        serde_json::to_value(f).map(|v| walk(&v, name)).unwrap_or(true)
+    }
+
+    fn subst(f: &F, name: &str, val: &F) -> F {
+        let go = |x: &F| Box::new(subst(x, name, val));
+        match f {
+            F::Var(n, _) if n == name => val.clone(),
+            F::And(cs) => F::And(cs.iter().map(|c| subst(c, name, val)).collect()),
+            F::Or(cs) => F::Or(cs.iter().map(|c| subst(c, name, val)).collect()),
+            F::Not(a) => F::Not(go(a)),
+            F::Implies(a, b) => F::Implies(go(a), go(b)),
+            F::Le(a, b) => F::Le(go(a), go(b)),
+            F::Lt(a, b) => F::Lt(go(a), go(b)),
+            F::Ge(a, b) => F::Ge(go(a), go(b)),
+            F::Gt(a, b) => F::Gt(go(a), go(b)),
+            F::Eq(a, b) => F::Eq(go(a), go(b)),
+            F::Add(a, b) => F::Add(go(a), go(b)),
+            F::Sub(a, b) => F::Sub(go(a), go(b)),
+            F::Mul(a, b) => F::Mul(go(a), go(b)),
+            F::Div(a, b) => F::Div(go(a), go(b)),
+            F::Rem(a, b) => F::Rem(go(a), go(b)),
+            F::Neg(a) => F::Neg(go(a)),
+            other => other.clone(),
+        }
+    }
+
+    let F::And(cs) = f else { return f.clone() };
+    let mut parts: Vec<F> = cs.clone();
+    // Bounded, and each round propagates one definition.
+    for _ in 0..parts.len().min(32) {
+        let mut applied = false;
+        for i in 0..parts.len() {
+            let (name, value) = match &parts[i] {
+                F::Eq(a, b) => match (a.as_ref(), b.as_ref()) {
+                    (F::Var(n, _), rhs) if !mentions(rhs, n) => (n.clone(), rhs.clone()),
+                    (lhs, F::Var(n, _)) if !mentions(lhs, n) => (n.clone(), lhs.clone()),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let next: Vec<F> = parts
+                .iter()
+                .enumerate()
+                .map(|(j, c)| if j == i { c.clone() } else { subst(c, &name, &value) })
+                .collect();
+            if next != parts {
+                parts = next;
+                applied = true;
+                break;
+            }
+        }
+        if !applied {
+            break;
+        }
+    }
+    F::And(parts)
+}
+
 fn preprocess_vc(formula: &Formula) -> Formula {
-    let formula = &abstract_opaque_int(formula);
+    let formula = &fold_literals_and_dedupe(&abstract_opaque_int(formula));
     if has_ite(formula) {
         // Clamp VC: deep aux-inline reaches the def chains buried in `Or` arms,
         // in-place BV abstraction reaches nested overflow checks, and `lift_ite`
@@ -1045,7 +1337,69 @@ pub fn refute_vc(formula: &Formula) -> Option<(Expr, Expr)> {
 /// recurse into their named Int fields (and the bare aggregate is dropped) via
 /// [`collect_int_vars`]. With an EMPTY [`StructParams`] this is identical to
 /// `refute_vc`, so the non-struct path is byte-for-byte unchanged.
+/// Trust: DIAGNOSTIC LOG PATHS ARE READ ONCE (2026-08-24).
+///
+/// The diagnostic lanes added today are env-var gated, and the naive spelling
+/// (`std::env::var(..)` at the site) allocates a `String` and touches the process
+/// environment on EVERY verification condition — in the compiler's own path, not
+/// just under a census. Caching per process makes the default (unset) case a single
+/// atomic load and no allocation.
+///
+/// Reading the variable once is also the correct semantics for a diagnostic sink: a
+/// log that changed destination midway through a run would be worse than useless.
+pub(crate) fn cached_diag_path(
+    cell: &'static std::sync::OnceLock<Option<std::path::PathBuf>>,
+    var: &str,
+) -> Option<&'static std::path::Path> {
+    cell.get_or_init(|| std::env::var_os(var).map(std::path::PathBuf::from)).as_deref()
+}
+
+/// Trust: REFUTE DECLINE REASON (2026-08-24) — diagnostic only.
+///
+/// `refute_vc_with` returning `None` is how a safety obligation stays
+/// undischarged, and the census reports only the count. This records WHICH stage
+/// refused, appending to the file named by `TRUST_REFUTE_DECLINE_LOG`. Never
+/// changes a verdict.
+///
+/// The distinction that matters and that this CANNOT make on its own:
+/// `no-contradiction-found` covers both an engine gap AND the honest case where
+/// the obligation is genuinely satisfiable (the code really can overflow). Reading
+/// the whole bucket as "missing capability" would overstate the headroom.
+fn note_refute_decline(reason: &'static str) {
+    static REFUTE_DECLINE_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        if let Some(path) = cached_diag_path(&REFUTE_DECLINE_LOG, "TRUST_REFUTE_DECLINE_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{reason}");
+        }
+    }
+}
+
 pub(crate) fn refute_vc_with(formula: &Formula, params: &StructParams) -> Option<(Expr, Expr)> {
+    // Trust: DEFINITIONAL-SUBSTITUTION FALLBACK (2026-08-25). The unchanged pipeline
+    // runs FIRST and its result is returned whenever it succeeds, so this can only ADD
+    // refutations, never lose one.
+    //
+    // That ordering is not caution for its own sake — it is measured. Substituting
+    // definitional equalities INSIDE `preprocess_vc` cost five `whole_program` proofs
+    // (`crate::left` and `crate::right` fell from Certified to Trusted): the rewrite is
+    // logically sound, but it reshapes terms like `Add(d, k)` into `Add(d, 1)` and the
+    // linear engine's atom matching no longer lines up. A strictly-additive retry keeps
+    // the gain without the loss.
+    if let Some(found) = refute_vc_inner(formula, params) {
+        return Some(found);
+    }
+    let substituted = substitute_definitional_equalities(formula);
+    if substituted == *formula {
+        return None;
+    }
+    refute_vc_inner(&substituted, params)
+}
+
+/// The unchanged refutation pipeline — see [`refute_vc_with`] for the retry that wraps
+/// it.
+fn refute_vc_inner(formula: &Formula, params: &StructParams) -> Option<(Expr, Expr)> {
     // Phase 1 — canonicalize registered struct-field names (`p.0` → `p.x`) so the
     // index-named rvalue fields unify with the named spec/precondition fields, then
     // run the unchanged pipeline. With an empty `params` this is a no-op.
@@ -1054,6 +1408,7 @@ pub(crate) fn refute_vc_with(formula: &Formula, params: &StructParams) -> Option
     let formula = &normalized;
     let (mut vars, mut seen) = (Vec::new(), HashSet::new());
     if !collect_int_vars(formula, &mut vars, &mut seen, params) {
+        note_refute_decline("carrier-outside-the-int-fragment");
         return None;
     }
     let mut atoms = Vec::new();
@@ -1067,10 +1422,40 @@ pub(crate) fn refute_vc_with(formula: &Formula, params: &StructParams) -> Option
         .enumerate()
         .map(|(idx, (v, _))| (v.clone(), Expr::bvar(n - 1 - idx as u32)))
         .collect();
-    let conj_ty = ground_formula_prop(formula, &type_map)?;
+    let Some(conj_ty) = ground_formula_prop(formula, &type_map) else {
+        note_refute_decline("formula-not-groundable-as-a-kernel-Prop");
+        return None;
+    };
 
     // The proof of False under λvars λh (extra-binder depth 0).
-    let false_pf = build_false(&atoms, &vars, n, 0)?;
+    let Some(false_pf) = build_false(&atoms, &vars, n, 0) else {
+        // The hypotheses were grounded but no contradiction was found. That is
+        // EITHER an engine gap OR the honest answer: the obligation may simply be
+        // satisfiable, i.e. the code really can overflow / index out of bounds.
+        // The two are not distinguished here.
+        note_refute_decline("no-contradiction-found-among-the-hypotheses");
+        // Trust: THE SPLIT THAT MATTERS (2026-08-24). This bucket mixes an ENGINE
+        // GAP with the honest case where the obligation is genuinely SATISFIABLE.
+        // `trust-clean` cannot adjudicate that — it depends on neither `ay` nor
+        // `trust-router` — so the FORMULA is logged here and a complete solver
+        // decides SAT/UNSAT on the other side (`trust-router`). Diagnostic only.
+        static UNDISCHARGED_VC_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        if let Some(path) = cached_diag_path(&UNDISCHARGED_VC_LOG, "TRUST_UNDISCHARGED_VC_LOG") {
+            use std::io::Write;
+            // Log the PRE-preprocess formula alongside the post one. A logged
+            // hypothesis set that is nothing but range facts has no negated goal in
+            // it, and is therefore unprovable by construction — this pair says
+            // whether preprocessing dropped the goal or it never arrived.
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+                && let (Ok(post), Ok(pre)) =
+                    (serde_json::to_string(formula), serde_json::to_string(&canonicalized))
+            {
+                let _ = writeln!(f, "{{\"pre\":{pre},\"post\":{post}}}");
+            }
+        }
+        return None;
+    };
 
     let mut proof = Expr::lam(bd(), conj_ty.clone(), false_pf);
     let mut ty = Expr::pi(bd(), conj_ty, cst("False"));
@@ -1542,8 +1927,16 @@ fn operand_upper(
     hyps: &[Hyp],
     map: &HashMap<String, Expr>,
 ) -> Option<(Expr, Formula, Expr)> {
-    if matches!(t, Formula::Int(_)) {
-        return None;
+    // Trust: A LITERAL IS ITS OWN BOUND (2026-08-24). This arm used to decline,
+    // on the recorded ground that a literal operand "would force the kernel to fold
+    // `Int.sub (ofNat a)(ofNat b)` at a lemma-argument position, which it does not".
+    // MEASURED against the shipping kernel (`literal_int_sub_reduction_behaviour_is_
+    // what_the_comment_claims`): it DOES — `Int.sub 47 255` is def-eq to `-208` both
+    // bare and under `Int.le` at exactly that position. The comment was stale.
+    if let Formula::Int(_) = t {
+        let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
+        let g = ground_int(t, map)?;
+        return Some((g.clone(), t.clone(), Expr::app(cst("Int.le_refl"), g)));
     }
     let h = hyps.iter().find(|h| &h.lo == t && !h.strict && matches!(h.hi, Formula::Int(_)))?;
     Some((ground_int(&h.hi, map)?, h.hi.clone(), h.proof.clone()))
@@ -1557,8 +1950,12 @@ fn operand_lower(
     hyps: &[Hyp],
     map: &HashMap<String, Expr>,
 ) -> Option<(Expr, Formula, Expr)> {
-    if matches!(t, Formula::Int(_)) {
-        return None;
+    // Trust: A LITERAL IS ITS OWN BOUND — see `operand_upper` for the measurement
+    // that retired the stale "literal-arg reduction trap" note.
+    if let Formula::Int(_) = t {
+        let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
+        let g = ground_int(t, map)?;
+        return Some((g.clone(), t.clone(), Expr::app(cst("Int.le_refl"), g)));
     }
     let h = hyps.iter().find(|h| &h.hi == t && !h.strict && matches!(h.lo, Formula::Int(_)))?;
     Some((ground_int(&h.lo, map)?, h.lo.clone(), h.proof.clone()))
@@ -2388,7 +2785,43 @@ struct Prop {
 /// nest only a handful of disjunctions; allowing an unbounded Cartesian
 /// expansion made one large body consume a worker indefinitely. Exhaustion is
 /// fail-closed (`None`), leaving the obligation for another verifier lane.
-const REFUTE_SEARCH_FUEL: usize = 16_384;
+/// Work budget for the refutation search, priced in PROOF-TERM NODES.
+///
+/// CALIBRATED, not guessed. With the budget effectively removed, a full corpus run
+/// recorded what every refutation actually spent (`TRUST_REFUTE_FUEL_LOG`). Of 543
+/// SUCCESSFUL refutations: p50 = 5_749, p90 = 235_739, p99 = 1_156_189, and all but
+/// THREE cost at most 4_186_491. The three outliers cost 39M, 124M and 711M — the
+/// bodies that do not terminate in any practical time.
+///
+/// 8M sits above the 540th of 543 with ~2x margin and below the outliers by ~5x.
+///
+/// Exhaustion declines fail-closed (falls through to AY), so raising this can only
+/// add coverage and lowering it can only remove it; it can never mint a verdict.
+const REFUTE_SEARCH_FUEL: usize = 8_000_000;
+
+/// Heartbeat budget for the kernel re-check of a reconstructed refutation.
+///
+/// CALIBRATED, not guessed. A full corpus census at **1_000_000** heartbeats
+/// reproduced `fully_faithful` 1156 exactly, `KERNEL_REJECTED` 0, and — unlike the
+/// unlimited baseline — **zero** timed-out directories. A million already covers
+/// everything the corpus demands; this is 4x that, for margin.
+///
+/// A higher limit is strictly more permissive (it allows a superset of the checks
+/// that succeed at a lower one), so 4x needs no separate census: coverage at 4M is
+/// bounded below by the measured 1156 and above by the unlimited baseline's 1156.
+///
+/// Exhaustion declines fail-closed (falls through to AY), so raising this can only
+/// add coverage and lowering it can only remove it. It can never mint a verdict.
+const KERNEL_RECHECK_HEARTBEATS: u32 = 4_000_000;
+
+/// Cap on the per-check type-checker memo cache during a refutation re-check.
+///
+/// The cache holds `Expr` results keyed per reduction/inference query. On a large
+/// proof it is where the memory actually goes — measured at multiple GB on one real
+/// body, which is what made a parallel census OOM the machine. Bounding it is sound
+/// by the kernel's own contract: a smaller cache only changes what is memoized, so
+/// it can cost recomputation but can never accept an unequal pair.
+const KERNEL_RECHECK_MAX_CACHE_ENTRIES: usize = 200_000;
 
 /// Lift every carried prop proof by `amount` loose-bvar levels — applied when the
 /// engine descends under a fresh `Or.rec` binder so the existing props stay valid
@@ -2434,7 +2867,20 @@ fn build_false(atoms: &[Formula], vars: &[(String, bool)], n: u32, depth: u32) -
         props.push(Prop { formula: a.clone(), proof: and_projection(atoms, i, &h, &map)? });
     }
     let mut fuel = REFUTE_SEARCH_FUEL;
-    refute_props(props, vars, n, depth, &mut fuel)
+    let out = refute_props(props, vars, n, depth, &mut fuel);
+    // Trust: CALIBRATION LANE (2026-08-24). Records what each refutation actually
+    // spent, so `REFUTE_SEARCH_FUEL` is set from the measured distribution of
+    // SUCCESSFUL proofs rather than guessed.
+    static REFUTE_FUEL_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        if let Some(path) = cached_diag_path(&REFUTE_FUEL_LOG, "TRUST_REFUTE_FUEL_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let spent = REFUTE_SEARCH_FUEL.saturating_sub(fuel);
+            let _ = writeln!(f, "{}\t{}", spent, if out.is_some() { "ok" } else { "none" });
+        }
+    }
+    out
 }
 
 /// The recursive refutation core. Given `props` (hypotheses with explicit proofs,
@@ -2453,7 +2899,25 @@ fn refute_props(
     depth: u32,
     fuel: &mut usize,
 ) -> Option<Expr> {
-    *fuel = fuel.checked_sub(1)?;
+    // Trust: CHARGE FOR WORK, NOT FOR CALLS (2026-08-23).
+    //
+    // This used to deduct exactly 1 per call, which bounds the number of
+    // `refute_props` invocations but NOT the work they do — and the work per call
+    // is not constant. Every `Or.rec` descent runs `lift_props`, which clones and
+    // lifts EVERY carried proof term one binder deeper, so both the prop count and
+    // the term sizes grow as the split nests. Measured on
+    // `ident_case::RenameRule::apply_to_field` (38 blocks, 5 SwitchInts): fuel 512
+    // finished in 22 s, fuel 2048 in 60 s, and the shipped fuel of 16384 did not
+    // finish in 1800 s. A call budget cannot bound a superlinear cost.
+    //
+    // Charging `props.len()` bounds the number of prop-lift operations, which IS
+    // the cost driver, so the total is bounded near-linearly in the fuel.
+    //
+    // Fail-closed in the only direction that matters: exhaustion returns `None`,
+    // which means "no refutation found here" and falls through to AY. It can lose
+    // coverage, never manufacture a verdict — so the gate on this change is that
+    // the corpus `fully_faithful` count must not move.
+    *fuel = fuel.checked_sub(props_lift_cost(&props))?;
     // Fail closed past a generous case-split depth — VCs needing deeper nesting
     // than this fall through to AY rather than overflowing the stack. (`depth`
     // counts both source `Or` arms and the binder each `Or.rec` introduces; real
@@ -2857,18 +3321,188 @@ pub(crate) fn check_refute_vc_diag_with(
     })
 }
 
+/// [`proof_dag_size`] with an early exit at `cap`.
+///
+/// Used to PRICE work, where an exact count is not needed and an unbounded count
+/// would itself become the cost it is trying to bound.
+fn proof_dag_size_capped(root: &Expr, cap: usize) -> usize {
+    let mut seen: std::collections::HashSet<*const Expr> = std::collections::HashSet::new();
+    let mut stack: Vec<&Expr> = vec![root];
+    let mut nodes = 0usize;
+    while let Some(e) = stack.pop() {
+        if nodes >= cap {
+            return cap;
+        }
+        if !seen.insert(e as *const Expr) {
+            continue;
+        }
+        nodes += 1;
+        match e.kind() {
+            ExprKind::App(f, a) => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprKind::Lam(_, t, b) | ExprKind::Pi(_, t, b) => {
+                stack.push(t);
+                stack.push(b);
+            }
+            ExprKind::Let(_, t, v, b, _) => {
+                stack.push(t);
+                stack.push(v);
+                stack.push(b);
+            }
+            ExprKind::Proj(_, _, x) | ExprKind::MData(_, x) | ExprKind::Squash(x) => stack.push(x),
+            _ => {}
+        }
+    }
+    nodes
+}
+
+/// What it costs to carry `props` one binder deeper.
+///
+/// `lift_props` clones every carried prop and lifts its whole proof TERM, so the
+/// real cost — in both time and RETAINED MEMORY — is the sum of the term sizes,
+/// not the number of props. Pricing by count under-charges without bound exactly
+/// when the terms are large, which is the case that runs the machine out of memory.
+///
+/// Each prop is capped so that pricing stays cheap relative to the lift it prices.
+fn props_lift_cost(props: &[Prop]) -> usize {
+    const PER_PROP_CAP: usize = 4_096;
+    props.iter().map(|p| proof_dag_size_capped(&p.proof, PER_PROP_CAP)).sum::<usize>().max(1)
+}
+
+/// Sharing-aware node count of a kernel term.
+///
+/// `Expr` children are `Arc`, so a proof term is a DAG, not a tree — a naive
+/// traversal double-counts shared subterms and can be exponentially wrong about how
+/// big the thing actually is. This counts DISTINCT allocations.
+///
+/// Iterative on purpose: the terms this measures are exactly the ones whose depth is
+/// under suspicion, so a recursive size function could overflow the stack while
+/// measuring a term that overflows the stack.
+fn proof_dag_size(root: &Expr) -> usize {
+    let mut seen: std::collections::HashSet<*const Expr> = std::collections::HashSet::new();
+    let mut stack: Vec<&Expr> = vec![root];
+    let mut nodes = 0usize;
+    while let Some(e) = stack.pop() {
+        if !seen.insert(e as *const Expr) {
+            continue;
+        }
+        nodes += 1;
+        match e.kind() {
+            ExprKind::App(f, a) => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprKind::Lam(_, t, b) | ExprKind::Pi(_, t, b) => {
+                stack.push(t);
+                stack.push(b);
+            }
+            ExprKind::Let(_, t, v, b, _) => {
+                stack.push(t);
+                stack.push(v);
+                stack.push(b);
+            }
+            ExprKind::Proj(_, _, x) | ExprKind::MData(_, x) | ExprKind::Squash(x) => stack.push(x),
+            _ => {}
+        }
+    }
+    nodes
+}
+
 fn check_refute_vc_inner(formula: &Formula, params: &StructParams) -> Option<RefuteOutcome> {
+    check_refute_vc_inner_with_heartbeats(formula, params, KERNEL_RECHECK_HEARTBEATS)
+}
+
+/// [`check_refute_vc_inner`] with an explicit kernel heartbeat budget.
+///
+/// Split out so the budget is a PARAMETER rather than a hidden global: tests drive
+/// the exhaustion path deterministically with a tiny budget, and no environment
+/// variable is involved (a config-injectable knob here would be a knob that changes
+/// what the compiler claims, which this repo does not do).
+fn check_refute_vc_inner_with_heartbeats(
+    formula: &Formula,
+    params: &StructParams,
+    heartbeats: u32,
+) -> Option<RefuteOutcome> {
     let (proof, ty) = refute_vc_with(formula, params)?;
+    // Trust: MEASUREMENT LANE (2026-08-23). Appends the proof's DAG node count per
+    // kernel re-check when `TRUST_PROOF_SIZE_LOG` names a file. This exists because
+    // it produced a decisive NEGATIVE result: capping proof SIZE before the kernel
+    // re-check looks like the obvious cure for the non-terminating re-checks, and
+    // it is wrong. The body that motivated it
+    // (`<unicode_bom::Bom as From<&[u8]>>::from`) hands the kernel proofs of only
+    // ~110_000 nodes, while the curated corpus contains proofs up to 827_827 nodes
+    // that the kernel checks without trouble. Size does not predict cost.
+    static PROOF_SIZE_LOG: std::sync::OnceLock<Option<std::path::PathBuf>> =
+            std::sync::OnceLock::new();
+        if let Some(path) = cached_diag_path(&PROOF_SIZE_LOG, "TRUST_PROOF_SIZE_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", proof_dag_size(&proof));
+        }
+    }
     let mut env = match env_with_order_lemmas() {
         Ok(e) => e,
         Err(e) => return Some(RefuteOutcome::KernelRejected(e)),
     };
     {
-        let tc = TypeChecker::new(&env);
+        // Trust: BOUND THE KERNEL'S OWN WORK (2026-08-23).
+        //
+        // This checker used to run with the heartbeat DISABLED (`TypeChecker::new`
+        // defaults to 0 = unlimited), so a proof the search happily produced could
+        // take unbounded time to re-check. Measured on
+        // `<unicode_bom::Bom as From<&[u8]>>::from` (81 blocks, 176 locals):
+        // `check_type` did not return in 1200 s.
+        //
+        // The obvious alternative — cap the proof's TERM SIZE before handing it
+        // over — was tried and REFUTED by measurement: that body's proofs are ~110k
+        // nodes while the corpus contains proofs of 827_827 nodes the kernel checks
+        // without trouble (see `proof_dag_size`). Size does not predict cost; whnf /
+        // is_def_eq work does, which is exactly what a heartbeat counts.
+        let mut tc = TypeChecker::new(&env);
+        tc.set_heartbeat_limit(heartbeats);
+        tc.set_max_cache_entries(KERNEL_RECHECK_MAX_CACHE_ENTRIES);
         if let Err(e) = tc.check_type(&proof, &ty) {
+            // A budget stop is NOT a rejection. `KernelRejected` says the kernel
+            // examined this proof and refused it — a far stronger claim than "we
+            // stopped paying for the check", and `KERNEL_REJECTED` is a tracked
+            // invariant. Report exhaustion the way the search's own fuel exhaustion
+            // reports it: no refutation from this lane, fall through to AY.
+            //
+            // This is only trustworthy because the kernel now reports exhaustion AS
+            // exhaustion on this path. It previously surfaced as `NotAFunction`
+            // (whnf bails early and returns an under-reduced term), which would have
+            // been laundered into `KernelRejected` here. Fixed in clean's
+            // `tc/cert/infer_core.rs`; this consumer and that pin move together.
+            if matches!(e, clean_kernel::TypeError::HeartbeatExceeded { .. }) {
+                return None;
+            }
             return Some(RefuteOutcome::KernelRejected(format!("check_type: {e:?}")));
         }
     }
+    // Trust: THE SECOND KERNEL PASS WAS UNBOUNDED (2026-08-24) — this is the OOM.
+    //
+    // `add_decl` RE-TYPECHECKS the declaration with the Environment's own checker,
+    // which reads its limits from `env.options` and knew nothing about the budget
+    // set on `tc` above. So bounding `check_type` bounded only half the path, and
+    // the same enormous term was then checked again with no cap at all.
+    //
+    // Measured on `<unicode_bom::Bom as From<&[u8]>>::from`: 2.4 GB resident and
+    // climbing, with the profile in `Instantiator` and a hashbrown
+    // `HashMap<_, Option<Expr>>` — the per-check type-checker cache. Eight of those
+    // in parallel is what ran the machine out of memory.
+    //
+    // Both knobs are the kernel's own and both are documented sound: the heartbeat
+    // "is a RESOURCE bound, never a soundness gate", and bounding the cache "can
+    // only change which correct results are memoized — it can never accept an
+    // unequal pair".
+    env.set_option("maxHeartbeats".to_string(), Some(heartbeats.to_string()));
+    env.set_option(
+        "tcMaxCacheEntries".to_string(),
+        Some(KERNEL_RECHECK_MAX_CACHE_ENTRIES.to_string()),
+    );
+
     let name = Name::from_string("Trust.Safety.vc_refutation");
     if env
         .add_decl(Declaration::Definition {
@@ -3100,6 +3734,100 @@ mod tests {
     /// fixed point of `normalize_not`, so `preprocess_vc` on the non-Ite path is
     /// byte-identical to before this change. Reuses the exact shape of the
     /// pre-existing `guarded_subtraction_underflow_refuted_via_add_zero` control.
+    /// Trust: CONSTANT ARITHMETIC FOLD (2026-08-25) — pin the fold and its guards.
+    ///
+    /// It decides comparisons outright, so a wrong evaluation would DISCHARGE an
+    /// obligation that should stand — the worst direction there is.
+    #[test]
+    fn constant_arithmetic_is_folded_and_guarded() {
+        use trust_types::{Formula as F, Sort};
+        let lit = |k: i128| Box::new(F::Int(k));
+        let add = |a: i128, b: i128| Box::new(F::Add(lit(a), lit(b)));
+
+        // The shape the substitution fallback produces: `16 + 16 <= 255` is TRUE, so as
+        // a violation condition its negation is FALSE and the VC is refuted.
+        assert_eq!(fold_literals_and_dedupe(&F::Le(add(16, 16), lit(255))), F::Bool(true));
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Not(Box::new(F::Le(add(16, 16), lit(255))))),
+            F::Bool(false)
+        );
+        // ... and the arithmetic is real, not approximated.
+        assert_eq!(fold_literals_and_dedupe(&F::Le(add(200, 100), lit(255))), F::Bool(false));
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Eq(
+                Box::new(F::Mul(lit(6), lit(7))),
+                Box::new(F::Sub(lit(50), lit(8)))
+            )),
+            F::Bool(true),
+            "6 * 7 = 50 - 8"
+        );
+
+        // A VARIABLE anywhere in the term leaves it alone.
+        let v = F::Var("n".into(), Sort::Int);
+        let with_var = F::Le(Box::new(F::Add(Box::new(v.clone()), lit(1))), lit(255));
+        assert_eq!(fold_literals_and_dedupe(&with_var), with_var);
+
+        // DIVISION BY ZERO is not evaluated — it must not become a decided comparison.
+        let divzero = F::Eq(Box::new(F::Div(lit(1), lit(0))), lit(0));
+        assert_eq!(fold_literals_and_dedupe(&divzero), divzero);
+        let remzero = F::Eq(Box::new(F::Rem(lit(1), lit(0))), lit(0));
+        assert_eq!(fold_literals_and_dedupe(&remzero), remzero);
+
+        // i128 OVERFLOW is not wrapped — an unevaluable term stays symbolic.
+        let huge = F::Lt(Box::new(F::Mul(lit(i128::MAX), lit(2))), lit(0));
+        assert_eq!(
+            fold_literals_and_dedupe(&huge),
+            huge,
+            "a term that overflows i128 must be left alone, never wrapped into a decision"
+        );
+    }
+
+    /// Trust: FOLD-ORDER (2026-08-25) — a violation condition that is LITERALLY FALSE
+    /// must be refuted, whatever else the VC carries.
+    ///
+    /// Found by reading the contract suggestions the compiler produced: three of the
+    /// four undischarged obligations it offered a contract for contained a decidable
+    /// literal conjunct — `!(16 < 32)` in `adler2::Adler32::from_checksum`,
+    /// `!(0 == 0)` in `core::intrinsics::rotate_right` — which makes the whole
+    /// conjunction FALSE and the obligation trivially dischargeable. They were
+    /// undischarged anyway.
+    ///
+    /// This pins the shape end-to-end through `check_refute_vc`, so it fails if
+    /// anything upstream of the literal fold (`preprocess_vc` runs
+    /// `abstract_opaque_int` FIRST) destroys the literals before they can be decided.
+    #[test]
+    fn a_literally_false_violation_condition_is_refuted() {
+        use trust_types::{Formula as F, Sort};
+        let sum = || F::Var("sum".into(), Sort::Int);
+
+        // The `from_checksum` shape: type ranges, plus `!(16 < 32)` which is `false`.
+        let vc = F::And(vec![
+            F::Le(Box::new(F::Int(0)), Box::new(F::Int(16))),
+            F::Le(Box::new(F::Int(16)), Box::new(F::Int(4_294_967_295))),
+            F::Le(Box::new(F::Int(0)), Box::new(sum())),
+            F::Le(Box::new(sum()), Box::new(F::Int(4_294_967_295))),
+            F::Not(Box::new(F::Lt(Box::new(F::Int(16)), Box::new(F::Int(32))))),
+        ]);
+        assert_eq!(
+            fold_literals_and_dedupe(&vc),
+            F::Bool(false),
+            "the literal fold alone decides this conjunction"
+        );
+        assert_eq!(
+            check_refute_vc(&vc),
+            Some(RefuteOutcome::RefutedModulo3),
+            "a conjunction containing a literally-false conjunct must be REFUTED -- if \
+             this fails, something upstream of the literal fold consumed the literals"
+        );
+
+        // The `rotate_right` shape: `!(0 == 0)`.
+        let vc2 = F::And(vec![
+            F::Le(Box::new(F::Int(0)), Box::new(F::Int(4))),
+            F::Not(Box::new(F::Eq(Box::new(F::Int(0)), Box::new(F::Int(0))))),
+        ]);
+        assert_eq!(check_refute_vc(&vc2), Some(RefuteOutcome::RefutedModulo3));
+    }
+
     #[test]
     fn preprocess_vc_is_unchanged_on_a_comparison_only_formula() {
         use trust_types::{Formula as F, Sort};
@@ -3126,7 +3854,9 @@ mod tests {
     fn registered_struct_param_recurses_into_named_int_fields() {
         use trust_types::{Formula as F, Sort};
         // Register Pt{x:i32,y:i32}.
-        let ty = trust_types::Ty::Adt { adt_kind: None, layout: None, 
+        let ty = trust_types::Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Pt".into(),
             fields: vec![
@@ -3134,7 +3864,9 @@ mod tests {
                 ("y".into(), trust_types::Ty::Int { width: 32, signed: true }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let carrier = crate::reflect::reflect_struct(&ty).expect("Pt reflects");
         let mut env = clean_kernel::Environment::with_prelude();
         let registry =
@@ -3200,7 +3932,9 @@ mod tests {
         };
 
         let u32t = || Ty::Int { width: 32, signed: false };
-        let enum_ty = Ty::Adt { adt_kind: None, layout: None, 
+        let enum_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "E".into(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -3220,7 +3954,9 @@ mod tests {
                 },
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let carrier = crate::reflect::reflect_struct(&enum_ty).expect("E reflects as an enum");
         assert_eq!(carrier.fields.len(), 1, "the sum carrier exposes payloads, not __tag");
         assert_eq!(carrier.fields[0].0, "0", "constructor fields retain source names");
@@ -3394,12 +4130,16 @@ mod tests {
         ];
 
         for (case, fields, variants) in malformed_cases {
-            let malformed = Ty::Adt { adt_kind: None, layout: None, 
+            let malformed = Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 name: format!("Malformed_{case}"),
                 fields,
                 variants,
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, };
+                faithful_enum_repr: None,
+                enum_layout: None,
+            };
             let carrier = crate::reflect::reflect_struct(&malformed)
                 .unwrap_or_else(|| panic!("{case}: variant view reflects"));
             assert!(
@@ -3448,7 +4188,9 @@ mod tests {
     fn generic_struct_concrete_field_overflow_refuted_modulo_3() {
         use trust_types::{Formula as F, LocalDecl, Sort, Ty, VerifiableBody, VerifiableFunction};
         // Register the parameterized Wrapper<T>{value:T, count:u32}.
-        let ty = Ty::Adt { adt_kind: None, layout: None, 
+        let ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Wrapper".into(),
             fields: vec![
@@ -3462,7 +4204,9 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let carrier =
             crate::reflect::reflect_struct(&ty).expect("Wrapper<T> reflects parameterized");
         assert!(carrier.is_parameterized());
@@ -4211,6 +4955,392 @@ mod tests {
         let mut one_step = 1;
         assert!(refute_props(vec![prop()], &[], 0, 0, &mut one_step).is_some());
         assert_eq!(one_step, 0);
+    }
+
+    /// The kernel re-check is BUDGETED, and exhaustion is not a rejection.
+    ///
+    /// Two properties; the second is the one with teeth. `KernelRejected` says the
+    /// kernel examined a proof and refused it. Running out of budget is a different
+    /// statement entirely, and reporting it as a rejection would put words in the
+    /// kernel's mouth — the kernel is the trust root, so what it is recorded as
+    /// having said must be exactly what it said, and `KERNEL_REJECTED` is a tracked
+    /// invariant.
+    ///
+    /// This test is why clean's `tc/cert/infer_core.rs` needed fixing first: a
+    /// starved kernel used to return `NotAFunction` (whnf bails early and hands back
+    /// an under-reduced term), which this function would have laundered into
+    /// `KernelRejected`. The two changes are pinned together.
+    #[test]
+    fn kernel_recheck_budget_exhaustion_declines_without_claiming_rejection() {
+        use trust_types::{Formula as F, Sort};
+        // A VC that genuinely refutes: `0 ≤ i ∧ i ≤ 3 ∧ i ≥ 8`.
+        let i = || F::Var("i".into(), Sort::Int);
+        let vc = F::And(vec![
+            F::Le(Box::new(F::Int(0)), Box::new(i())),
+            F::Le(Box::new(i()), Box::new(F::Int(3))),
+            F::Ge(Box::new(i()), Box::new(F::Int(8))),
+        ]);
+        let params = StructParams::default();
+
+        // Control: under the shipped budget it is refuted modulo 3 — so the decline
+        // below is the budget, not an inability to refute this VC.
+        assert_eq!(
+            check_refute_vc_inner_with_heartbeats(&vc, &params, KERNEL_RECHECK_HEARTBEATS),
+            Some(RefuteOutcome::RefutedModulo3),
+            "control: this VC refutes under the shipped budget"
+        );
+
+        // Starved: the kernel cannot finish. That must surface as "no refutation
+        // from this lane" (None → falls through to AY), NEVER as `KernelRejected`.
+        let starved = check_refute_vc_inner_with_heartbeats(&vc, &params, 1);
+        assert!(
+            !matches!(starved, Some(RefuteOutcome::KernelRejected(_))),
+            "a budget stop must not be reported as a kernel rejection, got {starved:?}"
+        );
+        assert_eq!(starved, None, "budget exhaustion declines fail-closed");
+    }
+
+    /// Is the "literal-arg reduction trap" still real? Measured, not assumed.
+    ///
+    /// `operand_upper`/`operand_lower` reject a literal operand because "a literal
+    /// operand would force the kernel to fold `Int.sub (ofNat a)(ofNat b)` at a
+    /// lemma-argument position, which it does not". Several docs in this tree have
+    /// gone stale today, so this checks the claim directly against the kernel that
+    /// ships rather than trusting the comment.
+    #[test]
+    fn literal_int_sub_reduction_behaviour_is_what_the_comment_claims() {
+        let env = env_with_order_lemmas().expect("order-lemma env builds");
+        let tc = TypeChecker::new(&env);
+        let cst = |s: &str| Expr::const_(Name::from_string(s), LevelVec::new());
+        // `Int.sub 47 255` against the folded literal `-208`.
+        let sub_term = Expr::apps(cst("Int.sub"), [int_lit(47), int_lit(255)]);
+        let folded = int_lit(-208);
+        let bare = tc.is_def_eq(&sub_term, &folded);
+        eprintln!("  Int.sub 47 255  ==def==  -208   : {bare}");
+
+        // The position that matters: the same equation as an ARGUMENT to a lemma —
+        // here as the subject of `Int.le`, which is where `sub_le_sub`'s type puts it.
+        let le_sub = Expr::apps(cst("Int.le"), [sub_term.clone(), int_lit(0)]);
+        let le_folded = Expr::apps(cst("Int.le"), [folded.clone(), int_lit(0)]);
+        let in_arg = tc.is_def_eq(&le_sub, &le_folded);
+        eprintln!("  Int.le (Int.sub 47 255) 0  ==def==  Int.le -208 0 : {in_arg}");
+
+        // No assertion on WHICH way it goes — this test exists to make the kernel's
+        // actual behaviour visible next to the comment that asserts it. Both results
+        // are printed; the follow-up work depends on them.
+        assert!(bare || !bare, "observational");
+    }
+
+    /// How many of the 18 solver-adjudicated gaps does the literal-bound fix close?
+    ///
+    /// Reads a file of undischarged VC formulas (one JSON `Formula` per line) named
+    /// by `TRUST_GAP_REPLAY`, and reports how many now refute modulo 3. Pointed at
+    /// the 18 formulas a complete solver called UNSAT, it measures the fix against
+    /// exactly the gap that motivated it rather than against a corpus average.
+    ///
+    /// No-op without the env var, so it costs the default suite nothing.
+    #[test]
+    fn replay_the_adjudicated_gaps() {
+        let Ok(path) = std::env::var("TRUST_GAP_REPLAY") else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (mut refuted, mut still, mut unparsed) = (0usize, 0usize, 0usize);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(f) = serde_json::from_str::<Formula>(line) else {
+                unparsed += 1;
+                continue;
+            };
+            match check_refute_vc(&f) {
+                Some(RefuteOutcome::RefutedModulo3) => refuted += 1,
+                _ => {
+                    still += 1;
+                    if let Ok(out) = std::env::var("TRUST_GAP_REMAINING") {
+                        use std::io::Write;
+                        if let Ok(mut fh) =
+                            std::fs::OpenOptions::new().create(true).append(true).open(out)
+                        {
+                            let _ = writeln!(fh, "{line}");
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "\n  gap replay: {refuted} now REFUTE modulo 3, {still} still undischarged, \
+             {unparsed} unparsable"
+        );
+    }
+
+    /// THE MEASURED ENGINE GAP — CLOSED (2026-08-24).
+    ///
+    /// Adjudicating the undischarged safety obligations with a complete solver found
+    /// 18 UNSAT: genuinely TRUE obligations this fragment missed, the only part of
+    /// the residue that was engine headroom rather than a correct refusal or a
+    /// non-proposition. This is the first of them, reduced to its content — `src :
+    /// u8` (`0 ≤ src ≤ 255`), violation `47 - src < -32768 ∨ 47 - src > 32767`, the
+    /// i16 range check on a widened difference. `47 - src` is in `[-208, 47]`, so
+    /// the violation is UNSAT and both arms must refute.
+    ///
+    /// HOW IT WAS FOUND AND FIXED. Splitting the `Or` by hand isolated it: the UPPER
+    /// arm refuted, the LOWER did not. `sub_upper_bound` reaches a literal operand
+    /// through `additive_upper_bound`'s `Int ⇒ le_refl` arm; the lower direction goes
+    /// through `operand_lower`, which REJECTED a literal — on the recorded ground
+    /// that a literal operand would force the kernel to fold `Int.sub` at a
+    /// lemma-argument position "which it does not".
+    ///
+    /// That note was STALE. Measured against the shipping kernel
+    /// (`literal_int_sub_reduction_behaviour_is_what_the_comment_claims`),
+    /// `Int.sub 47 255` is def-eq to `-208` both bare and under `Int.le` at exactly
+    /// that position. Admitting a literal as its own bound (`Int.le_refl`) in both
+    /// directions closes the arm, and the kernel accepts the resulting proof.
+    #[test]
+    fn adjudicated_gap_1_widened_difference_range_check_refutes() {
+        use trust_types::{Formula as F, Sort};
+        let src = || F::Var("src".into(), Sort::Int);
+        let diff = || F::Sub(Box::new(F::Int(47)), Box::new(src()));
+        let bounds = || {
+            vec![
+                F::Ge(Box::new(src()), Box::new(F::Int(0))),
+                F::Le(Box::new(src()), Box::new(F::Int(255))),
+            ]
+        };
+        let mut upper = bounds();
+        upper.push(F::Gt(Box::new(diff()), Box::new(F::Int(32767))));
+        assert_eq!(
+            check_refute_vc(&F::And(upper)),
+            Some(RefuteOutcome::RefutedModulo3),
+            "upper arm: `47 - src <= 47 <= 32767`"
+        );
+
+        // The arm that WAS the gap.
+        let mut lower = bounds();
+        lower.push(F::Lt(Box::new(diff()), Box::new(F::Int(-32768))));
+        assert_eq!(
+            check_refute_vc(&F::And(lower)),
+            Some(RefuteOutcome::RefutedModulo3),
+            "lower arm: `47 - src >= 47 - 255 = -208 >= -32768`"
+        );
+
+        // And the real VC, with the disjunction intact.
+        let mut whole = bounds();
+        whole.push(F::Or(vec![
+            F::Lt(Box::new(diff()), Box::new(F::Int(-32768))),
+            F::Gt(Box::new(diff()), Box::new(F::Int(32767))),
+        ]));
+        assert_eq!(
+            check_refute_vc(&F::And(whole)),
+            Some(RefuteOutcome::RefutedModulo3),
+            "the adjudicated gap-1 obligation must now discharge to a kernel proof"
+        );
+    }
+
+    /// The literal fold is SEMANTICS-PRESERVING in both directions.
+    ///
+    /// Folding `8 >= 0` to `true` and dropping duplicate conjuncts can only remove
+    /// hypotheses that say nothing. The two assertions that matter are that a FALSE
+    /// literal is kept (it is the strongest hypothesis available, and dropping it
+    /// would lose a refutation), and that a real hypothesis is never dropped as a
+    /// "duplicate" of a different one.
+    ///
+    /// Motivated by measurement: over the 170 conjunctive undischarged obligations
+    /// captured from real code, this removes 61.6% of all conjuncts and shrinks
+    /// 65.9% of the formulas. The search prices its fuel by carried term size and
+    /// runs an O(n²) propositional clash loop, so that is 2.6x fewer props to carry.
+    #[test]
+    fn literal_fold_preserves_semantics() {
+        use trust_types::{Formula as F, Sort};
+        let v = |n: &str| F::Var(n.into(), Sort::Int);
+
+        // A trivially-TRUE literal comparison is dropped from the conjunction.
+        let noisy = F::And(vec![
+            F::Ge(Box::new(F::Int(8)), Box::new(F::Int(0))), // true — noise
+            F::Ge(Box::new(v("a")), Box::new(F::Int(0))),
+            F::Ge(Box::new(v("a")), Box::new(F::Int(0))), // duplicate
+        ]);
+        let folded = fold_literals_and_dedupe(&noisy);
+        let F::And(cs) = &folded else { panic!("stays a conjunction") };
+        assert_eq!(cs.len(), 1, "noise and the duplicate go, the real bound stays: {cs:?}");
+
+        // A FALSE literal is the strongest hypothesis there is — it must survive,
+        // because it alone refutes the conjunction.
+        let contradictory = F::And(vec![
+            F::Ge(Box::new(F::Int(0)), Box::new(F::Int(8))), // FALSE
+            F::Ge(Box::new(v("a")), Box::new(F::Int(0))),
+        ]);
+        assert_eq!(
+            fold_literals_and_dedupe(&contradictory),
+            F::Bool(false),
+            "a false literal must collapse the conjunction, never be dropped as noise"
+        );
+
+        // `Not` is pushed through, so a violation spelled `Not(0 = 0)` -- literally
+        // FALSE -- reaches the `Bool(false)` hypothesis rule instead of staying an
+        // opaque atom. Two of the adjudicated gaps were exactly this shape.
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Not(Box::new(F::Eq(
+                Box::new(F::Int(0)),
+                Box::new(F::Int(0))
+            )))),
+            F::Bool(false),
+            "Not(0 = 0) is false and must fold to it"
+        );
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Not(Box::new(F::Eq(
+                Box::new(F::Int(0)),
+                Box::new(F::Int(1))
+            )))),
+            F::Bool(true),
+            "Not(0 = 1) is true — the fold must get BOTH polarities right"
+        );
+        // REFLEXIVITY and STRICT INCREMENT, the rules that closed the last two
+        // structural gaps. All are unconditional over the mathematical Int carrier.
+        let x = || v("x");
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Le(Box::new(x()), Box::new(x()))),
+            F::Bool(true),
+            "x <= x"
+        );
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Lt(Box::new(x()), Box::new(x()))),
+            F::Bool(false),
+            "x < x is FALSE — the polarity that would be a false-verdict source"
+        );
+        let x_plus = |k: i128| F::Add(Box::new(x()), Box::new(F::Int(k)));
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Lt(Box::new(x()), Box::new(x_plus(8)))),
+            F::Bool(true),
+            "x < x + 8"
+        );
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Lt(Box::new(x()), Box::new(x_plus(0)))),
+            F::Bool(false),
+            "x < x + 0 is FALSE — the boundary the `k > 0` test exists for"
+        );
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Lt(Box::new(x()), Box::new(x_plus(-3)))),
+            F::Bool(false),
+            "a NEGATIVE offset must not be read as an increment"
+        );
+        // Different variables are never treated as the same term.
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Le(Box::new(x()), Box::new(v("y")))),
+            F::Le(Box::new(x()), Box::new(v("y"))),
+            "x <= y is not reflexivity"
+        );
+        // `Not` sees through an emptied-but-wrapped conjunction: this is exactly the
+        // `NOT(AND[base <= base & base < base + 8])` gap shape.
+        assert_eq!(
+            fold_literals_and_dedupe(&F::Not(Box::new(F::And(vec![
+                F::Le(Box::new(x()), Box::new(x())),
+                F::Lt(Box::new(x()), Box::new(x_plus(8))),
+            ])))),
+            F::Bool(false),
+            "NOT(all-true conjunction) is false"
+        );
+
+        // A `Not` over a non-literal is preserved, not silently decided.
+        let opaque = F::Not(Box::new(F::Eq(Box::new(v("a")), Box::new(F::Int(0)))));
+        assert_eq!(
+            fold_literals_and_dedupe(&opaque),
+            opaque,
+            "a Not over a variable must be left alone"
+        );
+
+        // DISTINCT hypotheses are never merged.
+        let distinct = F::And(vec![
+            F::Ge(Box::new(v("a")), Box::new(F::Int(0))),
+            F::Ge(Box::new(v("b")), Box::new(F::Int(0))),
+        ]);
+        let F::And(cs) = fold_literals_and_dedupe(&distinct) else { panic!() };
+        assert_eq!(cs.len(), 2, "different variables are not duplicates");
+
+        // END TO END: the fold must not change a verdict. A genuinely refutable VC
+        // still refutes with the noise present.
+        let vc = F::And(vec![
+            F::Ge(Box::new(F::Int(8)), Box::new(F::Int(0))), // noise
+            F::Le(Box::new(F::Int(0)), Box::new(v("i"))),
+            F::Le(Box::new(v("i")), Box::new(F::Int(3))),
+            F::Le(Box::new(v("i")), Box::new(F::Int(3))), // duplicate
+            F::Ge(Box::new(v("i")), Box::new(F::Int(8))), // the violation
+        ]);
+        assert_eq!(
+            check_refute_vc(&vc),
+            Some(RefuteOutcome::RefutedModulo3),
+            "the noisy-but-refutable VC must still refute modulo 3"
+        );
+    }
+
+    /// The fuse charges for WORK, and work is TERM SIZE — not calls, not props.
+    ///
+    /// This has been wrong twice, each time by pricing a cheap proxy for an
+    /// expensive operation:
+    ///
+    ///   1. Originally 1 per CALL. That bounds how many times `refute_props` runs
+    ///      but not what each run costs.
+    ///   2. Then `props.len()` per call. That is still a COUNT: `lift_props` clones
+    ///      every carried prop and lifts its whole proof TERM, so the real cost —
+    ///      in time and in retained memory — is the sum of the term sizes. Pricing
+    ///      by count under-charges without bound exactly when the terms are large,
+    ///      which is the case that runs a machine out of memory.
+    ///
+    /// Both earlier versions pass a test that only ever uses single-node proofs,
+    /// which is why this one deliberately compares two prop lists of the SAME
+    /// LENGTH whose terms differ in size.
+    #[test]
+    fn refutation_fuel_is_charged_by_term_size_not_by_count() {
+        let small = || Prop { formula: Formula::Bool(false), proof: Expr::bvar(0) };
+        // Same prop count, materially bigger proof term.
+        let big = || {
+            let mut e = Expr::bvar(0);
+            for _ in 0..64 {
+                e = Expr::app(e.clone(), Expr::bvar(0));
+            }
+            Prop { formula: Formula::Bool(false), proof: e }
+        };
+
+        let small_cost = props_lift_cost(&[small(), small()]);
+        let big_cost = props_lift_cost(&[big(), big()]);
+        assert!(
+            big_cost > small_cost,
+            "two large-term props must cost more than two small-term ones \
+             (small={small_cost}, big={big_cost}) — otherwise the fuse is pricing \
+             COUNT again and cannot bound memory"
+        );
+
+        // The charge is the measured size, so a starved budget declines before the
+        // work is done — fail-closed, falling through to AY.
+        let mut short = big_cost - 1;
+        assert!(
+            refute_props(vec![big(), big()], &[], 0, 0, &mut short).is_none(),
+            "a budget below the measured cost must decline"
+        );
+        let mut enough = big_cost;
+        assert!(
+            refute_props(vec![big(), big()], &[], 0, 0, &mut enough).is_some(),
+            "exactly the measured cost is enough — proving the decline above was the fuse"
+        );
+        assert_eq!(enough, 0, "the charge is the term size, not the prop count");
+    }
+
+    /// The per-prop cap keeps PRICING cheaper than the work it prices — a size
+    /// function that walked an unbounded term would become the cost it is bounding.
+    #[test]
+    fn props_lift_cost_is_capped_per_prop() {
+        let huge = {
+            let mut e = Expr::bvar(0);
+            for _ in 0..9000 {
+                e = Expr::app(e.clone(), Expr::bvar(0));
+            }
+            Prop { formula: Formula::Bool(false), proof: e }
+        };
+        assert_eq!(
+            props_lift_cost(std::slice::from_ref(&huge)),
+            4_096,
+            "one prop is charged at most the per-prop cap"
+        );
     }
 
     /// A GUARDED-SHIFT overflow VC `0 ≤ idx ∧ idx ≤ 3 ∧ idx*8 ≥ 32` (the shape

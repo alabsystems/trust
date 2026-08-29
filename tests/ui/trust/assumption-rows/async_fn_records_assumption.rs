@@ -4,37 +4,27 @@
 // human surface names the capability gap — never a hard abort (that is
 // the crate-under-check strict lane's job) and never a silent skip.
 //
-// RE-PINNED 2026-08-20 (D2). The ASSUMPTION row this test exists to guard is
-// RESTORED — `ca53846043` had replaced it with a `CONTRACT [coroutine-resume-state]`
-// row in EVERY lane, including this advisory one, and never measured the flip.
-// The RAW "Trust: ASSUMPTION [coroutine]" pin at the bottom of this file is the
-// guarantee, and it passes again. (Do not spell an annotation sequence inside a
-// comment here — compiletest parses it as a real expectation.)
+// RE-PINNED 2026-08-22 for D2 (0e9090f03b), which closed a false Certified PROVE on the
+// coroutine resume premise. The premise is published as an ASSUMPTION row again, not as
+// the `CONTRACT [coroutine-resume-state]` row that `ca53846043` had substituted in every
+// lane. MEASURED on stage2 ec4783d80 with this file's own flags — the raw row and the
+// warning are pinned below; the `note:` summary is quoted here, not pinned:
 //
-// The WARN pin was DELETED because its count described a vanished inventory, not
-// because disclosure weakened: "1 obligation(s) were not proved" was the state
-// when the coroutine body's sole row was the authority-less panic-freedom
-// aggregate. Sentinels are now separate rows and the aggregate has a real
-// (ex-falso) discharge, so that count is structurally unreachable. What replaces
-// it is stronger and measured: the summary for this body now reads
-// "2 conditionally discharged (NOT proved), … 1 skipped out of 3 obligation(s)"
-// — never the word "proved" — next to the assumption row pinned below.
+//     Trust: ASSUMPTION [coroutine] `async_fn_records_assumption::tick::{closure#0}`:
+//         coroutine resume-state executor protocol is assumed valid; supported user
+//         data-safety obligations were still verified — recorded as an unverified
+//         assumption (NOT proved)
+//     note: Trust verification: 1 conditionally discharged (NOT proved), 2 failed,
+//         0 unknown, 0 timed out, 1 runtime-checked, 1 skipped out of 5 obligation(s)
+//     warning: Trust Level 0 safety verification incomplete for
+//         `async_fn_records_assumption::tick::{closure#0}`: 3 obligation(s) were not proved
 //
-// RE-PINNED 2026-08-15 for upstream 983bc1a3b6 (merged here as f1182b2285), which
-// REMOVED the whole-function panic-freedom subsumption as a false proof. UPSTREAM
-// CAUSED THIS: that commit's own message records the stage2/ui measurement as "NOT
-// MEASURED", and the file is byte-identical on both merge parents. The coroutine
-// body's `assertion:panic-freedom:0` aggregate is this item's SOLE result row, so the
-// subsumption's supporting conjunction was empty and its discharge was vacuous — it
-// was the only authority that ever let the row report as proved (the opaque
-// `panic_reachable:` formula earns no kernel cert, and the native trust-mc run leaves
-// it Unsupported). Without it the row keeps its authority-less `trust-assert-refute`
-// label and reports runtime-checked, i.e. NOT proved, hence the new warning.
-// STRONGER-OR-EQUAL: one obligation moved proved -> not-proved; the ASSUMPTION row
-// this test exists to guard is still emitted, and no verdict was downgraded. Do NOT
-// "recover" it by crediting the CHC: the bundle prunes the sentinel with an entry
-// `Assume(resume_state == 0)` (measured via -Ztrust-dump=native-bundle), so a native
-// proof would just relaunder the executor-protocol premise this ledger records.
+// The warning is the disclosure this file guards: no row for this body reports "proved",
+// and the advisory lane still compiles (exit 0). Why the unproved rows must not be
+// "recovered" by crediting the solver is argued, with its runtime exhibit, in the sibling
+// `async_exhibit_does_not_certify.rs`; the strict arm is `refutation_not_swallowed_strict.rs`.
+// (Do not spell an annotation sequence inside a comment here — compiletest parses it as a
+// real expectation.)
 //@ edition: 2021
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on
@@ -42,7 +32,8 @@
 //@ build-pass
 //@ dont-check-compiler-stderr
 pub async fn tick(x: u32) -> u32 {
+    //~^ WARN Trust Level 0 safety verification incomplete for `async_fn_records_assumption::tick::{closure#0}`: 3 obligation(s) were not proved
     x
 }
 fn main() {}
-//~? RAW Trust: ASSUMPTION [coroutine]
+//~? RAW Trust: ASSUMPTION [coroutine] `async_fn_records_assumption::tick::{closure#0}`

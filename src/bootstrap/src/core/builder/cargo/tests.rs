@@ -8,9 +8,10 @@ use super::{
     effective_codegen_units, effective_debuginfo_level, flags_env,
     parse_trust_verify_library_request, refuse_bootstrap_verification_request,
     retired_trust_bootstrap_shim_target_only_refusal, rustflags_request_bootstrap_verification,
-    trust_cg_codegen_flags, trust_cg_codegen_is_active, trust_verifier_controls,
-    trust_verify_library_units_authorized,
+    std_out_dir_needs_clear, trust_cg_codegen_flags, trust_cg_codegen_is_active,
+    trust_verifier_controls, trust_verify_library_units_authorized,
 };
+use crate::core::builder::Kind;
 use crate::core::config::DebuginfoLevel;
 use crate::{CodegenBackendKind, Mode, TargetSelection};
 
@@ -468,4 +469,132 @@ fn no_live_bootstrap_control_collides_with_the_retired_trust_env_wall() {
     // is evidence about the list rather than about an empty parse.
     assert!(retired.iter().any(|name| name == "TRUST_VERIFY_POLICY"), "{retired:?}");
     assert!(retired.iter().any(|name| name == "TRUST_DISABLE_TV"), "{retired:?}");
+}
+
+/// Every `Kind` bootstrap can drive a cargo invocation with. Spelled out rather than derived so
+/// a new variant fails to compile here and forces a decision about whether it writes into a std
+/// output directory.
+const ALL_KINDS: &[Kind] = &[
+    Kind::Build,
+    Kind::Check,
+    Kind::Clippy,
+    Kind::Fix,
+    Kind::Format,
+    Kind::Test,
+    Kind::Miri,
+    Kind::MiriSetup,
+    Kind::MiriTest,
+    Kind::Bench,
+    Kind::Doc,
+    Kind::Clean,
+    Kind::Dist,
+    Kind::Install,
+    Kind::Run,
+    Kind::Setup,
+    Kind::Vendor,
+];
+
+/// Regression test for the never-cleared `build/<host>/stage2-std`.
+///
+/// `x.py test --stage 2` builds std units into `stage2-std`, but stage-2 std is UPLIFTED from
+/// stage 1 (`Std::should_be_uplifted_from_stage_1`), so a `Mode::Std` + `Kind::Build` cargo is
+/// never constructed for that directory. Gating the clear on `Kind::Build` alone therefore left
+/// it never cleared, and since Trust's `CFG_VERSION` embeds the git short sha, every commit
+/// changed compiler identity and stranded artifacts there. Measured 2026-08-24: the release
+/// gate's log carried 16x `E0514: found crate 'core' compiled by an incompatible version of
+/// rustc`, each followed by `cannot resolve a prelude import`.
+#[test]
+fn std_out_dir_is_cleared_for_test_not_only_build() {
+    // The bug: `Kind::Test` used to answer `false` here, so `stage2-std` was never cleared.
+    assert!(
+        std_out_dir_needs_clear(Mode::Std, Kind::Test),
+        "x.py test --stage 2 builds std units into stage2-std, which no Kind::Build cargo ever \
+         targets (stage-2 std is uplifted); not clearing strands artifacts built by a rustc with \
+         a different CFG_VERSION and yields E0514 on core"
+    );
+    assert!(std_out_dir_needs_clear(Mode::Std, Kind::Build), "upstream's original case");
+}
+
+#[test]
+fn std_out_dir_clear_is_confined_to_std_and_to_building_kinds() {
+    // Non-std modes are Cargo's business: it can see those dependencies via depdep info.
+    for &mode in ALL_MODES {
+        for &kind in ALL_KINDS {
+            if mode == Mode::Std {
+                continue;
+            }
+            assert!(
+                !std_out_dir_needs_clear(mode, kind),
+                "{mode:?} + {kind:?} must not clear a std out dir; only Mode::Std has the \
+                 rustc-identity problem bootstrap has to solve on Cargo's behalf"
+            );
+        }
+    }
+
+    // Within Mode::Std, only the kinds that actually compile std units clear. Widening this
+    // would delete artifacts a read-only kind is about to report on.
+    for &kind in ALL_KINDS {
+        let expected = matches!(kind, Kind::Build | Kind::Test);
+        assert_eq!(
+            std_out_dir_needs_clear(Mode::Std, kind),
+            expected,
+            "Mode::Std + {kind:?}: a kind that writes std units must clear, one that does not \
+             must leave the directory alone"
+        );
+    }
+}
+
+/// Trust: `trust_verifier_controls` must parse the `\x1f`-JOINED form, not only
+/// the whitespace form.
+///
+/// `Rustflags::arg` joins with the ASCII unit separator — it asserts no argument
+/// contains one, precisely because that byte IS the separator. `split_whitespace`
+/// does not treat `\x1f` as whitespace (U+001F is not in Unicode's White_Space
+/// set), so the old implementation collapsed an entire `Rustflags` value into a
+/// single unrecognizable token and returned an EMPTY control list no matter what
+/// the flags actually said.
+///
+/// This survived because every existing test fed it the whitespace form, which
+/// parsed correctly. The production callers feed it `Rustflags.0`, which does not.
+///
+/// Two things were blind as a result, and both are asserted below:
+///   * the already-present check, which then added a SECOND `-Ztrust-verify=off`
+///     — a repeated rustflag forks the cargo unit, because rustflags feed cargo's
+///     `unit_id` but not its `c_metadata`;
+///   * `rustflags_request_bootstrap_verification`, the self-proof refusal, whose
+///     whole job is to notice a verifier control in bootstrap's own rustflags.
+#[test]
+fn trust_verifier_controls_parses_the_unit_separator_form() {
+    // Exactly how `Rustflags` stores it.
+    let joined = "-Zannotate-moves\u{1f}--check-cfg=cfg(bootstrap)\u{1f}-Ztrust-verify=off";
+    assert_eq!(
+        trust_verifier_controls(joined),
+        vec![TRUST_BOOTSTRAP_NO_VERIFY_OPTION],
+        "a \\x1f-joined Rustflags value must parse; returning [] here is what made the \
+         already-present check add a duplicate flag and fork the std unit"
+    );
+
+    // The whitespace form (an inherited `RUSTFLAGS`) must keep working.
+    let spaced = "-Zannotate-moves --check-cfg=cfg(bootstrap) -Ztrust-verify=off";
+    assert_eq!(trust_verifier_controls(spaced), vec![TRUST_BOOTSTRAP_NO_VERIFY_OPTION]);
+
+    // The consequence that mattered: with the flag already present, the default
+    // must NOT add a second copy.
+    assert!(
+        !bootstrap_disables_default_trust_verification(1, joined),
+        "the flag is already in these rustflags, so the default must not re-add it — \
+         observed as `stage=1 present=1 add=true` before this fix"
+    );
+    // ...and with it absent, it still must.
+    assert!(bootstrap_disables_default_trust_verification(
+        1,
+        "-Zannotate-moves\u{1f}--check-cfg=cfg(bootstrap)"
+    ));
+
+    // The self-proof refusal must see a REAL verifier request in the joined form.
+    assert!(
+        rustflags_request_bootstrap_verification("-Zannotate-moves\u{1f}-Ztrust-verify=on"),
+        "the refusal exists to notice exactly this, and could not"
+    );
+    assert!(!rustflags_request_bootstrap_verification(joined), "the off-switch is not a request");
 }

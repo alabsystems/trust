@@ -179,7 +179,10 @@ pub fn check_umul_overflow_adequacy(w: UWidth) -> AdequacyVerdict {
 
 /// Internal: `claimed_rhs = Some(e)` overrides the spec (the fail-closed path — a
 /// wrong threshold / `Int.add` head must make the reflexivity proof fail to type-check).
-pub(super) fn check_umul_overflow_adequacy_inner(w: UWidth, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_umul_overflow_adequacy_inner(
+    w: UWidth,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let mut env = match mirsem_safety_env() {
         Ok(e) => e,
         Err(e) => return AdequacyVerdict::KernelRejected(e),
@@ -361,7 +364,10 @@ pub fn check_overflow_adequacy(w: UWidth) -> AdequacyVerdict {
 
 /// Internal: `claimed_rhs = Some(e)` overrides the spec (the fail-closed path — a
 /// wrong threshold / width must make the reflexivity proof fail to type-check).
-pub(super) fn check_overflow_adequacy_inner(w: UWidth, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_overflow_adequacy_inner(
+    w: UWidth,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let mut env = match mirsem_safety_env() {
         Ok(e) => e,
         Err(e) => return AdequacyVerdict::KernelRejected(e),

@@ -306,9 +306,7 @@ where
     Ok(Some(timeout_ms))
 }
 
-fn deserialize_positive_function_budget_ms<'de, D>(
-    deserializer: D,
-) -> Result<Option<u64>, D::Error>
+fn deserialize_positive_function_budget_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -570,13 +568,9 @@ fn read_config_source(path: &Path) -> Result<Option<String>, TrustConfigLoadErro
             });
         }
     }
-    read_bounded_utf8_file(path, MAX_RELEASE_METADATA_BYTES)
-        .map(Some)
-        .map_err(|error| TrustConfigLoadError {
-            path: path.to_path_buf(),
-            action: "read",
-            detail: error.to_string(),
-        })
+    read_bounded_utf8_file(path, MAX_RELEASE_METADATA_BYTES).map(Some).map_err(|error| {
+        TrustConfigLoadError { path: path.to_path_buf(), action: "read", detail: error.to_string() }
+    })
 }
 
 /// The nearest ancestor manifest that declares a `[workspace]`, together with
@@ -762,7 +756,10 @@ mod tests {
     #[test]
     fn a_non_workspace_ancestor_does_not_supply_defaults() {
         let root = tempfile::tempdir().expect("config fixture");
-        write(&root.path().join("Cargo.toml"), "[package]\nname=\"outer\"\n\n[trust]\nlevel=\"L0\"\n");
+        write(
+            &root.path().join("Cargo.toml"),
+            "[package]\nname=\"outer\"\n\n[trust]\nlevel=\"L0\"\n",
+        );
         let inner = root.path().join("inner");
         write(&inner.join("Cargo.toml"), "[package]\nname = \"inner\"\n");
 
@@ -802,7 +799,10 @@ mod tests {
     #[test]
     fn an_invalid_level_is_rejected_with_the_known_levels() {
         let root = tempfile::tempdir().expect("config fixture");
-        write(&root.path().join("Cargo.toml"), "[package]\nname=\"d\"\n\n[trust]\nlevel = \"L9\"\n");
+        write(
+            &root.path().join("Cargo.toml"),
+            "[package]\nname=\"d\"\n\n[trust]\nlevel = \"L9\"\n",
+        );
 
         let error = resolve_trust_config(root.path(), None).expect_err("bad level must fail");
         assert!(error.detail.contains("invalid verification level"), "{error}");
@@ -851,8 +851,8 @@ mod tests {
         let file = std::fs::File::create(&path).expect("create oversized config");
         file.set_len(MAX_RELEASE_METADATA_BYTES as u64 + 1).expect("size oversized config");
 
-        let error = resolve_trust_config(root.path(), None)
-            .expect_err("oversized config must fail closed");
+        let error =
+            resolve_trust_config(root.path(), None).expect_err("oversized config must fail closed");
         assert_eq!(error.action, "read");
         assert!(error.detail.contains("safety limit"), "{error}");
     }
@@ -867,8 +867,8 @@ mod tests {
         std::fs::write(&target, "level = \"L2\"\n").expect("write target config");
         symlink(&target, root.path().join("trust.toml")).expect("link config");
 
-        let error = resolve_trust_config(root.path(), None)
-            .expect_err("symlinked config must fail closed");
+        let error =
+            resolve_trust_config(root.path(), None).expect_err("symlinked config must fail closed");
         assert_eq!(error.action, "read");
         assert!(error.detail.contains("not a regular file"), "{error}");
     }

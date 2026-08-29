@@ -43,7 +43,10 @@ pub(super) fn is_parameter(func: &VerifiableFunction, local: usize) -> bool {
 /// checks `r == a_final` (11==11 → vacuously PROVED) while the true `r == a_entry` (11==10) is
 /// FALSE — a default-mode false proof (FULL fail-closes soundly). The caller FAIL-CLOSES on this
 /// (does not credit the proof) until proper entry-snapshot modeling lands.
-pub(super) fn postcondition_references_mutated_param(func: &VerifiableFunction, post: &Formula) -> bool {
+pub(super) fn postcondition_references_mutated_param(
+    func: &VerifiableFunction,
+    post: &Formula,
+) -> bool {
     let mut reassigned: FxHashSet<String> = FxHashSet::default();
     let mut note = |func: &VerifiableFunction, local: usize| {
         if is_parameter(func, local) {
@@ -90,10 +93,11 @@ pub(super) fn postcondition_references_mutated_param(func: &VerifiableFunction, 
 
 /// True iff `local` is assigned EXACTLY ONCE across the whole function (a single
 /// whole-local def, by an `Assign` statement OR a `Call` terminator dest), with no
-/// field/index store that would make its value ambiguous. A store THROUGH the
-/// local (`*local = …`, a `Deref`-first projection) mutates the pointee, not the
-/// local, so it does not count. Licenses treating `Var(local)` as a GLOBAL
-/// invariant — the symbol has one meaning at every program point.
+/// field/index store, `SetDiscriminant`, or `Deinit` that would make its value
+/// ambiguous. A store THROUGH the local (`*local = …`, a `Deref`-first
+/// projection) mutates the pointee, not the local, so it does not count. Licenses
+/// treating `Var(local)` as a GLOBAL invariant — the symbol has one meaning at
+/// every program point.
 ///
 /// SOUNDNESS (P0 false-proof fix, 2026-06-17 hunt skeptic #2): `local` must ALSO not be
 /// mutably borrowed or raw-pointed. `let p = &mut i; *p = b;` reassigns `i` through the
@@ -109,23 +113,38 @@ pub(super) fn is_single_static_assignment(func: &VerifiableFunction, local: usiz
     let mut count = 0u32;
     for block in &func.body.blocks {
         for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt {
-                if let Rvalue::Ref { mutable: true, place: borrowed }
-                | Rvalue::AddressOf(_, borrowed) = rvalue
-                    && borrowed.local == local
+            match stmt {
+                Statement::Assign { place, rvalue, .. } => {
+                    if let Rvalue::Ref { mutable: true, place: borrowed }
+                    | Rvalue::AddressOf(_, borrowed) = rvalue
+                        && borrowed.local == local
+                    {
+                        return false;
+                    }
+                    if place.local != local {
+                        continue;
+                    }
+                    if place.projections.first() == Some(&trust_types::Projection::Deref) {
+                        continue;
+                    }
+                    if !place.projections.is_empty() {
+                        return false;
+                    }
+                    count += 1;
+                }
+                // Both statements change the value rooted at `local` without an
+                // `Assign` rvalue. A discriminant rewrite after construction (or
+                // deinitialization) therefore gives the local more than one
+                // meaning and must revoke every global single-assignment fact.
+                // A Deref-first place changes the pointee, not the pointer local
+                // itself, matching the Assign handling above.
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if place.local == local
+                        && place.projections.first() != Some(&trust_types::Projection::Deref) =>
                 {
                     return false;
                 }
-                if place.local != local {
-                    continue;
-                }
-                if place.projections.first() == Some(&trust_types::Projection::Deref) {
-                    continue;
-                }
-                if !place.projections.is_empty() {
-                    return false;
-                }
-                count += 1;
+                _ => {}
             }
         }
         if let Terminator::Call { dest, .. } = &block.terminator
@@ -134,6 +153,9 @@ pub(super) fn is_single_static_assignment(func: &VerifiableFunction, local: usiz
             if !dest.projections.is_empty() {
                 return false;
             }
+            count += 1;
+        }
+        if matches!(&block.terminator, Terminator::TailCall { .. }) && local == 0 {
             count += 1;
         }
     }
@@ -170,7 +192,11 @@ pub(super) fn local_mut_escapes(func: &VerifiableFunction, local: usize) -> bool
 /// following a `&(*param)` / `&raw const (*param)` reborrow to the parameter root.
 /// None unless the root is a parameter whose type is a slice or ref/raw-ptr to a
 /// slice — only then is the length immutable and the symbol stable.
-pub(super) fn param_slice_len(func: &VerifiableFunction, operand: &Operand, fuel: u32) -> Option<Formula> {
+pub(super) fn param_slice_len(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    fuel: u32,
+) -> Option<Formula> {
     if fuel == 0 {
         return None;
     }
@@ -590,7 +616,10 @@ pub(super) fn build_cast_lower_bound_facts(func: &VerifiableFunction) -> Vec<For
 ///   * `trailing_zeros`/`leading_zeros`/`count_ones`/`count_zeros` on a width-`w` integer
 ///     → `w` (result in `[0, w]`).
 /// None for any other call (unknown bound — fail open, never a wrong fact).
-pub(super) fn cast_source_const_upper_nonneg(func: &VerifiableFunction, local: usize) -> Option<i128> {
+pub(super) fn cast_source_const_upper_nonneg(
+    func: &VerifiableFunction,
+    local: usize,
+) -> Option<i128> {
     for block in &func.body.blocks {
         if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
             && dest.local == local
@@ -662,6 +691,9 @@ pub(super) fn min_call_const_upper_bound(func: &VerifiableFunction, local: usize
 /// runtime-checked at use sites). The bound is always >= 0, so it discharges an
 /// unsigned index use `arr[helper(..)]` when `bound < arr.len()`.
 pub(super) fn function_return_const_upper_bound(func: &VerifiableFunction) -> Option<i128> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     // Multi-return-site const shape: every return site is a constant, so the
     // LARGEST one bounds the returned value on every path. Same `>= 0` filter
     // as the SSA chain below — preserving the documented "bound is always
@@ -721,6 +753,9 @@ pub(super) fn function_return_const_upper_bound(func: &VerifiableFunction) -> Op
 /// only to the call's SUCCESS target by `build_semantic_guard_map` (an unwind
 /// edge never sees it).
 pub(super) fn function_return_const_sites(func: &VerifiableFunction) -> Option<Vec<i128>> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     let mut consts: Vec<i128> = Vec::new();
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -839,6 +874,9 @@ pub(super) fn ret_call_const_lower_bound(func: &VerifiableFunction, local: usize
 /// lower bound of any sign is a sound, potentially useful fact (`>= 1`
 /// discharges a Rem/Div-by-zero obligation on `h % helper(..)`).
 pub(super) fn function_return_const_lower_bound(func: &VerifiableFunction) -> Option<i128> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     if let Some(consts) = function_return_const_sites(func) {
         return consts.first().copied(); // sorted ascending — the min
     }
@@ -943,6 +981,9 @@ pub fn compute_return_const_set_summaries(
 ///   * the operand is a whole (projection-free) DIFFERENT parameter of the
 ///     exact pointee type, or an integer constant within the pointee's range.
 pub(super) fn function_trivial_setter(func: &VerifiableFunction) -> Option<SetterSummary> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     let arg_count = func.body.arg_count;
     if arg_count == 0 || func.body.blocks.is_empty() {
         return None;
@@ -1123,7 +1164,10 @@ pub fn compute_trivial_setter_summaries(
 ///     also rejects projected stores), and it is `Ref { mutable: true }` of a
 ///     PROJECTION-FREE place (a reborrow `&mut *r` / field borrow `&mut s.f`
 ///     stays fail-closed).
-pub(super) fn callsite_unique_mut_borrow_target(func: &VerifiableFunction, temp: usize) -> Option<usize> {
+pub(super) fn callsite_unique_mut_borrow_target(
+    func: &VerifiableFunction,
+    temp: usize,
+) -> Option<usize> {
     for block in &func.body.blocks {
         if let Terminator::Call { dest, .. } = &block.terminator
             && dest.local == temp
@@ -1397,7 +1441,10 @@ pub(super) fn entry_prefix_switch_ordinal(func: &VerifiableFunction) -> Option<u
 /// actual substituted into the VC must still denote the call-time value at the
 /// downstream unwrap block (a reassignable actual could go stale between the
 /// two — the S2c staleness class — so it is refused, never versioned here).
-pub(super) fn entry_stable_operand_formula(func: &VerifiableFunction, op: &Operand) -> Option<Formula> {
+pub(super) fn entry_stable_operand_formula(
+    func: &VerifiableFunction,
+    op: &Operand,
+) -> Option<Formula> {
     let ground_const = |f: Formula| matches!(f, Formula::Int(_) | Formula::Bool(_)).then_some(f);
     let (Operand::Copy(p) | Operand::Move(p)) = op else {
         return ground_const(crate::operand_to_formula(func, op));
@@ -1581,6 +1628,9 @@ pub(super) fn arm_single_site_variant(
 ///     the arm taken is decided by `cond` over ENTRY parameter values (the
 ///     parameters are pinned: never written, never `&mut`-borrowed).
 pub(crate) fn function_return_disc_summary(func: &VerifiableFunction) -> Option<ReturnDiscSummary> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     let ret_ty = crate::local_ty_ref(func, 0)?;
     let (enum_name, variants) = modeled_std_enum_shape(ret_ty)?;
     let sites = function_return_variant_sites(func, enum_name, variants.len())?;
@@ -1695,7 +1745,12 @@ pub fn compute_return_bool_pred_summaries(
 /// derived per-definition with generics erased — the shape gates are
 /// instantiation-invariant (the tag layout is the flattened std shape for
 /// every instantiation the extractor models).
-pub(super) fn function_return_bool_pred_summary(func: &VerifiableFunction) -> Option<ReturnBoolPredSummary> {
+pub(super) fn function_return_bool_pred_summary(
+    func: &VerifiableFunction,
+) -> Option<ReturnBoolPredSummary> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     // Common gates. MULTI-PARAM: the predicate subject is param `_1` (enum-first
     // idiom, incl. `&self`); extra params `_2..` are permitted but the body must
     // STILL bind `_0` solely from `_1`'s probe/discriminant. The entry-block

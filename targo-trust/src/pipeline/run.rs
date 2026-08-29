@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Compiler invocation and rewrite loop entry points.
 //
 // Builds the native trustc command line for single-file vs. targo-driven crate
@@ -75,9 +76,7 @@ fn certified_test_execution_platform_blocker_for(
     target_os: &str,
     target_arch: &str,
 ) -> Option<&'static str> {
-    if matches!(target_os, "linux" | "macos")
-        && matches!(target_arch, "x86_64" | "aarch64")
-    {
+    if matches!(target_os, "linux" | "macos") && matches!(target_arch, "x86_64" | "aarch64") {
         None
     } else {
         Some(CERTIFIED_TEST_EXECUTION_PLATFORM_BLOCKER)
@@ -1061,6 +1060,15 @@ struct VerificationControls<'a> {
     ay_path: Option<&'a Path>,
     verification_session: &'a str,
     proof_artifact_root: &'a Path,
+    /// Trust (v6/D1): directory for the compiler's kernel-graded Clean goal
+    /// artifact (`targo trust spec --emit clean`). Deliberately NOT one of the
+    /// graph-wide `-Z` host-policy options — that protocol is closed
+    /// (`VERIFIED_TARGO_HOST_POLICY_OPTIONS`) — so crate mode transports it as
+    /// the deliberately staged `TRUST_SPEC_EMIT_DIR` child env (after the
+    /// ambient-authority scrub) and direct mode appends the typed
+    /// `-Ztrust-dump=spec-clean:` sink to the compiler argv. Disclosure-only:
+    /// the artifact can never change a verdict.
+    spec_emit_dir: Option<&'a Path>,
 }
 
 /// Every `-Z` option this run may place in the graph-wide Cargo rustflags, by
@@ -1357,6 +1365,16 @@ where
     apply_targo_test_monitor_session(&mut cmd, cargo_test_mode, controls.verification_session);
     apply_native_runtime_env(&mut cmd, rustc_path);
     cmd.env("TRUST_TARGO_VERIFY", "1");
+    // Trust (v6/D1): the spec-goal artifact transport for crate mode. The
+    // ambient-authority scrub above already removed any inherited value; only
+    // this run's deliberate request survives. Env rather than rustflags
+    // because the graph-wide `-Z` channel is a closed host-policy protocol,
+    // and the emission itself is gated compiler-side on an enabled
+    // verification walk, so dependency units (compiled `-Ztrust-verify=off`)
+    // write nothing.
+    if let Some(dir) = controls.spec_emit_dir {
+        cmd.env("TRUST_SPEC_EMIT_DIR", dir);
+    }
     apply_cargo_child_rustc_env(&mut cmd, rustc_path);
     apply_cargo_rustflags_env(
         &mut cmd,
@@ -1856,7 +1874,11 @@ pub(crate) fn build_native_command_with_json_transport(
             cmd_args.push("trust-verify-output=json".to_string());
         }
         append_verification_mode_args(&mut cmd_args, sub_args.allow_l0_gaps_lane());
-        append_codegen_backend_args(&mut cmd_args, selected_codegen_backend, sub_args.allow_l0_gaps_lane());
+        append_codegen_backend_args(
+            &mut cmd_args,
+            selected_codegen_backend,
+            sub_args.allow_l0_gaps_lane(),
+        );
         cmd_args.extend(passthrough);
         if selected_codegen_backend == Some("trust-cg") {
             append_trust_cg_codegen_args(&mut cmd_args);
@@ -1975,6 +1997,9 @@ pub(crate) struct CompilerRun<'a> {
     pub(crate) hardened: bool,
     pub(crate) trust_profile: Option<&'a str>,
     pub(crate) ay_path: Option<&'a Path>,
+    /// Trust (v6/D1): request the compiler's kernel-graded Clean goal artifact
+    /// in this directory (`targo trust spec --emit clean` reads it back).
+    pub(crate) spec_emit_dir: Option<&'a Path>,
     pub(crate) format: OutputFormat,
     pub(crate) report_dir: Option<&'a str>,
     pub(crate) unsafe_memory_report: Option<&'a UnsafeMemoryReportRequest>,
@@ -2175,10 +2200,7 @@ fn recovery_trustd_for_selected_targo(program: &OsStr) -> Result<PathBuf, String
         ));
     }
     let bin = targo.parent().ok_or_else(|| {
-        format!(
-            "selected Targo path `{}` has no same-sysroot bin directory",
-            targo.display()
-        )
+        format!("selected Targo path `{}` has no same-sysroot bin directory", targo.display())
     })?;
     Ok(bin.join(format!("trustd{}", std::env::consts::EXE_SUFFIX)))
 }
@@ -2455,6 +2477,7 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
         hardened,
         trust_profile,
         ay_path,
+        spec_emit_dir,
         format,
         report_dir,
         unsafe_memory_report,
@@ -2528,6 +2551,7 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
         ay_path,
         verification_session: &verification_session.id,
         proof_artifact_root: verification_session.artifact_root(),
+        spec_emit_dir,
     };
     let mut effective_args = if crate_mode {
         let normalized = if cargo_test_mode {
@@ -2554,6 +2578,13 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
         // config-derived policy above, mirroring the crate-mode rustflags
         // merge in apply_cargo_rustflags_env.
         trustflags.apply_to_args(&mut effective_args);
+        // Trust (v6/D1): a direct trustc invocation takes the typed sink on
+        // argv; this is deliberately outside `verification_control_options`,
+        // whose output must stay inside the graph-wide host-policy protocol.
+        if let Some(dir) = controls.spec_emit_dir {
+            effective_args.push("-Z".to_string());
+            effective_args.push(format!("trust-dump=spec-clean:{}", dir.display()));
+        }
     }
     let _ephemeral_output =
         match prepare_ephemeral_single_file_output(args, ephemeral_single_file_output) {
@@ -2766,7 +2797,10 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
     let authenticated_compiler_results = verification_results.clone();
     let zero_obligation_functions =
         crate::types::authenticated_zero_obligation_inventory(&authenticated_compiler_results);
-    crate::types::normalize_authenticated_results_for_publication(
+    // Trust (#220): the boundary this pass applies used to be discarded here.
+    // It is the ONLY point at which a demoted-then-elided row is still
+    // countable, so it is captured and carried into the report for disclosure.
+    let publication_boundary = crate::types::normalize_authenticated_results_for_publication(
         &mut verification_results,
         Some(verification_session.artifact_root()),
     );
@@ -3183,6 +3217,7 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
         cached: cached_obligations,
         total,
         results: verification_results,
+        publication_boundary: Some(publication_boundary),
         zero_obligation_functions,
         compiler_diagnostics,
         duration_ms,
@@ -3342,11 +3377,12 @@ pub(crate) fn run_compiler(run: CompilerRun<'_>) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Trust (dep-TCB ledger, Stage 0): surface the crate's dependency trust base
-    // — every crate scoped out of verification (transitive deps + the
-    // core/alloc/std hard-skip) that the proof is conditional on. Only in crate
-    // mode (single-file builds have no resolved dep graph), and never gated on
-    // success: the trust base is reported whether or not the obligations passed.
+    // Trust (dep-TCB ledger, Stage 0): surface every dependency scoped out of
+    // verification plus the unconditional foundational core/alloc/std residual
+    // TCB. A local stdlib subject can emit selected behavioral obligations
+    // without closing that residual surface. Only in crate mode (single-file
+    // builds have no resolved dep graph), and never gated on success: the trust
+    // base is reported whether or not the obligations passed.
     if crate_mode && render_output {
         let ledger = crate::dep_tcb::dep_tcb_ledger_lines(cargo_proof_inventory.as_ref());
         if !ledger.is_empty() {
@@ -3529,6 +3565,10 @@ pub(super) fn run_compiler_capture(
         ay_path,
         verification_session: &verification_session.id,
         proof_artifact_root: verification_session.artifact_root(),
+        // The rewrite-capture lane never publishes spec goals: its compiles
+        // are exploratory, and a spec artifact must come from the canonical
+        // verification run the user asked about.
+        spec_emit_dir: None,
     };
     let mut effective_args = if crate_mode {
         cargo_args_with_proof_message_format(args).map_err(|error| {
@@ -4025,8 +4065,7 @@ fn run_rewrite_loop_fallback(
         if let Some(pending) = unverified.take() {
             // Taking the generation out is the accept: without a rejection its
             // checkpoint has done its job and the edits stand.
-            if let Some(rejection) =
-                rewrite_rejection(run_result.exit_code, obligations, &decision)
+            if let Some(rejection) = rewrite_rejection(run_result.exit_code, obligations, &decision)
             {
                 eprintln!("{}", describe_restore(&pending, rejection));
                 match pending.restore() {
@@ -4269,29 +4308,25 @@ mod selection_and_control_tests {
 
     #[cfg(unix)]
     use super::TRUSTD_DISABLE_ENV;
-    use super::TrustFlags;
     use super::{
         CertifiedTestExecutionCompletionScope, CertifiedTestExecutionPhaseState,
         CertifiedTestExecutionReport, TRUST_MEMORY_JOBSERVER_ENV, TRUST_MEMORY_JOBSERVER_SOCK_ENV,
-        TrustPolicySelection, VerificationControls, VerificationSession,
-        append_verification_control_args,
-        apply_cargo_child_rustc_env, apply_cargo_rustflags_env,
-        apply_crate_memory_coordination_with, apply_targo_test_monitor_session,
+        TrustFlags, TrustPolicySelection, VERIFIED_TARGO_HOST_POLICY_OPTIONS, VerificationControls,
+        VerificationSession, append_verification_control_args, apply_cargo_child_rustc_env,
+        apply_cargo_rustflags_env, apply_crate_memory_coordination_with,
+        apply_targo_test_monitor_session, canonical_rustc_option_name,
         cargo_args_with_proof_message_format, cargo_manifest_path_arg,
         cargo_rustflags_with_controls, cargo_target_dir, cargo_target_dir_arg,
         cargo_test_compile_only_args, cargo_test_execution_args,
         cargo_test_execution_evidence_blocker, certified_test_execution_platform_blocker,
         certified_test_execution_platform_blocker_for, child_signal_exit_code, child_status_code,
-        configured_verified_cargo_child_with_memory, prepare_ephemeral_single_file_output,
-        record_certified_test_execution_error, scrub_proof_compiler_authority_env,
+        configured_verified_cargo_child_with_memory, env, inherited_trust_rustflags_warning,
+        prepare_ephemeral_single_file_output, record_certified_test_execution_error,
+        reject_out_of_protocol_host_policy, scrub_proof_compiler_authority_env,
         selected_package_names_from_selection, temp_single_file_output_path,
-        validate_direct_custom_target_extension_tcb, verification_cache_target_dir,
+        trust_verify_disable_diagnostic, validate_direct_custom_target_extension_tcb,
+        verification_cache_target_dir, verification_control_options,
         write_test_execution_authority,
-    };
-    use super::{
-        VERIFIED_TARGO_HOST_POLICY_OPTIONS, canonical_rustc_option_name, env,
-        inherited_trust_rustflags_warning, reject_out_of_protocol_host_policy,
-        trust_verify_disable_diagnostic, verification_control_options,
     };
     use crate::config::TrustConfig;
     use crate::pipeline::transport::{CargoTargetIdentity, CargoTestExecutable};
@@ -4305,14 +4340,8 @@ mod selection_and_control_tests {
     fn certified_test_execution_platform_gate_matches_the_current_authenticated_backend() {
         let blocker = certified_test_execution_platform_blocker();
         if cfg!(any(
-            all(
-                target_os = "linux",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ),
-            all(
-                target_os = "macos",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            )
+            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
         )) {
             assert!(blocker.is_none(), "supported host was blocked: {blocker:?}");
         } else {
@@ -4327,12 +4356,9 @@ mod selection_and_control_tests {
 
     #[test]
     fn certified_test_execution_platform_gate_matches_cargo_target_matrix() {
-        for (target_os, target_arch) in [
-            ("linux", "x86_64"),
-            ("linux", "aarch64"),
-            ("macos", "x86_64"),
-            ("macos", "aarch64"),
-        ] {
+        for (target_os, target_arch) in
+            [("linux", "x86_64"), ("linux", "aarch64"), ("macos", "x86_64"), ("macos", "aarch64")]
+        {
             assert_eq!(
                 certified_test_execution_platform_blocker_for(target_os, target_arch),
                 None,
@@ -4396,6 +4422,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &session.id,
             proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: None,
         };
         let selection = ResolvedCargoSelection {
             packages: Vec::new(),
@@ -4479,6 +4506,92 @@ mod selection_and_control_tests {
                 "unbound Cargo child did not explicitly remove `{name}`"
             );
         }
+    }
+
+    /// Trust (v6/D1): the spec-goal artifact transport. A requested emission
+    /// stages the exact directory on the Cargo child; an unrequested run
+    /// explicitly SCRUBS any inherited value (the ambient-authority scrub owns
+    /// `TRUST_SPEC_EMIT_DIR`), so ambient shell state can never pick where a
+    /// verified run writes evidence.
+    #[test]
+    fn spec_emit_dir_is_staged_exactly_when_requested_and_scrubbed_otherwise() {
+        let session = VerificationSession::create().expect("create verification session");
+        let spec_dir = session.artifact_root().join("spec-clean");
+        let controls = VerificationControls {
+            policy: TrustPolicySelection::Strict,
+            timeout_ms: 5_000,
+            function_budget_ms: 120_000,
+            hardened_profile: None,
+            ay_path: None,
+            verification_session: &session.id,
+            proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: Some(&spec_dir),
+        };
+        let selection = ResolvedCargoSelection {
+            packages: Vec::new(),
+            target_directory: session.artifact_root().join("target"),
+        };
+        let args = s(&["check"]);
+        let rustc = std::path::Path::new("/authenticated/toolchain/bin/trustc");
+        let configure =
+            |command: &mut std::process::Command, _: &[String], _: Option<&std::path::Path>| {
+                command.env_remove(TRUST_MEMORY_JOBSERVER_ENV);
+                Ok(())
+            };
+
+        let requested = configured_verified_cargo_child_with_memory(
+            "unused",
+            &args,
+            &args,
+            rustc,
+            &TrustConfig::default(),
+            None,
+            true,
+            true,
+            false,
+            &controls,
+            &TrustFlags::default(),
+            &selection,
+            false,
+            None,
+            configure,
+        )
+        .expect("configure spec-emitting Cargo child");
+        assert_eq!(
+            requested
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("TRUST_SPEC_EMIT_DIR"))
+                .map(|(_, value)| value),
+            Some(Some(spec_dir.as_os_str())),
+            "a requested emission must stage the exact session directory"
+        );
+
+        let unrequested = configured_verified_cargo_child_with_memory(
+            "unused",
+            &args,
+            &args,
+            rustc,
+            &TrustConfig::default(),
+            None,
+            true,
+            true,
+            false,
+            &VerificationControls { spec_emit_dir: None, ..controls },
+            &TrustFlags::default(),
+            &selection,
+            false,
+            None,
+            configure,
+        )
+        .expect("configure Cargo child without spec emission");
+        assert_eq!(
+            unrequested
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("TRUST_SPEC_EMIT_DIR"))
+                .map(|(_, value)| value),
+            Some(None),
+            "an unrequested run must explicitly scrub inherited TRUST_SPEC_EMIT_DIR"
+        );
     }
 
     #[test]
@@ -4911,6 +5024,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: "trust-cg-incremental-test",
             proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: None,
         };
         apply_cargo_rustflags_env(
             &mut command,
@@ -4972,10 +5086,7 @@ mod selection_and_control_tests {
             if let Some(value) = command.get_envs().find_map(|(key, value)| {
                 (key == std::ffi::OsStr::new(name)).then_some(value).flatten()
             }) {
-                return (
-                    value.to_str().expect("exported rustflags are UTF-8").to_string(),
-                    name,
-                );
+                return (value.to_str().expect("exported rustflags are UTF-8").to_string(), name);
             }
         }
         panic!("no rustflags variable was exported to the child Cargo");
@@ -5055,6 +5166,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &session.id,
             proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: None,
         };
         let configure = |command: &mut std::process::Command| {
             apply_cargo_rustflags_env(
@@ -5092,8 +5204,7 @@ mod selection_and_control_tests {
         // 2. Cargo's encoded representation takes the same path.
         {
             let _plain = RustflagsEnvGuard::unset("RUSTFLAGS");
-            let _encoded =
-                RustflagsEnvGuard::set("CARGO_ENCODED_RUSTFLAGS", "-C\x1fopt-level=2");
+            let _encoded = RustflagsEnvGuard::set("CARGO_ENCODED_RUSTFLAGS", "-C\x1fopt-level=2");
             let mut command = std::process::Command::new("unused");
             configure(&mut command);
             let (flags, variable) = exported_cargo_rustflags(&command);
@@ -5218,6 +5329,7 @@ mod selection_and_control_tests {
             ay_path: Some(std::path::Path::new("/tmp/ay")),
             verification_session: &session.id,
             proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: None,
         };
 
         for policy in [
@@ -5226,8 +5338,9 @@ mod selection_and_control_tests {
             TrustPolicySelection::Advisory,
             TrustPolicySelection::MemorySafe,
         ] {
-            let options = verification_control_options(&VerificationControls { policy, ..controls })
-                .expect("assemble verifier control options");
+            let options =
+                verification_control_options(&VerificationControls { policy, ..controls })
+                    .expect("assemble verifier control options");
             for option in &options {
                 let name = canonical_rustc_option_name(option).replace('_', "-");
                 assert!(
@@ -5239,8 +5352,9 @@ mod selection_and_control_tests {
             // The evidence hook itself: without the tracked nonce the run has
             // no authenticated verification stream to authenticate at all.
             assert!(
-                options.iter().any(|option| option
-                    == &format!("trust-verify-session={}", session.id)),
+                options
+                    .iter()
+                    .any(|option| option == &format!("trust-verify-session={}", session.id)),
                 "the tracked session nonce must be part of every verified run: {options:?}"
             );
         }
@@ -5557,6 +5671,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &first.id,
             proof_artifact_root: first.artifact_root(),
+            spec_emit_dir: None,
         };
         let CargoRustflags::Plain(plain) = cargo_rustflags_with_controls(
             CargoRustflags::Plain("-C opt-level=2".to_string()),
@@ -5591,6 +5706,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &second.id,
             proof_artifact_root: second.artifact_root(),
+            spec_emit_dir: None,
         };
         let CargoRustflags::Encoded(encoded) = cargo_rustflags_with_controls(
             CargoRustflags::Encoded("-C\x1fopt-level=2".to_string()),
@@ -5623,6 +5739,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &session.id,
             proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: None,
         };
         let merged = cargo_rustflags_with_controls(
             CargoRustflags::Plain("-C opt-level=2".to_string()),
@@ -5683,6 +5800,7 @@ mod selection_and_control_tests {
             ay_path: Some(std::path::Path::new("/tmp/solver tools/ay")),
             verification_session: &session.id,
             proof_artifact_root: session.artifact_root(),
+            spec_emit_dir: None,
         };
         let CargoRustflags::Encoded(encoded) = cargo_rustflags_with_controls(
             CargoRustflags::Plain("-C opt-level=2".to_string()),
@@ -5705,6 +5823,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &session.id,
             proof_artifact_root: std::path::Path::new("/tmp/proof artifacts/run"),
+            spec_emit_dir: None,
         };
         let CargoRustflags::Encoded(encoded) = cargo_rustflags_with_controls(
             CargoRustflags::Plain("-C opt-level=2".to_string()),
@@ -5727,6 +5846,7 @@ mod selection_and_control_tests {
             ay_path: None,
             verification_session: &session.id,
             proof_artifact_root: std::path::Path::new("/tmp/proof\u{1f}artifacts"),
+            spec_emit_dir: None,
         };
         let error = match cargo_rustflags_with_controls(
             CargoRustflags::Plain("-C opt-level=2".to_string()),

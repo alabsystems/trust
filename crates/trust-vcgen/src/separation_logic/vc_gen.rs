@@ -64,8 +64,9 @@ pub fn deref_vc(func_name: &str, ptr_name: &str, span: &SourceSpan) -> Vec<Verif
     // VC 3: Alignment check -- ptr % align != 0 is a violation.
     // Without concrete type info, we use a symbolic alignment variable.
     //
-    // Trust TODO (one of the two remaining `noOverflow_*` unknowns — full plan in
-    // ~/.claude/.../memory/project_nooverflow_deep_closure.md cont.5/17): this
+    // Trust FIXME (one of the two remaining `noOverflow_*` unknowns; the plan is
+    // reproduced in full immediately below, because its original write-up lived in
+    // an agent-local memory file that no other reader of this repo can open): this
     // symbolic-divisor `ptr % align` is NONLINEAR, so the VC stays `unknown` for a
     // box-good pointer even though the box is aligned by construction. Discharge it
     // by substituting the CONCRETE pointee alignment K (a power of two) for `align`

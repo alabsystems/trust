@@ -93,10 +93,8 @@ fn shared_ref_two_reads_emit_congruence() {
 #[test]
 fn mut_ref_base_declines() {
     let mut func = two_read_func();
-    func.body.locals[1].ty = Ty::Ref {
-        mutable: true,
-        inner: Box::new(Ty::Array { elem: Box::new(u32_ty()), len: 3 }),
-    };
+    func.body.locals[1].ty =
+        Ty::Ref { mutable: true, inner: Box::new(Ty::Array { elem: Box::new(u32_ty()), len: 3 }) };
     assert!(build_immutable_read_value_tie_facts(&func).is_empty());
 }
 
@@ -142,10 +140,7 @@ fn different_field_shapes_do_not_group() {
     // Retype the array element to a 2-tuple and re-project the reads.
     func.body.locals[1].ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Array {
-            elem: Box::new(Ty::Tuple(vec![u32_ty(), u32_ty()])),
-            len: 3,
-        }),
+        inner: Box::new(Ty::Array { elem: Box::new(Ty::Tuple(vec![u32_ty(), u32_ty()])), len: 3 }),
     };
     let read_a = Operand::Copy(Place {
         local: 1,

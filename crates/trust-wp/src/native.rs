@@ -3,24 +3,24 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-//! Native in-process trust_wp API.
+//! Standalone typed in-process trust_wp compatibility API.
 //!
-//! This module defines the request/result shape for the tRustc-owned path:
-//! callers pass typed MIR and typed contract expressions directly instead of
-//! reconstructing contracts from CLI arguments or source strings. With the
-//! `trust-build` feature, the first native lane verifies pure trust_wp IR
-//! obligations in-process through `trust-wp-ay`; unsupported richer semantics
-//! and proof-evidence gaps still fail closed with structured blockers.
+//! Explicit callers may pass typed program data and contract expressions instead
+//! of reconstructing them from CLI arguments or source strings. With
+//! `trust-build`, this standalone API evaluates its narrow pure-IR fragment
+//! in-process through `trust-wp-ay`; unsupported richer semantics and evidence
+//! gaps fail closed with structured blockers. The compiler/full verifier does
+//! not route to this API, and its result grants no publication authority.
 
 #[cfg(feature = "trust-build")]
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "trust-build")]
-use trust_wp_core::{TrackLevel, formula::PureExpr};
-#[cfg(feature = "trust-build")]
 use trust_wp_ay::{
     VerificationRequest, VerificationResult as AYVerificationResult, verify_function_with_modes,
 };
+#[cfg(feature = "trust-build")]
+use trust_wp_core::{TrackLevel, formula::PureExpr};
 
 use crate::config::TrustWpConfig;
 use crate::contract::{Contract, ContractKind, ContractSet};
@@ -32,11 +32,11 @@ use crate::verifier_api::{
     TRUST_WP_NATIVE_PURE_REPLAY_SCHEMA_VERSION, TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION,
 };
 
-/// A tRustc-native trust_wp verification request.
+/// A standalone typed trust_wp verification request.
 ///
-/// `Mir` and `Expr` are intentionally generic so compiler-side callers can pass
-/// borrowed rustc MIR bodies and typed contract nodes without this standalone
-/// crate depending on rustc internals.
+/// `Mir` and `Expr` are intentionally generic so explicit compatibility callers
+/// can supply borrowed program bodies and typed contract nodes without this
+/// crate depending on compiler internals.
 #[derive(Debug, Clone)]
 pub struct NativeTrustWpRequest<Mir, Expr> {
     /// Function identity for reporting and result correlation.
@@ -70,16 +70,16 @@ impl<Mir, Expr> NativeTrustWpRequest<Mir, Expr> {
     }
 }
 
-/// Function identity supplied by the compiler.
+/// Function identity supplied by the standalone caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeFunctionTarget {
-    /// Human-readable path, usually rustc's def path.
+    /// Human-readable function path.
     pub def_path: String,
 
-    /// Stable compiler identity, such as `DefPathHash`, when available.
+    /// Optional stable caller identity, such as a source-level definition hash.
     pub stable_id: Option<String>,
 
-    /// Source span for diagnostics, formatted by the compiler caller.
+    /// Source span for diagnostics, formatted by the caller.
     pub span: Option<String>,
 }
 
@@ -89,7 +89,7 @@ impl NativeFunctionTarget {
         Self { def_path: def_path.into(), stable_id: None, span: None }
     }
 
-    /// Attach a stable compiler identity.
+    /// Attach a stable caller identity.
     #[must_use]
     pub fn with_stable_id(mut self, stable_id: impl Into<String>) -> Self {
         self.stable_id = Some(stable_id.into());
@@ -116,7 +116,7 @@ pub struct NativeContractBundle<Expr> {
     /// Functional refinement predicates.
     pub refinements: Vec<NativeContract<Expr>>,
 
-    /// Loop invariants keyed by compiler loop identity when available.
+    /// Loop invariants keyed by caller-provided loop identity when available.
     pub loop_invariants: Vec<NativeLoopContract<Expr>>,
 
     /// Loop variants/termination metrics.
@@ -232,8 +232,8 @@ impl<Expr> NativeContractBundle<Expr> {
 impl NativeContractBundle<String> {
     /// Build a native-shaped string bundle from the compatibility contract set.
     ///
-    /// This is useful for tests and adapters, but the target tRustc path should
-    /// pass typed compiler contract nodes as `Expr`.
+    /// This is useful for tests and standalone adapters; typed callers can use
+    /// their own expression type as `Expr`.
     pub fn from_compat_contracts(contracts: &ContractSet) -> Self {
         let mut bundle = Self::new().with_trusted(contracts.trusted);
 
@@ -260,7 +260,7 @@ pub struct NativeContract<Expr> {
     /// Caller-owned typed expression.
     pub expression: Expr,
 
-    /// Source span for diagnostics, formatted by the compiler caller.
+    /// Source span for diagnostics, formatted by the caller.
     pub span: Option<String>,
 }
 
@@ -288,7 +288,7 @@ impl NativeContract<String> {
     }
 }
 
-/// A typed loop contract with optional compiler loop identity.
+/// A typed loop contract with optional caller-provided loop identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeLoopContract<Expr> {
     /// Contract kind. This is normally `Invariant` for invariants; variants use
@@ -298,7 +298,7 @@ pub struct NativeLoopContract<Expr> {
     /// Whether this loop contract is an invariant or a termination variant.
     pub role: NativeLoopContractRole,
 
-    /// Compiler loop identity, such as a MIR basic block index.
+    /// Caller-provided loop identity, such as a control-flow node index.
     pub loop_id: Option<String>,
 }
 
@@ -321,7 +321,7 @@ impl<Expr> NativeLoopContract<Expr> {
         }
     }
 
-    /// Attach a compiler loop identity.
+    /// Attach a caller-provided loop identity.
     #[must_use]
     pub fn with_loop_id(mut self, loop_id: impl Into<String>) -> Self {
         self.loop_id = Some(loop_id.into());
@@ -354,10 +354,10 @@ pub struct NativeSnapshot<Expr> {
     /// Snapshot name used in typed contract expressions.
     pub name: String,
 
-    /// Compiler-owned expression captured at function entry or another program point.
+    /// Caller-owned expression captured at function entry or another program point.
     pub expression: Expr,
 
-    /// Source span for diagnostics, formatted by the compiler caller.
+    /// Source span for diagnostics, formatted by the caller.
     pub span: Option<String>,
 }
 
@@ -381,10 +381,10 @@ pub struct NativeResultBinding {
     /// Binding name used by typed contract expressions.
     pub name: String,
 
-    /// Compiler type display for diagnostics and lowering checks.
+    /// Caller-provided type display for diagnostics and lowering checks.
     pub ty: Option<String>,
 
-    /// Source span for diagnostics, formatted by the compiler caller.
+    /// Source span for diagnostics, formatted by the caller.
     pub span: Option<String>,
 }
 
@@ -394,7 +394,7 @@ impl NativeResultBinding {
         Self { name: name.into(), ty: None, span: None }
     }
 
-    /// Attach compiler type display.
+    /// Attach a caller-provided type display.
     #[must_use]
     pub fn with_ty(mut self, ty: impl Into<String>) -> Self {
         self.ty = Some(ty.into());
@@ -415,7 +415,7 @@ pub struct NativeSummaryRef {
     /// Callee def path or summary key.
     pub callee: String,
 
-    /// Optional stable compiler identity for the summary.
+    /// Optional stable caller identity for the summary.
     pub stable_id: Option<String>,
 }
 
@@ -425,7 +425,7 @@ impl NativeSummaryRef {
         Self { callee: callee.into(), stable_id: None }
     }
 
-    /// Attach a stable compiler identity.
+    /// Attach a stable caller identity.
     #[must_use]
     pub fn with_stable_id(mut self, stable_id: impl Into<String>) -> Self {
         self.stable_id = Some(stable_id.into());
@@ -585,7 +585,7 @@ pub enum NativeUnsupportedKind {
     ProofCertificate,
 }
 
-/// Concrete native body shape for the first in-process trust_wp lane.
+/// Concrete body shape for the standalone in-process compatibility API.
 ///
 /// This is intentionally not a source-string or CLI facade: callers provide
 /// already-typed trust_wp IR facts and an optional typed return expression. The
@@ -623,7 +623,7 @@ impl NativePureBody {
     }
 }
 
-/// Native MIR/body lowering hook for the `trust-build` in-process lane.
+/// Body-lowering hook for the standalone `trust-build` compatibility API.
 #[cfg(feature = "trust-build")]
 pub trait NativeTrustWpMir {
     /// Return typed trust_wp IR facts produced from the native body.
@@ -658,7 +658,7 @@ impl NativeTrustWpExpr for PureExpr {
     }
 }
 
-/// Verify using the native tRustc-owned request path.
+/// Evaluate a standalone typed compatibility request without native internals.
 ///
 /// Without `trust-build`, native trust_wp internals are not linked into this
 /// standalone compatibility crate, so the call records structured blockers and
@@ -671,11 +671,12 @@ pub fn verify_native<Mir, Expr>(
     Ok(NativeTrustWpResult::unsupported(request.target, blockers))
 }
 
-/// Verify using the native tRustc-owned request path.
+/// Evaluate a standalone typed compatibility request in-process.
 ///
 /// With `trust-build`, this lowers typed native inputs to trust_wp `PureExpr`
-/// obligations and calls `trust-wp-ay` in-process. The currently supported class
-/// is pure function/postcondition obligations:
+/// obligations and calls `trust-wp-ay` in-process. This diagnostic result is not
+/// consumed by the compiler/full verifier. The supported standalone class is
+/// pure function/postcondition obligations:
 ///
 /// `requires + native_body_facts => ensures`
 ///

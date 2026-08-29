@@ -16,7 +16,9 @@
 //! proof-carrying surface is the complete general lane: no sound checker can
 //! automatically discover proofs of arbitrary propositions. TY remains an
 //! optional producer for recognized decidable classes. This report is
-//! implementation status, never proof evidence.
+//! implementation status, never proof evidence. Whole-project automatic
+//! integration is tracked separately and remains fail-closed until the compiler
+//! authenticates the semantic inputs, checker identity, and final artifact.
 
 /// Legacy schema identifier retained so stored v1 reports can still be named.
 ///
@@ -27,6 +29,10 @@ pub const R5_TEMPORAL_PARITY_REPORT_SCHEMA_V1: &str = "trust.r5-temporal-parity/
 
 /// Current schema identifier for the public R5 temporal migration report.
 pub const R5_TEMPORAL_PARITY_REPORT_SCHEMA_V2: &str = "trust.r5-temporal-parity/v2";
+
+/// Separate, non-gating automatic project-integration report schema.
+pub const TEMPORAL_AUTOMATIC_INTEGRATION_REPORT_SCHEMA_V1: &str =
+    "trust.temporal-automatic-integration/v1";
 
 /// Stable R5 gap identifiers.
 ///
@@ -56,9 +62,11 @@ pub enum R5TemporalParityBlocker {
     /// comparisons), plus unchecked casts into `Char`, decline fail-closed.
     /// The wire ID remains deserializable for older status artifacts.
     LiteralProgramTransitionRefinementMissing,
-    /// Historical blocker ID. The authenticated compiler manifest now binds the
-    /// semantic inputs, checker/output identity, and final program artifact into
-    /// one freshly replayed evidence chain.
+    /// Active blocker for the separate automatic project-integration route: the
+    /// compiler does not yet bind temporal semantic inputs, resolved dependencies,
+    /// checker/output identity, and the final program artifact into one evidence
+    /// chain. It is historical/non-gating only for macro migration and retirement,
+    /// whose replacement is the explicit caller-owned Clean certification API.
     AuthenticatedCompilerEvidenceMissing,
     /// Historical blocker ID: production certificates lacked an exact
     /// kernel-closed route for their actual explicit-fixpoint evidence.
@@ -182,6 +190,15 @@ pub const R5_TEMPORAL_RETIREMENT_BLOCKERS: &[R5TemporalParityBlocker] = &[];
 /// cannot erase an independently checked proof.
 pub const R5_MODEL_ABI_AMBITION_BLOCKERS: &[R5TemporalParityBlocker] = &[];
 
+/// Blockers for automatic whole-project temporal discovery/execution. This is
+/// separate from macro migration/retirement: explicit Clean certification is
+/// complete while `targo trust temporal` intentionally remains fail-closed.
+pub const TEMPORAL_AUTOMATIC_INTEGRATION_BLOCKERS: &[R5TemporalParityBlocker] =
+    &[R5TemporalParityBlocker::AuthenticatedCompilerEvidenceMissing];
+
+pub const TEMPORAL_AUTOMATIC_INTEGRATION_READY: bool =
+    TEMPORAL_AUTOMATIC_INTEGRATION_BLOCKERS.is_empty();
+
 /// Whether the compatibility macros may be removed from the public surface.
 pub const R5_TEMPORAL_MACRO_RETIREMENT_ALLOWED: bool = R5_TEMPORAL_RETIREMENT_BLOCKERS.is_empty();
 
@@ -215,6 +232,104 @@ pub struct R5TemporalParityReport {
     pub macro_retirement_allowed: bool,
     /// Exact full-target gaps preventing macro deletion.
     pub macro_retirement_blockers: Vec<R5TemporalParityBlocker>,
+}
+
+/// Non-proof status of automatic project integration. This report is separate
+/// so an integration gap cannot be mistaken for a macro-retirement blocker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TemporalAutomaticIntegrationReport {
+    pub schema: String,
+    pub status: R5TemporalParityStatus,
+    pub ready: bool,
+    pub blockers: Vec<R5TemporalParityBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalAutomaticIntegrationReportValidationError {
+    SchemaMismatch { found: String },
+    DuplicateBlocker { blocker: R5TemporalParityBlocker },
+    BlockerSetMismatch,
+    StatusMismatch,
+    ReadyMismatch,
+}
+
+impl std::fmt::Display for TemporalAutomaticIntegrationReportValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemaMismatch { found } => write!(
+                formatter,
+                "unsupported temporal automatic-integration report schema `{found}`"
+            ),
+            Self::DuplicateBlocker { blocker } => {
+                write!(formatter, "duplicate temporal automatic-integration blocker `{blocker:?}`")
+            }
+            Self::BlockerSetMismatch => formatter.write_str(
+                "temporal automatic-integration blockers do not match the implementation snapshot",
+            ),
+            Self::StatusMismatch => formatter
+                .write_str("temporal automatic-integration status contradicts its blockers"),
+            Self::ReadyMismatch => formatter
+                .write_str("temporal automatic-integration readiness contradicts its blockers"),
+        }
+    }
+}
+
+impl std::error::Error for TemporalAutomaticIntegrationReportValidationError {}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TemporalAutomaticIntegrationReportWire {
+    schema: String,
+    status: R5TemporalParityStatus,
+    ready: bool,
+    blockers: Vec<R5TemporalParityBlocker>,
+}
+
+impl TemporalAutomaticIntegrationReport {
+    pub fn validate(&self) -> Result<(), TemporalAutomaticIntegrationReportValidationError> {
+        if self.schema != TEMPORAL_AUTOMATIC_INTEGRATION_REPORT_SCHEMA_V1 {
+            return Err(TemporalAutomaticIntegrationReportValidationError::SchemaMismatch {
+                found: self.schema.clone(),
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for &blocker in &self.blockers {
+            if !seen.insert(blocker) {
+                return Err(TemporalAutomaticIntegrationReportValidationError::DuplicateBlocker {
+                    blocker,
+                });
+            }
+        }
+        if self.blockers.as_slice() != TEMPORAL_AUTOMATIC_INTEGRATION_BLOCKERS {
+            return Err(TemporalAutomaticIntegrationReportValidationError::BlockerSetMismatch);
+        }
+        if self.status != status(&self.blockers) {
+            return Err(TemporalAutomaticIntegrationReportValidationError::StatusMismatch);
+        }
+        if self.ready != self.blockers.is_empty() {
+            return Err(TemporalAutomaticIntegrationReportValidationError::ReadyMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TemporalAutomaticIntegrationReport {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let wire = <TemporalAutomaticIntegrationReportWire as serde::Deserialize>::deserialize(
+            deserializer,
+        )?;
+        let report = Self {
+            schema: wire.schema,
+            status: wire.status,
+            ready: wire.ready,
+            blockers: wire.blockers,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +491,18 @@ pub fn r5_temporal_parity_report() -> R5TemporalParityReport {
     report
 }
 
+/// Return the current automatic project-integration status.
+pub fn temporal_automatic_integration_report() -> TemporalAutomaticIntegrationReport {
+    let report = TemporalAutomaticIntegrationReport {
+        schema: TEMPORAL_AUTOMATIC_INTEGRATION_REPORT_SCHEMA_V1.to_owned(),
+        status: status(TEMPORAL_AUTOMATIC_INTEGRATION_BLOCKERS),
+        ready: TEMPORAL_AUTOMATIC_INTEGRATION_READY,
+        blockers: TEMPORAL_AUTOMATIC_INTEGRATION_BLOCKERS.to_vec(),
+    };
+    debug_assert_eq!(report.validate(), Ok(()));
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +520,66 @@ mod tests {
         assert!(report.macro_retirement_allowed);
         assert!(report.macro_retirement_blockers.is_empty());
         assert!(R5_TEMPORAL_MACRO_RETIREMENT_ALLOWED);
+    }
+
+    #[test]
+    fn automatic_project_integration_is_separate_and_fails_closed() {
+        let report = temporal_automatic_integration_report();
+        assert_eq!(report.schema, TEMPORAL_AUTOMATIC_INTEGRATION_REPORT_SCHEMA_V1);
+        assert_eq!(report.status, R5TemporalParityStatus::Blocked);
+        assert!(!report.ready);
+        assert!(!TEMPORAL_AUTOMATIC_INTEGRATION_READY);
+        assert_eq!(
+            report.blockers,
+            vec![R5TemporalParityBlocker::AuthenticatedCompilerEvidenceMissing]
+        );
+        let blocker = R5TemporalParityBlocker::AuthenticatedCompilerEvidenceMissing;
+        assert!(!R5_TEMPORAL_PARITY_BLOCKERS.contains(&blocker));
+        assert!(!R5_TEMPORAL_RETIREMENT_BLOCKERS.contains(&blocker));
+
+        let temporal_cli = include_str!("../../../targo-trust/src/temporal_cli.rs");
+        assert!(temporal_cli.contains("UNBOUND_TEMPORAL_EVIDENCE"));
+        assert!(temporal_cli.contains("authenticated input/output manifest"));
+        assert!(temporal_cli.contains("ExitCode::from(2)"));
+    }
+
+    #[test]
+    fn automatic_integration_report_rejects_schema_status_and_blocker_drift() {
+        let baseline = serde_json::to_value(temporal_automatic_integration_report()).unwrap();
+        assert_eq!(baseline["status"], "blocked");
+        assert_eq!(baseline["ready"], false);
+        assert_eq!(
+            baseline["blockers"],
+            serde_json::json!(["authenticated_compiler_evidence_missing"])
+        );
+
+        for (field, value) in [
+            ("schema", serde_json::json!("trust.temporal-automatic-integration/v999")),
+            ("status", serde_json::json!("ready")),
+            ("ready", serde_json::json!(true)),
+            ("blockers", serde_json::json!([])),
+        ] {
+            let mut drifted = baseline.clone();
+            drifted[field] = value;
+            assert!(
+                serde_json::from_value::<TemporalAutomaticIntegrationReport>(drifted).is_err(),
+                "contradictory automatic-integration field `{field}` was accepted"
+            );
+        }
+
+        let mut duplicate = baseline.clone();
+        duplicate["blockers"] = serde_json::json!([
+            "authenticated_compiler_evidence_missing",
+            "authenticated_compiler_evidence_missing"
+        ]);
+        assert!(serde_json::from_value::<TemporalAutomaticIntegrationReport>(duplicate).is_err());
+        let mut unknown = baseline.clone();
+        unknown["proof"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TemporalAutomaticIntegrationReport>(unknown).is_err());
+
+        let round_trip: TemporalAutomaticIntegrationReport =
+            serde_json::from_value(baseline).unwrap();
+        assert_eq!(round_trip, temporal_automatic_integration_report());
     }
 
     #[test]

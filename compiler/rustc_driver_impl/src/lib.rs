@@ -323,15 +323,14 @@ fn canonicalize_trust_options(opts: &mut config::Options) {
     // A `strict` request must survive canonicalization. Resolving "does the frontend run" and
     // stamping `On` would silently drop "and fail closed on a body it cannot lower" — the
     // resolved answer has to carry both halves, not just the one this predicate asks about.
-    let resolved_ir_lower = if opts.unstable_opts.trust_ir_lower
-        == Some(config::TrustIrLower::Strict)
-    {
-        config::TrustIrLower::Strict
-    } else if trust_ir_lower_is_active(opts) {
-        config::TrustIrLower::On
-    } else {
-        config::TrustIrLower::Off
-    };
+    let resolved_ir_lower =
+        if opts.unstable_opts.trust_ir_lower == Some(config::TrustIrLower::Strict) {
+            config::TrustIrLower::Strict
+        } else if trust_ir_lower_is_active(opts) {
+            config::TrustIrLower::On
+        } else {
+            config::TrustIrLower::Off
+        };
     opts.unstable_opts.trust_ir_lower = Some(resolved_ir_lower);
 
     if trust_strict_policy_is_active(opts) {
@@ -426,6 +425,25 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
     if !matches!(unstable.trust_cg_frontend.as_str(), "mir" | "trust-ir") {
         return Some("invalid callback-injected -Ztrust-cg-frontend value");
     }
+    // Trust (wall A, instance-flip probe): a MEASUREMENT-ONLY control, same lane
+    // discipline as -Ztrust-sat-perturb — never in an evidence policy, and never in
+    // an artifact-publication compile (the probe re-runs the frozen comparator per
+    // instance, which bumps the session differential tally; see
+    // trust_thir_lower::instance_probe module docs).
+    if unstable.trust_instance_flip_probe.is_some() {
+        if unstable.trust_verify.is_on() || !trust_ir_lower_is_requested(opts) {
+            return Some(
+                "-Ztrust-instance-flip-probe is a measurement-only control and requires \
+                 -Ztrust-verify=off -Ztrust-ir-lower",
+            );
+        }
+        if unstable.trust_dump.paths().next().is_some() {
+            return Some(
+                "-Ztrust-instance-flip-probe re-runs the frozen differential per instance \
+                 and cannot be combined with any -Ztrust-dump artifact sink",
+            );
+        }
+    }
     if let Some(perturbation) = unstable.trust_sat_perturb.as_deref() {
         if !matches!(
             perturbation,
@@ -442,12 +460,70 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
                 | "payload-tramp"
                 | "dr-tramp"
                 | "dr-retire"
+                // Trust (wave-MC): the by-value call-chain class's control. It corrupts the
+                // sealed PLAN rather than an emission site, so both sides of the marker law move
+                // together and the ORACLE — not the law — is what must reject the result.
+                | "mc-plan"
+                // Trust (lane EM): the call-forward `&str`-literal pair's control. It swaps
+                // the pair's LIVE order through the sealed PLAN, so both sides of the marker
+                // law move together and the ORACLE — not the law — is what must reject it.
+                | "cf-lit-order"
+                // Trust (wave-WB8): the chain-forward final retirement's control. It swaps the
+                // retirement's two runs through the sealed PLAN, so both sides of the marker
+                // law move together and the ORACLE — not the law — is what must reject it.
+                | "chain-ret-order"
+                // Trust (lane S1F): the call-forward plan's four receiver-class controls —
+                // field-projection pair DROP, unit-statement temp LATE, explicit-borrow pair
+                // retirement ORDER, reborrowed-return temp LATE. Each rides the sealed PLAN,
+                // so both sides of the marker law move together and the ORACLE — not the law —
+                // is what must reject it.
+                | "cf-field-drop"
+                | "cf-unit-late"
+                | "cf-pair-order"
+                | "cf-ret-late"
+                // Trust (lane R53): the call-forward POST-OP class's control — the destination
+                // temp opened LATE. It rides the sealed PLAN like the four above, so both sides
+                // of the marker law move together and the ORACLE — not the law — is what must
+                // reject it.
+                | "cf-post-late"
+                // Trust (lane F8): the switch-to-join class's control — one
+                // match-candidate trampoline MOVED onto the last candidate's edge. It
+                // rides the sealed PLAN, so both sides of the marker law move together
+                // and the ORACLE — not the law — is what must reject it.
+                | "sw-tramp"
+                // Trust (lane F8B): the discriminant-match class's control — one
+                // match-candidate trampoline MOVED onto the default edge's arm block. It
+                // rides the sealed PLAN, so both sides of the marker law move together and
+                // the ORACLE — not the law — is what must reject it.
+                | "swr-tramp"
+                // Trust (lane G25): the `||`/`&&` sugar condition and the delayed cast, each
+                // MOVED to a position the plan never puts it at with the TOTAL unchanged. It
+                // rides the sealed PLAN like the classes above, so both sides of the marker law
+                // move together and the ORACLE — not the law — is what must reject it.
+                | "g25-hoist"
+                // Trust (lane SC): the statement-call sequence class's control — EVERY group's
+                // `()` temp opened LATE. It rides the sealed PLAN like the classes above, so both
+                // sides of the marker law move together and the ORACLE — not the law — is what
+                // must reject it.
+                | "seq-unit-late"
+                // Trust (lane G21): the short-circuit-over-calls class's control — the RHS
+                // call's argument temps retired FORWARD instead of in reverse creation order.
+                // It rides the sealed PLAN like the classes above, so both sides of the marker
+                // law move together and the ORACLE — not the law — is what must reject it.
+                | "g21-ret-order"
+                // Trust (lane G17): the deep unit-chain class's control — the statement's `()`
+                // temp opened LATE. It rides the sealed PLAN like the classes above, so both
+                // sides of the marker law move together and the ORACLE — not the law — is what
+                // must reject it.
+                | "uc-unit-late"
         ) {
             return Some(
                 "invalid -Ztrust-sat-perturb value: expected enum-reshape, \
                  enum-case-value, enum-ctor, enum-disc-index, switch-map, enum-payload, \
                  marker-order, marker-drop, agg-field-order, marker-arm, payload-tramp, \
-                 dr-tramp, or dr-retire",
+                 dr-tramp, dr-retire, mc-plan, cf-lit-order, chain-ret-order, cf-field-drop, \
+                 cf-unit-late, cf-pair-order, cf-ret-late, cf-post-late, sw-tramp, \
+                 swr-tramp, g25-hoist, seq-unit-late, g21-ret-order, or uc-unit-late",
             );
         }
         // A perturbation deliberately corrupts one lowering class so the
@@ -513,13 +589,13 @@ fn trust_option_domain_error(opts: &config::Options) -> Option<&'static str> {
              -Ztrust-verify-package-name and -Ztrust-verify-session",
         );
     }
-    for path in [unstable.trust_verify_ay_path.as_ref(), unstable.trust_proof_artifact_root.as_ref()]
-        .into_iter()
-        .flatten()
-        .chain(unstable.trust_dump.paths())
+    for path in
+        [unstable.trust_verify_ay_path.as_ref(), unstable.trust_proof_artifact_root.as_ref()]
+            .into_iter()
+            .flatten()
+            .chain(unstable.trust_dump.paths())
     {
-        if path.as_os_str().is_empty()
-            || path.to_str().is_some_and(|value| value.trim().is_empty())
+        if path.as_os_str().is_empty() || path.to_str().is_some_and(|value| value.trim().is_empty())
         {
             return Some("invalid callback-injected Trust path option: must be non-empty");
         }
@@ -556,11 +632,9 @@ fn raw_direct_ir_dump_directories(matches: &getopts::Matches) -> Vec<String> {
         .into_iter()
         .filter(|option| raw_z_option_named(option, "trust_dump"))
         .filter_map(|option| {
-            option
-                .split_once('=')
-                .and_then(|(_, value)| {
-                    value.strip_prefix(config::TrustDump::IR_REQUEST_PREFIX).map(str::to_string)
-                })
+            option.split_once('=').and_then(|(_, value)| {
+                value.strip_prefix(config::TrustDump::IR_REQUEST_PREFIX).map(str::to_string)
+            })
         })
         .collect()
 }
@@ -665,10 +739,9 @@ fn direct_ir_publication_identity(
         return None;
     };
     let Some(crate_name) = opts.crate_name.as_deref() else {
-        early_dcx
-            .early_fatal(
-                "-Ztrust-dump=ir:<dir> with -Ztrust-ir-lower requires an explicit --crate-name",
-            );
+        early_dcx.early_fatal(
+            "-Ztrust-dump=ir:<dir> with -Ztrust-ir-lower requires an explicit --crate-name",
+        );
     };
     if crate_name.is_empty() {
         early_dcx.early_fatal("crate name must not be empty");
@@ -724,11 +797,10 @@ fn raw_outer_direct_ir_publication_identity(
         );
     }
 
-    let directory = Some(dump_directories[0].as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            "outer -Ztrust-dump=ir: requires one non-empty `<directory>` value".to_string()
-        })?;
+    let directory =
+        Some(dump_directories[0].as_str()).filter(|value| !value.trim().is_empty()).ok_or_else(
+            || "outer -Ztrust-dump=ir: requires one non-empty `<directory>` value".to_string(),
+        )?;
     let crate_names = matches.opt_strs("crate-name");
     if crate_names.len() != 1 {
         return Err(
@@ -770,21 +842,22 @@ fn parsed_direct_ir_publication_request(
     // every other parsed publication request is still rejected, but does not
     // grant an ambiguous string authority to mutate the filesystem.
     let crate_names = matches.opt_strs("crate-name");
-    let identity =
-        if let ([directory], [crate_name]) = (dump_directories.as_slice(), crate_names.as_slice()) {
-            Some(directory.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .filter(|_| !crate_name.is_empty())
-                .filter(|_| {
-                    rustc_session::output::invalid_crate_name_chars(crate_name).next().is_none()
-                })
-                .map(|directory| DirectIrPublicationIdentity {
-                    directory: PathBuf::from(directory),
-                    crate_name: crate_name.clone(),
-                })
-        } else {
-            None
-        };
+    let identity = if let ([directory], [crate_name]) =
+        (dump_directories.as_slice(), crate_names.as_slice())
+    {
+        Some(directory.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| !crate_name.is_empty())
+            .filter(|_| {
+                rustc_session::output::invalid_crate_name_chars(crate_name).next().is_none()
+            })
+            .map(|directory| DirectIrPublicationIdentity {
+                directory: PathBuf::from(directory),
+                crate_name: crate_name.clone(),
+            })
+    } else {
+        None
+    };
     Ok(Some(ParsedDirectIrPublicationRequest { identity }))
 }
 
@@ -1344,26 +1417,23 @@ fn frontend_forbidden_option(
         return None;
     }
 
-    let forbidden_z = matches
-        .opt_strs("Z")
-        .into_iter()
-        .find_map(|option| {
-            let name = raw_trust_option_name(&option);
-            // Both typed deauthorization routes force this value to Off below.
-            // Accepting the caller's identical semantic value is monotonic and
-            // lets a coordinator stamp dependency and workspace units
-            // uniformly. The exact-value check deliberately excludes a bare
-            // selector, malformed values, and every enabling value.
-            let redundant_deauthorization = name == "trust_verify"
-                && option.split_once('=').is_some_and(|(_, value)| value == "off");
-            (name.starts_with("trust_") && !redundant_deauthorization
-                || frontend_policy.requires_evidence_inert_backend()
-                    && matches!(
-                        name.as_str(),
-                        "autodiff" | "autodiff_post_passes" | "codegen_backend" | "llvm_plugins"
-                    ))
-            .then_some(name)
-        });
+    let forbidden_z = matches.opt_strs("Z").into_iter().find_map(|option| {
+        let name = raw_trust_option_name(&option);
+        // Both typed deauthorization routes force this value to Off below.
+        // Accepting the caller's identical semantic value is monotonic and
+        // lets a coordinator stamp dependency and workspace units
+        // uniformly. The exact-value check deliberately excludes a bare
+        // selector, malformed values, and every enabling value.
+        let redundant_deauthorization = name == "trust_verify"
+            && option.split_once('=').is_some_and(|(_, value)| value == "off");
+        (name.starts_with("trust_") && !redundant_deauthorization
+            || frontend_policy.requires_evidence_inert_backend()
+                && matches!(
+                    name.as_str(),
+                    "autodiff" | "autodiff_post_passes" | "codegen_backend" | "llvm_plugins"
+                ))
+        .then_some(name)
+    });
     if let Some(name) = forbidden_z {
         return Some(format!("-Z{}", name.replace('_', "-")));
     }
@@ -1450,10 +1520,8 @@ fn run_compiler_with_argfile_mode(
     // request from a trusted frontend entry point, directly into tracked typed
     // state. Rewriting argv cannot preserve getopts semantics because a literal
     // `--` may itself be the required value of the preceding option.
-    let trust_verify_override = trust_verify_override_requested(
-        frontend_policy,
-        env::var_os("TRUST_NO_VERIFY").as_deref(),
-    );
+    let trust_verify_override =
+        trust_verify_override_requested(frontend_policy, env::var_os("TRUST_NO_VERIFY").as_deref());
 
     let (matches, help_only) =
         match handle_options_with_frontend_policy(&default_early_dcx, &args, frontend_policy) {

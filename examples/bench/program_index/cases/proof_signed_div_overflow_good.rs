@@ -4,11 +4,7 @@
 // arithmetic proof surface without std I/O noise.
 
 fn signed_divide_guarded(x: i32, y: i32) -> i32 {
-    if y == 0 || (x == i32::MIN && y == -1) {
-        0
-    } else {
-        x / y
-    }
+    if y == 0 || (x == i32::MIN && y == -1) { 0 } else { x / y }
 }
 
 fn main() {

@@ -48,7 +48,9 @@ fn is_panic_entrypoint(name: &str) -> bool {
 fn is_own_panic_site(t: &Terminator) -> bool {
     match t {
         Terminator::Assert { .. } => true,
-        Terminator::Call { func, .. } => is_panic_entrypoint(func),
+        Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => {
+            is_panic_entrypoint(func)
+        }
         // A `Drop` runs the value's destructor (`Drop::drop`) — an uninspected
         // callee that is named by no `func`, so it is invisible to the
         // all-callees composition — and a destructor may panic. Fail closed.
@@ -121,6 +123,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         }
     }

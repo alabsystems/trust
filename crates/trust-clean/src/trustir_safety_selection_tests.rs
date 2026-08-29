@@ -44,12 +44,13 @@
 // it is the positive control that passes on both trees and would catch the definition
 // lane being tightened into uselessness.
 
-use super::*;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
     Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnOp, VcKind, VerifiableBody,
     VerifiableFunction, VerificationCondition,
 };
+
+use super::*;
 
 const CENSUS: &str = "fixtures/census-2026-07-06";
 const LADDER_ROOT: &str = "fixtures/census-rung2-2026-07-07";
@@ -80,13 +81,12 @@ fn contains_mixed_or(f: &Formula) -> bool {
     let here = matches!(f, Formula::Or(v)
         if v.iter().any(|d| matches!(d, Formula::And(_)))
             && v.iter().any(|d| !matches!(d, Formula::And(_))));
-    here
-        || match f {
-            Formula::And(v) | Formula::Or(v) => v.iter().any(contains_mixed_or),
-            Formula::Not(a) => contains_mixed_or(a),
-            Formula::Implies(a, b) => contains_mixed_or(a) || contains_mixed_or(b),
-            _ => false,
-        }
+    here || match f {
+        Formula::And(v) | Formula::Or(v) => v.iter().any(contains_mixed_or),
+        Formula::Not(a) => contains_mixed_or(a),
+        Formula::Implies(a, b) => contains_mixed_or(a) || contains_mixed_or(b),
+        _ => false,
+    }
 }
 
 /// Every `(kind, verdict)` this tier mints for the safety VCs of `func` that match
@@ -303,6 +303,23 @@ fn bit_field_get_bit_certifies_its_own_shift_width_under_a_ge_spelled_preconditi
              parameter-domain precondition this test exists to pin"
         );
         let got = minted(&func, |k| matches!(k, VcKind::ShiftOverflow { .. }));
+        // Trust: ONE row, as of `c67021cd0d` (2026-08-23). This used to expect TWO
+        // and was not updated by the commit that changed the count — a trust-vcgen
+        // change with a trust-clean pin, which only a cross-workspace run can see.
+        //
+        // The second row was the per-statement `Shl` arm, and it was VACUOUS.
+        // rustc lowers `x << s` so the shift statement always sits in the success
+        // target of `assert(Lt(s, BITS))`, and the statement row inherits that
+        // passed guard through its block defs — giving `_3 AND NOT _3`, UNSAT by
+        // construction. It could never fail, discharged nothing, and still shipped
+        // as a `proved` row at the span of a genuinely-false shift overflow. It is
+        // now suppressed exactly where the assert lane provably binds the same
+        // proposition (`v2_shift_assert_binds_statement`); any non-canonical shape
+        // still keeps both, so the direction remains over-report, never under.
+        //
+        // What this test exists to pin is UNCHANGED and still asserted: the row that
+        // survives certifies THIS body's own `Ge(bit, W)` threshold, never one read
+        // off the hypothesis side of the VC formula.
         assert_eq!(
             got,
             vec![(Some(IrSafetyVcKind::ShiftOob(expected, false)), true)],
@@ -494,9 +511,8 @@ fn real_byteorder_slice_range_bounds_vc_is_not_certified_from_a_slice_len_bound(
         "<lib__LittleEndian as lib__ByteOrder>__read_u128.json",
     ] {
         let func = load(&format!("{CENSUS}/byteorder"), name);
-        let got = minted(&func, |k| {
-            matches!(k, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck)
-        });
+        let got =
+            minted(&func, |k| matches!(k, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck));
         assert!(!got.is_empty(), "{name}: expected a bounds VC");
         assert!(
             got.iter().all(|(_, proven)| !proven),
@@ -613,10 +629,43 @@ fn a_flattened_path_guard_may_not_cost_the_emitters_own_violation() {
          violation; a fixed sibling arity withdraws a legitimate certificate ({certified_w64} \
          certified)"
     );
+    // MEASURED 2026-08-25 — this used to assert `function_safety_vcs_faithful_via_trustir`
+    // reads `true` for `process_one`. It no longer does, and the reason is NOT this test's
+    // subject: the body also raises `UnsupportedMir { kind: "Rvalue::Cast" }` (the
+    // `ArrayVec::as_ptr`/`as_mut_ptr` pointer casts), a DECLINED row that is not an
+    // `is_safety_vc_kind` member. Before the decline clause that row fell out of the
+    // filter and the function-level `all()` ran over a set with the decline REMOVED —
+    // the vacuous-on-a-filtered-set reading. INCIDENTAL to the locator arity this test
+    // measures: the per-row claim above (both widened `Or([Lt(g+1,0), Gt(g+1,u64::MAX)])`
+    // rows certify from their OWN emitted violation) is the subject, is unchanged, and is
+    // what a fixed sibling arity would take away.
+    //
+    // The function-level control is kept, at the layer that still discriminates: every
+    // SAFETY VC must still certify, and the ONLY thing standing between that and the
+    // whole-function verdict must be the declined cast row.
+    let all_safety_rows_certify = trust_vcgen::generate_vcs(&func)
+        .iter()
+        .filter(|vc| crate::mirsem::is_safety_vc_kind_pub(&vc.kind))
+        .all(|vc| {
+            matches!(
+                crate::trustir_safety::trustir_safety_vc_adequate(&func, vc),
+                crate::trustir_anchor::RefinementVerdict::ProvenModulo3
+            )
+        });
     assert!(
-        function_safety_vcs_faithful_via_trustir(&func),
-        "process_one's function-level certificate must hold: every one of its safety VCs \
+        all_safety_rows_certify,
+        "process_one's per-row certificates must hold: every one of its safety VCs \
          certifies from its own emitted violation"
+    );
+    assert!(
+        crate::mirsem::function_emits_declined_vc(&func),
+        "and the ONLY thing left blocking the function-level verdict is the DECLINED \
+         `Rvalue::Cast` row — if that stops being true this test is measuring the wrong \
+         thing again"
+    );
+    assert!(
+        !function_safety_vcs_faithful_via_trustir(&func),
+        "the declined row must keep the function-level gate closed"
     );
 }
 
@@ -646,8 +695,12 @@ fn only_a_direct_positive_sibling_conjunct_can_define_the_certified_core() {
     // the condition-local route is open and what is on trial below is the SIBLING rule:
     // a `Not`-wrapped, an `Or`-wrapped and a non-`Bool` occurrence must each fail to
     // define `_2`, even though the honest definition exists in the MIR.
-    let func =
-        assert_cond_func("z", 0, AssertMessage::DivisionByZero, Ty::Int { width: 32, signed: false });
+    let func = assert_cond_func(
+        "z",
+        0,
+        AssertMessage::DivisionByZero,
+        Ty::Int { width: 32, signed: false },
+    );
     let core = || Box::new(Formula::Eq(var("z"), int(0)));
     for (tag, formula) in [
         (
@@ -660,10 +713,7 @@ fn only_a_direct_positive_sibling_conjunct_can_define_the_certified_core() {
         (
             "DISJOINED equation — holds on one branch, so it defines nothing",
             Formula::And(vec![
-                Formula::Or(vec![
-                    Formula::Eq(bvar(COND), core()),
-                    Formula::Bool(true),
-                ]),
+                Formula::Or(vec![Formula::Eq(bvar(COND), core()), Formula::Bool(true)]),
                 Formula::Var(COND.into(), Sort::Bool),
             ]),
         ),
@@ -685,10 +735,7 @@ fn only_a_direct_positive_sibling_conjunct_can_define_the_certified_core() {
             obligation: None,
         };
         assert!(
-            matches!(
-                trustir_safety_vc_adequate(&func, &vc),
-                RefinementVerdict::KernelRejected(_)
-            ),
+            matches!(trustir_safety_vc_adequate(&func, &vc), RefinementVerdict::KernelRejected(_)),
             "{tag}: the located core came from something that is not a definition of the \
              condition local the VC body names"
         );
@@ -730,8 +777,12 @@ fn the_negation_width_must_agree_with_the_vcs_own_negated_type() {
     // The MIR binds `_2 := (k == -128)` under an `expected == false` `OverflowNeg`
     // assert, so the condition-local route RESOLVES and the decline below is the width
     // cross-check firing, not the MIR confirmation declining first.
-    let func =
-        assert_cond_func("k", -128, AssertMessage::OverflowNeg, Ty::Int { width: 32, signed: true });
+    let func = assert_cond_func(
+        "k",
+        -128,
+        AssertMessage::OverflowNeg,
+        Ty::Int { width: 32, signed: true },
+    );
     let vc = VerificationCondition {
         kind: VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: true } },
         function: "crate::f".into(),
@@ -744,19 +795,13 @@ fn the_negation_width_must_agree_with_the_vcs_own_negated_type() {
         obligation: None,
     };
     assert!(
-        matches!(
-            trustir_safety_vc_adequate(&func, &vc),
-            RefinementVerdict::KernelRejected(_)
-        ),
+        matches!(trustir_safety_vc_adequate(&func, &vc), RefinementVerdict::KernelRejected(_)),
         "an `i8` INT_MIN threshold cannot be the violation of an `i32` negation VC"
     );
 }
 
 fn urange(name: &str, lo: i128, hi: i128) -> Formula {
-    Formula::And(vec![
-        Formula::Le(int(lo), var(name)),
-        Formula::Le(var(name), int(hi)),
-    ])
+    Formula::And(vec![Formula::Le(int(lo), var(name)), Formula::Le(var(name), int(hi))])
 }
 
 fn uadd_or(lo_bound: i128, max: i128) -> Formula {
@@ -884,10 +929,7 @@ fn the_arithmetic_width_must_be_one_the_vcs_own_operand_types_mention() {
     // certify at EITHER width if nothing checks the narrowing, must now decline.
     assert!(
         matches!(
-            trustir_safety_vc_adequate(
-                &no_assert_func(),
-                &signed_vc((i64t, i8t), -128, 127)
-            ),
+            trustir_safety_vc_adequate(&no_assert_func(), &signed_vc((i64t, i8t), -128, 127)),
             RefinementVerdict::KernelRejected(_)
         ),
         "a mixed-width `(i64, i8)` kind over TWO BARE `Var` operands has no constant \
@@ -1003,10 +1045,7 @@ fn a_signed_index_bounds_violation_is_declined_not_half_certified() {
     // is the signed form, which `idxOob` does not model — not because it is not a bounds
     // shape at all.
     let vc = bounds_vc_recorded(trust_types::ObligationRecord {
-        body: Formula::Or(vec![
-            Formula::Lt(var("i"), int(0)),
-            Formula::Ge(var("i"), var("len")),
-        ]),
+        body: Formula::Or(vec![Formula::Lt(var("i"), int(0)), Formula::Ge(var("i"), var("len"))]),
         wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
             facts: vec![Formula::Ge(var("len"), int(0))],
         }],
@@ -1070,6 +1109,10 @@ fn a_signed_index_bounds_violation_is_declined_not_half_certified() {
 ///
 /// The MIR confirmation closes it: `mir_assert_condition_core` requires the assert's own
 /// block to CONTAIN the defining statement, and a contract cannot manufacture one.
+///
+/// Trust: 2026-08 vcgen campaign — the NEG arm's emitter-driven forged shape no longer
+/// exists (the emitter refuses upstream with a proof-gap row), so that arm pins the
+/// upstream refusal plus a hand-built replica; the div/rem arms are unchanged.
 #[test]
 fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_define() {
     let i32_ty = Ty::Int { width: 32, signed: true };
@@ -1132,9 +1175,11 @@ fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_d
         let forged: Vec<_> = vcs
             .iter()
             .filter(|vc| pick(&vc.kind) && is_forged(vc))
-            .filter(|vc| matches!(&vc.formula, Formula::And(v)
+            .filter(|vc| {
+                matches!(&vc.formula, Formula::And(v)
                 if v.iter().any(|c| matches!(c, Formula::Eq(l, _)
-                    if matches!(&**l, Formula::Var(n, _) if n == "ok")))))
+                    if matches!(&**l, Formula::Var(n, _) if n == "ok"))))
+            })
             .collect();
         assert!(
             !forged.is_empty(),
@@ -1154,6 +1199,18 @@ fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_d
 
     // (a) NEGATION — `#[requires] ok == (other == i32::MIN)` over a variable the body
     //     never negates.
+    //
+    // Trust: 2026-08 campaign re-triage. The OverflowNeg assert lane now refuses this
+    // shape at the EMITTER: `v2_build_assert_negation_vc` demands the cond's live
+    // definition compare THE NEGATED OPERAND against its own width's INT_MIN, and an
+    // undefined cond has no definition at all — so the precondition can no longer
+    // reach a VC as the bare-`Var(ok)` body's sibling, and the assert falls to the
+    // fail-closed `RecognizedSafetyAssertProofGap(OverflowNeg)` UnsupportedMir row.
+    // (The per-statement `-k` row survives and honestly certifies about `k`, so the
+    // function-level gate now rests on that honest row; the old "gate must not pass"
+    // assertion pinned a forged certificate that can no longer be emitted.) The
+    // CONSUMER-side refusal this test names stays exercised on a hand-built replica of
+    // the retired shape, which remains deserialization-reachable.
     let neg = with_pre(
         &base(
             AssertMessage::OverflowNeg,
@@ -1161,10 +1218,39 @@ fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_d
         ),
         vec![binds(Formula::Eq(var("other"), int(-2_147_483_648)))],
     );
-    check(&neg, &|k| matches!(k, VcKind::NegationOverflow { .. }), "neg");
+    let neg_vcs = trust_vcgen::generate_vcs(&neg);
     assert!(
-        !function_safety_vcs_faithful_via_trustir(&neg),
-        "the function-level gate must not pass on a certificate read off a precondition"
+        neg_vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+            if kind == "RecognizedSafetyAssertProofGap(OverflowNeg)")),
+        "neg: the undefined-cond OverflowNeg assert must keep a fail-closed proof-gap row"
+    );
+    assert!(
+        !neg_vcs
+            .iter()
+            .any(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }) && is_forged(vc)),
+        "neg: no emitted negation VC may carry the precondition beside a bare `Var(ok)` body"
+    );
+    let neg_binding = binds(Formula::Eq(var("other"), int(-2_147_483_648)));
+    let neg_replica = VerificationCondition {
+        kind: VcKind::NegationOverflow { ty: i32_ty.clone() },
+        function: "crate::f".into(),
+        location: SourceSpan::default(),
+        formula: Formula::And(vec![neg_binding.clone(), Formula::Var("ok".into(), Sort::Bool)]),
+        contract_metadata: None,
+        obligation: Some(trust_types::ObligationRecord {
+            body: Formula::Var("ok".into(), Sort::Bool),
+            wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+                facts: vec![neg_binding],
+            }],
+            subject: None,
+            width: None,
+        }),
+    };
+    let (kind, verdict) = trustir_safety_vc_adequate_kind(&neg, &neg_replica);
+    assert!(
+        matches!(verdict, RefinementVerdict::KernelRejected(_)),
+        "neg: a `#[requires]` bound the assert's condition local and minted {kind:?} off \
+         it — the MIR never defines `ok`"
     );
 
     // (b) DIV / REM — the same construction off `Eq(z, 0)`, over a variable that is not
@@ -1194,8 +1280,12 @@ fn a_precondition_can_never_define_the_assert_condition_local_the_mir_does_not_d
 /// the same property on real extracted MIR.)
 #[test]
 fn a_mir_bound_assert_condition_local_still_supplies_the_certified_core() {
-    let func =
-        assert_cond_func("d", 0, AssertMessage::DivisionByZero, Ty::Int { width: 32, signed: false });
+    let func = assert_cond_func(
+        "d",
+        0,
+        AssertMessage::DivisionByZero,
+        Ty::Int { width: 32, signed: false },
+    );
     // Authenticated: the body is the bare assert-condition local `Var(COND)`; the block
     // definition `Eq(COND, Eq(d, 0))` is a demoted `ConjoinFactsLast` fact. The arm reads
     // the body, sees it is not the core, and resolves it through the MIR-confirmed binding.
@@ -1257,6 +1347,16 @@ fn a_mir_bound_assert_condition_local_still_supplies_the_certified_core() {
 /// table `[_0: i32, x: subject_ty, y: i32]`.
 fn neg_assert_func(subject_local: usize, subject_ty: Ty, neg_local: usize) -> VerifiableFunction {
     let i32t = Ty::Int { width: 32, signed: true };
+    // Trust: 2026-08 admission audit — the compared literal must FIT the compared
+    // local's own type (`binary_operand_matches_type`): real MIR cannot compare an i8
+    // against −2³¹, and that spelling now collapses the whole function to
+    // MalformedTrustIr. Compare against the COMPARED local's own width's MIN instead;
+    // the compared-vs-negated mismatch each caller builds is unchanged.
+    let compared_ty = if subject_local == 1 { &subject_ty } else { &i32t };
+    let compared_min: i128 = match compared_ty {
+        Ty::Int { width, signed: true } if *width < 128 => -(1i128 << (width - 1)),
+        _ => -2_147_483_648,
+    };
     VerifiableFunction {
         name: "f".into(),
         def_path: "crate::f".into(),
@@ -1264,7 +1364,7 @@ fn neg_assert_func(subject_local: usize, subject_ty: Ty, neg_local: usize) -> Ve
         body: VerifiableBody {
             locals: vec![
                 LocalDecl { index: 0, ty: i32t.clone(), name: Some("_0".into()) },
-                LocalDecl { index: 1, ty: subject_ty, name: Some("x".into()) },
+                LocalDecl { index: 1, ty: subject_ty.clone(), name: Some("x".into()) },
                 LocalDecl { index: 2, ty: i32t.clone(), name: Some("y".into()) },
                 LocalDecl { index: 3, ty: Ty::Bool, name: Some("_3".into()) },
             ],
@@ -1276,7 +1376,7 @@ fn neg_assert_func(subject_local: usize, subject_ty: Ty, neg_local: usize) -> Ve
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Eq,
                             Operand::Copy(Place::local(subject_local)),
-                            Operand::Constant(ConstValue::Int(-2_147_483_648)),
+                            Operand::Constant(ConstValue::Int(compared_min)),
                         ),
                         span: SourceSpan::default(),
                     }],
@@ -1323,31 +1423,76 @@ fn neg_assert_func(subject_local: usize, subject_ty: Ty, neg_local: usize) -> Ve
 /// i32 subject, and the SAME `Some(NegOverflow(W32))` with `ProvenModulo3` for the i8
 /// subject — a kernel-checked 32-bit negation-overflow claim about an `i8`, a type that
 /// cannot hold −2³¹.
+///
+/// Trust: 2026-08 vcgen campaign — the emitter refuses this assert upstream now, so the
+/// hostile pair is driven on hand-built replicas of the retired assert-route VC; the
+/// emitter-driven half pins the upstream fail-closed refusal. See the in-test note.
 #[test]
 fn a_dominating_assert_over_an_unrelated_variable_can_never_certify_a_negation() {
+    // Trust: 2026-08 campaign re-triage. The EMITTER now refuses the mismatched assert
+    // upstream (`cond_binds_operand` in `v2_build_assert_negation_vc`): no assert-lane
+    // NegationOverflow VC exists, a fail-closed `RecognizedSafetyAssertProofGap`
+    // UnsupportedMir row stands in for it, and the surviving per-statement row is
+    // about `y` — the operand this MIR actually negates — which certifying is honest,
+    // not the forgery (the function gate now rests on that honest row, so the old
+    // "gate must not pass" assertion no longer applies). The CONSUMER-side subject
+    // gate this test pins is exercised on a hand-built replica of the retired
+    // assert-route shape, which remains reachable through deserialized VCs.
     let i32t = Ty::Int { width: 32, signed: true };
     let i8t = Ty::Int { width: 8, signed: true };
-    for (tag, subject_ty) in
-        [("i32 subject", i32t.clone()), ("i8 subject — a 32-bit claim about an i8", i8t)]
-    {
+    for (tag, subject_ty, compared_min) in [
+        ("i32 subject", i32t.clone(), -2_147_483_648i128),
+        ("i8 subject — a 32-bit claim about an i8", i8t, -128),
+    ] {
         // `x` (local 1) is compared; `y` (local 2) is negated.
         let func = neg_assert_func(1, subject_ty, 2);
+        let vcs = trust_vcgen::generate_vcs(&func);
+        assert!(
+            vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+                if kind == "RecognizedSafetyAssertProofGap(OverflowNeg)")),
+            "{tag}: the mismatched OverflowNeg assert must keep a fail-closed proof-gap row"
+        );
         let got = minted(&func, |k| matches!(k, VcKind::NegationOverflow { .. }));
         assert!(
             !got.is_empty(),
             "{tag}: the emitter no longer raises a `NegationOverflow` VC for the \
-             `OverflowNeg` assert lowering; this test's subject is gone"
+             `OverflowNeg` assert lowering; this test's control is gone"
         );
+        // Whatever certifies is the honest per-statement row about `y` at `y`'s own
+        // width — never a claim minted off the comparison of `x`.
         for (kind, proven) in &got {
             assert!(
-                !proven,
-                "{tag}: minted {kind:?} for a negation of `y` off a comparison of `x` — the \
-                 certified proposition is about a variable the obligation never negates"
+                !proven || *kind == Some(IrSafetyVcKind::NegOverflow(IrSWidth::W32)),
+                "{tag}: minted {kind:?} for a negation of `y` off a comparison of `x`"
             );
         }
+        // The retired assert-route shape, hand-built: a genuine, MIR-confirmed
+        // comparison — on `x` — must never supply the certificate, because `y` is what
+        // this MIR negates.
+        let binding = Formula::Eq(
+            Box::new(Formula::Var("_3".into(), Sort::Bool)),
+            Box::new(Formula::Eq(var("x"), int(compared_min))),
+        );
+        let replica = VerificationCondition {
+            kind: VcKind::NegationOverflow { ty: i32t.clone() },
+            function: "crate::f".into(),
+            location: SourceSpan::default(),
+            formula: Formula::And(vec![binding.clone(), Formula::Var("_3".into(), Sort::Bool)]),
+            contract_metadata: None,
+            obligation: Some(trust_types::ObligationRecord {
+                body: Formula::Var("_3".into(), Sort::Bool),
+                wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast {
+                    facts: vec![binding],
+                }],
+                subject: None,
+                width: None,
+            }),
+        };
+        let (kind, verdict) = trustir_safety_vc_adequate_kind(&func, &replica);
         assert!(
-            !function_safety_vcs_faithful_via_trustir(&func),
-            "{tag}: the function-level gate must not pass either"
+            !matches!(verdict, RefinementVerdict::ProvenModulo3),
+            "{tag}: minted {kind:?} for a negation of `y` off a comparison of `x` — the \
+             certified proposition is about a variable the obligation never negates"
         );
     }
 }
@@ -1523,8 +1668,7 @@ fn a_mixed_or_hides_an_occurrence_from_the_uadd_universal_and_must_decline() {
     // to the SHARED `ConjoinFactsLast`) certifies — so the decline above is the hidden-range
     // vacuity failure, not an unrecognized body or a failed authentication.
     assert_eq!(
-        trustir_safety_vc_adequate_kind(&no_assert_func(), &uadd_vc(0, 255, (u8t.clone(), u8t)))
-            .0,
+        trustir_safety_vc_adequate_kind(&no_assert_func(), &uadd_vc(0, 255, (u8t.clone(), u8t))).0,
         Some(IrSafetyVcKind::UAddOverflow(IrUWidth::W8)),
         "the honest recorded shape with SHARED operand ranges must still certify"
     );
@@ -1971,10 +2115,7 @@ fn a_mixed_path_guard_or_declines_at_every_lane_not_only_the_arithmetic_one() {
         kind: VcKind::IndexOutOfBounds,
         function: "crate::f".into(),
         location: SourceSpan::default(),
-        formula: mixed(
-            Formula::Ge(var("i"), var("len")),
-            Formula::Ge(var("j"), var("other_len")),
-        ),
+        formula: mixed(Formula::Ge(var("i"), var("len")), Formula::Ge(var("j"), var("other_len"))),
         contract_metadata: None,
         obligation: None,
     };
@@ -1983,10 +2124,7 @@ fn a_mixed_path_guard_or_declines_at_every_lane_not_only_the_arithmetic_one() {
         kind: VcKind::DivisionByZero,
         function: "crate::f".into(),
         location: SourceSpan::default(),
-        formula: mixed(
-            Formula::Eq(var("b"), int(0)),
-            Formula::Eq(var("c"), int(0)),
-        ),
+        formula: mixed(Formula::Eq(var("b"), int(0)), Formula::Eq(var("c"), int(0))),
         contract_metadata: None,
         obligation: None,
     };
@@ -2010,8 +2148,10 @@ fn a_mixed_path_guard_or_declines_at_every_lane_not_only_the_arithmetic_one() {
     // Reported TOGETHER: each lane is a separate instance of the same defect, and a
     // single failing assertion would hide the other two behind the first.
     let lanes = [("bounds", bounds_got), ("div/rem", divzero_got), ("shift", shift_got)];
-    let minting: Vec<_> =
-        lanes.iter().filter(|(_, g)| !matches!(g.1, RefinementVerdict::KernelRejected(_))).collect();
+    let minting: Vec<_> = lanes
+        .iter()
+        .filter(|(_, g)| !matches!(g.1, RefinementVerdict::KernelRejected(_)))
+        .collect();
     assert!(
         minting.is_empty(),
         "no lane may certify its own half of a MIXED `Or` while a body position it never \
@@ -2036,10 +2176,7 @@ fn two_different_body_positions_are_ambiguous_not_a_singleton() {
         location: SourceSpan::default(),
         formula: Formula::Or(vec![
             Formula::And(vec![Formula::Gt(var("g"), int(0)), Formula::Eq(var("b"), int(0))]),
-            Formula::And(vec![
-                Formula::Le(var("g"), int(0)),
-                Formula::Ge(var("i"), var("len")),
-            ]),
+            Formula::And(vec![Formula::Le(var("g"), int(0)), Formula::Ge(var("i"), var("len"))]),
         ]),
         contract_metadata: None,
         obligation: None,
@@ -2060,10 +2197,8 @@ fn two_different_body_positions_are_ambiguous_not_a_singleton() {
 /// WITH its signedness ([`bounds_violation_shape`]) and declined by name.
 #[test]
 fn the_signed_index_bounds_form_is_recognized_and_declined_by_name() {
-    let signed = Formula::Or(vec![
-        Formula::Lt(var("i"), int(0)),
-        Formula::Ge(var("i"), var("len")),
-    ]);
+    let signed =
+        Formula::Or(vec![Formula::Lt(var("i"), int(0)), Formula::Ge(var("i"), var("len"))]);
     assert_eq!(
         bounds_violation_shape(&signed).map(|(_, _, s)| s),
         Some(true),
@@ -2118,9 +2253,8 @@ fn the_signed_index_bounds_form_is_recognized_and_declined_by_name() {
 #[test]
 fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
     let f = no_assert_func();
-    let vacuous = |body: Formula| {
-        Formula::Or(vec![Formula::And(vec![body]), Formula::And(Vec::new())])
-    };
+    let vacuous =
+        |body: Formula| Formula::Or(vec![Formula::And(vec![body]), Formula::And(Vec::new())]);
     let bounds = VerificationCondition {
         kind: VcKind::IndexOutOfBounds,
         function: "crate::f".into(),
@@ -2147,10 +2281,7 @@ fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
         },
         function: "crate::f".into(),
         location: SourceSpan::default(),
-        formula: vacuous(Formula::And(vec![
-            urange("n", 0, 255),
-            Formula::Ge(var("n"), int(32)),
-        ])),
+        formula: vacuous(Formula::And(vec![urange("n", 0, 255), Formula::Ge(var("n"), int(32))])),
         contract_metadata: None,
         obligation: None,
     };
@@ -2158,8 +2289,10 @@ fn an_empty_and_disjunct_is_a_body_position_stating_true_not_a_droppable_one() {
     // Reported TOGETHER, as the D7 test above does: one failing assertion would hide
     // the other two lanes behind the first.
     let lanes = [("bounds", bounds_got), ("div/rem", divzero_got), ("shift", shift_got)];
-    let minting: Vec<_> =
-        lanes.iter().filter(|(_, g)| !matches!(g.1, RefinementVerdict::KernelRejected(_))).collect();
+    let minting: Vec<_> = lanes
+        .iter()
+        .filter(|(_, g)| !matches!(g.1, RefinementVerdict::KernelRejected(_)))
+        .collect();
     assert!(
         minting.is_empty(),
         "an empty `And` disjunct folds to `True`, so the obligation is identically true \
@@ -2244,9 +2377,8 @@ fn a_truthful_recorded_obligation_certifies_and_a_hostile_one_is_declined_ir() {
         contract_metadata: None,
         obligation,
     };
-    let conjoin = |facts: Vec<Formula>| {
-        vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }]
-    };
+    let conjoin =
+        |facts: Vec<Formula>| vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }];
     let div_truthful = trust_types::ObligationRecord {
         body: div_core.clone(),
         wrappers: conjoin(vec![div_hyp.clone()]),
@@ -2306,7 +2438,10 @@ fn a_truthful_recorded_obligation_certifies_and_a_hostile_one_is_declined_ir() {
     };
 
     assert_eq!(
-        proven(trustir_safety_vc_adequate_kind(&raw_neg_func("y", 32), &neg_vc(Some(neg_truthful)))),
+        proven(trustir_safety_vc_adequate_kind(
+            &raw_neg_func("y", 32),
+            &neg_vc(Some(neg_truthful))
+        )),
         (Some(IrSafetyVcKind::NegOverflow(IrSWidth::W32)), true),
         "a TRUTHFUL recorded negation obligation must certify NegOverflow(W32)"
     );

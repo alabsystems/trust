@@ -27,15 +27,14 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::interpret::{InterpretValue, Interpreter};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
 use trust_ir::{Block, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build a trust_ir::Module for a 2-arg integer binop function.
@@ -49,11 +48,8 @@ fn make_binop_module(name: &str, op: BinOp) -> Module {
     let mut module = Module::new("test_module");
 
     // fn(i32, i32) -> i32
-    let func_ty = FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    };
+    let func_ty =
+        FuncTy { params: vec![Ty::I32, Ty::I32], returns: vec![Ty::I32], is_vararg: false };
     module.func_types.push(func_ty);
     let func_ty_id = FuncTyId::new(0);
 
@@ -72,13 +68,7 @@ fn make_binop_module(name: &str, op: BinOp) -> Module {
     block.params.push((arg_a, Ty::I32));
     block.params.push((arg_b, Ty::I32));
     block.body.push(
-        InstrNode::new(Inst::BinOp {
-            op,
-            ty: Ty::I32,
-            lhs: arg_a,
-            rhs: arg_b,
-        })
-        .with_result(sum),
+        InstrNode::new(Inst::BinOp { op, ty: Ty::I32, lhs: arg_a, rhs: arg_b }).with_result(sum),
     );
     block.body.push(InstrNode::new(Inst::Return { values: vec![sum] }));
 
@@ -193,9 +183,9 @@ fn sort_width(sort: &Sort) -> u32 {
 fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
     match f {
         Formula::Var(name, sort) => solver.bv_var(name, sort_width(sort)),
-        Formula::BitVec { value, width } => solver
-            .try_bv_const_bigint(&BigInt::from(*value), *width)
-            .expect("bv const"),
+        Formula::BitVec { value, width } => {
+            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
+        }
         Formula::BvAdd(a, b, _) => {
             let a = formula_to_term(solver, a);
             let b = formula_to_term(solver, b);
@@ -293,13 +283,9 @@ fn interpret_add(module: &Module, a: i128, b: i128) -> i128 {
         InterpretValue::int(Ty::I32, a).expect("arg a"),
         InterpretValue::int(Ty::I32, b).expect("arg b"),
     ];
-    let outcome = interp
-        .execute_func(FuncId::new(0), args)
-        .expect("interpreter execute_func failed");
-    outcome.returns[0]
-        .as_int()
-        .expect("integer return")
-        .as_signed()
+    let outcome =
+        interp.execute_func(FuncId::new(0), args).expect("interpreter execute_func failed");
+    outcome.returns[0].as_int().expect("integer return").as_signed()
 }
 
 // ---------------------------------------------------------------------------

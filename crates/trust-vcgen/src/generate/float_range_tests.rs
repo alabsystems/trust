@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use trust_types::{
     AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
     Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,
@@ -7,15 +9,13 @@ use trust_types::{
 use super::{
     FLOAT_ADD_TINY_OPERAND_BOUND, FLOAT_EXP_BOUND_FUEL, FLOAT_OVERFLOW_DISCHARGE_MARGIN,
     FloatNanMode, FloatRangeCtx, canonicalize_contract_index_segments, contract_range,
-    derive_float_result_range, float_range, generate_callsite_precondition_vcs,
-    generate_callsite_precondition_vcs_attributed, generate_v2_safety_vcs,
-    parse_projection_suffix, precondition_interval_dominance, substitute_summary_params,
-    v2_float_binop_cannot_overflow, v2_float_binop_cannot_overflow_at,
-    float_witness_width_is_supported, v2_float_contract_magnitude_hypotheses,
-    v2_float_overflow_witness_formula,
+    derive_float_result_range, float_range, float_witness_width_is_supported,
+    generate_callsite_precondition_vcs, generate_callsite_precondition_vcs_attributed,
+    generate_v2_safety_vcs, parse_projection_suffix, precondition_interval_dominance,
+    substitute_summary_params, v2_float_binop_cannot_overflow, v2_float_binop_cannot_overflow_at,
+    v2_float_contract_magnitude_hypotheses, v2_float_overflow_witness_formula,
 };
 use crate::modular::{FunctionSummary, SummaryDatabase};
-use std::sync::Arc;
 
 fn f64s() -> Sort {
     Sort::Float { eb: 11, sb: 53 }
@@ -54,7 +54,13 @@ fn make(
         name: "fixture".into(),
         def_path: "test::fixture".into(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions,
         postconditions: vec![],
@@ -67,14 +73,7 @@ fn range_forbid(
     operand: &Operand,
 ) -> Option<(f64, f64)> {
     let ctx = FloatRangeCtx::new(func, None);
-    float_range(
-        &ctx,
-        FloatNanMode::Forbid,
-        block,
-        operand,
-        &mut Vec::new(),
-        FLOAT_EXP_BOUND_FUEL,
-    )
+    float_range(&ctx, FloatNanMode::Forbid, block, operand, &mut Vec::new(), FLOAT_EXP_BOUND_FUEL)
 }
 fn range_nob(
     func: &VerifiableFunction,
@@ -178,10 +177,7 @@ fn multi_def_hull_of_small_consts_discharges() {
     let func = multi_def(1.0, 2.0);
     let t = Operand::Copy(Place::local(2));
     let (lo, hi) = range_forbid(&func, None, &t).expect("hull of {1.0, 2.0}");
-    assert!(
-        lo <= 1.0 && hi >= 2.0 && lo >= 0.5 && hi <= 4.0,
-        "hull ≈ [1, 2], got [{lo}, {hi}]"
-    );
+    assert!(lo <= 1.0 && hi >= 2.0 && lo >= 0.5 && hi <= 4.0, "hull ≈ [1, 2], got [{lo}, {hi}]");
     assert!(v2_float_binop_cannot_overflow(&func, BinOp::Add, &t, &t));
     assert!(float_overflow_kinds(&func).is_empty(), "small hull must discharge the Add");
 }
@@ -273,10 +269,7 @@ fn opaque_terminator_poisons_def_tracing() {
             },
             BasicBlock {
                 id: BlockId(1),
-                stmts: vec![assign(
-                    Place::local(0),
-                    Rvalue::Use(Operand::Copy(Place::local(1))),
-                )],
+                stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(1))))],
                 terminator: Terminator::Return,
             },
         ],
@@ -578,9 +571,7 @@ fn unguarded_float_div_emits_float_overflow_vc() {
     func.preconditions = vec![];
     let kinds = float_overflow_kinds(&func);
     assert!(
-        kinds
-            .iter()
-            .any(|k| matches!(k, VcKind::FloatOverflowToInfinity { op: BinOp::Div, .. })),
+        kinds.iter().any(|k| matches!(k, VcKind::FloatOverflowToInfinity { op: BinOp::Div, .. })),
         "got {kinds:?}"
     );
 }
@@ -764,11 +755,7 @@ fn constant_index_render_matches_contract_spelling() {
     let func = array_param_func(both("arr[0]", 1e10));
     let read = Place {
         local: 1,
-        projections: vec![Projection::ConstantIndex {
-            offset: 0,
-            min_length: 2,
-            from_end: false,
-        }],
+        projections: vec![Projection::ConstantIndex { offset: 0, min_length: 2, from_end: false }],
     };
     assert_eq!(contract_range(&func, &read), Some((-1e10, 1e10)));
 }
@@ -782,10 +769,7 @@ fn parse_projection_suffix_unit() {
         parse_projection_suffix("[3]"),
         Some(vec![Projection::ConstantIndex { offset: 3, min_length: 4, from_end: false }])
     );
-    assert_eq!(
-        parse_projection_suffix("*.2"),
-        Some(vec![Projection::Deref, Projection::Field(2)])
-    );
+    assert_eq!(parse_projection_suffix("*.2"), Some(vec![Projection::Deref, Projection::Field(2)]));
     assert_eq!(
         parse_projection_suffix(".0[3].1"),
         Some(vec![
@@ -846,6 +830,7 @@ fn f5_caller() -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "callee".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -956,6 +941,7 @@ fn clamp_func() -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::f64::<impl f64>::clamp".to_string(),
                     args: vec![Operand::Copy(Place::local(1)), fconst(0.0), fconst(1.0)],
@@ -967,10 +953,7 @@ fn clamp_func() -> VerifiableFunction {
             },
             BasicBlock {
                 id: BlockId(1),
-                stmts: vec![assign(
-                    Place::local(0),
-                    Rvalue::Use(Operand::Copy(Place::local(2))),
-                )],
+                stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(2))))],
                 terminator: Terminator::Return,
             },
         ],
@@ -1040,6 +1023,7 @@ fn summary_caller(pre: Vec<Formula>) -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "leaf".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -1177,6 +1161,34 @@ fn derive_result_range_rejects_non_f64_returns() {
 }
 
 #[test]
+fn derive_result_range_does_not_reuse_a_stale_pre_tail_assignment() {
+    let func = make(
+        vec![decl(0, Ty::f64_ty(), None)],
+        vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![assign(Place::local(0), Rvalue::Use(fconst(1.0)))],
+            terminator: Terminator::TailCall {
+                func: "test::unknown_float".into(),
+                args: Vec::new(),
+                span: SourceSpan::default(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                callee_identity: None,
+            },
+        }],
+        0,
+        Ty::f64_ty(),
+        vec![],
+    );
+    assert_eq!(
+        derive_float_result_range(&func),
+        None,
+        "the TailCall result overwrites `_0`; its earlier assignment is not a return summary"
+    );
+}
+
+#[test]
 fn derive_result_range_uses_per_def_guard_context() {
     // The div def sits under its own dominating `len ∈ [1e-3, 1e3]`-style
     // contract; the hull over {a/len, 0.0} must come out bounded (each _0
@@ -1221,6 +1233,7 @@ fn abs_guarded_div(reseat: bool) -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::f64::<impl f64>::abs".to_string(),
                     args: vec![Operand::Copy(Place::local(2))],
@@ -1342,22 +1355,21 @@ fn witness_magnitude_shapes_are_disjunctive_round11() {
     let lhs = Operand::Copy(Place::local(1));
     let rhs = Operand::Copy(Place::local(2));
     for op in [BinOp::Add, BinOp::Sub] {
-        let w =
-            v2_float_overflow_witness_formula(&func, op, &lhs, &rhs).expect("witness minted");
+        let w = v2_float_overflow_witness_formula(&func, op, &lhs, &rhs).expect("witness minted");
         let Formula::And(conjuncts) = w else { panic!("{op:?} witness must be And") };
         assert!(
             conjuncts.iter().any(|c| matches!(c, Formula::Or(items) if items.len() == 2)),
             "{op:?} witness must carry the DISJUNCTIVE magnitude shape"
         );
     }
-    let w = v2_float_overflow_witness_formula(&func, BinOp::Mul, &lhs, &rhs)
-        .expect("witness minted");
+    let w =
+        v2_float_overflow_witness_formula(&func, BinOp::Mul, &lhs, &rhs).expect("witness minted");
     assert!(
         matches!(w, Formula::Or(ref items) if items.len() == 2),
         "Mul witness must be the two-operand disjunction"
     );
-    let w = v2_float_overflow_witness_formula(&func, BinOp::Div, &lhs, &rhs)
-        .expect("witness minted");
+    let w =
+        v2_float_overflow_witness_formula(&func, BinOp::Div, &lhs, &rhs).expect("witness minted");
     let Formula::And(conjuncts) = w else { panic!("Div witness must be And") };
     assert_eq!(
         conjuncts.len(),
@@ -1427,10 +1439,7 @@ fn user_crate_trig_suffixes_are_not_unit_bounded() {
         "mycrate::act::tanh",
         "mycrate::f64::cos_unchecked",
     ] {
-        assert!(
-            !super::is_unit_bounded_float_call(forged),
-            "`{forged}` must not be unit-bounded"
-        );
+        assert!(!super::is_unit_bounded_float_call(forged), "`{forged}` must not be unit-bounded");
     }
     for genuine in ["std::f64::<impl f64>::cos", "core::f64::<impl f64>::sin"] {
         assert!(super::is_unit_bounded_float_call(genuine), "`{genuine}` must stay recognized");
@@ -1449,14 +1458,7 @@ fn range_forbid_db(
     operand: &Operand,
 ) -> Option<(f64, f64)> {
     let ctx = FloatRangeCtx::new(func, Some(db));
-    float_range(
-        &ctx,
-        FloatNanMode::Forbid,
-        block,
-        operand,
-        &mut Vec::new(),
-        FLOAT_EXP_BOUND_FUEL,
-    )
+    float_range(&ctx, FloatNanMode::Forbid, block, operand, &mut Vec::new(), FLOAT_EXP_BOUND_FUEL)
 }
 
 // ---- W3 item 2: caller-proved parameter-interval overrides ----
@@ -1597,9 +1599,8 @@ fn callee_trace_derives_a_context_sensitive_interval() {
     assert_eq!(derive_float_result_range(&callee), None, "static lane must be stuck");
     let db = traced_leaf_db(callee);
     let caller = summary_caller(both("x", 2.0));
-    let (lo, hi) =
-        range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(2)))
-            .expect("context-sensitive interval");
+    let (lo, hi) = range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(2)))
+        .expect("context-sensitive interval");
     assert!(lo <= -1.0 && lo >= -1.001 && hi >= 1.0 && hi <= 1.001, "got [{lo}, {hi}]");
     // …and the r*r Mul downstream discharges through it.
     assert!(mul_discharges_with(&caller, &db));
@@ -1641,7 +1642,9 @@ fn callee_trace_requires_matching_extracted_arity() {
 // exact production residual shape (48 unknowns in a3d-geom).
 
 fn vec3_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "Vec3".into(),
         fields: vec![
             ("x".into(), Ty::f64_ty()),
@@ -1650,16 +1653,22 @@ fn vec3_ty() -> Ty {
         ],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn aabb_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "Aabb".into(),
         fields: vec![("min".into(), vec3_ty()), ("max".into(), vec3_ty())],
         variants: Vec::new(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn vec3_bounds(base: &str, c: f64) -> Vec<Formula> {
@@ -1686,7 +1695,12 @@ fn vec3_new_callee() -> VerifiableFunction {
             stmts: vec![assign(
                 Place::local(0),
                 Rvalue::Aggregate(
-                    AggregateKind::Adt { name: "Vec3".into(), variant: 0, active_field: None, args: None },
+                    AggregateKind::Adt {
+                        name: "Vec3".into(),
+                        variant: 0,
+                        active_field: None,
+                        args: None,
+                    },
                     vec![
                         Operand::Copy(Place::local(1)),
                         Operand::Copy(Place::local(2)),
@@ -1751,6 +1765,7 @@ fn vec3_add_callee() -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "Vec3::new".to_string(),
                     args: vec![
@@ -1775,10 +1790,8 @@ fn vec3_add_callee() -> VerifiableFunction {
 fn center_caller() -> VerifiableFunction {
     // fn center(&self: &Aabb) -> Vec3, requires |self.min.*|,|self.max.*| <= 1e149:
     //   _2 = (*_1).0; _3 = (*_1).1; _4 = add(_2, _3); _5 = scale(_4, 0.5); _0 = _5
-    let deref_field = |f: usize| Place {
-        local: 1,
-        projections: vec![Projection::Deref, Projection::Field(f)],
-    };
+    let deref_field =
+        |f: usize| Place { local: 1, projections: vec![Projection::Deref, Projection::Field(f)] };
     let mut pre: Vec<Formula> = Vec::new();
     for (fld, base) in [(0, "self*.0"), (1, "self*.1")] {
         let _ = fld;
@@ -1807,12 +1820,10 @@ fn center_caller() -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "Vec3::add".to_string(),
-                    args: vec![
-                        Operand::Copy(Place::local(2)),
-                        Operand::Copy(Place::local(3)),
-                    ],
+                    args: vec![Operand::Copy(Place::local(2)), Operand::Copy(Place::local(3))],
                     dest: Place::local(4),
                     target: Some(BlockId(1)),
                     span: SourceSpan::default(),
@@ -1825,6 +1836,7 @@ fn center_caller() -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "Vec3::scale".to_string(),
                     args: vec![Operand::Move(Place::local(4)), fconst(0.5)],
@@ -1865,8 +1877,8 @@ fn center_chain_db() -> SummaryDatabase {
     let mut scale_pre = vec3_bounds("self", 1.0e150);
     scale_pre.push(le_f("s", 1.0e150));
     scale_pre.push(ge_f("s", -1.0e150));
-    let mut scale = FunctionSummary::new("Vec3::scale")
-        .with_param_names(vec!["self".into(), "s".into()]);
+    let mut scale =
+        FunctionSummary::new("Vec3::scale").with_param_names(vec!["self".into(), "s".into()]);
     scale = scale.with_precondition(Formula::And(scale_pre));
     db.insert(scale);
     db
@@ -1918,10 +1930,8 @@ fn center_chain_production_dump_suppresses_both_precondition_vcs() {
     db.insert(scale_summary);
 
     let vcs = generate_callsite_precondition_vcs(&center, &db);
-    let pre: Vec<_> = vcs
-        .iter()
-        .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
-        .collect();
+    let pre: Vec<_> =
+        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
     assert!(
         pre.is_empty(),
         "the production center chain must discharge both callsites, got {} VC(s): {:?}",
@@ -1955,12 +1965,7 @@ fn mat_chain_row_dot_production_dump_suppresses_the_dot_precondition() {
     let mut db = SummaryDatabase::new();
     db.insert(
         FunctionSummary::new("Vec4::new")
-            .with_param_names(vec![
-                "_1".into(),
-                "_2".into(),
-                "_3".into(),
-                "_4".into(),
-            ])
+            .with_param_names(vec!["_1".into(), "_2".into(), "_3".into(), "_4".into()])
             .with_extracted_body(Arc::new(new)),
     );
     let mut row_summary = FunctionSummary::new("Mat2::row")
@@ -1979,10 +1984,8 @@ fn mat_chain_row_dot_production_dump_suppresses_the_dot_precondition() {
     db.insert(dot_summary);
 
     let vcs = generate_callsite_precondition_vcs(&mul_row, &db);
-    let pre: Vec<_> = vcs
-        .iter()
-        .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
-        .collect();
+    let pre: Vec<_> =
+        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
     assert!(
         pre.is_empty(),
         "the row(0).dot(v) chain must discharge, got {} VC(s): {:?}",
@@ -2017,11 +2020,7 @@ fn deep_chain_through_normalized_division_suppresses_the_dot_precondition() {
             .with_param_names(vec!["_1".into(), "_2".into(), "_3".into()])
             .with_extracted_body(Arc::new(new)),
     );
-    for (name, f) in [
-        ("Vec3::sub", &sub),
-        ("Vec3::normalized", &normalized),
-        ("Vec3::dot", &dot),
-    ] {
+    for (name, f) in [("Vec3::sub", &sub), ("Vec3::normalized", &normalized), ("Vec3::dot", &dot)] {
         let params: Vec<String> = if f.body.arg_count == 1 {
             vec!["self".into()]
         } else {
@@ -2037,10 +2036,8 @@ fn deep_chain_through_normalized_division_suppresses_the_dot_precondition() {
     }
 
     let vcs = generate_callsite_precondition_vcs(&fwd, &db);
-    let pre: Vec<_> = vcs
-        .iter()
-        .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
-        .collect();
+    let pre: Vec<_> =
+        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
     assert!(
         pre.is_empty(),
         "the sub→normalized→dot chain must discharge, got {} VC(s): {:?}",
@@ -2059,9 +2056,7 @@ fn deep_chain_guarded_division_emits_no_float_div_obligation() {
     let vcs = generate_v2_safety_vcs(&half);
     let float_divs: Vec<_> = vcs
         .iter()
-        .filter(|vc| {
-            matches!(&vc.kind, VcKind::FloatOverflowToInfinity { op: BinOp::Div, .. })
-        })
+        .filter(|vc| matches!(&vc.kind, VcKind::FloatOverflowToInfinity { op: BinOp::Div, .. }))
         .collect();
     assert!(
         float_divs.is_empty(),
@@ -2078,8 +2073,7 @@ fn a3d_geom_whole_crate_residual_diagnosis() {
     // and report which callsite-precondition VCs still mint for the
     // residual functions. Diagnostic: prints the census; asserts only
     // that the harness ran (the numeric goal is tracked outside).
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/a3d-geom-2026-07-18");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/a3d-geom-2026-07-18");
     let mut db = SummaryDatabase::new();
     let mut fns: Vec<VerifiableFunction> = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("fixture dir") {
@@ -2091,19 +2085,14 @@ fn a3d_geom_whole_crate_residual_diagnosis() {
         // Mat4-class contracts nest ~64 `And` levels — use the
         // depth-tolerant parser (the same one the compiler uses for VC
         // payloads).
-        let f: VerifiableFunction =
-            trust_types::json_depth::from_str_deep(&raw).expect("parse");
+        let f: VerifiableFunction = trust_types::json_depth::from_str_deep(&raw).expect("parse");
         fns.push(f);
     }
     for f in &fns {
         let arg_count = f.body.arg_count;
         let params: Vec<String> = (1..=arg_count)
             .map(|i| {
-                f.body
-                    .locals
-                    .get(i)
-                    .and_then(|l| l.name.clone())
-                    .unwrap_or_else(|| format!("_{i}"))
+                f.body.locals.get(i).and_then(|l| l.name.clone()).unwrap_or_else(|| format!("_{i}"))
             })
             .collect();
         let mut s = FunctionSummary::new(f.def_path.clone())
@@ -2170,9 +2159,8 @@ fn mat_chain_soundness_twins() {
     db.insert(dot_summary.clone());
     let vcs = generate_callsite_precondition_vcs(&mul_row, &db);
     assert!(
-        vcs.iter().any(
-            |vc| matches!(&vc.kind, VcKind::Precondition { callee } if callee == "Vec4::dot")
-        ),
+        vcs.iter()
+            .any(|vc| matches!(&vc.kind, VcKind::Precondition { callee } if callee == "Vec4::dot")),
         "missing transitive new must keep the dot VC minted: {:?}",
         vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
     );
@@ -2201,9 +2189,8 @@ fn mat_chain_soundness_twins() {
     db2.insert(dot_summary);
     let vcs = generate_callsite_precondition_vcs(&mul_row, &db2);
     assert!(
-        vcs.iter().any(
-            |vc| matches!(&vc.kind, VcKind::Precondition { callee } if callee == "Mat2::row")
-        ),
+        vcs.iter()
+            .any(|vc| matches!(&vc.kind, VcKind::Precondition { callee } if callee == "Mat2::row")),
         "a violated int precondition (r >= 1, actual 0) must mint: {:?}",
         vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
     );
@@ -2240,10 +2227,8 @@ fn center_chain_without_transitive_callee_summary_mints_the_scale_vc() {
     db.insert(scale_summary);
 
     let vcs = generate_callsite_precondition_vcs(&center, &db);
-    let pre: Vec<_> = vcs
-        .iter()
-        .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
-        .collect();
+    let pre: Vec<_> =
+        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
     assert_eq!(pre.len(), 1, "exactly the scale callsite must mint: {pre:?}");
     assert!(
         matches!(&pre[0].kind, VcKind::Precondition { callee } if callee == "Vec3::scale"),
@@ -2257,10 +2242,8 @@ fn center_chain_call_dest_actual_suppresses_both_precondition_vcs() {
     let caller = center_caller();
     let db = center_chain_db();
     let vcs = generate_callsite_precondition_vcs(&caller, &db);
-    let pre: Vec<_> = vcs
-        .iter()
-        .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
-        .collect();
+    let pre: Vec<_> =
+        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
     assert!(
         pre.is_empty(),
         "both chain callsites must discharge structurally (F5 + F6b), got {} VC(s): {:?}",
@@ -2310,6 +2293,7 @@ fn forwarder(callee: &str) -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -2321,10 +2305,7 @@ fn forwarder(callee: &str) -> VerifiableFunction {
             },
             BasicBlock {
                 id: BlockId(1),
-                stmts: vec![assign(
-                    Place::local(0),
-                    Rvalue::Use(Operand::Copy(Place::local(1))),
-                )],
+                stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(Place::local(1))))],
                 terminator: Terminator::Return,
             },
         ],
@@ -2431,6 +2412,7 @@ fn pair_caller(pre: Vec<Formula>) -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "leaf".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -2478,7 +2460,12 @@ fn call_dest_field_read_traces_through_the_extracted_body() {
 }
 
 fn option_kind(variant: usize) -> AggregateKind {
-    AggregateKind::Adt { name: "core::option::Option".into(), variant, active_field: None, args: None }
+    AggregateKind::Adt {
+        name: "core::option::Option".into(),
+        variant,
+        active_field: None,
+        args: None,
+    }
 }
 
 /// `fn maybe(v: f64, c: bool) -> Option<f64>`-shaped callee: the Some arm
@@ -2512,6 +2499,7 @@ fn option_callee(via_copy: bool, none_only: bool, call_def: bool) -> VerifiableF
             terminator: Terminator::Call {
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "mystery".to_string(),
                 args: vec![],
@@ -2522,11 +2510,7 @@ fn option_callee(via_copy: bool, none_only: bool, call_def: bool) -> VerifiableF
             },
         }
     } else {
-        BasicBlock {
-            id: BlockId(1),
-            stmts: some_stmts,
-            terminator: Terminator::Goto(BlockId(3)),
-        }
+        BasicBlock { id: BlockId(1), stmts: some_stmts, terminator: Terminator::Goto(BlockId(3)) }
     };
     make(
         vec![
@@ -2583,6 +2567,7 @@ fn option_caller(pre: Vec<Formula>) -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "leaf".to_string(),
                     args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -2629,9 +2614,8 @@ fn option_payload_read_hulls_only_the_matching_variant_defs() {
     // comes from a variant-1 def).
     let db = option_db(option_callee(false, false, false));
     let caller = option_caller(both("x", 2.0));
-    let (lo, hi) =
-        range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(4)))
-            .expect("payload interval");
+    let (lo, hi) = range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(4)))
+        .expect("payload interval");
     assert!(lo <= -1.0 && lo >= -1.001 && hi >= 1.0 && hi <= 1.001, "got [{lo}, {hi}]");
 }
 
@@ -2641,9 +2625,8 @@ fn option_payload_collector_recurses_through_whole_local_copies() {
     // construction-def collector must flatten through the copy.
     let db = option_db(option_callee(true, false, false));
     let caller = option_caller(both("x", 2.0));
-    let (lo, hi) =
-        range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(4)))
-            .expect("payload interval through the copy hop");
+    let (lo, hi) = range_forbid_db(&caller, &db, Some(BlockId(1)), &Operand::Copy(Place::local(4)))
+        .expect("payload interval through the copy hop");
     assert!(lo <= -1.0 && hi >= 1.0 && hi <= 1.001, "got [{lo}, {hi}]");
 }
 
@@ -2680,11 +2663,7 @@ fn use_temp_field_read_rebases_onto_the_contract_chain() {
     let inner_ty = Ty::Tuple(vec![Ty::f64_ty(), Ty::f64_ty()]);
     let outer_ty = Ty::Tuple(vec![inner_ty.clone()]);
     let func = make(
-        vec![
-            decl(0, Ty::f64_ty(), None),
-            decl(1, outer_ty, Some("a")),
-            decl(2, inner_ty, None),
-        ],
+        vec![decl(0, Ty::f64_ty(), None), decl(1, outer_ty, Some("a")), decl(2, inner_ty, None)],
         vec![BasicBlock {
             id: BlockId(0),
             stmts: vec![
@@ -2697,10 +2676,7 @@ fn use_temp_field_read_rebases_onto_the_contract_chain() {
         Ty::f64_ty(),
         both("a.0.1", 1e10),
     );
-    assert_eq!(
-        range_forbid(&func, None, &Operand::Copy(Place::field(2, 1))),
-        Some((-1e10, 1e10))
-    );
+    assert_eq!(range_forbid(&func, None, &Operand::Copy(Place::field(2, 1))), Some((-1e10, 1e10)));
     // A SECOND identical copy def is now SOUNDLY hulled (the mixed
     // multi-def hull): both defs are `_2 = copy(a.0)`, so a read of `_2.1`
     // yields `a.0.1` on EITHER reaching def — the hull over both is the
@@ -2708,10 +2684,9 @@ fn use_temp_field_read_rebases_onto_the_contract_chain() {
     // rebase lane's conservatism; the reused-slot case — `look_at_rh`'s
     // basis vectors — is exactly this shape.)
     let mut two_defs = func.clone();
-    two_defs.body.blocks[0].stmts.insert(
-        1,
-        assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::field(1, 0)))),
-    );
+    two_defs.body.blocks[0]
+        .stmts
+        .insert(1, assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::field(1, 0)))));
     assert_eq!(
         range_forbid(&two_defs, None, &Operand::Copy(Place::field(2, 1))),
         Some((-1e10, 1e10))
@@ -2722,10 +2697,9 @@ fn use_temp_field_read_rebases_onto_the_contract_chain() {
     // poisons the whole hull.
     let mut mixed = func.clone();
     mixed.body.locals.push(decl(3, Ty::Tuple(vec![Ty::f64_ty(), Ty::f64_ty()]), Some("u")));
-    mixed.body.blocks[0].stmts.insert(
-        1,
-        assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::local(3)))),
-    );
+    mixed.body.blocks[0]
+        .stmts
+        .insert(1, assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::local(3)))));
     assert_eq!(range_forbid(&mixed, None, &Operand::Copy(Place::field(2, 1))), None);
 }
 
@@ -2761,12 +2735,10 @@ fn compose_scalar_field_actual_dominates_through_copy_temps() {
                     terminator: Terminator::Call {
                         unwind: trust_types::UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "scale".to_string(),
-                        args: vec![
-                            Operand::Move(Place::local(3)),
-                            Operand::Move(Place::local(4)),
-                        ],
+                        args: vec![Operand::Move(Place::local(3)), Operand::Move(Place::local(4))],
                         dest: Place::local(5),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
@@ -2894,10 +2866,7 @@ fn multi_def_aggregate_one_unbounded_element_fails_closed() {
     // …and a contract on the param restores the hull.
     let mut bounded = func.clone();
     bounded.preconditions = both("x", 5.0);
-    assert_eq!(
-        range_forbid(&bounded, None, &Operand::Copy(Place::field(3, 0))),
-        Some((-5.0, 5.0))
-    );
+    assert_eq!(range_forbid(&bounded, None, &Operand::Copy(Place::field(3, 0))), Some((-5.0, 5.0)));
 }
 
 // ---- W3 item 6: abs-guard caps (the fdiv probe) ----
@@ -2938,6 +2907,7 @@ fn fdiv_abs_probe(cap: f64, false_edge: bool, reseat_a: bool) -> VerifiableFunct
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::f64::<impl f64>::abs".to_string(),
                     args: vec![Operand::Copy(Place::local(2))],
@@ -2967,6 +2937,7 @@ fn fdiv_abs_probe(cap: f64, false_edge: bool, reseat_a: bool) -> VerifiableFunct
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::f64::<impl f64>::abs".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],

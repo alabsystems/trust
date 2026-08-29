@@ -28,7 +28,8 @@ pub use binary::{
     BinaryFunctionSelection, BinaryLiftOptions, ExactReplayInstructionAttestation,
     ExactReplayInstructionWitness, ExactReplaySelectedImage, ExactReplaySliceAttestation,
     LiftedBinary, LiftedFunctionFailure, LiftedFunctionSeed, LiftedFunctionSeedSource,
-    LiftedSourceMapping, LiftedSourceProvenance, LiftedSourceProvenanceStatus, lift_binary_to_trust_ir,
+    LiftedSourceMapping, LiftedSourceProvenance, LiftedSourceProvenanceStatus,
+    lift_binary_to_trust_ir,
 };
 pub use boundary::FunctionBoundary;
 pub use calling_convention::{CallingConvention, FunctionSignature};

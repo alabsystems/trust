@@ -65,9 +65,7 @@ fn kernel_bool(tc: &TypeChecker<'_>, op: &str, a: &[u64], b: &[u64]) -> bool {
     match reduced.kind() {
         ExprKind::Const(name, _) if name.to_string() == "Bool.true" => true,
         ExprKind::Const(name, _) if name.to_string() == "Bool.false" => false,
-        other => panic!(
-            "kernel whnf left `{op}` stuck on limbs {a:?} / {b:?}: got {other:?}"
-        ),
+        other => panic!("kernel whnf left `{op}` stuck on limbs {a:?} / {b:?}: got {other:?}"),
     }
 }
 
@@ -148,17 +146,17 @@ impl Rng {
 /// by transcription is re-measured here against the executing kernel.
 fn edge_values() -> Vec<Vec<u64>> {
     vec![
-        vec![],                        // 0
-        vec![1],                       // 1
+        vec![],  // 0
+        vec![1], // 1
         vec![2],
-        vec![u64::MAX],                // 2^64 - 1
-        vec![0, 1],                    // 2^64
-        vec![1, 1],                    // 2^64 + 1
-        vec![u64::MAX, u64::MAX],      // 2^128 - 1
-        vec![0, 0, 1],                 // 2^128
-        vec![5, 0, 0],                 // non-canonical spelling of 5
-        vec![0, u64::MAX, 1],          // mixed magnitude
-        vec![u64::MAX, 0, 0, 1],       // 4 limbs, sparse
+        vec![u64::MAX],           // 2^64 - 1
+        vec![0, 1],               // 2^64
+        vec![1, 1],               // 2^64 + 1
+        vec![u64::MAX, u64::MAX], // 2^128 - 1
+        vec![0, 0, 1],            // 2^128
+        vec![5, 0, 0],            // non-canonical spelling of 5
+        vec![0, u64::MAX, 1],     // mixed magnitude
+        vec![u64::MAX, 0, 0, 1],  // 4 limbs, sparse
     ]
 }
 
@@ -210,9 +208,9 @@ fn subtraction_truncates_identically_across_the_boundary() {
     let env = Environment::new();
     let tc = TypeChecker::new(&env);
     let pairs: [(&[u64], &[u64]); 4] = [
-        (&[0, 1], &[1, 1]),                 // 2^64 - (2^64 + 1) = 0
-        (&[1, 1], &[0, 1]),                 // (2^64 + 1) - 2^64 = 1
-        (&[u64::MAX], &[0, 1]),             // (2^64 - 1) - 2^64 = 0
+        (&[0, 1], &[1, 1]),                  // 2^64 - (2^64 + 1) = 0
+        (&[1, 1], &[0, 1]),                  // (2^64 + 1) - 2^64 = 1
+        (&[u64::MAX], &[0, 1]),              // (2^64 - 1) - 2^64 = 0
         (&[0, 0, 1], &[u64::MAX, u64::MAX]), // 2^128 - (2^128 - 1) = 1
     ];
     for (a, b) in pairs {

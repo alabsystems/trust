@@ -22,6 +22,9 @@ use attr_wrapper::{AttrWrapper, UsePreAttrPos};
 pub use diagnostics::AttemptLocalParseRecovery;
 // Public to use it for custom `if` expressions in rustfmt forks like https://github.com/tucant/rustfmt
 pub use expr::LetChainsPolicy;
+// Trust: the stock-surviving loop-clause attribute transport funnels through
+// the NATIVE clause parser; re-exported so `rustc_expand` can desugar it.
+pub use generics::parse_trust_loop_clause_attr;
 // Trust (I8): `trust_clean_decls_from_text` is re-exported one level so
 // `crate::trust_parse_clean_unit_decls` (the out-of-line `.clean` unit parse,
 // called from `rustc_expand`'s loader) can reach it without widening

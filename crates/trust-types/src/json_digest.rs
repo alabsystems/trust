@@ -889,10 +889,7 @@ mod tests {
         let as_int = canonical_digest_json_value(&Formula::Int(wide as i128)).unwrap();
         let as_uint = canonical_digest_json_value(&Formula::UInt(wide)).unwrap();
         assert_ne!(as_int, as_uint);
-        assert_ne!(
-            serde_json::to_vec(&as_int).unwrap(),
-            serde_json::to_vec(&as_uint).unwrap(),
-        );
+        assert_ne!(serde_json::to_vec(&as_int).unwrap(), serde_json::to_vec(&as_uint).unwrap(),);
 
         // On the raw/tagged lane the sort separation lives in the tag key
         // itself: serialize_i128 and serialize_u128 stay distinguishable even
@@ -930,8 +927,7 @@ mod tests {
             canonical_digest_json_value(&i128_range_guard_formula()).unwrap(),
             canonical_digest_json_value(&Formula::Int(i128::MIN)).unwrap(),
             canonical_digest_json_value(&Formula::UInt(u128::MAX)).unwrap(),
-            canonical_digest_json_value(&Formula::BitVec { value: i128::MIN, width: 128 })
-                .unwrap(),
+            canonical_digest_json_value(&Formula::BitVec { value: i128::MIN, width: 128 }).unwrap(),
             canonical_digest_json_value(&Formula::FpConst { bits: u128::MAX, eb: 15, sb: 113 })
                 .unwrap(),
             canonical_digest_json_value(&i128::MIN).unwrap(),

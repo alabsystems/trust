@@ -265,8 +265,7 @@ pub const COROUTINE_RESUME_CONTRACT_ROW_SOLVER: &str = "trust-classifier";
 /// Exact `reason` stamped on the published contract row. Consumers (targo's
 /// partition) require this exact string as part of the row-shape check, so a
 /// hand-built row that merely claims the kind cannot green.
-pub const COROUTINE_RESUME_CONTRACT_ROW_REASON: &str =
-    "proved-under-exported-precondition: every compiler-inserted ResumedAfterReturn/Panic/Drop \
+pub const COROUTINE_RESUME_CONTRACT_ROW_REASON: &str = "proved-under-exported-precondition: every compiler-inserted ResumedAfterReturn/Panic/Drop \
      sentinel was discharged by the solver under the coroutine resume-state entry contract; \
      the crate's proof remains conditional on every caller establishing the resume state";
 
@@ -298,8 +297,7 @@ pub const COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX: &str =
 /// Exact `reason` stamped on a contract-conditional row, naming the premise the
 /// row's formula consumed. Consumers require this exact string as part of the
 /// fail-closed row-shape check.
-pub const COROUTINE_RESUME_CONDITIONAL_ROW_REASON: &str =
-    "conditional-on-exported-precondition: this obligation was discharged under the coroutine \
+pub const COROUTINE_RESUME_CONDITIONAL_ROW_REASON: &str = "conditional-on-exported-precondition: this obligation was discharged under the coroutine \
      resume-state entry assumption injected at function entry, which dominates every block; the \
      result is conditional on every caller establishing the resume state and is NOT an \
      unconditional proof";
@@ -596,10 +594,9 @@ mod tests {
     /// marker-free, and round-trips the original kind it wraps.
     #[test]
     fn coroutine_resume_conditional_kind_is_distinct_and_round_trips() {
-        for s in [
-            COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX,
-            COROUTINE_RESUME_CONDITIONAL_ROW_REASON,
-        ] {
+        for s in
+            [COROUTINE_RESUME_CONDITIONAL_ROW_KIND_PREFIX, COROUTINE_RESUME_CONDITIONAL_ROW_REASON]
+        {
             let lower = s.to_ascii_lowercase();
             for marker in FULL_VERIFIER_MARKERS {
                 assert!(
@@ -641,8 +638,7 @@ mod tests {
         assert_eq!(states, vec![0]);
         assert_eq!(sentinel, "resumed after return");
 
-        let desc =
-            coroutine_resume_contract_obligation_description(&[0, 3], "resumed after panic");
+        let desc = coroutine_resume_contract_obligation_description(&[0, 3], "resumed after panic");
         let (states, sentinel) =
             parse_coroutine_resume_contract_obligation_description(&desc).expect("round trip");
         assert_eq!(states, vec![0, 3]);

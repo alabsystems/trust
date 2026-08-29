@@ -695,8 +695,6 @@ impl ObligationSetDiff {
     }
 }
 
-
-
 /// The CANONICAL CLASS of an obligation kind — what the two producers must agree
 /// on for them to be talking about the same obligation.
 ///
@@ -758,9 +756,7 @@ fn l0_obligation_key_set(
     vcs: &[VerificationCondition],
 ) -> std::collections::BTreeMap<(String, SpanKey), SourceSpan> {
     vcs.iter()
-        .map(|vc| {
-            ((obligation_class(&vc.kind), span_key(&vc.location)), vc.location.clone())
-        })
+        .map(|vc| ((obligation_class(&vc.kind), span_key(&vc.location)), vc.location.clone()))
         .collect()
 }
 
@@ -1254,6 +1250,7 @@ pub fn flip_contract_verdicts_with_module(
 #[cfg(test)]
 mod tests {
     use trust_types::UnwindEdge;
+
     use super::*;
     use crate::parity::tests as oracle;
 
@@ -2164,9 +2161,31 @@ mod tests {
 
     /// LIVE-FIRING (shift): `fn shl(x,n){x<<n}` (`/tmp/vfdump2/shl.json`) flips
     /// SPINE-SOURCED (formula) on the LIVE-path VC set. The spine reconstructs
-    /// trust-vcgen's full live formula
+    /// trust-vcgen's full live STATEMENT-row formula
     /// `And([env, And([Eq(_3, Lt(n, 32)), And([range(n), Ge(n, 32)])])])`
     /// byte-for-byte (cond binding + shift-range violation, param-env wrapped).
+    ///
+    ///
+    /// ONE ROW, and that is the suppression working. This fixture is the CANONICAL
+    /// exactly-bound chain — `_3 = Lt(Copy _2, const 32u32); assert(Move _3,
+    /// Overflow(Shl)) -> bb1` with `bb1: _0 = Shl(Copy _1, Copy _2)` — so the
+    /// assert lane emits the row and the statement lane suppresses its duplicate.
+    /// That duplicate is the VACUOUS one: it sits in the assert's TARGET block
+    /// under the threaded `AssertHolds` guard, where its violation reduces to
+    /// `_3 AND NOT _3`, UNSAT for every program, and it shipped as a `proved`
+    /// row at the span of a genuinely-false overflow. The survivor carries
+    /// `PathGuardOr { paths: [Raw] }` — built in the assert's OWN block, before
+    /// the guard is threaded — so it is the refutable one.
+    ///
+    /// The DUAL-row expectation belongs to NON-CANONICAL shapes, where both lanes
+    /// must report ("duplicates over-report, they never under-report"). That is
+    /// `trust-vcgen/tests/projected_shift_canary_real_mir.rs`'s job, and it is a
+    /// genuine defect surface: the projected chain under-reported to ZERO
+    /// shift-family rows until the assert lane was taught to bind projected
+    /// comparison inputs. Do not port that expectation back here — trust-vcgen's
+    /// own `shift_overflow_canary_keeps_exactly_one_non_vacuous_obligation` pins
+    /// exactly ONE row for the canonical shape, "not a self-guarded duplicate
+    /// that can only ever be `proved`".
     #[test]
     fn live_path_shift_shl_flips_spine_sourced_formula() {
         use trust_types::ProofLevel;
@@ -2176,19 +2195,39 @@ mod tests {
                 .iter()
                 .filter(|vc| matches!(vc.kind, VcKind::ShiftOverflow { .. }))
                 .count();
-            assert_eq!(shift_count, 1, "[{max_level:?}] one shift VC expected: {solver_vcs:?}");
+            assert_eq!(
+                shift_count, 1,
+                "[{max_level:?}] one shift row expected — canonical chain, so the assert \
+                 lane emits and the vacuous statement duplicate is suppressed: {solver_vcs:?}"
+            );
             let before = solver_vcs.clone();
             let (after, report) = flip_safety_verdicts_to_spine(&func, solver_vcs);
             assert_verdict_identical(&before, &after);
             assert_eq!(
                 report.spine_sourced_formula(),
                 1,
-                "[{max_level:?}] LIVE-path shl shift VC must flip SPINE-SOURCED (formula): {report:?}"
+                "[{max_level:?}] LIVE-path shl statement row must flip SPINE-SOURCED (formula): {report:?}"
             );
             assert_eq!(
                 report.spine_sourced_kept_formula(),
                 0,
                 "[{max_level:?}] no kept-formula expected for live-path shl shift: {report:?}"
+            );
+            // The flipped row is genuinely a spine reconstruction; the assert-lane
+            // row's formula is NOT one (it stays vcgen-sourced, fail-closed).
+            let spine_matched: Vec<bool> = after
+                .iter()
+                .map(|vc| {
+                    matches!(vc.kind, VcKind::ShiftOverflow { .. })
+                        && reconstruct_full_safety_formula_candidates(&func, &vc.location, &vc.kind)
+                            .iter()
+                            .any(|c| formula_eq_modulo_versions(c, &vc.formula))
+                })
+                .collect();
+            assert_eq!(
+                spine_matched.iter().filter(|m| **m).count(),
+                1,
+                "[{max_level:?}] exactly one shift row is a spine reconstruction"
             );
         }
     }
@@ -2203,17 +2242,29 @@ mod tests {
     /// cond binding via the shared self-contained-comparison helper), so the formula
     /// now lives on the spine. Asserted against the LIVE
     /// `generate_vcs_with_discharge_and_summaries` path.
+    ///
+    /// DUAL ROWS (2026-08-21, `4ca0cb0eac` campaign): the live path now emits TWO
+    /// `NegationOverflow` VCs at the one negation span — the statement row above
+    /// plus the cond-bound ASSERT-lane row (path-guarded via `Not(_2)`, carrying
+    /// the destination-typed range facts). Over-report is the design; the
+    /// statement row is suppressed only under exact cond-bound authority. The
+    /// flip's ambiguous-vcgen lane flips EXACTLY the one row the spine reproduces
+    /// byte-for-byte and leaves the assert-lane row trust-vcgen-sourced — both
+    /// rows stay dispatched, nothing is dropped.
     #[test]
     fn live_path_negation_ng_flips_spine_sourced_formula() {
         use trust_types::ProofLevel;
         for max_level in [ProofLevel::L0Safety, ProofLevel::L1Functional] {
             let (func, solver_vcs) = live_path_vcs("/tmp/vfdump3/ng.json", max_level);
-            // Sanity: exactly one negation VC at one span (uniquely flippable).
             let neg_count = solver_vcs
                 .iter()
                 .filter(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
                 .count();
-            assert_eq!(neg_count, 1, "[{max_level:?}] one negation VC expected: {solver_vcs:?}");
+            assert_eq!(
+                neg_count, 1,
+                "[{max_level:?}] one negation row expected — canonical chain, so the assert \
+                 lane emits and the vacuous statement duplicate is suppressed: {solver_vcs:?}"
+            );
             let before = solver_vcs.clone();
             let target_flags: Vec<bool> = before
                 .iter()
@@ -2221,7 +2272,8 @@ mod tests {
                 .collect();
             let (after, report) = flip_safety_verdicts_to_spine(&func, solver_vcs);
             assert_verdict_identical(&before, &after);
-            // The negation VC specifically flips spine-sourced (formula).
+            // Exactly ONE of the two negation rows flips spine-sourced (formula):
+            // the statement row the spine reproduces byte-for-byte.
             let neg_spine_formula = report
                 .decisions
                 .iter()
@@ -2230,18 +2282,31 @@ mod tests {
                 .count();
             assert_eq!(
                 neg_spine_formula, 1,
-                "[{max_level:?}] LIVE-path ng negation VC must flip SPINE-SOURCED (formula): {report:?}"
+                "[{max_level:?}] LIVE-path ng statement row must flip SPINE-SOURCED (formula): {report:?}"
             );
-            // And the dispatched negation formula is genuinely a spine reconstruction.
-            let neg_vc = after
+            // And the flipped row's formula is genuinely a spine reconstruction,
+            // while the assert-lane row's is not (it stays vcgen-sourced).
+            let neg_matches: Vec<bool> = after
                 .iter()
-                .find(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
-                .expect("a negation VC is present");
-            let cands =
-                reconstruct_full_safety_formula_candidates(&func, &neg_vc.location, &neg_vc.kind);
-            assert!(
-                cands.iter().any(|c| formula_eq_modulo_versions(c, &neg_vc.formula)),
-                "[{max_level:?}] the dispatched negation formula must be a spine reconstruction"
+                .zip(report.decisions.iter())
+                .filter(|(vc, _)| matches!(vc.kind, VcKind::NegationOverflow { .. }))
+                .map(|(vc, d)| {
+                    let is_recon =
+                        reconstruct_full_safety_formula_candidates(&func, &vc.location, &vc.kind)
+                            .iter()
+                            .any(|c| formula_eq_modulo_versions(c, &vc.formula));
+                    assert_eq!(
+                        is_recon,
+                        *d == FlipDecision::SpineSourcedFormula,
+                        "[{max_level:?}] a negation row flips iff the spine reconstructs it"
+                    );
+                    is_recon
+                })
+                .collect();
+            assert_eq!(
+                neg_matches.iter().filter(|m| **m).count(),
+                1,
+                "[{max_level:?}] exactly one negation row is a spine reconstruction"
             );
         }
     }
@@ -2327,6 +2392,12 @@ mod tests {
         for (path, label) in [
             ("/tmp/vfdump3/mul.json", "mul(i32)"),
             ("/tmp/vfmul/umul.json", "umul(u32)"),
+            // Moved here from the sub-multiset loop, following that block's own
+            // instruction ("If vcgen returns to single-row emission here ... move
+            // the entry back into the byte-equal loop above"). Both are CANONICAL
+            // exactly-bound chains, so the assert lane emits and the vacuous
+            // statement duplicate is suppressed: native's multiset is byte-EQUAL,
+            // not one short.
             ("/tmp/vfdump2/shl.json", "shl(shift)"),
             ("/tmp/vfdump3/ng.json", "ng(neg)"),
         ] {
@@ -2342,6 +2413,14 @@ mod tests {
             vk.sort();
             assert_eq!(nk, vk, "[{label}] native-generated VC set must equal trust-vcgen's L0 set");
         }
+        // NO DUAL-ROW CLASSES REMAIN. shift and negation moved to the byte-equal
+        // loop above: both fixtures are canonical exactly-bound chains, so
+        // trust-vcgen emits ONE row per operation and native matches it byte for
+        // byte. If a fixture is ever added whose shape is NOT exactly bound, its
+        // two lanes both report and it belongs in a sub-multiset loop like the one
+        // that used to live here -- see
+        // trust-vcgen/tests/projected_shift_canary_real_mir.rs, which pins exactly
+        // that "duplicates over-report, they never under-report" contract.
         // BOUNDS (idx): native CANONICALIZES the slice length (`s__slice_len`), so its
         // FORMULA intentionally differs from trust-vcgen's raw-local form (this is what
         // lets a guarded slice index's dominating guard bind the violation). It still
@@ -2756,9 +2835,13 @@ mod tests {
                 let count = solver_vcs.iter().filter(|vc| is_target(vc)).count();
                 // The ambiguity precondition: >= 2 same-class VCs at one span.
                 assert!(
-                    count >= 2,
-                    "[{label} {max_level:?}] expected >=2 same-class div/rem-by-zero VCs (the \
-                     same-span ambiguity disambiguation resolves): got {count}"
+                    count >= 1,
+                    "[{label} {max_level:?}] expected >=1 same-class div/rem-by-zero VC. The \
+                     same-span DUPLICATE this once disambiguated no longer arises: the canonical \
+                     chain binds, so the vacuous statement row is suppressed and one refutable \
+                     row remains (the co-located ArithmeticOverflow{{Div}} is a DIFFERENT fine \
+                     class). Every assertion below still pins the flip's behaviour on it: got \
+                     {count}"
                 );
                 // The div/rem-by-zero VCs are all at one shared span+class.
                 let spans: std::collections::HashSet<_> = solver_vcs
@@ -3828,8 +3911,9 @@ mod tests {
 ///     `helper`). Fixed by [`l0_obligation_set_diff_with_discharged`].
 #[cfg(test)]
 mod missing_obligation_ratchet {
-    use super::*;
     use std::path::{Path, PathBuf};
+
+    use super::*;
 
     /// ZERO. Not a ceiling, not a whitelist — every obligation the trust-ir spine
     /// derives is one trust-vcgen either dispatches or has already proved.
@@ -3855,7 +3939,7 @@ mod missing_obligation_ratchet {
     /// the spine's generator walks `Terminator::Assert` and NOTHING ELSE, while
     /// trust-vcgen also derives obligations from place projections and from panic
     /// calls:
-    ///  * `BoundsCheck` (24, was 38 before the C1/C1b slice range-index lanes) —
+    ///  * `BoundsCheck` (27, was 38 before the C1/C1b slice range-index lanes) —
     ///    non-range shapes: arrayvec truncate, BigNat limbs, ascii,
     ///    `SliceIndex::get`, plus range calls whose receiver or endpoint falls
     ///    outside the modeled scope. The 4 projection-derived rows
@@ -3871,13 +3955,83 @@ mod missing_obligation_ratchet {
     ///    site (the diverging panic-call arm: `Assert(const false)` + NoPanic +
     ///    `Unreachable` + a PanicFreedom obligation), so this gap is ACCOUNTING —
     ///    see `EXPECTED_ASSERTION_VCGEN_ONLY_ROWS` for the defer rationale.
-    ///  * `ArithmeticOverflow(Add)` (37) — concentrated in probe fixtures.
+    ///  * `ArithmeticOverflow(Add)` (36) — concentrated in probe fixtures.
     ///
     /// Lowering this is progress; raising it means coverage was retired. Note the
     /// asymmetry with the zero-gate above: ADDING spine derivation is the risky
     /// direction now, because anything the spine derives that trust-vcgen does not
     /// lands in `native_only` and fail-closes the compiler.
-    const VCGEN_ONLY_CEILING: usize = 125;
+    ///
+    /// RE-PINNED 125 → 313 (2026-08-21, post-merge of the UncheckedBinaryOp /
+    /// exact-authority trust-vcgen campaign, `4ca0cb0eac`). The growth is vcgen
+    /// EMITTING MORE, not the spine deriving less — verified class-by-class with
+    /// an instrumented run (per-row def_path attribution), because a raised
+    /// ceiling that merely absorbs a number would be exactly the laundering this
+    /// gate exists to catch:
+    ///  * `Unreachable` **+185** (the whole jump, 185 rows / 175 functions):
+    ///    the campaign deleted the `exhaustive_enum_unreachable` suppression in
+    ///    `overflow_vc.rs::v2_build_terminator_vc` — that flag is serialized
+    ///    public input, not proof authority, so the per-VC `Unreachable` row is
+    ///    now ALWAYS emitted (an unauthenticated hint may never erase an
+    ///    obligation). The spine's generator walks `Terminator::Assert` and
+    ///    nothing else, so every one of these lands in vcgen_only: a documented
+    ///    enumeration gap, dispatched and checked by trust-vcgen regardless.
+    ///  * arithmetic classes net +3 (non-Unreachable total 128 vs the old 125
+    ///    ceiling): the campaign models `UncheckedBinaryOp` — "every admitted
+    ///    site emits its ArithmeticOverflow VC in the safety walk" — so
+    ///    `wrapping_*` / `unchecked_*` bodies now carry rows that did not exist
+    ///    before (e.g. `wrapping_mul`/`wrapping_sub`/`unchecked_mul` sites in
+    ///    the corpus census). The pre-existing diagnosed classes are unmoved:
+    ///    BoundsCheck 24 (still at its class ceiling), Assertion 22 (still
+    ///    exactly the identity pin), `ArithmeticOverflow(Add)` 37 → 36.
+    /// Full class map at pin time: {Add 36, Mul 8, Rem 1, Shl 1, Shr 3, Sub 7,
+    /// Assertion 22, BoundsCheck 24, CopyBoundsViolation 7, DivisionByZero 4,
+    /// FfiBoundaryViolation 2, NegationOverflow 5, RemainderByZero 1,
+    /// UnboundedAllocation 7, Unreachable 185}. The ceiling-finding message now
+    /// prints this map itself, so the next re-pin does not need the
+    /// instrumented run this one did.
+    ///
+    /// RE-PINNED 313 → 314 (2026-08-26, `decline-handling-2026-08-25` intake).
+    /// ONE row, named: `BoundsCheck@probes2.rs:44:14` in
+    /// `probes2::q7_boxslice_range`
+    /// (`decline-handling-2026-08-25/dumps/q7_boxslice_range.json`). It is a
+    /// PRE-EXISTING spine gap that no prior fixture reached, not a new one:
+    ///  * the whole-corpus per-row census is byte-identical to pristine HEAD's
+    ///    except for this single row — no other row moved in either direction;
+    ///  * running those 11 new dumps through pristine HEAD's spine + trust-vcgen
+    ///    reproduces the same row, so no branch diff caused it;
+    ///  * the dump itself is byte-identical whether produced by pristine HEAD's
+    ///    `trustc` or this branch's, so the fixture is not an artifact of the
+    ///    extractor change either.
+    /// THE GAP: `lower::slice_range_index_call_plan` declines a call with a
+    /// cleanup unwind successor (its G8 discipline — a real cleanup edge is CFG
+    /// the plan does not model), while trust-vcgen's RangeIndex arm emits the
+    /// `SliceBoundsCheck` regardless. `q7`'s receiver is an owned `Box<[u8]>`,
+    /// so its `<[u8] as Index<RangeTo<usize>>>::index` call carries
+    /// `unwind: Cleanup` — the first corpus body to combine a modeled slice
+    /// length, an admissible endpoint AND a drop edge. Measured by isolation:
+    /// flipping only that terminator's `unwind` to `Continue` makes the spine
+    /// emit the row and the gap close. Nothing is unchecked — trust-vcgen still
+    /// dispatches it; widening G8 to model the cleanup edge retires the row.
+    ///
+    /// RE-PINNED 314 -> 364 (2026-08-28, exact callee-identity recovery).
+    /// Commits `9f00605c17`, `fd9f900a35`, and `e6bed6dc93` authenticated call
+    /// identities across call forms, kept those identities well typed, and
+    /// forwarded only the exactly recognized erased-generic identity. That made
+    /// 53 previously declined fixture bodies comparable; the exact decline
+    /// census below names those 53 retired rows. Their newly visible difference
+    /// is +51 `Unreachable` and +2 `BoundsCheck`: trust-vcgen already emitted and
+    /// dispatched every row, while the assert-only spine does not derive those
+    /// classes. This is more cross-check coverage, not a hidden obligation or a
+    /// spine regression.
+    ///
+    /// The full measured class-map delta from the prior 314 pin is: Mul -1,
+    /// Shl -1, Shr -3, BoundsCheck +2, UncheckedArithmeticOverflow +1,
+    /// UncheckedIndexBounds +1, and Unreachable +51; every other class is
+    /// unchanged. Thus the 53 recovered comparisons add 53 visible rows while
+    /// independent class closures/reclassification net -3, for 364 total.
+    /// `native_only` remains exactly zero: nothing the spine derives is unchecked.
+    const VCGEN_ONLY_CEILING: usize = 364;
 
     /// Trust (#63): the spine's DECLINE CENSUS — the pinned set of dump instances
     /// whose `generate_native_safety_vcs` returns `None`, keyed
@@ -3971,17 +4125,43 @@ mod missing_obligation_ratchet {
     /// The second control is also the KEY's own proof. That def_path is ALREADY
     /// in this table — as `ae6144ec175edbda`, a different dump of the same
     /// function that DOES decline — so a `def_path`-keyed gate would have stayed
-    /// green while a compared instance was pinned as a decliner. Seven of the 227
-    /// census def_paths have further dumps in the corpus that are compared today;
-    /// those are exactly the slots where a real regression would have been silent
-    /// under the old key.
+    /// green while a compared instance was pinned as a decliner. At the original
+    /// 227-row pin, seven census def_paths had further dumps in the corpus that
+    /// were compared; those were exactly the slots where a real regression would
+    /// have been silent under the old key.
+    ///
+    /// RE-KEYED 2026-08-26 — 19 rows, hash side only. The raw-tag re-decode
+    /// (`scripts/regen_raw_enum_tag_fixtures.py`) rewrote `cmp::Ordering::Less`
+    /// in 61 dumps, and `content_hash()` is content, so every rewritten dump that
+    /// declines got a new key. This is the CENSUS WORKING, not a regression: the
+    /// same 19 def_paths decline for the same reason before and after, no dump
+    /// entered or left the set, and the aggregate is unchanged. It is also why
+    /// the key is a PAIR — a `def_path`-keyed census could not have told this
+    /// apart from a compared function silently becoming a decliner.
+    ///
+    /// RE-PINNED 227 -> 174 (2026-08-28, exact callee-identity recovery).
+    /// Commits `9f00605c17`, `fd9f900a35`, and `e6bed6dc93` made exactly 53
+    /// pinned bodies comparable. The ratchet reported every retired identity as
+    /// STALE and rendered this surviving set; no fixture disappeared. Removing
+    /// those rows is therefore the intended downward motion of this exact-set
+    /// gate. The recovered bodies expose +51 `Unreachable` and +2
+    /// `BoundsCheck` vcgen-only rows, all still dispatched by trust-vcgen.
     const SPINE_DECLINED_PIN: &[(&str, &str)] = &[
-        // The 225 declines that predate the two INTAKE rows below.
+        // The 172 surviving declines that predate the two INTAKE rows below.
         ("<[T] as lib::BitArray<T>>::bit_length", "0d044330f8215218"),
-        ("<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::fold::<i32, {closure@<i32 as core::iter::traits::accum::Sum<&i32>>::sum<core::slice::iter::Iter<'_, i32>>::{closure#0}}>", "a14702a23ca07be2"),
-        ("<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::next", "571566dc7d3e162a"),
-        ("<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt", "7739181a02c2e548"),
-        ("<expr::types::BigNat as std::cmp::Ord>::cmp", "6706700503686cad"),
+        (
+            "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::fold::<i32, {closure@<i32 as core::iter::traits::accum::Sum<&i32>>::sum<core::slice::iter::Iter<'_, i32>>::{closure#0}}>",
+            "a14702a23ca07be2",
+        ),
+        (
+            "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::next",
+            "571566dc7d3e162a",
+        ),
+        (
+            "<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt",
+            "7739181a02c2e548",
+        ),
+        ("<expr::types::BigNat as std::cmp::Ord>::cmp", "e1e244f3e83f797e"),
         ("<i128 as lib::BitField>::get_bit", "a90e8b292f0b1b3c"),
         ("<i128 as lib::BitField>::set_bit", "1500dc5cdbe22d1f"),
         ("<i16 as lib::BitField>::get_bit", "fcf619f56e35d6e4"),
@@ -3997,33 +4177,10 @@ mod missing_obligation_ratchet {
         ("<lib::ByteSize as core::ops::arith::AddAssign<T>>::add_assign", "cb718900716fe662"),
         ("<lib::ByteSize as core::ops::arith::AddAssign>::add_assign", "ba11eff572fca004"),
         ("<lib::ByteSize as core::ops::arith::MulAssign<T>>::mul_assign", "89e625c04ed6e72e"),
-        ("<lib::Either<L, R> as core::clone::Clone>::clone_from", "137b8b62b1e6d970"),
-        ("<lib::Either<L, R> as core::cmp::Ord>::cmp", "1c1d4461fc7391c1"),
-        ("<lib::Either<L, R> as core::cmp::PartialEq>::eq", "9a2acfa7543aa11b"),
-        ("<lib::Either<L, R> as core::cmp::PartialOrd>::partial_cmp", "ddee88df4b5a2c53"),
-        ("<lib::Either<L, R> as core::convert::AsMut<[Target]>>::as_mut", "0aca333e806a657b"),
-        ("<lib::Either<L, R> as core::convert::AsMut<str>>::as_mut", "c407541f2d916b80"),
-        ("<lib::Either<L, R> as core::convert::AsMut<Target>>::as_mut", "80d8855f15a8d438"),
-        ("<lib::Either<L, R> as core::convert::AsRef<[Target]>>::as_ref", "cfc6f6a0b5deadd9"),
-        ("<lib::Either<L, R> as core::convert::AsRef<str>>::as_ref", "7400c569777e0e4b"),
-        ("<lib::Either<L, R> as core::convert::AsRef<Target>>::as_ref", "4c64add06d6e1bf3"),
-        ("<lib::Either<L, R> as core::fmt::Debug>::fmt", "de27a7c507a3b99d"),
-        ("<lib::Either<L, R> as core::fmt::Display>::fmt", "3698658e3b6a049b"),
-        ("<lib::Either<L, R> as core::fmt::Write>::write_char", "a53017bd293b5e86"),
-        ("<lib::Either<L, R> as core::fmt::Write>::write_fmt", "733844c970226402"),
-        ("<lib::Either<L, R> as core::fmt::Write>::write_str", "3fd48bdcd7346292"),
-        ("<lib::Either<L, R> as core::hash::Hash>::hash", "116c4e9c975f460e"),
-        ("<lib::Either<L, R> as core::ops::deref::Deref>::deref", "de706be0682cd15b"),
-        ("<lib::Either<L, R> as core::ops::deref::DerefMut>::deref_mut", "640cc5d67f42803c"),
-        ("<lib::errors::AsciiError as core::cmp::PartialEq>::eq", "71b02bd7870210b7"),
-        ("<lib::errors::AsciiError as core::fmt::Debug>::fmt", "0cc53abc29bea0c2"),
-        ("<lib::iterator::IterEither<L, R> as core::iter::traits::double_ended::DoubleEndedIterator>::next_back", "3a8a6b96b69c2727"),
-        ("<lib::iterator::IterEither<L, R> as core::iter::traits::double_ended::DoubleEndedIterator>::nth_back", "cb4ae4caf80d2139"),
-        ("<lib::iterator::IterEither<L, R> as core::iter::traits::exact_size::ExactSizeIterator>::len", "012d85606fd2c6b4"),
-        ("<lib::iterator::IterEither<L, R> as core::iter::traits::iterator::Iterator>::next", "0ecb5446538ae8f9"),
-        ("<lib::iterator::IterEither<L, R> as core::iter::traits::iterator::Iterator>::nth", "b504196cf67470f3"),
-        ("<lib::iterator::IterEither<L, R> as core::iter::traits::iterator::Iterator>::size_hint", "db265b9d214f3329"),
-        ("<std::slice::Iter<'_, i32> as std::iter::Iterator>::fold::<i32, {closure@<i32 as std::iter::Sum<&i32>>::sum<std::slice::Iter<'_, i32>>::{closure#0}}>", "d634fc6633dd9fb1"),
+        (
+            "<std::slice::Iter<'_, i32> as std::iter::Iterator>::fold::<i32, {closure@<i32 as std::iter::Sum<&i32>>::sum<std::slice::Iter<'_, i32>>::{closure#0}}>",
+            "d634fc6633dd9fb1",
+        ),
         ("<std::slice::Iter<'_, i32> as std::iter::Iterator>::next", "e9555c1150946b2e"),
         ("<u128 as lib::BitField>::get_bit", "4776e281ee1645e0"),
         ("<u128 as lib::BitField>::set_bit", "9f37adad28cd8170"),
@@ -4049,19 +4206,19 @@ mod missing_obligation_ratchet {
         ("cmp::impls::<impl cmp::Ord for i64>::cmp", "f13eb17e5b9388d8"),
         ("cmp::Ord::clamp", "84ec0c0555f9bbb7"),
         ("cmp::Ordering::as_raw", "3b636abbcd039f4a"),
-        ("cmp::Ordering::reverse", "9d024ecd874f203b"),
-        ("cmp::Ordering::then", "fd99e14c993c1b4c"),
+        ("cmp::Ordering::reverse", "212a69e99f1aacba"),
+        ("cmp::Ordering::then", "ae8f5c3b4751915f"),
         ("core::num::<impl i32>::checked_pow", "87bf1dbc0d40e528"),
         ("core::num::<impl i32>::div_ceil", "674c1762325c18eb"),
         ("core::num::<impl i32>::div_floor", "9785e303f2ae7270"),
         ("core::num::<impl i32>::isqrt", "7408c5ad8e999cd3"),
         ("core::num::<impl i32>::midpoint", "4da22b893f2a6895"),
         ("core::num::<impl i32>::overflowing_pow", "f52f3d0d63b69a8e"),
-        ("core::num::<impl i32>::signum", "2a94ab8a996ea30c"),
+        ("core::num::<impl i32>::signum", "f330d60b06b7bf00"),
         ("core::num::<impl i32>::strict_pow", "12c899fd00b1bc6c"),
         ("core::num::<impl i32>::unchecked_shl", "801ac3e2adc3eeaa"),
-        ("core::num::<impl i64>::signum", "a706b36f70b4fcc4"),
-        ("core::num::<impl i8>::signum", "fd3e6b548c4d063f"),
+        ("core::num::<impl i64>::signum", "a0ed9b680543a9e4"),
+        ("core::num::<impl i8>::signum", "81901dd97c0116bb"),
         ("core::num::<impl u32>::ilog2", "4afc3fbe281e68f6"),
         ("core::num::<impl u32>::one_less_than_next_power_of_two", "850239fc54396aaf"),
         ("core::num::<impl usize>::unchecked_add::precondition_check", "06cbcafd82e8f840"),
@@ -4075,10 +4232,25 @@ mod missing_obligation_ratchet {
         ("core::num::nonzero::NonZero::<u32>::ilog2", "094ddab65ab2a993"),
         ("core::num::nonzero::NonZero::<u32>::new", "00893d35b7537777"),
         ("core::num::nonzero::NonZero::<u8>::new", "57464d39eb9c9486"),
-        ("core::slice::iter::<impl core::iter::traits::collect::IntoIterator for &[i32]>::into_iter", "2738df63c73099d9"),
-        ("core::slice::iter::<impl std::iter::IntoIterator for &[i32]>::into_iter", "83df2ef4de83877c"),
+        (
+            "core::slice::iter::<impl core::iter::traits::collect::IntoIterator for &[i32]>::into_iter",
+            "2738df63c73099d9",
+        ),
+        (
+            "core::slice::iter::<impl std::iter::IntoIterator for &[i32]>::into_iter",
+            "83df2ef4de83877c",
+        ),
         ("core::slice::iter::Iter::<'_, i32>::new", "08b9f642e295a020"),
-        ("crate::exp_bump", "f3fd4d05d65aa8be"),
+        // exp_bump re-hashed 2026-08-21 (was "f3fd4d05d65aa8be"): the `4ca0cb0eac`
+        // campaign re-spelled the fixture extractor-faithfully — its admission
+        // audits reject a widthless signed `ConstValue::Int` against an unsigned
+        // destination, so the u8 Add's constant became `Uint [1, 8]` and the
+        // float-field read was hoisted through a fresh temp, exactly what the
+        // extractor emits (see the fixture's diff in that commit). Same subject,
+        // observed still declining in the same census run; only the content
+        // identity moved — the census going red on a re-spell is precisely the
+        // behavior the content-hash key was chosen for.
+        ("crate::exp_bump", "6d385a7eb8ab2000"),
         ("crate::vec_get", "1aed8bb5b637a0c1"),
         ("deref", "a51e6d29ed470ab3"),
         ("direct_call", "58d03eb8c010a621"),
@@ -4094,23 +4266,13 @@ mod missing_obligation_ratchet {
         ("expr::subst::FoldMemo::get", "a4c3803052d33642"),
         ("expr::subst::FoldMemo::put", "ecd0c309faac4292"),
         ("expr::types::BigNat::mul_big_capped", "92a0ec34d32f899e"),
-        ("expr::visitor::opt::ExprFolderOpt::fold_expr_opt_extensions", "4379341969a517f3"),
-        ("expr::visitor::opt::ExprFolderOpt::fold_expr_opt_inner_full", "7964b898062aa383"),
-        ("expr::visitor::opt::ExprFolderOpt::fold_expr_opt_zfc", "f96f666fba151e4d"),
-        ("expr::visitor::opt::ExprFolderOpt::fold_zfc_set_expr_opt", "1e8fe4d93bc462e6"),
-        ("extract_foldmemo::level::Level::collect_params_impl", "7dfa6207401f04bb"),
-        ("extract_foldmemo::level::Level::has_params_impl", "682d5d8bc85f3596"),
-        ("extract_foldmemo::level::Level::is_nonzero", "ad5fe2f6abd9803c"),
-        ("extract_foldmemo::level::Level::is_zero", "17e1ac8503a00bad"),
-        ("extract_foldmemo::level::Level::substitute_map_impl_opt", "08ea49111feb4fe9"),
-        ("extract_foldmemo::level::Level::substitute_slice_impl_opt", "98f0715eba1cf8e2"),
         ("forgery::F1_dangling_local", "49aca9324254bd29"),
-        ("forgery::G1_signum_cmp_rhs_nonzero", "338e7b99a60d55a1"),
-        ("forgery::G2_signum_wrong_disc_mapping", "9bf7a3e13d6de9ff"),
-        ("forgery::G3_signum_non_ordering_enum", "8b58c86dff167a4d"),
-        ("forgery::G4_signum_flipped_operands", "c02c77180c31c533"),
-        ("forgery::G5_signum_unsigned_cast_dest", "46ff64ec5ed631ae"),
-        ("forgery::G6_signum_valid_control", "5257042c509017bf"),
+        ("forgery::G1_signum_cmp_rhs_nonzero", "85c0c07b98b9c7a8"),
+        ("forgery::G2_signum_wrong_disc_mapping", "2330be33d3902722"),
+        ("forgery::G3_signum_non_ordering_enum", "18f4b6378838d887"),
+        ("forgery::G4_signum_flipped_operands", "e4a4ce3fde3f1afa"),
+        ("forgery::G5_signum_unsigned_cast_dest", "c5b9d8a7275d9130"),
+        ("forgery::G6_signum_valid_control", "1f63a2dd3e1af589"),
         ("halve", "421cc391197e0d14"),
         ("is_even", "065e6e084961b13e"),
         ("is_leap_year", "99ab05fb39368650"),
@@ -4126,27 +4288,13 @@ mod missing_obligation_ratchet {
         ("lib::arch::all::memchr::One::rfind_raw", "9e71868623106510"),
         ("lib::arrayvec::ArrayVec::<T, CAP>::new_const", "5cb39681c865bcce"),
         ("lib::arrayvec::ArrayVec::<T, CAP>::retain::process_one", "a294277d217166b0"),
-        ("lib::Either::<L, R>::as_mut", "193f1e970107f46a"),
-        ("lib::Either::<L, R>::as_pin_mut", "77ebeab62aae1152"),
-        ("lib::Either::<L, R>::as_pin_ref", "62afec6094bdefc5"),
-        ("lib::Either::<L, R>::as_ref", "6a484295825b0d06"),
-        ("lib::Either::<L, R>::factor_iter_mut", "d7587065b0549597"),
-        ("lib::Either::<L, R>::factor_iter", "d228da658638fcd5"),
-        ("lib::Either::<L, R>::iter_mut", "2174e4015f8ac340"),
-        ("lib::Either::<L, R>::iter", "6c0f810ec3612f94"),
-        ("lib::iterator::<impl core::iter::traits::double_ended::DoubleEndedIterator for lib::Either<L, R>>::next_back", "e5bba6dea997cae2"),
-        ("lib::iterator::<impl core::iter::traits::double_ended::DoubleEndedIterator for lib::Either<L, R>>::nth_back", "4e1a8db959b4167f"),
-        ("lib::iterator::<impl core::iter::traits::exact_size::ExactSizeIterator for lib::Either<L, R>>::len", "79f9ce62cad1a37a"),
-        ("lib::iterator::<impl core::iter::traits::iterator::Iterator for lib::Either<L, R>>::next", "68c0693cd077eaf1"),
-        ("lib::iterator::<impl core::iter::traits::iterator::Iterator for lib::Either<L, R>>::nth", "4cb8d6c494e8e9b7"),
-        ("lib::iterator::<impl core::iter::traits::iterator::Iterator for lib::Either<L, R>>::size_hint", "0a82710858cad45b"),
         ("lib::udiv128::u128_mulhi", "6a1ddb48fc755c70"),
         ("lib::udiv128::udivmod_1e19", "97ca8cd00a333e35"),
         ("main::S::bump", "82ddd980b90eba58"),
-        ("num::<impl i16>::signum", "9f57b91fe371e13d"),
-        ("num::<impl i32>::signum", "5257042c509017bf"),
-        ("num::<impl i64>::signum", "d21cb3a9d4117f84"),
-        ("num::<impl i8>::signum", "9b94922315bb2245"),
+        ("num::<impl i16>::signum", "d8c7bb4d89dc7183"),
+        ("num::<impl i32>::signum", "1f63a2dd3e1af589"),
+        ("num::<impl i64>::signum", "5b38c999f3563733"),
+        ("num::<impl i8>::signum", "971808493ecde690"),
         ("p_even_branch", "c8afaa804174c262"),
         ("p_is_even_usize", "eae681e3a08fe311"),
         ("p_is_odd_usize", "8871b08537049c17"),
@@ -4156,8 +4304,7 @@ mod missing_obligation_ratchet {
         ("p_parity", "f9ee2693bddaf0d7"),
         ("parser::_convert_classic_tokens", "3946b6e8bb58891f"),
         ("parser::_get_ast", "4d87e1b2ddecae3f"),
-        ("parser::fold_exprs", "4552e591288ce004"),
-        ("reduction::<impl term::Term>::_apply", "0ea7fea8071b1e8c"),
+        ("reduction::<impl term::Term>::_apply", "9ac18e619713977c"),
         ("reduction::<impl term::Term>::beta_app", "3927a2e33007b13a"),
         ("reduction::<impl term::Term>::beta_hap", "135c24788b0bc509"),
         ("reduction::<impl term::Term>::beta_hno", "08e33d72aec2510b"),
@@ -4170,18 +4317,42 @@ mod missing_obligation_ratchet {
         ("std::num::NonZero::<i64>::new", "1c022513d4e6bd54"),
         ("std::num::NonZero::<u32>::get", "5e23789181280118"),
         ("std::num::NonZero::<u32>::new", "5a8b2f4ea66eb1fa"),
-        ("std::option::Option::<i32>::and_then::<i32, {closure@main.rs:15:16: 15:19}>", "fef0eff00cb2375b"),
-        ("std::option::Option::<i32>::and_then::<i32, {closure@main.rs:17:16: 17:24}>", "7915268a1a16bdcb"),
+        (
+            "std::option::Option::<i32>::and_then::<i32, {closure@main.rs:15:16: 15:19}>",
+            "fef0eff00cb2375b",
+        ),
+        (
+            "std::option::Option::<i32>::and_then::<i32, {closure@main.rs:17:16: 17:24}>",
+            "7915268a1a16bdcb",
+        ),
         ("std::option::Option::<i32>::expect", "76538a8b0171e834"),
-        ("std::option::Option::<i32>::filter::<{closure@main.rs:20:14: 20:17}>", "4690500e691d8abc"),
-        ("std::option::Option::<i32>::map::<i32, {closure@main.rs:10:11: 10:19}>", "07927a68806ad347"),
-        ("std::option::Option::<i32>::map::<i32, {closure@main.rs:26:11: 26:19}>", "0f99f183a4037aa0"),
-        ("std::option::Option::<i32>::map::<i32, {closure@main.rs:5:11: 5:14}>", "bd02b317d3060711"),
+        (
+            "std::option::Option::<i32>::filter::<{closure@main.rs:20:14: 20:17}>",
+            "4690500e691d8abc",
+        ),
+        (
+            "std::option::Option::<i32>::map::<i32, {closure@main.rs:10:11: 10:19}>",
+            "07927a68806ad347",
+        ),
+        (
+            "std::option::Option::<i32>::map::<i32, {closure@main.rs:26:11: 26:19}>",
+            "0f99f183a4037aa0",
+        ),
+        (
+            "std::option::Option::<i32>::map::<i32, {closure@main.rs:5:11: 5:14}>",
+            "bd02b317d3060711",
+        ),
         ("std::option::Option::<i32>::unwrap", "f8103e479a2fdf99"),
-        ("std::option::Option::<u8>::map::<u8, {closure@main.rs:12:11: 12:19}>", "ca3e5e3f7bade044"),
+        (
+            "std::option::Option::<u8>::map::<u8, {closure@main.rs:12:11: 12:19}>",
+            "ca3e5e3f7bade044",
+        ),
         ("std::option::Option::<u8>::map::<u8, {closure@main.rs:7:11: 7:19}>", "1861a0ab16376266"),
         ("std::option::Option::<u8>::unwrap", "1ae34b3770614960"),
-        ("std::ptr::const_ptr::<impl *const T>::offset_from_unsigned::precondition_check", "ca730a2a0ecc740a"),
+        (
+            "std::ptr::const_ptr::<impl *const T>::offset_from_unsigned::precondition_check",
+            "ca730a2a0ecc740a",
+        ),
         ("std::ptr::mut_ptr::<impl *mut T>::add::precondition_check", "ad2acde7927b3952"),
         ("std::result::Result::<i32, u8>::unwrap", "0ae7f1429a408aac"),
         ("std::slice::Iter::<'_, i32>::new", "367323a6cc2c82ca"),
@@ -4199,14 +4370,12 @@ mod missing_obligation_ratchet {
         ("term::Term::unapp_mut", "d0f727ed5ec19b98"),
         ("term::Term::unapp_ref", "d3c141518ee9456c"),
         ("term::Term::unapp", "ab4b67e896872a8f"),
-        ("term::Term::unvar_mut", "6562b41e2c499085"),
-        ("term::Term::unvar_ref", "9f2f87141a2bae14"),
         ("version_meta_for", "f7673ce8a9c97de3"),
-
         // ------------------------------------------------------------------
         // Trust (#63): THE TWO ROWS THAT MADE THE OLD CEILING FIRE. These are
-        // INTAKE, not retired coverage, and separating them from the 225 above
-        // is the whole reason this table is a set and not the number 227.
+        // INTAKE, not retired coverage, and separating them from the original
+        // 225 predecessor rows is the whole reason this table is a set and not
+        // the historical number 227.
         //
         // Both dump files were ADDED by `41189ffd76` ("r4: local mono dumps +
         // FS-CALL-RHS — the bytesize chain closes"), which created
@@ -4237,20 +4406,61 @@ mod missing_obligation_ratchet {
         // Closing the projection lane retires BOTH rows at once, and the census
         // will then go red as STALE — which is correct, and the fix is to delete
         // these two lines.
-        ("<main::bytesize::ByteSize as core::ops::arith::AddAssign<u64>>::add_assign", "e2743b9eca40d162"),
-        ("<main::bytesize::ByteSize as core::ops::arith::MulAssign<u64>>::mul_assign", "18f7529d9044c241"),
+        (
+            "<main::bytesize::ByteSize as core::ops::arith::AddAssign<u64>>::add_assign",
+            "e2743b9eca40d162",
+        ),
+        (
+            "<main::bytesize::ByteSize as core::ops::arith::MulAssign<u64>>::mul_assign",
+            "18f7529d9044c241",
+        ),
     ];
 
     /// Trust (#61, C0): functions dispatching the spine's own VC set — measured
     /// 1809 at pin time. Must never silently fall.
-    const NATIVE_DISPATCH_FLOOR: usize = 1809;
+    ///
+    /// RE-PINNED 1809 → 1656 (2026-08-21, same campaign merge as the
+    /// `VCGEN_ONLY_CEILING` re-pin above; -153). This fall is NOT the spine
+    /// losing capability and NOT an obligation going unchecked — dispatch is
+    /// gated on byte-equality to trust-vcgen's set, and it is trust-vcgen's
+    /// side that moved, in three documented ways:
+    ///  * 151 of the 153: functions whose ONLY new disagreement row is the
+    ///    previously-suppressed per-VC `Unreachable` row (counted directly in
+    ///    the instrumented attribution run — 151 Disagreed functions carry
+    ///    `Unreachable` rows and nothing else). They were byte-equal before;
+    ///    the un-suppression alone moved them out of native dispatch.
+    ///  * the rest: the campaign's DUAL-EMIT (safety walk + cond-bound assert
+    ///    lane both emit a row for one shift/div/rem/neg operation — over-report
+    ///    is the design; 23 fallback functions show the dual-row signature) and
+    ///    its re-founded formulas (destination-typed range facts, cond-bound
+    ///    definition disjuncts), both of which break byte-equality while the
+    ///    (kind, span) enumeration still matches → FlippedFallback, fail-closed.
+    /// Every affected function still dispatches trust-vcgen's own set; the
+    /// zero-gate (`native_only`) stayed empty throughout. Re-closing the gap is
+    /// spine work: derive `Unreachable` obligations and reproduce the dual
+    /// assert-lane rows, then this floor goes back up.
+    const NATIVE_DISPATCH_FLOOR: usize = 1656;
 
     /// Trust (#61, C0): per-class ceilings inside `vcgen_only`, so a campaign that
     /// claims to close one class must move THAT class's number — the aggregate
     /// alone can hide a swap (one class up, another down, total flat). Only the
-    /// two campaign-relevant classes are pinned; the aggregate ceiling bounds the
-    /// rest.
-    const VCGEN_ONLY_CLASS_CEILINGS: &[(&str, usize)] = &[("BoundsCheck", 24)];
+    /// campaign-relevant classes are pinned; the aggregate ceiling bounds the
+    /// rest. `Unreachable` was pinned 2026-08-21 at its intake value: it is 59%
+    /// of the aggregate, so without its own ceiling the aggregate could hide a
+    /// 185-row swap into any other class.
+    ///
+    /// `BoundsCheck` RE-PINNED 24 → 25 (2026-08-26): the same single row that
+    /// moved the aggregate ceiling above, `BoundsCheck@probes2.rs:44:14` in
+    /// `probes2::q7_boxslice_range`. The attribution — pre-existing gap, cause
+    /// isolated to the G8 cleanup-edge decline — is written out there.
+    ///
+    /// RE-PINNED `BoundsCheck` 25 -> 27 and `Unreachable` 185 -> 236
+    /// (2026-08-28): exactly the +2/+51 rows exposed when the 53
+    /// exact-callee-identity bodies stopped declining. See the aggregate ceiling
+    /// and exact decline-census attribution above. Both classes remain emitted
+    /// and dispatched by trust-vcgen; this records newly live comparison coverage.
+    const VCGEN_ONLY_CLASS_CEILINGS: &[(&str, usize)] =
+        &[("BoundsCheck", 27), ("Unreachable", 236)];
 
     /// Trust (#62, C-D0): the Assertion class is IDENTITY-PINNED, not count-bounded.
     ///
@@ -4275,28 +4485,85 @@ mod missing_obligation_ratchet {
     /// `One::{find_raw,rfind_raw}` and itoa `udivmod_1e19`. Adding EXACTLY those,
     /// with this comment updated, is approved; anything else is a finding.
     const EXPECTED_ASSERTION_VCGEN_ONLY_ROWS: &[(&str, &str)] = &[
-        ("core::cmp::impls::<impl core::cmp::Ord for i32>::clamp", "Assertion@core/src/panic.rs:62:8"),
-        ("<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt", "Assertion@library/core/src/panic.rs:62:8"),
-        ("lib::arrayvec::ArrayVec::<T, CAP>::into_inner_unchecked", "Assertion@core/src/macros/mod.rs:51:20"),
+        (
+            "core::cmp::impls::<impl core::cmp::Ord for i32>::clamp",
+            "Assertion@core/src/panic.rs:62:8",
+        ),
+        (
+            "<expr::subst::Lowerer as expr::visitor::opt::ExprFolderOpt>::fold_bvar_opt",
+            "Assertion@library/core/src/panic.rs:62:8",
+        ),
+        (
+            "lib::arrayvec::ArrayVec::<T, CAP>::into_inner_unchecked",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
         ("lib::arrayvec::ArrayVec::<T, CAP>::new", "Assertion@core/src/panic.rs:62:8"),
         ("lib::arrayvec::extend_panic", "Assertion@core/src/panic.rs:62:8"),
-        ("<lib::BigEndian as lib::ByteOrder>::read_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::read_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::read_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::read_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::write_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::write_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::write_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::BigEndian as lib::ByteOrder>::write_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u128_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u16_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u32_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::read_u64_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::write_u128_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::write_u16_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::write_u32_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::BigEndian as lib::ByteOrder>::write_u64_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
         ("lib::check_ascii_printable", "Assertion@core/src/panic.rs:73:8"),
-        ("<lib::LittleEndian as lib::ByteOrder>::read_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::read_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::read_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::read_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::write_u128_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::write_u16_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::write_u32_into", "Assertion@core/src/macros/mod.rs:51:20"),
-        ("<lib::LittleEndian as lib::ByteOrder>::write_u64_into", "Assertion@core/src/macros/mod.rs:51:20"),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u128_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u16_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u32_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::read_u64_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::write_u128_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::write_u16_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::write_u32_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
+        (
+            "<lib::LittleEndian as lib::ByteOrder>::write_u64_into",
+            "Assertion@core/src/macros/mod.rs:51:20",
+        ),
     ];
 
     fn dump_dirs(root: &Path, out: &mut Vec<PathBuf>) {
@@ -4472,7 +4739,10 @@ mod missing_obligation_ratchet {
                 "the spine's coverage gap GREW to {vcgen_only_total} (ceiling \
                  {VCGEN_ONLY_CEILING}). Nothing is unchecked — trust-vcgen still dispatches \
                  these — but the spine stopped cross-checking obligations it used to, which \
-                 is how an over-aggressive fold hides.",
+                 is how an over-aggressive fold hides.\n\
+                 Per-class census (attribute the growth BY CLASS before re-pinning — the \
+                 2026-08-21 re-pin took an instrumented run to recover exactly this map):\n  \
+                 {vcgen_only_by_class:?}",
             ));
         }
 
@@ -4488,10 +4758,8 @@ mod missing_obligation_ratchet {
         //    dispatched producer must never silently fall.
         //  * per-class sub-ceilings: a campaign that claims to close one class must
         //    move THAT class's number; the aggregate alone can hide a swap.
-        let pinned_declined: std::collections::BTreeSet<(String, String)> = SPINE_DECLINED_PIN
-            .iter()
-            .map(|(d, h)| ((*d).to_string(), (*h).to_string()))
-            .collect();
+        let pinned_declined: std::collections::BTreeSet<(String, String)> =
+            SPINE_DECLINED_PIN.iter().map(|(d, h)| ((*d).to_string(), (*h).to_string())).collect();
         let unpinned_declines: std::collections::BTreeSet<(String, String)> =
             spine_declined.difference(&pinned_declined).cloned().collect();
         let vanished_declines: std::collections::BTreeSet<(String, String)> =
@@ -4538,9 +4806,7 @@ mod missing_obligation_ratchet {
         let unexpected_assertion_rows: Vec<&(String, String)> = assertion_rows_observed
             .iter()
             .filter(|(d, k)| {
-                !EXPECTED_ASSERTION_VCGEN_ONLY_ROWS
-                    .iter()
-                    .any(|(pd, pk)| pd == d && pk == k)
+                !EXPECTED_ASSERTION_VCGEN_ONLY_ROWS.iter().any(|(pd, pk)| pd == d && pk == k)
             })
             .collect();
         if !unexpected_assertion_rows.is_empty() {
@@ -4554,13 +4820,16 @@ mod missing_obligation_ratchet {
         }
         for (pd, pk) in EXPECTED_ASSERTION_VCGEN_ONLY_ROWS {
             if !assertion_rows_observed.iter().any(|(d, k)| d == pd && k == pk) {
-                eprintln!("pinned Assertion row no longer observed (downward motion): {pd} :: {pk}");
+                eprintln!(
+                    "pinned Assertion row no longer observed (downward motion): {pd} :: {pk}"
+                );
             }
         }
         for (class, ceiling) in VCGEN_ONLY_CLASS_CEILINGS {
             let n = vcgen_only_by_class.get(*class).copied().unwrap_or(0);
             if n > *ceiling {
-                findings.push(format!("vcgen_only class `{class}` GREW to {n} (ceiling {ceiling})"));
+                findings
+                    .push(format!("vcgen_only class `{class}` GREW to {n} (ceiling {ceiling})"));
             }
         }
 

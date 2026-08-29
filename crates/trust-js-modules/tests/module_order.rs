@@ -19,12 +19,12 @@
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 mod common;
-use common::{drive_async, ModuleSource, TestHost};
-
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
+
+use common::{ModuleSource, TestHost, drive_async};
 use trust_js_modules::{
     ImportEntry, ImportName, IndirectExport, LocalExport, ModuleGraph, ReExportName, StarExport,
 };
@@ -122,13 +122,17 @@ fn gen_js(m: &Mod) -> String {
         match i {
             Imp::Side(f) => writeln!(s, "import {:?};", spec(f)).unwrap(),
             Imp::Default(f, l) => writeln!(s, "import {l} from {:?};", spec(f)).unwrap(),
-            Imp::Named(f, n, l) => writeln!(s, "import {{ {n} as {l} }} from {:?};", spec(f)).unwrap(),
+            Imp::Named(f, n, l) => {
+                writeln!(s, "import {{ {n} as {l} }} from {:?};", spec(f)).unwrap()
+            }
             Imp::Ns(f, l) => writeln!(s, "import * as {l} from {:?};", spec(f)).unwrap(),
         }
     }
     for e in &m.exports {
         match e {
-            Exp::ReNamed(f, n, a) => writeln!(s, "export {{ {n} as {a} }} from {:?};", spec(f)).unwrap(),
+            Exp::ReNamed(f, n, a) => {
+                writeln!(s, "export {{ {n} as {a} }} from {:?};", spec(f)).unwrap()
+            }
             Exp::ReStar(f) => writeln!(s, "export * from {:?};", spec(f)).unwrap(),
             Exp::ReNsAs(f, a) => writeln!(s, "export * as {a} from {:?};", spec(f)).unwrap(),
             _ => {}
@@ -184,10 +188,9 @@ fn build_source(m: &Mod) -> ModuleSource {
     }
     for e in &m.exports {
         match e {
-            Exp::Const(n) => src.local_exports.push(LocalExport {
-                export_name: n.to_string(),
-                local_name: n.to_string(),
-            }),
+            Exp::Const(n) => src
+                .local_exports
+                .push(LocalExport { export_name: n.to_string(), local_name: n.to_string() }),
             Exp::Default => src.local_exports.push(LocalExport {
                 export_name: "default".to_string(),
                 local_name: "*default*".to_string(),
@@ -214,11 +217,23 @@ fn build_source(m: &Mod) -> ModuleSource {
 
 /// A synchronous logging module whose only imports are dependency edges.
 fn dep(name: &'static str, deps: &[&'static str]) -> Mod {
-    Mod { name, imports: deps.iter().map(|d| Imp::Side(d)).collect(), exports: vec![], log: true, tla: false }
+    Mod {
+        name,
+        imports: deps.iter().map(|d| Imp::Side(d)).collect(),
+        exports: vec![],
+        log: true,
+        tla: false,
+    }
 }
 /// A top-level-await logging module with dependency-edge imports.
 fn tla(name: &'static str, deps: &[&'static str]) -> Mod {
-    Mod { name, imports: deps.iter().map(|d| Imp::Side(d)).collect(), exports: vec![], log: true, tla: true }
+    Mod {
+        name,
+        imports: deps.iter().map(|d| Imp::Side(d)).collect(),
+        exports: vec![],
+        log: true,
+        tla: true,
+    }
 }
 /// A module with explicit import/export forms.
 fn m(name: &'static str, imports: Vec<Imp>, exports: Vec<Exp>, log: bool) -> Mod {
@@ -236,94 +251,262 @@ fn graphs() -> Vec<Battery> {
         b("linear_2", vec![dep("main", &["a"]), dep("a", &[])]),
         b("linear_3", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &[])]),
         b("linear_4", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), dep("c", &[])]),
-        b("linear_5", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), dep("c", &["d"]), dep("d", &[])]),
-        b("linear_6", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), dep("c", &["d"]), dep("d", &["e"]), dep("e", &[])]),
+        b(
+            "linear_5",
+            vec![
+                dep("main", &["a"]),
+                dep("a", &["b"]),
+                dep("b", &["c"]),
+                dep("c", &["d"]),
+                dep("d", &[]),
+            ],
+        ),
+        b(
+            "linear_6",
+            vec![
+                dep("main", &["a"]),
+                dep("a", &["b"]),
+                dep("b", &["c"]),
+                dep("c", &["d"]),
+                dep("d", &["e"]),
+                dep("e", &[]),
+            ],
+        ),
         // --- diamonds / fan-out / trees ---
-        b("diamond", vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["c"]), dep("c", &[])]),
-        b("diamond_wide", vec![dep("main", &["a", "b", "c"]), dep("a", &["d"]), dep("b", &["d"]), dep("c", &["d"]), dep("d", &[])]),
+        b(
+            "diamond",
+            vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["c"]), dep("c", &[])],
+        ),
+        b(
+            "diamond_wide",
+            vec![
+                dep("main", &["a", "b", "c"]),
+                dep("a", &["d"]),
+                dep("b", &["d"]),
+                dep("c", &["d"]),
+                dep("d", &[]),
+            ],
+        ),
         b("diamond_asym", vec![dep("main", &["a", "b"]), dep("a", &["b"]), dep("b", &[])]),
-        b("diamond_deep", vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["d"]), dep("c", &["e"]), dep("d", &["e"]), dep("e", &[])]),
-        b("fanout_5", vec![dep("main", &["a", "b", "c", "d", "e"]), dep("a", &[]), dep("b", &[]), dep("c", &[]), dep("d", &[]), dep("e", &[])]),
-        b("tree", vec![dep("main", &["a", "b"]), dep("a", &["c", "d"]), dep("b", &["e", "f"]), dep("c", &[]), dep("d", &[]), dep("e", &[]), dep("f", &[])]),
-        b("shared_leaf", vec![dep("main", &["a", "b", "c"]), dep("a", &["z"]), dep("b", &["z"]), dep("c", &["z"]), dep("z", &[])]),
-        b("wide_then_deep", vec![dep("main", &["a", "b"]), dep("a", &["x", "y"]), dep("b", &["y", "x"]), dep("x", &[]), dep("y", &[])]),
+        b(
+            "diamond_deep",
+            vec![
+                dep("main", &["a", "b"]),
+                dep("a", &["c"]),
+                dep("b", &["d"]),
+                dep("c", &["e"]),
+                dep("d", &["e"]),
+                dep("e", &[]),
+            ],
+        ),
+        b(
+            "fanout_5",
+            vec![
+                dep("main", &["a", "b", "c", "d", "e"]),
+                dep("a", &[]),
+                dep("b", &[]),
+                dep("c", &[]),
+                dep("d", &[]),
+                dep("e", &[]),
+            ],
+        ),
+        b(
+            "tree",
+            vec![
+                dep("main", &["a", "b"]),
+                dep("a", &["c", "d"]),
+                dep("b", &["e", "f"]),
+                dep("c", &[]),
+                dep("d", &[]),
+                dep("e", &[]),
+                dep("f", &[]),
+            ],
+        ),
+        b(
+            "shared_leaf",
+            vec![
+                dep("main", &["a", "b", "c"]),
+                dep("a", &["z"]),
+                dep("b", &["z"]),
+                dep("c", &["z"]),
+                dep("z", &[]),
+            ],
+        ),
+        b(
+            "wide_then_deep",
+            vec![
+                dep("main", &["a", "b"]),
+                dep("a", &["x", "y"]),
+                dep("b", &["y", "x"]),
+                dep("x", &[]),
+                dep("y", &[]),
+            ],
+        ),
         // --- cycles ---
         b("cycle_2", vec![dep("main", &["a"]), dep("a", &["main"])]),
         b("cycle_3", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["main"])]),
         b("cycle_tail", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["a"])]),
-        b("cycle_4", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), dep("c", &["main"])]),
-        b("cycle_plus_leaf", vec![dep("main", &["a", "leaf"]), dep("a", &["main"]), dep("leaf", &[])]),
-        b("two_cycles", vec![dep("main", &["p", "q"]), dep("p", &["p2"]), dep("p2", &["p"]), dep("q", &["q2"]), dep("q2", &["q"])]),
-        b("cycle_shared_dep", vec![dep("main", &["a"]), dep("a", &["b", "z"]), dep("b", &["a", "z"]), dep("z", &[])]),
+        b(
+            "cycle_4",
+            vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), dep("c", &["main"])],
+        ),
+        b(
+            "cycle_plus_leaf",
+            vec![dep("main", &["a", "leaf"]), dep("a", &["main"]), dep("leaf", &[])],
+        ),
+        b(
+            "two_cycles",
+            vec![
+                dep("main", &["p", "q"]),
+                dep("p", &["p2"]),
+                dep("p2", &["p"]),
+                dep("q", &["q2"]),
+                dep("q2", &["q"]),
+            ],
+        ),
+        b(
+            "cycle_shared_dep",
+            vec![dep("main", &["a"]), dep("a", &["b", "z"]), dep("b", &["a", "z"]), dep("z", &[])],
+        ),
         // --- star re-export ---
-        b("star_reexport", vec![
-            m("main", vec![Imp::Named("hub", "x", "x")], vec![], true),
-            m("hub", vec![], vec![Exp::ReStar("a")], true),
-            m("a", vec![], vec![Exp::Const("x")], true),
-        ]),
-        b("star_chain", vec![
-            m("main", vec![Imp::Named("hub2", "x", "x")], vec![], true),
-            m("hub2", vec![], vec![Exp::ReStar("hub1")], true),
-            m("hub1", vec![], vec![Exp::ReStar("a")], true),
-            m("a", vec![], vec![Exp::Const("x")], true),
-        ]),
-        b("star_two_sources", vec![
-            m("main", vec![Imp::Named("hub", "x", "x"), Imp::Named("hub", "y", "y")], vec![], true),
-            m("hub", vec![], vec![Exp::ReStar("a"), Exp::ReStar("b")], true),
-            m("a", vec![], vec![Exp::Const("x")], true),
-            m("b", vec![], vec![Exp::Const("y")], true),
-        ]),
-        b("reexport_named", vec![
-            m("main", vec![Imp::Named("lib", "y", "y")], vec![], true),
-            m("lib", vec![], vec![Exp::ReNamed("a", "x", "y")], true),
-            m("a", vec![], vec![Exp::Const("x")], true),
-        ]),
-        b("reexport_ns_as", vec![
-            m("main", vec![Imp::Named("provider", "inner", "inner")], vec![], true),
-            m("provider", vec![], vec![Exp::ReNsAs("lib", "inner")], true),
-            m("lib", vec![], vec![Exp::Const("foo")], true),
-        ]),
+        b(
+            "star_reexport",
+            vec![
+                m("main", vec![Imp::Named("hub", "x", "x")], vec![], true),
+                m("hub", vec![], vec![Exp::ReStar("a")], true),
+                m("a", vec![], vec![Exp::Const("x")], true),
+            ],
+        ),
+        b(
+            "star_chain",
+            vec![
+                m("main", vec![Imp::Named("hub2", "x", "x")], vec![], true),
+                m("hub2", vec![], vec![Exp::ReStar("hub1")], true),
+                m("hub1", vec![], vec![Exp::ReStar("a")], true),
+                m("a", vec![], vec![Exp::Const("x")], true),
+            ],
+        ),
+        b(
+            "star_two_sources",
+            vec![
+                m(
+                    "main",
+                    vec![Imp::Named("hub", "x", "x"), Imp::Named("hub", "y", "y")],
+                    vec![],
+                    true,
+                ),
+                m("hub", vec![], vec![Exp::ReStar("a"), Exp::ReStar("b")], true),
+                m("a", vec![], vec![Exp::Const("x")], true),
+                m("b", vec![], vec![Exp::Const("y")], true),
+            ],
+        ),
+        b(
+            "reexport_named",
+            vec![
+                m("main", vec![Imp::Named("lib", "y", "y")], vec![], true),
+                m("lib", vec![], vec![Exp::ReNamed("a", "x", "y")], true),
+                m("a", vec![], vec![Exp::Const("x")], true),
+            ],
+        ),
+        b(
+            "reexport_ns_as",
+            vec![
+                m("main", vec![Imp::Named("provider", "inner", "inner")], vec![], true),
+                m("provider", vec![], vec![Exp::ReNsAs("lib", "inner")], true),
+                m("lib", vec![], vec![Exp::Const("foo")], true),
+            ],
+        ),
         // --- mixed default / named / namespace imports ---
-        b("default_import", vec![
-            m("main", vec![Imp::Default("lib", "D")], vec![], true),
-            m("lib", vec![], vec![Exp::Default], true),
-        ]),
-        b("named_import", vec![
-            m("main", vec![Imp::Named("lib", "foo", "foo")], vec![], true),
-            m("lib", vec![], vec![Exp::Const("foo")], true),
-        ]),
-        b("ns_import", vec![
-            m("main", vec![Imp::Ns("lib", "L")], vec![], true),
-            m("lib", vec![], vec![Exp::Const("foo")], true),
-        ]),
-        b("mixed_all_forms", vec![
-            m("main", vec![Imp::Default("lib", "D"), Imp::Named("lib", "foo", "f"), Imp::Ns("lib", "L")], vec![], true),
-            m("lib", vec![], vec![Exp::Default, Exp::Const("foo")], true),
-        ]),
-        b("two_libs", vec![
-            m("main", vec![Imp::Named("a", "x", "x"), Imp::Named("b", "y", "y")], vec![], true),
-            m("a", vec![], vec![Exp::Const("x")], true),
-            m("b", vec![], vec![Exp::Const("y")], true),
-        ]),
-        b("diamond_named", vec![
-            m("main", vec![Imp::Named("a", "x", "ax"), Imp::Named("b", "x", "bx")], vec![], true),
-            m("a", vec![Imp::Named("c", "x", "cx")], vec![Exp::Const("x")], true),
-            m("b", vec![Imp::Named("c", "x", "cx")], vec![Exp::Const("x")], true),
-            m("c", vec![], vec![Exp::Const("x")], true),
-        ]),
+        b(
+            "default_import",
+            vec![
+                m("main", vec![Imp::Default("lib", "D")], vec![], true),
+                m("lib", vec![], vec![Exp::Default], true),
+            ],
+        ),
+        b(
+            "named_import",
+            vec![
+                m("main", vec![Imp::Named("lib", "foo", "foo")], vec![], true),
+                m("lib", vec![], vec![Exp::Const("foo")], true),
+            ],
+        ),
+        b(
+            "ns_import",
+            vec![
+                m("main", vec![Imp::Ns("lib", "L")], vec![], true),
+                m("lib", vec![], vec![Exp::Const("foo")], true),
+            ],
+        ),
+        b(
+            "mixed_all_forms",
+            vec![
+                m(
+                    "main",
+                    vec![
+                        Imp::Default("lib", "D"),
+                        Imp::Named("lib", "foo", "f"),
+                        Imp::Ns("lib", "L"),
+                    ],
+                    vec![],
+                    true,
+                ),
+                m("lib", vec![], vec![Exp::Default, Exp::Const("foo")], true),
+            ],
+        ),
+        b(
+            "two_libs",
+            vec![
+                m("main", vec![Imp::Named("a", "x", "x"), Imp::Named("b", "y", "y")], vec![], true),
+                m("a", vec![], vec![Exp::Const("x")], true),
+                m("b", vec![], vec![Exp::Const("y")], true),
+            ],
+        ),
+        b(
+            "diamond_named",
+            vec![
+                m(
+                    "main",
+                    vec![Imp::Named("a", "x", "ax"), Imp::Named("b", "x", "bx")],
+                    vec![],
+                    true,
+                ),
+                m("a", vec![Imp::Named("c", "x", "cx")], vec![Exp::Const("x")], true),
+                m("b", vec![Imp::Named("c", "x", "cx")], vec![Exp::Const("x")], true),
+                m("c", vec![], vec![Exp::Const("x")], true),
+            ],
+        ),
         // --- top-level await ordering ---
         b("tla_leaf", vec![dep("main", &["a"]), tla("a", &[])]),
         b("tla_chain", vec![dep("main", &["a"]), dep("a", &["b"]), tla("b", &[])]),
-        b("tla_two_dependents", vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["c"]), tla("c", &[])]),
+        b(
+            "tla_two_dependents",
+            vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["c"]), tla("c", &[])],
+        ),
         b("tla_two_async", vec![dep("main", &["a", "b"]), tla("a", &[]), tla("b", &[])]),
         b("tla_entry_async", vec![tla("main", &["a"]), dep("a", &[])]),
         b("tla_mixed_deps", vec![dep("main", &["a", "b"]), tla("a", &[]), dep("b", &[])]),
         b("tla_nested", vec![dep("main", &["a"]), tla("a", &["b"]), tla("b", &[])]),
-        b("tla_chain_deep", vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), tla("c", &[])]),
-        b("tla_diamond_shared_async", vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["c"]), tla("c", &[])]),
-        b("tla_diamond_two_async", vec![dep("main", &["a", "b"]), tla("a", &["c"]), tla("b", &["c"]), dep("c", &[])]),
-        b("tla_three_async", vec![dep("main", &["a", "b", "c"]), tla("a", &[]), tla("b", &[]), tla("c", &[])]),
-        b("tla_async_with_sync_sibling", vec![dep("main", &["x", "a", "y"]), dep("x", &[]), tla("a", &[]), dep("y", &[])]),
+        b(
+            "tla_chain_deep",
+            vec![dep("main", &["a"]), dep("a", &["b"]), dep("b", &["c"]), tla("c", &[])],
+        ),
+        b(
+            "tla_diamond_shared_async",
+            vec![dep("main", &["a", "b"]), dep("a", &["c"]), dep("b", &["c"]), tla("c", &[])],
+        ),
+        b(
+            "tla_diamond_two_async",
+            vec![dep("main", &["a", "b"]), tla("a", &["c"]), tla("b", &["c"]), dep("c", &[])],
+        ),
+        b(
+            "tla_three_async",
+            vec![dep("main", &["a", "b", "c"]), tla("a", &[]), tla("b", &[]), tla("c", &[])],
+        ),
+        b(
+            "tla_async_with_sync_sibling",
+            vec![dep("main", &["x", "a", "y"]), dep("x", &[]), tla("a", &[]), dep("y", &[])],
+        ),
     ]
 }
 
@@ -356,7 +539,9 @@ struct NodeEnv {
 
 fn node_env_or_skip() -> Option<NodeEnv> {
     let Ok(node) = std::env::var("TRUST_JS_NODE") else {
-        eprintln!("SKIP ordering_oracle_differential: set TRUST_JS_NODE to a node binary to run the differential");
+        eprintln!(
+            "SKIP ordering_oracle_differential: set TRUST_JS_NODE to a node binary to run the differential"
+        );
         return None;
     };
     Some(NodeEnv { node, tmp: tempfile::tempdir().expect("tempdir") })

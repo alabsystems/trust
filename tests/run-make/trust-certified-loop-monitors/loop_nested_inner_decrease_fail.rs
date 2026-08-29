@@ -1,8 +1,14 @@
 fn bad_inner_measure(mut outer: u32) {
-    while outer > 0 invariant outer <= 2 decreases outer {
+    while outer > 0
+        invariant outer <= 2
+        decreases outer
+    {
         let mut inner = 2u32;
         let mut stalled = false;
-        while inner > 0 invariant inner <= 2 decreases inner {
+        while inner > 0
+            invariant inner <= 2
+            decreases inner
+        {
             if stalled {
                 // If the inner-loop monitor disappeared, terminate on the next trip instead of
                 // leaving the regression control spinning.

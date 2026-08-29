@@ -17,7 +17,9 @@ use super::*;
 /// latter is undecidable (QF_NIA ⊇ Hilbert's 10th). It converts AY's exact
 /// failure mode — a 203 GB unbounded growth that OOM-killed the host — into a
 /// mechanically-flagged obligation that the fixed, budget-checked code discharges.
-pub(super) fn generate_unbounded_allocation_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
+pub(super) fn generate_unbounded_allocation_vcs(
+    func: &VerifiableFunction,
+) -> Vec<VerificationCondition> {
     let mut vcs = Vec::new();
     if func.body.blocks.is_empty() {
         return vcs;
@@ -243,10 +245,10 @@ pub(super) fn generate_unbounded_allocation_vcs(func: &VerifiableFunction) -> Ve
         };
         let mut formula = v2_formula_with_block_defs(func, block, body);
         formula = conjoin_arg_type_ranges(func, formula);
-        // verifier-precision: bound NON-parameter integer locals/temps too (sibling of
-        // arg ranges). SOUNDNESS: DROP-ONLY — a true in-type-range fact.
+        // verifier-precision: bound NON-parameter integer/char locals and temps too
+        // (sibling of arg ranges). SOUNDNESS: DROP-ONLY — a true carrier fact.
         formula = conjoin_local_type_ranges(func, formula);
-        // Lever A: bound fixed-width-integer datatype FIELDS too (same sound bound).
+        // Lever A: bound integer/char datatype FIELDS too (same sound carrier fact).
         formula = conjoin_datatype_field_ranges(func, formula);
         // Trust S2c (exemption): the whole-VC version rename runs FIRST, on the body
         // + same-block block-defs only. The THREADED facts (dominating path guards +
@@ -703,9 +705,10 @@ fn ty_is_unbounded_sysroot_iterator_rec(ty: &Ty, depth: usize) -> bool {
 /// endless iterator is defined in the IMPERSONATING crate itself the field renders
 /// `std::vec::Endless`, whose root authenticates, and no NAME test can tell it
 /// from a real std iterator. Distinguishing it is the PRODUCER stamp's job
-/// (`trust_mir_extract::convert::impersonates_sysroot_crate`, whose own residual
-/// R2 — a `#[rustc_diagnostic_item]` forgery — is what both fixtures above use to
-/// get their forged receiver past the string side in the first place). This
+/// (`trust_mir_extract::convert::impersonates_sysroot_crate`, whose residual R2 —
+/// a `#[rustc_diagnostic_item]` forgery — reaches the crate under compilation,
+/// because an EXTERNAL crate is authenticated by artifact residency rather than
+/// by attributes). This
 /// function closes the composed shape only where the source crate is honestly
 /// named; the sysroot-named-source half belongs to the stamp.
 ///
@@ -729,9 +732,9 @@ fn ty_iterator_source_boundedness_unestablished(ty: &Ty, depth: usize) -> bool {
         Ty::RawPtr { pointee, .. } => {
             ty_iterator_source_boundedness_unestablished(pointee, depth + 1)
         }
-        Ty::Tuple(elems) => elems
-            .iter()
-            .any(|e| ty_iterator_source_boundedness_unestablished(e, depth + 1)),
+        Ty::Tuple(elems) => {
+            elems.iter().any(|e| ty_iterator_source_boundedness_unestablished(e, depth + 1))
+        }
         Ty::Adt { name, fields, .. }
             if path_head_is_sysroot_iter_module(name) || path_head_is_source_transport(name) =>
         {
@@ -1293,42 +1296,74 @@ pub(super) fn generate_v2_rvalue_safety_vcs_impl(
         Some(s) => build_semantic_guard_map_with_summaries(func, s),
         None => build_semantic_guard_map(func),
     };
-    let bounds_guard_targets = v2_bounds_guard_targets(func);
+    let bounds_assert_by_target = v2_sole_bounds_assert_by_target(func);
 
     let mut block_vcs: Vec<(BlockId, VerificationCondition)> = Vec::new();
     for block in &func.body.blocks {
-        for stmt in &block.stmts {
+        // The SOLE native `BoundsCheck` assert whose success edge enters this
+        // block, if any — a CANDIDATE authority the per-row exact binding below
+        // must still confirm. Bare target identity used to suppress every index
+        // row in the block, which let a `Lt(_i, len_A)` assert suppress
+        // `B[_j]`'s rows on A's authority — the same identity weakness the
+        // Overflow/OverflowNeg and Div/Rem lanes removed. See
+        // `v2_bounds_assert_exactly_covers_place`.
+        let sole_bounds_assert = bounds_assert_by_target
+            .get(&block.id)
+            .and_then(|assert_index| func.body.blocks.get(*assert_index));
+        for (stmt_index, stmt) in block.stmts.iter().enumerate() {
             let Statement::Assign { place, rvalue, span } = stmt else {
                 continue;
             };
-            // A native `BoundsCheck` assert dominating this block already
-            // discharges the index obligation. Skip both the rvalue-side
-            // projection (read / `&arr[i]` / `CopyForDeref`) and the
-            // destination-side projection (`arr[i] = v`) so we don't
-            // double-emit a VC the assert already covers.
-            let native_bounds_guarded = bounds_guard_targets.contains(&block.id);
-            if native_bounds_guarded && rvalue_safety::is_direct_projection_load(rvalue) {
-                continue;
-            }
-            // verifier-perf: borrowed resolve — `check_rvalue_safety` only INSPECTS the
-            // destination type (it takes `Option<&Ty>`), so never clone the (possibly fat
-            // recursive-ADT) declared root for the dest place.
-            let dest_ty = crate::place_ty_cow(func, place);
             let mut stmt_vcs = Vec::new();
-            rvalue_safety::check_rvalue_safety(
-                func,
-                block,
-                rvalue,
-                dest_ty.as_deref(),
-                span,
-                &mut stmt_vcs,
-            );
+            // A native `BoundsCheck` assert EXACTLY BOUND to every index row of
+            // the loaded place (canonical `Lt(index, len)` cond over THIS row's
+            // index and THIS collection's length, sole-entry success edge)
+            // already discharges the load obligation — skip the rvalue-side
+            // projection walk (read / `&arr[i]` / `CopyForDeref`) so we don't
+            // double-emit a VC the assert already covers. Anything short of the
+            // exact binding keeps the row (over-report is fail-closed; a
+            // dominating path guard can still discharge it downstream).
+            let load_bounds_guarded = sole_bounds_assert.is_some_and(|assert_block| {
+                rvalue_safety::direct_projection_load_place(rvalue).is_some_and(|load_place| {
+                    v2_bounds_assert_exactly_covers_place(
+                        func,
+                        assert_block,
+                        block,
+                        stmt_index,
+                        load_place,
+                    )
+                })
+            });
+            if !load_bounds_guarded {
+                // verifier-perf: borrowed resolve — `check_rvalue_safety` only INSPECTS the
+                // destination type (it takes `Option<&Ty>`), so never clone the (possibly fat
+                // recursive-ADT) declared root for the dest place.
+                let dest_ty = crate::place_ty_cow(func, place);
+                rvalue_safety::check_rvalue_safety(
+                    func,
+                    block,
+                    rvalue,
+                    dest_ty.as_deref(),
+                    span,
+                    &mut stmt_vcs,
+                );
+            }
             // STORE-side index bounds: `arr[i] = v` carries the `Index(i)`
             // projection on the assignment *destination*, which the rvalue
             // walk above never inspects. Bounds-check it with the same builder
-            // (and same native-assert suppression) so an out-of-bounds write
-            // is no longer reported safe.
-            if !(native_bounds_guarded && rvalue_safety::place_needs_bounds_check(place)) {
+            // (and the same exact-binding native-assert suppression) so an
+            // out-of-bounds write is no longer reported safe.
+            let store_bounds_guarded = sole_bounds_assert.is_some_and(|assert_block| {
+                rvalue_safety::place_needs_bounds_check(place)
+                    && v2_bounds_assert_exactly_covers_place(
+                        func,
+                        assert_block,
+                        block,
+                        stmt_index,
+                        place,
+                    )
+            });
+            if !store_bounds_guarded {
                 rvalue_safety::check_place_index_bounds(func, place, span, &mut stmt_vcs);
             }
             block_vcs.extend(stmt_vcs.into_iter().map(|vc| (block.id, vc)));
@@ -1475,29 +1510,6 @@ pub(super) fn v2_recognized_assert_proof_gap_vc(
     )
 }
 
-/// Build a real overflow VC for `CheckedBinaryOp(op, lhs, rhs)` feeding an
-/// `Assert { Overflow(op) }` terminator.
-///
-/// Formula: `input_range(lhs) AND input_range(rhs) AND NOT in_range(lhs op rhs)`.
-/// SAT iff the operation overflows for some in-range inputs → test is_failed().
-pub(super) fn v2_build_overflow_vc(
-    func: &VerifiableFunction,
-    block: &trust_types::BasicBlock,
-    op: BinOp,
-    span: &SourceSpan,
-) -> Option<VerificationCondition> {
-    // Find the CheckedBinaryOp assignment in this block that matches `op`.
-    let (lhs, rhs) = block.stmts.iter().find_map(|stmt| {
-        let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(stmt_op, l, r), .. } = stmt else {
-            return None;
-        };
-        if *stmt_op == op { Some((l, r)) } else { None }
-    })?;
-    // The checked op's overflow is asserted at the block's Assert terminator, so
-    // conjoin whole-block defs (`stmt_index = None`).
-    v2_build_overflow_vc_for_operands(func, block, op, lhs, rhs, span, None)
-}
-
 /// Whether the `Overflow(op)` assert guarding this block provably cannot fire.
 ///
 /// WHY THIS EXISTS SEPARATELY from the builder. In the assert lane a builder that
@@ -1512,30 +1524,33 @@ pub(super) fn v2_build_overflow_vc(
 /// gate, which is why its provably-safe case could only be expressed as a
 /// constant-false formula that no downstream authority could ever discharge.
 ///
-/// Operand recovery MIRRORS `v2_build_overflow_vc` above — the same
-/// `CheckedBinaryOp` scan of the same block — so this predicate answers for the
-/// same operands the builder would have used. The actual decision is delegated
-/// to `v2_signed_mul_provably_cannot_overflow`, which both share.
+/// Operand recovery requires the exact tuple local read by the assert condition.
+/// A target-block operation is not a binding to a caller-controlled condition.
 pub(super) fn v2_overflow_assert_provably_cannot_fire(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
+    _target: BlockId,
     op: BinOp,
+    cond: &Operand,
+    expected: bool,
 ) -> bool {
-    let Some((lhs, rhs)) = block.stmts.iter().find_map(|stmt| {
-        let Statement::Assign { rvalue: Rvalue::CheckedBinaryOp(stmt_op, l, r), .. } = stmt else {
-            return None;
-        };
-        if *stmt_op == op { Some((l, r)) } else { None }
-    }) else {
+    if expected {
         return false;
-    };
-    v2_signed_mul_provably_cannot_overflow(func, block, op, lhs, rhs, None)
+    }
+    if let Some((stmt_index, lhs, rhs)) =
+        v2_find_checked_binop_for_assert_cond(func, block, cond, op)
+    {
+        return v2_signed_mul_provably_cannot_overflow(func, block, op, lhs, rhs, Some(stmt_index));
+    }
+    // Target+operator alone does not bind the public Assert condition to that
+    // operation. Only the exact `.1` flag definition may suppress an assertion.
+    false
 }
 
 /// Build an ArithmeticOverflow VC for `lhs OP rhs` (op in Add/Sub/Mul) from the
-/// operands directly. Shared by the CheckedBinaryOp path (whole-block defs,
-/// `stmt_index = None`) and the direct `Rvalue::BinaryOp` path (defs before the
-/// statement, `stmt_index = Some`). Add/Sub use the LIA range encoding (keeping
+/// operands directly. Checked and direct BinaryOp callers both bind the exact
+/// defining statement (`stmt_index = Some`) so later writes cannot rewrite the
+/// operation's inputs. Add/Sub use the LIA range encoding (keeping
 /// conjoined preconditions/guards/block-defs so a bounded op PROVES); Mul uses
 /// the decidable bitvector encoding. See the soundness/completeness notes below.
 // Trust: reusable (ungated, pub(crate)) — the hardened panic_boundary path also
@@ -1569,15 +1584,16 @@ pub(crate) fn conjoin_arg_type_ranges(func: &VerifiableFunction, formula: Formul
         if decl.index < 1 || decl.index > func.body.arg_count {
             continue; // local 0 is the return slot; > arg_count are temporaries
         }
-        let Some(width) = decl.ty.int_width() else {
+        let Some(range) = crate::range::rust_type_range_constraint(
+            &Formula::Var(
+                decl.name.clone().unwrap_or_else(|| format!("_{}", decl.index)),
+                trust_types::Sort::Int,
+            ),
+            &decl.ty,
+        ) else {
             continue;
         };
-        let name = decl.name.clone().unwrap_or_else(|| format!("_{}", decl.index));
-        bounds.push(crate::range::input_range_constraint(
-            &Formula::Var(name, trust_types::Sort::Int),
-            width,
-            decl.ty.is_signed(),
-        ));
+        bounds.push(range);
     }
     if bounds.is_empty() {
         return formula;

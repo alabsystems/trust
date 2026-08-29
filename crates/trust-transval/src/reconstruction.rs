@@ -658,7 +658,6 @@ fn result_diagnostics(direction: &str, result: &SmtValidationResult) -> Vec<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_router::Router;
     use trust_types::{
         BasicBlock, BinOp, BlockId, DecompileTarget, LocalDecl, Operand, Place,
@@ -667,6 +666,8 @@ mod tests {
         ReconstructionValidationStatus, RustReconstructionEligibility, Rvalue, SourceSpan,
         Statement, Terminator, Ty, ValidatedRustReconstruction, VerifiableBody,
     };
+
+    use super::*;
 
     fn simple_binop(name: &str, op: BinOp) -> VerifiableFunction {
         VerifiableFunction {

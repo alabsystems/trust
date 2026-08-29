@@ -18,10 +18,10 @@
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
 use std::time::{Duration, Instant};
-use trust_types::fx::FxHashMap;
 
 use trust_router::{MirRouter, MirRouterConfig, MirStrategy, Router, build_v1_vcs};
 use trust_types::VerifiableFunction;
+use trust_types::fx::FxHashMap;
 
 // ---------------------------------------------------------------------------
 // Workload construction
@@ -29,11 +29,13 @@ use trust_types::VerifiableFunction;
 
 /// Build a workload of `count` functions by cycling through the 5 fixture functions.
 fn build_workload(count: usize) -> Vec<VerifiableFunction> {
-    let fixtures = [trust_integration_tests::midpoint_function(),
+    let fixtures = [
+        trust_integration_tests::midpoint_function(),
         trust_integration_tests::division_function(),
         trust_integration_tests::array_access_function(),
         trust_integration_tests::contract_function(),
-        trust_integration_tests::noop_function()];
+        trust_integration_tests::noop_function(),
+    ];
     let mut funcs = Vec::with_capacity(count);
     for i in 0..count {
         let mut f = fixtures[i % fixtures.len()].clone();

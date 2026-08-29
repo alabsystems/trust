@@ -250,7 +250,11 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
                 kind: rk,
             },
         ) => eq_label(ll.as_ref(), rl.as_ref()) && eq_pat(lp, rp) && eq_expr(li, ri) && eq_block(lt, rt) && lk == rk,
-        (Loop(lt, ll, _), Loop(rt, rl, _)) => eq_label(ll.as_ref(), rl.as_ref()) && eq_block(lt, rt),
+        (Loop(lt, ll, _, l_contract), Loop(rt, rl, _, r_contract)) => {
+            eq_label(ll.as_ref(), rl.as_ref())
+                && eq_block(lt, rt)
+                && eq_loop_contract(l_contract.as_deref(), r_contract.as_deref())
+        },
         (Block(lb, ll), Block(rb, rl)) => eq_label(ll.as_ref(), rl.as_ref()) && eq_block(lb, rb),
         (TryBlock(lb, lt), TryBlock(rb, rt)) => eq_block(lb, rb) && both(lt.as_deref(), rt.as_deref(), eq_ty),
         (Yield(l), Yield(r)) => eq_expr_opt(l.expr().map(Box::as_ref), r.expr().map(Box::as_ref)) && l.same_kind(r),
@@ -1176,7 +1180,7 @@ mod tests {
     };
     use rustc_ast::attr::data_structures::CfgEntry;
     use rustc_ast::visit::Visitor;
-    use rustc_span::{BytePos, DUMMY_SP, Span, Symbol, create_default_session_globals_then};
+    use rustc_span::{BytePos, DUMMY_SP, Ident, Span, Symbol, create_default_session_globals_then};
 
     fn citation(name: &str, span: Span) -> TrustCitation {
         TrustCitation {
@@ -1430,14 +1434,37 @@ mod tests {
     fn pprust_rewrite_guard_classifies_clean_islands_as_authored_source() {
         // Trust: the island payload is the real Clean parse (ruling v7/D1); an
         // empty one is still authored verifier source.
-        assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(Box::new(
-            rustc_ast::CleanIsland {
-                content_span: DUMMY_SP,
-                text: rustc_span::Symbol::intern(""),
-                decls: thin_vec::ThinVec::new(),
-                // Trust (I8): inline island — not a pending `clean mod` unit.
-                unloaded_unit: None,
-            }
-        ))));
+        //
+        // `Symbol::intern` needs session globals — every other test in this
+        // module already wraps for that reason. This one did not, and could not
+        // be caught by it: `clippy_utils` was missing `extern crate thin_vec`,
+        // so the whole `lib test` target failed to COMPILE and this assertion
+        // had never executed once. Both defects were invisible to `x.py build`
+        // and surface only under `x.py test src/tools/tippy`.
+        create_default_session_globals_then(|| {
+            assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(Box::new(
+                rustc_ast::CleanIsland {
+                    content_span: DUMMY_SP,
+                    text: Symbol::intern(""),
+                    decls: thin_vec::ThinVec::new(),
+                    // Trust (I8): inline island — not a pending `clean mod` unit.
+                    unloaded_unit: None,
+                }
+            ))));
+            // And a NON-empty island, so the row is not merely the empty case:
+            // v7/D1's point is that the payload is a real parse either way.
+            assert!(item_kind_has_authored_verifier_source(&ItemKind::CleanIsland(Box::new(
+                rustc_ast::CleanIsland {
+                    content_span: DUMMY_SP,
+                    text: Symbol::intern("def six : UInt64 := 6"),
+                    decls: thin_vec::ThinVec::new(),
+                    unloaded_unit: None,
+                }
+            ))));
+            // The converse: a plain fn with no contract is NOT authored
+            // verifier source. Without this the assertion above would pass for
+            // a predicate that returned `true` unconditionally.
+            assert!(!item_kind_has_authored_verifier_source(&ItemKind::ExternCrate(None, Ident::from_str("x"))));
+        });
     }
 }

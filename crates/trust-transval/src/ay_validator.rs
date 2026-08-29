@@ -753,8 +753,9 @@ fn numeric_value(value: &EvalValue) -> Option<i128> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::SourceSpan;
+
+    use super::*;
 
     /// A router pinned to the deterministic `ConstantFolderBackend` only, so these
     /// validator tests stay independent of workspace feature unification (which

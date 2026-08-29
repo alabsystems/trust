@@ -147,15 +147,33 @@ function erase(s,   out, i, n, c, d, h, j) {
   }
   if (line ~ /#\[cfg\(test\)\]/ || line ~ /#\[cfg\(all\([^)]*test[^)]*\)\)\]/) { pend = 1; next }
   if (pend == 1) {
-    pend = 0
+    # Scan forward to the ITEM the `#[cfg(test)]` attaches to. Anything between
+    # is a further attribute or a signature continuation and is dropped while
+    # STAYING pending — an item is either braced or `;`-terminated, so this
+    # search is bounded and cannot run away.
+    #
+    # Staying pending is the whole point. This used to clear `pend` after
+    # exactly ONE line, so it only stripped `#[cfg(test)]` items whose brace sat
+    # on the very next line. The ubiquitous
+    #     #[cfg(test)]
+    #     #[test]
+    #     fn t() { ... a.unwrap() ... }
+    # form therefore leaked its ENTIRE BODY into the production count: `#[test]`
+    # carries no brace, `pend` reset, and `fn t() {` was then read as
+    # production code. Measured 2026-08-26 on this tree, that mismeasurement was
+    # the whole of the gate's red.
+    #
     # A braced item (mod/fn/impl/struct) is skipped whole; a `mod tests;`
     # DECLARATION has no brace and only drops its own line — its body lives in
     # an excluded, test-named file.
     if (line ~ /\{/) {
+      pend = 0
       o = gsub(/{/, "{", line); c = gsub(/}/, "}", line)
       depth = o - c
       if (depth > 0) in_test = 1
+      next
     }
+    if (line ~ /;/) { pend = 0; next }
     next
   }
   print FILENAME ":" line

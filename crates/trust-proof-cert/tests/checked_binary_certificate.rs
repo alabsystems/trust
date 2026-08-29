@@ -184,7 +184,8 @@ fn checked_manifest_acceptance_fixture(
     export.stdout_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stdout"));
     export.stderr_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stderr"));
     let checker = checked_certificate_checker();
-    let replay_transcript_digest = trust_types::stable_sha256_hex(b"deterministic replay transcript for acceptance");
+    let replay_transcript_digest =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for acceptance");
     let dir = temp_artifact_dir(name);
     let mut request =
         BinaryCertificateCheckRequest::from_export(&dispatch, canonical_vc_bytes, &export);
@@ -426,7 +427,8 @@ fn production_checker_evidence_from_external_process_binds_invocation_transcript
         CheckedBinaryCertificateCheckerInvocationKind::ExternalProcess
     );
     assert_eq!(evidence.invocation_sha256, expected_invocation_sha256);
-    let expected_stdout_sha256 = trust_types::stable_sha256_hex(b"external checker stdout: accepted");
+    let expected_stdout_sha256 =
+        trust_types::stable_sha256_hex(b"external checker stdout: accepted");
     let expected_stderr_sha256 = trust_types::stable_sha256_hex(b"external checker stderr: empty");
     assert_eq!(evidence.stdout_sha256.as_deref(), Some(expected_stdout_sha256.as_str()));
     assert_eq!(evidence.stderr_sha256.as_deref(), Some(expected_stderr_sha256.as_str()));
@@ -574,9 +576,13 @@ fn external_checker_runner_invokes_fixture_and_returns_production_evidence() {
         evidence.invocation_kind,
         CheckedBinaryCertificateCheckerInvocationKind::ExternalProcess
     );
-    assert_eq!(evidence.checker_binary_sha256, trust_types::stable_sha256_hex(script_body.as_bytes()));
+    assert_eq!(
+        evidence.checker_binary_sha256,
+        trust_types::stable_sha256_hex(script_body.as_bytes())
+    );
     assert_eq!(evidence.checker_config_sha256.as_deref(), Some(config_sha256.as_str()));
-    let expected_stdout_sha256 = trust_types::stable_sha256_hex(b"checker accepted\nmode=production\n");
+    let expected_stdout_sha256 =
+        trust_types::stable_sha256_hex(b"checker accepted\nmode=production\n");
     assert_eq!(evidence.stdout_sha256.as_deref(), Some(expected_stdout_sha256.as_str()));
     let expected_stderr = format!("certificate={certificate_path}\n");
     let expected_stderr_sha256 = trust_types::stable_sha256_hex(expected_stderr.as_bytes());
@@ -939,7 +945,8 @@ fn checked_binary_certificate_binds_replay_transcript_digest_in_normalized_paylo
     let dispatch = proved_dispatch("vc0");
     let export = proof_export(&dispatch, canonical_vc_bytes);
     let checker = checked_certificate_checker();
-    let replay_transcript_digest = trust_types::stable_sha256_hex(b"deterministic replay transcript for vc0");
+    let replay_transcript_digest =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for vc0");
     let mut request =
         BinaryCertificateCheckRequest::from_export(&dispatch, canonical_vc_bytes, &export);
     request.replay_transcript_digest = Some(&replay_transcript_digest);
@@ -955,7 +962,10 @@ fn checked_binary_certificate_binds_replay_transcript_digest_in_normalized_paylo
         Some(replay_transcript_digest.as_str())
     );
     assert_eq!(payload["replay_transcript_digest"], serde_json::json!(&replay_transcript_digest));
-    assert_eq!(artifact.certificate_sha256, trust_types::stable_sha256_hex(&artifact.normalized_payload));
+    assert_eq!(
+        artifact.certificate_sha256,
+        trust_types::stable_sha256_hex(&artifact.normalized_payload)
+    );
     artifact.validate_integrity().expect("replay transcript digest should validate");
 
     let baseline = check_binary_certificate(
@@ -1133,7 +1143,8 @@ fn checked_binary_certificate_manifest_row_binds_vc_replay_export_and_checker() 
     export.stdout_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stdout"));
     export.stderr_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stderr"));
     let checker = checked_certificate_checker();
-    let replay_transcript_digest = trust_types::stable_sha256_hex(b"deterministic replay transcript for manifest row");
+    let replay_transcript_digest =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for manifest row");
     let dir = temp_artifact_dir("manifest-production-row");
     let mut request =
         BinaryCertificateCheckRequest::from_export(&dispatch, canonical_vc_bytes, &export);
@@ -1141,9 +1152,11 @@ fn checked_binary_certificate_manifest_row_binds_vc_replay_export_and_checker() 
 
     let artifact_ref = produce_checked_certificate_artifact(&checker, request, &dir)
         .expect("production helper should persist checked artifact");
-    let manifest =
-        CheckedBinaryCertificateManifest::from_artifact_refs(&dir, std::slice::from_ref(&artifact_ref))
-            .expect("checked artifact ref should export into a manifest row");
+    let manifest = CheckedBinaryCertificateManifest::from_artifact_refs(
+        &dir,
+        std::slice::from_ref(&artifact_ref),
+    )
+    .expect("checked artifact ref should export into a manifest row");
     manifest
         .validate_files(&dir)
         .expect("manifest row should validate against the checked artifact");
@@ -1251,7 +1264,10 @@ fn checked_binary_certificate_manifest_acceptance_loads_imports_structured_produ
         record.replay_transcript.replay_transcript_digest.as_deref(),
         Some(replay_transcript_digest.as_str())
     );
-    assert_eq!(record.artifact_identity.vc_sha256, trust_types::stable_sha256_hex(canonical_vc_bytes));
+    assert_eq!(
+        record.artifact_identity.vc_sha256,
+        trust_types::stable_sha256_hex(canonical_vc_bytes)
+    );
     assert_eq!(
         record.artifact_identity.content_sha256,
         record.artifact_identity.certificate_sha256
@@ -1328,7 +1344,8 @@ fn checked_binary_certificate_manifest_acceptance_rejects_mismatched_production_
         .production_checker_evidence
         .as_mut()
         .expect("production evidence should be present")
-        .invocation_sha256 = trust_types::stable_sha256_hex(b"different checker invocation transcript");
+        .invocation_sha256 =
+        trust_types::stable_sha256_hex(b"different checker invocation transcript");
     let mut gate_dispatch = proved_dispatch("gate-run:vc0-invocation-mismatch");
 
     let err = import_checked_certificate_manifest_entry_for_dispatch(
@@ -1675,9 +1692,12 @@ fn checked_certificate_audit_bundle_readback_accepts_distinct_source_backprop_vc
         Some("4.13.0".to_string()),
         1_777_070_400_000,
     );
-    export_a.stdout_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stdout for readback vc-a"));
-    export_a.stderr_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stderr for readback vc-a"));
-    let replay_a = trust_types::stable_sha256_hex(b"deterministic replay transcript for readback vc-a");
+    export_a.stdout_digest =
+        Some(trust_types::stable_sha256_hex(b"deterministic solver stdout for readback vc-a"));
+    export_a.stderr_digest =
+        Some(trust_types::stable_sha256_hex(b"deterministic solver stderr for readback vc-a"));
+    let replay_a =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for readback vc-a");
     let mut request_a = BinaryCertificateCheckRequest::from_export(&dispatch_a, vc_a, &export_a);
     request_a.replay_transcript_digest = Some(&replay_a);
     let artifact_ref_a = produce_checked_certificate_artifact(&checker, request_a, &dir)
@@ -1693,9 +1713,12 @@ fn checked_certificate_audit_bundle_readback_accepts_distinct_source_backprop_vc
         Some("4.13.0".to_string()),
         1_777_070_400_100,
     );
-    export_b.stdout_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stdout for readback vc-b"));
-    export_b.stderr_digest = Some(trust_types::stable_sha256_hex(b"deterministic solver stderr for readback vc-b"));
-    let replay_b = trust_types::stable_sha256_hex(b"deterministic replay transcript for readback vc-b");
+    export_b.stdout_digest =
+        Some(trust_types::stable_sha256_hex(b"deterministic solver stdout for readback vc-b"));
+    export_b.stderr_digest =
+        Some(trust_types::stable_sha256_hex(b"deterministic solver stderr for readback vc-b"));
+    let replay_b =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for readback vc-b");
     let mut request_b = BinaryCertificateCheckRequest::from_export(&dispatch_b, vc_b, &export_b);
     request_b.replay_transcript_digest = Some(&replay_b);
     let artifact_ref_b = produce_checked_certificate_artifact(&checker, request_b, &dir)
@@ -1810,7 +1833,8 @@ fn checked_certificate_audit_bundle_readback_accepts_distinct_source_backprop_vc
         .expect("row validation should load both checked rows");
     assert_eq!(validation.accepted_count(), 2);
     assert_eq!(validation.rejected_count(), 0);
-    let required_vc_sha256 = vec![trust_types::stable_sha256_hex(vc_a), trust_types::stable_sha256_hex(vc_b)];
+    let required_vc_sha256 =
+        vec![trust_types::stable_sha256_hex(vc_a), trust_types::stable_sha256_hex(vc_b)];
     let coverage = validation
         .validate_complete_checked_vc_coverage(&required_vc_sha256)
         .expect("readback rows should cover every required VC");
@@ -1952,7 +1976,8 @@ fn checked_certificate_audit_bundle_rejects_stale_source_backpropagation_identit
     std::fs::write(&audit_path, stale_audit_json.as_bytes())
         .expect("stale audit export should be writable");
     bundle.audit_exports[0].source_backpropagation_gate = stale_gate;
-    bundle.audit_exports[0].audit_export_sha256 = trust_types::stable_sha256_hex(stale_audit_json.as_bytes());
+    bundle.audit_exports[0].audit_export_sha256 =
+        trust_types::stable_sha256_hex(stale_audit_json.as_bytes());
     assert_eq!(bundle.audit_exports[0].manifest_identity_sha256, original_manifest_identity);
     let bundle_json = bundle.to_json().expect("stale bundle should remain structurally valid");
     std::fs::write(checked_certificate_audit_export_bundle_path(&dir), bundle_json.as_bytes())
@@ -2443,7 +2468,8 @@ fn checked_binary_certificate_manifest_audit_export_bundle_rejects_stale_audit_r
     let audit_path = dir.join(&bundle.audit_exports[0].audit_export_path);
     std::fs::write(&audit_path, stale_audit_json.as_bytes())
         .expect("stale audit export should be writable");
-    bundle.audit_exports[0].audit_export_sha256 = trust_types::stable_sha256_hex(stale_audit_json.as_bytes());
+    bundle.audit_exports[0].audit_export_sha256 =
+        trust_types::stable_sha256_hex(stale_audit_json.as_bytes());
     let bundle_json = bundle.to_json().expect("updated bundle digest should serialize");
     std::fs::write(checked_certificate_audit_export_bundle_path(&dir), bundle_json.as_bytes())
         .expect("updated bundle should be writable");
@@ -2589,7 +2615,8 @@ fn checked_binary_certificate_audit_export_bundle_rows_reject_stale_proof_export
     .expect("accepted bundle row should still import by canonical VC and origin digests");
     assert!(current_dispatch.certificate.is_checked());
 
-    let required_vc_sha256 = vec![trust_types::stable_sha256_hex(vc_a), trust_types::stable_sha256_hex(vc_b)];
+    let required_vc_sha256 =
+        vec![trust_types::stable_sha256_hex(vc_a), trust_types::stable_sha256_hex(vc_b)];
     let coverage_err = validation
         .validate_complete_checked_vc_coverage(&required_vc_sha256)
         .expect_err("stale rejected rows must not satisfy per-VC checked coverage");
@@ -2771,7 +2798,8 @@ fn checked_binary_certificate_audit_export_bundle_coverage_rejects_missing_requi
     assert_eq!(present_coverage.rejected_rows, 0);
 
     let missing_vc_sha256 = trust_types::stable_sha256_hex(missing_vc_bytes);
-    let required = vec![trust_types::stable_sha256_hex(canonical_vc_bytes), missing_vc_sha256.clone()];
+    let required =
+        vec![trust_types::stable_sha256_hex(canonical_vc_bytes), missing_vc_sha256.clone()];
     let validation = load_checked_certificate_audit_export_bundle_rows(&dir)
         .expect("row validation should load the single accepted row");
     let coverage =
@@ -2915,7 +2943,8 @@ fn checked_binary_certificate_manifest_acceptance_rejects_artifact_identity_mism
         checked_manifest_acceptance_fixture("manifest-acceptance-artifact-mismatch");
     let entry = manifest.certificates.first().expect("manifest should have one row");
     let mut acceptance_request = production_acceptance_request(entry, &export);
-    let wrong_digest = trust_types::stable_sha256_hex(b"different checked certificate artifact identity");
+    let wrong_digest =
+        trust_types::stable_sha256_hex(b"different checked certificate artifact identity");
     acceptance_request.artifact_identity.certificate_sha256 = wrong_digest.clone();
     acceptance_request.artifact_identity.content_sha256 = wrong_digest.clone();
     acceptance_request.artifact_identity.certificate_path =
@@ -2951,7 +2980,8 @@ fn checked_binary_certificate_manifest_rejects_replay_transcript_digest_mismatch
     let dispatch = proved_dispatch("vc0");
     let export = proof_export(&dispatch, canonical_vc_bytes);
     let checker = checked_certificate_checker();
-    let replay_transcript_digest = trust_types::stable_sha256_hex(b"deterministic replay transcript for manifest row");
+    let replay_transcript_digest =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for manifest row");
     let dir = temp_artifact_dir("manifest-replay-digest-mismatch");
     let mut request =
         BinaryCertificateCheckRequest::from_export(&dispatch, canonical_vc_bytes, &export);
@@ -2990,7 +3020,8 @@ fn checked_binary_certificate_manifest_rejects_proof_export_digest_mismatch() {
     .expect("checked artifact should persist");
     let mut manifest = CheckedBinaryCertificateManifest::from_artifact_refs(&dir, &[artifact_ref])
         .expect("manifest should build from checked artifact refs");
-    manifest.certificates[0].proof_export_sha256 = trust_types::stable_sha256_hex(b"different proof export metadata");
+    manifest.certificates[0].proof_export_sha256 =
+        trust_types::stable_sha256_hex(b"different proof export metadata");
 
     let err = manifest
         .validate_files(&dir)
@@ -3304,8 +3335,9 @@ fn checked_binary_certificate_content_addressed_import_rejects_bound_identity_mi
         .binary_artifact_digest_identity
         .as_mut()
         .expect("fixture has digest identity")
-        .root_artifact_digest =
-        Some(BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(b"different root artifact")));
+        .root_artifact_digest = Some(BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(
+        b"different root artifact",
+    )));
     let root_digest_err = import_checked_certificate_artifact_for_dispatch(
         &mut root_digest_mismatch,
         canonical_vc_bytes,
@@ -3524,7 +3556,8 @@ fn checked_binary_certificate_import_rejects_noncanonical_replay_transcript_dige
     let dispatch = proved_dispatch("vc0");
     let export = proof_export(&dispatch, canonical_vc_bytes);
     let checker = checked_certificate_checker();
-    let replay_transcript_digest = trust_types::stable_sha256_hex(b"deterministic replay transcript for vc0");
+    let replay_transcript_digest =
+        trust_types::stable_sha256_hex(b"deterministic replay transcript for vc0");
     let mut request =
         BinaryCertificateCheckRequest::from_export(&dispatch, canonical_vc_bytes, &export);
     request.replay_transcript_digest = Some(&replay_transcript_digest);
@@ -3587,7 +3620,8 @@ fn checked_binary_certificate_import_rejects_tampered_persisted_bindings() {
     );
 
     let mut origin_digest_tampered = artifact.clone();
-    origin_digest_tampered.origin_sha256 = trust_types::stable_sha256_hex(b"different binary origin");
+    origin_digest_tampered.origin_sha256 =
+        trust_types::stable_sha256_hex(b"different binary origin");
     let origin_digest_err = origin_digest_tampered
         .validate_for_dispatch(&dispatch, canonical_vc_bytes)
         .expect_err("tampered binary origin digest should fail");
@@ -3597,8 +3631,9 @@ fn checked_binary_certificate_import_rejects_tampered_persisted_bindings() {
     );
 
     let mut artifact_digest_tampered = artifact.clone();
-    artifact_digest_tampered.binary_artifact_digest_identity.root_artifact_digest =
-        Some(BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(b"different root artifact")));
+    artifact_digest_tampered.binary_artifact_digest_identity.root_artifact_digest = Some(
+        BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(b"different root artifact")),
+    );
     let artifact_digest_err = artifact_digest_tampered
         .validate_for_dispatch(&dispatch, canonical_vc_bytes)
         .expect_err("tampered binary artifact digest identity should fail");
@@ -3677,9 +3712,11 @@ fn checked_binary_certificate_content_addressed_load_rejects_wrong_digest() {
     let root = unique_temp_dir("checked-binary-certificate-digest-mismatch");
     persist_checked_certificate_artifact(&root, &artifact)
         .expect("checked artifact should persist content-addressed");
-    let err =
-        load_content_addressed_checked_certificate_artifact(&root, &trust_types::stable_sha256_hex(b"wrong digest"))
-            .expect_err("wrong content address should fail");
+    let err = load_content_addressed_checked_certificate_artifact(
+        &root,
+        &trust_types::stable_sha256_hex(b"wrong digest"),
+    )
+    .expect_err("wrong content address should fail");
 
     assert!(matches!(err, CertError::IoError { .. }), "{err:?}");
 
@@ -4078,8 +4115,9 @@ fn proof_grade_production_manifest_accepts_real_manifest_row_readback_bindings()
         Some(replay_transcript_digest.as_str())
     );
     assert_eq!(row_acceptance.binary_artifact_digest_identity, binary_artifact_digest_identity());
-    let expected_source_gate_sha256 =
-        trust_types::stable_sha256_hex(&serde_json::to_vec(&source_gate).expect("source gate should serialize"));
+    let expected_source_gate_sha256 = trust_types::stable_sha256_hex(
+        &serde_json::to_vec(&source_gate).expect("source gate should serialize"),
+    );
     assert_eq!(row_acceptance.source_backpropagation_gate_sha256, expected_source_gate_sha256);
     let source_gate_row = row_acceptance
         .source_backpropagation_gate_row
@@ -4301,7 +4339,8 @@ fn proof_grade_production_manifest_requires_complete_runner_contract_bindings() 
                 .manifest_row_acceptance
                 .as_mut()
                 .expect("row acceptance should exist")
-                .source_backpropagation_gate_sha256 = trust_types::stable_sha256_hex(b"stale source gate identity");
+                .source_backpropagation_gate_sha256 =
+                trust_types::stable_sha256_hex(b"stale source gate identity");
         },
         |rejection| {
             matches!(
@@ -4321,7 +4360,8 @@ fn proof_grade_production_manifest_requires_complete_runner_contract_bindings() 
                 .manifest_row_acceptance
                 .as_mut()
                 .expect("row acceptance should exist")
-                .proof_metadata_sha256 = trust_types::stable_sha256_hex(b"stale proof metadata digest");
+                .proof_metadata_sha256 =
+                trust_types::stable_sha256_hex(b"stale proof metadata digest");
         },
         |rejection| {
             matches!(
@@ -4391,15 +4431,17 @@ fn proof_grade_production_manifest_rejects_each_stale_manifest_row_binding_indep
                 .as_mut()
                 .expect("row acceptance should exist")
                 .binary_artifact_digest_identity
-                .root_artifact_digest =
-                Some(BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(b"stale root artifact digest")));
+                .root_artifact_digest = Some(BinaryArtifactDigest::sha256(
+                trust_types::stable_sha256_hex(b"stale root artifact digest"),
+            ));
         }),
         ("replay digest", "manifest_row_acceptance.replay_transcript_digest", |manifest| {
             manifest.entries[0]
                 .manifest_row_acceptance
                 .as_mut()
                 .expect("row acceptance should exist")
-                .replay_transcript_digest = Some(trust_types::stable_sha256_hex(b"stale replay transcript digest"));
+                .replay_transcript_digest =
+                Some(trust_types::stable_sha256_hex(b"stale replay transcript digest"));
         }),
         (
             "source gate identity",
@@ -4409,7 +4451,8 @@ fn proof_grade_production_manifest_rejects_each_stale_manifest_row_binding_indep
                     .manifest_row_acceptance
                     .as_mut()
                     .expect("row acceptance should exist")
-                    .source_backpropagation_gate_sha256 = trust_types::stable_sha256_hex(b"stale source gate identity");
+                    .source_backpropagation_gate_sha256 =
+                    trust_types::stable_sha256_hex(b"stale source gate identity");
             },
         ),
         ("proof metadata digest", "manifest_row_acceptance.proof_metadata_sha256", |manifest| {
@@ -4417,7 +4460,8 @@ fn proof_grade_production_manifest_rejects_each_stale_manifest_row_binding_indep
                 .manifest_row_acceptance
                 .as_mut()
                 .expect("row acceptance should exist")
-                .proof_metadata_sha256 = trust_types::stable_sha256_hex(b"stale proof metadata digest");
+                .proof_metadata_sha256 =
+                trust_types::stable_sha256_hex(b"stale proof metadata digest");
         }),
     ];
 
@@ -4533,7 +4577,8 @@ fn proof_grade_production_manifest_rejects_missing_stale_or_wrong_source_gate_ro
                     .source_backpropagation_gate_row
                     .as_mut()
                     .expect("source gate row should exist")
-                    .manifest_identity_sha256 = trust_types::stable_sha256_hex(b"wrong manifest identity");
+                    .manifest_identity_sha256 =
+                    trust_types::stable_sha256_hex(b"wrong manifest identity");
             },
         ),
         (
@@ -4547,7 +4592,8 @@ fn proof_grade_production_manifest_rejects_missing_stale_or_wrong_source_gate_ro
                     .source_backpropagation_gate_row
                     .as_mut()
                     .expect("source gate row should exist")
-                    .certificate_sha256 = trust_types::stable_sha256_hex(b"wrong checked certificate");
+                    .certificate_sha256 =
+                    trust_types::stable_sha256_hex(b"wrong checked certificate");
             },
         ),
         (
@@ -4589,7 +4635,8 @@ fn proof_grade_production_manifest_rejects_missing_stale_or_wrong_source_gate_ro
                     .source_backpropagation_gate_row
                     .as_mut()
                     .expect("source gate row should exist")
-                    .assumption_digest = trust_types::stable_sha256_hex(b"wrong assumptions digest");
+                    .assumption_digest =
+                    trust_types::stable_sha256_hex(b"wrong assumptions digest");
             },
         ),
         ("replay", "manifest_row_acceptance.source_backpropagation_gate_row.replay", |manifest| {
@@ -4613,7 +4660,8 @@ fn proof_grade_production_manifest_rejects_missing_stale_or_wrong_source_gate_ro
                     .source_backpropagation_gate_row
                     .as_mut()
                     .expect("source gate row should exist")
-                    .replay_transcript_digest = Some(trust_types::stable_sha256_hex(b"wrong replay transcript"));
+                    .replay_transcript_digest =
+                    Some(trust_types::stable_sha256_hex(b"wrong replay transcript"));
             },
         ),
         (
@@ -4809,7 +4857,8 @@ fn proof_grade_production_manifest_rejects_missing_or_mismatched_real_manifest_r
         .manifest_row_acceptance
         .as_mut()
         .expect("row acceptance should exist")
-        .replay_transcript_digest = Some(trust_types::stable_sha256_hex(b"different replay transcript digest"));
+        .replay_transcript_digest =
+        Some(trust_types::stable_sha256_hex(b"different replay transcript digest"));
     assert_production_manifest_rejects_field(
         &replay_mismatch,
         "manifest_row_acceptance.replay_transcript_digest",
@@ -4821,8 +4870,9 @@ fn proof_grade_production_manifest_rejects_missing_or_mismatched_real_manifest_r
         .as_mut()
         .expect("row acceptance should exist")
         .binary_artifact_digest_identity
-        .root_artifact_digest =
-        Some(BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(b"different root artifact digest")));
+        .root_artifact_digest = Some(BinaryArtifactDigest::sha256(trust_types::stable_sha256_hex(
+        b"different root artifact digest",
+    )));
     assert_production_manifest_rejects_field(
         &binary_digest_mismatch,
         "manifest_row_acceptance.binary_artifact_digest_identity",

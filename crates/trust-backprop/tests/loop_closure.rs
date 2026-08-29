@@ -40,9 +40,9 @@ fn prove_strengthen_backprop_loop_closes_on_unsigned_max() {
     // return type and the body brace. That position is what the parser lowers
     // into `body.contract`; the same text one line lower would be a statement
     // the re-prove step never sees as a precondition.
-    let clause = rewritten
-        .find("requires width < 128")
-        .unwrap_or_else(|| panic!("backprop must insert a native requires clause; got:\n{rewritten}"));
+    let clause = rewritten.find("requires width < 128").unwrap_or_else(|| {
+        panic!("backprop must insert a native requires clause; got:\n{rewritten}")
+    });
     let body_brace = rewritten.find('{').expect("the rewritten fn must keep a body");
     assert!(
         clause < body_brace,

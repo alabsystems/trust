@@ -198,11 +198,7 @@ pub fn g08_and_or_mixed(a: u32, b: u32, d: u32) -> bool {
 }
 #[inline(never)]
 pub fn g09_nested_if(c: bool, e: bool, a: u32, b: u32) -> u32 {
-    if c {
-        if e { a } else { b }
-    } else {
-        a & b
-    }
+    if c { if e { a } else { b } } else { a & b }
 }
 #[inline(never)]
 pub fn g10_if_cond_is_computed(a: u32, b: u32, x: u32, y: u32) -> u32 {
@@ -214,11 +210,7 @@ pub fn g11_if_cond_is_load(p: &bool, x: u32, y: u32) -> u32 {
 }
 #[inline(never)]
 pub fn g12_if_builds_struct(c: bool, x: u32, y: u32, z: u32) -> B3 {
-    if c {
-        B3 { a: x, b: y, c: z }
-    } else {
-        B3 { c: z, b: y, a: x }
-    }
+    if c { B3 { a: x, b: y, c: z } } else { B3 { c: z, b: y, a: x } }
 }
 #[inline(never)]
 pub fn g13_if_arms_swapped_same_type(c: bool, x: u32, y: u32) -> bool {

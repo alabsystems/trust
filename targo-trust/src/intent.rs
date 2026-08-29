@@ -17,8 +17,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::fs;
-use std::path::Component;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::{ConfiguredIntent, TRUST_TABLE};
 use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
@@ -385,9 +384,8 @@ mod tests {
         let file = fs::File::create(&path).expect("create intent");
         file.set_len(MAX_RELEASE_METADATA_BYTES as u64 + 1).expect("size intent");
 
-        let error =
-            resolve_intent(path.to_str(), None, None)
-                .expect_err("oversized intent must fail closed");
+        let error = resolve_intent(path.to_str(), None, None)
+            .expect_err("oversized intent must fail closed");
         assert!(error.contains("safety limit"), "{error}");
     }
 

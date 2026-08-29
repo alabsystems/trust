@@ -29,9 +29,7 @@ pub fn js_number_to_string(x: f64) -> String {
     // Shortest round-trip decimal: Rust's LowerExp gives `d[.ddd]e<exp>` with
     // the minimal digit count that round-trips (Grisu/Ryū since 1.32).
     let sci = format!("{x:e}");
-    let (mant, exp_s) = sci
-        .split_once('e')
-        .expect("LowerExp always contains an exponent");
+    let (mant, exp_s) = sci.split_once('e').expect("LowerExp always contains an exponent");
     let exp: i32 = exp_s.parse().expect("LowerExp exponent is an integer");
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
     let digits = digits.trim_end_matches('0');
@@ -76,20 +74,15 @@ pub fn projection_number_repr(x: f64) -> String {
 fn is_js_ws(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\u{b}'
-            | '\u{c}'
-            | ' '
-            | '\u{a0}'
-            | '\u{feff}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\n'
-            | '\r'
-            | '\u{2028}'
-            | '\u{2029}'
+        '\t' | '\u{b}' | '\u{c}' | ' ' | '\u{a0}' | '\u{feff}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\n'
+                | '\r'
+                | '\u{2028}'
+                | '\u{2029}'
     )
 }
 
@@ -97,9 +90,7 @@ fn is_js_ws(c: char) -> bool {
 /// is outside the modeled slice (radix literal too long for exact f64
 /// accumulation) and the case must refuse rather than guess.
 pub fn to_number_str(s: &str) -> Result<f64, String> {
-    let t: String = s
-        .trim_matches(is_js_ws)
-        .to_string();
+    let t: String = s.trim_matches(is_js_ws).to_string();
     if t.is_empty() {
         return Ok(0.0);
     }
@@ -238,10 +229,7 @@ mod tests {
         assert!(to_number_str("-0x10").unwrap().is_nan());
         assert!(to_number_str("1e").unwrap().is_nan());
         assert!(to_number_str("0xffffffffffffffff").is_err()); // 16 hex digits: refuse
-        assert_eq!(
-            to_number_str("-0").unwrap().to_bits(),
-            (-0.0f64).to_bits()
-        );
+        assert_eq!(to_number_str("-0").unwrap().to_bits(), (-0.0f64).to_bits());
     }
 
     #[test]

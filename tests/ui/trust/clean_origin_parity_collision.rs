@@ -16,21 +16,47 @@
 //! call site got would be an accident of lookup order.
 //!
 //! ============================================================================
-//! **FLIPPED 2026-08-19.** This file was `check-pass` and WRONG-GREEN BY DESIGN:
-//! it passed precisely because the defect was live. It is now `check-fail` with
-//! the `E0428` its own instructions demanded, and the Rust `fn f` was NOT
-//! deleted, NOT renamed, and NOT moved to another module — every one of those
-//! would have made it pass for the reason it was written to rule out.
+//! THE FLIP HAPPENED. THIS FIXTURE NOW PINS THE `E0428`.
 //!
-//! The collision cost no extra code, exactly as predicted: `define_local`
-//! routes through the duplicate detection that already exists, and it fires
-//! only because the child is planted into the ENCLOSING module rather than
-//! under the island's own def. `def_collector` calls the mint BEFORE
-//! `with_owner` for that reason — `with_owner_tables` swaps `current_owner`, so
-//! a child minted inside would be filed under the island's table, invisible to
-//! the module, silently failing parity and never tripping `E0428` at all. One
-//! placement decision satisfies both halves of parity, and getting it wrong
-//! breaks both silently.
+//! It used to carry `check-pass` and say so: the island declared no children,
+//! nothing was planted into the module's value namespace, and there was nothing
+//! for `pub fn f` to collide with — WRONG-GREEN BY DESIGN, with the instruction
+//! "WHEN I5 LANDS, THIS FILE MUST FLIP TO check-fail WITH E0428".
+//!
+//! 7b5c5535b3 ("the mint is wired") landed that. MEASURED 2026-08-19: the
+//! `E0428` fires, and its secondary span reads "previous definition of the
+//! value `f` here" pointing at the `def f` line inside the island. **The
+//! acceptance criterion this half owns is met.** The `check-pass` directive is
+//! therefore gone, and the collision is pinned positively — a compiler that
+//! stopped planting the child would fail this file rather than quietly pass it.
+//!
+//! The mechanism, as predicted and now exercised: the mint calls
+//! `Resolver::define_local` (`rustc_resolve/src/build_reduced_graph.rs`,
+//! `trust_mint_clean_island_decls`), which routes through
+//! `plant_decl_into_local_module` where duplicate detection lives — and only
+//! because the child is planted into the ENCLOSING MODULE rather than under the
+//! island's own def. That same placement is what makes the `DefPath` `m::f`
+//! line up with the Clean path `Crate.m.f`.
+//!
+//! Do not keep this file green by deleting the Rust `fn f`, by renaming either
+//! `f`, or by moving one of them to another module — every one of those makes
+//! the fixture pass for the reason it was written to rule out.
+//!
+//! THE CALL IN `main` IS NOT THIS FIXTURE'S SUBJECT, and it now pins nothing.
+//! It used to carry a privacy expectation (`E0603`) and a comptime-context one
+//! ("comptime fns can only be called at compile time"), on the strength of a
+//! mint that planted its decls module-private and always-const. The mint now
+//! plants `Visibility::Public` and `Constness::Const { always: false }`
+//! (`rustc_resolve/src/build_reduced_graph.rs`,
+//! `trust_mint_clean_island_decls`), so neither diagnostic exists any more.
+//! MEASURED 2026-08-22 on stage2 ec4783d80 — here, where the `E0428` is the
+//! only diagnostic emitted, and on the same island with the colliding `fn f`
+//! removed, where the call compiles clean. Those two mint decisions are shared
+//! with `clean_origin_call_parity.rs`, and that file owns them.
+//!
+//! Never spell the annotation sigil literally in this prose: compiletest scans
+//! EVERY line with a bare regex (`src/tools/compiletest/src/errors.rs:141`), so
+//! a quoted sigil in a comment becomes a real, unsatisfiable expectation.
 //! ============================================================================
 
 mod m {
@@ -38,7 +64,7 @@ mod m {
         def f (a : UInt64) : UInt64 := a
     }
 
-    // Collides with the Clean-origin `f` above, which I5 mints into THIS module.
+    // MUST collide with the Clean-origin `f` above. It does.
     pub fn f(a: u64) -> u64 { a }
     //~^ ERROR the name `f` is defined multiple times
 }

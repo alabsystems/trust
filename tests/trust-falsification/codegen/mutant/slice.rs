@@ -6,4 +6,6 @@
 // `#[trust::verified_codegen]` (build error) rather than vacuously accept it —
 // proving the verified-codegen guarantee is non-vacuous.
 #[trust::verified_codegen]
-pub fn first(s: &[u32]) -> u32 { s[0] }
+pub fn first(s: &[u32]) -> u32 {
+    s[0]
+}

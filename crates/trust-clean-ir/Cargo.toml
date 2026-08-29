@@ -1,0 +1,68 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-clean-ir — the Clean -> TrustIR producer.
+#
+# WHY THIS CRATE EXISTS.
+# Trust has two authoritative languages, and until now they met at MIR: a Clean
+# island is parsed, kernel-checked, and planned into a `CleanOriginPlan`, and the
+# ONLY consumer of that plan was `clean_origin_mir`, which emits `Body<'tcx>`.
+# Rust, meanwhile, reaches TrustIR two ways (the THIR frontend behind
+# `-Ztrust-ir-lower`, and the MIR-derived compatibility spine). So TrustIR could
+# not be the common spine for the two languages: one of them never produced it.
+#
+# This crate is the second consumer of the same plan. It takes the IR-agnostic
+# `CleanOriginPlan` -- name, total `CarrierSignature`, and recognised
+# `CleanOriginShape` -- and emits a `trust_ir::Function`, so Clean and Rust meet
+# in TrustIR rather than in MIR.
+#
+# WHY NOT IN `trust-clean-origin`.
+# That crate's header states an "exactly six dependencies" rule and argues the
+# dependency list as part of its soundness argument (kernel, proof search,
+# carrier, symbols, types, reflector). Adding TrustIR there would put a code
+# producer inside the crate that decides admissibility and faithfulness. Keeping
+# the producer separate also keeps the decision one-directional: this crate
+# CONSUMES a sealed plan and can never widen what the gate admits.
+#
+# WHAT THIS CRATE IS NOT.
+# It is not proof authority and it is not a second gate. A plan only exists
+# because `plan_clean_origin_body` already re-checked the declaration's
+# provenance (`FullKernelCheck`) and its total carrier signature. This crate
+# adds no verdict; it re-spells a sealed plan in a second IR. The kernel gate on
+# the emitted body remains `trust-clean-origin`'s (`admit_lowering`), and a
+# TrustIR body that is not put back to that gate must not be trusted -- see the
+# `GATING` section in lib.rs.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-clean-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Clean -> TrustIR producer: the second consumer of a sealed CleanOriginPlan."
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-clean-origin = { path = "../trust-clean-origin" }
+trust-clean-carrier = { path = "../trust-clean-carrier" }
+trust-ir = { workspace = true }
+# The `ArithBinOp`/`ArithOperand`/`ArithExpr` vocabulary the plan speaks. REUSED,
+# never redefined: the plan's values come from the Clean term and the MIR
+# recognizer reads the same vocabulary off the emitted body, so a second
+# spelling here would be a producer edit disguised as a convenience.
+trust-types = { path = "../trust-types", default-features = false }
+
+[dev-dependencies]
+# TESTS ONLY. A `CleanOriginPlan` has no public constructor -- by design, since a
+# plan must rest on a kernel verdict -- so the tests drive REAL Clean source
+# through a real island session, exactly as trust-clean-origin's own control
+# tests do. No cycle: neither crate depends on this one.
+trust-certify = { path = "../trust-certify" }
+clean-kernel = { workspace = true }
+trust-ir = { workspace = true, features = ["clean-expr"] }

@@ -1,12 +1,11 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Sort, SourceSpan, Terminator, Ty,
-    VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Sort, SourceSpan,
+    Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{
     generate_callsite_precondition_vcs, generate_callsite_precondition_vcs_attributed,
-    generate_vcs_with_discharge, generate_vcs_with_discharge_and_summaries,
+    generate_vcs, generate_vcs_with_discharge, generate_vcs_with_discharge_and_summaries,
 };
 use crate::modular::{FunctionSummary, SummaryDatabase};
 
@@ -28,6 +27,7 @@ fn caller_to_reciprocal() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "example::reciprocal".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -48,6 +48,36 @@ fn caller_to_reciprocal() -> VerifiableFunction {
         postconditions: vec![],
         spec: Default::default(),
     }
+}
+
+fn tail_caller_to_reciprocal() -> VerifiableFunction {
+    let mut func = caller_to_reciprocal();
+    func.body.locals[0].ty = Ty::u32();
+    func.body.return_ty = Ty::u32();
+    let Terminator::Call {
+        func: callee,
+        args,
+        span,
+        atomic,
+        is_foreign,
+        is_unsafe_sig,
+        callee_identity,
+        ..
+    } = func.body.blocks[0].terminator.clone()
+    else {
+        unreachable!();
+    };
+    func.body.blocks[0].terminator = Terminator::TailCall {
+        func: callee,
+        args,
+        span,
+        atomic,
+        is_foreign,
+        is_unsafe_sig,
+        callee_identity,
+    };
+    func.body.blocks.truncate(1);
+    func
 }
 
 fn caller_to_reciprocal_with_body_vc() -> VerifiableFunction {
@@ -79,6 +109,7 @@ fn caller_to_slice_sink() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: trust_types::UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "example::slice_sink".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -133,6 +164,72 @@ fn summaries_emit_unproved_callsite_preconditions_with_actual_args() {
 }
 
 #[test]
+fn tail_calls_retain_exact_preconditions_in_every_callsite_producer() {
+    let func = tail_caller_to_reciprocal();
+    let mut summaries = SummaryDatabase::new();
+    summaries.insert(
+        FunctionSummary::new("example::reciprocal")
+            .with_param_names(vec!["n".to_string()])
+            .with_precondition(Formula::Gt(
+                Box::new(Formula::var("n", Sort::Int)),
+                Box::new(Formula::Int(0)),
+            )),
+    );
+
+    let ordinary = generate_callsite_precondition_vcs(&func, &summaries);
+    let attributed = generate_callsite_precondition_vcs_attributed(&func, &summaries)
+        .into_iter()
+        .map(|(vc, _, _)| vc)
+        .collect::<Vec<_>>();
+    let modular = crate::modular::generate_modular_vcs(&func, &summaries);
+    for (lane, vcs) in [("ordinary", ordinary), ("attributed", attributed), ("modular", modular)] {
+        let pre = vcs
+            .iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(pre.len(), 1, "{lane} dropped or duplicated the tail-call requires row");
+        assert_eq!(
+            pre[0].formula,
+            Formula::Not(Box::new(Formula::Gt(
+                Box::new(Formula::var("x", Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ))),
+        );
+    }
+
+    let mut dominated = func;
+    let Terminator::TailCall { args, .. } = &mut dominated.body.blocks[0].terminator else {
+        unreachable!();
+    };
+    args[0] = Operand::Constant(ConstValue::Uint(1, 32));
+    assert!(
+        super::float_range::all_callsites_precondition_dominated(
+            &dominated,
+            &summaries,
+            "example::reciprocal",
+        ),
+        "R1's exact suppressed-row audit must count a dominated TailCall site"
+    );
+}
+
+#[test]
+fn tail_call_emits_the_callers_ordinary_return_postcondition() {
+    for post in [true, false] {
+        let mut func = tail_caller_to_reciprocal();
+        func.postconditions = vec![Formula::Bool(post)];
+        let rows = generate_vcs(&func);
+        let post_rows =
+            rows.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).collect::<Vec<_>>();
+        assert_eq!(post_rows.len(), 1, "TailCall dropped or duplicated its ensures row");
+        assert_eq!(
+            post_rows[0].formula,
+            Formula::Not(Box::new(Formula::Bool(post))),
+            "TailCall must use the same SAT-as-violation polarity as Return"
+        );
+    }
+}
+
+#[test]
 fn direct_summary_slice_length_rebinds_to_actual_argument() {
     let func = caller_to_slice_sink();
     let slice_ty =
@@ -165,10 +262,7 @@ fn direct_summary_slice_length_rebinds_to_actual_argument() {
 fn arithmetic_summary_requires_fail_closed_in_all_callsite_producers() {
     let func = caller_to_reciprocal();
     let arithmetic = Formula::Gt(
-        Box::new(Formula::Add(
-            Box::new(Formula::var("n", Sort::Int)),
-            Box::new(Formula::Int(1)),
-        )),
+        Box::new(Formula::Add(Box::new(Formula::var("n", Sort::Int)), Box::new(Formula::Int(1)))),
         Box::new(Formula::var("n", Sort::Int)),
     );
     let mut summaries = SummaryDatabase::new();
@@ -322,6 +416,7 @@ fn caller_passing_copy_of_param(mutate_source: bool) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "example::reciprocal".to_string(),
                         args: vec![Operand::Move(Place::local(3))],
@@ -375,10 +470,7 @@ fn sigma_does_not_fold_when_source_is_reassigned() {
 /// `lo <= hi` over the caller's formals (entry names) — the shared shape of
 /// the caller `#[requires]` AND (post-σ-rooting) the callee's substituted P.
 fn lo_le_hi() -> Formula {
-    Formula::Le(
-        Box::new(Formula::var("lo", Sort::Int)),
-        Box::new(Formula::var("hi", Sort::Int)),
-    )
+    Formula::Le(Box::new(Formula::var("lo", Sort::Int)), Box::new(Formula::var("hi", Sort::Int)))
 }
 
 /// The `range_usize` shape:
@@ -436,12 +528,10 @@ fn caller_with_widening_casts(reassign_lo: bool) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "example::range_i128".to_string(),
-                        args: vec![
-                            Operand::Move(Place::local(5)),
-                            Operand::Move(Place::local(6)),
-                        ],
+                        args: vec![Operand::Move(Place::local(5)), Operand::Move(Place::local(6))],
                         dest: Place::local(7),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
@@ -539,6 +629,7 @@ fn caller_casting_param(from_ty: Ty, to_ty: Ty) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "example::sink".to_string(),
                         args: vec![Operand::Move(Place::local(3))],
@@ -580,6 +671,7 @@ fn sigma_declines_root_reassigned_via_call_destination() {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "example::reseat".to_string(),
                 args: vec![],
@@ -645,10 +737,7 @@ fn reassigned_formal_precondition_is_not_conjoined() {
         "a reassigned formal's precondition must NOT reach the obligation: {conjuncts:?}"
     );
     // The reassigned root also declines the σ fold (kept fail-closed).
-    assert_eq!(
-        super::sigma_actual_stable_copy_root(&func, &Operand::Move(Place::local(5))),
-        None
-    );
+    assert_eq!(super::sigma_actual_stable_copy_root(&func, &Operand::Move(Place::local(5))), None);
 }
 
 #[test]

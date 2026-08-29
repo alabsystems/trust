@@ -32,17 +32,16 @@ owner = "@trust-release"
 # test-exc.crashes.135122.no-ice is status = "resolved"; adopted-fix rationale
 # in tests/upstream-rust/upstream-fixes.toml
 # (fix.trait_solver.implied_outlives_bounds_infer_ice_135122).
-[[items]]
-id = "upstream.accepted.crashes.135122.no-ice"
-scope = "upstream-rust"
-status = "resolved"
-ledger = "tests/upstream-rust/test-exceptions.toml#test-exc.crashes.135122.no-ice"
-suite = "crashes"
-path = "tests/crashes/135122.rs"
-reason = "Retired: Trust emits ordinary diagnostics where upstream ICEs (rust-lang/rust#135122); the crashes entry is deleted and replaced by a ui regression test per the upstream-sanctioned de-ICE process."
-compatibility_impact = "No successful Rust program is rejected or miscompiled; the upstream crash-regression expectation is retired in favor of a fixed-behavior regression test."
-required_action = "None; drop this row if upstream deletes its crashes entry once the next-solver fix lands."
-expires_on = "2026-07-28"
+# DROPPED 2026-08-27: this row reached its `expires_on` (2026-07-28) and its own
+# `required_action` said "None; drop this row if upstream deletes its crashes
+# entry". Both stated preconditions verified before removal:
+#   * tests/crashes/135122.rs               — absent (deleted, as the row said)
+#   * tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs — present
+#   * test-exc.crashes.135122.no-ice        — already RETIRED 2026-07-23
+# The row was `status = "resolved"`, so this is the documented retirement, NOT an
+# expiry extension. An expired quarantine row must never be renewed to green a
+# gate; it is either fixed and dropped, or it is still a live problem.
+
 
 # Decomposed 2026-07-24 per the PR rule: the most recent executed domination
 # run (2026-07-12, exec-c30dc44143) recorded exactly two ui failures in this

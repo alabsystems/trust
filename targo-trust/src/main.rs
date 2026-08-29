@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // targo trust: Cargo subcommand for Trust verification
 //
 // Usage:
@@ -60,6 +61,7 @@ mod self_improve;
 mod self_verify_cli;
 mod solver_detect;
 mod source_analysis;
+mod spec_cli;
 mod stage2_tools;
 mod temporal_cli;
 mod trust_added;
@@ -274,17 +276,49 @@ fn run_main() -> ExitCode {
             // such results to that artifact.
             let build_result = run_subcommand(Subcommand::Build, &args[start + 1..]);
             // In order, temporal, Kani, and Creusot inspect the resolved
-            // package graph only to detect an active opt-in. An opted-in
-            // package is rejected with an explicit unbound-evidence setup
-            // error; a package with no active temporal engine edge, Kani
-            // dependency, or Creusot-family dependency is a no-op
-            // pass-through. See temporal_cli::gate_build,
-            // pipeline::kani_gate::gate_build, and
+            // package graph only to detect an active opt-in. A temporal
+            // opt-in is rejected with an explicit unbound-evidence setup
+            // error; Kani and Creusot opt-ins DISCLOSE and proceed (v5 §3.2
+            // zero-authority ingestion lanes — the Creusot disclosure names
+            // the tippy reader as the migration path). A package with no
+            // active temporal engine edge, Kani dependency, or
+            // Creusot-family dependency is a no-op pass-through. See
+            // temporal_cli::gate_build, pipeline::kani_gate::gate_build, and
             // pipeline::creusot_gate::gate_build.
             let build_result = temporal_cli::gate_build(build_result, &args[start + 1..]);
             let build_result = pipeline::kani_gate::gate_build(build_result, &args[start + 1..]);
             pipeline::creusot_gate::gate_build(build_result, &args[start + 1..])
         }
+        // `kani` is NOT a rename, so this arm deliberately names no replacement
+        // subcommand: the Route-2 shim was deleted outright (R2 deletion D-A)
+        // and the boundary it wrapped now lives inside `targo trust build` as
+        // pipeline::kani_gate. Restored because a user typing the removed
+        // spelling was getting the generic `unknown subcommand` usage dump —
+        // its only callers are users, so the wave-1 dead-code sweep
+        // (fc5a9655a0) read it as dead and deleted it, exactly as it did the
+        // repo/verify/gate/rust-vs-trust arms.
+        //
+        // The pre-sweep text is NOT restored verbatim: it claimed a package
+        // declaring a `kani` dependency "remains fail-closed in `targo trust
+        // build`", and the 2026-07-26 amendment (two-language design v5 §3.2)
+        // replaced that rejection with a disclosure. Repeating the old sentence
+        // would now be a lie about the build gate, so this states today's
+        // behaviour instead.
+        Some("kani") => {
+            eprintln!(
+                "targo trust: `kani` has been removed (R2 deletion D-A) and has no replacement \
+                 subcommand; harnesses are written with the native `#[kani::harness]` attribute, \
+                 and a package that declares a `kani` dependency is DISCLOSED — not rejected — \
+                 by the post-build boundary in `targo trust build`, because Kani is a \
+                 zero-authority ingestion lane (two-language design v5 §3.2). Use `targo trust \
+                 check` for the verdicts Trust actually stands behind."
+            );
+            ExitCode::from(2)
+        }
+        // Trust (v6/D1): compiler-authoritative spec-goal surface. Runs a
+        // verified check with the emission knob and prints the artifact; it
+        // fails closed when no live compiler session produced one.
+        Some("spec") => spec_cli::run_spec_subcommand(&args[start + 1..]),
         Some("version") => release_cli::run_version_subcommand(&args[start + 1..]),
         Some("release") => release_cli::run_release_subcommand(&args[start + 1..]),
         Some("verify") => script_cli::run_verify_subcommand(&args[start + 1..]),
@@ -313,6 +347,19 @@ fn run_main() -> ExitCode {
             external_checker::run_checker_supervisor(&args[start + 1..])
         }
         Some("domination") => rust_vs_trust::run_subcommand(&args[start + 1..]),
+        // `rust-vs-trust` was renamed to `domination`; the removed spelling
+        // still NAMES its replacement instead of landing in the generic
+        // `unknown subcommand` usage dump. Its only callers are users and
+        // scripts typing the old name, so it has no in-repo call site by
+        // construction — which is how the wave-1 dead-code sweep (fc5a9655a0)
+        // came to delete it. `targo trust domination upstream-rust-tests`
+        // keeps the identical shape one level down.
+        Some("rust-vs-trust") => {
+            eprintln!(
+                "targo trust: `rust-vs-trust` has been removed; use `targo trust domination`"
+            );
+            ExitCode::from(2)
+        }
         Some("report-query") => report_query::run_report_query_subcommand(&args[start + 1..]),
         Some("report") => run_subcommand(Subcommand::Report, &args[start + 1..]),
         Some("loop") => run_subcommand(Subcommand::Loop, &args[start + 1..]),
@@ -2995,7 +3042,9 @@ fn release_transcript_exact_source_ownership_sha256(
     if !report.source_provenance.effective_source_backpropagation_allowed()
         || !source_backpropagation_gate.source_backpropagation_allowed
         || !source_backpropagation_gate.exact_source_provenance
-        || !source_backpropagation_gate_sha256.as_deref().is_some_and(trust_types::digest::is_stable_sha256_hex)
+        || !source_backpropagation_gate_sha256
+            .as_deref()
+            .is_some_and(trust_types::digest::is_stable_sha256_hex)
     {
         return None;
     }
@@ -4940,7 +4989,10 @@ fn trust_ir_target_binding_input(
 }
 
 fn trust_ir_target_output_identifier(output_content: &str) -> String {
-    format!("trust_ir-json:sha256:{}", trust_types::digest::stable_sha256_hex(output_content.as_bytes()))
+    format!(
+        "trust_ir-json:sha256:{}",
+        trust_types::digest::stable_sha256_hex(output_content.as_bytes())
+    )
 }
 
 fn trust_ir_lifted_artifact_identity(
@@ -5031,7 +5083,10 @@ fn trust_ir_lifted_artifact_identity(
 
     let bytes = serde_json::to_vec(&projection)
         .expect("serializing TrustIr lifted-function identity projection should not fail");
-    Some(format!("lifted-binary-trust_ir:sha256:{}", trust_types::digest::stable_sha256_hex(&bytes)))
+    Some(format!(
+        "lifted-binary-trust_ir:sha256:{}",
+        trust_types::digest::stable_sha256_hex(&bytes)
+    ))
 }
 
 fn trust_ir_reconstruction_refinement_identity(
@@ -5063,7 +5118,10 @@ fn trust_ir_reconstruction_refinement_identity(
     });
     let bytes = serde_json::to_vec(&refinement_projection)
         .expect("serializing TrustIr refinement identity projection should not fail");
-    Some(format!("structured-trust_ir-refinement:sha256:{}", trust_types::digest::stable_sha256_hex(&bytes)))
+    Some(format!(
+        "structured-trust_ir-refinement:sha256:{}",
+        trust_types::digest::stable_sha256_hex(&bytes)
+    ))
 }
 
 fn parse_report_hex_address(address: &str) -> Option<u64> {
@@ -6357,9 +6415,18 @@ fn release_transcript_evidence_origin_for_convert_readback(
 ) -> &'static str {
     if record.status == "readback"
         && record.production_checked
-        && record.manifest_identity_sha256.as_deref().is_some_and(trust_types::digest::is_stable_sha256_hex)
-        && record.source_backpropagation_gate_sha256.as_deref().is_some_and(trust_types::digest::is_stable_sha256_hex)
-        && record.production_checker_evidence_sha256.as_deref().is_some_and(trust_types::digest::is_stable_sha256_hex)
+        && record
+            .manifest_identity_sha256
+            .as_deref()
+            .is_some_and(trust_types::digest::is_stable_sha256_hex)
+        && record
+            .source_backpropagation_gate_sha256
+            .as_deref()
+            .is_some_and(trust_types::digest::is_stable_sha256_hex)
+        && record
+            .production_checker_evidence_sha256
+            .as_deref()
+            .is_some_and(trust_types::digest::is_stable_sha256_hex)
         && record.replay_digest_identity.status == "accepted"
         && record.release_transcript_binding.status == "accepted"
         && decompile_production_proof_grade_evidence_accepts(report)
@@ -11070,7 +11137,10 @@ fn checked_certificate_import_record_is_accepted_evidence(
         && trust_types::digest::is_stable_sha256_hex(&artifact.origin_sha256)
         && trust_types::digest::is_stable_sha256_hex(&artifact.certificate_sha256)
         && trust_types::digest::is_stable_sha256_hex(&artifact.proof_export_sha256)
-        && artifact.manifest_identity_sha256.as_deref().is_some_and(trust_types::digest::is_stable_sha256_hex)
+        && artifact
+            .manifest_identity_sha256
+            .as_deref()
+            .is_some_and(trust_types::digest::is_stable_sha256_hex)
         && artifact
             .source_backpropagation_gate_sha256
             .as_deref()
@@ -11083,7 +11153,6 @@ fn checked_certificate_import_record_is_accepted_evidence(
         && artifact.replay_digest_identity.status == "accepted"
         && checked_certificate_import_release_transcript_binding(artifact).status == "accepted"
 }
-
 
 fn checked_certificate_import_proof_grade_release_transcript_rows(
     import: Option<&CheckedCertificateImportReport>,
@@ -14703,6 +14772,7 @@ pub(crate) fn run_subcommand_with_live_report(
             hardened: sub_args.hardened,
             trust_profile: sub_args.trust_profile.as_deref(),
             ay_path: selected_ay_path.as_deref(),
+            spec_emit_dir: sub_args.spec_emit_dir.as_deref().map(Path::new),
             format: render_format,
             report_dir: sub_args.report_dir.as_deref(),
             unsafe_memory_report: unsafe_memory_report_request.as_ref(),

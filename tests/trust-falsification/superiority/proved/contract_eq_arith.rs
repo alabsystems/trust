@@ -7,4 +7,6 @@
 // the return value to the body). Default mode must report it fully proved.
 #[core::contracts::requires(x < 100)]
 #[core::contracts::ensures(move |ret: &u32| *ret == x + 1)]
-pub fn contract_eq_arith(x: u32) -> u32 { x + 1 }
+pub fn contract_eq_arith(x: u32) -> u32 {
+    x + 1
+}

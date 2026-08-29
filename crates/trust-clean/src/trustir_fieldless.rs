@@ -60,8 +60,7 @@ use clean_kernel::{
 };
 
 use crate::mirsem::{
-    MIRSEM_DISCRIMINANT_TAG_KEY, SemFieldlessEnumClone, SemFieldlessEnumEq,
-    SemFieldlessEnumThen,
+    MIRSEM_DISCRIMINANT_TAG_KEY, SemFieldlessEnumClone, SemFieldlessEnumEq, SemFieldlessEnumThen,
 };
 use crate::trustir_anchor::{
     RefinementVerdict, TRUSTIR_IDX_ELEM, cst, env_ty, int_lit, int_ty, trustir_env,

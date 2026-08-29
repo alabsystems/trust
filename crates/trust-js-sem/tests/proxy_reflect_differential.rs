@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -100,202 +101,449 @@ fn cases() -> Vec<Case> {
 
     // ---- Reflect: the 13 statics -----------------------------------------
     c("reflect-get", false, C, "console.log(Reflect.get({ a: 1 }, 'a'), Reflect.get({}, 'x'));");
-    c("reflect-get-receiver", false, C,
-      "var o = { get x() { return this.y; }, y: 7 }; console.log(Reflect.get(o, 'x', { y: 42 }));");
+    c(
+        "reflect-get-receiver",
+        false,
+        C,
+        "var o = { get x() { return this.y; }, y: 7 }; console.log(Reflect.get(o, 'x', { y: 42 }));",
+    );
     c("reflect-set", false, C, "var o = {}; console.log(Reflect.set(o, 'x', 5), o.x);");
-    c("reflect-has", false, C, "console.log(Reflect.has({ a: 1 }, 'a'), Reflect.has({ a: 1 }, 'b'), Reflect.has([], 'length'));");
-    c("reflect-deleteproperty", false, C,
-      "var o = { a: 1 }; console.log(Reflect.deleteProperty(o, 'a'), 'a' in o);");
-    c("reflect-defineproperty", false, C,
-      "var o = {}; console.log(Reflect.defineProperty(o, 'x', { value: 1, enumerable: true }), o.x);");
-    c("reflect-getownpropertydescriptor", false, C,
-      "console.log(Reflect.getOwnPropertyDescriptor({ a: 1 }, 'a').value, Reflect.getOwnPropertyDescriptor({}, 'z'));");
-    c("reflect-getprototypeof", false, C,
-      "console.log(Reflect.getPrototypeOf([]) === Array.prototype, Reflect.getPrototypeOf(Object.create(null)));");
-    c("reflect-setprototypeof", false, C,
-      "var o = {}; console.log(Reflect.setPrototypeOf(o, null), Reflect.getPrototypeOf(o));");
-    c("reflect-isextensible-prevent", false, C,
-      "var o = {}; console.log(Reflect.isExtensible(o), Reflect.preventExtensions(o), Reflect.isExtensible(o));");
-    c("reflect-ownkeys", false, C,
-      "var o = { b: 1, 2: 'x', a: 3, 0: 'y' }; console.log(Reflect.ownKeys(o));");
-    c("reflect-ownkeys-symbols", false, C,
-      "var s = Symbol('s'); var o = { a: 1 }; o[s] = 2; var k = Reflect.ownKeys(o); console.log(k.length, k[0], k[1] === s);");
+    c(
+        "reflect-has",
+        false,
+        C,
+        "console.log(Reflect.has({ a: 1 }, 'a'), Reflect.has({ a: 1 }, 'b'), Reflect.has([], 'length'));",
+    );
+    c(
+        "reflect-deleteproperty",
+        false,
+        C,
+        "var o = { a: 1 }; console.log(Reflect.deleteProperty(o, 'a'), 'a' in o);",
+    );
+    c(
+        "reflect-defineproperty",
+        false,
+        C,
+        "var o = {}; console.log(Reflect.defineProperty(o, 'x', { value: 1, enumerable: true }), o.x);",
+    );
+    c(
+        "reflect-getownpropertydescriptor",
+        false,
+        C,
+        "console.log(Reflect.getOwnPropertyDescriptor({ a: 1 }, 'a').value, Reflect.getOwnPropertyDescriptor({}, 'z'));",
+    );
+    c(
+        "reflect-getprototypeof",
+        false,
+        C,
+        "console.log(Reflect.getPrototypeOf([]) === Array.prototype, Reflect.getPrototypeOf(Object.create(null)));",
+    );
+    c(
+        "reflect-setprototypeof",
+        false,
+        C,
+        "var o = {}; console.log(Reflect.setPrototypeOf(o, null), Reflect.getPrototypeOf(o));",
+    );
+    c(
+        "reflect-isextensible-prevent",
+        false,
+        C,
+        "var o = {}; console.log(Reflect.isExtensible(o), Reflect.preventExtensions(o), Reflect.isExtensible(o));",
+    );
+    c(
+        "reflect-ownkeys",
+        false,
+        C,
+        "var o = { b: 1, 2: 'x', a: 3, 0: 'y' }; console.log(Reflect.ownKeys(o));",
+    );
+    c(
+        "reflect-ownkeys-symbols",
+        false,
+        C,
+        "var s = Symbol('s'); var o = { a: 1 }; o[s] = 2; var k = Reflect.ownKeys(o); console.log(k.length, k[0], k[1] === s);",
+    );
     c("reflect-apply", false, C, "console.log(Reflect.apply(Math.max, null, [1, 5, 3]));");
-    c("reflect-apply-this", false, C,
-      "function f(a) { return this.x + a; } console.log(Reflect.apply(f, { x: 10 }, [5]));");
-    c("reflect-construct", false, C,
-      "function F(a) { this.a = a; } var o = Reflect.construct(F, [9]); console.log(o.a, o instanceof F);");
-    c("reflect-construct-newtarget", false, C,
-      "function F() {} function G() {} var o = Reflect.construct(F, [], G); console.log(Object.getPrototypeOf(o) === G.prototype);");
-    c("reflect-nonobject-throws", false, C,
-      "var t = false; try { Reflect.get(1, 'x'); } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("reflect-apply-noncallable-throws", false, C,
-      "var t = false; try { Reflect.apply({}, null, []); } catch (e) { t = e instanceof TypeError; } console.log(t);");
+    c(
+        "reflect-apply-this",
+        false,
+        C,
+        "function f(a) { return this.x + a; } console.log(Reflect.apply(f, { x: 10 }, [5]));",
+    );
+    c(
+        "reflect-construct",
+        false,
+        C,
+        "function F(a) { this.a = a; } var o = Reflect.construct(F, [9]); console.log(o.a, o instanceof F);",
+    );
+    c(
+        "reflect-construct-newtarget",
+        false,
+        C,
+        "function F() {} function G() {} var o = Reflect.construct(F, [], G); console.log(Object.getPrototypeOf(o) === G.prototype);",
+    );
+    c(
+        "reflect-nonobject-throws",
+        false,
+        C,
+        "var t = false; try { Reflect.get(1, 'x'); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "reflect-apply-noncallable-throws",
+        false,
+        C,
+        "var t = false; try { Reflect.apply({}, null, []); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- Proxy: the property traps ---------------------------------------
-    c("proxy-get-trap", false, C,
-      "var p = new Proxy({}, { get: function (t, k) { return k + '!'; } }); console.log(p.foo, p.bar);");
-    c("proxy-get-default", false, C,
-      "var p = new Proxy({ a: 1 }, {}); console.log(p.a, p.b);");
-    c("proxy-get-receiver-forwarded", false, C,
-      "var log = []; var p = new Proxy({}, { get: function (t, k, r) { log.push(r === p); return 1; } }); p.x; console.log(log);");
-    c("proxy-set-trap", false, C,
-      "var log = []; var p = new Proxy({}, { set: function (t, k, v) { log.push(k + '=' + v); t[k] = v; return true; } });\n\
-       p.x = 5; console.log(log, p.x);");
-    c("proxy-set-default", false, C,
-      "var t = {}; var p = new Proxy(t, {}); p.y = 9; console.log(t.y, p.y);");
-    c("proxy-has-trap", false, C,
-      "var p = new Proxy({}, { has: function (t, k) { return k === 'yes'; } }); console.log('yes' in p, 'no' in p);");
-    c("proxy-has-default", false, C,
-      "var p = new Proxy({ a: 1 }, {}); console.log('a' in p, 'b' in p);");
-    c("proxy-delete-trap", false, C,
-      "var log = []; var p = new Proxy({ a: 1 }, { deleteProperty: function (t, k) { log.push(k); return true; } });\n\
-       var d = delete p.a; console.log(d, log);");
-    c("proxy-ownkeys-descriptor", false, C,
-      "var p = new Proxy({}, { ownKeys: function () { return ['a', 'b']; },\n\
+    c(
+        "proxy-get-trap",
+        false,
+        C,
+        "var p = new Proxy({}, { get: function (t, k) { return k + '!'; } }); console.log(p.foo, p.bar);",
+    );
+    c("proxy-get-default", false, C, "var p = new Proxy({ a: 1 }, {}); console.log(p.a, p.b);");
+    c(
+        "proxy-get-receiver-forwarded",
+        false,
+        C,
+        "var log = []; var p = new Proxy({}, { get: function (t, k, r) { log.push(r === p); return 1; } }); p.x; console.log(log);",
+    );
+    c(
+        "proxy-set-trap",
+        false,
+        C,
+        "var log = []; var p = new Proxy({}, { set: function (t, k, v) { log.push(k + '=' + v); t[k] = v; return true; } });\n\
+       p.x = 5; console.log(log, p.x);",
+    );
+    c(
+        "proxy-set-default",
+        false,
+        C,
+        "var t = {}; var p = new Proxy(t, {}); p.y = 9; console.log(t.y, p.y);",
+    );
+    c(
+        "proxy-has-trap",
+        false,
+        C,
+        "var p = new Proxy({}, { has: function (t, k) { return k === 'yes'; } }); console.log('yes' in p, 'no' in p);",
+    );
+    c(
+        "proxy-has-default",
+        false,
+        C,
+        "var p = new Proxy({ a: 1 }, {}); console.log('a' in p, 'b' in p);",
+    );
+    c(
+        "proxy-delete-trap",
+        false,
+        C,
+        "var log = []; var p = new Proxy({ a: 1 }, { deleteProperty: function (t, k) { log.push(k); return true; } });\n\
+       var d = delete p.a; console.log(d, log);",
+    );
+    c(
+        "proxy-ownkeys-descriptor",
+        false,
+        C,
+        "var p = new Proxy({}, { ownKeys: function () { return ['a', 'b']; },\n\
        getOwnPropertyDescriptor: function (t, k) { return { value: k, enumerable: true, configurable: true }; } });\n\
-       console.log(Object.keys(p), Object.getOwnPropertyNames(p));");
-    c("proxy-getownpropertydescriptor-trap", false, C,
-      "var p = new Proxy({}, { getOwnPropertyDescriptor: function (t, k) { return { value: 42, configurable: true }; } });\n\
-       var d = Object.getOwnPropertyDescriptor(p, 'x'); console.log(d.value, d.enumerable, d.writable);");
-    c("proxy-defineproperty-trap", false, C,
-      "var log = []; var p = new Proxy({}, { defineProperty: function (t, k, d) { log.push(k); Object.defineProperty(t, k, d); return true; } });\n\
-       Object.defineProperty(p, 'x', { value: 1, configurable: true }); console.log(log);");
-    c("proxy-getprototypeof-trap", false, C,
-      "var proto = { p: 1 }; var p = new Proxy({}, { getPrototypeOf: function () { return proto; } });\n\
-       console.log(Object.getPrototypeOf(p) === proto, Reflect.getPrototypeOf(p) === proto);");
-    c("proxy-setprototypeof-trap", false, C,
-      "var log = []; var p = new Proxy({}, { setPrototypeOf: function (t, v) { log.push('set'); return true; } });\n\
-       console.log(Reflect.setPrototypeOf(p, {}), log);");
-    c("proxy-isextensible-trap", false, C,
-      "var p = new Proxy({}, { isExtensible: function (t) { return Reflect.isExtensible(t); } });\n\
-       console.log(Reflect.isExtensible(p));");
-    c("proxy-preventextensions-trap", false, C,
-      "var p = new Proxy({}, { preventExtensions: function (t) { Object.preventExtensions(t); return true; } });\n\
-       console.log(Reflect.preventExtensions(p), Reflect.isExtensible(p));");
+       console.log(Object.keys(p), Object.getOwnPropertyNames(p));",
+    );
+    c(
+        "proxy-getownpropertydescriptor-trap",
+        false,
+        C,
+        "var p = new Proxy({}, { getOwnPropertyDescriptor: function (t, k) { return { value: 42, configurable: true }; } });\n\
+       var d = Object.getOwnPropertyDescriptor(p, 'x'); console.log(d.value, d.enumerable, d.writable);",
+    );
+    c(
+        "proxy-defineproperty-trap",
+        false,
+        C,
+        "var log = []; var p = new Proxy({}, { defineProperty: function (t, k, d) { log.push(k); Object.defineProperty(t, k, d); return true; } });\n\
+       Object.defineProperty(p, 'x', { value: 1, configurable: true }); console.log(log);",
+    );
+    c(
+        "proxy-getprototypeof-trap",
+        false,
+        C,
+        "var proto = { p: 1 }; var p = new Proxy({}, { getPrototypeOf: function () { return proto; } });\n\
+       console.log(Object.getPrototypeOf(p) === proto, Reflect.getPrototypeOf(p) === proto);",
+    );
+    c(
+        "proxy-setprototypeof-trap",
+        false,
+        C,
+        "var log = []; var p = new Proxy({}, { setPrototypeOf: function (t, v) { log.push('set'); return true; } });\n\
+       console.log(Reflect.setPrototypeOf(p, {}), log);",
+    );
+    c(
+        "proxy-isextensible-trap",
+        false,
+        C,
+        "var p = new Proxy({}, { isExtensible: function (t) { return Reflect.isExtensible(t); } });\n\
+       console.log(Reflect.isExtensible(p));",
+    );
+    c(
+        "proxy-preventextensions-trap",
+        false,
+        C,
+        "var p = new Proxy({}, { preventExtensions: function (t) { Object.preventExtensions(t); return true; } });\n\
+       console.log(Reflect.preventExtensions(p), Reflect.isExtensible(p));",
+    );
 
     // ---- Proxy: call / construct -----------------------------------------
-    c("proxy-apply-trap", false, C,
-      "var p = new Proxy(function () {}, { apply: function (t, thisArg, args) { return args[0] + args[1]; } });\n\
-       console.log(p(2, 3), typeof p);");
-    c("proxy-apply-default", false, C,
-      "var p = new Proxy(function (a, b) { return a * b; }, {}); console.log(p(3, 4));");
-    c("proxy-construct-trap", false, C,
-      "var p = new Proxy(function () {}, { construct: function (t, args) { return { sum: args[0] + args[1] }; } });\n\
-       console.log(new p(2, 3).sum);");
-    c("proxy-construct-default", false, C,
-      "function F(a) { this.a = a; } var p = new Proxy(F, {}); var o = new p(7); console.log(o.a, o instanceof F);");
-    c("proxy-typeof-callable", false, C,
-      "console.log(typeof new Proxy(function () {}, {}), typeof new Proxy({}, {}));");
+    c(
+        "proxy-apply-trap",
+        false,
+        C,
+        "var p = new Proxy(function () {}, { apply: function (t, thisArg, args) { return args[0] + args[1]; } });\n\
+       console.log(p(2, 3), typeof p);",
+    );
+    c(
+        "proxy-apply-default",
+        false,
+        C,
+        "var p = new Proxy(function (a, b) { return a * b; }, {}); console.log(p(3, 4));",
+    );
+    c(
+        "proxy-construct-trap",
+        false,
+        C,
+        "var p = new Proxy(function () {}, { construct: function (t, args) { return { sum: args[0] + args[1] }; } });\n\
+       console.log(new p(2, 3).sum);",
+    );
+    c(
+        "proxy-construct-default",
+        false,
+        C,
+        "function F(a) { this.a = a; } var p = new Proxy(F, {}); var o = new p(7); console.log(o.a, o instanceof F);",
+    );
+    c(
+        "proxy-typeof-callable",
+        false,
+        C,
+        "console.log(typeof new Proxy(function () {}, {}), typeof new Proxy({}, {}));",
+    );
 
     // ---- Proxy: revocation -----------------------------------------------
-    c("proxy-revocable", false, C,
-      "var r = Proxy.revocable({ a: 1 }, {}); console.log(r.proxy.a); r.revoke();\n\
-       var t = false; try { r.proxy.a; } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("proxy-revoke-idempotent", false, C,
-      "var r = Proxy.revocable({}, {}); r.revoke(); r.revoke(); console.log('ok');");
-    c("proxy-revoke-all-methods", false, C,
-      "var r = Proxy.revocable({}, {}); r.revoke(); var n = 0;\n\
+    c(
+        "proxy-revocable",
+        false,
+        C,
+        "var r = Proxy.revocable({ a: 1 }, {}); console.log(r.proxy.a); r.revoke();\n\
+       var t = false; try { r.proxy.a; } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "proxy-revoke-idempotent",
+        false,
+        C,
+        "var r = Proxy.revocable({}, {}); r.revoke(); r.revoke(); console.log('ok');",
+    );
+    c(
+        "proxy-revoke-all-methods",
+        false,
+        C,
+        "var r = Proxy.revocable({}, {}); r.revoke(); var n = 0;\n\
        try { r.proxy.x; } catch (e) { n++; }\n\
        try { r.proxy.x = 1; } catch (e) { n++; }\n\
        try { 'x' in r.proxy; } catch (e) { n++; }\n\
        try { delete r.proxy.x; } catch (e) { n++; }\n\
        try { Object.keys(r.proxy); } catch (e) { n++; }\n\
-       console.log(n);");
+       console.log(n);",
+    );
 
     // ---- Proxy: composition ----------------------------------------------
-    c("proxy-of-proxy", false, C,
-      "var inner = new Proxy({}, { get: function () { return 'inner'; } });\n\
-       var outer = new Proxy(inner, {}); console.log(outer.anything);");
-    c("proxy-as-prototype", false, C,
-      "var p = new Proxy({}, { get: function (t, k) { return k === 'foo' ? 42 : undefined; } });\n\
-       var o = Object.create(p); console.log(o.foo, o.bar);");
-    c("proxy-instanceof", false, C,
-      "function F() {} var p = new Proxy(F, {}); var o = new F(); console.log(o instanceof p);");
+    c(
+        "proxy-of-proxy",
+        false,
+        C,
+        "var inner = new Proxy({}, { get: function () { return 'inner'; } });\n\
+       var outer = new Proxy(inner, {}); console.log(outer.anything);",
+    );
+    c(
+        "proxy-as-prototype",
+        false,
+        C,
+        "var p = new Proxy({}, { get: function (t, k) { return k === 'foo' ? 42 : undefined; } });\n\
+       var o = Object.create(p); console.log(o.foo, o.bar);",
+    );
+    c(
+        "proxy-instanceof",
+        false,
+        C,
+        "function F() {} var p = new Proxy(F, {}); var o = new F(); console.log(o instanceof p);",
+    );
 
     // ---- Proxy: IsArray recursion ----------------------------------------
     c("proxy-isarray-true", false, C, "console.log(Array.isArray(new Proxy([], {})));");
     c("proxy-isarray-false", false, C, "console.log(Array.isArray(new Proxy({}, {})));");
-    c("proxy-isarray-nested", false, C,
-      "console.log(Array.isArray(new Proxy(new Proxy([], {}), {})));");
-    c("proxy-isarray-revoked-throws", false, C,
-      "var r = Proxy.revocable([], {}); r.revoke(); var t = false;\n\
-       try { Array.isArray(r.proxy); } catch (e) { t = e instanceof TypeError; } console.log(t);");
+    c(
+        "proxy-isarray-nested",
+        false,
+        C,
+        "console.log(Array.isArray(new Proxy(new Proxy([], {}), {})));",
+    );
+    c(
+        "proxy-isarray-revoked-throws",
+        false,
+        C,
+        "var r = Proxy.revocable([], {}); r.revoke(); var t = false;\n\
+       try { Array.isArray(r.proxy); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- Proxy: constructor errors ---------------------------------------
-    c("proxy-ctor-nonobject-target", false, C,
-      "var t = false; try { new Proxy(1, {}); } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("proxy-ctor-nonobject-handler", false, C,
-      "var t = false; try { new Proxy({}, 1); } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("proxy-call-without-new", false, C,
-      "var t = false; try { Proxy({}, {}); } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("proxy-call-noncallable", false, C,
-      "var p = new Proxy({}, {}); var t = false; try { p(); } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("proxy-construct-nonconstructor", false, C,
-      "var p = new Proxy({}, {}); var t = false; try { new p(); } catch (e) { t = e instanceof TypeError; } console.log(t);");
+    c(
+        "proxy-ctor-nonobject-target",
+        false,
+        C,
+        "var t = false; try { new Proxy(1, {}); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "proxy-ctor-nonobject-handler",
+        false,
+        C,
+        "var t = false; try { new Proxy({}, 1); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "proxy-call-without-new",
+        false,
+        C,
+        "var t = false; try { Proxy({}, {}); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "proxy-call-noncallable",
+        false,
+        C,
+        "var p = new Proxy({}, {}); var t = false; try { p(); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "proxy-construct-nonconstructor",
+        false,
+        C,
+        "var p = new Proxy({}, {}); var t = false; try { new p(); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- Proxy: the FULL invariant → TypeError ---------------------------
-    c("proxy-inv-get-nonwritable-mismatch", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\n\
+    c(
+        "proxy-inv-get-nonwritable-mismatch",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\n\
        var p = new Proxy(t, { get: function () { return 2; } });\n\
-       var r = false; try { p.x; } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-get-nonwritable-match", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\n\
-       var p = new Proxy(t, { get: function () { return 1; } }); console.log(p.x);");
-    c("proxy-inv-set-nonwritable-mismatch", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\n\
+       var r = false; try { p.x; } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-get-nonwritable-match",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\n\
+       var p = new Proxy(t, { get: function () { return 1; } }); console.log(p.x);",
+    );
+    c(
+        "proxy-inv-set-nonwritable-mismatch",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\n\
        var p = new Proxy(t, { set: function () { return true; } });\n\
-       var r = false; try { p.x = 2; } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-gopd-hide-nonconfig", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
+       var r = false; try { p.x = 2; } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-gopd-hide-nonconfig",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
        var p = new Proxy(t, { getOwnPropertyDescriptor: function () { return undefined; } });\n\
-       var r = false; try { Object.getOwnPropertyDescriptor(p, 'x'); } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-has-hide-nonconfig", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
+       var r = false; try { Object.getOwnPropertyDescriptor(p, 'x'); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-has-hide-nonconfig",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
        var p = new Proxy(t, { has: function () { return false; } });\n\
-       var r = false; try { 'x' in p; } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-delete-nonconfig", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
+       var r = false; try { 'x' in p; } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-delete-nonconfig",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
        var p = new Proxy(t, { deleteProperty: function () { return true; } });\n\
-       var r = false; try { delete p.x; } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-ownkeys-missing-nonconfig", false, C,
-      "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
+       var r = false; try { delete p.x; } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-ownkeys-missing-nonconfig",
+        false,
+        C,
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\n\
        var p = new Proxy(t, { ownKeys: function () { return []; } });\n\
-       var r = false; try { Object.getOwnPropertyNames(p); } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-ownkeys-duplicate", false, C,
-      "var p = new Proxy({}, { ownKeys: function () { return ['a', 'a']; } });\n\
-       var r = false; try { Object.getOwnPropertyNames(p); } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-ownkeys-nonextensible-extra", false, C,
-      "var t = {}; Object.preventExtensions(t);\n\
+       var r = false; try { Object.getOwnPropertyNames(p); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-ownkeys-duplicate",
+        false,
+        C,
+        "var p = new Proxy({}, { ownKeys: function () { return ['a', 'a']; } });\n\
+       var r = false; try { Object.getOwnPropertyNames(p); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-ownkeys-nonextensible-extra",
+        false,
+        C,
+        "var t = {}; Object.preventExtensions(t);\n\
        var p = new Proxy(t, { ownKeys: function () { return ['extra']; } });\n\
-       var r = false; try { Object.getOwnPropertyNames(p); } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-getprototypeof-nonextensible", false, C,
-      "var t = {}; Object.preventExtensions(t);\n\
+       var r = false; try { Object.getOwnPropertyNames(p); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-getprototypeof-nonextensible",
+        false,
+        C,
+        "var t = {}; Object.preventExtensions(t);\n\
        var p = new Proxy(t, { getPrototypeOf: function () { return Array.prototype; } });\n\
-       var r = false; try { Object.getPrototypeOf(p); } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-defineproperty-false", false, C,
-      "var t = {}; Object.preventExtensions(t);\n\
+       var r = false; try { Object.getPrototypeOf(p); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-defineproperty-false",
+        false,
+        C,
+        "var t = {}; Object.preventExtensions(t);\n\
        var p = new Proxy(t, { defineProperty: function () { return true; } });\n\
-       var r = false; try { Object.defineProperty(p, 'x', { value: 1, configurable: false }); } catch (e) { r = e instanceof TypeError; } console.log(r);");
-    c("proxy-inv-preventextensions-still-extensible", false, C,
-      "var p = new Proxy({}, { preventExtensions: function () { return true; } });\n\
-       var r = false; try { Reflect.preventExtensions(p); } catch (e) { r = e instanceof TypeError; } console.log(r);");
+       var r = false; try { Object.defineProperty(p, 'x', { value: 1, configurable: false }); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
+    c(
+        "proxy-inv-preventextensions-still-extensible",
+        false,
+        C,
+        "var p = new Proxy({}, { preventExtensions: function () { return true; } });\n\
+       var r = false; try { Reflect.preventExtensions(p); } catch (e) { r = e instanceof TypeError; } console.log(r);",
+    );
 
     // ---- Proxy: freeze / seal / integrity --------------------------------
-    c("proxy-freeze-transparent", false, C,
-      "var t = { a: 1 }; var p = new Proxy(t, {}); Object.freeze(p);\n\
-       console.log(Object.isFrozen(t), Object.isFrozen(p), Object.isExtensible(p));");
-    c("proxy-seal-transparent", false, C,
-      "var t = { a: 1 }; var p = new Proxy(t, {}); Object.seal(p);\n\
-       console.log(Object.isSealed(p), Object.isFrozen(p));");
+    c(
+        "proxy-freeze-transparent",
+        false,
+        C,
+        "var t = { a: 1 }; var p = new Proxy(t, {}); Object.freeze(p);\n\
+       console.log(Object.isFrozen(t), Object.isFrozen(p), Object.isExtensible(p));",
+    );
+    c(
+        "proxy-seal-transparent",
+        false,
+        C,
+        "var t = { a: 1 }; var p = new Proxy(t, {}); Object.seal(p);\n\
+       console.log(Object.isSealed(p), Object.isFrozen(p));",
+    );
 
     // ---- Refusals: a proxy reaching the trace projection -----------------
     c("proxy-log-refuses", false, R, "var p = new Proxy({ a: 1 }, {}); console.log(p);");
     c("proxy-completion-refuses", false, R, "var p = new Proxy({ a: 1 }, {}); p;");
-    c("proxy-forin-refuses", false, R,
-      "var p = new Proxy({ a: 1, b: 2 }, {}); var ks = []; for (var k in p) ks.push(k); console.log(ks);");
-    c("proxy-thrown-refuses", false, R,
-      "try { throw new Proxy({}, {}); } catch (e) { throw e; }");
+    c(
+        "proxy-forin-refuses",
+        false,
+        R,
+        "var p = new Proxy({ a: 1, b: 2 }, {}); var ks = []; for (var k in p) ks.push(k); console.log(ks);",
+    );
+    c("proxy-thrown-refuses", false, R, "try { throw new Proxy({}, {}); } catch (e) { throw e; }");
 
     v
 }
@@ -367,10 +615,8 @@ fn proxy_reflect_adversarial_vs_node() {
 // Corpus sweep over the Proxy / Reflect directories.
 // ---------------------------------------------------------------------------
 
-const SWEEP_DIRS: &[(&str, usize)] = &[
-    ("test/built-ins/Proxy", 400),
-    ("test/built-ins/Reflect", 250),
-];
+const SWEEP_DIRS: &[(&str, usize)] =
+    &[("test/built-ins/Proxy", 400), ("test/built-ins/Reflect", 250)];
 
 /// The four-head-gate tail (17 cases): Proxy-integration edges + a couple of
 /// regressions the recorded gate found after the initial Proxy landing. Each
@@ -402,10 +648,22 @@ const PINNED_TAIL: &[(&str, Expect)] = &[
     //    → coerce + store;
     //  * in-range index with O != Receiver → OrdinarySet onto Receiver, no
     //    coercion; out-of-range with a non-object / non-TA Receiver → coerce.
-    ("test/built-ins/TypedArrayConstructors/internals/Set/key-is-out-of-bounds-receiver-is-proto.js", C),
-    ("test/built-ins/TypedArrayConstructors/internals/Set/key-is-in-bounds-receiver-is-not-typed-array.js", C),
-    ("test/built-ins/TypedArrayConstructors/internals/Set/key-is-out-of-bounds-receiver-is-not-object.js", C),
-    ("test/built-ins/TypedArrayConstructors/internals/Set/key-is-out-of-bounds-receiver-is-not-typed-array.js", C),
+    (
+        "test/built-ins/TypedArrayConstructors/internals/Set/key-is-out-of-bounds-receiver-is-proto.js",
+        C,
+    ),
+    (
+        "test/built-ins/TypedArrayConstructors/internals/Set/key-is-in-bounds-receiver-is-not-typed-array.js",
+        C,
+    ),
+    (
+        "test/built-ins/TypedArrayConstructors/internals/Set/key-is-out-of-bounds-receiver-is-not-object.js",
+        C,
+    ),
+    (
+        "test/built-ins/TypedArrayConstructors/internals/Set/key-is-out-of-bounds-receiver-is-not-typed-array.js",
+        C,
+    ),
     // Array.prototype.concat over a spreadable whose length exceeds the
     // iteration cap is engine-specific (V8 skips dense-element access): refuse.
     ("test/built-ins/Array/prototype/concat/arg-length-near-integer-limit.js", R),
@@ -499,11 +757,14 @@ fn collect_js_files(dir: &Path, cap: usize) -> Vec<PathBuf> {
 #[allow(clippy::too_many_lines)]
 fn proxy_reflect_corpus_vs_node() {
     let Some(node) = node_bin() else {
-        eprintln!("SKIP proxy_reflect_corpus_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS) to run");
+        eprintln!(
+            "SKIP proxy_reflect_corpus_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS) to run"
+        );
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     assert!(
         corpus.join("harness/assert.js").is_file(),
         "corpus harness not found under {}",
@@ -533,11 +794,8 @@ fn proxy_reflect_corpus_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".into(), "sta.js".into()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
             include_names.extend(fm.includes.iter().cloned());
             let mut include_srcs: Vec<String> = Vec::new();
             let mut include_paths: Vec<String> = Vec::new();
@@ -560,7 +818,8 @@ fn proxy_reflect_corpus_vs_node() {
             let rel = path.strip_prefix(&corpus).unwrap_or(&path).display().to_string();
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let inc_refs: Vec<&str> = include_srcs.iter().map(String::as_str).collect();
                 let sem_trace = match evaluate_case_opts(&inc_refs, &sem_body, false) {
                     SemOutcome::Trace(t) => t,
@@ -574,11 +833,21 @@ fn proxy_reflect_corpus_vs_node() {
                 covered += 1;
                 per_dir.entry(dir).or_default().0 += 1;
                 let node_trace = match node_trace_of(
-                    &node, &driver, tmp.path(), &format!("case-{case_no}"), &body, &include_paths, strict, false,
+                    &node,
+                    &driver,
+                    tmp.path(),
+                    &format!("case-{case_no}"),
+                    &body,
+                    &include_paths,
+                    strict,
+                    false,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        failures.push(format!("{rel} [{}]: {e}", if strict { "strict" } else { "bare" }));
+                        failures.push(format!(
+                            "{rel} [{}]: {e}",
+                            if strict { "strict" } else { "bare" }
+                        ));
                         continue;
                     }
                 };
@@ -588,7 +857,8 @@ fn proxy_reflect_corpus_vs_node() {
                     failures.push(format!(
                         "{rel} [{}]: WRONG TRACE: {}",
                         if strict { "strict" } else { "bare" },
-                        explain_divergence(&sem_trace, &node_trace).unwrap_or_else(|| "unlocalized".into())
+                        explain_divergence(&sem_trace, &node_trace)
+                            .unwrap_or_else(|| "unlocalized".into())
                     ));
                 }
             }
@@ -627,8 +897,9 @@ fn pinned_tail_vs_node() {
         eprintln!("SKIP pinned_tail_vs_node: set TRUST_JS_NODE to run");
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     assert!(
         corpus.join("harness/assert.js").is_file(),
         "corpus harness not found under {}",
@@ -654,11 +925,8 @@ fn pinned_tail_vs_node() {
         } else {
             &[false, true]
         };
-        let mut include_names: Vec<String> = if raw {
-            Vec::new()
-        } else {
-            vec!["assert.js".into(), "sta.js".into()]
-        };
+        let mut include_names: Vec<String> =
+            if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
         include_names.extend(fm.includes.iter().cloned());
         let mut include_srcs: Vec<String> = Vec::new();
         let mut include_paths: Vec<String> = Vec::new();
@@ -677,14 +945,22 @@ fn pinned_tail_vs_node() {
             match (evaluate_case(&inc_refs, &sem_body), expect) {
                 (SemOutcome::NoCoverage { .. }, Expect::Refuse) => {}
                 (SemOutcome::NoCoverage { reason }, Expect::Cover) => {
-                    failures.push(format!("{rel} [{mode}]: expected Cover, got NoCoverage: {reason}"));
+                    failures
+                        .push(format!("{rel} [{mode}]: expected Cover, got NoCoverage: {reason}"));
                 }
                 (SemOutcome::Trace(_), Expect::Refuse) => {
                     failures.push(format!("{rel} [{mode}]: expected Refuse, got a trace"));
                 }
                 (SemOutcome::Trace(sem_trace), Expect::Cover) => {
                     match node_trace_of(
-                        &node, &driver, tmp.path(), &format!("tail-{i}"), &body, &include_paths, strict, true,
+                        &node,
+                        &driver,
+                        tmp.path(),
+                        &format!("tail-{i}"),
+                        &body,
+                        &include_paths,
+                        strict,
+                        true,
                     ) {
                         Ok(node_trace) => {
                             if !traces_equal(&sem_trace, &node_trace) {

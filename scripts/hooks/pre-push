@@ -2,57 +2,66 @@
 # Trust pre-push gate. Install with `scripts/install-git-hooks.sh`.
 #
 # Trust has no CI, so this is the only thing between a drift class and `origin`.
-# It is therefore scoped to what can run in under a minute on any checkout —
-# three lanes, none needing a stage2 build:
 #
-#   fast.pr-gate         toolchain/flag drift + stage0 seed cadence + ledger
-#                        expirations (scripts/pr_gate.sh)
-#   fast.pin-coherence   every submodule at its recorded pin
-#   fast.bridge-pin      the vendored Lean semantics match the trust-ir pin
-#   fast.measurement-provenance  no commit this push introduces publishes a test
-#                          count naming a tree it does not carry
-#   fast.revert-rationale  no commit this push introduces reverts something
-#                        without saying WHY (scripts/check_revert_rationale.sh).
-#                        Added 2026-08-20 after `31814afa35` reverted the
-#                        wave-SG struct-interior offset gate — a confirmed
-#                        miscompile mechanism — with an empty body, leaving the
-#                        class ungated on main for 2h10m until another lane
-#                        re-derived the evidence from scratch.
+# THIS HOOK DECLARES NO LANES. It runs exactly the rows carrying the `push`
+# profile in `emit_gate_manifest` (tests/run_trust_comprehensive_harness.sh),
+# fetched at run time via `--list push`. Until 2026-08-27 it hand-maintained its
+# own list of eight ids, every one of which also existed in the manifest: two
+# inventories that could only agree by eye. One of the eight, `fast.pr-gate`,
+# was itself a bundle of ten checks behind one id, so a red inside it could only
+# be quarantined by darkening all ten. Both duplications are gone; adding or
+# removing a pre-push lane is now one word in one manifest row.
 #
-# and one SCOPED lane, which is not in the under-a-minute budget and does not
-# pretend to be:
+# One id per lane, wherever it runs, so one quarantine row governs it — which is
+# why the push rows keep their `fast.`/`scoped.` ids rather than minting `push.*`
+# twins. The `scoped.` prefix also carries the tier: those lanes run LAST here,
+# because a 9-11 minute build ahead of a 200ms pin check is how a gate teaches
+# people --no-verify.
 #
-#   scoped.compiler-check  `x.py check --stage 1` INCLUDING test targets, run
-#                          only when the push touches compiler/, crates/,
-#                          src/bootstrap/, targo-trust/ or a first-party
-#                          gitlink. Skips instantly otherwise, so a docs push
-#                          pays nothing. It exists because the three lanes
-#                          above are drift and pin checks — none of them
-#                          compiles a line of the compiler, and `main` was
-#                          broken three times on 2026-08-12/13 by pushes that
-#                          never built the superproject.
+# Lanes deliberately NOT in the push profile:
 #
-# The bridge REPLAY (every bridged arm still carries its kernel-checked
-# agreement theorem) is deliberately NOT here: it kernel-checks 185 modules and
-# takes ~142s, and a pre-push gate that slow is one everyone learns to skip with
-# --no-verify. It runs in the slower `bridge.replay` lane instead. The two are
-# genuinely different questions — fast.bridge-pin proves the artifacts BELONG to
-# the pin, and an artifact set can match its pin while a theorem inside it has
-# stopped checking, which is exactly what happened on 2026-07-25.
+#   bridge REPLAY (`slow.bridge-replay`) — every bridged arm still carries its
+#   kernel-checked agreement theorem. It kernel-checks 185 modules in ~142s.
+#   Genuinely a different question from `fast.bridge-pin`, which proves the
+#   artifacts BELONG to the pin: an artifact set can match its pin while a
+#   theorem inside it has stopped checking, which is what happened 2026-07-25.
 #
-# Those are the gate ids the `fast` profile of
-# tests/run_trust_comprehensive_harness.sh uses, deliberately: one id per lane
-# means one quarantine row governs the lane wherever it runs.
+#   the rustc_mir_transform suite (`slow.mir-transform-ratchet`) — it is a BUILD
+#   and takes scripts/trust_build_lock.sh, so it collided with the compiler-check
+#   lane for that lock and produced two red lanes and zero defects. Only its
+#   SELFTEST, which builds nothing, is in the push tier.
+#
+# WHY THE SLOW LANE IS HERE AT ALL. `scoped.compiler-check` runs
+# `x.py check --stage 1` INCLUDING test targets, but only when the push touches
+# compiler/, crates/, src/bootstrap/, targo-trust/ or a first-party gitlink, so a
+# docs push pays nothing. It exists because every other push lane is a drift or
+# pin check that compiles no compiler code, and `main` was broken three times on
+# 2026-08-12/13 by pushes that never built the superproject — one of which also
+# hid a dropped soundness check.
+#
+# A PUSH IS A BUILD for build-tree interlock purposes, and that is not obvious —
+# it has bitten. Because that lane runs `x.py`, it takes the build-tree mutual
+# exclusion lock like any other build, so a push attempted while a measurement
+# sweep is in flight REFUSES here rather than deleting stage1/bin/rustc
+# underneath it. The lock lives in x.py precisely so there is one place.
+#
+# PUSH CONTEXT. A manifest command string is fixed and gets no stdin, so the
+# refs git hands us are EXPORTED as TRUST_PUSHED_REFS. Exactly three lanes read
+# it, each via its own `--push-context` mode: fast.revert-rationale,
+# fast.measurement-provenance, fast.pin-regression. With the variable unset the
+# same rows widen to their history/`origin/main..HEAD` reading, so a `push`
+# profile run outside this hook still works — and each prints a `SUBJECT:` line
+# saying which reading it took, so the two are never confused.
 #
 # QUARANTINE, not bypass. A lane that is known-red gets a row in
 # `tests/trust-comprehensive/divergences.toml` with an owner, a reason, and an
 # `expires_on`. While that row is active the lane reports QUARANTINED and the
 # push proceeds — and the moment the lane goes GREEN with the row still active,
 # this hook FAILS and tells you to delete the row. A quarantine therefore cannot
-# outlive the problem it documents, and `scripts/check_ledger_expirations.py`
-# (inside pr_gate) fails once it expires. There is no environment variable that
-# turns a lane off; the escape hatch is `git push --no-verify`, which is git's
-# and is visible in the reflog.
+# outlive the problem it documents, and the `fast.ledger-expirations` lane fails
+# once it expires. There is no environment variable that turns a lane off; the
+# escape hatch is `git push --no-verify`, which is git's and is visible in the
+# reflog.
 #
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
@@ -135,7 +144,7 @@ PY
 FAILED=0
 run_lane() {
   local gate_id="$1"
-  shift
+  local command="$2"
   local quarantine
   if ! quarantine="$(quarantine_for "$gate_id")"; then
     echo "pre-push: cannot read $LEDGER — refusing to judge any lane" >&2
@@ -144,7 +153,9 @@ run_lane() {
 
   echo
   echo "=== $gate_id ==="
-  if "$@"; then
+  # Same exec form as the harness's run_gate, so one command string cannot mean
+  # two things. </dev/null: a lane must not eat the lane list off our stdin.
+  if ( cd "$REPO_ROOT" && bash -o pipefail -c "$command" ) </dev/null; then
     if [ -n "$quarantine" ]; then
       echo "FAIL: $gate_id is GREEN but still quarantined."
       echo "      Delete the row and push again: $quarantine"
@@ -166,29 +177,35 @@ run_lane() {
 
 echo "Trust pre-push gate (no stage2 build required)"
 
-revert_rationale_lane() {
-  printf '%s\n' "$PUSHED_REFS" | bash scripts/check_revert_rationale.sh --pre-push
-}
+# THE MANIFEST IS THE INVENTORY, and this hook is not a second copy of it.
+HARNESS="tests/run_trust_comprehensive_harness.sh"
+if ! LANES="$(bash "$HARNESS" --list push)"; then
+  echo "pre-push: \`$HARNESS --list push\` failed — refusing to push with an unknown lane set" >&2
+  exit 2
+fi
+if [ -z "$LANES" ]; then
+  echo "pre-push: the push profile is EMPTY — a gate with no lanes is not a green gate." >&2
+  exit 2
+fi
 
-# Judges exactly the commits this push would introduce: a `Measured-on:` trailer
-# must name a blob the commit actually carries, and a soundness-gate commit that
-# quotes a test count must carry one. See reports/reporting-integrity-2026-08-20.md.
-measurement_provenance_lane() {
-  printf '%s\n' "$PUSHED_REFS" | bash scripts/check_measurement_provenance.sh --pre-push
-}
+# EXPORTED, not piped: the command string must be byte-identical wherever it
+# runs, and this loop's own stdin is already the lane list.
+export TRUST_PUSHED_REFS="$PUSHED_REFS"
 
-run_lane fast.revert-rationale revert_rationale_lane
-run_lane fast.measurement-provenance measurement_provenance_lane
-run_lane fast.pr-gate bash scripts/pr_gate.sh
-run_lane fast.pin-coherence bash scripts/check_pin_coherence.sh
-run_lane fast.bridge-pin bash scripts/check_bridge_pin.sh --check
-# NOT a `fast.` lane, and the id says so: it runs `x.py check --stage 1` (~9-11
-# min) and is therefore SCOPED — it skips instantly unless the push touches
-# compiler/, crates/, src/bootstrap/, targo-trust/ or a first-party gitlink, so
-# most pushes pay nothing. See the script header for the three separate times
-# `main` was broken by a push that never built the superproject, one of which
-# also hid a dropped soundness check.
-run_lane scoped.compiler-check bash scripts/check_compiler_targets_build.sh
+# Manifest order is execution order; `scoped.*` is deferred to the end.
+SCOPED=()
+while IFS=$'\t' read -r gate_id _category _required _last_green command; do
+  [ -n "$gate_id" ] || continue
+  case "$gate_id" in
+    scoped.*) SCOPED+=("$gate_id"$'\t'"$command"); continue ;;
+  esac
+  run_lane "$gate_id" "$command"
+done <<< "$LANES"
+# bash 3.2 (what /usr/bin/env bash resolves to here) errors on "${A[@]}" for an
+# empty array under `set -u`.
+for entry in ${SCOPED+"${SCOPED[@]}"}; do
+  run_lane "${entry%%$'\t'*}" "${entry#*$'\t'}"
+done
 
 echo
 if [ "$FAILED" -eq 0 ]; then

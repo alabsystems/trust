@@ -111,12 +111,12 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
+use clean_kernel::ExprKind;
 use clean_kernel::{
     BinderData, BinderInfo, Constructor, Declaration, Environment, Expr, InductiveDecl,
     InductiveType, Level, LevelVec, Name, TypeChecker,
 };
-#[cfg(test)]
-use clean_kernel::ExprKind;
 
 use crate::clean_ground::ground_int;
 
@@ -231,6 +231,22 @@ pub const TRUSTIR_OPERAND_CAST_U: &str = "Trust.TrustIr.Operand.CastU";
 /// Trust: DELTA-2 — `CastS : Operand → Nat → Operand`, an integer cast to the SIGNED
 /// destination of the given width. RECURSIVE in its first field.
 pub const TRUSTIR_OPERAND_CAST_S: &str = "Trust.TrustIr.Operand.CastS";
+
+/// Trust: FLOAT-CAST leaf (2026-08-22) — `CastF : Operand → Nat → Nat → Nat →
+/// Operand` (base, signedFlag, srcWidth, dstWidth). APPENDED LAST so every
+/// existing minor-premise position is unchanged and all prior reductions stay
+/// byte-for-byte identical.
+pub const TRUSTIR_OPERAND_CAST_F: &str = "Trust.TrustIr.Operand.CastF";
+
+/// Trust: FLOAT-WIDEN leaf (2026-08-24) — `CastFF : Operand → Nat → Nat →
+/// Operand`, a float→float conversion carrying BOTH widths. APPENDED LAST after
+/// `CastF`, so every existing minor-premise position stays byte-for-byte identical.
+///
+/// It cannot reuse `CastF`: that constructor's minor denotes literally
+/// `floatOfInt (evalOperand e s) sg sw dw`, whose head is the INTEGER-source
+/// conversion, and widening its arity would renumber every later minor premise —
+/// the exact thing its own doc forbids.
+pub const TRUSTIR_OPERAND_CAST_FF: &str = "Trust.TrustIr.Operand.CastFF";
 /// Trust: DELTA-2 — `bnotAt : Int → Int → Int`, the OPAQUE total bitwise-NOT-at-width.
 /// `Declaration::Opaque`, so a term naming it gains NO axiom dependency (the
 /// `idxElem`/`sliceLen` precedent). Deliberately UNINTERPRETED: `!x` is a bitvector
@@ -688,6 +704,27 @@ pub const TRUSTIR_ITER_HAS_NEXT2: &str = "Trust.MirSem.iter_has_next2";
 /// params may overlap one allocation) — enforced by the recognizer + the forgery probes, NEVER
 /// by this opaque (env separation cannot carry the argument: `trustir_env` is not MirSem-free).
 pub const TRUSTIR_SLICE_START: &str = "Trust.TrustIr.sliceStart";
+
+/// Trust: FLOAT-CAST leaf (2026-08-22) — `Trust.TrustIr.floatOfInt : Int → Int →
+/// Int → Int → Int`, the OPAQUE integer→float conversion token
+/// `floatOfInt ⟦x⟧ signedFlag srcWidth dstWidth`.
+///
+/// It is an `Opaque` (never δ-reduces, NOT an axiom — the
+/// `sliceStart`/`ptrOffset`/`idxElem` precedent), so a term mentioning it gains no
+/// axiom dependency and modulo-3 closure is preserved. It asserts NOTHING about
+/// IEEE-754 rounding: the claim a certificate carries is only "the returned value
+/// is THIS fixed function of the argument". The signedness and BOTH widths ride as
+/// ARGUMENTS — exactly why `ptrOffset` carries `elemSize` — so `u32 as f64`,
+/// `i32 as f64` and `u32 as f32` denote DISTINCTLY and no two conversions can be
+/// confused for one another.
+pub const TRUSTIR_FLOAT_OF_INT: &str = "Trust.TrustIr.floatOfInt";
+
+/// Trust: FLOAT-WIDEN leaf (2026-08-24) — the OPAQUE float→float conversion token,
+/// `Int → Int → Int → Int` (value, srcWidth, dstWidth). A `Declaration::Opaque`, so
+/// it never δ-reduces and is NOT an axiom: a term mentioning it gains no axiom
+/// dependency and modulo-3 closure is preserved. Same precedent as
+/// `sliceStart`/`ptrOffset`/`idxElem`/`floatOfInt`.
+pub const TRUSTIR_FLOAT_WIDEN: &str = "Trust.TrustIr.floatWiden";
 /// Trust: RECORD-WITNESS increment 3 (2026-07-22) — GATE-PTR-SLOT-OPACITY(b) —
 /// `Trust.TrustIr.ptrOffset : Int → Int → Int → Int`, the UNINTERPRETED total
 /// POINTEE-PINNED POINTER-OFFSET (`Declaration::Opaque`, EMPTY axiom_deps): `ptrOffset
@@ -856,18 +893,24 @@ impl IntCastDest {
 fn wrap_unsigned_expr(source: Expr, width: u32) -> Expr {
     let modulus = int_pow2_expr(width);
     let remainder = Expr::apps(cst("Int.mod"), [source, modulus.clone()]);
-    let negative_remainder = Expr::apps(cst("decide"), [
-        Expr::apps(cst("Int.lt"), [remainder.clone(), int_lit(0)]),
-        Expr::apps(cst("Int.decLt"), [remainder.clone(), int_lit(0)]),
-    ]);
+    let negative_remainder = Expr::apps(
+        cst("decide"),
+        [
+            Expr::apps(cst("Int.lt"), [remainder.clone(), int_lit(0)]),
+            Expr::apps(cst("Int.decLt"), [remainder.clone(), int_lit(0)]),
+        ],
+    );
     let int_motive = Expr::lam(bd_default(), cst("Bool"), cst("Int"));
     let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
-    Expr::apps(bool_rec, [
-        int_motive,
-        remainder.clone(),
-        Expr::apps(cst("Int.add"), [remainder, modulus]),
-        negative_remainder,
-    ])
+    Expr::apps(
+        bool_rec,
+        [
+            int_motive,
+            remainder.clone(),
+            Expr::apps(cst("Int.add"), [remainder, modulus]),
+            negative_remainder,
+        ],
+    )
 }
 
 /// The signed reinterpretation on top of [`wrap_unsigned_expr`]: a residue at or above
@@ -875,10 +918,13 @@ fn wrap_unsigned_expr(source: Expr, width: u32) -> Expr {
 fn wrap_signed_expr(wrapped: Expr, width: u32) -> Expr {
     let modulus = int_pow2_expr(width);
     let half = int_pow2_expr(width - 1);
-    let upper_half = Expr::apps(cst("decide"), [
-        Expr::apps(cst("Int.le"), [half.clone(), wrapped.clone()]),
-        Expr::apps(cst("Int.decLe"), [half, wrapped.clone()]),
-    ]);
+    let upper_half = Expr::apps(
+        cst("decide"),
+        [
+            Expr::apps(cst("Int.le"), [half.clone(), wrapped.clone()]),
+            Expr::apps(cst("Int.decLe"), [half, wrapped.clone()]),
+        ],
+    );
     let int_motive = Expr::lam(bd_default(), cst("Bool"), cst("Int"));
     let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
     let negative = Expr::apps(cst("Int.sub"), [wrapped.clone(), modulus]);
@@ -1266,6 +1312,25 @@ pub enum IrOperand {
     /// Trust: DELTA-2 — `CastS base width` — the SIGNED destination twin of
     /// [`IrOperand::CastU`], denoted by the exact reducible `castS`.
     CastS(Box<IrOperand>, u32),
+
+    /// Trust: FLOAT-CAST leaf (2026-08-22) — an integer→float conversion
+    /// `base as f{dst_width}`, denoted by the OPAQUE `floatOfInt` head with the
+    /// source signedness and BOTH widths as arguments, so two conversions differing
+    /// in any of them denote distinctly. Carries NO numeric claim — in particular
+    /// nothing about IEEE-754 rounding. The recognizer that mints it
+    /// (`prove::int_to_float_cast_fully_faithful_via_trustir`) admits only
+    /// cast-then-return, so the token is the returned value and is never an operand
+    /// of an Int operation.
+    CastF { base: Box<IrOperand>, src_signed: bool, src_width: u32, dst_width: u32 },
+    /// Trust: FLOAT-WIDEN leaf (2026-08-24) — `base as f{dst_width}` where `base` is
+    /// ALREADY a float of `src_width`. Denoted by the OPAQUE `floatWiden` head with
+    /// both widths, so `f32→f64` and a hypothetical `f64→f32` denote distinctly.
+    /// Carries NO numeric claim — nothing about rounding, and nothing about the
+    /// widening being exact. The recognizer that mints it
+    /// (`prove::float_widening_cast_fully_faithful_via_trustir`) admits only
+    /// cast-then-return, so the token is the returned value and is never an operand
+    /// of an Int operation.
+    CastFF { base: Box<IrOperand>, src_width: u32, dst_width: u32 },
     /// Trust: DELTA-4 (2026-08-05) — `Discr paramIdx` — an enum TAG READ on parameter
     /// `paramIdx` (`Rvalue::Discriminant`), the `is_some`/`is_ok`/`is_break`/`is_eq`
     /// predicate shape's first statement.
@@ -1302,18 +1367,39 @@ impl IrOperand {
             IrOperand::Len(s) => Expr::app(cst(TRUSTIR_OPERAND_LEN), s.to_operand_expr()),
             // Trust: DELTA-2 — operand FIRST, width SECOND (as `Nat`), matching the
             // constructor arity registered on the inductive.
-            IrOperand::PreOpNotAt(b, w) => Expr::apps(cst(TRUSTIR_OPERAND_PREOP_NOT_AT), [
-                b.to_operand_expr(),
-                Expr::nat_lit(u64::from(*w)),
-            ]),
-            IrOperand::CastU(b, w) => Expr::apps(cst(TRUSTIR_OPERAND_CAST_U), [
-                b.to_operand_expr(),
-                Expr::nat_lit(u64::from(*w)),
-            ]),
-            IrOperand::CastS(b, w) => Expr::apps(cst(TRUSTIR_OPERAND_CAST_S), [
-                b.to_operand_expr(),
-                Expr::nat_lit(u64::from(*w)),
-            ]),
+            IrOperand::PreOpNotAt(b, w) => Expr::apps(
+                cst(TRUSTIR_OPERAND_PREOP_NOT_AT),
+                [b.to_operand_expr(), Expr::nat_lit(u64::from(*w))],
+            ),
+            IrOperand::CastU(b, w) => Expr::apps(
+                cst(TRUSTIR_OPERAND_CAST_U),
+                [b.to_operand_expr(), Expr::nat_lit(u64::from(*w))],
+            ),
+            IrOperand::CastS(b, w) => Expr::apps(
+                cst(TRUSTIR_OPERAND_CAST_S),
+                [b.to_operand_expr(), Expr::nat_lit(u64::from(*w))],
+            ),
+            // Trust: FLOAT-CAST leaf — base FIRST, then signedness and BOTH widths as
+            // `Nat` payloads, matching the constructor's arity exactly.
+            IrOperand::CastF { base, src_signed, src_width, dst_width } => Expr::apps(
+                cst(TRUSTIR_OPERAND_CAST_F),
+                [
+                    base.to_operand_expr(),
+                    Expr::nat_lit(u64::from(*src_signed)),
+                    Expr::nat_lit(u64::from(*src_width)),
+                    Expr::nat_lit(u64::from(*dst_width)),
+                ],
+            ),
+            // Trust: FLOAT-WIDEN leaf — base FIRST, then BOTH widths as `Nat`
+            // payloads. No signedness: a float source has none.
+            IrOperand::CastFF { base, src_width, dst_width } => Expr::apps(
+                cst(TRUSTIR_OPERAND_CAST_FF),
+                [
+                    base.to_operand_expr(),
+                    Expr::nat_lit(u64::from(*src_width)),
+                    Expr::nat_lit(u64::from(*dst_width)),
+                ],
+            ),
             // Trust: DELTA-4 — non-recursive, one Nat payload (the parameter index).
             IrOperand::Discr(p) => Expr::app(cst(TRUSTIR_OPERAND_DISCR), Expr::nat_lit(*p)),
         }
@@ -1336,6 +1422,40 @@ impl IrOperand {
             // BASE alone would be a LIE — it would drop the NOT/cast entirely — so
             // reflect a fresh opaque Select keyed on the base instead, which matches
             // nothing live and can never be mistaken for the operand's value.
+            // Trust: FLOAT-CAST leaf — like `Field`/`Index`, NEVER live-groundable
+            // (the live grounder has no float carrier). Reflected for TOTALITY only;
+            // every call site that could reach it is gated by `is_grounder_connected`.
+            IrOperand::CastF { base, src_signed, src_width, dst_width } => {
+                trust_types::Formula::Select(
+                    Box::new(base.to_formula()),
+                    // A NEGATIVE key, disjoint from every sibling's non-negative
+                    // width key by construction: the sibling `PreOpNotAt`/`CastU`/
+                    // `CastS` arm emits `Select(base, Int(width))` with width >= 0, so
+                    // no packing collision is possible however large a width grows.
+                    // (This reflection is never live-groundable — `CastF` returns
+                    // `None` from the grounder fold — so the key exists for TOTALITY
+                    // and distinctness only.)
+                    Box::new(trust_types::Formula::Int(
+                        -1 - (i128::from(*src_signed) * 1_000_000
+                            + i128::from(*src_width) * 1_000
+                            + i128::from(*dst_width)),
+                    )),
+                )
+            }
+            // Trust: FLOAT-WIDEN leaf — same treatment as `CastF`, on a key drawn
+            // from a DISJOINT negative band. `CastF` packs into
+            // `-1 - (sg*1_000_000 + sw*1_000 + dw)`, whose magnitude stays below
+            // 2_000_000 for any realistic width; this band starts below that and
+            // grows downward, so the two can never meet.
+            IrOperand::CastFF { base, src_width, dst_width } => {
+                trust_types::Formula::Select(
+                    Box::new(base.to_formula()),
+                    Box::new(trust_types::Formula::Int(
+                        -1_000_000_000
+                            - (i128::from(*src_width) * 1_000 + i128::from(*dst_width)),
+                    )),
+                )
+            }
             IrOperand::PreOpNotAt(b, w) | IrOperand::CastU(b, w) | IrOperand::CastS(b, w) => {
                 F::Select(Box::new(b.to_formula()), Box::new(F::Int(i128::from(*w))))
             }
@@ -1382,6 +1502,11 @@ impl IrOperand {
             IrOperand::Const(_) => {}
             // Trust: DELTA-2 — recurse into the base; the width is a fixed payload, not
             // a bound index (the same treatment `Field`'s key gets).
+            // Trust: FLOAT-CAST leaf — recurse into the base; the three `Nat` payloads
+            // are fixed, not bound indices (the `CastU`/`CastS` treatment).
+            IrOperand::CastF { base, .. } | IrOperand::CastFF { base, .. } => {
+                base.var_indices(out)
+            }
             IrOperand::PreOpNotAt(b, _) | IrOperand::CastU(b, _) | IrOperand::CastS(b, _) => {
                 b.var_indices(out);
             }
@@ -1707,6 +1832,9 @@ fn inline_operand_formula(
         // head, so there is no faithful reflection to give. Returning anything here —
         // the base alone, or a Select — would hand the live grounder a term that is not
         // this operand's value. `None` fail-closes the whole fold instead.
+        // Trust: FLOAT-CAST leaf — never live-groundable, exactly like the pre-op and
+        // integer-cast heads beside it.
+        IrOperand::CastF { .. } | IrOperand::CastFF { .. } => None,
         IrOperand::PreOpNotAt(..) | IrOperand::CastU(..) | IrOperand::CastS(..) => None,
         // Trust: DELTA-4 — `Discr` takes `Field`'s treatment rather than the hard
         // decline above: a live `Formula::Select` head DOES exist for it, so returning
@@ -1847,14 +1975,21 @@ fn inline_operand_denotation(
         // built inside a straight-line body, so the arm would be dead code — and its
         // current behaviour (denote, mismatch, fail closed) is the safe direction if
         // that ever stops being true.
-        IrOperand::CastU(b, w) => Some(Expr::apps(cst(TRUSTIR_CAST_U), [
-            inline_operand_denotation(b, defs, env, depth + 1)?,
-            int_lit(i128::from(*w)),
-        ])),
-        IrOperand::CastS(b, w) => Some(Expr::apps(cst(TRUSTIR_CAST_S), [
-            inline_operand_denotation(b, defs, env, depth + 1)?,
-            int_lit(i128::from(*w)),
-        ])),
+        IrOperand::CastU(b, w) => Some(Expr::apps(
+            cst(TRUSTIR_CAST_U),
+            [inline_operand_denotation(b, defs, env, depth + 1)?, int_lit(i128::from(*w))],
+        )),
+        IrOperand::CastS(b, w) => Some(Expr::apps(
+            cst(TRUSTIR_CAST_S),
+            [inline_operand_denotation(b, defs, env, depth + 1)?, int_lit(i128::from(*w))],
+        )),
+        // Trust: FLOAT-CAST leaf — `CastF` deliberately stays on the wildcard below,
+        // with the PreOpNotAt reasoning: the recognizer that mints it (`prove::
+        // int_to_float_cast_fully_faithful_via_trustir`) builds the conversion over a
+        // PARAMETER, never over an assigned SSA temp, so there is no threaded value to
+        // substitute. If one ever were built over a temp, the wildcard denotes it as
+        // `env t` — which MISMATCHES the inlined chain and fails closed, the safe
+        // direction. Recorded so this is a decision rather than an omission.
         _ => Some(operand_denotation(op, env)),
     }
 }
@@ -1987,8 +2122,7 @@ pub(crate) enum BoolConnective {
 pub(crate) fn bool_connective_minor(which: BoolConnective, a: Expr, b: Expr) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     // `x != 0` as a Bool.
-    let nonzero =
-        |x: Expr| Expr::app(cst("Bool.not"), Expr::apps(cst("Int.beq"), [x, int_lit(0)]));
+    let nonzero = |x: Expr| Expr::app(cst("Bool.not"), Expr::apps(cst("Int.beq"), [x, int_lit(0)]));
     // `Bool.rec.{1} (λ_:Bool. Int) <false-case> <true-case> <scrutinee>` — minor
     // order follows the `Bool` constructor order (`false`, then `true`), exactly
     // as `bool_as_int` relies on.
@@ -2024,24 +2158,22 @@ fn operand_denotation(op: &IrOperand, e_ref: &Expr) -> Expr {
         // and with the constant `Int` motive the IH IS `evalOperand e s` — so the reduct
         // is the head applied to the recursive denotation and the width as an `Int`.
         // These MUST stay byte-identical to those minors or the refinement cannot close.
-        IrOperand::PreOpNotAt(b, w) => Expr::apps(cst(TRUSTIR_BNOT_AT), [
-            operand_denotation(b, e_ref),
-            int_lit(i128::from(*w)),
-        ]),
-        IrOperand::CastU(b, w) => Expr::apps(cst(TRUSTIR_CAST_U), [
-            operand_denotation(b, e_ref),
-            int_lit(i128::from(*w)),
-        ]),
-        IrOperand::CastS(b, w) => Expr::apps(cst(TRUSTIR_CAST_S), [
-            operand_denotation(b, e_ref),
-            int_lit(i128::from(*w)),
-        ]),
+        IrOperand::PreOpNotAt(b, w) => Expr::apps(
+            cst(TRUSTIR_BNOT_AT),
+            [operand_denotation(b, e_ref), int_lit(i128::from(*w))],
+        ),
+        IrOperand::CastU(b, w) => {
+            Expr::apps(cst(TRUSTIR_CAST_U), [operand_denotation(b, e_ref), int_lit(i128::from(*w))])
+        }
+        IrOperand::CastS(b, w) => {
+            Expr::apps(cst(TRUSTIR_CAST_S), [operand_denotation(b, e_ref), int_lit(i128::from(*w))])
+        }
         // Trust: DELTA-4 — the exact reduct of the `Discr` minor:
         // `idxElem (e p) (Int RESERVED)`. Must stay byte-identical to that minor.
-        IrOperand::Discr(p) => Expr::apps(cst(TRUSTIR_IDX_ELEM), [
-            Expr::app(e_ref.clone(), Expr::nat_lit(*p)),
-            int_lit(TRUSTIR_DISCRIMINANT_TAG_KEY),
-        ]),
+        IrOperand::Discr(p) => Expr::apps(
+            cst(TRUSTIR_IDX_ELEM),
+            [Expr::app(e_ref.clone(), Expr::nat_lit(*p)), int_lit(TRUSTIR_DISCRIMINANT_TAG_KEY)],
+        ),
         IrOperand::Var(i) => Expr::app(e_ref.clone(), Expr::nat_lit(*i)),
         IrOperand::Const(c) => int_lit(*c),
         IrOperand::Field(p, fld) => Expr::apps(
@@ -2053,6 +2185,29 @@ fn operand_denotation(op: &IrOperand, e_ref: &Expr) -> Expr {
             [operand_denotation(s, e_ref), operand_denotation(i, e_ref)],
         ),
         IrOperand::Len(s) => Expr::app(cst(TRUSTIR_SLICE_LEN), operand_denotation(s, e_ref)),
+        // Trust: FLOAT-CAST leaf — the exact reduct of `evalOperand`'s `CastF` minor:
+        // `floatOfInt (denotation base) signedFlag srcWidth dstWidth`, with the three
+        // payloads lifted to `Int` exactly as that minor's `Int.ofNat` lifts them.
+        IrOperand::CastF { base, src_signed, src_width, dst_width } => Expr::apps(
+            cst(TRUSTIR_FLOAT_OF_INT),
+            [
+                operand_denotation(base, e_ref),
+                int_lit(i128::from(*src_signed)),
+                int_lit(i128::from(*src_width)),
+                int_lit(i128::from(*dst_width)),
+            ],
+        ),
+        // Trust: FLOAT-WIDEN leaf — the exact reduct of `evalOperand`'s `CastFF`
+        // minor: `floatWiden (denotation base) srcWidth dstWidth`, with both payloads
+        // lifted to `Int` exactly as that minor's `Int.ofNat` lifts them.
+        IrOperand::CastFF { base, src_width, dst_width } => Expr::apps(
+            cst(TRUSTIR_FLOAT_WIDEN),
+            [
+                operand_denotation(base, e_ref),
+                int_lit(i128::from(*src_width)),
+                int_lit(i128::from(*dst_width)),
+            ],
+        ),
     }
 }
 
@@ -2449,10 +2604,8 @@ impl IrCfg {
                 let else_v = self.walk_return_denotation(*else_bb, defs, env, fuel - 1)?;
                 let bd = BinderData::from(BinderInfo::Default);
                 let int_motive = Expr::lam(bd, cst("Bool"), int_ty());
-                let bool_rec = Expr::const_(
-                    Name::from_string("Bool.rec"),
-                    vec![Level::succ(Level::zero())],
-                );
+                let bool_rec =
+                    Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
                 // Bool.rec minor order is (false, true): FALSE ↦ else, TRUE ↦ then —
                 // the SAME order `register_eval_cfg`'s switch minor uses.
                 Some(Expr::apps(bool_rec, [int_motive, else_v, then_v, cond_b]))
@@ -3073,6 +3226,33 @@ fn register_operand_inductive(env: &mut Environment) -> Result<(), String> {
         name: Name::from_string(TRUSTIR_OPERAND_DISCR),
         type_: Expr::pi(bd(), nat_ty(), operand_ty()),
     };
+    // Trust: FLOAT-CAST leaf (2026-08-22) — `CastF : Operand → Nat → Nat → Nat →
+    // Operand` (base, signedFlag, srcWidth, dstWidth). ONE recursive field (the
+    // base) plus three `Nat` payloads. APPENDED LAST, so every existing
+    // minor-premise position is unchanged.
+    let cast_f_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_CAST_F),
+        type_: Expr::pi(
+            bd(),
+            operand_ty(),
+            Expr::pi(
+                bd(),
+                nat_ty(),
+                Expr::pi(bd(), nat_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
+            ),
+        ),
+    };
+    // Trust: FLOAT-WIDEN leaf (2026-08-24) — one recursive field (the base) plus TWO
+    // `Nat` payloads (source and destination widths). APPENDED LAST, after `CastF`,
+    // so every existing minor-premise position is unchanged.
+    let cast_ff_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_CAST_FF),
+        type_: Expr::pi(
+            bd(),
+            operand_ty(),
+            Expr::pi(bd(), nat_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
+        ),
+    };
     let decl = InductiveDecl {
         level_params: vec![],
         num_params: 0,
@@ -3089,6 +3269,8 @@ fn register_operand_inductive(env: &mut Environment) -> Result<(), String> {
                 cast_u_ctor,
                 cast_s_ctor,
                 discr_ctor,
+                cast_f_ctor,
+                cast_ff_ctor,
             ],
         }],
     };
@@ -3212,25 +3394,80 @@ fn register_eval_operand(env: &mut Environment) -> Result<(), String> {
     // and the env `e` is bvar(2) at this depth (the same position `field_case` reads it
     // from, since that minor binds two Nats and this one binds one — see below).
     let discr_case = {
-        let body = Expr::apps(cst(TRUSTIR_IDX_ELEM), [
-            Expr::app(Expr::bvar(2), Expr::bvar(0)),
-            int_lit(TRUSTIR_DISCRIMINANT_TAG_KEY),
-        ]);
+        let body = Expr::apps(
+            cst(TRUSTIR_IDX_ELEM),
+            [Expr::app(Expr::bvar(2), Expr::bvar(0)), int_lit(TRUSTIR_DISCRIMINANT_TAG_KEY)],
+        );
         Expr::lam(bd(), nat_ty(), body)
     };
-    let rec_app = Expr::apps(operand_rec, [
-        motive,
-        var_case,
-        const_case,
-        field_case,
-        index_case,
-        len_case,
-        preop_not_at_case,
-        cast_u_case,
-        cast_s_case,
-        discr_case,
-        Expr::bvar(0),
-    ]);
+    // Trust: FLOAT-CAST leaf — `CastF s sg sw dw ↦ floatOfInt (evalOperand e s)
+    // (Int.ofNat sg) (Int.ofNat sw) (Int.ofNat dw)`. ONE recursive field plus three
+    // `Nat` payloads, so the recursor binds λ(s:Operand). λ(sg sw dw : Nat).
+    // λ(ih_s:Int). <body>; de-Bruijn at the body: ih_s=bvar(0), dw=bvar(1),
+    // sw=bvar(2), sg=bvar(3), s=bvar(4).
+    //
+    // OPAQUE, unlike the `castU`/`castS` minors immediately above: those are exact
+    // and REDUCIBLE because an integer cast that did not compute would make that
+    // lane a fiction. A float conversion has no Int-carrier value to compute, so
+    // this arm makes NO numeric claim — it names the conversion and pins its
+    // signedness and widths, nothing more.
+    let cast_f_case = {
+        let nat_arg = |d: u32| Expr::app(cst("Int.ofNat"), Expr::bvar(d));
+        let body = Expr::apps(
+            cst(TRUSTIR_FLOAT_OF_INT),
+            [Expr::bvar(0), nat_arg(3), nat_arg(2), nat_arg(1)],
+        );
+        Expr::lam(
+            bd(),
+            operand_ty(),
+            Expr::lam(
+                bd(),
+                nat_ty(),
+                Expr::lam(
+                    bd(),
+                    nat_ty(),
+                    Expr::lam(bd(), nat_ty(), Expr::lam(bd(), int_ty(), body)),
+                ),
+            ),
+        )
+    };
+    // Trust: FLOAT-WIDEN leaf — `CastFF s sw dw ↦ floatWiden (evalOperand e s) sw dw`.
+    // Binder order for one recursive field plus TWO Nat payloads is
+    // `λ(base).λ(sw).λ(dw).λ(ih)`, so at the body `ih = #0`, `dw = #1`, `sw = #2`.
+    // Like `CastF` this arm makes NO numeric claim — it names the conversion and
+    // pins both widths, nothing more.
+    let cast_ff_case = {
+        let nat_arg = |d: u32| Expr::app(cst("Int.ofNat"), Expr::bvar(d));
+        let body =
+            Expr::apps(cst(TRUSTIR_FLOAT_WIDEN), [Expr::bvar(0), nat_arg(2), nat_arg(1)]);
+        Expr::lam(
+            bd(),
+            operand_ty(),
+            Expr::lam(
+                bd(),
+                nat_ty(),
+                Expr::lam(bd(), nat_ty(), Expr::lam(bd(), int_ty(), body)),
+            ),
+        )
+    };
+    let rec_app = Expr::apps(
+        operand_rec,
+        [
+            motive,
+            var_case,
+            const_case,
+            field_case,
+            index_case,
+            len_case,
+            preop_not_at_case,
+            cast_u_case,
+            cast_s_case,
+            discr_case,
+            cast_f_case,
+            cast_ff_case,
+            Expr::bvar(0),
+        ],
+    );
     let val = Expr::lam(bd(), env_ty(), Expr::lam(bd(), operand_ty(), rec_app));
     env.add_decl(Declaration::Definition {
         name,
@@ -3290,8 +3527,7 @@ fn register_bnot_at_and_casts(env: &mut Environment) -> Result<(), String> {
     let bd = || BinderData::from(BinderInfo::Default);
     let binary_int = || Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()));
     if env.get_const(&Name::from_string(TRUSTIR_BNOT_AT)).is_none() {
-        let placeholder =
-            Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), int_lit(0)));
+        let placeholder = Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), int_lit(0)));
         env.add_decl(Declaration::Opaque {
             name: Name::from_string(TRUSTIR_BNOT_AT),
             level_params: vec![],
@@ -3342,15 +3578,17 @@ fn register_bnot_at_and_casts(env: &mut Environment) -> Result<(), String> {
         // onto it. A width outside the whitelist cannot be built (`IntCastDest`), so
         // the fall-through exists only to make the Definition total.
         let motive = || Expr::lam(bd(), cst("Bool"), int_ty());
-        let bool_rec = || {
-            Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())])
-        };
+        let bool_rec =
+            || Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
         // `decide (a <= b)`, the reducible form the rest of this module already uses.
         let le = |a: Expr, b: Expr| {
-            Expr::apps(cst("decide"), [
-                Expr::apps(cst("Int.le"), [a.clone(), b.clone()]),
-                Expr::apps(cst("Int.decLe"), [a, b]),
-            ])
+            Expr::apps(
+                cst("decide"),
+                [
+                    Expr::apps(cst("Int.le"), [a.clone(), b.clone()]),
+                    Expr::apps(cst("Int.decLe"), [a, b]),
+                ],
+            )
         };
         // Trust: CAST FALL-THROUGH FIX (2026-08-11, same day) — the off-whitelist
         // default is the OPAQUE `castUnsupported`, NOT the value unchanged.
@@ -3370,8 +3608,7 @@ fn register_bnot_at_and_casts(env: &mut Environment) -> Result<(), String> {
         // between it (w = 9..15 took the width-16 arm), which is the same class of
         // quiet-wrong-answer as the inverted dispatch it replaced. Each rung now tests
         // `w <= k` AND `k <= w`.
-        let unsupported =
-            Expr::apps(cst(TRUSTIR_CAST_UNSUPPORTED), [Expr::bvar(1), Expr::bvar(0)]);
+        let unsupported = Expr::apps(cst(TRUSTIR_CAST_UNSUPPORTED), [Expr::bvar(1), Expr::bvar(0)]);
         let mut body = unsupported;
         for width in [64_u32, 32, 16, 8] {
             let dest = IntCastDest::new(width, signed).expect("whitelisted");
@@ -3379,18 +3616,9 @@ fn register_bnot_at_and_casts(env: &mut Environment) -> Result<(), String> {
             let k = || int_lit(i128::from(width));
             // w == width, spelled as the two `<=` the rest of this module already
             // reduces: `w <= k ? (k <= w ? cast_k : rest) : rest`.
-            let inner = Expr::apps(bool_rec(), [
-                motive(),
-                body.clone(),
-                at_width,
-                le(k(), Expr::bvar(0)),
-            ]);
-            body = Expr::apps(bool_rec(), [
-                motive(),
-                body,
-                inner,
-                le(Expr::bvar(0), k()),
-            ]);
+            let inner =
+                Expr::apps(bool_rec(), [motive(), body.clone(), at_width, le(k(), Expr::bvar(0))]);
+            body = Expr::apps(bool_rec(), [motive(), body, inner, le(Expr::bvar(0), k())]);
         }
         let value = Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), body));
         env.add_decl(Declaration::Definition {
@@ -6495,7 +6723,9 @@ fn register_iter_selectors_ir(env: &mut Environment) -> Result<(), String> {
 /// `Trust.TrustIr.ptrOffset : Int → Int → Int → Int` (idempotent) as
 /// `Declaration::Opaque` — the UNINTERPRETED total slice-start handle constructor + the
 /// pointee-pinned pointer offset the `into_iter`/`slice::Iter::new` RECORD witness names
-/// (see [`TRUSTIR_SLICE_START`] / [`TRUSTIR_PTR_OFFSET`]). Bodies are type-correct
+/// (see [`TRUSTIR_SLICE_START`] / [`TRUSTIR_PTR_OFFSET`], and since 2026-08-22 the
+/// integer→float conversion token [`TRUSTIR_FLOAT_OF_INT`], which is registered here
+/// because this slot must precede `register_eval_operand`). Bodies are type-correct
 /// placeholders the kernel NEVER unfolds (`Opaque` constants do not δ-reduce), so each
 /// behaves as a fresh uninterpreted function symbol. `Opaque` is NOT `ConstantKind::Axiom`,
 /// so a term referencing them gains NO axiom dependency — modulo-3 closure preserved,
@@ -6515,11 +6745,8 @@ fn register_ptr_selectors_ir(env: &mut Environment) -> Result<(), String> {
     }
     if env.get_const(&Name::from_string(TRUSTIR_PTR_OFFSET)).is_none() {
         // `Int → Int → Int → Int` (base, count, elemSize).
-        let ty = Expr::pi(
-            bd(),
-            int_ty(),
-            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty())),
-        );
+        let ty =
+            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty())));
         let placeholder = Expr::lam(
             bd(),
             int_ty(),
@@ -6532,6 +6759,50 @@ fn register_ptr_selectors_ir(env: &mut Environment) -> Result<(), String> {
             value: placeholder,
         })
         .map_err(|e| format!("add_decl(ptrOffset): {e:?}"))?;
+    }
+    if env.get_const(&Name::from_string(TRUSTIR_FLOAT_OF_INT)).is_none() {
+        // `Int → Int → Int → Int → Int` (value, signedFlag, srcWidth, dstWidth).
+        let ty = Expr::pi(
+            bd(),
+            int_ty(),
+            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty()))),
+        );
+        let placeholder = Expr::lam(
+            bd(),
+            int_ty(),
+            Expr::lam(
+                bd(),
+                int_ty(),
+                Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), int_lit(0))),
+            ),
+        );
+        env.add_decl(Declaration::Opaque {
+            name: Name::from_string(TRUSTIR_FLOAT_OF_INT),
+            level_params: vec![],
+            type_: ty,
+            value: placeholder,
+        })
+        .map_err(|e| format!("add_decl(floatOfInt): {e:?}"))?;
+    }
+    if env.get_const(&Name::from_string(TRUSTIR_FLOAT_WIDEN)).is_none() {
+        // `Int → Int → Int → Int` (value, srcWidth, dstWidth).
+        let ty = Expr::pi(
+            bd(),
+            int_ty(),
+            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty())),
+        );
+        let placeholder = Expr::lam(
+            bd(),
+            int_ty(),
+            Expr::lam(bd(), int_ty(), Expr::lam(bd(), int_ty(), int_lit(0))),
+        );
+        env.add_decl(Declaration::Opaque {
+            name: Name::from_string(TRUSTIR_FLOAT_WIDEN),
+            level_params: vec![],
+            type_: ty,
+            value: placeholder,
+        })
+        .map_err(|e| format!("add_decl(floatWiden): {e:?}"))?;
     }
     Ok(())
 }
@@ -6558,11 +6829,8 @@ fn register_field_set_surface_ir(env: &mut Environment) -> Result<(), String> {
     let bd = || BinderData::from(BinderInfo::Default);
     if env.get_const(&Name::from_string(crate::mirsem::MIRSEM_IDX_ELEM_PRIME)).is_none() {
         // `Int → Int → Int → Int` (recv-handle, field-key, generation).
-        let ty = Expr::pi(
-            bd(),
-            int_ty(),
-            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty())),
-        );
+        let ty =
+            Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), Expr::pi(bd(), int_ty(), int_ty())));
         let placeholder = Expr::lam(
             bd(),
             int_ty(),
@@ -6603,11 +6871,10 @@ fn register_field_set_surface_ir(env: &mut Environment) -> Result<(), String> {
 
 /// The `@Eq.{1} Int x y` proposition (both operands are `Int : Sort 1`).
 fn eq_int_prop(x: Expr, y: Expr) -> Expr {
-    Expr::apps(Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]), [
-        int_ty(),
-        x,
-        y,
-    ])
+    Expr::apps(
+        Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+        [int_ty(), x, y],
+    )
 }
 
 /// `sliceStart (bvar si)` — the abstract base address of the slice handle bound at
@@ -6652,14 +6919,10 @@ pub(crate) fn iter_dist_init_theorem_terms() -> (Expr, Expr) {
     let sub = |x: Expr, y: Expr| Expr::apps(cst("Int.sub"), [x, y]);
     let neg = |x: Expr| Expr::app(cst("Int.neg"), x);
     let eq_subst = |m: Expr, a: Expr, b: Expr, h: Expr, t: Expr| {
-        Expr::apps(Expr::const_(Name::from_string("Eq.subst"), vec![l1()]), [
-            int_ty(),
-            m,
-            a,
-            b,
-            h,
-            t,
-        ])
+        Expr::apps(
+            Expr::const_(Name::from_string("Eq.subst"), vec![l1()]),
+            [int_ty(), m, a, b, h, t],
+        )
     };
 
     // ---- STATEMENT: ∀ (s e : Int), hOff → hLen → ptrOffset(..) - sliceStart s = sliceLen s * e.
@@ -6685,7 +6948,13 @@ pub(crate) fn iter_dist_init_theorem_terms() -> (Expr, Expr) {
     // add_comm B A : (B + A) = (A + B)
     let add_comm_ba = Expr::apps(cst("Int.add_comm"), [b.clone(), a.clone()]);
     // base : ((A + B) + (-A)) = B   ≡def   (Int.sub (A+B) A) = B
-    let base = eq_subst(motive1, add(b.clone(), a.clone()), add(a.clone(), b.clone()), add_comm_ba, cancel);
+    let base = eq_subst(
+        motive1,
+        add(b.clone(), a.clone()),
+        add(a.clone(), b.clone()),
+        add_comm_ba,
+        cancel,
+    );
     // motive2 := λ z. (Int.sub z A) = B      (A,B live one binder out → lift 1)
     let motive2 = Expr::lam(
         bd(),
@@ -6693,12 +6962,10 @@ pub(crate) fn iter_dist_init_theorem_terms() -> (Expr, Expr) {
         eq_int_prop(sub(Expr::bvar(0), a.clone().lift(1)), b.clone().lift(1)),
     );
     // Eq.symm hOff : (A + B) = P             [hOff : P = A + B, hOff = bvar 1]
-    let eq_symm_hoff = Expr::apps(Expr::const_(Name::from_string("Eq.symm"), vec![l1()]), [
-        int_ty(),
-        p.clone(),
-        add(a.clone(), b.clone()),
-        Expr::bvar(1),
-    ]);
+    let eq_symm_hoff = Expr::apps(
+        Expr::const_(Name::from_string("Eq.symm"), vec![l1()]),
+        [int_ty(), p.clone(), add(a.clone(), b.clone()), Expr::bvar(1)],
+    );
     // goal : (Int.sub P A) = B   — rewrite (A+B) ↦ P in `base` via Eq.subst.
     let goal = eq_subst(motive2, add(a.clone(), b.clone()), p, eq_symm_hoff, base);
 
@@ -6732,7 +6999,8 @@ pub(crate) fn iter_dist_init_theorem_axiom_residue() -> Result<Vec<String>, Stri
         value: proof,
     })
     .map_err(|e| format!("add_decl(iterDistInit): {e:?}"))?;
-    let residue = env.axiom_deps(&name).ok_or_else(|| "iterDistInit decl absent after add".to_string())?;
+    let residue =
+        env.axiom_deps(&name).ok_or_else(|| "iterDistInit decl absent after add".to_string())?;
     let mut names: Vec<String> = residue.iter().map(ToString::to_string).collect();
     names.sort();
     names.dedup();
@@ -6748,9 +7016,9 @@ pub(crate) fn iter_dist_init_theorem_axiom_residue() -> Result<Vec<String>, Stri
 #[must_use]
 pub(crate) fn iter_dist_init_theorem_checks() -> bool {
     static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MEMO.get_or_init(|| {
-        matches!(iter_dist_init_theorem_axiom_residue(), Ok(residue) if residue.is_empty())
-    })
+    *MEMO.get_or_init(
+        || matches!(iter_dist_init_theorem_axiom_residue(), Ok(residue) if residue.is_empty()),
+    )
 }
 
 /// The iterDistInit statement's Pi-telescope binder DOMAIN types (outermost first —
@@ -6786,10 +7054,7 @@ pub(crate) fn iter_dist_init_expected_hypotheses() -> [Expr; 2] {
 #[cfg(test)]
 #[must_use]
 pub(crate) fn iter_dist_init_expected_consequent() -> Expr {
-    eq_int_prop(
-        Expr::apps(cst("Int.sub"), [dist_p(3, 2), dist_start(3)]),
-        dist_b(3, 2),
-    )
+    eq_int_prop(Expr::apps(cst("Int.sub"), [dist_p(3, 2), dist_start(3)]), dist_b(3, 2))
 }
 
 /// `Int : Sort 1` type expr — exposed so the hypothesis-list pin can byte-compare the two
@@ -8925,12 +9190,10 @@ pub(crate) fn cond_update_preservation_proof_ir(lp: &IrCondUpdateLoop) -> Expr {
             // cod (under `λ b` AND `Pi(eq_dom)`): Int.le c (Bool.rec (λ_.Int) (e m)(e i) b)
             //   e = bvar(4), b = bvar(1).
             let e_m4 = e_at(m_idx, 4);
-            let body_b = Expr::apps(bool_rec_int(), [
-                int_motive.clone(),
-                e_m4,
-                true_term_at(4),
-                Expr::bvar(1),
-            ]);
+            let body_b = Expr::apps(
+                bool_rec_int(),
+                [int_motive.clone(), e_m4, true_term_at(4), Expr::bvar(1)],
+            );
             let cod = Expr::apps(cst("Int.le"), [c_lit.clone(), body_b]);
             let arrow = Expr::pi(bd(), eq_dom, cod);
             Expr::lam(bd(), cst("Bool"), arrow)
@@ -8978,13 +9241,10 @@ pub(crate) fn cond_update_preservation_proof_ir(lp: &IrCondUpdateLoop) -> Expr {
                 );
                 let m3_plus_one = Expr::apps(cst("Int.add"), [e_m3b.clone(), int_one()]);
                 let self_le_succ = Expr::app(cst("Int.le_self_add_one"), e_m3b.clone());
-                Expr::apps(cst("Int.le_trans"), [
-                    c_lit.clone(),
-                    e_m3b.clone(),
-                    m3_plus_one,
-                    h_m3,
-                    self_le_succ,
-                ])
+                Expr::apps(
+                    cst("Int.le_trans"),
+                    [c_lit.clone(), e_m3b.clone(), m3_plus_one, h_m3, self_le_succ],
+                )
             };
             Expr::lam(bd(), eq_true, arm)
         };
@@ -9118,11 +9378,10 @@ pub fn check_cond_update_loop_instance(lp: &IrCondUpdateLoop) -> RefinementVerdi
     // why the `Bool.rec` case-split in the proof discharges without knowing it.
     let accumulate_ok = {
         let inc_tmp = match lp.body.first() {
-            Some(IrSStmt::Assign(t, IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(a), IrOperand::Const(1))))
-                if *a == lp.m_idx && *t != lp.m_idx && *t != lp.i_idx =>
-            {
-                Some(*t)
-            }
+            Some(IrSStmt::Assign(
+                t,
+                IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(a), IrOperand::Const(1)),
+            )) if *a == lp.m_idx && *t != lp.m_idx && *t != lp.i_idx => Some(*t),
             _ => None,
         };
         let sel_ok = matches!(
@@ -9861,6 +10120,10 @@ pub fn pin_trustir_anchor() -> AnchorVerdict {
         // RECORD-WITNESS increment 3 — the pointee-pinned record pointer-field selectors.
         TRUSTIR_SLICE_START,
         TRUSTIR_PTR_OFFSET,
+        // Trust: FLOAT-CAST leaf — the new opaque joins the audited list, matching
+        // the precedent this lane invokes (sliceStart/ptrOffset are both here).
+        TRUSTIR_FLOAT_OF_INT,
+        TRUSTIR_FLOAT_WIDEN,
     ] {
         match env.axiom_deps(&Name::from_string(n)) {
             Some(residue) if residue.is_empty() => {}
@@ -10738,7 +11001,10 @@ pub fn check_branch_refinement(cfg: &IrCfg) -> RefinementVerdict {
 /// fully-inlined MODEL denotation ([`IrCfg::inlined_return_denotation`]) instead of
 /// the live-grounded formula. No `is_grounder_connected` gate — this is the lane a
 /// `Discr`-guarded CFG certifies on.
-pub(crate) fn branch_model_refinement_statement(cfg: &IrCfg, claimed: Option<&Expr>) -> Option<Expr> {
+pub(crate) fn branch_model_refinement_statement(
+    cfg: &IrCfg,
+    claimed: Option<&Expr>,
+) -> Option<Expr> {
     let bd = || BinderData::from(BinderInfo::Default);
     let indices = cfg.param_indices();
     let n = indices.len();
@@ -11113,8 +11379,8 @@ mod exact_cast_tests {
     #[test]
     fn straight_line_cmp_op_mapping_value_oracle() {
         use trust_types::{
-            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
-            SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
         };
 
         use super::{IrBody, IrOperand, IrRvalue, IrStmt};
@@ -11243,8 +11509,8 @@ mod exact_cast_tests {
     #[test]
     fn trust_ir_chain_cmp_op_mapping_value_oracle() {
         use trust_types::{
-            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
-            SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
         };
 
         use super::{IrBody, IrOperand, IrRvalue, IrStmt};
@@ -11308,8 +11574,7 @@ mod exact_cast_tests {
                 let func = synth(bop, b_val);
                 let ir = crate::prove::straight_line_ir_body_chain(&func)
                     .unwrap_or_else(|| panic!("{bop:?} chain body must be admitted"));
-                let IrRvalue::Cmp(op, _, IrOperand::Const(k)) = ir.stmts[1].rvalue.clone()
-                else {
+                let IrRvalue::Cmp(op, _, IrOperand::Const(k)) = ir.stmts[1].rvalue.clone() else {
                     panic!("expected a Cmp final statement, got {:?}", ir.stmts[1].rvalue)
                 };
                 assert_eq!(k, b_val, "the recognizer must carry the literal through");
@@ -11397,10 +11662,18 @@ mod exact_cast_tests {
         let env = trustir_env().expect("anchor env");
         let tc = TypeChecker::new(&env);
         for (v, w) in [
-            (0_i128, 8_u32), (300, 8), (255, 8), (256, 8), (-1, 8),
-            (300, 16), (65_600, 16), (-1, 16),
-            (4_294_967_296, 32), (-1, 32),
-            (-1, 64), (18_446_744_073_709_551_617, 64),
+            (0_i128, 8_u32),
+            (300, 8),
+            (255, 8),
+            (256, 8),
+            (-1, 8),
+            (300, 16),
+            (65_600, 16),
+            (-1, 16),
+            (4_294_967_296, 32),
+            (-1, 32),
+            (-1, 64),
+            (18_446_744_073_709_551_617, 64),
         ] {
             let modulus = 1_i128 << w;
             let unsigned = v.rem_euclid(modulus);
@@ -11517,10 +11790,7 @@ mod exact_cast_tests {
                             },
                             Statement::Assign {
                                 place: Place::local(0),
-                                rvalue: Rvalue::Cast(
-                                    Operand::Move(Place::local(2)),
-                                    dest.clone(),
-                                ),
+                                rvalue: Rvalue::Cast(Operand::Move(Place::local(2)), dest.clone()),
                                 span: SourceSpan::default(),
                             },
                         ],
@@ -11550,7 +11820,10 @@ mod exact_cast_tests {
             for signed in [false, true] {
                 let func = synth(Ty::Int { width, signed });
                 let ir = crate::prove::straight_line_ir_body_chain(&func).unwrap_or_else(|| {
-                    panic!("the `as {}{width}` chain must be admitted", if signed { 'i' } else { 'u' })
+                    panic!(
+                        "the `as {}{width}` chain must be admitted",
+                        if signed { 'i' } else { 'u' }
+                    )
                 });
                 // The recognizer must have chosen the carrier — and the WIDTH — that
                 // the destination local declares. Read it back rather than assume it.
@@ -11778,10 +12051,7 @@ mod exact_cast_tests {
                 matches!(
                     super::check_refinement_decl(
                         "Trust.TrustIr.Refinement.bool_not_value_oracle_neg",
-                        super::body_model_chain_refinement_statement(
-                            &closed,
-                            Some(&claim(!truth))
-                        ),
+                        super::body_model_chain_refinement_statement(&closed, Some(&claim(!truth))),
                         super::body_model_chain_refinement_proof(&closed),
                     ),
                     RefinementVerdict::KernelRejected(_)
@@ -11801,10 +12071,7 @@ mod exact_cast_tests {
                     },
                     IrStmt {
                         idx: ir.stmts[1].idx,
-                        rvalue: IrRvalue::Un(
-                            TrustIrUnOp::Not,
-                            IrOperand::Var(ir.stmts[0].idx),
-                        ),
+                        rvalue: IrRvalue::Un(TrustIrUnOp::Not, IrOperand::Var(ir.stmts[0].idx)),
                     },
                 ],
                 ret: ir.ret,
@@ -11825,10 +12092,7 @@ mod exact_cast_tests {
                 matches!(
                     super::check_refinement_decl(
                         "Trust.TrustIr.Refinement.bool_not_forgery",
-                        super::body_model_chain_refinement_statement(
-                            &forged,
-                            Some(&claim(truth))
-                        ),
+                        super::body_model_chain_refinement_statement(&forged, Some(&claim(truth))),
                         super::body_model_chain_refinement_proof(&forged),
                     ),
                     RefinementVerdict::KernelRejected(_)
@@ -11902,6 +12166,207 @@ mod exact_cast_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Trust: FLOAT-WIDEN leaf (2026-08-24) — the `CastFF` operand denotes through the
+    /// opaque `floatWiden` head, the two mirrors agree, and the axiom residue stays
+    /// empty (an `Opaque` is not an axiom).
+    #[test]
+    fn float_widen_operand_denotes_and_stays_modulo_3() {
+        let env = trustir_env().expect("anchor env builds with CastFF");
+        assert!(env.get_const(&Name::from_string(TRUSTIR_FLOAT_WIDEN)).is_some());
+        assert!(
+            env.get_inductive(&Name::from_string(TRUSTIR_OPERAND)).is_some(),
+            "the Operand inductive still registers with the appended CastFF"
+        );
+        // `evalOperand e (CastFF (Var 0) 32 64)` must ι-reduce to the Rust-side
+        // denotation — the minor premise and `operand_denotation` are the two mirrors.
+        let op = IrOperand::CastFF {
+            base: Box::new(IrOperand::Var(0)),
+            src_width: 32,
+            dst_width: 64,
+        };
+        let e = refinement_env(&[0]);
+        let lhs = Expr::apps(cst(TRUSTIR_EVAL_OPERAND), [e.clone(), op.to_operand_expr()]);
+        let rhs = operand_denotation(&op, &e);
+        let tc = TypeChecker::new(&env);
+        assert!(
+            tc.is_def_eq(&lhs, &rhs),
+            "evalOperand's CastFF minor must reduce to operand_denotation's CastFF term"
+        );
+        // APPENDING CastFF MUST NOT DISTURB CastF. Its minor premise sits one position
+        // earlier, and the whole point of appending last is that every prior reduction
+        // is byte-for-byte unchanged — so check the sibling still reduces here.
+        let sib = IrOperand::CastF {
+            base: Box::new(IrOperand::Var(0)),
+            src_signed: false,
+            src_width: 32,
+            dst_width: 64,
+        };
+        assert!(
+            tc.is_def_eq(
+                &Expr::apps(cst(TRUSTIR_EVAL_OPERAND), [e.clone(), sib.to_operand_expr()]),
+                &operand_denotation(&sib, &e)
+            ),
+            "appending CastFF must leave CastF's minor premise position untouched"
+        );
+        // The name promises axiom closure, so CHECK it: a CLOSED `floatWiden` instance
+        // in a theorem, audited directly.
+        let mut env2 = env.clone();
+        let closed =
+            Expr::apps(cst(TRUSTIR_FLOAT_WIDEN), [int_lit(7), int_lit(32), int_lit(64)]);
+        let stmt = Expr::apps(
+            Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+            [int_ty(), closed.clone(), closed.clone()],
+        );
+        let proof = Expr::apps(
+            Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+            [int_ty(), closed],
+        );
+        let name = Name::from_string("Trust.TrustIr.Test.floatWidenClosure");
+        env2.add_decl(Declaration::Theorem {
+            name: name.clone(),
+            level_params: vec![],
+            type_: stmt,
+            value: proof,
+        })
+        .expect("a floatWiden-mentioning theorem type-checks");
+        let residue = env2.axiom_deps(&name).expect("decl present after add");
+        assert!(
+            residue.is_empty(),
+            "an Opaque is NOT an axiom — a floatWiden-mentioning theorem must carry an \
+             empty axiom residue, got {residue:?}"
+        );
+    }
+
+    /// Both widths are load-bearing: `f32→f64` and `f64→f32` must NOT denote alike.
+    #[test]
+    fn float_widen_payloads_discriminate() {
+        let env = trustir_env().expect("anchor env builds");
+        let tc = TypeChecker::new(&env);
+        let e = refinement_env(&[0]);
+        let den = |sw: u32, dw: u32| {
+            operand_denotation(
+                &IrOperand::CastFF {
+                    base: Box::new(IrOperand::Var(0)),
+                    src_width: sw,
+                    dst_width: dw,
+                },
+                &e,
+            )
+        };
+        assert!(!tc.is_def_eq(&den(32, 64), &den(64, 32)), "direction must discriminate");
+        assert!(!tc.is_def_eq(&den(32, 64), &den(16, 64)), "source width must discriminate");
+        assert!(!tc.is_def_eq(&den(32, 64), &den(32, 128)), "dest width must discriminate");
+        // And a widening must never denote as the int-source conversion.
+        let as_int_cast = operand_denotation(
+            &IrOperand::CastF {
+                base: Box::new(IrOperand::Var(0)),
+                src_signed: false,
+                src_width: 32,
+                dst_width: 64,
+            },
+            &e,
+        );
+        assert!(
+            !tc.is_def_eq(&den(32, 64), &as_int_cast),
+            "a float source and an int source must denote through DIFFERENT heads"
+        );
+    }
+
+    /// Trust: FLOAT-CAST leaf (2026-08-22) — the `CastF` operand denotes through the
+    /// kernel, and the whole anchor env still closes over ⊆ the 3 foundational axioms
+    /// (`floatOfInt` is `Declaration::Opaque`, NOT an axiom).
+    #[test]
+    fn float_cast_operand_denotes_and_stays_modulo_3() {
+        let env = trustir_env().expect("anchor env builds with CastF");
+        // The constructor and the opaque head both exist.
+        assert!(env.get_const(&Name::from_string(TRUSTIR_FLOAT_OF_INT)).is_some());
+        assert!(
+            env.get_inductive(&Name::from_string(TRUSTIR_OPERAND)).is_some(),
+            "the Operand inductive still registers with the appended CastF"
+        );
+        // `evalOperand e (CastF (Var 0) 0 32 64)` must ι-reduce to the denotation the
+        // Rust side builds — i.e. the two mirrors agree.
+        let op = IrOperand::CastF {
+            base: Box::new(IrOperand::Var(0)),
+            src_signed: false,
+            src_width: 32,
+            dst_width: 64,
+        };
+        let e = refinement_env(&[0]);
+        let lhs = Expr::apps(cst(TRUSTIR_EVAL_OPERAND), [e.clone(), op.to_operand_expr()]);
+        let rhs = operand_denotation(&op, &e);
+        let tc = TypeChecker::new(&env);
+        assert!(
+            tc.is_def_eq(&lhs, &rhs),
+            "evalOperand's CastF minor must reduce to operand_denotation's CastF term"
+        );
+        // The name of this test promises axiom closure, so CHECK it rather than
+        // relying on a corpus test elsewhere: register a theorem whose statement
+        // mentions `floatOfInt` and audit its closure directly.
+        let mut env2 = env.clone();
+        // A CLOSED floatOfInt instance (the denotation above is built under the env
+        // binder, so it is not a closed statement on its own).
+        let closed = Expr::apps(
+            cst(TRUSTIR_FLOAT_OF_INT),
+            [int_lit(7), int_lit(0), int_lit(32), int_lit(64)],
+        );
+        let stmt = Expr::apps(
+            Expr::const_(Name::from_string("Eq"), vec![Level::succ(Level::zero())]),
+            [int_ty(), closed.clone(), closed.clone()],
+        );
+        let proof = Expr::apps(
+            Expr::const_(Name::from_string("Eq.refl"), vec![Level::succ(Level::zero())]),
+            [int_ty(), closed],
+        );
+        let name = Name::from_string("Trust.TrustIr.Test.floatOfIntClosure");
+        env2.add_decl(Declaration::Theorem {
+            name: name.clone(),
+            level_params: vec![],
+            type_: stmt,
+            value: proof,
+        })
+        .expect("a floatOfInt-mentioning theorem type-checks");
+        let residue = env2.axiom_deps(&name).expect("decl present after add");
+        assert!(
+            residue.is_empty(),
+            "an Opaque head must add NO axiom dependency; residue was {residue:?}"
+        );
+    }
+
+    /// The payloads DISCRIMINATE: two conversions differing in signedness, source
+    /// width, or destination width must NOT be definitionally equal. This is the pin
+    /// that stops `u32 as f64`, `i32 as f64` and `u32 as f32` collapsing onto one
+    /// certificate — the `EndOffset`/`elem_size` discipline.
+    #[test]
+    fn float_cast_payloads_discriminate() {
+        let env = trustir_env().expect("env");
+        let tc = TypeChecker::new(&env);
+        let e = refinement_env(&[0]);
+        let den = |sg: bool, sw: u32, dw: u32| {
+            operand_denotation(
+                &IrOperand::CastF {
+                    base: Box::new(IrOperand::Var(0)),
+                    src_signed: sg,
+                    src_width: sw,
+                    dst_width: dw,
+                },
+                &e,
+            )
+        };
+        let base = den(false, 32, 64);
+        assert!(tc.is_def_eq(&base, &den(false, 32, 64)), "identical casts agree");
+        for (sg, sw, dw, what) in [
+            (true, 32, 64, "signedness"),
+            (false, 64, 64, "source width"),
+            (false, 32, 32, "destination width"),
+        ] {
+            assert!(
+                !tc.is_def_eq(&base, &den(sg, sw, dw)),
+                "a conversion differing in {what} must denote DISTINCTLY"
+            );
+        }
+    }
     use super::*;
 
     /// The anchor itself rests on ⊆ the 3 foundational axioms.
@@ -13968,9 +14433,6 @@ mod tests {
         );
     }
 }
-
-
-
 
 #[cfg(test)]
 mod accumulate_loop_family_tests {

@@ -1,18 +1,14 @@
 // trust-strengthen/trust_wp_oracle.rs: trust-wp-direct verification oracle for CEGIS loop
 //
-// Implements VerificationOracle for TrustWpNativeBackend so a CEGIS driver can
-// use trust-wp's deductive engine to validate proposed specifications. Also
-// provides StdlibSpecs import as seed specs.
+// Retained compatibility surface for the old TrustWP CEGIS oracle, plus
+// StdlibSpecs import as seed specs. TrustWP currently owns no proof-producing
+// obligation kind, so the oracle refuses every non-empty candidate set instead
+// of spawning and parsing the compatibility CLI.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_router::VerificationBackend;
-use trust_types::{
-    Formula, ProofStrength, Sort, SourceSpan, VcKind, VerificationCondition, VerificationResult,
-};
 use trust_vcgen::{FnContract, StdlibSpecs};
-use trust_wp::{Contract, ContractSet, TrustWpConfig, TrustWpLibError, verify_with_contracts};
 
 use crate::spec_proposal::{SpecKind, SpecProposal};
 
@@ -47,195 +43,30 @@ pub trait VerificationOracle: Send + Sync {
     fn verify_specs(&self, function_path: &str, specs: &[SpecProposal]) -> VerifyOutcome;
 }
 
-/// Verification oracle that delegates to trust-wp-native for deductive verification.
+/// Fail-closed compatibility shim for the retired direct TrustWP oracle.
 ///
-/// Converts `SpecProposal`s into `VerificationCondition`s and routes them
-/// through `TrustWpNativeBackend`. Maps trust_wp results back to `VerifyOutcome`.
-///
-/// trust-wp's strongest-postcondition reasoning is better suited for spec
-/// validation than raw SMT solving because it understands Rust ownership
-/// and contracts natively.
-pub struct TrustWpDirectOracle {
-    backend: TrustWpNativeBackend,
-}
-
-struct TrustWpNativeBackend {
-    config: TrustWpConfig,
-}
-
-impl TrustWpNativeBackend {
-    const NAME: &'static str = "trust-wp-native";
-
-    fn new() -> Self {
-        Self { config: TrustWpConfig::new() }
-    }
-
-    fn with_timeout(timeout_ms: u64) -> Self {
-        Self { config: TrustWpConfig::new().with_timeout(timeout_ms) }
-    }
-
-    fn name(&self) -> &str {
-        Self::NAME
-    }
-}
-
-impl VerificationBackend for TrustWpNativeBackend {
-    fn name(&self) -> &str {
-        self.name()
-    }
-
-    fn can_handle(&self, vc: &VerificationCondition) -> bool {
-        matches!(
-            vc.kind,
-            VcKind::Precondition { .. } | VcKind::Postcondition | VcKind::Assertion { .. }
-        )
-    }
-
-    fn verify(&self, vc: &VerificationCondition) -> VerificationResult {
-        if let Some(result) = trust_router::unsupported_mir_unknown(vc, self.name(), 0) {
-            return result;
-        }
-        if !self.can_handle(vc) {
-            return VerificationResult::Unknown {
-                solver: self.name().into(),
-                time_ms: 0,
-                reason: format!("trust-wp cannot handle VC kind {:?}", vc.kind),
-            };
-        }
-
-        // `vc.formula` is the VIOLATION: Bool(false) violation is UNSAT => property
-        // holds => Proved; Bool(true) violation always holds => Failed. Matches the
-        // canonical convention (constant_folder.rs:109-116). Previously inverted —
-        // an always-violated obligation must never be reported as a vacuous PROVED.
-        match vc.formula {
-            Formula::Bool(false) => {
-                return VerificationResult::Proved {
-                    solver: self.name().into(),
-                    time_ms: 0,
-                    strength: ProofStrength::deductive(),
-                    proof_certificate: None,
-                    solver_warnings: None,
-                    native_proof_envelope: None,
-                };
-            }
-            Formula::Bool(true) => {
-                return VerificationResult::Failed {
-                    solver: self.name().into(),
-                    time_ms: 0,
-                    counterexample: None,
-                };
-            }
-            _ => {}
-        }
-
-        let Some(contracts) = vc_to_trust_wp_contracts(vc) else {
-            return VerificationResult::Unknown {
-                solver: self.name().into(),
-                time_ms: 0,
-                reason: "trust-wp cannot translate this VC formula to contracts".into(),
-            };
-        };
-
-        match verify_with_contracts(vc.function.as_ref(), &contracts, &self.config) {
-            Ok(result) => result.to_verification_result(),
-            Err(TrustWpLibError::Timeout { timeout_ms }) => {
-                VerificationResult::Timeout { solver: self.name().into(), timeout_ms }
-            }
-            Err(err) => VerificationResult::Unknown {
-                solver: self.name().into(),
-                time_ms: 0,
-                reason: format!("trust-wp unavailable or inconclusive: {err}"),
-            },
-        }
-    }
-}
+/// The type remains source-compatible for CEGIS callers, but it cannot validate
+/// proposals: TrustWP advertises zero owned obligation kinds and the formula-less
+/// RustHorn give-back record is not a dischargeable proof obligation.
+/// Callers must submit body-aware contracts to the compiler's typed TrustMC
+/// route (or refinement to TrustVC) instead of treating a parsed subprocess
+/// verdict as authority. Like the compiler's per-VC route after the R4 flip,
+/// this oracle never spawns the `trust_wp` subprocess, never reads
+/// `TRUST_WP_PATH`, and never parses the `TRUST_WP_RESULT:v1` text protocol.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustWpDirectOracle;
 
 impl TrustWpDirectOracle {
     /// Create a new oracle with default trust_wp timeout.
     #[must_use]
     pub fn new() -> Self {
-        Self { backend: TrustWpNativeBackend::new() }
+        Self
     }
 
-    /// Create an oracle with a custom trust_wp timeout (milliseconds).
+    /// Preserve the historical constructor without enabling the retired path.
     #[must_use]
-    pub fn with_timeout(timeout_ms: u64) -> Self {
-        Self { backend: TrustWpNativeBackend::with_timeout(timeout_ms) }
-    }
-}
-
-fn vc_to_trust_wp_contracts(vc: &VerificationCondition) -> Option<ContractSet> {
-    // `vc.formula` is the VIOLATION; the contract clause asserts the PROPERTY
-    // (`¬violation`) to stay consistent with the constant short-circuit above.
-    let goal = Formula::Not(Box::new(vc.formula.clone()));
-    let expr = formula_to_trust_wp_expr(&goal)?;
-    let contracts = match &vc.kind {
-        VcKind::Precondition { .. } => ContractSet::new().with_requires(Contract::requires(expr)),
-        VcKind::Postcondition => ContractSet::new().with_ensures(Contract::ensures(expr)),
-        VcKind::Assertion { message } if message.contains("[loop:invariant]") => {
-            ContractSet::new().with_invariant(Contract::invariant(expr))
-        }
-        VcKind::Assertion { .. } => ContractSet::new().with_ensures(Contract::ensures(expr)),
-        _ => return None,
-    };
-    Some(contracts)
-}
-
-fn formula_to_trust_wp_expr(formula: &Formula) -> Option<String> {
-    match formula {
-        Formula::Bool(true) => Some("true".to_string()),
-        Formula::Bool(false) => Some("false".to_string()),
-        Formula::Var(name, Sort::Bool) => Some(name.clone()),
-        Formula::Not(inner) => Some(format!("!({})", formula_to_trust_wp_expr(inner)?)),
-        Formula::And(terms) => terms
-            .iter()
-            .map(formula_to_trust_wp_expr)
-            .collect::<Option<Vec<_>>>()
-            .map(|terms| terms.join(" && ")),
-        Formula::Or(terms) => terms
-            .iter()
-            .map(formula_to_trust_wp_expr)
-            .collect::<Option<Vec<_>>>()
-            .map(|terms| terms.join(" || ")),
-        Formula::Implies(lhs, rhs) => Some(format!(
-            "({}) ==> ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Eq(lhs, rhs) => Some(format!(
-            "({}) == ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Lt(lhs, rhs) => Some(format!(
-            "({}) < ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Le(lhs, rhs) => Some(format!(
-            "({}) <= ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Gt(lhs, rhs) => Some(format!(
-            "({}) > ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Ge(lhs, rhs) => Some(format!(
-            "({}) >= ({})",
-            formula_to_trust_wp_expr(lhs)?,
-            formula_to_trust_wp_expr(rhs)?
-        )),
-        Formula::Int(value) => Some(value.to_string()),
-        Formula::UInt(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-impl Default for TrustWpDirectOracle {
-    fn default() -> Self {
-        Self::new()
+    pub fn with_timeout(_timeout_ms: u64) -> Self {
+        Self
     }
 }
 
@@ -244,138 +75,11 @@ impl VerificationOracle for TrustWpDirectOracle {
         if specs.is_empty() {
             return VerifyOutcome::AllPassed;
         }
-
-        let mut failed_specs = Vec::new();
-        let mut counterexample_parts = Vec::new();
-
-        for spec in specs {
-            let vc = spec_to_vc(spec, function_path);
-
-            if let Some((failed_spec, reason)) =
-                unsupported_mir_soft_failure(&self.backend, spec, &vc)
-            {
-                counterexample_parts.push(reason);
-                failed_specs.push(failed_spec);
-                continue;
-            }
-
-            // Check if trust_wp can handle this VC kind + formula
-            if !self.backend.can_handle(&vc) {
-                // If trust_wp cannot handle it, treat as unknown (not a hard failure).
-                // The spec might still be valid -- trust_wp just can't verify it.
-                continue;
-            }
-
-            let result = self.backend.verify(&vc);
-
-            match result {
-                VerificationResult::Proved { .. } => {
-                    // This spec is valid -- continue checking others
-                }
-                VerificationResult::Failed { counterexample, .. } => {
-                    let cex_text = counterexample
-                        .as_ref()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| format!("trust-wp rejected spec: {}", spec.to_clause()));
-                    counterexample_parts.push(cex_text);
-                    failed_specs.push(spec.clone());
-                }
-                VerificationResult::Unknown { reason, .. } => {
-                    // Unknown is not a hard failure -- trust_wp can't decide.
-                    // Log but continue (treat as inconclusive, not failed).
-                    counterexample_parts.push(format!(
-                        "trust-wp inconclusive for {}: {}",
-                        spec.to_clause(),
-                        reason
-                    ));
-                    // For CEGIS purposes, treat unknown as a soft failure
-                    // so the loop can try to refine the spec.
-                    failed_specs.push(spec.clone());
-                }
-                VerificationResult::Timeout { .. } => {
-                    return VerifyOutcome::Error {
-                        message: format!("trust-wp timed out verifying: {}", spec.to_clause()),
-                    };
-                }
-                _ => {
-                    counterexample_parts.push(format!(
-                        "trust-wp returned an unrecognized result for {}",
-                        spec.to_clause()
-                    ));
-                    failed_specs.push(spec.clone());
-                }
-            }
-        }
-
-        if failed_specs.is_empty() {
-            VerifyOutcome::AllPassed
-        } else {
-            VerifyOutcome::Failed { counterexample: counterexample_parts.join("; "), failed_specs }
-        }
-    }
-}
-
-fn unsupported_mir_soft_failure(
-    backend: &TrustWpNativeBackend,
-    spec: &SpecProposal,
-    vc: &VerificationCondition,
-) -> Option<(SpecProposal, String)> {
-    trust_router::unsupported_mir_unknown(vc, backend.name(), 0).map(|result| {
-        let reason = match result {
-            VerificationResult::Unknown { reason, .. } => reason,
-            other => format!("unexpected unsupported MIR result: {other:?}"),
-        };
-        (
-            spec.clone(),
-            format!("trust-wp cannot verify unsupported MIR for {}: {}", spec.to_clause(), reason),
-        )
-    })
-}
-
-/// Convert a `SpecProposal` into a `VerificationCondition` for trust_wp.
-///
-/// The spec body is encoded as a `Formula::Var` with the spec text as the
-/// variable name (trust-wp will parse the expression). The VC kind is set
-/// based on the spec kind (precondition vs postcondition).
-fn spec_to_vc(spec: &SpecProposal, function_path: &str) -> VerificationCondition {
-    let kind = match spec.kind {
-        SpecKind::Requires => VcKind::Precondition { callee: function_path.to_string() },
-        SpecKind::Ensures => VcKind::Postcondition,
-        SpecKind::Invariant => {
-            VcKind::Assertion { message: format!("[loop:invariant] {}", spec.spec_body) }
-        }
-    };
-
-    // Encode the spec body as a formula. For simple boolean specs,
-    // try to parse as true/false; otherwise wrap as a named variable
-    // that trust-wp's translation pipeline can handle.
-    let formula = spec_body_to_formula(&spec.spec_body);
-
-    VerificationCondition {
-        kind,
-        function: function_path.into(),
-        location: SourceSpan::default(),
-        formula,
-        contract_metadata: None,
-        obligation: None,
-    }
-}
-
-/// Convert a spec body string into a Formula.
-///
-/// Handles simple cases:
-/// - `"true"` -> `Formula::Bool(true)`
-/// - `"false"` -> `Formula::Bool(false)`
-/// - Otherwise wraps as a named variable (placeholder for the expression).
-fn spec_body_to_formula(spec_body: &str) -> Formula {
-    let trimmed = spec_body.trim();
-    match trimmed {
-        "true" => Formula::Bool(true),
-        "false" => Formula::Bool(false),
-        _ => {
-            // Wrap the spec body as a Var so it passes through the formula
-            // translation. The trust_wp bridge will see it as a named predicate.
-            Formula::Var(trimmed.to_string(), Sort::Bool)
+        VerifyOutcome::Failed {
+            counterexample: format!(
+                "TrustWP direct validation is unsupported for `{function_path}`: the engine owns no dischargeable obligation kind; submit body-aware contracts through the compiler TrustMC route and refinement through TrustVC"
+            ),
+            failed_specs: specs.to_vec(),
         }
     }
 }
@@ -449,6 +153,8 @@ fn contract_to_proposals(contract: &FnContract) -> Vec<SpecProposal> {
 
 #[cfg(test)]
 mod tests {
+    use trust_types::Formula;
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -457,14 +163,12 @@ mod tests {
 
     #[test]
     fn test_trust_wp_oracle_default() {
-        let oracle = TrustWpDirectOracle::default();
-        assert_eq!(oracle.backend.name(), "trust-wp-native");
+        let _oracle = TrustWpDirectOracle;
     }
 
     #[test]
     fn test_trust_wp_oracle_with_timeout() {
-        let oracle = TrustWpDirectOracle::with_timeout(5_000);
-        assert_eq!(oracle.backend.name(), "trust-wp-native");
+        let _oracle = TrustWpDirectOracle::with_timeout(5_000);
     }
 
     #[test]
@@ -475,40 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trust_wp_oracle_unsupported_mir_fails_before_backend_dispatch() {
-        let backend = TrustWpNativeBackend::new();
-        let spec = SpecProposal {
-            function_path: "test::f".into(),
-            function_name: "f".into(),
-            kind: SpecKind::Ensures,
-            spec_body: "result > 0".into(),
-            confidence: 0.8,
-            rationale: "test".into(),
-            iteration: 1,
-            validated: true,
-            validation_errors: vec![],
-        };
-        let vc = VerificationCondition {
-            kind: VcKind::UnsupportedMir {
-                kind: "terminator".into(),
-                detail: "opaque terminator not modeled".into(),
-            },
-            function: "test::f".into(),
-            location: SourceSpan::default(),
-            formula: Formula::Bool(false),
-            contract_metadata: None,
-            obligation: None,
-        };
-
-        let (failed_spec, reason) =
-            unsupported_mir_soft_failure(&backend, &spec, &vc).expect("unsupported MIR guard");
-        assert_eq!(failed_spec.spec_body, spec.spec_body);
-        assert!(reason.contains("unsupported MIR"));
-        assert!(reason.contains("opaque terminator not modeled"));
-    }
-
-    #[test]
-    fn test_trust_wp_oracle_trivially_true_spec_passes() {
+    fn test_trust_wp_oracle_rejects_even_trivial_true_without_owned_claim() {
         let oracle = TrustWpDirectOracle::new();
         let spec = SpecProposal {
             function_path: "test::f".into(),
@@ -516,41 +187,74 @@ mod tests {
             kind: SpecKind::Ensures,
             spec_body: "true".into(),
             confidence: 0.9,
-            rationale: "trivially true".into(),
+            rationale: "must not become a synthetic proof".into(),
             iteration: 1,
             validated: true,
             validation_errors: vec![],
         };
         let outcome = oracle.verify_specs("test::f", &[spec]);
-        assert!(
-            matches!(outcome, VerifyOutcome::AllPassed),
-            "trivially true ensures should pass: {outcome:?}"
-        );
-    }
-
-    #[test]
-    fn test_trust_wp_oracle_trivially_false_spec_fails() {
-        let oracle = TrustWpDirectOracle::new();
-        let spec = SpecProposal {
-            function_path: "test::f".into(),
-            function_name: "f".into(),
-            kind: SpecKind::Ensures,
-            spec_body: "false".into(),
-            confidence: 0.5,
-            rationale: "trivially false".into(),
-            iteration: 1,
-            validated: true,
-            validation_errors: vec![],
+        let VerifyOutcome::Failed { counterexample, failed_specs } = outcome else {
+            panic!("a non-empty retired TrustWP request must fail closed");
         };
-        let outcome = oracle.verify_specs("test::f", &[spec]);
+        assert_eq!(failed_specs.len(), 1);
+        assert!(counterexample.contains("owns no dischargeable obligation kind"));
+        assert!(counterexample.contains("TrustMC"));
+        assert!(counterexample.contains("TrustVC"));
+    }
+
+    #[test]
+    fn test_trust_wp_oracle_binary_absent_from_path_still_fails_closed() {
+        const CHILD: &str = "TRUST_R4_TRUST_WP_PATH_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let oracle = TrustWpDirectOracle::new();
+            let spec = SpecProposal {
+                function_path: "test::f".into(),
+                function_name: "f".into(),
+                kind: SpecKind::Ensures,
+                spec_body: "true".into(),
+                confidence: 0.9,
+                rationale: "PATH-absent control".into(),
+                iteration: 1,
+                validated: true,
+                validation_errors: vec![],
+            };
+            assert!(matches!(
+                oracle.verify_specs("test::f", &[spec]),
+                VerifyOutcome::Failed { .. }
+            ));
+            eprintln!("R4_PATH_ABSENT_CHILD_EXECUTED");
+            return;
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable path"),
+        )
+        .args([
+            "--exact",
+            "trust_wp_oracle::tests::test_trust_wp_oracle_binary_absent_from_path_still_fails_closed",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("PATH", "/definitely/no/trust-wp/binary")
+        .env_remove("TRUST_WP_PATH")
+        .output()
+        .expect("spawn isolated PATH-absent control");
         assert!(
-            matches!(outcome, VerifyOutcome::Failed { .. }),
-            "trivially false ensures should fail: {outcome:?}"
+            output.status.success(),
+            "PATH-absent child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("R4_PATH_ABSENT_CHILD_EXECUTED"),
+            "PATH-absent child filter ran no test:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
     #[test]
-    fn test_trust_wp_oracle_nontrivial_spec_returns_failed_or_unknown() {
+    fn test_trust_wp_oracle_nontrivial_spec_is_unsupported() {
         let oracle = TrustWpDirectOracle::new();
         let spec = SpecProposal {
             function_path: "test::f".into(),
@@ -564,124 +268,10 @@ mod tests {
             validation_errors: vec![],
         };
         let outcome = oracle.verify_specs("test::f", &[spec]);
-        // Nontrivial specs go through trust_wp which returns Unknown (solver pending)
-        // Our oracle treats Unknown as soft failure for CEGIS refinement
         assert!(
             matches!(outcome, VerifyOutcome::Failed { .. }),
-            "nontrivial spec should be treated as inconclusive/failed: {outcome:?}"
+            "nontrivial spec must remain unsupported: {outcome:?}"
         );
-    }
-
-    #[test]
-    fn test_trust_wp_oracle_unhandleable_vc_skipped() {
-        let oracle = TrustWpDirectOracle::new();
-        // DivisionByZero VcKind is not a deductive VC kind, so trust_wp
-        // cannot handle it. The oracle should skip it (not fail).
-        // We need a Requires spec because that generates a Precondition VcKind
-        // which IS deductive. So use an Invariant with a non-loop message
-        // to get something trust_wp rejects.
-        // Actually, let's just test with a spec that produces a VcKind
-        // trust_wp can't handle. Requires -> Precondition is deductive.
-        // Ensures -> Postcondition is deductive. Invariant with loop prefix is too.
-        // The only way trust_wp rejects is if the formula can't translate.
-        // Test: all specs pass because trust_wp skips unhandleable ones.
-        let spec = SpecProposal {
-            function_path: "test::f".into(),
-            function_name: "f".into(),
-            kind: SpecKind::Requires,
-            spec_body: "true".into(),
-            confidence: 0.9,
-            rationale: "should pass".into(),
-            iteration: 1,
-            validated: true,
-            validation_errors: vec![],
-        };
-        let outcome = oracle.verify_specs("test::f", &[spec]);
-        assert!(
-            matches!(outcome, VerifyOutcome::AllPassed),
-            "trivially true precondition should pass: {outcome:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // spec_to_vc conversion tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_spec_to_vc_requires() {
-        let spec = SpecProposal {
-            function_path: "math::f".into(),
-            function_name: "f".into(),
-            kind: SpecKind::Requires,
-            spec_body: "x > 0".into(),
-            confidence: 0.8,
-            rationale: "test".into(),
-            iteration: 1,
-            validated: true,
-            validation_errors: vec![],
-        };
-        let vc = spec_to_vc(&spec, "math::f");
-        assert!(matches!(vc.kind, VcKind::Precondition { .. }));
-        assert_eq!(vc.function, "math::f");
-    }
-
-    #[test]
-    fn test_spec_to_vc_ensures() {
-        let spec = SpecProposal {
-            function_path: "math::f".into(),
-            function_name: "f".into(),
-            kind: SpecKind::Ensures,
-            spec_body: "result > 0".into(),
-            confidence: 0.8,
-            rationale: "test".into(),
-            iteration: 1,
-            validated: true,
-            validation_errors: vec![],
-        };
-        let vc = spec_to_vc(&spec, "math::f");
-        assert!(matches!(vc.kind, VcKind::Postcondition));
-    }
-
-    #[test]
-    fn test_spec_to_vc_invariant() {
-        let spec = SpecProposal {
-            function_path: "math::f".into(),
-            function_name: "f".into(),
-            kind: SpecKind::Invariant,
-            spec_body: "i < n".into(),
-            confidence: 0.7,
-            rationale: "test".into(),
-            iteration: 1,
-            validated: true,
-            validation_errors: vec![],
-        };
-        let vc = spec_to_vc(&spec, "math::f");
-        assert!(matches!(vc.kind, VcKind::Assertion { .. }));
-        if let VcKind::Assertion { message } = &vc.kind {
-            assert!(message.contains("[loop:invariant]"));
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // spec_body_to_formula tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_spec_body_true() {
-        let f = spec_body_to_formula("true");
-        assert!(matches!(f, Formula::Bool(true)));
-    }
-
-    #[test]
-    fn test_spec_body_false() {
-        let f = spec_body_to_formula("false");
-        assert!(matches!(f, Formula::Bool(false)));
-    }
-
-    #[test]
-    fn test_spec_body_expression() {
-        let f = spec_body_to_formula("x > 0");
-        assert!(matches!(f, Formula::Var(..)));
     }
 
     // -----------------------------------------------------------------------
@@ -782,14 +372,16 @@ mod tests {
             },
         ];
         let outcome = oracle.verify_specs("math::add", &specs);
-        // The false spec should cause failure
+        // No spec is accepted through the retired direct TrustWP authority,
+        // including the syntactically trivial one.
         assert!(
             matches!(outcome, VerifyOutcome::Failed { .. }),
             "mixed specs with a false one should fail: {outcome:?}"
         );
         if let VerifyOutcome::Failed { failed_specs, .. } = &outcome {
-            assert_eq!(failed_specs.len(), 1, "only the false spec should fail");
-            assert_eq!(failed_specs[0].spec_body, "false");
+            assert_eq!(failed_specs.len(), 2, "both specs must remain unvalidated");
+            assert_eq!(failed_specs[0].spec_body, "true");
+            assert_eq!(failed_specs[1].spec_body, "false");
         }
     }
 }

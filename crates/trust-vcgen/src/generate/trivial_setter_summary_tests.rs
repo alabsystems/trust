@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    AssertMessage, BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
-    Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VerifiableBody,
+    AssertMessage, BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Projection,
+    Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
     VerifiableFunction,
 };
 
@@ -93,15 +92,13 @@ fn caller_fn() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         func: SETTER.into(),
-                        args: vec![
-                            Operand::Move(Place::local(5)),
-                            Operand::Copy(Place::local(2)),
-                        ],
+                        args: vec![Operand::Move(Place::local(5)), Operand::Copy(Place::local(2))],
                         dest: Place::local(4),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -318,6 +315,7 @@ fn rejects_call_and_assert_terminators() {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     assert!(compute_trivial_setter_summaries(&[with_call]).is_empty());
@@ -477,10 +475,8 @@ fn const_source_setter_pins_target_to_const() {
     };
     *args = vec![Operand::Move(Place::local(5))];
     let guards = post_call_guards_with(&[setter], &caller);
-    let expected = Formula::Eq(
-        Box::new(Formula::Var("a#s0_t".into(), Sort::Int)),
-        Box::new(Formula::Int(7)),
-    );
+    let expected =
+        Formula::Eq(Box::new(Formula::Var("a#s0_t".into(), Sort::Int)), Box::new(Formula::Int(7)));
     assert!(
         guards.contains(&expected),
         "the const-setter call site must carry `a#s0_t == 7`; got {guards:?}"

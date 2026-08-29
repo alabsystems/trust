@@ -18,9 +18,10 @@ and the boundary is not where a reader would guess. Natural unsigned `Select`
 and the closed compiler-authenticated S3/S4 wrapping lane now discharge;
 exact certified-callee closure is live; a citation to a theorem in a DEFERRED
 island (one naming the `trust_import_*` namespace) discharges after the
-whole-crate mint; while every constant-shaped probe remains outside the working
-lane. A prose description of that boundary goes stale silently; this matrix does
-not.
+whole-crate mint; and constant-valued definitions cited as a CALL discharge at
+every arity (2026-08-22), leaving only the argument-list-less citation spelling
+(`f04`) outside the lane. A prose description of that boundary goes stale
+silently; this matrix does not.
 
 Usage:
     python3 tests/e6-fragment-probe/run.py
@@ -109,13 +110,19 @@ def toolchain_stamp() -> dict:
         host = re.search(r"host:\s*(\S+)", p.stdout)
         commit = m.group(1) if m else None
     except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc), "commit": None, "host": None}
+        return {
+            "error": str(exc), "commit": None, "host": None,
+            "return_code": None, "usable": False,
+        }
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=REPO_ROOT
     ).stdout.strip()
     return {
         "commit": commit,
         "host": host.group(1) if host else None,
+        "return_code": p.returncode,
+        "error": p.stderr.strip() or None,
+        "usable": p.returncode == 0 and bool(commit and host),
         "repo_head": head,
         "matches_head": bool(commit and head.startswith(commit)),
     }
@@ -227,6 +234,25 @@ def main() -> int:
     args = ap.parse_args()
 
     stamp = toolchain_stamp()
+    # FAIL CLOSED when there is no compiler to measure. Without this the corpus
+    # is worse than useless: `rustup run trust trustc` writes its error to
+    # stderr and exits nonzero, `-vV` stdout comes back empty, `commit` is None,
+    # and every probe is then classified `unproved` -- a full table of verdicts
+    # produced by a compiler that never ran. Measured 2026-08-28: the default
+    # `trust` toolchain is a DANGLING symlink to build/<host>/stage2 on this
+    # machine, so the whole corpus silently reported 36 refusals. A probe result
+    # is a measurement or it is nothing.
+    if not stamp.get("usable"):
+        print(
+            "REFUSING to run: no usable trustc.\n"
+            f"  tried: {' '.join(_trustc_cmd())}\n"
+            f"  error: {stamp.get('error') or 'trustc -vV was not a successful, identifiable compiler'}\n"
+            "  Every probe would be recorded `unproved` by a compiler that never ran.\n"
+            "  Point TRUST_PROBE_TRUSTC at a built trustc, e.g.\n"
+            "    TRUST_PROBE_TRUSTC=/path/to/built/trustc",
+            file=sys.stderr,
+        )
+        return 2
     if stamp.get("matches_head") is False:
         print(
             f"NOTE: toolchain {stamp.get('commit')} != HEAD {str(stamp.get('repo_head'))[:10]}; "
@@ -237,6 +263,12 @@ def main() -> int:
     probes = sorted(PROBES.glob("*.rs"))
     if args.filter:
         probes = [p for p in probes if args.filter in p.name]
+    if not probes:
+        print(
+            f"REFUSING to run: no probes matched {args.filter!r}.",
+            file=sys.stderr,
+        )
+        return 2
 
     rows = [run_probe(p, args.timeout) for p in probes]
 

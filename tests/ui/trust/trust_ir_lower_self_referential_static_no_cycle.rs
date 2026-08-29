@@ -27,6 +27,15 @@
 //! rather than issue a query for anything already on it. A stack rather than a
 //! single "current body" field because the cycle can be MUTUAL, closing across
 //! two nested producer frames — see `mutual` below.
+//!
+//! LANE 1 UPDATE: the stack is necessary but NOT sufficient, and the shapes it
+//! misses were the `library/core` step-zero blocker. See
+//! `trust_ir_lower_static_ctfe_no_cycle.rs` for the two measured shapes (a
+//! nested closure inside the static's own initializer; two sibling items with
+//! no ancestry at all) and for the completing rule, which is LOCALITY. Every
+//! static in THIS file is local, so after that fix each of them declines at the
+//! locality gate before the reentrancy stack is consulted. The file is retained
+//! as-is on purpose: it pins the OUTER guard, which stays as defense in depth.
 
 pub struct Foo {
     pub foo: Option<&'static Foo>,
@@ -44,8 +53,10 @@ pub struct Node {
 pub static A: Node = Node { next: Some(&B) };
 pub static B: Node = Node { next: Some(&A) };
 
-// A non-cyclic static read through the same path must keep working — the guard
-// must decline only on genuine reentrancy, not on every static.
+// A non-cyclic static read through the same path must keep COMPILING. (Before
+// LANE 1 it also still lowered; it now declines at the locality gate with
+// `StaticRef(local static: CTFE deferral not implemented)` — a recorded
+// coverage gap, never an error and never a guessed value.)
 pub static PLAIN: u64 = 7;
 pub fn read_plain() -> u64 {
     PLAIN

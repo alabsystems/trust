@@ -57,6 +57,8 @@ use trust_vcgen::recursive_datatype_functional::recursive_datatype_functional_vc
 
 // ── The extracted mirror fixture (loaded literal extractor output) ───────────
 
+const LEVEL_DEF_PATH: &str = "clean_kernel::level::Level";
+
 /// Load the LITERAL extracted `mirror` and attach the test's postcondition
 /// (built against the loaded function's own Level sort).
 fn extracted_mirror_func(make_post: impl FnOnce(&Sort) -> Formula) -> VerifiableFunction {
@@ -65,21 +67,33 @@ fn extracted_mirror_func(make_post: impl FnOnce(&Sort) -> Formula) -> Verifiable
 
     // Sanity: the artifact really is the extracted recursive shape this lane
     // expects (the full pin is the extract-side drift gate).
-    let Ty::Datatype { name, variants } = &f.body.return_ty else {
-        panic!("mirror returns the modeled Level datatype, got {:?}", f.body.return_ty);
+    let level_sort = {
+        // Authenticated artifacts use markers everywhere and carry the one
+        // definition in `datatype_defs`. Exercise that consumer contract
+        // instead of depending on the superseded inline-variants spelling.
+        let Ty::Datatype { name: marker_name, variants: marker_variants } = &f.body.return_ty
+        else {
+            panic!("mirror return must carry a datatype marker, got {:?}", f.body.return_ty);
+        };
+        assert_eq!(marker_name, LEVEL_DEF_PATH);
+        assert!(marker_variants.is_empty(), "the authenticated root is a bare marker");
+        let level = f.body.resolved_datatype(&f.body.return_ty);
+        let Ty::Datatype { name, variants } = level.as_ref() else {
+            panic!("mirror returns the modeled Level datatype, got {:?}", f.body.return_ty);
+        };
+        assert_eq!(name, LEVEL_DEF_PATH);
+        assert_eq!(
+            variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
+            vec![("Zero", 0), ("Succ", 1)],
+        );
+        Sort::from_ty(level.as_ref())
     };
-    assert_eq!(name, "level::Level");
-    assert_eq!(
-        variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
-        vec![("Zero", 0), ("Succ", 1)],
-    );
     assert_eq!(f.body.arg_count, 1);
     assert!(
         f.postconditions.is_empty(),
         "the no_core fixture declares no spec; the test attaches the property"
     );
 
-    let level_sort = Sort::from_ty(&f.body.return_ty);
     f.postconditions = vec![make_post(&level_sort)];
     f
 }
@@ -122,12 +136,12 @@ fn recursive_mirror_identity_end_to_end() {
         })
         .collect();
     assert_eq!(
-        props,
-        vec![
-            "recursive_datatype_functional_case::Zero",
-            "recursive_datatype_functional_case::Succ",
-            "recursive_datatype_functional_conclusion[induction:level::Level;cases=2]",
-        ]
+        props[..2],
+        ["recursive_datatype_functional_case::Zero", "recursive_datatype_functional_case::Succ",]
+    );
+    assert_eq!(
+        props[2],
+        format!("recursive_datatype_functional_conclusion[induction:{LEVEL_DEF_PATH};cases=2]")
     );
 
     // 2. DISCHARGE: the LITERAL emitted VCs drive the generated `.rec`

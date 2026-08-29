@@ -13,8 +13,7 @@ use trust_proof_cert::{
     CertificateChain, CertificateStore, ChainStep, ChainStepType, FunctionHash, ProofCertificate,
     SolverInfo, VcSnapshot,
 };
-use trust_types::stable_sha256_hex;
-use trust_types::{VerificationCondition, VerificationResult};
+use trust_types::{VerificationCondition, VerificationResult, stable_sha256_hex};
 
 use crate::certification::{CertificationPipeline, CertificationResult};
 use crate::error::CertificateError;

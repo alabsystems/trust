@@ -21,12 +21,18 @@ use trust_types::{BinOp, Ty};
 /// elaboration, not here); `Bool` is direct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TsTy {
-    Num { width: u32, signed: bool },
+    Num {
+        width: u32,
+        signed: bool,
+    },
     Bool,
     /// A fixed-length array of unsigned `elem_width`-bit elements (`number[]` of a
     /// known length). Admitted via the denotational path (`Sort::Array` + `Select`)
     /// — array reducers (`arrayMax`, `clampEach`, table lookups) are in-fragment.
-    Arr { elem_width: u32, len: u32 },
+    Arr {
+        elem_width: u32,
+        len: u32,
+    },
 }
 
 impl TsTy {
@@ -150,7 +156,11 @@ impl TsExpr {
 
     /// `base[index_var]` — array read by a scalar (loop) variable.
     #[must_use]
-    pub fn index_var(base: impl Into<String>, elem_width: u32, index_var: impl Into<String>) -> TsExpr {
+    pub fn index_var(
+        base: impl Into<String>,
+        elem_width: u32,
+        index_var: impl Into<String>,
+    ) -> TsExpr {
         TsExpr::IndexVar { base: base.into(), elem_width, index_var: index_var.into() }
     }
 

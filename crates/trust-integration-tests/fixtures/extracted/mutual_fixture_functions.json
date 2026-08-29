@@ -16,26 +16,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::kind::ExprKind",
-              "variants": [
-                [
-                  "A",
-                  []
-                ],
-                [
-                  "B",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": null
@@ -48,26 +29,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -82,26 +44,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -139,26 +82,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": [
-                        [
-                          "A",
-                          []
-                        ],
-                        [
-                          "B",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::expr::kind::ExprKind",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -175,26 +99,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -212,26 +117,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::level::Level",
-                      "variants": [
-                        [
-                          "Zero",
-                          []
-                        ],
-                        [
-                          "Succ",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::level::Level",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -261,26 +147,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": [
-                        [
-                          "A",
-                          []
-                        ],
-                        [
-                          "B",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::expr::kind::ExprKind",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -294,26 +161,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::kind::ExprKind",
-              "variants": [
-                [
-                  "A",
-                  []
-                ],
-                [
-                  "B",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": "m"
@@ -326,26 +174,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -360,26 +189,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -394,26 +204,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -428,26 +219,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -462,26 +234,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -496,26 +249,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -772,7 +506,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -814,7 +549,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -983,7 +719,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 25,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -1002,7 +747,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -1061,7 +807,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -1098,26 +845,59 @@
       "return_ty": {
         "Datatype": {
           "name": "clean_kernel::expr::kind::ExprKind",
-          "variants": [
-            [
-              "A",
-              []
-            ],
-            [
-              "B",
+          "variants": []
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::kind::ExprKind": {
+          "Datatype": {
+            "name": "clean_kernel::expr::kind::ExprKind",
+            "variants": [
               [
+                "A",
+                []
+              ],
+              [
+                "B",
                 [
-                  "0",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": []
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variants": []
+                      }
                     }
-                  }
+                  ]
                 ]
               ]
             ]
-          ]
+          }
+        },
+        "clean_kernel::level::Level": {
+          "Datatype": {
+            "name": "clean_kernel::level::Level",
+            "variants": [
+              [
+                "Zero",
+                []
+              ],
+              [
+                "Succ",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ]
+            ]
+          }
         }
       }
     },
@@ -1238,26 +1018,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::kind::ExprKind",
-              "variants": [
-                [
-                  "A",
-                  []
-                ],
-                [
-                  "B",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": null
@@ -1270,26 +1031,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1304,26 +1046,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1361,26 +1084,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": [
-                        [
-                          "A",
-                          []
-                        ],
-                        [
-                          "B",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::expr::kind::ExprKind",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -1397,26 +1101,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1434,26 +1119,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::level::Level",
-                      "variants": [
-                        [
-                          "Zero",
-                          []
-                        ],
-                        [
-                          "Succ",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::level::Level",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -1483,26 +1149,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": [
-                        [
-                          "A",
-                          []
-                        ],
-                        [
-                          "B",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::expr::kind::ExprKind",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -1516,26 +1163,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::kind::ExprKind",
-              "variants": [
-                [
-                  "A",
-                  []
-                ],
-                [
-                  "B",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": "m"
@@ -1548,26 +1176,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1582,26 +1191,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1616,26 +1206,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1650,26 +1221,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1684,26 +1236,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1718,26 +1251,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -1994,7 +1508,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -2036,7 +1551,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -2205,7 +1721,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 26,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -2224,7 +1749,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -2283,7 +1809,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -2320,26 +1847,59 @@
       "return_ty": {
         "Datatype": {
           "name": "clean_kernel::expr::kind::ExprKind",
-          "variants": [
-            [
-              "A",
-              []
-            ],
-            [
-              "B",
+          "variants": []
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::kind::ExprKind": {
+          "Datatype": {
+            "name": "clean_kernel::expr::kind::ExprKind",
+            "variants": [
               [
+                "A",
+                []
+              ],
+              [
+                "B",
                 [
-                  "0",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": []
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variants": []
+                      }
                     }
-                  }
+                  ]
                 ]
               ]
             ]
-          ]
+          }
+        },
+        "clean_kernel::level::Level": {
+          "Datatype": {
+            "name": "clean_kernel::level::Level",
+            "variants": [
+              [
+                "Zero",
+                []
+              ],
+              [
+                "Succ",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ]
+            ]
+          }
         }
       }
     },
@@ -2460,26 +2020,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::kind::ExprKind",
-              "variants": [
-                [
-                  "A",
-                  []
-                ],
-                [
-                  "B",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": null
@@ -2492,26 +2033,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2526,26 +2048,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2583,26 +2086,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": [
-                        [
-                          "A",
-                          []
-                        ],
-                        [
-                          "B",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::expr::kind::ExprKind",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -2619,26 +2103,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2656,26 +2121,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::level::Level",
-                      "variants": [
-                        [
-                          "Zero",
-                          []
-                        ],
-                        [
-                          "Succ",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::level::Level",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -2705,26 +2151,7 @@
                   "pointee": {
                     "Datatype": {
                       "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": [
-                        [
-                          "A",
-                          []
-                        ],
-                        [
-                          "B",
-                          [
-                            [
-                              "0",
-                              {
-                                "Datatype": {
-                                  "name": "clean_kernel::expr::kind::ExprKind",
-                                  "variants": []
-                                }
-                              }
-                            ]
-                          ]
-                        ]
-                      ]
+                      "variants": []
                     }
                   }
                 }
@@ -2738,26 +2165,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::kind::ExprKind",
-              "variants": [
-                [
-                  "A",
-                  []
-                ],
-                [
-                  "B",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": "m"
@@ -2770,26 +2178,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2804,26 +2193,7 @@
               "inner": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2838,26 +2208,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2872,26 +2223,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2906,26 +2238,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::level::Level",
-                  "variants": [
-                    [
-                      "Zero",
-                      []
-                    ],
-                    [
-                      "Succ",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::level::Level",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -2940,26 +2253,7 @@
               "pointee": {
                 "Datatype": {
                   "name": "clean_kernel::expr::kind::ExprKind",
-                  "variants": [
-                    [
-                      "A",
-                      []
-                    ],
-                    [
-                      "B",
-                      [
-                        [
-                          "0",
-                          {
-                            "Datatype": {
-                              "name": "clean_kernel::expr::kind::ExprKind",
-                              "variants": []
-                            }
-                          }
-                        ]
-                      ]
-                    ]
-                  ]
+                  "variants": []
                 }
               }
             }
@@ -3216,7 +2510,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -3258,7 +2553,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -3427,7 +2723,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 24,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -3446,7 +2751,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -3505,7 +2811,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -3542,26 +2849,59 @@
       "return_ty": {
         "Datatype": {
           "name": "clean_kernel::expr::kind::ExprKind",
-          "variants": [
-            [
-              "A",
-              []
-            ],
-            [
-              "B",
+          "variants": []
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::kind::ExprKind": {
+          "Datatype": {
+            "name": "clean_kernel::expr::kind::ExprKind",
+            "variants": [
               [
+                "A",
+                []
+              ],
+              [
+                "B",
                 [
-                  "0",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": []
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variants": []
+                      }
                     }
-                  }
+                  ]
                 ]
               ]
             ]
-          ]
+          }
+        },
+        "clean_kernel::level::Level": {
+          "Datatype": {
+            "name": "clean_kernel::level::Level",
+            "variants": [
+              [
+                "Zero",
+                []
+              ],
+              [
+                "Succ",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ]
+            ]
+          }
         }
       }
     },

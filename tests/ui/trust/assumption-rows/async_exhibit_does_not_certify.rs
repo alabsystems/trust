@@ -5,8 +5,8 @@
 // its own commit message with "NOT MEASURED: the end-to-end fixture flips —
 // needs a stage2 rebuild + gate run". The fixtures it never ran were failing.
 //
-// WHAT WAS MEASURED, on HEAD, at the DEFAULT strict policy with no unusual
-// flags — one line of library code:
+// WHAT WAS MEASURED ON THE DEFECTIVE LANE (`ca53846043`, before D2 reverted it),
+// at the DEFAULT strict policy with no unusual flags — one line of library code:
 //
 //     $ trustc --edition 2021 -Ztrust-verify=on --crate-type=lib exlib.rs
 //     note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out,
@@ -54,6 +54,21 @@
 // ever compiles successfully again, a body whose sentinel is reachable at
 // runtime is being certified panic-free.
 //
+// MEASURED on stage2 ec4783d80 with this file's own flags — all three errors are
+// pinned below, so the exhibit fails if any one of them stops being emitted:
+//
+//     Trust: ASSUMPTION [coroutine] `async_exhibit_does_not_certify::tick::{closure#0}`
+//     error: Trust Level 0 safety verification incomplete for `...`: 3 obligation(s)
+//         were not proved
+//     error: Trust strict verification failed for `...`: coroutine executor-protocol
+//         premise is unproved
+//     error: Trust strict verification failed for `...`: 3 obligation(s) were not fully
+//         verified
+//
+// The "2 proved, 0 failed" line quoted above is gone: the summary now reads
+// "1 conditionally discharged (NOT proved), 2 failed, 0 unknown, 0 timed out,
+// 1 runtime-checked, 1 skipped out of 5 obligation(s)".
+//
 // Sibling `full_lane_abort_unchanged.rs` pins the same abort as a policy
 // contract; this file exists to carry the exhibit and its runtime evidence, so
 // the reason the abort must stay can never be lost again.
@@ -63,5 +78,8 @@
 //@ compile-flags: --crate-type=lib
 //@ check-fail
 //@ dont-check-compiler-stderr
-pub async fn tick(x: u32) -> u32 { x } //~ ERROR coroutine executor-protocol premise is unproved
-//~? RAW Trust: ASSUMPTION [coroutine]
+pub async fn tick(x: u32) -> u32 { x }
+//~^ ERROR Trust Level 0 safety verification incomplete
+//~| ERROR coroutine executor-protocol premise is unproved
+//~| ERROR obligation(s) were not fully verified
+//~? RAW Trust: ASSUMPTION [coroutine] `async_exhibit_does_not_certify::tick::{closure#0}`

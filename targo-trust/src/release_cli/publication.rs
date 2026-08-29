@@ -3,9 +3,8 @@ use std::{fs, io};
 
 use trust_release::{GateFinding, GateReport};
 
-use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
-
 use super::identity::{exact_file_sha256_with_prefix, file_sha256, read_trimmed};
+use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
 
 pub(super) fn check_publication_inputs(root: &Path) -> GateReport {
     let mut findings = Vec::new();

@@ -7,7 +7,6 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::FxHashMap;
-
 use trust_types::{
     Formula, ProofStrength, SourceSpan, VcKind, VerificationCondition, VerificationResult,
 };

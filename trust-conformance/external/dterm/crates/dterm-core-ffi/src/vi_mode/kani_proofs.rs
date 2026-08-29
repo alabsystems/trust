@@ -7,11 +7,7 @@ pub struct ViModeState {
 
 impl ViModeState {
     pub fn new(cursor: usize) -> Self {
-        Self {
-            cursor,
-            mark: None,
-            inline_search: None,
-        }
+        Self { cursor, mark: None, inline_search: None }
     }
 }
 
@@ -20,10 +16,7 @@ pub fn dterm_terminal_vi_mode_set_mark_v2(mut state: ViModeState, mark: usize) -
     state
 }
 
-pub fn dterm_terminal_vi_mode_inline_search_v2(
-    mut state: ViModeState,
-    needle: u8,
-) -> ViModeState {
+pub fn dterm_terminal_vi_mode_inline_search_v2(mut state: ViModeState, needle: u8) -> ViModeState {
     state.inline_search = Some(needle);
     state
 }

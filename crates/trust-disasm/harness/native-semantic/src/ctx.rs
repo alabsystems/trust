@@ -228,7 +228,13 @@ pub fn profile_corners(seed: u64) -> Profile {
             corner(i / 2)
         };
     }
-    Profile { name: "corners", gpr, sp: SCRATCH_PTR + 0x1000, nzcv: 0b0110, fpr: fp_values(seed ^ 0x33) }
+    Profile {
+        name: "corners",
+        gpr,
+        sp: SCRATCH_PTR + 0x1000,
+        nzcv: 0b0110,
+        fpr: fp_values(seed ^ 0x33),
+    }
 }
 
 /// Every register a corner value, no pointers at all. Memory forms mostly fault

@@ -151,70 +151,169 @@ pub(super) fn aggregate_variant_discriminant(
 /// fragment — a >1-field variant payload, a multiply-assigned/aliased temp, an extra
 /// write to `_0`, a mismatched outer enum name, or identical then/else variants.
 #[must_use]
-pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option<SemAdtReturn> {
-    use trust_types::{BlockId, Operand, Rvalue, Statement, Terminator};
-    trust_vcgen::validate_function(func).ok()?;
+/// Trust: DECLINE LABELLING (2026-08-26) — replay [`sem_adt_return_shape_of`]'s OWN
+/// early stages, in its order, using its OWN helpers, and name the first that stops a
+/// body.
+///
+/// This exists because two attempts to size the 2-arm lane's residue failed for the same
+/// underlying reason: both measured a MODEL of the recognizer (a shell scan over MIR
+/// shapes, then a structural proxy over gates I chose) instead of the recognizer. A
+/// `DowncastOpaque` payload lane was then built against the proxy's 410-body estimate and
+/// gained exactly zero, because the recognizer declines before the payload resolver is
+/// ever called.
+///
+/// It covers the stages up to the guard/arm split — deliberately NOT the whole function,
+/// because the later stages are threaded through `?` on shared helpers and labelling them
+/// means editing eighteen exits. Those are reported as one bucket, which is honest about
+/// what it does and does not resolve.
+#[must_use]
+pub fn sem_adt_return_decline_reason(func: &trust_types::VerifiableFunction) -> &'static str {
+    use trust_types::{Statement, Terminator};
+    if trust_vcgen::validate_function(func).is_err() {
+        return "validate_function rejects the body";
+    }
     let body = &func.body;
     if !crate::assignment_types::all_assignments_match(body) {
-        return None;
+        // Split the four clauses — "a write does not match its place type" was a guess
+        // at which one fires, and it stops a third of the class.
+        if let Some(k) = crate::assignment_types::first_assignment_mismatch_kind(body) {
+            return k;
+        }
+        return crate::assignment_types::all_assignments_match_reason(body);
     }
-    let arg_count = body.arg_count;
-    let param_index = move |local: usize| -> Option<u64> {
-        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    let Some(ret_block) = unique_return_block(body) else {
+        return "no unique return block";
     };
-
-    // (1)-(2): the convergence local + the two Goto arm blocks — VERBATIM copy of
-    // `sem_cf_return_of_mir`'s steps (1)-(2).
-    let ret_block = unique_return_block(body)?;
-    let assigns_local = |b: &trust_types::BasicBlock, loc: usize| {
+    let Some(join_local) = guarded_return_join_local(body, ret_block) else {
+        return "no guarded-return join local";
+    };
+    if join_local != 0 {
+        return "the join local is not `_0` (join-via-temp)";
+    }
+    let assigns_0 = |b: &trust_types::BasicBlock| {
         b.stmts.iter().any(|s| {
-            matches!(s, Statement::Assign { place, .. } if place.local == loc && place.projections.is_empty())
+            matches!(s, Statement::Assign { place, .. }
+                if place.local == 0 && place.projections.is_empty())
         })
     };
-    let join_local = guarded_return_join_local(body, ret_block)?;
-    if join_local != 0 {
-        return None; // this lane models direct enum construction into `_0` only.
-    }
-    let assigns_0 = |b: &trust_types::BasicBlock| assigns_local(b, join_local);
+    // Trust: the diagnostic MUST use the same arm-convergence rule the recognizer uses.
+    // It briefly did not — the recognizer was widened to admit a value-transparent arm
+    // `Drop` and this filter was left on `Goto`, so the histogram kept reporting a gate the
+    // recognizer no longer applied. That is precisely the recognizer/diagnostic drift the
+    // eight `_reasoned` conversions exist to prevent, reintroduced by hand.
     let arms: Vec<&trust_types::BasicBlock> = body
         .blocks
         .iter()
-        .filter(|b| matches!(b.terminator, Terminator::Goto(_)) && assigns_0(b))
+        .filter(|b| arm_convergence_target(b).is_some() && assigns_0(b))
         .collect();
     if arms.len() != 2 {
-        return None;
+        // Trust: ARM-TERMINATOR SPLIT (2026-08-27) — 650 of the 2,640 uncovered TWO-ARM
+        // bodies stop here, second only to entry-rooting. The lane requires an arm to end
+        // in `Goto`; naming what the `_0`-writing blocks actually END IN says whether that
+        // is an addressable shape restriction (a value-transparent `Drop`) or the
+        // interprocedural wall wearing a different label (a `Call`).
+        if arms.len() < 2 {
+            let writers: Vec<&trust_types::BasicBlock> =
+                body.blocks.iter().filter(|b| assigns_0(b)).collect();
+            let mut drops = 0usize;
+            let mut calls = 0usize;
+            let mut other = 0usize;
+            for b in &writers {
+                match &b.terminator {
+                    Terminator::Goto(_) => {}
+                    Terminator::Drop { .. } => drops += 1,
+                    Terminator::Call { .. } => calls += 1,
+                    _ => other += 1,
+                }
+            }
+            if writers.len() < 2 {
+                return "fewer than 2 blocks write `_0` at all";
+            }
+            if calls > 0 {
+                return "an arm ends in a CALL (interprocedural)";
+            }
+            if drops > 0 {
+                return "an arm ends in a DROP (value-transparent shape restriction)";
+            }
+            if other > 0 {
+                return "an arm ends in some other terminator";
+            }
+        }
+        return if arms.len() < 2 {
+            "fewer than 2 Goto arms write `_0`"
+        } else {
+            "more than 2 Goto arms write `_0`"
+        };
     }
-    let Terminator::Goto(j0) = arms[0].terminator else { return None };
-    let Terminator::Goto(j1) = arms[1].terminator else { return None };
+    let (Some(j0), Some(j1)) =
+        (arm_convergence_target(arms[0]), arm_convergence_target(arms[1]))
+    else {
+        return "an arm does not converge (neither Goto nor a value-transparent Drop)";
+    };
     if j0 != j1 {
-        return None;
+        return "the two arms do not join at the same block";
     }
-
-    // Trust: ADT-return well-formedness — `_0` (the RETURN local, distinct from an
-    // arbitrary join-via-temp) must be written EXACTLY in these two arm blocks and
-    // NOWHERE else in the whole function (adversarial probe (c): an extra write to
-    // `_0` after construction must decline). `join_local` may legitimately be a
-    // join-via-temp with its own writes elsewhere; the invariant applies to the
-    // OUTER return local `0` specifically.
     if !local_has_only_guarded_writes(body, 0, 2, 0) {
-        return None;
+        return "`_0` is written outside the two arms";
+    }
+    if sem_adt_return_shape_of(func).is_some() {
+        return "RECOGNIZED";
     }
 
-    // Trust: RECORD-WITNESS inc-2 (ok/err drop-ladder epilogue, 2026-07-22) — the
-    // `Result::ok`/`Result::err` bodies converge (both arms `Goto`) at a VALUE-TRANSPARENT
-    // conditional-drop ladder (a SECOND `SwitchInt(Discriminant(self))` routing ONLY to
-    // `Return` / `Drop(self) → Return` / `Unreachable`) AFTER the `Option` aggregate,
-    // rather than directly at the sole `Return` block. Recognize it fail-closed here; when
-    // present its `SwitchInt` is EXCLUDED from the guard analysis and entry-rooting is
-    // checked THROUGH the ladder. `None` (byte-unchanged) for EVERY non-ladder shape: for
-    // those `j0` IS the `Return` block (or a non-ladder block the existing entry-rooting
-    // already declines), so the detector returns immediately.
+    // Replay the next stages, still using the recognizer's own helpers, to split the
+    // "later stage" bucket. The 96 bodies it held on `fp4` are the last unresolved class
+    // in this report; everything below mirrors the recognizer's order exactly.
+    let Some(j0) = arm_convergence_target(arms[0]) else {
+        return "an arm does not converge (late)";
+    };
     let drop_ladder = recognize_drop_ladder_epilogue(body, j0);
-
-    // (3): the guard SwitchInt(s) — VERBATIM copy of `sem_cf_return_of_mir`'s step (3),
-    // with the recognized drop-ladder's OWN `SwitchInt` filtered out (it is an epilogue,
-    // never a guard). The filter is a NO-OP whenever `drop_ladder` is `None`.
-    let mut switches: Vec<(&Operand, &Vec<(u128, BlockId)>, BlockId, BlockId)> = body
+    let mut switches: Vec<trust_types::BlockId> = body
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::SwitchInt { .. } => Some(b.id),
+            _ => None,
+        })
+        .collect();
+    if let Some(l) = &drop_ladder {
+        switches.retain(|id| *id != l.switch_block);
+    }
+    if switches.is_empty() {
+        return "no guard SwitchInt (after excluding a drop-ladder epilogue)";
+    }
+    let arm_ids: Vec<trust_types::BlockId> = arms.iter().map(|b| b.id).collect();
+    let entry_rooted = if let Some(l) = &drop_ladder {
+        drop_ladder_cfg_is_entry_rooted(body, l.switch_block, &arm_ids, &switches)
+    } else {
+        guarded_cfg_is_entry_rooted(body, j0, &arm_ids, &switches)
+    };
+    if !entry_rooted {
+        return "the guarded CFG is not entry-rooted";
+    }
+    if switches.len() > 1 {
+        return "more than one guard SwitchInt (conjunctive chain)";
+    }
+    if !matches!(body.return_ty, trust_types::Ty::Adt { .. }) {
+        return "the return type is not an ADT";
+    }
+    // Final layer: ask `arm_adt_ctor_value_for` itself, once per arm — with the
+    // RECOGNIZER'S OWN `expected_downcast_variant`, not a guessed `None`.
+    //
+    // This layer previously passed `None` because deriving the real variant meant
+    // duplicating the recognizer's dispatch analysis, and gate D then declined EVERY
+    // downcast payload BY DESIGN — the diagnostic was measuring its own argument. The
+    // fix was not a better guess but [`sem_adt_return_dispatch_of`]: one derivation, both
+    // callers. A diagnostic that reproduces a gate is a second implementation of that
+    // gate, and the two disagree exactly when it matters.
+    let pi = |local: usize| -> Option<u64> {
+        if (1..=body.arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+    let mut sw: Vec<(
+        &trust_types::Operand,
+        &Vec<(u128, trust_types::BlockId)>,
+        trust_types::BlockId,
+        trust_types::BlockId,
+    )> = body
         .blocks
         .iter()
         .filter_map(|b| match &b.terminator {
@@ -224,23 +323,194 @@ pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option
             _ => None,
         })
         .collect();
-    if let Some(ladder) = &drop_ladder {
-        switches.retain(|(_, _, _, id)| *id != ladder.switch_block);
+    if let Some(l) = &drop_ladder {
+        sw.retain(|(_, _, _, id)| *id != l.switch_block);
     }
-    if switches.is_empty() {
-        return None;
-    }
-    let arm_ids: Vec<BlockId> = arms.iter().map(|b| b.id).collect();
-    let decision_ids: Vec<BlockId> = switches.iter().map(|(_, _, _, id)| *id).collect();
-    let entry_rooted = if let Some(ladder) = &drop_ladder {
-        drop_ladder_cfg_is_entry_rooted(body, ladder.switch_block, &arm_ids, &decision_ids)
-    } else {
-        guarded_cfg_is_entry_rooted(body, j0, &arm_ids, &decision_ids)
+    let Some((_cond, else_arm_id, then_arm_id, then_ev, else_ev, _why)) =
+        sem_adt_return_dispatch_of(body, &sw, &arm_ids, &pi)
+    else {
+        return "the DISPATCH derivation declines (guard shape / tag mapping)";
     };
-    if !entry_rooted {
-        return None;
+    if else_arm_id == then_arm_id {
+        return "both dispatch targets reach the SAME arm";
     }
+    let mut any_downcast = false;
+    let mut failing_arm_without_downcast = false;
+    let mut downcast_unpinned = false;
+    let mut payload_reason: Option<&'static str> = None;
+    let mut payload_accepted = false;
+    let mut first_arm_err: Option<&'static str> = None;
+    for arm in &arms {
+        let ev = if arm.id == then_arm_id {
+            then_ev
+        } else if arm.id == else_arm_id {
+            else_ev
+        } else {
+            return "an arm block is neither dispatch target";
+        };
+        let arm_err = match arm_adt_ctor_value_for_reasoned(body, arm, 0, &pi, ev) {
+            Ok(_) => continue,
+            Err(why) => why,
+        };
+        let has_downcast = arm.stmts.iter().any(|st| match st {
+            Statement::Assign { rvalue, .. } => match rvalue {
+                trust_types::Rvalue::Use(
+                    trust_types::Operand::Copy(p) | trust_types::Operand::Move(p),
+                )
+                | trust_types::Rvalue::Ref { place: p, .. } => p
+                    .projections
+                    .iter()
+                    .any(|pr| matches!(pr, trust_types::Projection::Downcast(_))),
+                _ => false,
+            },
+            _ => false,
+        });
+        if first_arm_err.is_none() {
+            first_arm_err = Some(arm_err);
+        }
+        if has_downcast {
+            any_downcast = true;
+            if ev.is_none() {
+                downcast_unpinned = true;
+            }
+            // Replay the payload gate on this arm's own downcast operand, through the
+            // SAME function the recognizer calls, with the SAME expected variant.
+            for st in &arm.stmts {
+                let Statement::Assign { rvalue, .. } = st else { continue };
+                match rvalue {
+                    trust_types::Rvalue::Use(o) => {
+                        let (trust_types::Operand::Copy(pl) | trust_types::Operand::Move(pl)) = o
+                        else {
+                            continue;
+                        };
+                        if !pl
+                            .projections
+                            .iter()
+                            .any(|pr| matches!(pr, trust_types::Projection::Downcast(_)))
+                        {
+                            continue;
+                        }
+                        match downcast_field_payload_reasoned(body, o, &pi, ev) {
+                            Err(why) => payload_reason = Some(why),
+                            // The payload gate ACCEPTED this read. Whatever declines the
+                            // arm is downstream of the payload entirely — the aggregate
+                            // shape, the operand count, the temp resolution. Reporting
+                            // this as "the payload resolver declines" pointed at the
+                            // wrong layer.
+                            Ok(_) => payload_accepted = true,
+                        }
+                    }
+                    // `Some(&payload)` — the `as_ref`/`as_mut` family. The payload is
+                    // BORROWED, not read by value, so the whole `downcast_field_payload`
+                    // fragment (which resolves a VALUE) never applies. A distinct class,
+                    // and it was invisible while this bucket was reported as one number.
+                    trust_types::Rvalue::Ref { place: pl, mutable } => {
+                        if pl
+                            .projections
+                            .iter()
+                            .any(|pr| matches!(pr, trust_types::Projection::Downcast(_)))
+                        {
+                            payload_reason = Some(if *mutable {
+                                "payload is a &mut BORROW of the downcast field (as_mut-class)"
+                            } else {
+                                "payload is a & BORROW of the downcast field (as_ref-class)"
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            failing_arm_without_downcast = true;
+        }
+    }
+    if failing_arm_without_downcast {
+        return first_arm_err.unwrap_or("ARM VALUE declines, NO downcast payload involved");
+    }
+    if downcast_unpinned {
+        // The payload IS a downcast and the dispatch did NOT pin its variant, so gate D
+        // refuses it. Ask WHICH gate — some of these are correct refusals (nothing
+        // establishes which variant is live), others name a real capability limit, and
+        // reporting them as one number is what hid the split for a whole round.
+        if let Some((_, targets, _, _)) = sw.first() {
+            match targets.as_slice() {
+                // The SINGLE-TARGET form (`switch d { 0 => a } otherwise => b`) never
+                // reaches the pin at all: [`sem_adt_return_dispatch_of`] hardcodes
+                // `(None, None)` for it. Nothing about the enum is wrong — the pin is
+                // simply never consulted.
+                [(0, _)] => return "SINGLE-TARGET switch — the pin is never consulted",
+                [(_, _)] => return "single-target switch on a NON-ZERO tag",
+                [(tag_a, _), (tag_b, _)] => {
+                    if let SemCondTree::Leaf(leaf) = &_cond
+                        && let Err(why) =
+                            downcast_expected_variants_reasoned(body, leaf, *tag_a, *tag_b, &pi)
+                    {
+                        return why;
+                    }
+                }
+                _ => return "3+ switch targets",
+            }
+        }
+        return "DOWNCAST payload whose variant the dispatch does not pin";
+    }
+    if any_downcast {
+        // The variant IS pinned and the payload still declines. Ask the payload gate
+        // ITSELF which of its checks refused — `downcast_field_payload_reasoned` is the
+        // same code the recognizer runs, so this cannot drift from it.
+        if let Some(reason) = payload_reason {
+            return reason;
+        }
+        // The payload gate accepted a downcast read in this arm, so the refusal is a
+        // DIFFERENT gate of the arm value. Report that one — it is the arm function's own
+        // answer, not a guess about which layer was reached first.
+        let _ = payload_accepted;
+        return first_arm_err.unwrap_or("DOWNCAST payload, variant PINNED — no gate identified");
+    }
+    "both arms resolve — declines in the guard/cond or a later cross-check"
+}
 
+/// Trust: RECORD-WITNESS — the ADT-return DISPATCH derivation, extracted so the
+/// recognizer and the decline diagnostic run the SAME code rather than two copies.
+///
+/// WHY THIS EXISTS AS A FUNCTION. The diagnostic used to re-derive the arm/guard
+/// analysis beside the recognizer and then call [`arm_adt_ctor_value_for`] with
+/// `expected_downcast_variant: None`, because deriving the real one meant duplicating
+/// this block. Gate D then declined EVERY downcast payload BY DESIGN, so the diagnostic
+/// was measuring its own argument, not the recognizer. Sharing the derivation is the
+/// only fix that cannot drift: a diagnostic that reproduces a gate is a second
+/// implementation of that gate, and the two disagree exactly when it matters.
+///
+/// Returns `(cond, else_arm_id, then_arm_id, then_expected_variant, else_expected_variant)`.
+/// The per-arm expected variant is `Some` ONLY for a two-target discriminant dispatch that
+/// [`downcast_expected_variants`] pins; `None` everywhere else, so a downcast-field payload
+/// declines outside the dispatch that establishes its variant.
+#[allow(clippy::type_complexity)]
+pub(super) fn sem_adt_return_dispatch_of(
+    body: &trust_types::VerifiableBody,
+    switches: &[(
+        &trust_types::Operand,
+        &Vec<(u128, trust_types::BlockId)>,
+        trust_types::BlockId,
+        trust_types::BlockId,
+    )],
+    arm_ids: &[trust_types::BlockId],
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<(
+    SemCondTree,
+    trust_types::BlockId,
+    trust_types::BlockId,
+    Option<usize>,
+    Option<usize>,
+    // Trust: WHY the expected downcast variants were not derived (2026-08-28), `None`
+    // when they were. `downcast_expected_variants` was called through its `.ok()`
+    // wrapper and its reason discarded, so every failure collapsed into a single
+    // downstream label -- measured, 156 of 357 `<X as Try>::branch` bodies, the largest
+    // gate in the enum lane, all reporting "derived NO expected downcast variant" and
+    // none saying WHICH of its eight causes fired. Carrying the reason costs one tuple
+    // slot and two call sites.
+    Option<&'static str>,
+)> {
+    use trust_types::{BlockId, Operand, Rvalue};
     let switch_leaf = |discr: &Operand, tag: u128| -> Option<SemCond> {
         let (Operand::Copy(dp) | Operand::Move(dp)) = discr else { return None };
         if !dp.projections.is_empty() {
@@ -254,13 +524,13 @@ pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option
                 a: sem_adt_guard_operand_of_mir(
                     body,
                     ca,
-                    &param_index,
+                    param_index,
                     Some((definition_block, Some(definition_statement))),
                 )?,
                 b: sem_adt_guard_operand_of_mir(
                     body,
                     cb,
-                    &param_index,
+                    param_index,
                     Some((definition_block, Some(definition_statement))),
                 )?,
             }),
@@ -268,7 +538,7 @@ pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option
                 let base = sem_discriminant_base_of_mir(
                     body,
                     place,
-                    &param_index,
+                    param_index,
                     Some((definition_block, Some(definition_statement))),
                 )?;
                 Some(SemCond {
@@ -287,85 +557,253 @@ pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option
     // payload declines outside that shape). Derived straight from THIS branch's
     // (tag_a → then, tag_b → else) mapping so the polarity is unambiguous — never
     // re-derived from `cond` (whose single-target form has the opposite polarity).
-    let (cond, else_arm_id, then_arm_id, then_expected_variant, else_expected_variant): (
+    let dispatch: (
         SemCondTree,
         BlockId,
         BlockId,
         Option<usize>,
         Option<usize>,
-    ) = if let [(discr, targets, otherwise, bid)] = switches.as_slice() {
+        Option<&'static str>,
+    ) = if let [(discr, targets, otherwise, bid)] = switches {
         match targets.as_slice() {
             [(zero_val, else_target)] if *zero_val == 0 => {
                 let leaf = switch_leaf(discr, 0)?;
-                let else_id = first_arm_on_path(body, *else_target, &arm_ids)?;
-                let then_id = first_arm_on_path(body, *otherwise, &arm_ids)?;
-                (SemCondTree::Leaf(leaf), else_id, then_id, None, None)
+                let else_id = first_arm_on_path(body, *else_target, arm_ids)?;
+                let then_id = first_arm_on_path(body, *otherwise, arm_ids)?;
+                (
+                    SemCondTree::Leaf(leaf),
+                    else_id,
+                    then_id,
+                    None,
+                    None,
+                    Some("single-target switch: this branch derives no expected variants"),
+                )
             }
             [(tag_a, block_a), (tag_b, block_b)] => {
                 if !exhaustive_two_arm_discriminant_switch(body, *bid, *otherwise) {
                     return None;
                 }
                 let leaf = switch_leaf(discr, *tag_a)?;
-                let else_id = first_arm_on_path(body, *block_b, &arm_ids)?;
-                let then_id = first_arm_on_path(body, *block_a, &arm_ids)?;
-                let (then_ev, else_ev) =
-                    downcast_expected_variants(body, &leaf, *tag_a, *tag_b, &param_index);
-                (SemCondTree::Leaf(leaf), else_id, then_id, then_ev, else_ev)
+                let else_id = first_arm_on_path(body, *block_b, arm_ids)?;
+                let then_id = first_arm_on_path(body, *block_a, arm_ids)?;
+                let (then_ev, else_ev, why) =
+                    match downcast_expected_variants_reasoned(
+                        body, &leaf, *tag_a, *tag_b, param_index,
+                    ) {
+                        Ok((t, e)) => (t, e, None),
+                        Err(reason) => (None, None, Some(reason)),
+                    };
+                (SemCondTree::Leaf(leaf), else_id, then_id, then_ev, else_ev, why)
             }
             _ => return None,
         }
     } else {
         let (cond, else_id, then_id) =
-            sem_conjunctive_chain(body, &switches, &arm_ids, &switch_leaf)?;
-        (cond, else_id, then_id, None, None)
+            sem_conjunctive_chain(body, switches, arm_ids, &switch_leaf)?;
+        (
+            cond,
+            else_id,
+            then_id,
+            None,
+            None,
+            Some("conjunctive multi-switch chain: this branch derives no expected variants"),
+        )
+    };
+    Some(dispatch)
+}
+
+/// Trust: VALUE-TRANSPARENT ARM DROP (2026-08-27) — the block an arm converges at, when
+/// the arm reaches it through a `Drop` rather than a bare `Goto`.
+///
+/// WHY. Measured on a frozen 57,803-body corpus: of the 2,640 uncovered TWO-ARM bodies,
+/// **648 stop because an arm ends in a `Drop`** — and exactly **0** because it ends in a
+/// `Call`. That makes this a shape restriction in the recognizer, not the interprocedural
+/// wall, and it is second only to entry-rooting in that population.
+///
+/// SOUND because the drop is VALUE-TRANSPARENT for the RETURN LOCAL specifically: the
+/// dropped place is gated `place.local != 0`, and `local_has_only_guarded_writes(body, 0,
+/// 2, 0)` — which the lane already requires — independently refuses ANY `Drop` of `_0`
+/// anywhere in the body. So `_0` at the join is exactly what the arm assigned. The unwind
+/// edge does not matter here: it leads away from the return, so it cannot change the value
+/// observed at the join.
+///
+/// Deliberately ONE drop deep. A chain of drops is admissible by the same argument, but
+/// each extra step needs its own intermediate-block discipline, and one step is what the
+/// measurement says the corpus actually contains.
+pub(crate) fn arm_convergence_target_for_test(
+    arm: &trust_types::BasicBlock,
+) -> Option<trust_types::BlockId> {
+    arm_convergence_target(arm)
+}
+
+fn arm_convergence_target(arm: &trust_types::BasicBlock) -> Option<trust_types::BlockId> {
+    use trust_types::Terminator;
+    match &arm.terminator {
+        Terminator::Goto(j) => Some(*j),
+        Terminator::Drop { place, target, .. } if place.local != 0 => Some(*target),
+        _ => None,
+    }
+}
+
+/// The two-arm ENUM-return recognizer. Thin `.ok()` over
+/// [`sem_adt_return_shape_reasoned`] — one implementation, two callers, so the reason a
+/// census reports can never describe a different gate from the one that fired.
+pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option<SemAdtReturn> {
+    sem_adt_return_shape_reasoned(func).ok()
+}
+
+/// Trust: the single implementation behind [`sem_adt_return_shape_of`], stating WHICH
+/// gate refused.
+///
+/// Built for a measured population: 530 uncovered authored call-free bodies are
+/// `<X as core::ops::try_trait::Try>::branch` — the `?` desugaring, emitted once per
+/// instantiation — and they are exactly this lane's two-arm enum shape, yet every one
+/// reports SHAPE_GAP. With 16 refusal points and no way to say which fires, the only way
+/// to act on that was to guess, and guessing produced two dead recognizers earlier in
+/// this campaign. Its siblings (`sem_struct_return_shape_reasoned`,
+/// `sem_enum_ctor_return_shape_reasoned`) are what made the aggregate gate census
+/// possible; this closes the same gap for the enum lane.
+pub(crate) fn sem_adt_return_shape_reasoned(
+    func: &trust_types::VerifiableFunction,
+) -> Result<SemAdtReturn, &'static str> {
+    use trust_types::{BlockId, Operand, Rvalue, Statement, Terminator};
+    if trust_vcgen::validate_function(func).is_err() {
+        return Err("the function does not validate");
+    }
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return Err("an assignment's operand TYPE does not match its place");
+    }
+    let arg_count = body.arg_count;
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+
+    let Some(ret_block) = unique_return_block(body) else {
+        return Err("no UNIQUE return block");
+    };
+    let assigns_local = |b: &trust_types::BasicBlock, loc: usize| {
+        b.stmts.iter().any(|s| {
+            matches!(s, Statement::Assign { place, .. } if place.local == loc && place.projections.is_empty())
+        })
+    };
+    let Some(join_local) = guarded_return_join_local(body, ret_block) else {
+        return Err("the return block has no guarded JOIN LOCAL");
+    };
+    if join_local != 0 {
+        return Err("the join local is not `_0` (this lane models direct construction into `_0`)");
+    }
+    let assigns_0 = |b: &trust_types::BasicBlock| assigns_local(b, join_local);
+    let arms: Vec<&trust_types::BasicBlock> = body
+        .blocks
+        .iter()
+        .filter(|b| arm_convergence_target(b).is_some() && assigns_0(b))
+        .collect();
+    if arms.len() != 2 {
+        return Err(match arms.len() {
+            0 => "NO converging block assigns `_0`",
+            1 => "only ONE converging block assigns `_0`",
+            _ => "THREE OR MORE converging blocks assign `_0`",
+        });
+    }
+    let (Some(j0), Some(j1)) =
+        (arm_convergence_target(arms[0]), arm_convergence_target(arms[1]))
+    else {
+        return Err("an arm has no convergence target");
+    };
+    if j0 != j1 {
+        return Err("the two arms converge on DIFFERENT blocks");
+    }
+
+    local_has_only_guarded_writes_reasoned(body, 0, 2, 0)?;
+
+    let drop_ladder = recognize_drop_ladder_epilogue(body, j0);
+
+    let mut switches: Vec<(&Operand, &Vec<(u128, BlockId)>, BlockId, BlockId)> = body
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::SwitchInt { discr, targets, otherwise, .. } => {
+                Some((discr, targets, *otherwise, b.id))
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some(ladder) = &drop_ladder {
+        switches.retain(|(_, _, _, id)| *id != ladder.switch_block);
+    }
+    if switches.is_empty() {
+        return Err("no SwitchInt decision block (outside the drop ladder)");
+    }
+    let arm_ids: Vec<BlockId> = arms.iter().map(|b| b.id).collect();
+    let decision_ids: Vec<BlockId> = switches.iter().map(|(_, _, _, id)| *id).collect();
+    let entry_rooted = if let Some(ladder) = &drop_ladder {
+        drop_ladder_cfg_is_entry_rooted(body, ladder.switch_block, &arm_ids, &decision_ids)
+    } else {
+        guarded_cfg_is_entry_rooted(body, j0, &arm_ids, &decision_ids)
+    };
+    if !entry_rooted {
+        return Err("the guarded CFG is not ENTRY-ROOTED");
+    }
+
+    let Some((
+        cond,
+        else_arm_id,
+        then_arm_id,
+        then_expected_variant,
+        else_expected_variant,
+        expected_variant_decline,
+    )) = sem_adt_return_dispatch_of(body, &switches, &arm_ids, &param_index)
+    else {
+        return Err("no recognizable two-variant DISPATCH");
+    };
+    // Trust: a missing expected variant surfaces DOWNSTREAM, at the arm-value gate, as
+    // "the dispatch derived NO expected downcast variant" — which says the derivation
+    // failed but not why. Substitute the derivation's OWN reason there, so the label
+    // names the gate that fired instead of the place it was noticed.
+    let attribute = |e: &'static str| -> &'static str {
+        if e == "gate D: the dispatch derived NO expected downcast variant" {
+            expected_variant_decline.unwrap_or(e)
+        } else {
+            e
+        }
     };
 
     if else_arm_id == then_arm_id {
-        return None;
+        return Err("the dispatch names the SAME arm twice");
     }
-    let else_arm = arms.iter().find(|b| b.id == else_arm_id)?;
-    let then_arm = arms.iter().find(|b| b.id == then_arm_id)?;
+    let (Some(else_arm), Some(then_arm)) = (
+        arms.iter().find(|b| b.id == else_arm_id),
+        arms.iter().find(|b| b.id == then_arm_id),
+    ) else {
+        return Err("the dispatch names a block that is not one of the two arms");
+    };
 
-    // Trust: RECORD-WITNESS inc-2 — gate B(i): a recognized drop-ladder must re-read the
-    // discriminant of the SAME self local the DISPATCH read. The dispatch self local is
-    // the base of a two-target discriminant guard; a ladder present under any other guard
-    // shape (a comparison, a non-discriminant dispatch) is malformed and fails closed.
     if let Some(ladder) = &drop_ladder
         && dispatch_self_local(&cond) != Some(ladder.self_local)
     {
-        return None;
+        return Err("the drop ladder's self local differs from the dispatch's");
     }
 
-    // (5.5) Trust: W20 REFERENCE-RETURN guard↔projection coherence — the from_end-aware
-    // ConstantIndex bounds gate. Runs HERE (guard `cond` in hand, BEFORE the step-6 arm
-    // value construction) because `arm_adt_ctor_value_for` has no guard access — exactly
-    // the siting the ratified adversarial-correctness verdict demands. A NO-OP for every
-    // non-slice-reference return (existing ADT-return lanes are byte-unaffected); for a
-    // `Some(&s[i])` payload it is the SOLE net against an out-of-bounds ConstantIndex
-    // forgery (trust-vcgen's `constant_index_projection_vc` is from_end-BLIND, so the
-    // `from_end:true` `1 <= o` clause is singly load-bearing) and against a
-    // branch-polarity swap / a guard keyed to a different slice handle.
     if !slice_ref_return_guard_coherent(body, then_arm, else_arm, join_local, &param_index, &cond) {
-        return None;
+        return Err("the slice-ref return guard is not coherent");
     }
 
-    // (6) NEW: the ADT-constructed arm values (the divergence point from
-    // `sem_cf_return_of_mir`). The per-arm `expected_variant` carries the TAG↔DOWNCAST
-    // provenance for a `Result::ok`/`err`-class downcast-field payload (`None` for every
-    // other arm — no downcast admitted).
     let then_ctor =
-        arm_adt_ctor_value_for(body, then_arm, join_local, &param_index, then_expected_variant)?;
+        arm_adt_ctor_value_for_reasoned(body, then_arm, join_local, &param_index, then_expected_variant)
+            .map_err(attribute)?;
     let else_ctor =
-        arm_adt_ctor_value_for(body, else_arm, join_local, &param_index, else_expected_variant)?;
+        arm_adt_ctor_value_for_reasoned(body, else_arm, join_local, &param_index, else_expected_variant)
+            .map_err(attribute)?;
     if then_ctor.variant == else_ctor.variant {
-        return None; // not a genuine two-variant dispatch.
+        return Err("both arms construct the SAME variant — not a genuine two-variant dispatch");
     }
 
-    // The outer enum's name — read from the RETURN TYPE (never assumed), and cross-
-    // checked (inside `arm_adt_ctor_value_for`) against each arm's own Aggregate.
-    let trust_types::Ty::Adt { name: enum_name, .. } = &body.return_ty else { return None };
+    let trust_types::Ty::Adt { name: enum_name, .. } = &body.return_ty else {
+        return Err("the return type is not an ADT");
+    };
 
-    Some(SemAdtReturn {
+    Ok(SemAdtReturn {
         cond,
         then_arm: then_ctor,
         else_arm: else_ctor,
@@ -373,35 +811,6 @@ pub fn sem_adt_return_shape_of(func: &trust_types::VerifiableFunction) -> Option
     })
 }
 
-/// Recognize an ARM's ADT-constructed return value: the arm block's SOLE assignment
-/// to `join_local` (bare, no projections) must be `Rvalue::Aggregate(AggregateKind::Adt
-/// {name, variant, active_field: None}, operands)` with `operands.len() <= 1` (a
-/// nullary or single-field variant — the `Ok(x)`/`Err(e)`/`Some(x)`/`None` family;
-/// a 2+-field variant payload is OUT OF SCOPE for this increment, declined). The
-/// single operand, if present, must be a `Move`/`Copy` of a local with NO
-/// projections — a bare `Operand::Constant` payload (a literal-valued arm, e.g.
-/// `Ok(0)`) is OUT OF SCOPE for this increment and declines here (this only ever
-/// admits a `Move`/`Copy` of a PLACE; [`sem_operand_of_mir`]'s own `Constant` arm is
-/// unreachable from this call site by construction). Resolved either directly (a
-/// parameter — [`sem_operand_of_mir`]) or, for a scratch temp, through its OWN single
-/// `Statement::Assign` (gated by
-/// [`crate::prove::local_soundly_resolvable`] — the well-formedness discipline that
-/// declines a multiply-assigned or call-dest/mutably-aliased temp, closing
-/// adversarial probe (b)): a `Use` rvalue resolves to a [`SemAdtPayload::Scalar`],
-/// while an integer `Cast` retains its exact destination width/signedness in
-/// [`SemAdtPayload::IntCast`]; a ZERO-operand `Aggregate` (a nested
-/// fieldless-variant construction) resolves to a [`SemAdtPayload::NullaryNested`].
-/// Fail-closed (`None`) on anything else — an `active_field: Some(_)` union-repr
-/// aggregate, a 2+-operand aggregate, a projected/multiply-assigned payload local,
-/// or a payload rvalue outside the {Cast, Use, nullary Aggregate} fragment.
-///
-/// Trust: RECORD-WITNESS inc-2 (ok/err, 2026-07-22) — a `Use` payload that reads a
-/// DOWNCAST + FIELD off the dispatched self enum (`Use(Move((_self as v#N).f))`, the
-/// `Result::ok`/`err` `Some(x)` payload) resolves to a [`SemAdtPayload::DowncastField`]
-/// (see [`downcast_field_payload`]) when `expected_downcast_variant == Some(N)` — the
-/// TAG↔DOWNCAST provenance the caller established for this arm's path. Every other arm
-/// passes `None`, so no downcast payload is ever admitted outside the discriminant
-/// dispatch that pins its variant.
 pub(super) fn arm_adt_ctor_value_for(
     body: &trust_types::VerifiableBody,
     arm: &trust_types::BasicBlock,
@@ -409,56 +818,79 @@ pub(super) fn arm_adt_ctor_value_for(
     param_index: &dyn Fn(usize) -> Option<u64>,
     expected_downcast_variant: Option<usize>,
 ) -> Option<SemAdtArm> {
+    arm_adt_ctor_value_for_reasoned(body, arm, join_local, param_index, expected_downcast_variant)
+        .ok()
+}
+
+/// [`arm_adt_ctor_value_for`] with the decline REASON — ONE implementation, two callers,
+/// the same discipline as [`sem_adt_return_dispatch_of`] and
+/// [`downcast_field_payload_reasoned`]. The recognizer takes `.ok()`; the diagnostic reads
+/// the `Err`, so a corpus histogram attributes every decline to the gate that actually
+/// refused instead of to whichever layer the instrument happened to reach first.
+pub(super) fn arm_adt_ctor_value_for_reasoned(
+    body: &trust_types::VerifiableBody,
+    arm: &trust_types::BasicBlock,
+    join_local: usize,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+    expected_downcast_variant: Option<usize>,
+) -> Result<SemAdtArm, &'static str> {
     use trust_types::{AggregateKind, Operand, Rvalue};
     let (use_statement, rv) =
         arm.stmts.iter().enumerate().rev().find_map(|(statement_index, statement)| {
             crate::assignment_types::assigned_local_rvalue(body, statement, join_local)
                 .map(|rvalue| (statement_index, rvalue))
-        })?;
+        })
+        .ok_or("the arm has NO assignment to the join local")?;
     let Rvalue::Aggregate(
         AggregateKind::Adt { name, variant: variant_index, active_field, .. },
         operands,
     ) = rv
     else {
-        return None;
+        return Err("the arm's join-local rvalue is not an ADT Aggregate");
     };
     if active_field.is_some() {
-        return None; // union-repr aggregate — out of scope.
+        return Err("UNION-repr aggregate (active_field) — out of scope");
     }
     if operands.len() > 1 {
-        return None; // 2+-field variant payload — out of scope for this increment.
+        return Err("2+-FIELD VARIANT payload — out of scope for this increment");
     }
-    let return_local_ty = &body.locals.get(join_local)?.ty;
+    let return_local_ty = &body.locals.get(join_local).ok_or("no such join local")?.ty;
     if join_local == 0 && return_local_ty != &body.return_ty {
-        return None;
+        return Err("the return local's type differs from the declared return type");
     }
-    let variant = aggregate_variant_discriminant(return_local_ty, name, *variant_index)?;
+    let variant = aggregate_variant_discriminant(return_local_ty, name, *variant_index)
+        .ok_or("the aggregate's variant is not in the return type's variant metadata")?;
     let Some(payload_op) = operands.first() else {
-        return Some(SemAdtArm { variant, payload: None });
+        return Ok(SemAdtArm { variant, payload: None });
     };
-    let (Operand::Copy(p) | Operand::Move(p)) = payload_op else { return None };
+    let (Operand::Copy(p) | Operand::Move(p)) = payload_op else {
+        return Err("the payload operand is a CONSTANT, not a place");
+    };
     if !p.projections.is_empty() {
-        return None;
+        return Err("the payload operand place is PROJECTED");
     }
     // A direct parameter/constant payload — resolve without any temp-tracing.
     if let Some(direct) = sem_operand_of_mir(body, payload_op, param_index) {
-        return Some(SemAdtArm { variant, payload: Some(SemAdtPayload::Scalar(direct)) });
+        return Ok(SemAdtArm { variant, payload: Some(SemAdtPayload::Scalar(direct)) });
     }
     // A scratch temp: it must be the ARM's OWN local (this arm's sole-writer
     // discipline), soundly resolvable (single-assign, not a call dest, not
     // mutably-aliased — closes adversarial probe (b)).
     if param_index(p.local).is_some() || !crate::prove::local_soundly_resolvable(body, p.local) {
-        return None;
+        return Err("outside the modeled arm-value fragment");
     }
     let (definition_block, definition_statement, definition) =
-        unique_local_definition_dominating(body, p.local, arm.id, Some(use_statement))?;
+        unique_local_definition_dominating(body, p.local, arm.id, Some(use_statement))
+            .ok_or("the payload TEMP has no unique dominating definition")?;
     let definition_site = Some((definition_block, Some(definition_statement)));
     match definition {
         // Preserve the actual integer-cast semantics.  Merely reaching this arm
         // under some guard is not evidence that a narrowing/sign-changing cast is
         // the identity; the destination metadata therefore remains in the witness.
         Rvalue::Cast(op, dest_ty) => {
-            let trust_types::Ty::Int { width, signed } = dest_ty else { return None };
+            let trust_types::Ty::Int { width, signed } = dest_ty else {
+                return Err("CAST payload destination is not an integer type");
+            };
             if !matches!(*width, 8 | 16 | 32 | 64 | 128)
                 || !matches!(op,
                     Operand::Copy(source) | Operand::Move(source)
@@ -466,10 +898,11 @@ pub(super) fn arm_adt_ctor_value_for(
                             && matches!(body.locals.get(source.local).map(|local| &local.ty),
                                 Some(trust_types::Ty::Int { .. })))
             {
-                return None;
+                return Err("outside the modeled arm-value fragment");
             }
-            let source = resolve_cast_source_operand(body, op, param_index, definition_site)?;
-            Some(SemAdtArm {
+            let source = resolve_cast_source_operand(body, op, param_index, definition_site)
+                .ok_or("the CAST source operand resolves to nothing")?;
+            Ok(SemAdtArm {
                 variant,
                 payload: Some(SemAdtPayload::IntCast { source, width: *width, signed: *signed }),
             })
@@ -480,13 +913,35 @@ pub(super) fn arm_adt_ctor_value_for(
             // `Result::ok`/`err` `Some(payload)`). Admitted ONLY under the TAG↔DOWNCAST
             // provenance link + the VARIANT-DISJOINT flattened `idxElem` key; the scalar
             // path below handles every non-downcast `Use` unchanged.
-            if let Some(payload) =
-                downcast_field_payload(body, op, param_index, expected_downcast_variant)
-            {
-                return Some(SemAdtArm { variant, payload: Some(payload) });
-            }
-            let resolved = resolve_cast_source_operand(body, op, param_index, definition_site)?;
-            Some(SemAdtArm { variant, payload: Some(SemAdtPayload::Scalar(resolved)) })
+            // Trust: SURFACE THE DOWNCAST REASON (2026-08-28). This used to call the
+            // `.ok()` wrapper and, on `None`, fall through to the scalar path whose own
+            // failure reported "the USE source operand resolves to nothing" — a label
+            // that named the FALLBACK rather than the gate that actually fired. Measured:
+            // it covered 172 of 357 `<X as Try>::branch` bodies (48.2%), the single
+            // largest bucket in the enum lane, and said nothing about any of them.
+            //
+            // The reasoned variant is the same implementation, so the reason cannot
+            // describe a different gate. It is preferred ONLY when the operand really is
+            // a downcast read; for an ordinary scalar `Use` the downcast reason would be
+            // the misleading one, and the scalar path keeps its own.
+            let downcast_decline =
+                match downcast_field_payload_reasoned(body, op, param_index, expected_downcast_variant)
+                {
+                    Ok(payload) => return Ok(SemAdtArm { variant, payload: Some(payload) }),
+                    Err(reason) => reason,
+                };
+            let operand_is_downcast_read = matches!(
+                op,
+                Operand::Copy(p) | Operand::Move(p)
+                    if p.projections.iter().any(|proj| matches!(proj, trust_types::Projection::Downcast(_)))
+            );
+            let resolved = resolve_cast_source_operand(body, op, param_index, definition_site)
+                .ok_or(if operand_is_downcast_read {
+                    downcast_decline
+                } else {
+                    "the USE source operand resolves to nothing"
+                })?;
+            Ok(SemAdtArm { variant, payload: Some(SemAdtPayload::Scalar(resolved)) })
         }
         // A NESTED fieldless-variant construction (`Error::Underflow`-class): a
         // ZERO-operand Aggregate.  Its enum name and declaration-order index are
@@ -496,15 +951,18 @@ pub(super) fn arm_adt_ctor_value_for(
             AggregateKind::Adt {
                 name: nested_name,
                 variant: nested_variant,
-                active_field: nested_active, .. },
+                active_field: nested_active,
+                ..
+            },
             nested_ops,
         ) if nested_active.is_none() && nested_ops.is_empty() => {
             let nested_variant = aggregate_variant_discriminant(
-                &body.locals.get(p.local)?.ty,
+                &body.locals.get(p.local).ok_or("no such payload local")?.ty,
                 nested_name,
                 *nested_variant,
-            )?;
-            Some(SemAdtArm {
+            )
+            .ok_or("the NESTED aggregate variant is not in the payload local's metadata")?;
+            Ok(SemAdtArm {
                 variant,
                 payload: Some(SemAdtPayload::NullaryNested {
                     enum_name: nested_name.clone(),
@@ -529,12 +987,16 @@ pub(super) fn arm_adt_ctor_value_for(
                 place,
                 param_index,
                 (definition_block, Some(definition_statement)),
-            )?;
+            )
+            .ok_or("the borrowed payload is not a recognized slice projection")?;
             // `from_end:true` (`slice::last`) denotes index `sliceLen(s) - offset`, which
             // no current `SemOperand` composes (no Sub / Len-minus-const carrier; `PreOp`
             // is Not/Neg only) — decline HONESTLY here (fail-closed `None`).
-            let idx = proj.kind.index_operand()?;
-            Some(SemAdtArm {
+            let idx = proj
+                .kind
+                .index_operand()
+                .ok_or("a from_end ConstantIndex composes no SemOperand")?;
+            Ok(SemAdtArm {
                 variant,
                 payload: Some(SemAdtPayload::Scalar(SemOperand::Index(
                     Box::new(SemOperand::Var(proj.base_param)),
@@ -542,9 +1004,53 @@ pub(super) fn arm_adt_ctor_value_for(
                 ))),
             })
         }
-        _ => None,
+        // Name the rvalue rather than lumping it: each of these is a different piece of
+        // work, and "outside the fragment" as one number hides which one is worth doing.
+        Rvalue::BinaryOp(..) | Rvalue::UncheckedBinaryOp(..) => {
+            Err("payload TEMP is a BINARY OP (arithmetic on the payload)")
+        }
+        Rvalue::CheckedBinaryOp(..) => Err("payload TEMP is a CHECKED binary op"),
+        Rvalue::UnaryOp(..) => Err("payload TEMP is a UNARY OP"),
+        // Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — `Some(Inner(x))`. Resolved through
+        // the STRUCT lane's own `nested_ctor_field_of`, so the admission gates (unique
+        // whole-local definition, no call-dest, no SetDiscriminant, declared-arity match,
+        // bounded depth) are shared rather than re-implemented. Refused when any field is
+        // an `OpaqueParam`: its denotation needs a binder the ADT-return witness's `(o, e)`
+        // layout does not have, and inventing one is exactly what fail-closed forbids.
+        Rvalue::Aggregate(..) => match nested_ctor_field_of(body, p, param_index, 0) {
+            Some(SemStructField::NestedCtor { ty, variant: inner_variant, fields })
+                if nested_fields_all_scalar(&fields) =>
+            {
+                Ok(SemAdtArm {
+                    variant,
+                    payload: Some(SemAdtPayload::NestedCtor {
+                        ty,
+                        variant: inner_variant,
+                        fields,
+                    }),
+                })
+            }
+            Some(SemStructField::NestedCtor { .. }) => {
+                Err("nested ctor payload has a NON-SCALAR field (no stub slot for it)")
+            }
+            // Ask the RESOLVER which of its gates refused — same code, not a second copy.
+            _ => match nested_ctor_field_of_reasoned(body, p, param_index, 0) {
+                Err(why) => Err(why),
+                Ok(_) => Err("the nested-ctor resolver returned a non-NestedCtor field"),
+            },
+        },
+        Rvalue::Discriminant(..) => Err("payload TEMP is a raw DISCRIMINANT read"),
+        Rvalue::Len(..) => Err("payload TEMP is a slice LEN"),
+        Rvalue::Repeat(..) => Err("payload TEMP is a REPEAT array"),
+        Rvalue::Ref { mutable: true, .. } => Err("payload TEMP is a MUTABLE borrow"),
+        Rvalue::AddressOf { .. } => Err("payload TEMP is a raw ADDRESS-OF"),
+        Rvalue::CopyForDeref(..) => Err("payload TEMP is a CopyForDeref"),
+        Rvalue::PtrOffset { .. } => Err("payload TEMP is a POINTER OFFSET"),
+        Rvalue::Unsupported { .. } => Err("payload TEMP rvalue is UNSUPPORTED by the extractor"),
+        _ => Err("the payload TEMP's rvalue is outside the modeled fragment"),
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Trust: RECORD-WITNESS inc-2 (ok/err DowncastField + value-transparent drop-ladder
@@ -579,41 +1085,121 @@ pub(super) fn downcast_field_payload(
     param_index: &dyn Fn(usize) -> Option<u64>,
     expected_downcast_variant: Option<usize>,
 ) -> Option<SemAdtPayload> {
+    downcast_field_payload_reasoned(body, op, param_index, expected_downcast_variant).ok()
+}
+
+/// [`downcast_field_payload`] with the decline REASON — ONE implementation, two callers.
+///
+/// The recognizer takes `.ok()`; the decline diagnostic reads the `Err`. It is written
+/// this way for the reason recorded on [`sem_adt_return_dispatch_of`]: a diagnostic that
+/// re-implements a gate is a second implementation of that gate, and the two disagree
+/// exactly when it matters. Every string below names the gate that refused, so a corpus
+/// histogram distinguishes a CORRECT refusal (no value identity, no pinned variant) from
+/// a real capability gap.
+pub(super) fn downcast_field_payload_reasoned(
+    body: &trust_types::VerifiableBody,
+    op: &trust_types::Operand,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+    expected_downcast_variant: Option<usize>,
+) -> Result<SemAdtPayload, &'static str> {
     use trust_types::{Operand, Projection, Ty};
-    let (Operand::Copy(p) | Operand::Move(p)) = op else { return None };
-    let [Projection::Downcast(v), Projection::Field(f)] = p.projections.as_slice() else {
-        return None;
+    let (Operand::Copy(p) | Operand::Move(p)) = op else {
+        return Err("payload operand is a CONSTANT, not a place");
     };
-    // The base is the by-value `self` PARAMETER, not reassigned/aliased.
-    let base_param = param_index(p.local)?;
+    // Trust: W20 VALUE-TIER `&self` PAYLOAD (2026-08-26) — the `&self` counterpart of the
+    // dispatch widening in [`downcast_expected_variants`]. `match self { E::A(x) => ..*x.. }`
+    // on a `&self` receiver reads `((*_self) as A).f`, i.e. the SAME downcast+field with one
+    // leading `Deref`. An immutable reference denotes its referent's value, so the read is
+    // the referent's own field and `Var(base_param)` denotes it exactly — the reasoning
+    // `sem_operand_of_mir`'s GAP-DEREF-SELF arm already ratified. Gated below on
+    // `mutable: false` AND `!deref_write_exists`; `&mut self` and any write-through decline.
+    let (v, f, through_ref) = match p.projections.as_slice() {
+        [Projection::Downcast(v), Projection::Field(f)] => (v, f, false),
+        [Projection::Deref, Projection::Downcast(v), Projection::Field(f)] => (v, f, true),
+        _ => return Err("projection is not [Downcast, Field] (nor one Deref before it)"),
+    };
+    // The base is the `self` PARAMETER (by value, or behind one immutable `&`), not
+    // reassigned/aliased.
+    let base_param = param_index(p.local).ok_or("the downcast base is not a PARAMETER")?;
     if param_reassigned_by_stmt(body, p.local) {
-        return None;
+        return Err("the base parameter is REASSIGNED before the read");
     }
     // TAG↔DOWNCAST provenance (gate D).
     if expected_downcast_variant != Some(*v) {
-        return None;
+        // Trust: SPLIT (2026-08-28). One label covered 156 of 357 `Try::branch` bodies
+        // — the largest gate in the enum lane — and conflated two situations needing
+        // opposite work. NO expected variant means the dispatch derivation
+        // (`downcast_expected_variants`) declined and the fix is there; a DIFFERENT one
+        // means it derived a variant and the arm reads the other, which is an
+        // arm/tag pairing question in `sem_adt_return_dispatch_of`.
+        return Err(if expected_downcast_variant.is_none() {
+            "gate D: the dispatch derived NO expected downcast variant"
+        } else {
+            "gate D: the dispatch pins a DIFFERENT downcast variant than the arm reads"
+        });
     }
-    let self_ty = &body.locals.get(p.local)?.ty;
-    let Ty::Adt { variants, fields, .. } = self_ty else { return None };
-    if variants.is_empty() || !self_ty.disc_index_safe() {
-        return None; // not an enum, or a niche layout (unsound off-variant slot read).
+    let self_ty = &body.locals.get(p.local).ok_or("no such local")?.ty;
+    let self_ty = if through_ref {
+        match self_ty {
+            Ty::Ref { mutable: false, inner }
+                if !crate::mirsem::deref_write_exists(body, p.local) =>
+            {
+                inner.as_ref()
+            }
+            _ => return Err("`&mut self`, a write-through, or a non-reference base"),
+        }
+    } else {
+        self_ty
+    };
+    let Ty::Adt { variants, fields, .. } = self_ty else {
+        return Err("the downcast base is not an ADT");
+    };
+    if variants.is_empty() {
+        return Err("the base ADT carries NO first-class variant metadata");
     }
-    let variant_def = variants.get(*v)?;
-    let (field_name, field_ty) = variant_def.fields.get(*f)?;
-    if !matches!(field_ty, Ty::Int { .. }) {
-        return None; // a non-scalar payload (String / nested ADT) declines.
+    if !self_ty.disc_index_safe() {
+        return Err("NICHE layout — an off-variant slot read would be unsound");
     }
+    let variant_def = variants.get(*v).ok_or("no such variant in the base ADT")?;
+    let (field_name, field_ty) =
+        variant_def.fields.get(*f).ok_or("no such field in that variant")?;
+    // Trust: NON-SCALAR DOWNCAST PAYLOAD (2026-08-26) — a `Ty::Adt` payload is admitted
+    // as `DowncastOpaque`, which denotes at the payload's OWN carrier rather than the
+    // `Int`-sorted `idxElem` key. Every other gate above (base is an unaliased
+    // parameter, `disc_index_safe` enum, TAG-DOWNCAST provenance) has already run, and
+    // the flattened key below is computed identically for both, so
+    // DOWNCAST-KEY-DISJOINTNESS is unchanged. A `String`, tuple, reference or otherwise
+    // non-reflectable payload still declines.
+    let opaque_payload = match field_ty {
+        Ty::Int { .. } => false,
+        Ty::Adt { .. } => true,
+        Ty::Ref { .. } => return Err("payload field is a REFERENCE"),
+        Ty::Bool => return Err("payload field is Bool"),
+        Ty::Tuple(_) => return Err("payload field is a TUPLE"),
+        _ => return Err("payload field is neither Int nor Adt"),
+    };
     // DOWNCAST-KEY-DISJOINTNESS (gate A): the VARIANT-DISJOINT flattened `idxElem` key is
     // the position of `__v{v}_{field}` in the flattened `fields` list — NEVER the
     // within-variant index `f`. Derived from the dump's own first-class field metadata;
     // fail-closed if that flattened name is absent (a legacy / non-flattened dump).
     let flat_name = format!("__v{v}_{field_name}");
-    let flat_key = fields.iter().position(|(name, _)| name == &flat_name)?;
-    let flat_key = u64::try_from(flat_key).ok()?;
+    let flat_key = fields
+        .iter()
+        .position(|(name, _)| name == &flat_name)
+        .ok_or("the flattened `__v{v}_{field}` slot is ABSENT (legacy/non-flattened dump)")?;
+    let flat_key = u64::try_from(flat_key).map_err(|_| "flattened key does not fit u64")?;
     if flat_key == 0 {
-        return None; // the `__tag` slot is never a payload field (belt-and-suspenders).
+        return Err("the flattened key is the `__tag` slot"); // never a payload field.
     }
-    Some(SemAdtPayload::DowncastField { base_param, flat_key, downcast_variant: *v })
+    if opaque_payload {
+        return Ok(SemAdtPayload::DowncastOpaque {
+            base_param,
+            flat_key,
+            downcast_variant: *v,
+            payload_ty: field_ty.clone(),
+        });
+    }
+    Ok(SemAdtPayload::DowncastField { base_param, flat_key, downcast_variant: *v })
 }
 
 /// Trust: RECORD-WITNESS inc-2 — the TAG↔DOWNCAST expected self variant for each arm of a
@@ -630,29 +1216,90 @@ pub(super) fn downcast_expected_variants(
     tag_else: u128,
     param_index: &dyn Fn(usize) -> Option<u64>,
 ) -> (Option<usize>, Option<usize>) {
-    let none = (None, None);
+    downcast_expected_variants_reasoned(body, leaf, tag_then, tag_else, param_index)
+        .unwrap_or((None, None))
+}
+
+/// [`downcast_expected_variants`] with the decline REASON — ONE implementation, two
+/// callers, for the reason recorded on [`sem_adt_return_dispatch_of`]. `Err` names the
+/// gate that refused to pin a variant, so a corpus histogram can tell a CORRECT refusal
+/// (nothing establishes which variant is live) from a real capability gap.
+pub(super) fn downcast_expected_variants_reasoned(
+    body: &trust_types::VerifiableBody,
+    leaf: &SemCond,
+    tag_then: u128,
+    tag_else: u128,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Result<(Option<usize>, Option<usize>), &'static str> {
+    let none = "";
+    let _ = none;
     if leaf.op != SemCmpOp::Eq {
-        return none;
+        return Err("the guard is not an EQUALITY");
     }
-    let SemOperand::Discriminant(base) = &leaf.a else { return none };
-    let SemOperand::Var(sp) = base.as_ref() else { return none };
+    let SemOperand::Discriminant(base) = &leaf.a else {
+        return Err("the guard's LHS is not a Discriminant read");
+    };
+    let SemOperand::Var(sp) = base.as_ref() else {
+        return Err("the discriminant base is not a bare Var");
+    };
     let Some(self_local) = usize::try_from(*sp).ok().and_then(|s| s.checked_add(1)) else {
-        return none;
+        return Err("the base var index does not map to a local");
     };
     if param_index(self_local) != Some(*sp) {
-        return none;
+        return Err("the discriminant base is not the PARAMETER at that index");
+    };
+    let Some(local) = body.locals.get(self_local) else { return Err("no such local") };
+    // Trust: W20 VALUE-TIER `&self` DISPATCH (2026-08-26) — an IMMUTABLE reference denotes
+    // its referent's VALUE, so `Discriminant(*self)` IS the referent's own tag. Look
+    // through exactly one immutable `&` here, mirroring what
+    // [`sem_discriminant_base_of_mir`] — which produced this very `leaf` — already did to
+    // resolve the base to `Var(sp)`. WITHOUT THIS THE TWO DISAGREE: the base resolver
+    // accepts `*self`, this function then re-read the RAW local type, saw `Ty::Ref`, and
+    // returned `(None, None)`, so every `&self` dispatch silently lost its TAG↔DOWNCAST
+    // provenance and its payload declined at gate D. `&mut` NEVER looks through — it can
+    // be written through between the tag read and the payload read — and neither does a
+    // reference with any write reaching through it, the same defense the base resolver
+    // applies at the same seam.
+    let self_ty = match &local.ty {
+        trust_types::Ty::Ref { mutable: false, inner }
+            if !crate::mirsem::deref_write_exists(body, self_local) =>
+        {
+            inner.as_ref()
+        }
+        other => other,
+    };
+    let trust_types::Ty::Adt { variants, .. } = self_ty else {
+        return Err("the dispatch base is not an ADT");
+    };
+    if variants.is_empty() {
+        return Err("the base ADT carries NO first-class variant metadata");
     }
-    let Some(local) = body.locals.get(self_local) else { return none };
-    let trust_types::Ty::Adt { variants, .. } = &local.ty else { return none };
-    if variants.len() != 2 || !local.ty.disc_index_safe() {
-        return none;
+    if variants.len() != 2 {
+        return Err("the base enum has 3+ VARIANTS (the pin is 2-variant only)");
     }
+    if !self_ty.disc_index_safe() {
+        return Err("NICHE layout — the tag does not index variants");
+    }
+    // RAW label vs DECODED tag, and that is EXACT here rather than an oversight.
+    // `VariantDef::discriminant` is decoded at the extraction boundary; a MIR
+    // arm label stays raw. For a NON-NEGATIVE tag the raw pattern and the
+    // decoded value are the same integer at every width that can hold it, so
+    // this comparison is exact on that sub-domain. A NEGATIVE tag's raw pattern
+    // is `>= 2^(w-1)` while its decoded value is `< 0`, so they never match and
+    // `position` yields `None` — the recognizer declines (fail closed). It is
+    // never a WRONG match: no width makes a negative tag's pattern collide with
+    // another variant's non-negative tag. This leaf carries no discriminant-temp
+    // type, so decoding the label here would mean guessing a width — declining
+    // is the correct alternative.
     let (Ok(tag_then), Ok(tag_else)) = (i128::try_from(tag_then), i128::try_from(tag_else)) else {
-        return none;
+        return Err("a switch tag does not fit i128");
     };
     let then_v = variants.iter().position(|variant| variant.discriminant == tag_then);
     let else_v = variants.iter().position(|variant| variant.discriminant == tag_else);
-    (then_v, else_v)
+    if then_v.is_none() && else_v.is_none() {
+        return Err("NEITHER switch tag matches a declared variant discriminant");
+    }
+    Ok((then_v, else_v))
 }
 
 /// Trust: RECORD-WITNESS inc-2 — the dispatch self local from a two-target discriminant
@@ -889,11 +1536,27 @@ pub(crate) fn is_unit_carrier_ty(ty: &trust_types::Ty) -> bool {
 pub fn sem_struct_return_shape_of(
     func: &trust_types::VerifiableFunction,
 ) -> Option<SemStructReturn> {
-    use trust_types::{AggregateKind, BlockId, ConstValue, Operand, Rvalue, Statement, Terminator, Ty};
-    trust_vcgen::validate_function(func).ok()?;
+    sem_struct_return_shape_reasoned(func).ok()
+}
+
+/// [`sem_struct_return_shape_of`] with the decline REASON — ONE implementation, two
+/// callers, the fifth application of the discipline on [`sem_adt_return_dispatch_of`].
+///
+/// WHY THIS LANE. Measured on a frozen 56,328-body corpus: 55.5% of bodies return an ADT,
+/// 97.5% of those are recognized by no extractor, and the largest intraprocedural class in
+/// that mass is 6,523 bodies whose SOLE `_0` write is an `Aggregate` — a plain constructor
+/// return that this very function declines. That is ~24x the entire `SemAdtReturn` family.
+/// Sizing it by gate is what says which of these twenty gates is worth moving.
+pub(crate) fn sem_struct_return_shape_reasoned(
+    func: &trust_types::VerifiableFunction,
+) -> Result<SemStructReturn, &'static str> {
+    use trust_types::{
+        AggregateKind, BlockId, ConstValue, Operand, Rvalue, Statement, Terminator, Ty,
+    };
+    trust_vcgen::validate_function(func).map_err(|_| "validate_function rejects the body")?;
     let body = &func.body;
     if !crate::assignment_types::all_assignments_match(body) {
-        return None;
+        return Err("an assignment's operand TYPE does not match its place");
     }
     let arg_count = body.arg_count;
     let param_index = move |local: usize| -> Option<u64> {
@@ -902,26 +1565,546 @@ pub fn sem_struct_return_shape_of(
 
     // (1) The return type is a CONCRETE struct with FRESH first-class field metadata.
     let Ty::Adt { name: ret_name, fields: ret_fields, variants, .. } = &body.return_ty else {
-        return None;
+        return Err("the return type is not an ADT");
     };
     if !variants.is_empty() {
-        return None; // an ENUM return is the `SemAdtReturn` family's business.
+        return Err("the return is an ENUM (the SemAdtReturn family's business)");
     }
     if ret_fields.is_empty() {
-        return None; // a FIELDLESS struct — `reflect_struct` declines it (the ZST lane's shape).
+        return Err("a FIELDLESS struct (ZST) — reflect_struct declines it");
     }
     if ret_fields.iter().any(|(fname, _)| fname == "__tag" || fname.starts_with("__v")) {
-        return None; // a LEGACY `__tag`/`__v`-flattened dump — decline (fresh-metadata gate).
+        return Err("a LEGACY __tag/__v-flattened dump (fresh-metadata gate)");
     }
 
     // (4) SOLE-WRITER: exactly one bare `_0` assign in the whole body; zero projected
     // `_0.f` writes, zero call-dest / drop of `_0`, no mutable alias.
     if !local_has_only_guarded_writes(body, 0, 1, 0) {
-        return None;
+        return Err("`_0` is not written EXACTLY ONCE bare (projected/call-dest/aliased)");
     }
 
     // (C) SPINE-STATEMENT WHITELIST — straight-line terminators + storage-or-unprojected-
     // Assign statements only. A deref-base write has a PROJECTED place and declines here.
+    for block in &body.blocks {
+        match &block.terminator {
+            Terminator::Goto(_) | Terminator::Return => {}
+            // Named individually, not lumped: a `Drop` is VALUE-TRANSPARENT (the
+            // `SemAdtReturn` lane already models a drop-ladder epilogue), a `SwitchInt`
+            // means a real branch, and a `Call` means interprocedural. Those are three
+            // different pieces of work and reporting them as one number hides which is
+            // worth doing — the mistake this report made four times before naming it.
+            Terminator::Drop { .. } => return Err("a DROP terminator on the spine"),
+            Terminator::SwitchInt { .. } => return Err("a SWITCHINT terminator on the spine"),
+            Terminator::Call { .. } => return Err("a CALL terminator on the spine"),
+            Terminator::Unreachable => return Err("an UNREACHABLE terminator on the spine"),
+            _ => return Err("some other non-straight-line terminator on the spine"),
+        }
+        for stmt in &block.stmts {
+            match stmt {
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::PlaceMention(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                Statement::Assign { place, .. } if place.projections.is_empty() => {}
+                _ => return Err("a PROJECTED assignment on the spine (e.g. a deref write)"),
+            }
+        }
+    }
+
+    // The sole `_0 = Aggregate(..)` write lives in the UNIQUE return block, immediately
+    // before `Return` (only storage markers may follow), on the entry-reachable spine.
+    let ret_block = unique_return_block(body).ok_or("no UNIQUE return block")?;
+    let reachable = cfg_reachable_from(body, BlockId(0)).ok_or("the CFG is not walkable")?;
+    if !reachable.contains(&ret_block.id) {
+        return Err("the return block is not reachable from entry");
+    }
+    let agg_idx = ret_block.stmts.iter().position(|s| {
+        matches!(s, Statement::Assign { place, rvalue: Rvalue::Aggregate(..), .. }
+            if place.local == 0 && place.projections.is_empty())
+    })
+    .ok_or("the return block has NO Aggregate assignment to `_0`")?;
+    // Nothing between the Aggregate and `Return` (only inert storage markers).
+    for stmt in &ret_block.stmts[agg_idx + 1..] {
+        match stmt {
+            Statement::StorageLive(l) | Statement::StorageDead(l) if *l != 0 => {}
+            Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => {}
+            _ => return Err("a statement other than a storage marker FOLLOWS the aggregate"),
+        }
+    }
+
+    let Statement::Assign { rvalue: Rvalue::Aggregate(kind, operands), .. } =
+        &ret_block.stmts[agg_idx]
+    else {
+        return Err("the sole `_0` write is not an Aggregate in the return block");
+    };
+    let AggregateKind::Adt { name: agg_name, variant, active_field, .. } = kind else {
+        return Err("the aggregate is not an ADT aggregate (tuple/array/closure)");
+    };
+    // (B) active_field == None as a LITERAL gate (union-repr aggregate declines).
+    if active_field.is_some() {
+        return Err("UNION-repr aggregate (active_field)");
+    }
+    // (2) return-type cross-check: single-variant struct (variant 0), name match, arity.
+    if *variant != 0 {
+        return Err("a STRUCT return whose aggregate names a non-zero variant");
+    }
+    if agg_name != ret_name {
+        return Err("the aggregate's NAME differs from the return type's name");
+    }
+    if operands.len() != ret_fields.len() {
+        return Err("the aggregate's ARITY differs from the return type's field count");
+    }
+
+    // (3) CARRIER ADMISSION — reflect the concrete single-`.mk` carrier, register it,
+    // and RE-GET the registry (never assume registration succeeded: a gate-failed
+    // inductive stays in the env but is absent from the registry).
+    let carrier = crate::reflect::reflect_struct(&body.return_ty)
+        .ok_or("the return type does NOT REFLECT to a carrier")?;
+    if carrier.is_enum() {
+        return Err("reflect routed this type to the ENUM family");
+    }
+    // Trust: GENERIC-CTOR increment (2026-08-25) — a PI-WRAPPED generic `.mk` is
+    // admitted. It used to decline here as "(7) concrete-only". Measured over the
+    // real-code dumps: of the 113 bare single-statement ADT constructors, 41 build a
+    // usable carrier and died on exactly this line, and ALL 41 carry at least one
+    // param-typed FIELD — so the cheap version of this lift (bind the type params,
+    // leave the field denotations alone) would have gained zero. The field loop below
+    // gives those fields a `GenericParam` binder keyed by SOURCE PARAMETER, and
+    // `trustir_adt::build_struct_refinement` binds `Sort 1` type binders outermost.
+    if carrier.fields.len() != operands.len() {
+        return Err("the CARRIER's field count differs from the aggregate's arity");
+    }
+    {
+        let mut env = crate::trustir_anchor::trustir_env().map_err(|_| "no anchor env")?;
+        let registry =
+            crate::clean_ground::register_adt_carriers(
+                &mut env,
+                &crate::clean_ground::carrier_closure_for(&body.return_ty, &carrier),
+            );
+        // re-get: a gate-failed carrier is absent from the registry.
+        let confirmed = registry
+            .get(&carrier.name)
+            .ok_or("the carrier FAILED TO REGISTER (add_inductive / axiom gate)")?;
+        if confirmed.fields.len() != operands.len() {
+            return Err("the REGISTERED carrier's field count differs from the arity");
+        }
+    }
+
+    // Per-field values in MIR / constructor order (incl. Unit markers).
+    let mut fields = Vec::with_capacity(operands.len());
+    for ((_fname, fty), op) in ret_fields.iter().zip(operands.iter()) {
+        if is_unit_carrier_ty(fty) {
+            // UNIT/PhantomData marker — accepted BY TYPE; the operand must be a `Unit`
+            // constant (an `Int`/`Bool`/other constant in a Unit slot declines).
+            match op {
+                Operand::Constant(ConstValue::Unit) => fields.push(SemStructField::Unit),
+                _ => return Err("a UNIT-carrier slot's operand is not the unit constant"),
+            }
+        } else if matches!(fty, Ty::Int { .. } | Ty::Bool) {
+            // A scalar field — route through the PARAM-ROOT chokepoint (gate A). A
+            // reassigned parameter, a non-parameter place, or a `Unit` constant in an
+            // `Int` slot all fail closed here (`sem_operand_of_mir` returns `None`).
+            // Trust: SCALAR TEMP CHASE (2026-08-27) — fall back to
+            // [`resolve_cast_source_operand`], which tries the direct read, then a field
+            // read, then traces a NON-parameter temp's SOLE static assignment one level
+            // deep behind its call-dest / mutable-alias gates.
+            //
+            // WHY IT IS SOUND HERE. `use_site: None` selects the "sole static assignment
+            // anywhere" resolution rather than a dominating one — which is exact in THIS
+            // lane because the lane already requires a STRAIGHT-LINE spine (the
+            // terminator whitelist above rejects any switch/call/drop), so a body with one
+            // static assignment has exactly one dynamic one.
+            //
+            // WHY IT IS WORTH DOING. Of the 788 bodies that pass every INDEPENDENT gate of
+            // this lane and are still unrecognized, 156 stop on this operand, and 138 of
+            // those (88%) are a bare temp needing exactly this chase. Unlike the classes
+            // that produced eight zero-gain widenings, these bodies have NO other
+            // independent blocker waiting behind this one.
+            let scalar = resolve_cast_source_operand(body, op, &param_index, None)
+                .ok_or("a SCALAR field's operand does not resolve")?;
+            fields.push(SemStructField::Scalar(scalar));
+        } else if matches!(fty, Ty::Adt { .. })
+            || carrier
+                .fields
+                .get(fields.len())
+                .is_some_and(|(_, code)| crate::reflect::carrier_mentions_param(code))
+        {
+            // Trust: GENERIC-CTOR increment (2026-08-25) — a field whose reflected
+            // carrier is (or nests) a BOUND TYPE PARAMETER. Its value cannot be an
+            // `Env` lookup (`Env` is `Int`-sorted), so it denotes a ∀-bound binder
+            // keyed by the SOURCE PARAMETER — which is what keeps the witness
+            // non-tautological (see `SemStructField::OpaqueParam`).
+            //
+            // Admission is deliberately narrow: a BARE, unprojected, entry-time read
+            // of a function parameter. A projected place, a temporary, a constant, or
+            // a parameter REASSIGNED before the aggregate all fail closed — the last
+            // one because the binder denotes the parameter's ENTRY value, exactly the
+            // discipline `sem_operand_of_mir` applies on the scalar arm.
+            let (Operand::Copy(place) | Operand::Move(place)) = op else {
+                return Err("a field operand is a CONSTANT where a place is required");
+            };
+            // Trust: PROJECTED SOURCE (2026-08-25) — a bare read, or exactly ONE field
+            // projection of a parameter. Anything deeper (a deref, an index, a nested
+            // field chain) is refused: its value is not determined by the parameter's
+            // entry value alone.
+            // A NESTED CONSTRUCTOR first (exact structure), else a bare-or-one-field
+            // read of a PARAMETER or a TEMPORARY that provably copies one.
+            if let Some(nested) = nested_ctor_field_of(body, place, &param_index, 0) {
+                fields.push(nested);
+            } else {
+                let (param, part) = resolve_temp_field_source(body, place, &param_index)
+                    .ok_or("a field operand is not a resolvable PARAMETER PART")?;
+                fields.push(SemStructField::OpaqueParam { param, part });
+            }
+        } else {
+            // (E) POINTER / ref / slice / tuple field — OUT of increment 1. A raw-ptr /
+            // `NonNull` root is NOT admitted in this lane (fail closed) until
+            // `sliceStart`/`ptrOffset` land with their gates (increment 3).
+            //
+            // Trust: LABEL CORRECTION (2026-08-27) — this message used to say
+            // "nested-struct" as well. It is WRONG: a `Ty::Adt` field is handled by the
+            // arm ABOVE (nested constructor, else parameter part), so no nested struct
+            // ever reaches here. The stale word sent a reader looking for a nested-struct
+            // gap that does not exist; naming the ACTUAL types is the point of these
+            // labels. Split by kind so the corpus says which of them is worth anything.
+            return Err(match fty {
+                Ty::Ref { .. } => "field type is a REFERENCE",
+                Ty::RawPtr { .. } => "field type is a RAW POINTER",
+                Ty::Slice { .. } => "field type is a SLICE",
+                Ty::Str => "field type is a STR",
+                Ty::Array { .. } => "field type is an ARRAY",
+                Ty::Tuple(..) => "field type is a TUPLE",
+                Ty::Float { .. } => "field type is a FLOAT",
+                Ty::Char => "field type is a CHAR",
+                Ty::PtrSizedInt { .. } => "field type is a PTR-SIZED INT",
+                _ => "field type is outside the modeled fragment",
+            });
+        }
+    }
+
+    Ok(SemStructReturn { struct_ty: body.return_ty.clone(), fields })
+}
+
+/// Trust: NESTED-CTOR increment (2026-08-25) — recognize a field operand that is itself
+/// a constructor: a temporary whose UNIQUE whole-local definition is an
+/// `Rvalue::Aggregate`.
+///
+/// Soundness is the same uniqueness argument the other temporary chases use: the local
+/// must be written exactly once in the whole body, unprojected, never by a call
+/// terminator or `SetDiscriminant`, so its value is the same on every path. Bounded
+/// depth, and every level re-applies the same field admission the top level does — a
+/// field it cannot admit declines the whole nest rather than approximating it.
+fn nested_ctor_field_of(
+    body: &trust_types::VerifiableBody,
+    place: &trust_types::Place,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+    depth: u32,
+) -> Option<SemStructField> {
+    nested_ctor_field_of_reasoned(body, place, param_index, depth).ok()
+}
+
+/// [`nested_ctor_field_of`] with the decline REASON — ONE implementation, two callers, the
+/// fourth application of the discipline recorded on [`sem_adt_return_dispatch_of`]. Twice
+/// in a row a class was sized by the layer the instrument happened to reach and the
+/// widening built for it gained ZERO; naming this layer's gates is what stops a third.
+pub(super) fn nested_ctor_field_of_reasoned(
+    body: &trust_types::VerifiableBody,
+    place: &trust_types::Place,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+    depth: u32,
+) -> Result<SemStructField, &'static str> {
+    use trust_types::{AggregateKind, ConstValue, Operand, Rvalue, Statement, Terminator, Ty};
+    if depth > 3 {
+        return Err("nesting DEPTH exceeded");
+    }
+    if !place.projections.is_empty() {
+        return Err("the payload place is PROJECTED");
+    }
+    // A parameter is not a nested constructor.
+    if param_index(place.local).is_some() {
+        return Err("the payload local is a PARAMETER, not a constructed temp");
+    }
+    let mut found: Option<&Rvalue> = None;
+    for bb in &body.blocks {
+        if let Terminator::Call { dest, .. } = &bb.terminator
+            && dest.local == place.local
+        {
+            return Err("the payload temp is a CALL destination");
+        }
+        for st in &bb.stmts {
+            match st {
+                Statement::Assign { place: p, rvalue, .. } if p.local == place.local => {
+                    if !p.projections.is_empty() {
+                        return Err("the payload temp is written through a PROJECTION");
+                    }
+                    if found.is_some() {
+                        return Err("the payload temp is assigned MORE THAN ONCE");
+                    }
+                    found = Some(rvalue);
+                }
+                Statement::SetDiscriminant { place: p, .. } if p.local == place.local => {
+                    return Err("the payload temp has a SetDiscriminant write");
+                }
+                _ => {}
+            }
+        }
+    }
+    let Rvalue::Aggregate(kind, operands) = found.ok_or("the payload temp has NO assignment")?
+    else {
+        return Err("the payload temp's rvalue is not an Aggregate");
+    };
+    let AggregateKind::Adt { name: agg_name, variant, active_field, .. } = kind else {
+        return Err("the payload aggregate is not an ADT aggregate");
+    };
+    if active_field.is_some() {
+        return Err("UNION-repr payload aggregate");
+    }
+    let inner_ty = body.locals.get(place.local).map(|l| l.ty.clone()).ok_or("no such local")?;
+    let (ty_name, flat, variants) = match &inner_ty {
+        Ty::Adt { name, fields, variants, .. } => (name.clone(), fields.clone(), variants.clone()),
+        _ => return Err("the payload temp's declared type is not an ADT"),
+    };
+    if &ty_name != agg_name {
+        return Err("the aggregate's NAME differs from the temp's declared ADT name");
+    }
+    let variant_idx = usize::try_from(*variant).map_err(|_| "variant index does not fit usize")?;
+    // The declared field list for THIS constructor: a variant's own fields for an enum,
+    // the struct's fields otherwise.
+    let declared: Vec<(String, Ty)> = if variants.is_empty() {
+        if variant_idx != 0 {
+            return Err("a STRUCT aggregate names a non-zero variant");
+        }
+        flat
+    } else {
+        variants.get(variant_idx).ok_or("no such variant in the temp's metadata")?.fields.clone()
+    };
+    if declared.len() != operands.len() {
+        return Err("the DECLARED field count differs from the aggregate's operand count");
+    }
+    let mut fields = Vec::with_capacity(operands.len());
+    for ((_fname, fty), op) in declared.iter().zip(operands.iter()) {
+        if is_unit_carrier_ty(fty) {
+            match op {
+                Operand::Constant(ConstValue::Unit) => fields.push(SemStructField::Unit),
+                _ => return Err("a UNIT-carrier field's operand is not the unit constant"),
+            }
+        } else if matches!(fty, Ty::Int { .. } | Ty::Bool) {
+            fields.push(SemStructField::Scalar(
+                sem_operand_of_mir(body, op, param_index)
+                    .ok_or("a SCALAR field's operand does not resolve")?,
+            ));
+        } else if matches!(fty, Ty::Adt { .. }) {
+            let (Operand::Copy(p) | Operand::Move(p)) = op else {
+                return Err("an ADT field's operand is a CONSTANT, not a place");
+            };
+            // Another nest, or a parameter part.
+            match nested_ctor_field_of(body, p, param_index, depth + 1) {
+                Some(f) => fields.push(f),
+                None => {
+                    let (param, part) = resolve_temp_field_source(body, p, param_index)
+                        .ok_or("an ADT field is neither a nested ctor nor a parameter part")?;
+                    fields.push(SemStructField::OpaqueParam { param, part });
+                }
+            }
+        } else {
+            return Err("a field TYPE is outside {Int, Bool, Unit-carrier, Adt}");
+        }
+    }
+    Ok(SemStructField::NestedCtor {
+        ty: inner_ty,
+        variant: if variants.is_empty() { None } else { Some(variant_idx) },
+        fields,
+    })
+}
+
+/// Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — is every field of this nested
+/// constructor a SCALAR?
+///
+/// The ADT-return lane denotes a nested payload through a STUB carrier
+/// (`trustir_adt::nested_ctor_stub_ty`) whose slots are `Int`, so a scalar field has a
+/// slot and anything else does not. In particular an [`SemStructField::OpaqueParam`] has
+/// no denotation at all here — its reading is a ∀-bound binder whose index depends on the
+/// whole binder layout, and this lane's `(o, e)` layout binds no such thing. Declining is
+/// the only honest option; inventing a binder is what fail-closed forbids.
+///
+/// A deeper nest declines too: its stub would need a non-`Int` slot, which is the same
+/// wall one level down. That is a scope boundary, not a soundness one — when the stub
+/// gains typed slots this check is what relaxes.
+fn nested_fields_all_scalar(fields: &[SemStructField]) -> bool {
+    !fields.is_empty() && fields.iter().all(|f| matches!(f, SemStructField::Scalar(_)))
+}
+
+/// Trust: ACCESSOR SHAPE (2026-08-26) — resolve `(*p)` or `(*p).n` on an
+/// IMMUTABLE-reference parameter to the `(param, part)` pair the passthrough witness
+/// uses.
+///
+/// `part` is `0` for the whole referent and `n + 1` for its field `n`, the same encoding
+/// [`SemStructField::OpaqueParam`] uses. Refused when the parameter is not an immutable
+/// reference, is reassigned, is deref-written anywhere in the body, or the projection is
+/// anything other than `[Deref]` / `[Deref, Field]` — a deeper chain is not determined by
+/// the parameter's entry value alone.
+fn resolve_deref_field_source(
+    body: &trust_types::VerifiableBody,
+    place: &trust_types::Place,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<(u64, u64)> {
+    use trust_types::{Projection, Ty};
+    let part = match place.projections.as_slice() {
+        [Projection::Deref] => 0u64,
+        [Projection::Deref, Projection::Field(n)] => u64::try_from(*n).ok()?.checked_add(1)?,
+        _ => return None,
+    };
+    // The base must be an IMMUTABLE reference parameter.
+    match body.locals.get(place.local).map(|l| &l.ty) {
+        Some(Ty::Ref { mutable: false, .. }) => {}
+        _ => return None,
+    }
+    let param = param_index(place.local)?;
+    if param_reassigned_by_stmt(body, place.local) || deref_write_exists(body, place.local) {
+        return None;
+    }
+    Some((param, part))
+}
+
+/// Trust: PASSTHROUGH-RETURN increment (2026-08-25) — recognize `_0 = <parameter>`.
+///
+/// Gates, all shared in spirit with the constructor lanes: straight-line terminators
+/// only, no calls, the whitelisted statement set, `_0` written exactly once and never
+/// through a projection or a `SetDiscriminant`, the source a bare-or-one-field read of a
+/// parameter that is neither reassigned nor deref-written. Fail-closed on each.
+/// Trust: CONST-RETURN recognizer (2026-08-28) — a single-block body whose one statement
+/// writes `_0` from a fixed string literal and returns.
+///
+/// The sibling of [`sem_passthrough_return_shape_of`], and deliberately as narrow: one
+/// block, one statement, an unprojected `_0`, an immutable `&str`/`&[u8]` return, and a
+/// `ConstValue::Str`. Anything else declines.
+///
+/// The byte cap is not arithmetic caution — the witness builds one `List.cons` per byte,
+/// so a megabyte literal would build a megabyte-deep kernel term. A literal past the cap
+/// declines rather than being truncated: a truncated literal would be a DIFFERENT claim
+/// wearing the same theorem.
+pub fn sem_const_return_shape_of(
+    func: &trust_types::VerifiableFunction,
+) -> Option<SemConstReturn> {
+    use trust_types::{ConstValue, Operand, Rvalue, Statement, Terminator, Ty};
+    /// The kernel term is linear in the literal's length; 4 KiB of bytes is far past any
+    /// real `Token::display` and still cheap to check.
+    const MAX_LITERAL_BYTES: usize = 4096;
+
+    trust_vcgen::validate_function(func).ok()?;
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return None;
+    }
+    // An immutable reference to a string or byte slice. `&mut` is refused for the same
+    // reason the passthrough lane refuses it: a mutable reference return carries a
+    // post-state this entry-time reading does not capture.
+    match &body.return_ty {
+        Ty::Ref { mutable: false, inner } => match inner.as_ref() {
+            Ty::Str => {}
+            Ty::Slice { elem } if matches!(elem.as_ref(), Ty::Int { .. }) => {}
+            _ => return None,
+        },
+        _ => return None,
+    }
+    let [block] = body.blocks.as_slice() else { return None };
+    if !matches!(block.terminator, Terminator::Return) {
+        return None;
+    }
+    let [Statement::Assign { place, rvalue, .. }] = block.stmts.as_slice() else { return None };
+    if place.local != 0 || !place.projections.is_empty() {
+        return None;
+    }
+    let Rvalue::Use(Operand::Constant(ConstValue::Str { bytes })) = rvalue else { return None };
+    if bytes.len() > MAX_LITERAL_BYTES {
+        return None;
+    }
+    Some(SemConstReturn { return_ty: body.return_ty.clone(), bytes: bytes.clone() })
+}
+
+pub fn sem_passthrough_return_shape_of(
+    func: &trust_types::VerifiableFunction,
+) -> Option<SemPassthroughReturn> {
+    use trust_types::{BlockId, Operand, Rvalue, Statement, Terminator, Ty};
+    trust_vcgen::validate_function(func).ok()?;
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return None;
+    }
+    // An ADT return, or an IMMUTABLE REFERENCE to one. The scalar shapes are the
+    // straight-line lane's business and already covered there.
+    //
+    // Trust: REFERENCE PASSTHROUGH (2026-08-26) — `fn f(x: &T) -> &T { x }` returns the
+    // same reference, so modelling it as "the referent VALUE of parameter p" is exactly
+    // the W20 value-tier reading of an immutable reference return: a value claim, never
+    // an address or aliasing claim. `&mut` is REFUSED — a mutable reference return
+    // carries a post-state the entry-time reading would not capture. Measured across
+    // three corpora: 117 call-free reference returns are this shape.
+    // Trust: SCALAR GETTER (2026-08-26) — `Int`/`Bool` returns are admitted too.
+    // `fn len(&self) -> usize { self.len }` is `_0 = ((*_1).n)`, which the trust-ir
+    // straight-line lane cannot express (its `to_ir_operand` requires an unprojected
+    // place) and no other lane looked for. Measured across three corpora: 185 call-free
+    // scalar returns read a parameter part this way — 131 of them `Deref.Field` on an
+    // immutable-reference parameter.
+    //
+    // The witness statement is carrier-agnostic, so a scalar carrier needs no new
+    // machinery: `o p k : Int` says the same thing about the same parameter part that
+    // `o p k : S` says for an ADT. Where the straight-line lane DOES handle a body it is
+    // tried in the same disjunction and its finer value relation still wins.
+    // Trust: CARRIER WIDENING (2026-08-28) — the witness is carrier-agnostic, as the
+    // note above already says: `o p k : [T]` asserts the same thing about the same
+    // parameter part that `o p k : S` does. The list was not a soundness boundary, it
+    // was the set of carriers that had come up so far, and it silently excluded the
+    // single most common one in real code.
+    //
+    // Measured on a dependency-closed monomorphized corpus (31,087 bodies): identity at
+    // an ADT certifies, identity at a SLICE REFERENCE declines, on bodies that are
+    // otherwise byte-identical. `&[T]`/`&str` is the only type family appearing in more
+    // than one uncovered bucket — 201 slice-returning and part of 171 identity bodies.
+    //
+    // SOUND BY CONSTRUCTION, and this is the load-bearing reason widening is safe here
+    // rather than merely plausible: `check_passthrough_return_refinement` builds the
+    // carrier's inductive through the same nested-closure path as every other lane, so
+    // a return type whose inductive cannot be built FAILS CLOSED there. Admitting a
+    // carrier can therefore only ever produce another kernel attempt that must still
+    // close modulo 3; it can never convert a refusal into an unchecked claim.
+    //
+    // Still REFUSED, because for these the claim itself would be wrong rather than
+    // merely unprovable:
+    //   * `&mut` — a mutable reference return carries a post-state the entry-time
+    //     reading does not capture (unchanged, and the reason is unchanged).
+    //   * `RawPtr` — returning the same pointer is an ADDRESS claim, not the W20
+    //     value-tier claim this witness makes.
+    //   * `Dynamic`/`FnPtr`/`FnDef`/`Closure` — no value-tier reading to assert.
+    fn passthrough_carrier_admissible(ty: &Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Adt { .. }
+                | Ty::Int { .. }
+                | Ty::Bool
+                | Ty::Float { .. }
+                | Ty::Char
+                | Ty::PtrSizedInt { .. }
+                | Ty::Tuple(_)
+                | Ty::Array { .. }
+                | Ty::Slice { .. }
+                | Ty::Str
+        )
+    }
+    match &body.return_ty {
+        ty if passthrough_carrier_admissible(ty) => {}
+        Ty::Ref { mutable: false, inner } if passthrough_carrier_admissible(inner) => {}
+        _ => return None,
+    }
+    let arg_count = body.arg_count;
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+    if !local_has_only_guarded_writes(body, 0, 1, 0) {
+        return None;
+    }
     for block in &body.blocks {
         match &block.terminator {
             Terminator::Goto(_) | Terminator::Return => {}
@@ -940,89 +2123,336 @@ pub fn sem_struct_return_shape_of(
             }
         }
     }
-
-    // The sole `_0 = Aggregate(..)` write lives in the UNIQUE return block, immediately
-    // before `Return` (only storage markers may follow), on the entry-reachable spine.
     let ret_block = unique_return_block(body)?;
     let reachable = cfg_reachable_from(body, BlockId(0))?;
     if !reachable.contains(&ret_block.id) {
         return None;
     }
-    let agg_idx = ret_block.stmts.iter().position(|s| {
-        matches!(s, Statement::Assign { place, rvalue: Rvalue::Aggregate(..), .. }
+    // `_0 = <place>` or, for the ACCESSOR shape, `_0 = &<place>`.
+    let idx = ret_block.stmts.iter().position(|s| {
+        matches!(s, Statement::Assign { place, rvalue: Rvalue::Use(..) | Rvalue::Ref { .. }, .. }
             if place.local == 0 && place.projections.is_empty())
     })?;
-    // Nothing between the Aggregate and `Return` (only inert storage markers).
-    for stmt in &ret_block.stmts[agg_idx + 1..] {
+    for stmt in &ret_block.stmts[idx + 1..] {
         match stmt {
             Statement::StorageLive(l) | Statement::StorageDead(l) if *l != 0 => {}
             Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => {}
             _ => return None,
         }
     }
+    // Trust: ACCESSOR SHAPE (2026-08-26) — `fn kind(&self) -> &Kind { &self.kind }`.
+    // MIR spells it `_0 = &((*_1).n)`, so the place carries a leading `Deref` of the
+    // `&self` parameter. Measured across three corpora: 128 call-free reference returns
+    // are this shape, the second-largest after the passthrough itself.
+    //
+    // Admitted only for an IMMUTABLE borrow of an immutable-reference parameter, which
+    // is the same W20 value-tier reading the reference passthrough uses: `&(*p).n`
+    // denotes the value of field `n` of `p`'s referent. A `&mut` borrow, or a parameter
+    // that is deref-written anywhere, is refused by `resolve_deref_field_source`.
+    let place = match &ret_block.stmts[idx] {
+        Statement::Assign { rvalue: Rvalue::Use(op), .. } => {
+            let (Operand::Copy(p) | Operand::Move(p)) = op else { return None };
+            p
+        }
+        Statement::Assign { rvalue: Rvalue::Ref { mutable: false, place }, .. } => place,
+        _ => return None,
+    };
+    let (param, part) = resolve_deref_field_source(body, place, &param_index)
+        .or_else(|| resolve_temp_field_source(body, place, &param_index))?;
+    Some(SemPassthroughReturn { return_ty: body.return_ty.clone(), param, part })
+}
 
+/// Trust: TEMPORARY FIELD SOURCE (2026-08-25) — resolve a field operand that is a
+/// TEMPORARY back to the parameter part it copies, when that is unambiguous.
+///
+/// Measured on a 12,880-body corpus: of 1153 call-free Aggregate constructors only 328
+/// are single-statement. The other 825 compute their fields into temporaries first, and
+/// the opaque-field arm required a BARE parameter read, so all of them declined.
+///
+/// SOUNDNESS RESTS ON UNIQUENESS. The local must be written exactly once in the whole
+/// body, by an unprojected whole-local `Rvalue::Use`, and never by a call terminator or
+/// a `SetDiscriminant`. Then `_t = <operand>` holds on EVERY path that defines `_t`, so
+/// reading the field through it is valid regardless of which path reached the
+/// constructor. A local written twice, written through a projection, or assigned by a
+/// terminator is refused.
+///
+/// The chase follows only `Use` and is bounded, so `_a = _b; _b = p.0` resolves while
+/// anything COMPUTED (`BinaryOp`, `Cast`, a call result) stops it. A two-level
+/// projection chain is refused as out of the fragment.
+fn resolve_temp_field_source(
+    body: &trust_types::VerifiableBody,
+    place: &trust_types::Place,
+    param_index: &dyn Fn(usize) -> Option<u64>,
+) -> Option<(u64, u64)> {
+    use trust_types::{Operand, Projection, Rvalue, Statement, Terminator};
+
+    /// `0` for the whole local, `n + 1` for its field `n`; anything else is out.
+    fn part_of(place: &trust_types::Place) -> Option<u64> {
+        match place.projections.as_slice() {
+            [] => Some(0),
+            [Projection::Field(n)] => u64::try_from(*n).ok()?.checked_add(1),
+            _ => None,
+        }
+    }
+
+    let mut cur = place.clone();
+    for _ in 0..8 {
+        if let Some(param) = param_index(cur.local) {
+            if param_reassigned_by_stmt(body, cur.local) || deref_write_exists(body, cur.local) {
+                return None;
+            }
+            return Some((param, part_of(&cur)?));
+        }
+        let mut found: Option<trust_types::Place> = None;
+        for bb in &body.blocks {
+            if let Terminator::Call { dest, .. } = &bb.terminator
+                && dest.local == cur.local
+            {
+                return None;
+            }
+            for st in &bb.stmts {
+                match st {
+                    Statement::Assign { place: p, rvalue, .. } if p.local == cur.local => {
+                        if !p.projections.is_empty() || found.is_some() {
+                            return None;
+                        }
+                        match rvalue {
+                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+                                found = Some(src.clone());
+                            }
+                            _ => return None,
+                        }
+                    }
+                    Statement::SetDiscriminant { place: p, .. } if p.local == cur.local => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let src = found?;
+        part_of(&src)?;
+        // `_a.0` where `_a = p.1` is two levels of projection — out of the fragment.
+        if !cur.projections.is_empty() && !src.projections.is_empty() {
+            return None;
+        }
+        let next_part = if cur.projections.is_empty() { part_of(&src)? } else { part_of(&cur)? };
+        let mut next = src;
+        next.projections = match next_part {
+            0 => Vec::new(),
+            n => vec![Projection::Field(usize::try_from(n - 1).ok()?)],
+        };
+        cur = next;
+    }
+    None
+}
+
+/// Trust: BARE-ENUM-CTOR increment (2026-08-25) — recognize a bare ENUM-constructor
+/// return (`Cow::from(s)`, `ControlFlow::Continue(x)`, `Err(e)`): the sole `_0` write is
+/// a concrete `Aggregate` of a VARIANT, immediately followed by `Return`.
+///
+/// A near-verbatim sibling of [`sem_struct_return_shape_of`] — same sole-writer gate,
+/// same spine-statement whitelist, same unique-return-block / reachability gates, same
+/// `active_field == None` literal gate, same PARAM-ROOT admission for scalar fields, and
+/// the same `OpaqueParam` binder for a field with no `Int`-sorted denotation. Three
+/// things differ, all of them enum-specific:
+///
+///   1. `variants` must be NON-empty (a struct return is the sibling lane's business);
+///   2. the flat `__tag` / `__v{v}_{f}` field view is EXPECTED here rather than a
+///      legacy-dump decline — an enum's `Ty::Adt::fields` IS that union view, and the
+///      constructor's real shape comes from `variants[v].fields`;
+///   3. arity and field types are cross-checked against the CONSTRUCTED VARIANT, and
+///      against the registered carrier's v-th constructor.
+pub fn sem_enum_ctor_return_shape_of(
+    func: &trust_types::VerifiableFunction,
+) -> Option<SemEnumCtorReturn> {
+    sem_enum_ctor_return_shape_reasoned(func).ok()
+}
+
+/// [`sem_enum_ctor_return_shape_of`] with the decline REASON — ONE implementation, two
+/// callers, the sixth application of the discipline on [`sem_adt_return_dispatch_of`].
+///
+/// WHY THIS LANE. Of the 6,523 single-`Aggregate` constructor bodies no extractor
+/// recognizes, **2,183** are declined by the STRUCT lane with "the return is an ENUM" —
+/// i.e. they are this function's business and it refuses them too. After the 2,325 that
+/// are interprocedural, this is the largest reachable class in the whole ADT mass.
+pub(crate) fn sem_enum_ctor_return_shape_reasoned(
+    func: &trust_types::VerifiableFunction,
+) -> Result<SemEnumCtorReturn, &'static str> {
+    use trust_types::{
+        AggregateKind, BlockId, ConstValue, Operand, Rvalue, Statement, Terminator, Ty,
+    };
+    trust_vcgen::validate_function(func).map_err(|_| "validate_function rejects the body")?;
+    let body = &func.body;
+    if !crate::assignment_types::all_assignments_match(body) {
+        return Err("an assignment's operand TYPE does not match its place");
+    }
+    let arg_count = body.arg_count;
+    let param_index = move |local: usize| -> Option<u64> {
+        if (1..=arg_count).contains(&local) { u64::try_from(local - 1).ok() } else { None }
+    };
+
+    // (1) The return type is a concrete ENUM with first-class variant metadata.
+    let Ty::Adt { name: ret_name, variants, .. } = &body.return_ty else {
+        return Err("the return type is not an ADT");
+    };
+    if variants.is_empty() {
+        return Err("a STRUCT return (sem_struct_return_shape_of owns it)");
+    }
+
+    // (4) SOLE-WRITER: exactly one bare `_0` assign; no projected `_0.f` write, no
+    // call-dest / drop of `_0`, no mutable alias.
+    if !local_has_only_guarded_writes(body, 0, 1, 0) {
+        return Err("`_0` is not written EXACTLY ONCE bare (projected/call-dest/aliased)");
+    }
+
+    // (C) SPINE-STATEMENT WHITELIST — straight-line terminators + storage-or-unprojected
+    // Assign statements only. A `SetDiscriminant` write declines here, which is what
+    // keeps this lane to genuine `Aggregate` construction.
+    for block in &body.blocks {
+        match &block.terminator {
+            Terminator::Goto(_) | Terminator::Return => {}
+            Terminator::Drop { .. } => return Err("a DROP terminator on the spine"),
+            Terminator::SwitchInt { .. } => return Err("a SWITCHINT terminator on the spine"),
+            Terminator::Call { .. } => return Err("a CALL terminator on the spine"),
+            Terminator::Unreachable => return Err("an UNREACHABLE terminator on the spine"),
+            _ => return Err("some other non-straight-line terminator on the spine"),
+        }
+        for stmt in &block.stmts {
+            match stmt {
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::PlaceMention(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                Statement::Assign { place, .. } if place.projections.is_empty() => {}
+                _ => return Err("a PROJECTED assignment on the spine (e.g. a deref write)"),
+            }
+        }
+    }
+
+    let ret_block = unique_return_block(body).ok_or("no UNIQUE return block")?;
+    let reachable = cfg_reachable_from(body, BlockId(0)).ok_or("the CFG is not walkable")?;
+    if !reachable.contains(&ret_block.id) {
+        return Err("the return block is not reachable from entry");
+    }
+    let agg_idx = ret_block.stmts.iter().position(|s| {
+        matches!(s, Statement::Assign { place, rvalue: Rvalue::Aggregate(..), .. }
+            if place.local == 0 && place.projections.is_empty())
+    })
+    .ok_or("the return block has NO Aggregate assignment to `_0`")?;
+    for stmt in &ret_block.stmts[agg_idx + 1..] {
+        match stmt {
+            Statement::StorageLive(l) | Statement::StorageDead(l) if *l != 0 => {}
+            Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => {}
+            _ => return Err("a statement other than a storage marker FOLLOWS the aggregate"),
+        }
+    }
     let Statement::Assign { rvalue: Rvalue::Aggregate(kind, operands), .. } =
         &ret_block.stmts[agg_idx]
     else {
-        return None;
+        return Err("the sole `_0` write is not an Aggregate in the return block");
     };
     let AggregateKind::Adt { name: agg_name, variant, active_field, .. } = kind else {
-        return None;
+        return Err("the aggregate is not an ADT aggregate (tuple/array/closure)");
     };
-    // (B) active_field == None as a LITERAL gate (union-repr aggregate declines).
+    // (B) union-repr aggregate declines.
     if active_field.is_some() {
-        return None;
+        return Err("UNION-repr aggregate (active_field)");
     }
-    // (2) return-type cross-check: single-variant struct (variant 0), name match, arity.
-    if *variant != 0 || agg_name != ret_name || operands.len() != ret_fields.len() {
-        return None;
+    if agg_name != ret_name {
+        return Err("the aggregate's NAME differs from the return type's name");
+    }
+    let variant_idx = usize::try_from(*variant).map_err(|_| "variant index does not fit usize")?;
+    let variant_def = variants.get(variant_idx).ok_or("no such variant in the return type")?;
+    if variant_def.fields.len() != operands.len() {
+        return Err("the variant's field count differs from the aggregate's arity");
     }
 
-    // (3) CARRIER ADMISSION — reflect the concrete single-`.mk` carrier, register it,
-    // and RE-GET the registry (never assume registration succeeded: a gate-failed
-    // inductive stays in the env but is absent from the registry).
-    let carrier = crate::reflect::reflect_struct(&body.return_ty)?;
-    if !carrier.type_params.is_empty() || carrier.is_enum() {
-        return None; // (7) concrete-only (no Pi-wrapped generic `.mk`); reflect routed to enum.
-    }
-    if carrier.fields.len() != operands.len() {
-        return None;
+    // (3) CARRIER ADMISSION — reflect, register, and RE-GET (a gate-failed inductive
+    // stays in the env but is absent from the registry), then cross-check THIS variant's
+    // constructor arity.
+    let carrier = crate::reflect::reflect_struct(&body.return_ty)
+        .ok_or("the return type does NOT REFLECT to a carrier")?;
+    if !carrier.is_enum() {
+        return Err("reflect routed this type AWAY from the enum family");
     }
     {
-        let mut env = crate::trustir_anchor::trustir_env().ok()?;
+        let mut env = crate::trustir_anchor::trustir_env().map_err(|_| "no anchor env")?;
         let registry =
-            crate::clean_ground::register_adt_carriers(&mut env, std::slice::from_ref(&carrier));
-        let confirmed = registry.get(&carrier.name)?; // re-get: gate-failed carrier is absent.
-        if confirmed.fields.len() != operands.len() {
-            return None;
+            crate::clean_ground::register_adt_carriers(
+                &mut env,
+                &crate::clean_ground::carrier_closure_for(&body.return_ty, &carrier),
+            );
+        let confirmed = registry
+            .get(&carrier.name)
+            .ok_or("the carrier FAILED TO REGISTER (add_inductive / axiom gate)")?;
+        let ctor = confirmed
+            .constructors
+            .get(variant_idx)
+            .ok_or("the REGISTERED carrier has no such constructor")?;
+        if ctor.fields.len() != operands.len() {
+            return Err("the registered constructor's arity differs from the aggregate's");
+        }
+        // The registered constructor must be THIS variant, by discriminant — a carrier
+        // whose constructor order does not track MIR variant order would otherwise
+        // silently build the wrong variant.
+        if ctor.discriminant != variant_def.discriminant {
+            return Err("the registered constructor's DISCRIMINANT differs from the variant's");
         }
     }
 
-    // Per-field values in MIR / constructor order (incl. Unit markers).
+    // Per-field values over the CONSTRUCTED VARIANT's fields.
     let mut fields = Vec::with_capacity(operands.len());
-    for ((_fname, fty), op) in ret_fields.iter().zip(operands.iter()) {
+    for ((_fname, fty), op) in variant_def.fields.iter().zip(operands.iter()) {
         if is_unit_carrier_ty(fty) {
-            // UNIT/PhantomData marker — accepted BY TYPE; the operand must be a `Unit`
-            // constant (an `Int`/`Bool`/other constant in a Unit slot declines).
             match op {
                 Operand::Constant(ConstValue::Unit) => fields.push(SemStructField::Unit),
-                _ => return None,
+                _ => return Err("a UNIT-carrier slot's operand is not the unit constant"),
             }
         } else if matches!(fty, Ty::Int { .. } | Ty::Bool) {
-            // A scalar field — route through the PARAM-ROOT chokepoint (gate A). A
-            // reassigned parameter, a non-parameter place, or a `Unit` constant in an
-            // `Int` slot all fail closed here (`sem_operand_of_mir` returns `None`).
-            let scalar = sem_operand_of_mir(body, op, &param_index)?;
+            // Trust: SCALAR TEMP CHASE (2026-08-27) — same fallback and same soundness
+            // argument as the struct lane above; this lane requires the same straight-line
+            // spine, so a sole static assignment is the definition.
+            let scalar = resolve_cast_source_operand(body, op, &param_index, None)
+                .ok_or("a SCALAR field's operand does not resolve")?;
             fields.push(SemStructField::Scalar(scalar));
+        } else if matches!(fty, Ty::Adt { .. })
+            || carrier
+                .constructors
+                .get(variant_idx)
+                .and_then(|c| c.fields.get(fields.len()))
+                .is_some_and(|(_, code)| crate::reflect::carrier_mentions_param(code))
+        {
+            // No `Int`-sorted denotation — a parameter-keyed opaque binder, exactly as on
+            // the struct lane. `Ty::Ref`/`Ty::RawPtr` fall through to the decline below.
+            let (Operand::Copy(place) | Operand::Move(place)) = op else {
+                return Err("a field operand is a CONSTANT where a place is required");
+            };
+            // Trust: PROJECTED SOURCE (2026-08-25) — a bare read, or exactly ONE field
+            // projection of a parameter. Anything deeper (a deref, an index, a nested
+            // field chain) is refused: its value is not determined by the parameter's
+            // entry value alone.
+            // A NESTED CONSTRUCTOR first (exact structure), else a bare-or-one-field
+            // read of a PARAMETER or a TEMPORARY that provably copies one.
+            if let Some(nested) = nested_ctor_field_of(body, place, &param_index, 0) {
+                fields.push(nested);
+            } else {
+                let (param, part) = resolve_temp_field_source(body, place, &param_index)
+                    .ok_or("a field operand is not a resolvable PARAMETER PART")?;
+                fields.push(SemStructField::OpaqueParam { param, part });
+            }
         } else {
-            // (E) POINTER / ref / nested-struct / slice field — OUT of increment 1.
-            // A raw-ptr / `NonNull` root is NOT admitted in this lane (fail closed)
-            // until `sliceStart`/`ptrOffset` land with their gates (increment 3).
-            return None;
+            return Err("a POINTER / reference / slice field type");
         }
     }
 
-    Some(SemStructReturn { struct_ty: body.return_ty.clone(), fields })
+    Ok(SemEnumCtorReturn {
+        enum_ty: body.return_ty.clone(),
+        variant: variant_idx,
+        fields,
+    })
 }
 
 /// Recognize the projection behind an immutable `&s[i]` reference return: the place must
@@ -1044,8 +2474,7 @@ pub(super) fn slice_ref_projection_of_ref_place(
     // without the leading `Deref`) declines.
     let kind = match place.projections.as_slice() {
         [Projection::Deref, Projection::Index(idx_local)] => {
-            let idx =
-                resolve_index_operand(body, *idx_local, use_site.0, use_site.1, param_index)?;
+            let idx = resolve_index_operand(body, *idx_local, use_site.0, use_site.1, param_index)?;
             SliceRefProjKind::Index(idx)
         }
         [Projection::Deref, Projection::ConstantIndex { offset, min_length, from_end }] => {
@@ -1706,6 +3135,7 @@ pub fn sem_adt_return_opaque_shape_of(
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             ..
         } = term
         else {
@@ -1936,8 +3366,10 @@ pub fn sem_adt_return_opaque_shape_of(
             if place.local != 0 || !place.projections.is_empty() {
                 return None;
             }
-            let Rvalue::Aggregate(AggregateKind::Adt { name, variant, active_field: None, .. }, ops) =
-                rvalue
+            let Rvalue::Aggregate(
+                AggregateKind::Adt { name, variant, active_field: None, .. },
+                ops,
+            ) = rvalue
             else {
                 return None;
             };
@@ -2112,7 +3544,14 @@ pub fn sem_adt_return_opaque_ord_shape_of(
     else {
         return None;
     };
-    let expected_ordering = [("Less", 255i128), ("Equal", 0), ("Greater", 1)];
+    // DECODED tags. `VariantDef::discriminant` crossed the extraction boundary as
+    // a raw two's-complement bit pattern until that boundary began decoding it, so
+    // this list read `("Less", 255)`; against a body extracted by a decoding
+    // compiler that comparison can never hold, and the lane would silently accept
+    // nothing. The SwitchInt arm labels below are a DIFFERENT channel and are
+    // still the raw `u128` the MIR carries — 255 there is correct and is not a
+    // leftover.
+    let expected_ordering = [("Less", -1i128), ("Equal", 0), ("Greater", 1)];
     if ordering_name != "std::cmp::Ordering"
         || ordering_variants.len() != expected_ordering.len()
         || !ordering_variants.iter().zip(expected_ordering).all(|(actual, expected)| {
@@ -2158,6 +3597,7 @@ pub fn sem_adt_return_opaque_ord_shape_of(
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         ..
     } = &bb0.terminator
     else {
@@ -2210,7 +3650,12 @@ pub fn sem_adt_return_opaque_ord_shape_of(
                 place,
                 rvalue:
                     Rvalue::Aggregate(
-                        AggregateKind::Adt { name, variant: actual_variant, active_field: None, .. },
+                        AggregateKind::Adt {
+                            name,
+                            variant: actual_variant,
+                            active_field: None,
+                            ..
+                        },
                         operands,
                     ),
                 ..
@@ -2292,6 +3737,7 @@ pub fn sem_adt_return_opaque_ord_shape_of(
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         ..
     } = &bb7.terminator
     else {
@@ -2334,6 +3780,7 @@ pub fn sem_adt_return_opaque_ord_shape_of(
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         ..
     } = &bb5.terminator
     else {
@@ -2532,6 +3979,7 @@ pub fn sem_scalar_sentinel_select_shape_of(
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         ..
     } = &entry.terminator
     else {

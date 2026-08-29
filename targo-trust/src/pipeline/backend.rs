@@ -544,7 +544,9 @@ pub(super) fn append_codegen_backend_args(
 pub(super) fn append_verification_mode_rustflags(flags: &mut String, allow_l0_gaps: bool) {
     // Verification and strictness are batteries-on. Only the explicit
     // advisory loosener needs a mode flag.
-    if allow_l0_gaps && !args_have_z_bool_flag(&split_plain_rustflags(flags), "trust-policy=advisory", true) {
+    if allow_l0_gaps
+        && !args_have_z_bool_flag(&split_plain_rustflags(flags), "trust-policy=advisory", true)
+    {
         if !flags.is_empty() {
             flags.push(' ');
         }

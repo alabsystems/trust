@@ -30,7 +30,7 @@
 
 #![cfg(feature = "ay-proofs")]
 
-use trust_cg_bridge::verify_output::{verify_output_preserved, OutputVerdict, ProvenEvidence};
+use trust_cg_bridge::verify_output::{OutputVerdict, ProvenEvidence, verify_output_preserved};
 use trust_types::grade::{AxiomClosure, GradeRecord, ProofValidation};
 use trust_types::{
     AssuranceLevel, BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan,
@@ -215,10 +215,7 @@ fn non_citation_evidence_carries_no_grade_record() {
 #[test]
 fn citation_grade_is_minted_once_at_the_citation_site() {
     let src = include_str!("../src/verify_output.rs");
-    assert!(
-        src.contains("fn structural_citation_evidence"),
-        "the single mint helper must exist"
-    );
+    assert!(src.contains("fn structural_citation_evidence"), "the single mint helper must exist");
     assert!(
         src.contains("return Some(structural_citation_evidence(width))"),
         "the citation path must mint through the helper"
@@ -241,14 +238,11 @@ fn citation_grade_is_minted_once_at_the_citation_site() {
 /// future edit that quietly promotes it fails here.
 #[test]
 fn citation_is_not_counted_as_proved() {
-    for src in [
-        include_str!("../src/verify_output.rs"),
-        include_str!("../src/verify_output_trust_ir.rs"),
-    ] {
-        let proved_arm = src
-            .split("=> report.proved += 1")
-            .next()
-            .expect("a proved-counting arm must exist");
+    for src in
+        [include_str!("../src/verify_output.rs"), include_str!("../src/verify_output_trust_ir.rs")]
+    {
+        let proved_arm =
+            src.split("=> report.proved += 1").next().expect("a proved-counting arm must exist");
         // The LAST proved arm before the counter must not mention the citation.
         let tail = &proved_arm[proved_arm.len().saturating_sub(400)..];
         assert!(
@@ -256,8 +250,22 @@ fn citation_is_not_counted_as_proved() {
             "a StructuralCitation must NOT be counted as proved — the kernel never \
              re-checked a term for the instance:\n{tail}"
         );
+        // Trust: check the GROUPING, not its formatting.
+        //
+        // This pinned an exact multi-line spelling — `StructuralCitation { .. }`,
+        // a newline, sixteen spaces, then `| ProvenEvidence::AyValidated`. rustfmt
+        // has since joined that match arm onto ONE line, so the substring stopped
+        // matching while the property it guards was completely intact. The test
+        // was reporting a formatting change as a soundness failure.
+        //
+        // Collapsing whitespace keeps the real assertion — the two variants share
+        // a match arm, which is what puts a citation on the [VALIDATED] surface
+        // and makes StrictProvenOnly refuse it — and survives the next reflow.
+        let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            src.contains("ProvenEvidence::StructuralCitation { .. }\n                | ProvenEvidence::AyValidated"),
+            collapsed.contains(
+                "ProvenEvidence::StructuralCitation { .. } | ProvenEvidence::AyValidated"
+            ),
             "a citation must be grouped with the [VALIDATED] surface, so \
              StrictProvenOnly refuses it"
         );

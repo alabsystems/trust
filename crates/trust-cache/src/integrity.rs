@@ -267,11 +267,7 @@ mod tests {
     fn test_hex_decode_odd_length_fails_closed() {
         assert_eq!(hex_decode("a"), None, "1-char hex must fail closed");
         assert_eq!(hex_decode("abc"), None, "odd-length hex must fail closed");
-        assert_eq!(
-            hex_decode(&"f".repeat(65)),
-            None,
-            "odd-length tag-sized hex must fail closed"
-        );
+        assert_eq!(hex_decode(&"f".repeat(65)), None, "odd-length tag-sized hex must fail closed");
     }
 
     #[test]

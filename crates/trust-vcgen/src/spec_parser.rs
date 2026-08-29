@@ -21,7 +21,7 @@ use trust_types::{
 /// For each spec clause:
 /// - `requires` clauses become `Precondition` VCs
 /// - `ensures` clauses become `Postcondition` VCs
-/// - `invariant` clauses become `Assertion` VCs
+/// - `invariant` clauses become `ContractInvariant` VCs
 ///
 /// Each VC's formula is the *negation* of the spec formula (we check for
 /// violations: if UNSAT, the spec holds; if SAT, the model is a counterexample).
@@ -151,36 +151,45 @@ pub(crate) fn generate_spec_vcs(func: &VerifiableFunction) -> Vec<VerificationCo
         ) {
             continue;
         }
-        if let Some(formula) = parse_spec_expr(expr) {
-            if crate::contracts::formula_uses_unmodeled_machine_arithmetic_in_function(
-                func, &formula,
-            ) {
-                vcs.push(crate::contracts::spec_unverifiable_vc(
-                    func,
-                    func.span.clone(),
-                    "invariant uses unmodeled fixed-width machine arithmetic",
-                    expr,
-                    contract_metadata,
-                ));
-                continue;
-            }
-            vcs.push(VerificationCondition {
-                kind: VcKind::Assertion { message: format!("invariant: {expr}") },
-                function: func.name.as_str().into(),
-                location: func.span.clone(),
-                formula: Formula::Not(Box::new(formula)),
-                contract_metadata,
-                obligation: None,
-            });
+        // Second mint site of the `#[invariant(..)]` clause (the `FunctionSpec`
+        // route). It must agree with the raw-contract route in `contracts.rs`
+        // or one spelling of the SAME clause would keep the fail-open the other
+        // lost — so, like that one, it fails closed for EVERY predicate.
+        //
+        // This arm used to split on `parse_spec_expr`: a parseable predicate
+        // became `ContractInvariant` with `formula: Not(parsed)` and an
+        // unparseable one became `spec_unverifiable_vc`. The split was the bug.
+        // With no program point to bind the clause's free names at, `Not(P)` is
+        // the entire query, so the row asks `is P VALID` — a question about the
+        // predicate's text and not about the program. It therefore reported
+        // PROVED exactly for the predicates that constrain NOTHING. MEASURED on
+        // `trust-e26541e3`: `invariant(1 == 1)` and `invariant(x == x)` came
+        // back `proved` / `clean-kernel-certified`, while `invariant(x >= 0)`
+        // on a `u32`, `invariant(true)` and `invariant(false)` all came back
+        // `unknown`. Parsing SUCCESS was the precondition for minting a vacuous
+        // kernel-certified `proved_by_kind.invariant` row.
+        //
+        // So parseability no longer decides anything here; it cannot, because a
+        // predicate this lane can parse is still a predicate this lane cannot
+        // situate. Both branches fail closed, with the detail distinguishing
+        // them for the reader. `spec_unverifiable_vc` sets
+        // `formula: Formula::Bool(true)`, which is trivially satisfiable, so
+        // neither the solver pipeline nor a direct caller can report proof.
+        let detail = if parse_spec_expr(expr).is_some() {
+            "item-position `invariant` names no program point, so it has no exact meaning to \
+             lower; a predicate checked in isolation is provable only when it is a tautology. \
+             Use the first-class loop clause `while <cond> invariant <predicate> { .. }`, or \
+             `requires`/`ensures` for an entry/return condition"
         } else {
-            vcs.push(crate::contracts::spec_unverifiable_vc(
-                func,
-                func.span.clone(),
-                "unparseable invariant",
-                expr,
-                contract_metadata,
-            ));
-        }
+            "unparseable invariant"
+        };
+        vcs.push(crate::contracts::spec_unverifiable_vc(
+            func,
+            func.span.clone(),
+            detail,
+            expr,
+            contract_metadata,
+        ));
     }
 
     vcs
@@ -282,6 +291,44 @@ mod tests {
         assert!(vcs.is_empty());
     }
 
+    /// REGRESSION GUARD for the one way this refusal could break the surface
+    /// that WORKS.
+    ///
+    /// `FunctionSpec::from_contracts` and `FunctionSpec::from_attributes` both
+    /// route `ContractKind::LoopInvariant` into the SAME `spec.invariants`
+    /// vector as item-position `ContractKind::Invariant`. A native
+    /// `while <cond> invariant <predicate> { .. }` clause therefore appears in
+    /// the very list this refusal walks, and if the refusal caught it, the one
+    /// contract surface measured to PROVE end-to-end — four obligations, one of
+    /// them kernel-certified — would start reporting an unprovable row instead.
+    ///
+    /// It does not, because `claim_raw_contract_mirror` treats a raw
+    /// `LoopInvariant` row as the owner of the mirrored spec text, so the entry
+    /// is claimed and skipped here while the raw row goes to
+    /// `generate_loop_invariant_vcs` with its real MIR loop header. That
+    /// ownership is what keeps the two surfaces separate, so it is pinned here
+    /// rather than trusted.
+    #[test]
+    fn native_loop_invariant_is_not_caught_by_the_item_position_refusal() {
+        let body = "bb0:x > 0";
+        let spec =
+            FunctionSpec { requires: vec![], ensures: vec![], invariants: vec![body.to_string()] };
+        let mut func = spec_test_function(spec);
+        func.contracts.push(Contract {
+            kind: ContractKind::LoopInvariant,
+            span: SourceSpan::default(),
+            body: body.to_string(),
+        });
+
+        let vcs = generate_spec_vcs(&func);
+
+        assert!(
+            vcs.is_empty(),
+            "the raw LoopInvariant row owns this clause; the compatibility mirror must emit \
+             nothing here, and in particular must not emit the item-position refusal: {vcs:#?}",
+        );
+    }
+
     #[test]
     fn spec_only_machine_arithmetic_clauses_all_fail_closed() {
         let spec = FunctionSpec {
@@ -302,7 +349,10 @@ mod tests {
             !vcs.iter().any(|vc| {
                 matches!(
                     vc.kind,
-                    VcKind::Precondition { .. } | VcKind::Postcondition | VcKind::Assertion { .. }
+                    VcKind::Precondition { .. }
+                        | VcKind::Postcondition
+                        | VcKind::Assertion { .. }
+                        | VcKind::ContractInvariant { .. }
                 )
             }),
             "no mathematical-Int contract row may reach a solver: {vcs:#?}",
@@ -350,8 +400,21 @@ mod tests {
         );
     }
 
+    /// REGRESSION LOCK, twin of the raw-contract one in `contracts.rs`. The
+    /// `FunctionSpec` route is the SECOND mint site of the same clause; if only
+    /// one of the two fails closed, the other keeps the fail-open.
+    ///
+    /// This lock is STRICTLY STRONGER than the one it replaces. The old lock
+    /// required only that the row not be `VcKind::Assertion` (whose
+    /// `has_runtime_fallback` is unconditionally `true`), and was satisfied by
+    /// `VcKind::ContractInvariant` with `formula: Not(parsed)`. That shape was
+    /// still refutable, and MEASURED on `trust-e26541e3` it came back
+    /// `proved` / `clean-kernel-certified` for `1 == 1` and for `x == x` — the
+    /// predicates that constrain nothing. The `has_runtime_fallback` asserts are
+    /// kept verbatim so the property the old lock bought is not lost, and the
+    /// non-refutability assert below is what closes the vacuous-proof hole.
     #[test]
-    fn test_invariant_generates_assertion_vc() {
+    fn item_position_invariant_is_non_refutable_and_never_provable() {
         let spec = FunctionSpec {
             requires: vec![],
             ensures: vec![],
@@ -360,9 +423,104 @@ mod tests {
         let func = spec_test_function(spec);
         let vcs = generate_spec_vcs(&func);
 
-        assert_eq!(vcs.len(), 1);
+        assert_eq!(vcs.len(), 1, "the authored clause must stay visible: {vcs:#?}");
         assert!(
-            matches!(&vcs[0].kind, VcKind::Assertion { message } if message == "invariant: n > 0")
+            matches!(&vcs[0].kind, VcKind::UnsupportedMir { kind, .. }
+                if kind == crate::contracts::SPEC_UNVERIFIABLE_KIND),
+            "got {:?}",
+            vcs[0].kind
+        );
+        assert!(
+            !matches!(vcs[0].kind, VcKind::ContractInvariant { .. }),
+            "the refutable shape must not come back: {:?}",
+            vcs[0].kind
+        );
+        assert_eq!(
+            vcs[0].formula,
+            Formula::Bool(true),
+            "a trivially-satisfiable formula is the only shape no solver can report proved",
+        );
+        for env in [
+            trust_types::RuntimeCheckEnv::new(false, false),
+            trust_types::RuntimeCheckEnv::new(true, false),
+            trust_types::RuntimeCheckEnv::new(false, true),
+            trust_types::RuntimeCheckEnv::new(true, true),
+        ] {
+            assert!(
+                !vcs[0].kind.has_runtime_fallback_in(env),
+                "a span-only attribute has no runtime check under {env:?}"
+            );
+        }
+    }
+
+    /// THE MEASURED BUG, as an executable test.
+    ///
+    /// On `trust-e26541e3` these four predicates split two-and-two: the
+    /// TAUTOLOGIES (`1 == 1`, `x == x`) were reported `proved` by
+    /// `clean-kernel-certified`, and the contingent ones (`x >= 0` on a `u32`,
+    /// `false`) were reported `unknown`. A row whose PROVED set is exactly the
+    /// set of predicates that say nothing is a vacuous-proof generator, and it
+    /// minted `kind: "invariant"` at `ProofLevel::L1Functional` — a
+    /// contract-kind, kernel-certified row, which is precisely what a
+    /// verification ratchet counts as headline progress.
+    ///
+    /// The lock is that a tautology and a contingent predicate now produce the
+    /// SAME non-refutable row, so no choice of predicate text can buy credit.
+    #[test]
+    fn no_invariant_predicate_can_buy_credit_regardless_of_tautology() {
+        for expr in ["1 == 1", "x == x", "x >= 0", "false", "n > 0"] {
+            let spec = FunctionSpec {
+                requires: vec![],
+                ensures: vec![],
+                invariants: vec![expr.to_string()],
+            };
+            let func = spec_test_function(spec);
+            let vcs = generate_spec_vcs(&func);
+
+            assert_eq!(vcs.len(), 1, "`{expr}` must mint exactly one row: {vcs:#?}");
+            assert_eq!(
+                vcs[0].formula,
+                Formula::Bool(true),
+                "`{expr}` must be non-refutable; a tautology must not be provable here",
+            );
+            assert!(
+                matches!(&vcs[0].kind, VcKind::UnsupportedMir { kind, .. }
+                    if kind == crate::contracts::SPEC_UNVERIFIABLE_KIND),
+                "`{expr}` got {:?}",
+                vcs[0].kind,
+            );
+        }
+    }
+
+    /// NEGATIVE TEST: the still-supported neighbours must keep their exact
+    /// treatment. Refusing item-position `invariant` must not be implemented by
+    /// dulling `requires`/`ensures`, and in particular must not shrink the
+    /// denominator for them.
+    #[test]
+    fn refusing_item_invariant_does_not_disturb_requires_or_ensures() {
+        let spec = FunctionSpec {
+            requires: vec!["x > 0".to_string()],
+            ensures: vec!["result >= 0".to_string()],
+            invariants: vec!["1 == 1".to_string()],
+        };
+        let func = spec_test_function(spec);
+        let vcs = generate_spec_vcs(&func);
+
+        assert_eq!(vcs.len(), 3, "one row per authored clause: {vcs:#?}");
+        let pre: Vec<_> =
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
+        let post: Vec<_> =
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).collect();
+        assert_eq!(pre.len(), 1, "`requires` keeps its Precondition row: {vcs:#?}");
+        assert_eq!(post.len(), 1, "`ensures` keeps its Postcondition row: {vcs:#?}");
+        assert_eq!(pre[0].formula, Formula::Bool(false), "definition-site precondition unchanged");
+        assert_eq!(
+            post[0].formula,
+            Formula::Not(Box::new(Formula::Ge(
+                Box::new(Formula::Var("_0".into(), Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ))),
+            "the postcondition stays a real refutable obligation over the return slot",
         );
     }
 
@@ -381,7 +539,8 @@ mod tests {
         let pre_count =
             vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).count();
         let post_count = vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).count();
-        let inv_count = vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Assertion { .. })).count();
+        let inv_count =
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::ContractInvariant { .. })).count();
         let unsupported_count =
             vcs.iter().filter(|vc| matches!(vc.kind, VcKind::UnsupportedMir { .. })).count();
 

@@ -1451,9 +1451,19 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         }
 
         // step 2 — declaration gate: any bodyless callee in the closure means there is no local
-        // body to link (extern / havoc / unresolved). LOAD-BEARING: a reachable vararg-sig
-        // declaration would err `SignatureMismatch` in the interpreter, which would surface as a
-        // FALSE oracle verdict.
+        // body to link. LOAD-BEARING: a reachable vararg-sig declaration would err
+        // `SignatureMismatch` in the interpreter, which would surface as a FALSE oracle verdict.
+        //
+        // Trust (B8 step 1): "no local body to link" is FIVE different facts — see [`DeclKind`].
+        // This gate is the corpus's largest single non-verdict class (983 clean rows on
+        // postbuild-slice20-control), and until this slice it reported all five under one name,
+        // which happened to be the name of only one of them. `blocker_summary` below names them.
+        //
+        // NOTE FOR ANYONE PRICING THIS CLASS: the count here is a FIRST-BLOCKER count. This loop
+        // is an eight-step first-wins chain, so a body refused at step 2 has never been tested
+        // against steps 3-8, and clearing step 2 for it is not the same as reaching a verdict.
+        // Measured on the same artifact, the bodies that DO clear step 2 reach `Agreed` 70 times
+        // out of 164 — and they are the easy end of the population (a fully bodyful closure).
         let declarations: Vec<FuncId> = closure
             .iter()
             .copied()
@@ -1479,11 +1489,17 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
             if tracing::enabled!(tracing::Level::DEBUG) {
                 row1_dead_path_probe(r, entry, &closure, &declarations, records, assembled);
             }
+            // Trust (B8 step 1): NAME the blockers. Everything before the `[blockers: …]` marker
+            // is the pre-split string byte for byte, because three published analyses quote it as
+            // a substring and the scorecard's legacy rule still matches on it.
             verdicts.push(skip(
                 r.def_index,
-                "seam-deferred body: reachable callee closure includes an extern/declaration-only \
-                 callee (no local body to link); crate-seam interpretation not asserted \
-                 (coverage-only)",
+                &format!(
+                    "seam-deferred body: reachable callee closure includes an \
+                     extern/declaration-only callee (no local body to link) [blockers: {}]; \
+                     crate-seam interpretation not asserted (coverage-only)",
+                    blocker_summary(assembled, &declarations)
+                ),
             ));
             continue;
         }
@@ -1655,6 +1671,59 @@ fn run_seam_differentials(records: &[BodyRecord], assembled: &Assembled) -> Vec<
         });
     }
     verdicts
+}
+
+/// Trust (B8 step 1): render a deferred body's bodyless reachable callees as a counted,
+/// deterministically-ordered [`DeclKind`] census for the step-2 skip note — e.g.
+/// `extern=3, local-unlowered=1`.
+///
+/// The counts are DISTINCT reachable callees, not call sites: `declarations` is filtered out of
+/// the step-1 BFS closure, which dedups on `FuncId`. So `extern=3` means three different bodyless
+/// functions are reachable, however many times each is called. That is the right unit here — the
+/// question the census answers is what would have to be MODELLED to clear the gate.
+///
+/// This is the whole of the measurement. Everything downstream (the scorecard's
+/// `clean-skip-seam-decl-*` split, the dominant/sole/participation census, the ranking of what
+/// Step 2 should be) is a pure function of this string.
+///
+/// Three properties it must have, each of which a test pins:
+///
+/// * **Deterministic.** Classes are emitted in [`DeclKind::ALL`] order, never in the order the
+///   BFS happened to walk the closure, so the note is stable across runs and the artifact stays
+///   diffable against a control.
+/// * **Total.** A declaration whose key this taxonomy cannot parse — or, defensively, a closure
+///   member that is not in the module at all, which the step-2 filter admits via its
+///   `unwrap_or(true)` — is counted under `unclassified`. It is NEVER attributed to a
+///   neighbouring class: the census exists to expose drift between this taxonomy and
+///   `resolve_callee`, and quietly rounding a stranger into `extern` would hide precisely that.
+///   `unclassified` is expected to be 0; a non-zero count is a finding, not a rounding error.
+/// * **Non-empty.** The caller only reaches this with `!declarations.is_empty()`, so the marker
+///   always carries at least one class and the scorecard can distinguish "split" from "this
+///   artifact predates the split" by presence alone.
+fn blocker_summary(assembled: &Assembled, declarations: &[FuncId]) -> String {
+    let mut counts = [0usize; DeclKind::ALL.len()];
+    let mut unclassified = 0usize;
+    for fid in declarations {
+        let kind = assembled
+            .decl_keys
+            .iter()
+            .find(|(id, _)| id == fid)
+            .and_then(|(_, key)| DeclKind::from_key(key));
+        match kind {
+            Some(k) => counts[DeclKind::ALL.iter().position(|c| *c == k).unwrap()] += 1,
+            None => unclassified += 1,
+        }
+    }
+    let mut parts: Vec<String> = DeclKind::ALL
+        .iter()
+        .zip(counts)
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{}={}", k.prefix(), n))
+        .collect();
+    if unclassified > 0 {
+        parts.push(format!("unclassified={unclassified}"));
+    }
+    parts.join(", ")
 }
 
 /// Trust (slice 20 ride-along b): the ROW-1 DEAD-PATH PROBE. **Instrument only — ships no
@@ -2041,7 +2110,17 @@ fn install_deferred_verification_disclosure(
 /// when the crate has no HIR body owners; an explicitly requested genuinely empty dump still
 /// publishes a deterministic empty module and coverage sidecar. A partial/missing registry is a
 /// semantic finalization error, never an empty success.
-pub fn finalize_and_dump(tcx: TyCtxt<'_>) -> FinalizeSummary {
+// Trust (IR-1, docs/design/2026-08-27-two-language-direct-to-trust-ir.md §3):
+// `clean_origin` is the finalize-seam collection of Clean-origin trust-ir
+// spellings (re-earned kernel verdict per def, `rustc_mir_transform::
+// clean_origin_ir`). `None` = verification off, the collection deliberately
+// did not run — recorded as a disclosed absence in coverage, never silently.
+// All substantive append/disclosure logic lives in `clean_origin_join` /
+// `contract_disclosure`; this frozen file only plumbs.
+pub fn finalize_and_dump(
+    tcx: TyCtxt<'_>,
+    clean_origin: Option<Vec<crate::clean_origin_join::CleanOriginIrOutcome>>,
+) -> FinalizeSummary {
     // Trust (B9-A): the registry drain, resolve, and assemble now run UNGATED — the crate-seam
     // differential ([`run_seam_differentials`]) needs the assembled crate module on every
     // `-Z trust-ir-lower` compile, not only when `-Z trust-dump=ir:` requested an artifact. Only
@@ -2194,6 +2273,16 @@ pub fn finalize_and_dump(tcx: TyCtxt<'_>) -> FinalizeSummary {
     ) {
         errors.push(error);
     }
+    // Trust (IR-3, design §5): the authored-contract disclosure — a DesignOnly
+    // SpecModule from the typed `trust_contracts` query, non-claim by
+    // construction; the tripwire re-run below covers it.
+    if let Err(error) = crate::contract_disclosure::install_contract_disclosure(
+        tcx,
+        &assembled.assigned,
+        &mut assembled.module,
+    ) {
+        errors.push(error);
+    }
     errors.extend(direct_authority_inventory_errors(&assembled.module));
     if !errors.is_empty() {
         return failed_semantic_finalization(errors, prepared_publication, emit_target.as_ref());
@@ -2209,6 +2298,36 @@ pub fn finalize_and_dump(tcx: TyCtxt<'_>) -> FinalizeSummary {
         // A partial, duplicate, unexpected, or internally inconsistent seam stream cannot back a
         // per-body evidence artifact. Abort even when no dump was requested so tracing and
         // publication share the same exact inventory contract.
+        return failed_semantic_finalization(errors, prepared_publication, emit_target.as_ref());
+    }
+
+    // Trust (IR-1, design §3.2): append the Clean-origin trust-ir spellings —
+    // AFTER the seam differentials (their population is the THIR records and
+    // must not see appended rows) and BEHIND a fresh authority-tripwire run
+    // (appended functions are claim-free by construction; this re-run is the
+    // enforcement, not a formality). Ids stay dense: minted at push in
+    // `clean_origin_join`.
+    let mut clean_origin_summary = match clean_origin {
+        Some(outcomes) => crate::clean_origin_join::append_clean_origin(
+            &mut assembled.module,
+            outcomes,
+            &mut errors,
+        ),
+        None => crate::clean_origin_join::CleanOriginJoinSummary::not_recorded(),
+    };
+    // Trust (IR-5, design §6.5): re-point the caller's fail-closed declaration
+    // edges onto the appended Clean-origin definitions — post-append, per-edge
+    // arity-guarded, and shape-certified per touched function by the same
+    // EXECUTABLE remap certificate discipline pass 2 argues (the pass-3 writer
+    // and its guards live in `clean_origin_join`; this frozen file only plumbs).
+    crate::clean_origin_join::link_clean_origin_edges(
+        &mut assembled.module,
+        &assembled.decl_keys,
+        &mut clean_origin_summary,
+        &mut errors,
+    );
+    errors.extend(direct_authority_inventory_errors(&assembled.module));
+    if !errors.is_empty() {
         return failed_semantic_finalization(errors, prepared_publication, emit_target.as_ref());
     }
 
@@ -2234,6 +2353,7 @@ pub fn finalize_and_dump(tcx: TyCtxt<'_>) -> FinalizeSummary {
                 &assembled.coverage_rows,
                 assembled.spliced,
                 assembled.declarations,
+                &clean_origin_summary,
             ) {
                 Ok(coverage) => {
                     rendered = Some((
@@ -3585,6 +3705,113 @@ fn patch_placeholder(func: Option<&mut Function>, value: ValueId, constant: Cons
     false
 }
 
+/// Trust (B8 step 1): the CLOSED taxonomy of reasons `resolve_callee` refuses to link a callee
+/// and mints a bodyless declaration instead.
+///
+/// # What this replaced, and what the anonymity cost
+///
+/// These five classes already existed — as five `format!` literals inside `resolve_callee`,
+/// whose only job was to keep a local path from dedup-merging with an extern one. What did NOT
+/// exist was any way to ask, of an assembled module, WHICH class a given declaration came from:
+/// [`decl_id`] consumes the key for interning and drops it, so by the time
+/// [`run_seam_differentials`] step 2 met a bodyless callee the sole surviving fact was
+/// `Function::is_declaration()` — a bool.
+///
+/// So step 2 pushed one string for all five, and the scorecard folded the lot into a single
+/// `clean-skip-extern-callee` class. Measured on `postbuild-slice20-control`: **983 clean rows
+/// (919 MODELLED + 64 OPAQUE-COLLAPSE) across 577 files** — the largest single non-verdict class
+/// in the corpus, and 50.0% of the MODELLED→Agreed gap, carried as one anonymous label that
+/// names exactly one of the five things it holds. (How much of it is actually
+/// [`Extern`](DeclKind::Extern) was not measurable until this slice; that is the point.)
+///
+/// A class that large with no internal structure cannot be ranked against, because its members
+/// are retired by unrelated work: a [`LocalUnlowered`](DeclKind::LocalUnlowered) blocker falls
+/// out of ordinary clean-rate waves with nobody aiming at it, a [`Havoc`](DeclKind::Havoc)
+/// blocker needs monomorphization, and an [`Extern`](DeclKind::Extern) blocker needs foreign
+/// callees modelled or the path proven dead. Naming them is the whole of this slice.
+///
+/// # Why an enum and not a prefix table
+///
+/// Making the taxonomy a type is what CLOSES the set. `resolve_callee` can no longer mint a
+/// sixth class by writing a new `format!` — every key is built by [`decl_key`], and
+/// [`DeclKind::from_key`] round-trips every variant (`decl_kind_round_trips`). A key that does
+/// not parse is reported as `unclassified` and never folded into a neighbour: a residue means
+/// this taxonomy has drifted from its producer, which is exactly the failure the split exists to
+/// make visible.
+///
+/// # Variant order is TRACTABILITY, least tractable first
+///
+/// [`DeclKind::ALL`]'s order is load-bearing, and the variants are declared to match it. A body
+/// whose closure carries several classes is attributed to the FIRST one present, so no class is
+/// ever credited with a body that retiring it alone would not unblock. Each per-class count is
+/// therefore a lower bound on what that class is worth — the honest direction for a number that
+/// decides whether to spend a campaign. The scorecard reports `sole_blocker` alongside it, which
+/// is the count to actually rank against.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum DeclKind {
+    /// A genuinely foreign callee: one ledger identity, not local. No body exists anywhere in
+    /// this crate to link, so nothing short of modelling the callee (or proving the call site
+    /// dead — see [`row1_dead_path_probe`]) retires it.
+    Extern,
+    /// No ledger entry at all behind the emitted `FuncId` (`r.callees` has no row for it), so
+    /// there is not even site evidence to type a return with. A producer instrumentation gap
+    /// rather than a property of the program.
+    Unknown,
+    /// A FORCED-HAVOC edge — a generic call site, which declares even when its `DefIndex` has a
+    /// perfectly clean local body (wave-20). Retired by monomorphization (B8 proper), never by
+    /// clean-rate work.
+    Havoc,
+    /// Two or more distinct identities behind one `DefIndex`-derived `FuncId`: which BODY to
+    /// link is a guess, so it declares. Retired by a finer callee identity.
+    Ambiguous,
+    /// A real local fn whose OWN body did not lower cleanly, so there was no spliced target to
+    /// point at. CLEAN-RATE-COUPLED: the one class ordinary producer waves retire as a side
+    /// effect. It has never had a bucket in any prediction this campaign has made.
+    LocalUnlowered,
+}
+
+impl DeclKind {
+    /// Every variant, in tractability order (see the type docs). The census reports in this
+    /// order and the dominant-blocker rule takes the first present.
+    const ALL: [DeclKind; 5] = [
+        DeclKind::Extern,
+        DeclKind::Unknown,
+        DeclKind::Havoc,
+        DeclKind::Ambiguous,
+        DeclKind::LocalUnlowered,
+    ];
+
+    /// The dedup-key prefix. These strings are LOAD-BEARING for declaration identity —
+    /// [`decl_id`] interns on the whole key, so changing one silently re-partitions the module's
+    /// declarations and moves real IR. They are the pre-existing spellings byte for byte, which
+    /// `decl_key_is_byte_identical_to_legacy_spelling` pins.
+    fn prefix(self) -> &'static str {
+        match self {
+            DeclKind::Extern => "extern",
+            DeclKind::Unknown => "unknown",
+            DeclKind::Havoc => "havoc",
+            DeclKind::Ambiguous => "ambiguous",
+            DeclKind::LocalUnlowered => "local-unlowered",
+        }
+    }
+
+    /// Recover the class from a minted key. `None` for anything this taxonomy does not know —
+    /// the caller reports that as `unclassified`, never as a neighbouring class.
+    ///
+    /// Splitting on the FIRST `:` is safe in both directions: no prefix contains a `:`, and the
+    /// remainder is free to (a `def_path` is `foo::bar`, and the call site may append
+    /// `|nres:{n}`).
+    fn from_key(key: &str) -> Option<DeclKind> {
+        let (prefix, _) = key.split_once(':')?;
+        DeclKind::ALL.into_iter().find(|k| k.prefix() == prefix)
+    }
+}
+
+/// Build a class-prefixed declaration dedup key. The ONLY way one is minted.
+fn decl_key(kind: DeclKind, rest: impl std::fmt::Display) -> String {
+    format!("{}:{}", kind.prefix(), rest)
+}
+
 /// How one `Inst::Call { callee }` was resolved during splicing.
 enum CalleeResolution {
     /// Rewritten to the spliced local target's new dense `FuncId`.
@@ -3615,6 +3842,18 @@ struct Assembled {
     /// deferred body's `def_index` → its spliced entry `FuncId`, and (inverting) a reachable
     /// closure member `FuncId` → its callee `def_index` to gather MIR snapshots.
     assigned: Vec<(u32, FuncId)>,
+    /// Trust (B8 step 1): the module's bodyless declarations as `(FuncId, key)` in mint order —
+    /// the SAME `(key, id)` pairs [`decl_id`] interned, carried past assembly instead of being
+    /// dropped with the local `decls` vector.
+    ///
+    /// This has to be carried because it cannot be re-derived at the point it is needed.
+    /// [`run_seam_differentials`] receives `&[BodyRecord] + &Assembled`, and the `FuncId` it holds
+    /// at the declaration gate is a REWRITTEN declaration id — it is not any `CalleeRef::func_id`
+    /// and cannot be mapped back to one: the ledger is keyed on the body-local PRE-rewrite id,
+    /// and one declaration deliberately coalesces an arbitrary number of those across every body
+    /// in the crate (that coalescing is [`decl_id`]'s entire purpose). Re-deriving the class at
+    /// the gate is therefore not merely expensive, it is not well-defined; carrying it is.
+    decl_keys: Vec<(FuncId, String)>,
 }
 
 /// Trust: the coverage/marker spelling of a body's kind (see `BodyRecord::kind`).
@@ -4011,7 +4250,19 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
     let lowered = rows.iter().filter(|r| r.lowered).count();
     let spliced = rows.iter().filter(|r| r.spliced).count();
 
-    Assembled { module, coverage_rows: rows, lowered, spliced, declarations: decls.len(), assigned }
+    // Trust (B8 step 1): keep the (FuncId, key) pairs. `decls` is about to go out of scope with
+    // the only record of WHY each declaration exists; the seam gate needs exactly that.
+    let decl_keys = decls.iter().map(|(k, id, ..)| (*id, k.clone())).collect();
+
+    Assembled {
+        module,
+        coverage_rows: rows,
+        lowered,
+        spliced,
+        declarations: decls.len(),
+        assigned,
+        decl_keys,
+    }
 }
 
 /// Trust (#197 item 3b, R2): does `ty` reach a struct the assembled module could not LAY OUT?
@@ -4245,7 +4496,7 @@ fn resolve_callee(
         // generic site. The distinct `havoc:` key prefix keeps it from coalescing with any real
         // `local:`/`extern:` edge to the same symbol; it counts in the honest can't-resolve bucket.
         [c] if c.force_havoc => CalleeResolution::Decl {
-            key: format!("havoc:{}{}", c.def_path, ret_key(c, maps)),
+            key: decl_key(DeclKind::Havoc, format!("{}{}", c.def_path, ret_key(c, maps))),
             name: c.def_path.clone(),
             is_extern: false,
             ret: decl_ret(c, maps),
@@ -4255,7 +4506,10 @@ fn resolve_callee(
             Some(id) => CalleeResolution::Local(id),
             // A real local fn, but its own body did not lower cleanly — declare, don't link.
             None => CalleeResolution::Decl {
-                key: format!("local-unlowered:{}{}", c.def_path, ret_key(c, maps)),
+                key: decl_key(
+                    DeclKind::LocalUnlowered,
+                    format!("{}{}", c.def_path, ret_key(c, maps)),
+                ),
                 name: c.def_path.clone(),
                 is_extern: false,
                 ret: decl_ret(c, maps),
@@ -4263,7 +4517,7 @@ fn resolve_callee(
             },
         },
         [c] => CalleeResolution::Decl {
-            key: format!("extern:{}{}", c.def_path, ret_key(c, maps)),
+            key: decl_key(DeclKind::Extern, format!("{}{}", c.def_path, ret_key(c, maps))),
             name: c.def_path.clone(),
             is_extern: true,
             ret: decl_ret(c, maps),
@@ -4271,7 +4525,7 @@ fn resolve_callee(
         },
         // No ledger entry at all — there is no site evidence to type a return with.
         [] => CalleeResolution::Decl {
-            key: format!("unknown:{}", callee.index()),
+            key: decl_key(DeclKind::Unknown, callee.index()),
             name: format!("!unknown_callee_{}", callee.index()),
             is_extern: false,
             ret: None,
@@ -4304,7 +4558,10 @@ fn resolve_callee(
             // `!ambiguous_callee_12363` is an ordinary Rust `Result::unwrap`.
             let rust_abi = idents.iter().all(|c| c.is_rust_abi);
             CalleeResolution::Decl {
-                key: format!("ambiguous:{}{}", callee.index(), ret_suffix(&ret)),
+                key: decl_key(
+                    DeclKind::Ambiguous,
+                    format!("{}{}", callee.index(), ret_suffix(&ret)),
+                ),
                 name: format!("!ambiguous_callee_{}", callee.index()),
                 is_extern: false,
                 ret,
@@ -5527,7 +5784,15 @@ fn ty_table_free(ty: &Ty) -> bool {
         // moving it verbatim would dangle the element id (the pre-B2 wholesale
         // `Ty::FatPtr(_) => true` arm was a latent splice bug, caught by the
         // B2 mapping sweep before any producer emitted the Slice kind).
+        // `ContainerLen` (v38) is id-less by construction, so it is table-free
+        // for exactly the reason `Str` is. Omitting it declined the SPLICE of
+        // every body whose signature mentions one: measured, spliced 9 -> 6 on
+        // the fat-pointee fixture, module 142 lines -> 74, which read as "zero
+        // validation errors" because the types were no longer emitted to
+        // validate. A green that comes from emitting NOTHING is what this arm
+        // prevents.
         Ty::FatPtr(trust_ir::FatPtrKind::Str)
+        | Ty::FatPtr(trust_ir::FatPtrKind::ContainerLen)
         | Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { .. }) => true,
         Ty::FatPtr(trust_ir::FatPtrKind::Slice(_)) => false,
         Ty::Vector(elem, _) => ty_table_free(elem),
@@ -5758,6 +6023,10 @@ fn coverage_json(
     rows: &[CoverageRow],
     spliced: usize,
     decls: usize,
+    // Trust (IR-1, design §3.4): the additive `clean_origin` section. Every
+    // pre-existing key, totals entry, and row stays byte-identical; only the
+    // structural comma after the `bodies` array moves.
+    clean_origin: &crate::clean_origin_join::CleanOriginJoinSummary,
 ) -> Result<String, String> {
     use std::fmt::Write as _;
 
@@ -5938,7 +6207,10 @@ fn coverage_json(
             comma,
         );
     }
-    let _ = writeln!(out, "  ]");
+    let _ = writeln!(out, "  ],");
+    // Trust (IR-1, design §3.4): the additive clean-origin section, rendered
+    // by `clean_origin_join` (the frozen file only splices it in).
+    let _ = writeln!(out, "{}", crate::clean_origin_join::coverage_section(clean_origin));
     let _ = writeln!(out, "}}");
     Ok(out)
 }
@@ -6155,7 +6427,7 @@ mod authority_tests {
 
         let mut rows = vec![coverage_row(3, true), coverage_row(7, false)];
         assert!(
-            coverage_json("probe", &rows, 2, 0).is_err(),
+            coverage_json("probe", &rows, 2, 0, &crate::clean_origin_join::CleanOriginJoinSummary::not_recorded()).is_err(),
             "a deferred row without a seam result must not serialize"
         );
 
@@ -6167,7 +6439,7 @@ mod authority_tests {
             note: "linked agreement".to_string(),
         }];
         assert!(install_seam_outcomes(&mut rows, &seam).is_empty());
-        let coverage = coverage_json("probe", &rows, 2, 0).expect("resolved coverage");
+        let coverage = coverage_json("probe", &rows, 2, 0, &crate::clean_origin_join::CleanOriginJoinSummary::not_recorded()).expect("resolved coverage");
         assert!(coverage.contains("trust.thir-lower.crate-module.coverage.v2"));
         assert!(coverage.contains(
             "\"seam\": { \"state\": \"resolved\", \"verdict\": \"agreed\", \"samples\": 4"
@@ -6228,7 +6500,7 @@ mod authority_tests {
         with_digest.lineage = Some(digest);
         with_digest.func_id = Some(4);
         let rows = vec![with_digest, coverage_row(7, false)];
-        let coverage = coverage_json("probe", &rows, 2, 0).expect("resolved coverage");
+        let coverage = coverage_json("probe", &rows, 2, 0, &crate::clean_origin_join::CleanOriginJoinSummary::not_recorded()).expect("resolved coverage");
         assert!(
             coverage.contains(&format!("\"lineage\": \"{digest}\"")),
             "a digest-bearing row must render the Display form the flip event logs"
@@ -6962,6 +7234,7 @@ mod authority_tests {
             &assembled.coverage_rows,
             assembled.spliced,
             assembled.declarations,
+            &crate::clean_origin_join::CleanOriginJoinSummary::not_recorded(),
         )
         .expect("empty coverage inventory is resolved");
 
@@ -7111,7 +7384,7 @@ mod authority_tests {
             "a28e05a07a056643c31e80c62a564f20fa655ef4b90d22a2728ef057745e496b",
             "artifact digest must remain domain-framed SHA-256, not a self-consistent substitute"
         );
-        let base = coverage_json("publication", &[], 0, 0).expect("empty coverage is resolved");
+        let base = coverage_json("publication", &[], 0, 0, &crate::clean_origin_join::CleanOriginJoinSummary::not_recorded()).expect("empty coverage is resolved");
         let first = coverage_publication_manifest(
             &base,
             "publication.trust-ir.bin",
@@ -7855,5 +8128,138 @@ mod str_const_finalize_tests {
             mir_snapshot: None,
             lineage: None,
         }
+    }
+}
+
+/// Trust (B8 step 1): the declaration-blocker taxonomy — the split of what used to be one
+/// anonymous `clean-skip-extern-callee` string.
+///
+/// Two of these tests guard the SPLIT (that the classes are recoverable and rendered
+/// deterministically). The third guards something more important and easier to lose: that
+/// routing the five keys through [`decl_key`] did not change a single byte of any key. Keys are
+/// declaration IDENTITY — [`decl_id`] interns on the whole string — so a one-character drift
+/// re-partitions a module's declarations, which changes real IR, which moves clean/Agreed. This
+/// slice is instrumentation and is required to move neither.
+#[cfg(test)]
+mod decl_kind_tests {
+    use super::*;
+
+    #[test]
+    fn decl_kind_round_trips() {
+        for kind in DeclKind::ALL {
+            // A `def_path`-shaped remainder, which itself contains the split character.
+            let key = decl_key(kind, "core::option::Option::<T>::unwrap|ret:U64");
+            assert_eq!(
+                DeclKind::from_key(&key),
+                Some(kind),
+                "{kind:?} did not round-trip through {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decl_kind_prefixes_are_distinct_and_colon_free() {
+        // `from_key` splits on the first `:`, so a prefix containing one would alias.
+        for kind in DeclKind::ALL {
+            assert!(!kind.prefix().contains(':'), "{kind:?} prefix contains the split character");
+        }
+        let mut seen: Vec<&str> = DeclKind::ALL.iter().map(|k| k.prefix()).collect();
+        seen.sort_unstable();
+        let n = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "two DeclKind variants share a prefix");
+    }
+
+    /// A key this taxonomy does not know is `None` — reported as `unclassified`, never rounded
+    /// into a neighbouring class.
+    #[test]
+    fn decl_kind_rejects_a_stranger() {
+        assert_eq!(DeclKind::from_key("some-new-class:foo"), None);
+        assert_eq!(DeclKind::from_key("no-colon-at-all"), None);
+        // A prefix that merely SHARES a leading substring with a real one must not match.
+        assert_eq!(DeclKind::from_key("externally:foo"), None);
+        assert_eq!(DeclKind::from_key("local:foo"), None);
+    }
+
+    /// THE REGRESSION THAT MATTERS. Pinned against the literal `format!` spellings
+    /// `resolve_callee` carried before this slice, transcribed from the pre-change source.
+    #[test]
+    fn decl_key_is_byte_identical_to_legacy_spelling() {
+        let def_path = "alloc::vec::Vec::<T>::push";
+        let ret_key = "|ret:Unit";
+        let callee_index: u32 = 12363;
+        let ret_suffix = "|ret:U64";
+
+        assert_eq!(
+            decl_key(DeclKind::Havoc, format!("{def_path}{ret_key}")),
+            format!("havoc:{def_path}{ret_key}")
+        );
+        assert_eq!(
+            decl_key(DeclKind::LocalUnlowered, format!("{def_path}{ret_key}")),
+            format!("local-unlowered:{def_path}{ret_key}")
+        );
+        assert_eq!(
+            decl_key(DeclKind::Extern, format!("{def_path}{ret_key}")),
+            format!("extern:{def_path}{ret_key}")
+        );
+        assert_eq!(decl_key(DeclKind::Unknown, callee_index), format!("unknown:{callee_index}"));
+        assert_eq!(
+            decl_key(DeclKind::Ambiguous, format!("{callee_index}{ret_suffix}")),
+            format!("ambiguous:{callee_index}{ret_suffix}")
+        );
+    }
+
+    /// The call site may append `|nres:{n}` to a key AFTER `resolve_callee` returns it. The
+    /// class must survive that, or every split declaration would land in `unclassified`.
+    #[test]
+    fn decl_kind_survives_the_nres_suffix() {
+        let key = format!("{}|nres:0", decl_key(DeclKind::Extern, "core::mem::drop|ret:U64"));
+        assert_eq!(DeclKind::from_key(&key), Some(DeclKind::Extern));
+    }
+
+    fn assembled_with(decls: &[(u32, &str)]) -> Assembled {
+        Assembled {
+            module: Module::new("test"),
+            coverage_rows: Vec::new(),
+            lowered: 0,
+            spliced: 0,
+            declarations: decls.len(),
+            assigned: Vec::new(),
+            decl_keys: decls
+                .iter()
+                .map(|(id, key)| (FuncId::new(*id), (*key).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn blocker_summary_counts_and_orders_deterministically() {
+        let a = assembled_with(&[
+            (0, "local-unlowered:krate::helper"),
+            (1, "extern:core::fmt::write"),
+            (2, "extern:core::panicking::panic"),
+            (3, "havoc:krate::generic::<T>"),
+        ]);
+        // Presented OUT of taxonomy order on purpose: the output must not depend on walk order.
+        let ids = [FuncId::new(3), FuncId::new(0), FuncId::new(2), FuncId::new(1)];
+        assert_eq!(blocker_summary(&a, &ids), "extern=2, havoc=1, local-unlowered=1");
+    }
+
+    #[test]
+    fn blocker_summary_reports_a_single_class_alone() {
+        let a = assembled_with(&[(0, "extern:core::fmt::write")]);
+        assert_eq!(blocker_summary(&a, &[FuncId::new(0)]), "extern=1");
+    }
+
+    /// An unparsable key, and a `FuncId` with no `decl_keys` entry at all (the closure member the
+    /// step-2 filter admits through `unwrap_or(true)`), both land in `unclassified` — and do not
+    /// disturb the classes that DID parse.
+    #[test]
+    fn blocker_summary_never_folds_a_stranger_into_a_neighbour() {
+        let a = assembled_with(&[(0, "extern:core::fmt::write"), (1, "brand-new-class:x")]);
+        assert_eq!(
+            blocker_summary(&a, &[FuncId::new(0), FuncId::new(1), FuncId::new(99)]),
+            "extern=1, unclassified=2"
+        );
     }
 }

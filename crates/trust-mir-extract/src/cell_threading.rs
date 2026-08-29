@@ -173,10 +173,69 @@ type DatatypeDefs = BTreeMap<String, Vec<(String, Vec<(String, Ty)>)>>;
 /// generics-erased-name collision (`Foo<u8>` and `Foo<i32>` both printing
 /// `Foo`); resolving it by guessing would merge two genuinely different types,
 /// which is worse than declining.
-fn cluster_datatype_definitions(functions: &BTreeMap<String, VerifiableFunction>) -> Option<DatatypeDefs> {
+fn cluster_datatype_definitions(
+    functions: &BTreeMap<String, VerifiableFunction>,
+) -> Option<DatatypeDefs> {
     let mut defs = DatatypeDefs::new();
     let mut conflict = false;
     for f in functions.values() {
+        // Trust: SEED FROM THE BODY'S OWN DEFINITION TABLE FIRST.
+        //
+        // This function used to build its table only by scanning lowered `Ty`s
+        // for a non-empty inline `variants` list (`collect_datatype_definitions`
+        // below). That worked while a recursive datatype's defining occurrence
+        // carried its variants in-band. Since the body-de-duplication landing in
+        // `ty_convert.rs` ("WHAT LANDED IS `Def1` WITH THE BODY DE-DUPLICATED"),
+        // a canonical CUT POINT is a by-name marker at EVERY occurrence and its
+        // one definition is filed in `body.datatype_defs` instead.
+        //
+        // The consequence was silent and total: the scan can no longer find a
+        // definition for any recursive type, so `defs` came back empty for
+        // exactly the types `resolve_datatype_refs` exists to resolve, and the
+        // resolution this module's doc comment promises became inert. Nothing
+        // failed loudly — a by-name marker simply stayed unresolved, which reads
+        // downstream as an opaque datatype rather than as a missing definition.
+        //
+        // Seeding from `datatype_defs` restores it at the source. The scan below
+        // is RETAINED, not replaced: a non-recursive datatype is not a cut point,
+        // is never filed, and is still only available in-band.
+        for (name, def) in &f.body.datatype_defs {
+            // Trust: accept BOTH filed shapes. An earlier version of this loop
+            // matched only `Ty::Datatype` and therefore still restored nothing —
+            // `ty_convert.rs`'s own measured table over 2330 shipped fixtures says
+            // definitional `Ty::Adt` occurs 7855 times and definitional
+            // `Ty::Datatype` ZERO times, because `lower_adt_as_datatype` is
+            // def-path-gated to exactly `clean_kernel`'s `Level`/`Expr`/`ExprKind`
+            // (`is_level_path` and its siblings). Every other recursive ADT --
+            // `clean_kernel::fuel::Fuel` included, which is what the cell-counter
+            // lane threads -- is filed as `Ty::Adt`, so a `Ty::Datatype`-only arm
+            // keeps exactly the shape that never occurs.
+            //
+            // `Ty::Adt`'s `variants` are `VariantDef`s carrying a discriminant this
+            // resolver's vocabulary has no slot for; that is fine here, because the
+            // consumer wants constructor names and field types to resolve a by-name
+            // reference, not to rebuild the tag. The discriminant stays in the
+            // filed definition for consumers that need it.
+            let variants: Vec<(String, Vec<(String, Ty)>)> = match def {
+                Ty::Datatype { variants, .. } if !variants.is_empty() => variants.clone(),
+                Ty::Adt { variants, .. } if !variants.is_empty() => {
+                    variants.iter().map(|v| (v.name.clone(), v.fields.clone())).collect()
+                }
+                _ => continue,
+            };
+            let variants = &variants;
+            match defs.get(name) {
+                // Same fail-closed discipline as the scan: one name carrying two
+                // different definitions is the generics-erased-name collision,
+                // and picking one would merge two genuinely different types.
+                Some(existing) if existing != variants => conflict = true,
+                Some(_) => {}
+                None => {
+                    defs.insert(name.clone(), variants.clone());
+                }
+            }
+        }
+
         let tys = f.body.locals.iter().map(|l| &l.ty).chain(std::iter::once(&f.body.return_ty));
         for ty in tys {
             let Some(normalized) = normalize_ty(ty) else {
@@ -276,7 +335,8 @@ fn normalize_function_tys(f: &mut VerifiableFunction, defs: &DatatypeDefs) -> Op
     for l in &mut f.body.locals {
         l.ty = resolve_datatype_refs(&normalize_ty(&l.ty)?, defs, &mut Vec::new());
     }
-    f.body.return_ty = resolve_datatype_refs(&normalize_ty(&f.body.return_ty)?, defs, &mut Vec::new());
+    f.body.return_ty =
+        resolve_datatype_refs(&normalize_ty(&f.body.return_ty)?, defs, &mut Vec::new());
     Some(())
 }
 
@@ -466,7 +526,7 @@ fn block_is_state_sensitive(block: &BasicBlock, spec: &CellThreadingSpec) -> boo
             if place.local == 0 && place.projections.is_empty())
     });
     let call_sensitive = matches!(&block.terminator,
-        Terminator::Call { func, .. }
+        Terminator::Call { func, .. } | Terminator::TailCall { func, .. }
             if callee_matches_configured(func, &spec.get_fn)
                 || callee_matches_configured(func, &spec.set_fn)
                 || configured_member_for_callee(func, &spec.members).is_some());
@@ -773,6 +833,10 @@ fn transform_member(
                     return None;
                 }
             }
+            // The threaded grammar depends on an in-function continuation to
+            // unpack the callee's result and advance the synthetic cell state.
+            // A TailCall has none, so this recognizer declines explicitly.
+            Terminator::TailCall { .. } => return None,
             _ => return None,
         }
         fx.blocks[bpos].stmts = new_stmts;

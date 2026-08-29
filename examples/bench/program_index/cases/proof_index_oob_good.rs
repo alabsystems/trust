@@ -4,11 +4,7 @@
 // bounds proof surface without std I/O noise.
 
 fn lookup_guarded(data: [u32; 4], idx: usize) -> u32 {
-    if idx < 4 {
-        data[idx]
-    } else {
-        0
-    }
+    if idx < 4 { data[idx] } else { 0 }
 }
 
 fn main() {

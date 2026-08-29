@@ -40,20 +40,30 @@ run() { OUT="$($T $2 -Z trust-policy=advisory \
             -Z "trust-verify-timeout-ms=$VERIFY_TIMEOUT_MS" \
             -Z trust-verify-output=json --crate-type lib \
             --out-dir /tmp/trust-unsafe-cov "$DEMOS/$1" 2>&1)"; }
+# The transport's `function` field is crate-qualified (`<crate>::<fn>`); the
+# trailing quote anchors the match so `caller` cannot match `safe_caller`.
+fn_row() { echo "$OUT" | grep '"type":"function_result"' | grep -E "\"function\":\"([A-Za-z0-9_]+::)*$1\""; }
+
 # expect_caught <file> <flags> <tag> <fn>
 expect_caught() {
   run "$1" "$2"
-  if echo "$OUT" | grep -q "\"function\":\"$4\"" && echo "$OUT" | grep -q "$3"; then
+  # tag must land on THAT fn's own row: a whole-output grep passes when the tag
+  # fired on some other fn in the same fixture, which is a false-proof window.
+  ROW="$(fn_row "$4")"
+  if [ -n "$ROW" ] && echo "$ROW" | grep -q "$3"; then
     echo "  PASS  $4: $3 caught"
   else
     echo "  FAIL  $4: expected $3 caught in $1"; fail=1
   fi
 }
-# expect_clean <file> <flags> <tag> <fn>  (tag must NOT appear for that fn)
+# expect_clean <file> <flags> <tag> <fn>  (fn must be reported, and its row must NOT carry the tag)
 expect_clean() {
   run "$1" "$2"
-  # crude: the tag must not appear anywhere in this single-control file's output
-  if echo "$OUT" | grep -q "$3"; then
+  ROW="$(fn_row "$4")"
+  if [ -z "$ROW" ]; then
+    # absent fn would otherwise pass vacuously — a control that never ran proves nothing
+    echo "  FAIL  $4: no function_result row in $1"; fail=1
+  elif echo "$ROW" | grep -q "$3"; then
     echo "  FAIL  $4: $3 should NOT fire (false positive) in $1"; fail=1
   else
     echo "  PASS  $4: $3 correctly not flagged"
@@ -68,7 +78,7 @@ expect_caught unmodeled_unsafe_call_caught.rs ""              "unsafe:unmodeled-
 expect_caught target_feature_call_caught.rs   "--edition 2021" "unsafe:unmodeled-call"        "caller_without_feature"
 
 echo "== discriminating controls (must NOT be flagged) =="
-expect_clean  target_feature_call_caught.rs   "--edition 2021" "caller_with_feature.*unmodeled-call" "caller_with_feature"
+expect_clean  target_feature_call_caught.rs   "--edition 2021" "unsafe:unmodeled-call"        "caller_with_feature"
 # aterm's real mmap.rs: HIGH-2 proved, and NO spurious unsafe-call/union/static flags
 run aterm_mmap_real_source.rs "--edition 2021"
 for tag in "unsafe:union-field" "unsafe:mutable-static" "unsafe:layout-constrained-field"; do

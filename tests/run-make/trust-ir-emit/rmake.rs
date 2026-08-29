@@ -115,4 +115,30 @@ fn main() {
          collect-all measurement pass never ran for a pure `--emit=trust-ir` invocation, so the \
          artifact reports a failed body as demanding no leaf shapes: {evens}"
     );
+
+    // Analysis-only means no code generation; it does not mean deferred
+    // verification. The first-class lane must still run borrow checking, and
+    // must not publish an artifact for borrow-invalid source: a stale .bin/.txt
+    // /.coverage.json left behind by a REJECTED compile is indistinguishable,
+    // to every downstream consumer, from the artifact of a body that compiled.
+    let rejected_dir = Path::new("borrow-invalid-emit");
+    rfs::create_dir(&rejected_dir);
+    rustc()
+        .input("borrow_invalid.rs")
+        .crate_type("lib")
+        .emit("trust-ir")
+        .out_dir(&rejected_dir)
+        .arg("-Ztrust-verify=off")
+        .run_fail()
+        .assert_stderr_contains("cannot borrow `value` as mutable more than once at a time");
+    for name in [
+        "borrow_invalid.trust-ir.bin",
+        "borrow_invalid.trust-ir.txt",
+        "borrow_invalid.trust-ir.coverage.json",
+    ] {
+        assert!(
+            !rejected_dir.join(name).exists(),
+            "borrow-invalid analysis published stale artifact `{name}`"
+        );
+    }
 }

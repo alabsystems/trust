@@ -14,13 +14,14 @@
 
 use std::path::{Path, PathBuf};
 
+use trust_backprop::file_io::apply_plan_to_files;
 use trust_backprop::{
     ApprovalPolicy, ContractClauseKind, GovernancePolicy, RewriteKind, RewritePlan, SourceRewrite,
     apply_plan, apply_plan_to_source, classify_rewrite, create_checkpoint, default_rules, rollback,
 };
-use trust_backprop::file_io::apply_plan_to_files;
 use trust_strengthen::{
-    FailureAnalysis, Proposal, ProposalKind, analyze_failure, read_function, strengthen_with_context,
+    FailureAnalysis, Proposal, ProposalKind, analyze_failure, read_function,
+    strengthen_with_context,
 };
 use trust_types::{
     Formula, SourceSpan, VcKind, VerificationCondition, VerificationResult as SolverVerdict,
@@ -40,7 +41,9 @@ fn div_zero_iteration_proposes_a_native_requires_clause_and_never_auto_writes_it
             ProposalKind::AddPrecondition { spec_body } => Some(spec_body.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("a div-zero failure must propose a precondition: {proposals:#?}"));
+        .unwrap_or_else(|| {
+            panic!("a div-zero failure must propose a precondition: {proposals:#?}")
+        });
     assert_eq!(
         precondition, "y != 0",
         "the precondition must name the fixture's real divisor parameter"
@@ -61,10 +64,9 @@ fn div_zero_iteration_proposes_a_native_requires_clause_and_never_auto_writes_it
         })
         .expect("the requires clause must be queued for review");
     assert!(
-        !auto.iter().any(|rewrite| matches!(
-            rewrite.kind,
-            RewriteKind::InsertContractClause { .. }
-        )),
+        !auto
+            .iter()
+            .any(|rewrite| matches!(rewrite.kind, RewriteKind::InsertContractClause { .. })),
         "no contract clause may be written to source without review: {auto:#?}"
     );
 
@@ -82,10 +84,7 @@ fn div_zero_iteration_proposes_a_native_requires_clause_and_never_auto_writes_it
         .find(&format!("fn {FUNCTION}"))
         .and_then(|start| rendered[start..].find('{').map(|offset| start + offset))
         .expect("the rewritten fn must keep a body");
-    assert!(
-        clause < body_brace,
-        "the clause must sit in the signature, not the body:\n{rendered}"
-    );
+    assert!(clause < body_brace, "the clause must sit in the signature, not the body:\n{rendered}");
     assert!(!rendered.contains("#["), "spec text must be a native clause:\n{rendered}");
 }
 
@@ -198,11 +197,8 @@ fn div_zero_analysis(file: &str) -> FailureAnalysis {
         contract_metadata: None,
         obligation: None,
     };
-    let verdict = SolverVerdict::Failed {
-        solver: "ay-smtlib".into(),
-        time_ms: 5,
-        counterexample: None,
-    };
+    let verdict =
+        SolverVerdict::Failed { solver: "ay-smtlib".into(), time_ms: 5, counterexample: None };
     analyze_failure(&vc, &verdict)
 }
 

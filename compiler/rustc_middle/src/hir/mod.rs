@@ -499,6 +499,20 @@ pub fn provide(providers: &mut Providers) {
         }) = node
         {
             idents
+        } else if matches!(node, Node::Synthetic) {
+            // A synthetic owner has no Rust parameter syntax to name — a
+            // Clean-origin def minted from a `clean {}` island is kernel-bound
+            // and never had any. The empty slice is the TRUE answer, not a
+            // placeholder: `Trust`'s own consumers already treat an empty result
+            // as fail-closed (see `trust_verify.rs`, "if `fn_arg_idents` is
+            // empty ... the def is not a `Fn`/`AssocFn`").
+            //
+            // Without this arm the fallthrough reaches `span_bug!`, whose SPAN
+            // LOOKUP then hits `Node::Synthetic => unreachable!()` — so the
+            // diagnostic path ICEs before it can report anything. Reached from
+            // `encode_def_ids`: metadata encoding asks every encoded def for its
+            // parameter idents, synthetic ones included.
+            &[]
         } else {
             span_bug!(
                 tcx.hir_span(tcx.local_def_id_to_hir_id(def_id)),

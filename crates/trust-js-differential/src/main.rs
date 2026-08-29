@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use util::{resolve_engine, Engine};
+use util::{Engine, resolve_engine};
 
 const DEFAULT_PIN: &str = "tests/js262/corpus-pin.json";
 const DEFAULT_SLICE: &str = "tests/js262/S0.toml";
@@ -124,14 +124,11 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
         "corpus-verify" => {
             let flags = parse_flags(rest, &["corpus", "pin"])?;
             let corpus = required(&flags, "corpus")?;
-            let pin = flags.get("pin").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_PIN));
+            let pin =
+                flags.get("pin").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_PIN));
             let findings = corpus::corpus_verify(&corpus, &pin);
             if findings.is_empty() {
-                println!(
-                    "corpus-verify: OK — {} matches pin {}",
-                    corpus.display(),
-                    pin.display()
-                );
+                println!("corpus-verify: OK — {} matches pin {}", corpus.display(), pin.display());
                 Ok(0)
             } else {
                 for f in &findings {
@@ -153,15 +150,14 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             );
             println!("{} rules_sha256={}", kind.id(), kind.rules_sha256());
             if let Some(out) = flags.get("out") {
-                let revision =
-                    util::git_head(&corpus).unwrap_or_else(|| "unknown".to_string());
+                let revision = util::git_head(&corpus).unwrap_or_else(|| "unknown".to_string());
                 // The committed S-async slice is payload-external (S0.toml's
                 // shape); S0 --out keeps its historical embedded form.
                 let text = match kind {
-                    slice::SliceKind::S0 => toml::to_string_pretty(&slice::build_manifest(
-                        &revision, &derived,
-                    ))
-                    .map_err(|e| format!("serialize {}: {e}", kind.id()))?,
+                    slice::SliceKind::S0 => {
+                        toml::to_string_pretty(&slice::build_manifest(&revision, &derived))
+                            .map_err(|e| format!("serialize {}: {e}", kind.id()))?
+                    }
                     // S-async and S-module share the payload-external form.
                     slice::SliceKind::SAsync | slice::SliceKind::SModule => {
                         slice::build_external_manifest(kind, &revision, &derived)
@@ -236,8 +232,17 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             let flags = parse_flags(
                 rest,
                 &[
-                    "corpus", "slice", "node", "bun", "sem", "trustjs", "jobs", "timeout-secs",
-                    "limit", "out-dir", "ledgers",
+                    "corpus",
+                    "slice",
+                    "node",
+                    "bun",
+                    "sem",
+                    "trustjs",
+                    "jobs",
+                    "timeout-secs",
+                    "limit",
+                    "out-dir",
+                    "ledgers",
                 ],
             )?;
             let opts = calibrate::CalibrateOpts {
@@ -291,11 +296,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             let card = ts_calibrate::run_ts_calibrate(&opts).map_err(|e| e.to_string())?;
             ts_calibrate::print_scorecard(&card);
             // The bar: zero wrong traces (a covered trace matching neither engine).
-            if card.trustts_divergent == 0 {
-                Ok(0)
-            } else {
-                Ok(1)
-            }
+            if card.trustts_divergent == 0 { Ok(0) } else { Ok(1) }
         }
         "parse-verdict" => {
             let flags = parse_flags(
@@ -368,7 +369,8 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             ratchet::run_ratchet(&opts).map_err(|e| e.to_string())
         }
         "minimize" => {
-            let flags = parse_flags(rest, &["corpus", "test", "node", "bun", "mode", "timeout-secs"])?;
+            let flags =
+                parse_flags(rest, &["corpus", "test", "node", "bun", "mode", "timeout-secs"])?;
             let mode = match flags.get("mode") {
                 Some(m) => Some(
                     heads::RunMode::parse(m)

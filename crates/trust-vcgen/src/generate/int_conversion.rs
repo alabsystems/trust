@@ -279,7 +279,10 @@ pub(super) fn int_try_from_def(
 /// init-before-use guarantees the conversion — the receiver chain's unique def
 /// — executed on every path reaching the `unwrap_or`, and a stable local cannot
 /// have changed in between).
-pub(super) fn int_try_from_source_formula(func: &VerifiableFunction, src: &Operand) -> Option<Formula> {
+pub(super) fn int_try_from_source_formula(
+    func: &VerifiableFunction,
+    src: &Operand,
+) -> Option<Formula> {
     match src {
         Operand::Constant(trust_types::ConstValue::Int(_) | trust_types::ConstValue::Uint(..)) => {
             Some(crate::operand_to_formula(func, src))

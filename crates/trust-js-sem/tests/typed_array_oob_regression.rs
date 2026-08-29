@@ -19,7 +19,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -143,11 +144,14 @@ fn node_trace_of(
 #[allow(clippy::too_many_lines)]
 fn typed_array_oob_cluster_vs_node() {
     let Some(node) = node_bin() else {
-        eprintln!("SKIP typed_array_oob_cluster_vs_node: set TRUST_JS_NODE (+ optional TRUST_JS262_CORPUS) to run");
+        eprintln!(
+            "SKIP typed_array_oob_cluster_vs_node: set TRUST_JS_NODE (+ optional TRUST_JS262_CORPUS) to run"
+        );
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     assert!(
         corpus.join("harness/assert.js").is_file(),
         "corpus harness not found under {}",
@@ -181,11 +185,7 @@ fn typed_array_oob_cluster_vs_node() {
 
         for &strict in &[false, true] {
             let mode = if strict { "strict" } else { "bare" };
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let inc_refs: Vec<&str> = include_srcs.iter().map(String::as_str).collect();
             let sem = evaluate_case_opts(&inc_refs, &sem_body, false);
             let sem_trace = match sem {
@@ -296,11 +296,8 @@ fn typed_array_oob_micro_vs_node() {
     for (name, body) in MICRO {
         for &strict in &[false, true] {
             let mode = if strict { "strict" } else { "bare" };
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                (*body).to_string()
-            };
+            let sem_body =
+                if strict { format!("\"use strict\";\n{body}") } else { (*body).to_string() };
             let sem_trace = match evaluate_case_opts(&[], &sem_body, false) {
                 SemOutcome::Trace(t) => t,
                 SemOutcome::NoCoverage { reason } => {

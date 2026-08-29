@@ -921,11 +921,8 @@ impl TrustCgCodegenBackend {
             });
         }
 
-        let bindings = module
-            .linkage
-            .iter()
-            .map(|linkage| linkage.symbol_binding())
-            .collect::<Vec<_>>();
+        let bindings =
+            module.linkage.iter().map(|linkage| linkage.symbol_binding()).collect::<Vec<_>>();
         let emission = self.emit_target_module(&module.lir_functions, &bindings)?;
         let bytes = Self::require_non_empty_object(emission.object, &module.name)?;
         Ok(EmittedModuleObject {
@@ -1273,10 +1270,9 @@ impl TrustCgCodegenBackend {
             // exported anyway (wrong) or shift indices under the writer's
             // locals-first partition (worse). Fail closed until that path
             // carries the flag too.
-            if bindings
-                .iter()
-                .any(|binding| *binding != trust_cg_codegen::pipeline::FunctionSymbolBinding::Global)
-            {
+            if bindings.iter().any(|binding| {
+                *binding != trust_cg_codegen::pipeline::FunctionSymbolBinding::Global
+            }) {
                 return Err(CodegenBackendError::EmitFailed {
                     reason: "the x86-64 object emitters do not yet carry per-function symbol \
                              bindings; refusing to emit an Internal-linkage definition as an \
@@ -1673,8 +1669,7 @@ impl RustcCodegenBackend for TrustCgCodegenBackend {
             match self.lower_function(func) {
                 Ok(lir) => {
                     source_functions.push(func.clone());
-                    linkage
-                        .push(crate_info.linkage.get(index).copied().unwrap_or_default());
+                    linkage.push(crate_info.linkage.get(index).copied().unwrap_or_default());
                     lir_functions.push(lir);
                 }
                 Err(e) => failures.push((func.name.clone(), e.to_string())),
@@ -2328,7 +2323,11 @@ mod tests {
     #[test]
     fn test_codegen_crate_single_function() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test_crate".to_string(), functions: vec![make_add()], linkage: Vec::new() };
+        let info = CrateInfo {
+            crate_name: "test_crate".to_string(),
+            functions: vec![make_add()],
+            linkage: Vec::new(),
+        };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen_crate should succeed");
 
@@ -2361,7 +2360,8 @@ mod tests {
     #[test]
     fn test_codegen_crate_empty() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "empty".to_string(), functions: vec![], linkage: Vec::new() };
+        let info =
+            CrateInfo { crate_name: "empty".to_string(), functions: vec![], linkage: Vec::new() };
 
         let ongoing = backend.codegen_crate(&info).expect("empty crate should succeed");
 
@@ -2373,7 +2373,11 @@ mod tests {
     #[test]
     fn test_join_codegen_success() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()], linkage: Vec::new() };
+        let info = CrateInfo {
+            crate_name: "test".to_string(),
+            functions: vec![make_add()],
+            linkage: Vec::new(),
+        };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
 
@@ -2434,7 +2438,11 @@ mod tests {
     #[test]
     fn test_join_codegen_preserves_attached_allocator_module() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()], linkage: Vec::new() };
+        let info = CrateInfo {
+            crate_name: "test".to_string(),
+            functions: vec![make_add()],
+            linkage: Vec::new(),
+        };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
 
@@ -2793,7 +2801,11 @@ mod tests {
     #[test]
     fn test_join_codegen_preserves_attached_allocator_module_spec() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "test".to_string(), functions: vec![make_add()], linkage: Vec::new() };
+        let info = CrateInfo {
+            crate_name: "test".to_string(),
+            functions: vec![make_add()],
+            linkage: Vec::new(),
+        };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
         let mut ongoing = backend.codegen_crate(&info).expect("codegen should succeed");
@@ -2920,7 +2932,11 @@ mod tests {
     #[test]
     fn test_codegen_produces_valid_lir_blocks() {
         let backend = TrustCgCodegenBackend::host();
-        let info = CrateInfo { crate_name: "lir_check".to_string(), functions: vec![make_add()], linkage: Vec::new() };
+        let info = CrateInfo {
+            crate_name: "lir_check".to_string(),
+            functions: vec![make_add()],
+            linkage: Vec::new(),
+        };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen should succeed");
         let ongoing_ref = ongoing.downcast_ref::<OngoingCodegen>().expect("downcast");
@@ -3152,7 +3168,13 @@ mod tests {
             name: format!("chain_{n}"),
             def_path: format!("test::chain_{n}"),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i64(), datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 1,
+                return_ty: Ty::i64(),
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -3287,7 +3309,13 @@ mod tests {
             name: "switch_fn".to_string(),
             def_path: "test::switch_fn".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32(), datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 1,
+                return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -3375,7 +3403,13 @@ mod tests {
             name: "loop_fn".to_string(),
             def_path: "test::loop_fn".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32(), datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 1,
+                return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],

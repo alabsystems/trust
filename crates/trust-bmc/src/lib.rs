@@ -54,13 +54,10 @@ mod error;
 pub mod replay_oracle;
 mod result;
 mod subprocess;
-#[cfg(not(feature = "trust-mc-core-types"))]
-mod verifier_api_stub;
 #[cfg(feature = "trust-mc-core-types")]
 mod verifier_api;
 #[cfg(not(feature = "trust-mc-core-types"))]
-use verifier_api_stub as verifier_api;
-
+mod verifier_api_stub;
 pub use config::{DiagConfig, TrustMcConfig};
 pub use error::TrustMcLibError;
 pub use result::{
@@ -69,39 +66,6 @@ pub use result::{
     TypedCounterexample, TypedValue, Verdict, ViolationInfo,
 };
 pub use subprocess::SubprocessBackend;
-pub use verifier_api::{
-    TRUST_MC_FULL_VERIFICATION_VERDICT_METADATA_KEY, TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY,
-    TRUST_MC_TYPED_CHC_BINDING_SCHEMA, TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA,
-    TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY,
-    TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY, TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY,
-    TrustMcVerifierApiAdapter, is_trust_mc_owned_obligation_kind,
-    trust_mc_owned_obligation_kinds,
-};
-#[cfg(feature = "trust-mc-core-types")]
-pub use verifier_api::{
-    TrustMcChcPdrProofEvidence, TrustMcChcPdrProofKind, TrustMcChcPdrStats,
-    TrustMcDiagnosticOnlyEvidence, TrustMcEvidenceHash, TrustMcEvidenceHashError,
-    TrustMcFullProofEvidenceMetadata, TrustMcFullVerificationArtifact,
-    TrustMcFullVerificationArtifactKind, TrustMcFullVerificationProblemKind,
-    TrustMcNativeFullVerifierEvidence, TrustMcNativeTypedChcObligationMetadata,
-    TrustMcProofCheckStatus, TrustMcProofReplayCheckStatus, TrustMcProofReplayStatus,
-};
-#[cfg(feature = "trust-mc-core-types")]
-pub use verifier_api::trust_mc_full_verification_verdict_metadata_entry;
-// targo-trust doctor: canonical one-obligation typed-CHC smoke request for the
-// in-process trust-mc suite. Construction only — verification of the returned
-// bundle goes through the public validated `verify_with_context` boundary.
-#[cfg(feature = "trust-mc-core-types")]
-pub use verifier_api::{DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID, doctor_smoke_bundle};
-#[cfg(feature = "trust-mc-native-solver")]
-pub use verifier_api::{
-    FreshExactDirectChcPdrBundleSeal, FreshExactDirectChcPdrDispatch,
-    FreshExactDirectChcPdrReceipt,
-    TrustMcNativeTypedChcPdrProofTransport, TrustMcNativeTypedProofArtifactRef,
-    TrustMcNativeTypedProofStatus, TrustMcNativeTypedProofStrength,
-};
-#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
-pub use verifier_api::NativeTrustIrBundleEvidenceWithFreshReceipts;
 // Additional re-exports for lower-level access. These are feature-gated so
 // default consumers do not depend on trust-mc-core as part of trust-bmc's
 // public API while the implementation split is staged.
@@ -119,6 +83,40 @@ pub use trust_mc_core::{
 // verification condition containers, violation descriptors, and property kinds.
 #[cfg(feature = "trust-mc-core-types")]
 pub use trust_mc_core::{BmcVc, ChcVc, PropertyKind, Violation};
+#[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+pub use verifier_api::NativeTrustIrBundleEvidenceWithFreshReceipts;
+#[cfg(feature = "trust-mc-core-types")]
+pub use verifier_api::trust_mc_full_verification_verdict_metadata_entry;
+// targo-trust doctor: canonical one-obligation typed-CHC smoke request for the
+// in-process trust-mc suite. Construction only — verification of the returned
+// bundle goes through the public validated `verify_with_context` boundary.
+#[cfg(feature = "trust-mc-core-types")]
+pub use verifier_api::{DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID, doctor_smoke_bundle};
+#[cfg(feature = "trust-mc-native-solver")]
+pub use verifier_api::{
+    FreshExactDirectChcPdrBundleSeal, FreshExactDirectChcPdrDispatch,
+    FreshExactDirectChcPdrReceipt, TrustMcNativeTypedChcPdrProofTransport,
+    TrustMcNativeTypedProofArtifactRef, TrustMcNativeTypedProofStatus,
+    TrustMcNativeTypedProofStrength,
+};
+pub use verifier_api::{
+    TRUST_MC_FULL_VERIFICATION_VERDICT_METADATA_KEY, TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY,
+    TRUST_MC_TYPED_CHC_BINDING_SCHEMA, TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA,
+    TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY,
+    TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY, TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY,
+    TrustMcVerifierApiAdapter, is_trust_mc_owned_obligation_kind, trust_mc_owned_obligation_kinds,
+};
+#[cfg(feature = "trust-mc-core-types")]
+pub use verifier_api::{
+    TrustMcChcPdrProofEvidence, TrustMcChcPdrProofKind, TrustMcChcPdrStats,
+    TrustMcDiagnosticOnlyEvidence, TrustMcEvidenceHash, TrustMcEvidenceHashError,
+    TrustMcFullProofEvidenceMetadata, TrustMcFullVerificationArtifact,
+    TrustMcFullVerificationArtifactKind, TrustMcFullVerificationProblemKind,
+    TrustMcNativeFullVerifierEvidence, TrustMcNativeTypedChcObligationMetadata,
+    TrustMcProofCheckStatus, TrustMcProofReplayCheckStatus, TrustMcProofReplayStatus,
+};
+#[cfg(not(feature = "trust-mc-core-types"))]
+use verifier_api_stub as verifier_api;
 
 /// Verify a function using trust-mc's safety/reachability engine.
 ///

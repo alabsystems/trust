@@ -1,0 +1,28 @@
+# trust-ratio: total, verified ratio and clamp arithmetic for Trust's own
+# scorecards, coverage lines and progress reports.
+#
+# Every public function is TOTAL — defined on all inputs, no panicking path —
+# and carries a grammar `ensures` clause that the Trust verifier discharges.
+# The point is not convenience: it is that a coverage line computed through
+# this crate is structurally unable to print a percentage above 100, and a
+# ratio is structurally unable to trap on a zero denominator. Both facts are
+# machine-checked, not asserted by a `.max(1)` in the caller.
+#
+# NO DEPENDENCIES, `#![no_std]`, no `derive`, no `impl Display`, no allocation.
+# That is not minimalism for its own sake: each of those is a measured blocker
+# on the strict verification lane, and this crate exists to PASS that lane.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-ratio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

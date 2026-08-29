@@ -4,11 +4,7 @@
 // target: strengthen the enabled branch with den != 0.
 
 fn guarded_quotient(num: u32, den: u32, enabled: bool) -> u32 {
-    if enabled {
-        num / den
-    } else {
-        0
-    }
+    if enabled { num / den } else { 0 }
 }
 
 fn main() {

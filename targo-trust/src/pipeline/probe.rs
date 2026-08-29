@@ -172,7 +172,6 @@ pub(crate) fn apply_trustd_runtime_closure(
     Ok(())
 }
 
-
 fn hash_runtime_closure_field(hasher: &mut Sha256, value: &str) {
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
@@ -742,7 +741,21 @@ pub(super) fn native_runtime_library_paths(rustc: &Path) -> Vec<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&rustc_deps_root) {
             push_sorted_unique_existing_dirs(
                 &mut paths,
-                entries.flatten().map(|entry| entry.path().join("release").join("deps")),
+                entries.flatten().filter_map(|entry| {
+                    // Keep this in lockstep with Targo's authenticated
+                    // runtime-closure reconstruction. Bootstrap places a
+                    // `doc` symlink beside the per-target directories; it is
+                    // not a loader root even when its target happens to have a
+                    // plausible `release/deps` suffix. Inspect the directory
+                    // entry without following it and admit only real target
+                    // directories. Verified Targo independently repeats this
+                    // rule and checks the resulting environment exactly.
+                    entry
+                        .file_type()
+                        .ok()
+                        .filter(std::fs::FileType::is_dir)
+                        .map(|_| entry.path().join("release").join("deps"))
+                }),
             );
         }
     }

@@ -21,11 +21,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::UnwindEdge;
 use trust_types::admissible_body::{ArithBinOp, ArithOperand};
 use trust_types::{
     BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Sort, SourceSpan,
-    Terminator, Ty, VerifiableBody, VerifiableFunction,
+    Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::assert_refutation::wrapping_call_assert_model;
@@ -61,6 +60,7 @@ fn wrapping_caller(callee: &str, args: Vec<Operand>) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -85,7 +85,8 @@ fn wrapping_summary(
     left: ArithOperand,
     right: ArithOperand,
 ) -> FunctionSummary {
-    let param_names = vec!["__trust_clean_origin_arg0".to_string(), "__trust_clean_origin_arg1".to_string()];
+    let param_names =
+        vec!["__trust_clean_origin_arg0".to_string(), "__trust_clean_origin_arg1".to_string()];
     let posts = clean_origin_wrapping_binop_postconditions(op, left, right, 64, &param_names)
         .expect("add/sub at width 64 over valid operands must be expressible");
     let mut summary = FunctionSummary::new(callee).with_param_names(param_names);
@@ -187,10 +188,8 @@ fn unbounded_add_clause_is_still_not_injectable() {
     };
     let a = || Box::new(Formula::var("a", Sort::Int));
     let b = || Box::new(Formula::var("b", Sort::Int));
-    let unbounded = Formula::Eq(
-        Box::new(Formula::var("_0", Sort::Int)),
-        Box::new(Formula::Add(a(), b())),
-    );
+    let unbounded =
+        Formula::Eq(Box::new(Formula::var("_0", Sort::Int)), Box::new(Formula::Add(a(), b())));
     let summary = FunctionSummary::new(ADD_MARKER)
         .with_param_names(vec!["a".to_string(), "b".to_string()])
         .with_definitional_postcondition(unbounded);

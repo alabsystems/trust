@@ -7,7 +7,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_interp::{evaluate_case, InterpOutcome};
+use trust_js_interp::{InterpOutcome, evaluate_case};
 use trust_js_trace::{HostEvent, ProjectedValue};
 
 /// Render one projected value the way `console.log` joins them (enough for the
@@ -32,9 +32,7 @@ fn stdout_lines(body: &str) -> Vec<String> {
             .events
             .iter()
             .filter_map(|e| match e {
-                HostEvent::Stdout { v } => {
-                    Some(v.iter().map(render).collect::<Vec<_>>().join(" "))
-                }
+                HostEvent::Stdout { v } => Some(v.iter().map(render).collect::<Vec<_>>().join(" ")),
                 _ => None,
             })
             .collect(),
@@ -85,10 +83,7 @@ fn async_generator_basic_next_ordering() {
          it.next().then(r => console.log('c', r.value, r.done));\n\
          console.log('sync');",
     );
-    assert_eq!(
-        lines,
-        vec!["sync", "a 1 false", "b 2 false", "c undefined true"]
-    );
+    assert_eq!(lines, vec!["sync", "a 1 false", "b 2 false", "c undefined true"]);
 }
 
 #[test]
@@ -112,10 +107,7 @@ fn async_generator_yield_expression_value() {
          it.next(10).then(r => console.log('b', r.value, r.done));\n\
          it.next(20).then(r => console.log('c', r.value, r.done));",
     );
-    assert_eq!(
-        lines,
-        vec!["a 1 false", "b 11 false", "c 30 true"]
-    );
+    assert_eq!(lines, vec!["a 1 false", "b 11 false", "c 30 true"]);
 }
 
 #[test]
@@ -177,10 +169,7 @@ fn async_generator_completed_next_is_done() {
          it.next().then(r => console.log('2', r.value, r.done));\n\
          it.next().then(r => console.log('3', r.value, r.done));",
     );
-    assert_eq!(
-        lines,
-        vec!["1 1 false", "2 undefined true", "3 undefined true"]
-    );
+    assert_eq!(lines, vec!["1 1 false", "2 undefined true", "3 undefined true"]);
 }
 
 #[test]

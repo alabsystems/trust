@@ -186,7 +186,10 @@ pub(super) fn collection_abstract_len_with_base(
 /// declined, the access must surface as `UnsupportedMir` (Unknown), never vanish.
 /// Deliberately trace-free: the call receiver is the (re)borrow temp itself, whose
 /// declared type already names the container.
-pub(super) fn operand_is_owned_container_receiver(func: &VerifiableFunction, operand: &Operand) -> bool {
+pub(super) fn operand_is_owned_container_receiver(
+    func: &VerifiableFunction,
+    operand: &Operand,
+) -> bool {
     let (Operand::Copy(p) | Operand::Move(p)) = operand else { return false };
     if !p.projections.is_empty() {
         return false;
@@ -217,7 +220,10 @@ pub(super) fn is_panicking_map_container_name(name: &str) -> bool {
 /// panicking std map container — see [`is_panicking_map_container_name`]. Used at
 /// the index site to surface `m[&k]` as a visible key-presence obligation rather
 /// than the former silent None-skip (a panic-freedom false-accept).
-pub(super) fn operand_is_map_container_receiver(func: &VerifiableFunction, operand: &Operand) -> bool {
+pub(super) fn operand_is_map_container_receiver(
+    func: &VerifiableFunction,
+    operand: &Operand,
+) -> bool {
     let (Operand::Copy(p) | Operand::Move(p)) = operand else { return false };
     if !p.projections.is_empty() {
         return false;
@@ -732,9 +738,26 @@ pub(super) fn slice_method_panic_body(
                         // is a COVERAGE GAP, not a violation: emit `UnsupportedMir`
                         // (→ Unknown), NEVER a refutable `failed` that would false-REFUTE a
                         // provably-safe slice.
+                        //
+                        // The formula is the SHARED fail-closed one (`Bool(true)`, SAT)
+                        // — the SAME polarity every other `UnsupportedMir` emitter in
+                        // this tree uses, and for the reason
+                        // `unsupported::unsupported_mir_fail_closed_formula` states: a
+                        // VC is a VIOLATION formula, so an UNSAT one reads as "no
+                        // violation". This site was the only emitter deviating, with
+                        // `Formula::Bool(false)`, and `UnsupportedMir::proof_level()`
+                        // is `L0Safety` — so every consumer that selects rows by PROOF
+                        // LEVEL instead of by kind read this DECLINED row as
+                        // DISCHARGED. Two shipped fixtures pin it:
+                        // `trust-clean/tests/unsupported_row_polarity_gate.rs` requires
+                        // this row's formula to be SAT and its fixture (which panics at
+                        // `end > v.len()`) not to certify, and
+                        // `trust-clean/fixtures/decline-handling-2026-08-25` carries the
+                        // same body, which reached `ProofStatus::Certified` /
+                        // `is_assumable` while the polarity was inverted.
                         Some(_) => {
                             return Some((
-                                Formula::Bool(false),
+                                super::unsupported::unsupported_mir_fail_closed_formula(),
                                 VcKind::UnsupportedMir {
                                     kind: "SliceBoundsCheck".to_string(),
                                     detail: "slice length is a non-derivable owned-Vec \
@@ -1003,7 +1026,13 @@ pub(super) fn v2_overflow_call_body(
                     return None;
                 }
                 // Provably-overflowing constant pow: emit a fail-closed obligation.
-                return Some((Formula::Bool(true), BinOp::Mul, result_ty.clone(), result_ty, width));
+                return Some((
+                    Formula::Bool(true),
+                    BinOp::Mul,
+                    result_ty.clone(),
+                    result_ty,
+                    width,
+                ));
             }
 
             // CONSTANT exponent (the dominant case: `.pow(2)`, `.pow(3)`). Unroll

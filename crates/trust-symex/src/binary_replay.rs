@@ -18,15 +18,13 @@
 // boundary so callers can pattern-match on it without an indirection.
 #![allow(clippy::type_complexity)]
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use trust_disasm::operand::{MemoryOperand, RegKind, Register};
 use trust_disasm::{
     ControlFlow, Instruction, Operand as DisasmOperand, decode_aarch64, decode_x86_64,
-    operand::{MemoryOperand, RegKind, Register},
 };
 use trust_machine_sem::{
     Aarch64Semantics, ConcreteState, Effect, MachineState, Semantics, X86_64Semantics,
@@ -2410,15 +2408,17 @@ impl BoundedMachineCodeReplayBackend {
         let mut call_frames = Vec::new();
 
         if let Some((_, first_step)) = expected_steps.first()
-            && let Err(error) = self.seed_initial_witness_state(&mut concrete, first_step) {
-                return Err(error.into_machine_result(Vec::new()));
-            }
+            && let Err(error) = self.seed_initial_witness_state(&mut concrete, first_step)
+        {
+            return Err(error.into_machine_result(Vec::new()));
+        }
 
         for (idx, (origin, step)) in expected_steps.iter().enumerate() {
             if idx > 0
-                && let Err(error) = self.validate_witness_trace_state(&concrete, step) {
-                    return Err(error.into_machine_result(observed));
-                }
+                && let Err(error) = self.validate_witness_trace_state(&concrete, step)
+            {
+                return Err(error.into_machine_result(observed));
+            }
             if let Err(error) =
                 observe_aarch64_return_address_stack_witness(&mut call_frames, step, &concrete)
             {
@@ -2564,18 +2564,19 @@ impl BoundedMachineCodeReplayBackend {
             ));
         }
         if let Some(size) = origin.instruction_size
-            && mapped.bytes.len() != usize::from(size) {
-                return Err(machine_result(
-                    BinaryMachineReplayStatus::Spurious,
-                    format!(
-                        "mapped instruction size for 0x{:x} was {}; expected {}",
-                        origin.instruction_address,
-                        mapped.bytes.len(),
-                        size
-                    ),
-                    Vec::new(),
-                ));
-            }
+            && mapped.bytes.len() != usize::from(size)
+        {
+            return Err(machine_result(
+                BinaryMachineReplayStatus::Spurious,
+                format!(
+                    "mapped instruction size for 0x{:x} was {}; expected {}",
+                    origin.instruction_address,
+                    mapped.bytes.len(),
+                    size
+                ),
+                Vec::new(),
+            ));
+        }
 
         let decoded = match self.image.architecture {
             BoundedMachineCodeArchitecture::Aarch64 => {
@@ -2641,27 +2642,29 @@ impl BoundedMachineCodeReplayBackend {
             ));
         }
         if let Some(size) = origin.instruction_size
-            && decoded.size != size {
-                return Err(machine_result(
-                    BinaryMachineReplayStatus::Spurious,
-                    format!(
-                        "decoded instruction size for 0x{:x} was {}; expected {}",
-                        origin.instruction_address, decoded.size, size
-                    ),
-                    Vec::new(),
-                ));
-            }
+            && decoded.size != size
+        {
+            return Err(machine_result(
+                BinaryMachineReplayStatus::Spurious,
+                format!(
+                    "decoded instruction size for 0x{:x} was {}; expected {}",
+                    origin.instruction_address, decoded.size, size
+                ),
+                Vec::new(),
+            ));
+        }
         if let Some(encoding) = origin.encoding
-            && decoded.encoding != encoding {
-                return Err(machine_result(
-                    BinaryMachineReplayStatus::Spurious,
-                    format!(
-                        "decoded instruction encoding for 0x{:x} was 0x{:x}; expected 0x{:x}",
-                        origin.instruction_address, decoded.encoding, encoding
-                    ),
-                    Vec::new(),
-                ));
-            }
+            && decoded.encoding != encoding
+        {
+            return Err(machine_result(
+                BinaryMachineReplayStatus::Spurious,
+                format!(
+                    "decoded instruction encoding for 0x{:x} was 0x{:x}; expected 0x{:x}",
+                    origin.instruction_address, decoded.encoding, encoding
+                ),
+                Vec::new(),
+            ));
+        }
 
         Ok(decoded)
     }
@@ -2982,12 +2985,13 @@ impl BoundedMachineCodeReplayBackend {
             };
             let byte = ((value >> (offset * 8)) & 0xff) as u8;
             if let Some(existing) = concrete.memory.get(&address)
-                && *existing != byte {
-                    return Err(WitnessStateError::spurious(format!(
-                        "bounded machine replay conflicting initial memory witness byte for `{}` at trace step {step}: address 0x{address:x} expected 0x{byte:02x}, already seeded 0x{existing:02x}",
-                        record.raw_name
-                    )));
-                }
+                && *existing != byte
+            {
+                return Err(WitnessStateError::spurious(format!(
+                    "bounded machine replay conflicting initial memory witness byte for `{}` at trace step {step}: address 0x{address:x} expected 0x{byte:02x}, already seeded 0x{existing:02x}",
+                    record.raw_name
+                )));
+            }
         }
 
         concrete.store_memory_le(memory.address, memory.width_bytes, value).map_err(|err| {
@@ -5350,9 +5354,10 @@ fn report_requirement_failure_reason(base_reason: &str, report: &BinaryReplayRep
         details.push(report.machine_replay.reason.clone());
     }
     if let Some(blocker) = report.machine_replay.source_backprop_replay_blocker_reason()
-        && !details.iter().any(|detail| detail == &blocker) {
-            details.push(blocker);
-        }
+        && !details.iter().any(|detail| detail == &blocker)
+    {
+        details.push(blocker);
+    }
 
     if details.is_empty() {
         base_reason.into()
@@ -5828,19 +5833,20 @@ fn validate_machine_replay_result(
                         return report;
                     }
                     if witness.provenance.requires_selected_image_identity
-                        && let Some(reason) = machine_model_trace_binding_reason(witness) {
-                            return BinaryMachineReplayReport::from_backend_result(
-                                BinaryMachineReplayStatus::NeedsMachineReplay,
-                                result,
-                                expected_artifact_digest,
-                                matched_artifact_digest,
-                                expected_selected_image,
-                                matched_selected_image,
-                                expected_instruction_trace,
-                                true,
-                                reason,
-                            );
-                        }
+                        && let Some(reason) = machine_model_trace_binding_reason(witness)
+                    {
+                        return BinaryMachineReplayReport::from_backend_result(
+                            BinaryMachineReplayStatus::NeedsMachineReplay,
+                            result,
+                            expected_artifact_digest,
+                            matched_artifact_digest,
+                            expected_selected_image,
+                            matched_selected_image,
+                            expected_instruction_trace,
+                            true,
+                            reason,
+                        );
+                    }
                     if let Some(diagnostic) = machine_byte_range_attestation_diagnostic(
                         expected_selected_image.as_ref(),
                         &result,
@@ -5896,22 +5902,23 @@ fn validate_machine_replay_result(
                         &result.effect_diagnostics,
                     );
                     if witness.provenance.requires_selected_image_identity
-                        && let Some(diagnostic) = effect_diagnostic.clone() {
-                            let status = effect_diagnostic_status(&diagnostic);
-                            let reason = diagnostic.diagnostic.clone();
-                            return BinaryMachineReplayReport::from_backend_result(
-                                status,
-                                result,
-                                expected_artifact_digest,
-                                matched_artifact_digest,
-                                expected_selected_image,
-                                matched_selected_image,
-                                expected_instruction_trace,
-                                true,
-                                reason,
-                            )
-                            .ensure_effect_diagnostic(diagnostic);
-                        }
+                        && let Some(diagnostic) = effect_diagnostic.clone()
+                    {
+                        let status = effect_diagnostic_status(&diagnostic);
+                        let reason = diagnostic.diagnostic.clone();
+                        return BinaryMachineReplayReport::from_backend_result(
+                            status,
+                            result,
+                            expected_artifact_digest,
+                            matched_artifact_digest,
+                            expected_selected_image,
+                            matched_selected_image,
+                            expected_instruction_trace,
+                            true,
+                            reason,
+                        )
+                        .ensure_effect_diagnostic(diagnostic);
+                    }
                     BinaryMachineReplayReport::from_backend_result(
                         BinaryMachineReplayStatus::Replayed,
                         result,
@@ -6200,7 +6207,8 @@ fn ssa_renamed_trace_candidates(
 ) -> Vec<String> {
     let mut candidates = trace_records
         .iter()
-        .filter(|&record| is_ssa_renamed_binding(model_name, &record.raw_name)).map(|record| record.raw_name.clone())
+        .filter(|&record| is_ssa_renamed_binding(model_name, &record.raw_name))
+        .map(|record| record.raw_name.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -7621,24 +7629,26 @@ fn decode_exact_instruction_origin(
     if bytes.len() == 4
         && let Some(instruction) =
             decode_exact_instruction(bytes, origin.instruction_address, decode_aarch64)
-        {
-            return Some(("AArch64", instruction));
-        }
+    {
+        return Some(("AArch64", instruction));
+    }
     if !bytes.is_empty()
         && let Some(instruction) =
             decode_exact_instruction(bytes, origin.instruction_address, decode_x86_64)
-        {
-            return Some(("x86_64", instruction));
-        }
-    if origin.instruction_bytes.is_empty() && origin.instruction_size == Some(4)
+    {
+        return Some(("x86_64", instruction));
+    }
+    if origin.instruction_bytes.is_empty()
+        && origin.instruction_size == Some(4)
         && let Some(encoding) = origin.encoding
-            && let Some(instruction) = decode_exact_instruction(
-                &encoding.to_le_bytes(),
-                origin.instruction_address,
-                decode_aarch64,
-            ) {
-                return Some(("AArch64", instruction));
-            }
+        && let Some(instruction) = decode_exact_instruction(
+            &encoding.to_le_bytes(),
+            origin.instruction_address,
+            decode_aarch64,
+        )
+    {
+        return Some(("AArch64", instruction));
+    }
     None
 }
 
@@ -7743,25 +7753,28 @@ fn decoded_boundary_diagnostic(
             origin.instruction_address,
             step,
             decode_aarch64,
-        ) {
-            return Some(diagnostic);
-        }
+        )
+    {
+        return Some(diagnostic);
+    }
     if !bytes.is_empty()
         && let Some(diagnostic) =
             decode_exact_boundary("x86_64", bytes, origin.instruction_address, step, decode_x86_64)
-        {
-            return Some(diagnostic);
-        }
-    if origin.instruction_bytes.is_empty() && origin.instruction_size == Some(4)
-        && let Some(encoding) = origin.encoding {
-            return decode_exact_boundary(
-                "AArch64",
-                &encoding.to_le_bytes(),
-                origin.instruction_address,
-                step,
-                decode_aarch64,
-            );
-        }
+    {
+        return Some(diagnostic);
+    }
+    if origin.instruction_bytes.is_empty()
+        && origin.instruction_size == Some(4)
+        && let Some(encoding) = origin.encoding
+    {
+        return decode_exact_boundary(
+            "AArch64",
+            &encoding.to_le_bytes(),
+            origin.instruction_address,
+            step,
+            decode_aarch64,
+        );
+    }
     None
 }
 
@@ -8115,7 +8128,9 @@ fn parse_memory_name(name: &str) -> Option<WitnessNameClassification> {
         body.strip_suffix(']')?
     } else if let Some(body) = trimmed.strip_prefix("mem:") {
         body
-    } else { trimmed.strip_prefix("memory:")? };
+    } else {
+        trimmed.strip_prefix("memory:")?
+    };
 
     let (address_text, size_bytes) =
         body.split_once(':').map_or((body, None), |(addr, size)| (addr, parse_u32_literal(size)));
@@ -8163,9 +8178,10 @@ fn parse_stack_base_offset(value: &str) -> Option<(BinaryStackBase, i64)> {
             return Some((base, 0));
         }
         if let Some(offset) = lower.strip_prefix(label)
-            && offset.starts_with(['+', '-']) {
-                return Some((base, parse_i64_literal(offset)?));
-            }
+            && offset.starts_with(['+', '-'])
+        {
+            return Some((base, parse_i64_literal(offset)?));
+        }
     }
     None
 }
@@ -8298,9 +8314,10 @@ fn parse_raw_counterexample_value(value: &str) -> Option<CounterexampleValue> {
         return Some(CounterexampleValue::Uint(n));
     }
     if trimmed.contains('.')
-        && let Ok(n) = trimmed.parse::<f64>() {
-            return Some(CounterexampleValue::Float(n));
-        }
+        && let Ok(n) = trimmed.parse::<f64>()
+    {
+        return Some(CounterexampleValue::Float(n));
+    }
     None
 }
 
@@ -8573,6 +8590,10 @@ fn unsupported_terminator(term: &Terminator) -> Option<(BinaryReplayStatus, Stri
         Terminator::Call { .. } => Some((
             BinaryReplayStatus::NeedsMachineReplay,
             "lifted call terminator requires machine replay or a call summary".into(),
+        )),
+        Terminator::TailCall { .. } => Some((
+            BinaryReplayStatus::NeedsMachineReplay,
+            "lifted tail-call terminator requires machine replay or a call summary".into(),
         )),
         Terminator::Opaque { kind, targets, .. } => Some((
             BinaryReplayStatus::NeedsMachineReplay,

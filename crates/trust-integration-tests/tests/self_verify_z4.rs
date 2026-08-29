@@ -12,9 +12,8 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_integration_tests::ay_test_support::{require_ay, ay_available};
-use trust_router::IncrementalAYSession;
-use trust_router::VerificationBackend;
+use trust_integration_tests::ay_test_support::{ay_available, require_ay};
+use trust_router::{IncrementalAYSession, VerificationBackend};
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Projection,
     Rvalue, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,

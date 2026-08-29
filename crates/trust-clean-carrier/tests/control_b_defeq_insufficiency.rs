@@ -28,7 +28,7 @@
 //! the kernel, and step 1 is what the kernel answers.
 
 use clean_kernel::{BigNat, Environment, Expr, ExprKind, Literal, Name, TypeChecker};
-use trust_clean_carrier::{carrier_at, CarrierRefused};
+use trust_clean_carrier::{CarrierRefused, carrier_at};
 use trust_types::Ty;
 
 /// `Nat`, the unbounded Clean natural.
@@ -114,10 +114,8 @@ fn step_4_a_defeq_only_gate_would_have_admitted_it() {
     let env = env_with_uints();
     let tc = TypeChecker::new(&env);
 
-    let defeq_only_gate_admits =
-        tc.is_def_eq(&round_trip(two_to_the_64()), &Expr::nat_lit(0));
-    let carrier_gate_admits =
-        carrier_at(&nat_ty(), &Ty::Int { width: 64, signed: false }).is_ok();
+    let defeq_only_gate_admits = tc.is_def_eq(&round_trip(two_to_the_64()), &Expr::nat_lit(0));
+    let carrier_gate_admits = carrier_at(&nat_ty(), &Ty::Int { width: 64, signed: false }).is_ok();
 
     assert!(defeq_only_gate_admits, "the defeq-only gate admits (step 1)");
     assert!(!carrier_gate_admits, "the carrier gate refuses (step 3)");
@@ -136,10 +134,7 @@ fn step_5_the_out_of_range_value_is_named_with_its_width() {
     let refusal = trust_clean_carrier::representable_at(&value, 64)
         .expect_err("2^64 does not fit in 64 bits");
     let text = refusal.to_string();
-    assert!(
-        text.contains("18446744073709551616"),
-        "the refusal must name the VALUE: {text}"
-    );
+    assert!(text.contains("18446744073709551616"), "the refusal must name the VALUE: {text}");
     assert!(text.contains("64"), "the refusal must name the WIDTH: {text}");
     assert!(text.contains("options:"), "v7/D3: must offer options: {text}");
 }

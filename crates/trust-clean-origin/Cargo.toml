@@ -15,7 +15,8 @@
 #                Requires `KernelChecked` AND an audited-empty axiom closure AND
 #                a total carrier. Any missing precondition => no `DefId`.
 #   2. `gate`  — does the lowered body agree with the Clean `def`? Decided by
-#                kernel definitional equality, ADMITTED AT THE CARRIER TYPE.
+#                kernel definitional equality or a kernel-checked, axiom-free
+#                structural-induction proof, ADMITTED AT THE CARRIER TYPE.
 #
 # WHY BOTH, AND WHY NEITHER SUFFICES ALONE.
 # I4's `tests/control_b_defeq_insufficiency.rs` executes the proof that kernel
@@ -24,16 +25,20 @@
 # defeq-only gate admits a term whose emitted value wrapped. The carrier
 # obligation catches that and does not consult the kernel. Conversely the
 # carrier says nothing about whether the LOWERING was faithful — that is what
-# defeq decides. The gate therefore requires a `Carrier` (which I4 seals so it
-# cannot exist without `CarrierEvidence::Total`) *and* a defeq verdict.
+# the kernel decides. The gate therefore requires a `Carrier` (which I4 seals
+# so it cannot exist without `CarrierEvidence::Total`) *and* a kernel verdict.
 #
 # THE DEPENDENCY LIST IS PART OF THE ARGUMENT.
 # `clean-kernel` is here because the faithfulness question must be put to the
-# REAL definitional-equality checker, never a Rust imitation of one.
+# REAL checker, never a Rust imitation of one. `clean-auto` is proof SEARCH for
+# the symbolic-recursion fallback: it returns a real recursor term which this
+# crate independently kernel-checks and audits for no non-foundational
+# domain/trust assumptions. It
+# is not part of the TCB and cannot itself mint `Faithful`.
 # `trust-clean-carrier` is here because the gate's admitted statement is at the
 # CARRIER type. `trust-symbols` is here because the mint decision reads
-# `KernelStatus` and `AxiomClosure`. There is no elaborator, no parser, and no
-# solver: this crate decides admissibility and faithfulness, never a proposition.
+# `KernelStatus` and `AxiomClosure`. There is no parser or oracle: this crate
+# decides admissibility and faithfulness from kernel-checkable terms.
 
 [package]
 name = "trust-clean-origin"
@@ -48,15 +53,24 @@ description = "Clean-origin CALL lane (I5): the gated DefId-mint decision and th
 workspace = true
 
 [dependencies]
-# Exactly five. See the header before adding a sixth.
+# Exactly six. See the header before changing the set.
 clean-kernel = { workspace = true }
+clean-auto = { workspace = true }
 trust-clean-carrier = { path = "../trust-clean-carrier" }
 trust-symbols = { path = "../trust-symbols" }
 trust-types = { path = "../trust-types", default-features = false }
-# The FIFTH, added with `emit.rs`: side B's producer. `admit_projection_function`
+# The SIXTH, added with `emit.rs`: side B's producer. `admit_projection_function`
 # reflects the EMITTED body back into a Clean term, and it is the same function
 # the E6 Rust->Clean kernel-import lane has always used — which is exactly why
 # the comparison is not co-authored. It is a dependency of this crate, never a
 # thing this crate may edit to make a Clean-origin body agree; doing so would
 # turn the gate into a round trip. See `emit.rs`'s module docs.
 trust-spec-elab = { path = "../trust-spec-elab" }
+
+[dev-dependencies]
+# TESTS ONLY, never the lib (the "exactly five" rule above governs
+# [dependencies]): probe_i3 pins the planner against the REAL island
+# elaboration — the C9 spelling gap proved hand-built side-A terms can admit
+# while the term the elaborator actually produces refuses. No cycle:
+# trust-certify does not depend on this crate.
+trust-certify = { path = "../trust-certify" }

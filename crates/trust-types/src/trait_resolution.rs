@@ -11,11 +11,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::{FxHashMap, FxHashSet};
-
 use serde::{Deserialize, Serialize};
 
 use crate::formula::{Formula, VcKind, VerificationCondition};
+use crate::fx::{FxHashMap, FxHashSet};
 use crate::model::{BlockId, SourceSpan, Terminator, Ty, VerifiableBody};
 use crate::traits::{
     CoherenceError, ConcreteTarget, MethodInfo, TraitBound, TraitConstraint, TraitImpl,
@@ -210,61 +209,62 @@ pub fn resolve_all_trait_calls(
     let mut vtable_traits: FxHashSet<String> = FxHashSet::default();
 
     for block in &body.blocks {
-        if let Terminator::Call { func, span, .. } = &block.terminator {
-            // Extract trait::method pattern from the function name.
-            if let Some((trait_part, method_name)) = func.rsplit_once("::") {
-                // Try to find impls that match this trait.
-                let matching_impls = find_matching_impls(resolver, trait_part);
+        let (func, span) = match &block.terminator {
+            Terminator::Call { func, span, .. } | Terminator::TailCall { func, span, .. } => {
+                (func, span)
+            }
+            _ => continue,
+        };
+        // Extract trait::method pattern from the function name.
+        if let Some((trait_part, method_name)) = func.rsplit_once("::") {
+            // Try to find impls that match this trait.
+            let matching_impls = find_matching_impls(resolver, trait_part);
 
-                if matching_impls.is_empty() {
+            if matching_impls.is_empty() {
+                result.unresolved_calls.push(UnresolvedCall {
+                    block: block.id,
+                    callee_name: func.clone(),
+                    reason: format!("no impl found for trait `{trait_part}`"),
+                    span: span.clone(),
+                });
+                continue;
+            }
+
+            // Build vtable for this trait if we haven't already.
+            for imp in &matching_impls {
+                if vtable_traits.insert(imp.trait_name.clone()) {
+                    result.vtables.push(resolver.build_vtable(&imp.trait_name));
+                }
+            }
+
+            // Resolve to concrete targets.
+            let trait_name = &matching_impls[0].trait_name;
+            let vtable = resolver.build_vtable(trait_name);
+            let targets = TraitResolver::devirtualize(&vtable, method_name);
+
+            if let Some(first_impl) = matching_impls.first() {
+                if let Some(method) = first_impl.methods.iter().find(|m| m.name == method_name) {
+                    let method_info = MethodInfo {
+                        containing_trait: Some(first_impl.trait_name.clone()),
+                        impl_type: first_impl.implementing_type.clone(),
+                        method_body_ref: method.body_def_path.clone(),
+                        method_name: method.name.clone(),
+                    };
+
+                    result.resolved_calls.push(ResolvedCall {
+                        block: block.id,
+                        callee_name: func.clone(),
+                        method_info,
+                        concrete_targets: targets,
+                        span: span.clone(),
+                    });
+                } else {
                     result.unresolved_calls.push(UnresolvedCall {
                         block: block.id,
                         callee_name: func.clone(),
-                        reason: format!("no impl found for trait `{trait_part}`"),
+                        reason: format!("method `{method_name}` not found in `{trait_name}` impls"),
                         span: span.clone(),
                     });
-                    continue;
-                }
-
-                // Build vtable for this trait if we haven't already.
-                for imp in &matching_impls {
-                    if vtable_traits.insert(imp.trait_name.clone()) {
-                        result.vtables.push(resolver.build_vtable(&imp.trait_name));
-                    }
-                }
-
-                // Resolve to concrete targets.
-                let trait_name = &matching_impls[0].trait_name;
-                let vtable = resolver.build_vtable(trait_name);
-                let targets = TraitResolver::devirtualize(&vtable, method_name);
-
-                if let Some(first_impl) = matching_impls.first() {
-                    if let Some(method) = first_impl.methods.iter().find(|m| m.name == method_name)
-                    {
-                        let method_info = MethodInfo {
-                            containing_trait: Some(first_impl.trait_name.clone()),
-                            impl_type: first_impl.implementing_type.clone(),
-                            method_body_ref: method.body_def_path.clone(),
-                            method_name: method.name.clone(),
-                        };
-
-                        result.resolved_calls.push(ResolvedCall {
-                            block: block.id,
-                            callee_name: func.clone(),
-                            method_info,
-                            concrete_targets: targets,
-                            span: span.clone(),
-                        });
-                    } else {
-                        result.unresolved_calls.push(UnresolvedCall {
-                            block: block.id,
-                            callee_name: func.clone(),
-                            reason: format!(
-                                "method `{method_name}` not found in `{trait_name}` impls"
-                            ),
-                            span: span.clone(),
-                        });
-                    }
                 }
             }
         }
@@ -473,8 +473,16 @@ mod tests {
 
     fn make_blanket_impl() -> TraitImpl {
         TraitImpl {
-            implementing_type: Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, },
+            implementing_type: Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new(),
+                name: "T".to_string(),
+                fields: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             trait_name: "MyTrait".to_string(),
             methods: vec![],
             where_clauses: vec![],
@@ -484,8 +492,16 @@ mod tests {
 
     fn make_bounded_blanket_impl() -> TraitImpl {
         TraitImpl {
-            implementing_type: Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, },
+            implementing_type: Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new(),
+                name: "T".to_string(),
+                fields: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             trait_name: "MyTrait".to_string(),
             methods: vec![],
             where_clauses: vec![TraitBound {
@@ -578,8 +594,19 @@ mod tests {
         let req = MonomorphizationRequest {
             generic_def_path: "std::collections::HashMap::insert".to_string(),
             substitutions: vec![
-                ("K".to_string(), Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "String".to_string(), fields: vec![],
-                    disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, }),
+                (
+                    "K".to_string(),
+                    Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
+                        variants: Vec::new(),
+                        name: "String".to_string(),
+                        fields: vec![],
+                        disc_index_safe: false,
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
+                ),
                 ("V".to_string(), Ty::i32()),
             ],
             call_site: span(),
@@ -646,7 +673,11 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    is_foreign: false,
                     func: "std::clone::Clone::clone".to_string(),
                     args: vec![],
                     dest: Place::local(0),
@@ -675,7 +706,11 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    is_foreign: false,
                     func: "UnknownTrait::method".to_string(),
                     args: vec![],
                     dest: Place::local(0),
@@ -705,7 +740,11 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    is_foreign: false,
                     func: "std::clone::Clone::clone".to_string(),
                     args: vec![],
                     dest: Place::local(0),
@@ -966,7 +1005,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::clone::Clone::clone".to_string(),
                         args: vec![],
                         dest: Place::local(0),
@@ -978,7 +1021,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::fmt::Debug::fmt".to_string(),
                         args: vec![],
                         dest: Place::local(1),

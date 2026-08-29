@@ -799,8 +799,9 @@ mod tests {
         // Truncatable file (no single-writer invariant): the env can shrink the
         // mapping, so an access-while-stale is reachable ⇒ ty CATCHES the hazard.
         // This is the SOUND result — re-validation would NOT change it (TOCTOU).
-        let hazard = TyBackend
-            .verify(&temporal(StateMachineMetadata::mmap_temporal_model(SingleWriterEvidence::None)));
+        let hazard = TyBackend.verify(&temporal(StateMachineMetadata::mmap_temporal_model(
+            SingleWriterEvidence::None,
+        )));
         assert!(
             matches!(hazard, VerificationResult::Failed { .. }),
             "without single-writer, ty must catch the truncate->stale-access hazard, got {hazard:?}"

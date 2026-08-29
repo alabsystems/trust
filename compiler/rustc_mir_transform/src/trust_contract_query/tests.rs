@@ -440,6 +440,98 @@ fn structural_query_identity_carries_bool_width_and_signedness() {
 }
 
 #[test]
+fn structural_query_refuses_cross_domain_numeric_operations() {
+    use rustc_middle::mir::trust_contract::{
+        TrustContractPredicateKind as Predicate, TrustContractPropositionDomain as Domain,
+    };
+
+    let domains = [
+        LoweredVariableDomain {
+            name: "u8v".to_string(),
+            domain: Domain::MachineInt { width: 8, signed: false },
+        },
+        LoweredVariableDomain {
+            name: "u16v".to_string(),
+            domain: Domain::MachineInt { width: 16, signed: false },
+        },
+        LoweredVariableDomain {
+            name: "i8v".to_string(),
+            domain: Domain::MachineInt { width: 8, signed: true },
+        },
+        LoweredVariableDomain {
+            name: "flag".to_string(),
+            domain: Domain::Bool,
+        },
+    ];
+
+    with_test_session_globals(|| {
+        for text in [
+            "u8v == u16v",
+            "u8v < i8v",
+            "u16v + u8v == u16v",
+            "flag == u8v",
+        ] {
+            assert!(
+                matches!(
+                    lowered_contract_text_with_domains(text.to_string(), &domains),
+                    Predicate::Opaque { .. }
+                ),
+                "mixed exact domains must fail closed: `{text}`",
+            );
+        }
+
+        for text in ["u8v == 1", "u16v + 1 == u16v", "flag == true"] {
+            assert!(
+                matches!(
+                    lowered_contract_text_with_domains(text.to_string(), &domains),
+                    Predicate::Typed { .. }
+                ),
+                "a literal may inherit the one authenticated adjacent domain: `{text}`",
+            );
+        }
+    });
+}
+
+#[test]
+fn helper_scanner_preserves_unicode_strings_comments_and_refused_calls() {
+    let source = concat!(
+        "π + δhelper(x) + \"helper(a, b))\" + r#\"helper(c)\"# + ",
+        " /* helper(d, e) */ helper( x ) + unknown(helper(y)) // helper(z)\n",
+    );
+    let mut calls = Vec::new();
+    let rewritten = rewrite_contract_helper_calls(source, 0, &mut |name, actuals, _| {
+        calls.push((name.to_string(), actuals.to_vec()));
+        (name == "helper").then(|| format!("<{}>", actuals.join(",")))
+    });
+
+    assert_eq!(
+        rewritten,
+        concat!(
+            "π + δhelper(x) + \"helper(a, b))\" + r#\"helper(c)\"# + ",
+            " /* helper(d, e) */ <x> + unknown(helper(y)) // helper(z)\n",
+        ),
+    );
+    assert!(calls.contains(&("helper".to_string(), vec!["x".to_string()])));
+    assert!(calls.contains(&("unknown".to_string(), vec!["<y>".to_string()])));
+    assert!(
+        calls.iter().all(|(name, actuals)|
+            !matches!((name.as_str(), actuals.as_slice()), ("helper", [value]) if matches!(value.as_str(), "a" | "c" | "d" | "z"))),
+        "helper-looking text inside protected tokens must never reach semantic resolution",
+    );
+}
+
+#[test]
+fn helper_argument_scanner_ignores_nested_delimiters_inside_tokens() {
+    assert_eq!(
+        split_top_level_commas("x, \"a,b)\", r#\"c,d)\"#, /* , ) */ nested(y, z)")
+            .unwrap(),
+        ["x", " \"a,b)\"", " r#\"c,d)\"#", " /* , ) */ nested(y, z)"],
+    );
+    let wrapped = "outer(\"λ)\", r#\")\"#, /* ) */ inner(x)) tail";
+    assert_eq!(matching_close_paren(wrapped, 5), wrapped.rfind(')'));
+}
+
+#[test]
 fn snippet_fallback_lowers_public_sample_requires() {
     assert_eq!(
         lowered_text(
@@ -1052,7 +1144,7 @@ fn native_collection_loop_clause_mints_exact_literal_projection_domains() {
                 ("_n".to_string(), Domain::PointerSizedInt { width: 64, signed: false }),
                 ("first".to_string(), Domain::MachineInt { width: 32, signed: false }),
                 ("xs[0]".to_string(), Domain::MachineInt { width: 32, signed: false }),
-                ("xs_len".to_string(), Domain::PointerSizedInt { width: 64, signed: false }),
+                ("xs__len".to_string(), Domain::PointerSizedInt { width: 64, signed: false }),
             ])
         );
 
@@ -1251,4 +1343,127 @@ fn malformed_native_verifier_vocabulary_fails_closed() {
             "malformed predicate must be unsupported: {malformed}"
         );
     }
+}
+
+/// The two halves of the citation lexer partition a snippet's identifiers:
+/// `called_identifiers` keeps the `ident(` shapes (whitespace-tolerant), and
+/// `bare_identifiers` keeps the rest — including e6 probe f04's zero-arity
+/// citation spelling, which the uncited defeq lane used to be blind to
+/// (measured TRUST_E9_DEBUG NO-ISLAND-CALL).
+#[test]
+fn citation_lexer_partitions_called_and_bare_identifiers() {
+    // f04's clause: no argument list anywhere.
+    assert_eq!(called_identifiers("result == forty_two_isl"), Vec::<String>::new());
+    assert_eq!(bare_identifiers("result == forty_two_isl"), vec!["result", "forty_two_isl"]);
+
+    // f06's clause: the callee is called, the argument is a literal.
+    assert_eq!(called_identifiers("result == c42(0)"), vec!["c42"]);
+    assert_eq!(bare_identifiers("result == c42(0)"), vec!["result"]);
+
+    // An identifier inside an argument list is bare, not called.
+    assert_eq!(called_identifiers("result == min2(a, b)"), vec!["min2"]);
+    assert_eq!(bare_identifiers("result == min2(a, b)"), vec!["result", "a", "b"]);
+
+    // Whitespace before `(` still reads as a call — for BOTH halves.
+    assert_eq!(called_identifiers("f (x)"), vec!["f"]);
+    assert_eq!(bare_identifiers("f (x)"), vec!["x"]);
+}
+
+/// D3 (cast half). The cast admission rule is a SOUNDNESS boundary, so it is
+/// pinned value-by-value rather than by example.
+///
+/// The contract formula is over MATHEMATICAL integers — every integer
+/// proposition domain maps to `Sort::Int` in
+/// `CompilerContractValueDomain::logical_sort`, so `+`/`*` never wrap at a
+/// machine width. Under that semantics `x as T` denotes the same value as `x`
+/// EXACTLY when `range(src)` is a subset of `range(dst)`, and the identity
+/// lowering is then exact. Every other integer cast truncates or reinterprets,
+/// and lowering it as identity would be a false proof.
+#[test]
+fn value_preserving_int_cast_admits_exactly_the_widenings() {
+    let u = |bits| (bits, false);
+    let i = |bits| (bits, true);
+
+    // Same signedness, widening or equal -> value-preserving.
+    for (src, dst) in [(8, 16), (8, 64), (32, 64), (32, 128), (64, 64), (8, 8)] {
+        assert!(
+            value_preserving_int_cast_widths(u(src), u(dst)),
+            "u{src} as u{dst} is a widening and must be admitted"
+        );
+        assert!(
+            value_preserving_int_cast_widths(i(src), i(dst)),
+            "i{src} as i{dst} is a widening and must be admitted"
+        );
+    }
+
+    // Same signedness, NARROWING -> truncates -> refused.
+    for (src, dst) in [(64, 32), (32, 8), (16, 8), (128, 64)] {
+        assert!(
+            !value_preserving_int_cast_widths(u(src), u(dst)),
+            "u{src} as u{dst} TRUNCATES and must be refused"
+        );
+        assert!(
+            !value_preserving_int_cast_widths(i(src), i(dst)),
+            "i{src} as i{dst} TRUNCATES and must be refused"
+        );
+    }
+
+    // Unsigned -> signed needs a STRICTLY wider target.
+    assert!(
+        value_preserving_int_cast_widths(u(8), i(16)),
+        "u8 as i16 keeps every value (0..=255 fits -32768..=32767)"
+    );
+    assert!(
+        !value_preserving_int_cast_widths(u(8), i(8)),
+        "u8 as i8 must be refused: 255 becomes -1"
+    );
+    assert!(
+        !value_preserving_int_cast_widths(u(64), i(64)),
+        "u64 as i64 must be refused: u64::MAX becomes -1"
+    );
+
+    // Signed -> unsigned is NEVER value-preserving: negatives wrap.
+    for (src, dst) in [(8, 8), (8, 64), (32, 64), (32, 128)] {
+        assert!(
+            !value_preserving_int_cast_widths(i(src), u(dst)),
+            "i{src} as u{dst} must be refused: a negative operand wraps"
+        );
+    }
+}
+
+/// D3 (cast half), pointer-sized lane. `usize`/`isize` used to be refused
+/// WHOLESALE, which is why the real guard `idx <= u32::MAX as usize` could not
+/// be written. They now arrive already resolved to the compilation's exact
+/// target pointer width, so they are decided by the same subset test as any
+/// other pair — and the answer is genuinely target-dependent, which is the
+/// point: the same clause is admitted on a 64-bit target and refused on a
+/// 16-bit one, rather than one answer being baked in.
+#[test]
+fn pointer_sized_casts_are_decided_at_the_target_width() {
+    let u = |bits| (bits, false);
+    let i = |bits| (bits, true);
+
+    // 64-bit target: usize is (64, false).
+    assert!(
+        value_preserving_int_cast_widths(u(32), u(64)),
+        "on a 64-bit target `u32 as usize` is a widening -> admitted"
+    );
+    assert!(
+        value_preserving_int_cast_widths(u(64), u(64)),
+        "on a 64-bit target `usize as u64` is the identity -> admitted"
+    );
+    assert!(
+        !value_preserving_int_cast_widths(u(64), u(32)),
+        "on a 64-bit target `usize as u32` TRUNCATES -> refused"
+    );
+    assert!(
+        !value_preserving_int_cast_widths(i(64), u(64)),
+        "on a 64-bit target `isize as usize` drops negatives -> refused"
+    );
+
+    // 16-bit target: usize is (16, false). The SAME source clause flips.
+    assert!(
+        !value_preserving_int_cast_widths(u(32), u(16)),
+        "on a 16-bit target `u32 as usize` TRUNCATES -> must be refused there"
+    );
 }

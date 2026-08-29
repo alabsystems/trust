@@ -50,6 +50,14 @@ const SIGMA_FRESH_VAR_PREFIX: &str = "__trust_sigma_";
 /// conjoined around it.
 const REPLAY_TEMP_VAR_PREFIX: &str = "__trust_replay__";
 
+/// Read once: [`composed_formula_is_caller_entry_grounded`] runs per obligation.
+fn ground_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TRUST_GROUND_DEBUG").is_some_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
 /// Whether every non-σ free var ("callee temp") of `violation` is
 /// FUNCTIONALLY PINNED by the formula itself: a top-level `And` conjunct
 /// `Eq(temp, rhs)` (either orientation) whose `rhs` free vars resolve — via
@@ -62,8 +70,12 @@ const REPLAY_TEMP_VAR_PREFIX: &str = "__trust_replay__";
 /// such a pin is an unconstrained model dimension — a SAT over it is an
 /// over-approximation, not a witness — so the candidate must drop. The
 /// fixpoint is drop-only: any unhandled shape (non-`And` top with temps,
-/// projected temp names, a temp pinned only under a disjunction) fails the
-/// check and loses the refutation, never mints one.
+/// projected temp names) fails the check and loses the refutation, never mints
+/// one.
+///
+/// A temp that is pinned only under a DISJUNCTION is admitted by exactly one
+/// extra rule, [`temp_is_repairable_under_one_disjunctive_pin`] — see its own
+/// soundness note; every other disjunctive shape still fails closed.
 fn callee_temps_are_def_pinned(
     violation: &Formula,
     temps: &FxHashSet<String>,
@@ -72,12 +84,25 @@ fn callee_temps_are_def_pinned(
     if temps.is_empty() {
         return true;
     }
-    // A temp is only ever pinned by a DIRECT conjunct of a flat top-level
-    // `And` — the exact shape the body-VC assemblers emit (defs and guards
-    // spliced flat beside the violation). Anything else: fail closed.
-    let Formula::And(conjuncts) = violation else {
+    // The top of the formula must be a conjunction: an `Eq` that is the WHOLE
+    // formula is the obligation's violation, not a definition of its own
+    // subject, and reading it as a pin would ground the exact
+    // `opaque_call_result == 0` shape this gate exists to reject.
+    if !matches!(violation, Formula::And(_)) {
         return false;
-    };
+    }
+    // ... but BELOW that top, `∧` is associative: a conjunct nested inside an
+    // `And` child of an `And` is a top-level conjunct of the same conjunction.
+    // This walk used to read only the DIRECT children, on the stated premise
+    // that "the body-VC assemblers emit defs and guards spliced flat beside the
+    // violation". MEASURED 2026-08-28 (`TRUST_GROUND_DEBUG=1`, `a / d`): that
+    // premise is false for the ordinary body-VC lane — `generate_vcs` emits a
+    // nested `And` (a type-range block, then a defs/guards/violation block), so
+    // `_3 == (d == 0)` sat two levels down, was invisible here, and EVERY
+    // ordinary Level-0 body VC carrying a MIR temp was judged ungrounded.
+    // Descent stops at every non-`And` node, so a pin under a disjunction or a
+    // negation is still not collected by the fixpoint below.
+    let conjuncts = flatten_and_conjuncts(violation);
     let mut resolved: FxHashSet<String> = FxHashSet::default();
     let rhs_grounded = |rhs: &Formula, resolved: &FxHashSet<String>| {
         rhs.free_variables().iter().all(|v| {
@@ -89,14 +114,13 @@ fn callee_temps_are_def_pinned(
     // Monotone fixpoint (chained defs: `_4 == i < _3` after `_3 == 4`).
     loop {
         let mut progressed = false;
-        for conjunct in conjuncts {
+        for conjunct in conjuncts.iter().copied() {
             let Formula::Eq(lhs, rhs) = conjunct else {
                 continue;
             };
             // Either orientation; the pinned side must be a WHOLE-name temp
             // var (a projected temp is not a value equation for its base).
-            for (var_side, def_side) in
-                [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
+            for (var_side, def_side) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
             {
                 if let Some(name) = var_side.var_name()
                     && temps.contains(name)
@@ -112,7 +136,104 @@ fn callee_temps_are_def_pinned(
             break;
         }
     }
+    // Second (and last) admission route, for the one shape the fixpoint cannot
+    // see. Applied AFTER the fixpoint so it can only ever add, and its results
+    // are deliberately not fed back into the fixpoint — a repaired temp never
+    // grounds another temp's def.
+    let repairable: Vec<String> = temps
+        .iter()
+        .filter(|t| !resolved.contains(*t))
+        .filter(|t| {
+            temp_is_repairable_under_one_disjunctive_pin(t, &conjuncts, &resolved, &rhs_grounded)
+        })
+        .cloned()
+        .collect();
+    resolved.extend(repairable);
     temps.iter().all(|t| resolved.contains(t))
+}
+
+/// Flatten the `And` spine of `formula` into its semantic conjunct list.
+///
+/// Descent stops at every non-`And` node, so an `Or`/`Not`/`Implies` subtree is
+/// returned WHOLE and is never mined for conjuncts it does not actually assert.
+fn flatten_and_conjuncts(formula: &Formula) -> Vec<&Formula> {
+    let mut out: Vec<&Formula> = Vec::new();
+    let mut stack: Vec<&Formula> = vec![formula];
+    while let Some(node) = stack.pop() {
+        match node {
+            Formula::And(children) => stack.extend(children.iter().rev()),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The single disjunctive admission: `temp` occurs in EXACTLY ONE flattened
+/// conjunct, that conjunct is an `Or`, and within it `temp` occurs only in a
+/// disjunct `Eq(temp, rhs)` (either orientation) whose `rhs` is grounded and
+/// does not itself mention `temp`.
+///
+/// SOUNDNESS (model repair, not model reading). Take any model of the whole
+/// formula and REASSIGN `temp := rhs`, the value the grounded inputs determine.
+/// Every other conjunct is untouched, because `temp` occurs in none of them.
+/// The one conjunct that does contain it is a disjunction of which `Eq(temp,
+/// rhs)` is now TRUE, so it holds too. The repaired assignment therefore still
+/// satisfies the formula AND gives `temp` the value a real execution computes,
+/// so the model's input projection denotes a real execution — which is exactly
+/// what the whole-name pin establishes for the fixpoint case.
+///
+/// This is what a checked-arithmetic body VC needs and it is why the shape is
+/// worth naming: rustc's overflow lowering conditions the destination
+/// definition on NOT overflowing, so the emitted conjunct is
+/// `(a + b > MAX) ∨ (_0 == a + b)` and `_0` — a local the assert dominates, so
+/// no execution has assigned it yet — is pinned nowhere else. Without this
+/// rule every `a + b` refutation in the tree is dropped as ungrounded.
+///
+/// It admits none of the hostile inhabitants the caller-side gate lists: a
+/// havoc'd call destination with no summary fact has no `Eq` disjunct at all, a
+/// `__r1occ` alias is rejected by name before this runs, and a temp mentioned
+/// by any second conjunct (which the repair would break) is rejected by the
+/// occurrence count.
+fn temp_is_repairable_under_one_disjunctive_pin(
+    temp: &str,
+    conjuncts: &[&Formula],
+    resolved: &FxHashSet<String>,
+    rhs_grounded: &dyn Fn(&Formula, &FxHashSet<String>) -> bool,
+) -> bool {
+    let mentions = |f: &Formula| f.free_variables().contains(temp);
+    let mut occurrences = conjuncts.iter().copied().filter(|c| mentions(c));
+    let Some(only) = occurrences.next() else {
+        return false;
+    };
+    if occurrences.next().is_some() {
+        return false;
+    }
+    let Formula::Or(disjuncts) = only else {
+        return false;
+    };
+    let mut carries_pin = false;
+    for disjunct in disjuncts {
+        let is_pin = match disjunct {
+            Formula::Eq(lhs, rhs) => {
+                [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())].iter().any(
+                    |(var_side, def_side)| {
+                        var_side.var_name() == Some(temp)
+                            && !mentions(def_side)
+                            && rhs_grounded(def_side, resolved)
+                    },
+                )
+            }
+            _ => false,
+        };
+        if is_pin {
+            carries_pin = true;
+        } else if mentions(disjunct) {
+            // A second, non-pinning occurrence inside the same `Or`: the repair
+            // would change that disjunct's truth value. Fail closed.
+            return false;
+        }
+    }
+    carries_pin
 }
 
 /// Caller-side mirror of [`callee_temps_are_def_pinned`], applied at the
@@ -131,12 +252,15 @@ fn callee_temps_are_def_pinned(
 ///     `local_versions_collapse_to_bare` parameter standard). Entry inputs are
 ///     universally quantified over real executions, so the model may range
 ///     freely over them.
-///   * DEF-PINNED: functionally determined by the conjoined caller facts — a
-///     top-level `Eq` conjunct grounding the var, via the same fixpoint the
-///     callee-side gate runs, in entry state / constants / already-pinned vars.
-///     This is what admits computed actuals (`let k = i + 1; helper(a, k)`
-///     carries `k == i + 1` as a block def) and the alpha-renamed
-///     `__trust_replay__*` callee temps (pinned by their own carried defs).
+///   * DEF-PINNED: functionally determined by the conjoined caller facts — an
+///     `Eq` conjunct anywhere on the formula's `And` spine grounding the var,
+///     via the same fixpoint the callee-side gate runs, in entry state /
+///     constants / already-pinned vars. This is what admits computed actuals
+///     (`let k = i + 1; helper(a, k)` carries `k == i + 1` as a block def), the
+///     alpha-renamed `__trust_replay__*` callee temps (pinned by their own
+///     carried defs), and every ordinary MIR block temp of a body VC. Its one
+///     extension for a temp pinned only under a disjunction is
+///     [`temp_is_repairable_under_one_disjunctive_pin`].
 ///
 /// EVERYTHING ELSE FAILS THE GATE, dropping the candidate (fail-closed, drop-
 /// only). The known hostile inhabitants, each a CONFIRMED false-refutation
@@ -154,7 +278,7 @@ fn callee_temps_are_def_pinned(
 ///   * a residual `X#tok` versioned read of a reassigned local, a
 ///     `__trust_sigma_*` fresh var, or any name that resolves to no unique
 ///     caller local — unclassifiable, hence unconstrained.
-pub(super) fn composed_formula_is_caller_entry_grounded(
+pub fn composed_formula_is_caller_entry_grounded(
     func: &VerifiableFunction,
     formula: &Formula,
 ) -> bool {
@@ -163,10 +287,8 @@ pub(super) fn composed_formula_is_caller_entry_grounded(
         // emitter spelling (`place_to_var_name` owns demotion/uniqueness);
         // ambiguity fails closed.
         let mut named = func.body.locals.iter().filter(|decl| {
-            crate::place_to_var_name(
-                func,
-                &Place { local: decl.index, projections: Vec::new() },
-            ) == base
+            crate::place_to_var_name(func, &Place { local: decl.index, projections: Vec::new() })
+                == base
         });
         let Some(decl) = named.next() else {
             return false;
@@ -177,8 +299,7 @@ pub(super) fn composed_formula_is_caller_entry_grounded(
         let local = decl.index;
         // Parameters only: a never-written non-parameter has no defined value
         // at all, and a written one must earn admission through a def pin.
-        (1..=func.body.arg_count).contains(&local)
-            && local_versions_collapse_to_bare(func, local)
+        (1..=func.body.arg_count).contains(&local) && local_versions_collapse_to_bare(func, local)
     };
     let in_domain = |name: &str| -> bool {
         if name.contains("__r1occ") {
@@ -191,17 +312,61 @@ pub(super) fn composed_formula_is_caller_entry_grounded(
         matches!(split_projection_base(whole), Some((base, _)) if entry_stable_param(base))
     };
     let mut temps: FxHashSet<String> = FxHashSet::default();
+    let mut r1occ_reject: Option<String> = None;
     for name in formula.free_variables() {
         // A per-occurrence opaque alias is unclassifiable BY CONSTRUCTION —
         // reject by name even if some Eq conjunct would appear to pin it.
         if name.contains("__r1occ") {
-            return false;
+            r1occ_reject = Some(name);
+            break;
         }
         if !in_domain(&name) {
             temps.insert(name);
         }
     }
-    callee_temps_are_def_pinned(formula, &temps, &in_domain)
+    let verdict = r1occ_reject.is_none() && callee_temps_are_def_pinned(formula, &temps, &in_domain);
+    // `TRUST_GROUND_DEBUG=1` prints one line per gate decision: the function,
+    // its parameters and their stability, the formula's free variables, which
+    // of them this gate could not classify, and the verdict. A dropped
+    // refutation is otherwise INVISIBLE — the row simply reads `runtime-checked`
+    // and the build succeeds — and reading the predicate instead of running it
+    // is what let the nested-`And` defect above survive its own review.
+    if ground_debug_enabled() {
+        let mut params: Vec<String> = Vec::new();
+        for decl in func.body.locals.iter() {
+            if (1..=func.body.arg_count).contains(&decl.index) {
+                params.push(format!(
+                    "{}({}{})",
+                    crate::place_to_var_name(
+                        func,
+                        &Place { local: decl.index, projections: Vec::new() }
+                    ),
+                    decl.index,
+                    if local_versions_collapse_to_bare(func, decl.index) {
+                        ",stable"
+                    } else {
+                        ",UNSTABLE"
+                    }
+                ));
+            }
+        }
+        let mut fv: Vec<String> = formula.free_variables().into_iter().collect();
+        fv.sort();
+        let mut tv: Vec<String> = temps.iter().cloned().collect();
+        tv.sort();
+        eprintln!(
+            "TRUST_GROUND: fn={} argc={} params=[{}] free=[{}] unpinned_candidates=[{}] r1occ={:?} verdict={} formula={:?}",
+            func.name,
+            func.body.arg_count,
+            params.join(" "),
+            fv.join(" "),
+            tv.join(" "),
+            r1occ_reject,
+            verdict,
+            formula,
+        );
+    }
+    verdict
 }
 
 /// Substitute the callee's L0 violation formula into the caller's namespace,
@@ -345,10 +510,13 @@ pub fn generate_callsite_l0_replay_candidates(
     if func_exceeds_vcgen_budget(func) {
         return Vec::new();
     }
-    // #5-PRE-A critical scoping: a recursive self-call's precondition is
-    // discharged against the DEFINITION-ENTRY assumption machinery; replaying
-    // the caller's own body as its "callee" would re-derive the entry
-    // obligation this scoping deliberately exempts. Never replay self-calls.
+    // #5-PRE-A critical scoping: a recursive self-call's precondition remains
+    // an ordinary caller-side proof request. This helper is only the optional
+    // refutation-replay lane: replaying the caller's own body as its "callee"
+    // would recurse into the same body rather than independently strengthen
+    // that proof request. Never produce self-call replay candidates. Their
+    // absence grants no authority; the ordinary precondition row is still
+    // generated and unresolved rows fail closed in the compiler consumer.
     if callee_name == func.name || callee_name == func.def_path {
         return Vec::new();
     }
@@ -404,8 +572,10 @@ pub fn generate_callsite_l0_replay_candidates(
     let mut seen: FxHashSet<String> = FxHashSet::default();
 
     for block in &func_view.body.blocks {
-        let Terminator::Call { func: block_callee, args, span, .. } = &block.terminator else {
-            continue;
+        let (block_callee, args, span) = match &block.terminator {
+            Terminator::Call { func, args, span, .. }
+            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+            _ => continue,
         };
         // Exact-site match: name AND span. The driver keys its replay request
         // off the refuted Precondition row's location, which the callsite
@@ -427,7 +597,9 @@ pub fn generate_callsite_l0_replay_candidates(
             .param_names
             .iter()
             .zip(args.iter())
-            .map(|(formal, actual)| (formal.clone(), sigma_actual_formula(func_view, formal, actual)))
+            .map(|(formal, actual)| {
+                (formal.clone(), sigma_actual_formula(func_view, formal, actual))
+            })
             .collect();
         append_length_replacements(func_view, summary, args, &mut replacements);
 

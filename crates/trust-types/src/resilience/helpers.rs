@@ -3,9 +3,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::{BasicBlock, BlockId, Operand, Place, Rvalue, Statement, Terminator};
-
 use super::types::{ErrorHandlingPattern, PanicKind};
+use crate::{BasicBlock, BlockId, Operand, Place, Rvalue, Statement, Terminator};
 
 /// Convert an AssertMessage to a human-readable description.
 pub(in crate::resilience) fn assert_msg_description(msg: &crate::AssertMessage) -> String {
@@ -48,7 +47,13 @@ pub(in crate::resilience) fn classify_error_handling(
     target_block: &BasicBlock,
 ) -> ErrorHandlingPattern {
     // Check if the result is used in an unwrap call.
-    if let Terminator::Call { func: next_func, args, .. } = &target_block.terminator
+    let next_call = match &target_block.terminator {
+        Terminator::Call { func, args, .. } | Terminator::TailCall { func, args, .. } => {
+            Some((func, args))
+        }
+        _ => None,
+    };
+    if let Some((next_func, args)) = next_call
         && next_func.contains("unwrap")
         && !next_func.contains("unwrap_or")
     {
@@ -144,7 +149,7 @@ fn operand_references_local(operand: &Operand, local: usize) -> bool {
 /// Check if a terminator references a given local variable.
 fn terminator_references_local(term: &Terminator, local: usize) -> bool {
     match term {
-        Terminator::Call { args, .. } => {
+        Terminator::Call { args, .. } | Terminator::TailCall { args, .. } => {
             args.iter().any(|arg| operand_references_local(arg, local))
         }
         Terminator::SwitchInt { discr, .. } => operand_references_local(discr, local),

@@ -29,9 +29,8 @@ use std::path::PathBuf;
 use trust_backprop::GovernancePolicy;
 use trust_integration_tests::ay_test_support::require_ay as new_ay_session;
 use trust_loop::{LoopConfig, TerminationReason, VerifyContext};
-use trust_router::VerificationBackend;
-use trust_router::build_v1_vcs;
 use trust_router::incremental_ay::IncrementalAYSession;
+use trust_router::{VerificationBackend, build_v1_vcs};
 use trust_strengthen::StrengthenConfig;
 use trust_types::*;
 

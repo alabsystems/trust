@@ -7,7 +7,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -113,8 +114,9 @@ fn broad_change_sweep_vs_node() {
         eprintln!("SKIP broad_change_sweep_vs_node: set TRUST_JS_NODE");
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     if !corpus.join("harness/assert.js").is_file() {
         eprintln!("SKIP: corpus missing");
         return;
@@ -139,9 +141,7 @@ fn broad_change_sweep_vs_node() {
             }
             let Ok(body) = std::fs::read_to_string(&path) else { continue };
             let fm = parse_fm(&body);
-            if fm.flags.iter().any(|f| {
-                f == "async" || f == "module" || f == "CanBlockIsRequired"
-            }) {
+            if fm.flags.iter().any(|f| f == "async" || f == "module" || f == "CanBlockIsRequired") {
                 continue;
             }
             let raw = fm.flags.iter().any(|f| f == "raw");
@@ -152,11 +152,8 @@ fn broad_change_sweep_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".into(), "sta.js".into()]
-            };
+            let mut names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
             names.extend(fm.includes.iter().cloned());
             let mut srcs = Vec::new();
             let mut ipaths = Vec::new();
@@ -181,11 +178,8 @@ fn broad_change_sweep_vs_node() {
             let rel = path.strip_prefix(&corpus).unwrap_or(&path).display().to_string();
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict {
-                    format!("\"use strict\";\n{body}")
-                } else {
-                    body.clone()
-                };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let refs: Vec<&str> = srcs.iter().map(String::as_str).collect();
                 let sem = match evaluate_case_opts(&refs, &sem_body, false) {
                     SemOutcome::Trace(t) => t,

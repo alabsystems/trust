@@ -8,10 +8,9 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::FxHashMap;
-
 use serde::{Deserialize, Serialize};
 use trust_strengthen::{Proposal, ProposalKind};
+use trust_types::fx::FxHashMap;
 
 use crate::SourceRewrite;
 use crate::dependency::{CallGraph, topological_order};
@@ -158,9 +157,10 @@ pub fn plan_cross_module_rewrites(
 
 #[cfg(test)]
 mod tests {
+    use trust_types::*;
+
     use super::*;
     use crate::dependency::build_call_graph;
-    use trust_types::*;
 
     /// Helper: make a VerifiableFunction with specified callees.
     fn make_function(name: &str, callees: &[&str]) -> VerifiableFunction {
@@ -176,6 +176,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -196,7 +197,13 @@ mod tests {
             name: name.to_string(),
             def_path: def_path.to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals: vec![], blocks, arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals: vec![],
+                blocks,
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],

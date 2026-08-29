@@ -26,5 +26,7 @@ pub fn offset_bad(start: usize, len: usize) -> usize {
     if len <= 64 {
         let p = unsafe { (addr_of!(buf) as *const u8).add(start) };
         unsafe { std::slice::from_raw_parts(p, len).len() }
-    } else { 0 }
+    } else {
+        0
+    }
 }

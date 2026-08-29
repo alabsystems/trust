@@ -196,7 +196,7 @@ suite_by_name = {
     for suite in report.get("verifier_suites", [])
     if isinstance(suite, dict)
 }
-expected_suites = ["trust-mc", "trust-wp", "trust-vc"]
+expected_suites = ["trust-mc", "trust-vc"]
 missing_suites = [name for name in expected_suites if name not in suite_by_name]
 if missing_suites:
     raise AssertionError("doctor missing verifier suite(s): " + ", ".join(missing_suites))
@@ -206,6 +206,12 @@ for name in expected_suites:
         raise AssertionError(f"{name} adapter is not compiled: {suite!r}")
     if suite.get("capability_available") is not True:
         raise AssertionError(f"{name} capability is not available: {suite!r}")
+trust_wp = suite_by_name.get("trust-wp")
+if trust_wp is not None:
+    if trust_wp.get("capability_available") is not False:
+        raise AssertionError(f"retired trust-wp route claims capability: {trust_wp!r}")
+    if (trust_wp.get("manifest") or {}).get("capabilities") not in ([], None):
+        raise AssertionError(f"retired trust-wp manifest is not zero-capability: {trust_wp!r}")
 
 if report.get("ready") is not True:
     print(
@@ -270,15 +276,35 @@ for subcommand in check build version release verify deps report loop diff init 
 done
 
 run_public_cli version --repo-root="$TRUST_ROOT" --format=json >"$VERSION_STDOUT" 2>"$TMP_DIR/version.stderr"
-python3 - "$VERSION_STDOUT" <<'PY'
+python3 - "$VERSION_STDOUT" "$TRUST_ROOT/release/trust-version.toml" <<'PY'
 import json
+import re
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     report = json.load(fh)
 
-if report.get("schema_version") != "trust.version.v2":
-    raise AssertionError("unexpected Trust version schema")
+# Take the expected schema from the checked-in authority rather than a literal
+# copied into this script: a stale copy stops being a check of the contract the
+# moment the schema is bumped, which is exactly how this line kept asserting
+# `trust.version.v2` after the product moved to v3.
+with open(sys.argv[2], "r", encoding="utf-8") as fh:
+    source = fh.read()
+match = re.search(r'^\[schemas\]$(.*?)(?=^\[|\Z)', source, re.M | re.S)
+if match is None:
+    raise AssertionError("release/trust-version.toml has no [schemas] table")
+schema_match = re.search(r'^version\s*=\s*"([^"]+)"$', match.group(1), re.M)
+if schema_match is None:
+    raise AssertionError("release/trust-version.toml [schemas] states no version schema")
+expected_schema = schema_match.group(1)
+
+if report.get("schema_version") != expected_schema:
+    raise AssertionError(
+        f"unexpected Trust version schema: {report.get('schema_version')!r} "
+        f"is not the checked-in {expected_schema!r}"
+    )
+if report.get("schemas", {}).get("version") != expected_schema:
+    raise AssertionError("version report does not register its own schema")
 if report.get("candidate_command") != "targo trust version --json":
     raise AssertionError("version identity does not name the canonical command")
 tools = report.get("tools")

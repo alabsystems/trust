@@ -186,8 +186,9 @@ impl Nat {
 
 #[cfg(test)]
 mod tests {
-    use crate::Nat;
     use alloc::vec;
+
+    use crate::Nat;
 
     #[test]
     fn add_carries_across_the_limb_boundary() {
@@ -231,10 +232,7 @@ mod tests {
     #[test]
     fn checked_sub_refuses_exactly_underflow() {
         assert_eq!(Nat::from_u64(3).checked_sub(&Nat::from_u64(5)), None);
-        assert_eq!(
-            Nat::from_u64(5).checked_sub(&Nat::from_u64(3)),
-            Some(Nat::from_u64(2))
-        );
+        assert_eq!(Nat::from_u64(5).checked_sub(&Nat::from_u64(3)), Some(Nat::from_u64(2)));
         // Equal values are NOT underflow: a - a = 0 is a real zero.
         assert_eq!(Nat::from_u64(5).checked_sub(&Nat::from_u64(5)), Some(Nat::ZERO));
     }

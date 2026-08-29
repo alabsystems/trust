@@ -174,7 +174,11 @@ pub(super) fn array_len_of_result(func: &VerifiableFunction, place: &Place) -> O
 ///
 /// `fuel` bounds the whole-local `Use`/`Ref`/`CopyForDeref` hop chain so a
 /// pathological MIR cannot loop.
-pub(super) fn slice_arg_static_len(func: &VerifiableFunction, place: &Place, fuel: u32) -> Option<u64> {
+pub(super) fn slice_arg_static_len(
+    func: &VerifiableFunction,
+    place: &Place,
+    fuel: u32,
+) -> Option<u64> {
     if fuel == 0 {
         return None;
     }
@@ -392,15 +396,25 @@ pub(super) fn range_from_const_len(
 /// place. A bare-local `receiver` whose place matches the length-source place pins
 /// `len_local == receiver.len()` exactly; any other def, a projected place, or a
 /// place mismatch (a length var of a DIFFERENT slice) returns `false` (decline).
-pub(super) fn local_is_len_of(func: &VerifiableFunction, len_local: usize, receiver: &Operand) -> bool {
+pub(super) fn local_is_len_of(
+    func: &VerifiableFunction,
+    len_local: usize,
+    receiver: &Operand,
+) -> bool {
     let (Operand::Copy(recv_place) | Operand::Move(recv_place)) = receiver else {
         return false;
     };
     let inner_place = match crate::unique_whole_local_def(func, len_local) {
-        Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => match inner {
-            Operand::Copy(q) | Operand::Move(q) => q,
-            _ => return false,
-        },
+        Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => {
+            if !matches!(crate::ptr_metadata_model(func, inner), crate::PtrMetadataModel::Length(_))
+            {
+                return false;
+            }
+            match inner {
+                Operand::Copy(q) | Operand::Move(q) => q,
+                _ => return false,
+            }
+        }
         Some(Rvalue::Len(q)) => q,
         _ => return false,
     };
@@ -601,16 +615,13 @@ pub(super) fn collect_rvalue_unsupported(
     match rvalue {
         Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, op) => {
             collect_operand_unsupported(func, context.clone(), span, op, vcs);
-            // Trust: `PtrMetadata` over a slice/str/array fat pointer is just its
-            // length, which `slice_len_formula` models as a deterministic symbolic
-            // `len` (keyed on the operand place, so the same slice always yields the
-            // same term) or a concrete array length. When that succeeds the value is
-            // fully modeled — both the `s.len()` guard (guards.rs) and the `s[i]`
-            // bounds check (rvalue_safety.rs) route through `slice_len_formula` — so
-            // emitting a spurious UnsupportedMir obligation here wedged the ubiquitous
-            // `if i < s.len() { s[i] }` bounds-checked-indexing idiom. Fail closed only
-            // for genuinely unmodelable metadata: raw-pointer provenance, `dyn` vtable.
-            if crate::slice_len_formula(func, op).is_none() {
+            // Slice/str fat pointers carry a modeled length. Pointers to sized
+            // pointees (including arrays) are thin and carry unit metadata.
+            // Dynamic-vtable and malformed metadata remain fail closed.
+            if matches!(
+                crate::ptr_metadata_model(func, op),
+                crate::PtrMetadataModel::Unsupported | crate::PtrMetadataModel::Invalid
+            ) {
                 vcs.push(unsupported_mir_vc(
                     func,
                     "Rvalue::UnaryOp(PtrMetadata)".to_string(),
@@ -635,7 +646,21 @@ pub(super) fn collect_rvalue_unsupported(
             );
             collect_cast_relation_unsupported(func, context, span, op, target_ty, vcs);
         }
-        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+        Rvalue::BinaryOp(BinOp::Cmp, lhs, rhs) => {
+            vcs.push(unsupported_mir_vc(
+                func,
+                "Rvalue::BinaryOp(Cmp)".to_string(),
+                format!(
+                    "{context}: three-way comparison requires destination Ordering discriminant tags; the current CHC Less=-1 spelling is not authority for every extracted Ordering layout"
+                ),
+                span.clone(),
+            ));
+            collect_operand_unsupported(func, format!("{context} lhs"), span, lhs, vcs);
+            collect_operand_unsupported(func, format!("{context} rhs"), span, rhs, vcs);
+        }
+        Rvalue::BinaryOp(_, lhs, rhs)
+        | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+        | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
             collect_operand_unsupported(func, format!("{context} lhs"), span, lhs, vcs);
             collect_operand_unsupported(func, format!("{context} rhs"), span, rhs, vcs);
         }
@@ -807,14 +832,12 @@ pub(super) fn unsupported_aggregate_kind(
     operands: &[Operand],
 ) -> Option<(String, String)> {
     match kind {
-        trust_types::AggregateKind::Adt { name, variant, active_field: Some(active_field), .. } => {
-            Some((
-                "AggregateKind::Adt(active_field)".to_string(),
-                format!(
-                    "union-like aggregate {name} variant {variant} active_field {active_field}"
-                ),
-            ))
-        }
+        trust_types::AggregateKind::Adt {
+            name, variant, active_field: Some(active_field), ..
+        } => Some((
+            "AggregateKind::Adt(active_field)".to_string(),
+            format!("union-like aggregate {name} variant {variant} active_field {active_field}"),
+        )),
         trust_types::AggregateKind::Closure { name, captures, .. } => {
             closure_aggregate_support_error(func, name, captures, operands)
                 .map(|detail| ("AggregateKind::Closure".to_string(), detail))
@@ -896,13 +919,34 @@ pub(super) fn collect_operand_unsupported(
     operand: &Operand,
     vcs: &mut Vec<VerificationCondition>,
 ) {
-    if let Operand::Unsupported { kind, detail } = operand {
-        vcs.push(unsupported_mir_vc(
+    match operand {
+        Operand::Unsupported { kind, detail } => vcs.push(unsupported_mir_vc(
             func,
             kind.clone(),
             format!("{context}: {detail}"),
             span.clone(),
-        ));
+        )),
+        // `OpaqueScalar` deliberately carries only a type, not an occurrence
+        // identity. Formula conversion therefore cannot distinguish two
+        // same-typed occurrences. Letting any proof-bearing rvalue or
+        // terminator consume one could turn two independent runtime values into
+        // one solver symbol (for example, `MIN / -1` into `S / S`) and create a
+        // false proof. The unsupported collector is the common public-body
+        // boundary for every operand-bearing statement and terminator, so fail
+        // closed here until TrustIR carries stable occurrence identity.
+        // Identity-bearing `ConstParam` remains supported.
+        Operand::Constant(ConstValue::OpaqueScalar { width, signed }) => {
+            vcs.push(unsupported_mir_vc(
+                func,
+                "ConstValue::OpaqueScalar".to_string(),
+                format!(
+                    "{context}: identity-less opaque {sign}{width}-bit scalar cannot be used as proof input",
+                    sign = if *signed { "signed " } else { "unsigned " },
+                ),
+                span.clone(),
+            ));
+        }
+        _ => {}
     }
     if let Operand::Symbolic(formula) = operand
         && let Err(rejection) = crate::symbolic_formula::consume_symbolic_formula(formula)

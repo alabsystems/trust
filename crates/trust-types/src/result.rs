@@ -13,7 +13,7 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::formula::{ProofLevel, VcKind, VerificationCondition};
+use crate::formula::{ProofLevel, RuntimeCheckEnv, VcKind, VerificationCondition};
 use crate::outcome::Outcome;
 use crate::{SourceSpan, Symbol};
 
@@ -527,9 +527,7 @@ impl<'de> DeserializeSeed<'de> for NativeProofKindSeed<'_> {
                     "SmtUnsatBundle" => Some(NativeProofEnvelopeKind::SmtUnsatBundle),
                     "ChcInductiveInvariant" => Some(NativeProofEnvelopeKind::ChcInductiveInvariant),
                     "PdrInductiveInvariant" => Some(NativeProofEnvelopeKind::PdrInductiveInvariant),
-                    "CleanKernelRefutation" => {
-                        Some(NativeProofEnvelopeKind::CleanKernelRefutation)
-                    }
+                    "CleanKernelRefutation" => Some(NativeProofEnvelopeKind::CleanKernelRefutation),
                     _ => None,
                 };
                 if kind.is_none() {
@@ -1831,12 +1829,43 @@ const FORCED_RUNTIME_NOTE: &str = "forced by #[trust(runtime)]";
 
 /// Classify a solver result into a static, runtime-checked, or compile-error
 /// disposition after applying the requested runtime-check policy.
+///
+/// FAIL-CLOSED ADAPTER — this spelling knows only `overflow_checks` and so
+/// resolves the `ub_checks` knob to OFF. A kind whose only guard is
+/// `ub_checks`-gated (`get_unchecked`, `unchecked_{add,sub,mul}`) will NOT be
+/// downgraded to `RuntimeChecked` here even when the session has `ub_checks`
+/// enabled. Callers that hold a `Session` should use
+/// [`classify_runtime_disposition_in`] with `Session::ub_checks()`; doing so can
+/// only turn `Unknown`/`Timeout` into `RuntimeChecked`, never the reverse.
 #[must_use]
 pub fn classify_runtime_disposition(
     vc_kind: &VcKind,
     result: &VerificationResult,
     policy: RuntimeCheckPolicy,
     overflow_checks: bool,
+) -> RuntimeDisposition {
+    classify_runtime_disposition_in(
+        vc_kind,
+        result,
+        policy,
+        RuntimeCheckEnv::overflow_checks_only(overflow_checks),
+    )
+}
+
+/// [`classify_runtime_disposition`] against the FULL check environment.
+///
+/// The `Auto` policy downgrades an `Unknown`/`Timeout` row to `RuntimeChecked`
+/// — which reads to the user as "covered" — on exactly one condition:
+/// `vc_kind.has_runtime_fallback_in(env)`. That predicate is a POSITIVE SAFETY
+/// CLAIM, so `env` must be the real check configuration of the build being
+/// classified; a default-constructed or guessed `env` would mint the claim from
+/// something that never established it.
+#[must_use]
+pub fn classify_runtime_disposition_in(
+    vc_kind: &VcKind,
+    result: &VerificationResult,
+    policy: RuntimeCheckPolicy,
+    env: RuntimeCheckEnv,
 ) -> RuntimeDisposition {
     match result {
         VerificationResult::Failed { .. } => RuntimeDisposition::Failed,
@@ -1848,7 +1877,7 @@ pub fn classify_runtime_disposition(
             }
         }
         VerificationResult::Unknown { reason, .. } => match policy {
-            RuntimeCheckPolicy::Auto if vc_kind.has_runtime_fallback(overflow_checks) => {
+            RuntimeCheckPolicy::Auto if vc_kind.has_runtime_fallback_in(env) => {
                 RuntimeDisposition::RuntimeChecked { note: vc_kind.description() }
             }
             RuntimeCheckPolicy::Auto => RuntimeDisposition::Unknown { reason: reason.clone() },
@@ -1862,7 +1891,7 @@ pub fn classify_runtime_disposition(
             }
         },
         VerificationResult::Timeout { timeout_ms, .. } => match policy {
-            RuntimeCheckPolicy::Auto if vc_kind.has_runtime_fallback(overflow_checks) => {
+            RuntimeCheckPolicy::Auto if vc_kind.has_runtime_fallback_in(env) => {
                 RuntimeDisposition::RuntimeChecked { note: vc_kind.description() }
             }
             RuntimeCheckPolicy::Auto => RuntimeDisposition::Timeout { timeout_ms: *timeout_ms },
@@ -5975,10 +6004,9 @@ impl From<Outcome> for TransportProofStatus {
             Outcome::Timeout => Self::Timeout,
             Outcome::Unsupported => Self::Unsupported,
             Outcome::Rejected => Self::Rejected,
-            Outcome::Unknown
-            | Outcome::RuntimeChecked
-            | Outcome::Skipped
-            | Outcome::Canceled => Self::Unknown,
+            Outcome::Unknown | Outcome::RuntimeChecked | Outcome::Skipped | Outcome::Canceled => {
+                Self::Unknown
+            }
         }
     }
 }
@@ -7064,7 +7092,8 @@ mod tests {
     #[test]
     fn certified_test_execution_report_is_typed_and_round_trips() {
         assert!(
-            CERTIFIED_TEST_EXECUTION_SCOPE.contains("Linux uses a sealed anonymous executable image")
+            CERTIFIED_TEST_EXECUTION_SCOPE
+                .contains("Linux uses a sealed anonymous executable image")
                 && CERTIFIED_TEST_EXECUTION_SCOPE
                     .contains("macOS uses a private signed pathname snapshot")
                 && CERTIFIED_TEST_EXECUTION_SCOPE
@@ -7152,10 +7181,7 @@ mod tests {
             let proved = || VerificationResult::Proved {
                 solver: Symbol::from("b2-pin"),
                 time_ms: 1,
-                strength: ProofStrength {
-                    reasoning: ReasoningKind::Smt,
-                    assurance: level.clone(),
-                },
+                strength: ProofStrength { reasoning: ReasoningKind::Smt, assurance: level.clone() },
                 proof_certificate: None,
                 solver_warnings: None,
                 native_proof_envelope: None,
@@ -7204,10 +7230,7 @@ mod tests {
         let victim: ProofStrength = serde_json::from_str(&forged).expect("forged payload");
         assert_eq!(victim.grade(), ProofStrength::smt_unsat_unvalidated().grade());
         assert!(!victim.grade().is_certified(), "forgery must not certify");
-        assert!(
-            !victim.assurance.meets_reporting_floor(),
-            "forgery must not cross the floor"
-        );
+        assert!(!victim.assurance.meets_reporting_floor(), "forgery must not cross the floor");
     }
 
     #[test]
@@ -9901,6 +9924,50 @@ mod tests {
         );
     }
 
+    /// CONSUMER GUARD for the `Unreachable` fallback flip. This is the seam the
+    /// false safety claim was actually observable at: an UNPROVED obligation on
+    /// a bare `Terminator::Unreachable` — which rustc lowers to
+    /// `llvm.unreachable`, emitting no check — used to be downgraded here from
+    /// `Unknown` to `RuntimeChecked`, asserting a monitor that does not exist.
+    /// Live in the JSON report path via `report_builder::result_to_outcome`.
+    #[test]
+    fn auto_policy_never_runtime_checks_an_unproved_unreachable() {
+        for overflow_checks in [true, false] {
+            for result in [unknown_result(), timeout_result()] {
+                let disposition = classify_runtime_disposition(
+                    &VcKind::Unreachable,
+                    &result,
+                    RuntimeCheckPolicy::Auto,
+                    overflow_checks,
+                );
+                assert!(
+                    !matches!(disposition, RuntimeDisposition::RuntimeChecked { .. }),
+                    "an unproved `VcKind::Unreachable` was reported as runtime-checked \
+                     (result={result:?} overflow_checks={overflow_checks}); reaching that \
+                     block is UB and no runtime check guards it"
+                );
+            }
+        }
+        assert_eq!(
+            classify_runtime_disposition(
+                &VcKind::Unreachable,
+                &unknown_result(),
+                RuntimeCheckPolicy::Auto,
+                true,
+            ),
+            RuntimeDisposition::Unknown { reason: "incomplete quantifier reasoning".into() }
+        );
+        assert_eq!(
+            classify_runtime_disposition(
+                &VcKind::Unreachable,
+                &timeout_result(),
+                RuntimeCheckPolicy::Auto,
+                true,
+            ),
+            RuntimeDisposition::Timeout { timeout_ms: 250 }
+        );
+    }
+
     #[test]
     fn test_classify_runtime_disposition_force_static() {
         let vc_kind = no_runtime_fallback_vc();
@@ -10598,7 +10665,8 @@ mod tests {
     /// targo's parse-failure path, which publishes nothing favorable.
     #[test]
     fn transport_rows_refuse_an_outcome_no_producer_writes() {
-        let json = r#"{"kind":"divzero","description":"d","outcome":"prooved","solver":"ay","time_ms":1}"#;
+        let json =
+            r#"{"kind":"divzero","description":"d","outcome":"prooved","solver":"ay","time_ms":1}"#;
         assert!(serde_json::from_str::<TransportObligationResult>(json).is_err());
     }
 

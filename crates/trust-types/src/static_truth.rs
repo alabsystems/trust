@@ -54,20 +54,37 @@ pub fn local_condition_truth_until(
     end_stmt_exclusive: usize,
 ) -> Option<bool> {
     for (idx, stmt) in block.stmts.iter().take(end_stmt_exclusive).enumerate().rev() {
-        let Statement::Assign { place, rvalue, .. } = stmt else {
-            continue;
-        };
-        if place.local != local || !place.projections.is_empty() {
-            continue;
-        }
-        return match rvalue {
-            Rvalue::Use(operand) => condition_truth_until(block, operand, idx),
-            Rvalue::BinaryOp(BinOp::Eq, lhs, rhs) => constant_eq_truth(lhs, rhs),
-            Rvalue::BinaryOp(BinOp::Ne, lhs, rhs) => {
-                constant_eq_truth(lhs, rhs).map(|truth| !truth)
+        match stmt {
+            Statement::Assign { place, rvalue, .. }
+                if place.local == local && place.projections.is_empty() =>
+            {
+                return match rvalue {
+                    Rvalue::Use(operand) => condition_truth_until(block, operand, idx),
+                    Rvalue::BinaryOp(BinOp::Eq, lhs, rhs) => constant_eq_truth(lhs, rhs),
+                    Rvalue::BinaryOp(BinOp::Ne, lhs, rhs) => {
+                        constant_eq_truth(lhs, rhs).map(|truth| !truth)
+                    }
+                    _ => None,
+                };
             }
-            _ => None,
-        };
+            // The shared fold intentionally has no function-wide alias oracle.
+            // A projected write can therefore overlap `local` through a separately
+            // named `&mut` pointer.  Likewise, opaque pointer-writing statements
+            // and lifetime-ending statements can invalidate a previously computed
+            // condition.  Decline the fold conservatively instead of treating a
+            // stale direct assignment as the value observed by the Assert.
+            Statement::Assign { place, .. } if !place.projections.is_empty() => return None,
+            Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                if place.local == local || !place.projections.is_empty() =>
+            {
+                return None;
+            }
+            Statement::StorageDead(dead) if *dead == local => return None,
+            Statement::Intrinsic { .. }
+            | Statement::CopyNonOverlapping { .. }
+            | Statement::Unsupported { .. } => return None,
+            _ => {}
+        }
     }
 
     None
@@ -92,6 +109,13 @@ pub fn const_eq_truth(lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
             (*rhs >= 0).then_some(*lhs == *rhs as u128)
         }
         (ConstValue::Float(lhs), ConstValue::Float(rhs)) => Some(lhs == rhs),
+        // `FloatBits` preserves the exact IEEE payload/width, while the legacy
+        // `Float(f64)` spelling does not.  Until this fold has one typed IEEE
+        // equality implementation for both spellings, any FloatBits involvement
+        // is UNKNOWN.  Falling through to `Some(false)` would call two identical
+        // bit-pattern constants definitely unequal and could delete a genuinely
+        // failing assertion.
+        (ConstValue::FloatBits { .. }, _) | (_, ConstValue::FloatBits { .. }) => None,
         (ConstValue::Unit, ConstValue::Unit) => Some(true),
         // Callable identity is extraction evidence for syntactic recognizers,
         // never a solver-level equality fact. Historical dumps encoded these
@@ -145,11 +169,7 @@ mod tests {
     fn assign_eq(local: usize, lhs: ConstValue, rhs: ConstValue) -> Statement {
         Statement::Assign {
             place: Place { local, projections: vec![] },
-            rvalue: Rvalue::BinaryOp(
-                BinOp::Eq,
-                Operand::Constant(lhs),
-                Operand::Constant(rhs),
-            ),
+            rvalue: Rvalue::BinaryOp(BinOp::Eq, Operand::Constant(lhs), Operand::Constant(rhs)),
             span: Default::default(),
         }
     }
@@ -158,7 +178,8 @@ mod tests {
     /// The failure branch is statically false, so the obligation does not exist.
     #[test]
     fn constant_nonzero_divisor_folds() {
-        let block = block_with(vec![assign_eq(3, ConstValue::Uint(2, 32), ConstValue::Uint(0, 32))]);
+        let block =
+            block_with(vec![assign_eq(3, ConstValue::Uint(2, 32), ConstValue::Uint(0, 32))]);
         let cond = Operand::Move(Place { local: 3, projections: vec![] });
         assert!(
             assert_failure_is_known_false(&block, &cond, false),
@@ -196,11 +217,33 @@ mod tests {
     /// program that definitely violates it.
     #[test]
     fn constant_zero_divisor_does_not_fold() {
-        let block = block_with(vec![assign_eq(3, ConstValue::Uint(0, 32), ConstValue::Uint(0, 32))]);
+        let block =
+            block_with(vec![assign_eq(3, ConstValue::Uint(0, 32), ConstValue::Uint(0, 32))]);
         let cond = Operand::Move(Place { local: 3, projections: vec![] });
         assert!(
             !assert_failure_is_known_false(&block, &cond, false),
             "`n / 0` must keep its obligation — the assert FAILS, it is not vacuous"
+        );
+    }
+
+    /// A direct constant definition is not authority after an intervening write
+    /// through a differently named mutable alias.  The shared helper has no
+    /// function-wide points-to oracle, so every projected write conservatively
+    /// defeats the fold.  Both trust-vcgen and the TrustIR spine call this exact
+    /// helper and therefore keep the assertion obligation together.
+    #[test]
+    fn projected_alias_write_defeats_a_stale_constant_fold() {
+        let mut block =
+            block_with(vec![assign_eq(3, ConstValue::Uint(2, 32), ConstValue::Uint(0, 32))]);
+        block.stmts.push(Statement::Assign {
+            place: Place { local: 8, projections: vec![crate::Projection::Deref] },
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+            span: Default::default(),
+        });
+        let cond = Operand::Move(Place { local: 3, projections: vec![] });
+        assert!(
+            !assert_failure_is_known_false(&block, &cond, false),
+            "an intervening projected write must keep the assertion obligation"
         );
     }
 
@@ -211,5 +254,23 @@ mod tests {
     fn opaque_constants_are_unknown_not_unequal() {
         assert_eq!(const_eq_truth(&ConstValue::OpaqueConst, &ConstValue::OpaqueConst), None);
         assert_eq!(const_eq_truth(&ConstValue::OpaqueConst, &ConstValue::Int(0)), None);
+    }
+
+    #[test]
+    fn float_bits_constants_are_unknown_not_definitely_unequal() {
+        let zero = ConstValue::FloatBits { bits: 0, width: 32 };
+        assert_eq!(const_eq_truth(&zero, &zero), None);
+        assert_eq!(const_eq_truth(&zero, &ConstValue::Float(0.0)), None);
+
+        let block = block_with(vec![assign_eq(
+            3,
+            ConstValue::FloatBits { bits: 0, width: 32 },
+            ConstValue::FloatBits { bits: 0, width: 32 },
+        )]);
+        let cond = Operand::Move(Place::local(3));
+        assert!(
+            !assert_failure_is_known_false(&block, &cond, false),
+            "an unimplemented FloatBits equality must retain the assertion"
+        );
     }
 }

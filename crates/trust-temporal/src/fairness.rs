@@ -18,6 +18,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::VecDeque;
+
 use trust_types::fx::{FxHashMap, FxHashSet};
 
 #[cfg(test)]
@@ -566,9 +567,8 @@ fn validate_fair_lasso(
         steps.push((first, first));
     }
 
-    let enabled = |s: StateId, action: &str| {
-        sm.transitions.iter().any(|t| t.from == s && t.event == action)
-    };
+    let enabled =
+        |s: StateId, action: &str| sm.transitions.iter().any(|t| t.from == s && t.event == action);
     let step_admits = |action: &str| {
         steps.iter().any(|&(a, b)| {
             sm.transitions.iter().any(|t| t.from == a && t.to == b && t.event == action)

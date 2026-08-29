@@ -1578,6 +1578,72 @@ pub(crate) fn subsume_hardened_panic_twins(results: &mut [VerificationResult]) {
     }
 }
 
+/// Trust (#220 — publication-boundary disclosure): what the ONE publication
+/// normalization did to the authenticated compiler vector, counted BY THE PASS
+/// ITSELF.
+///
+/// The counts are taken inside the transformation rather than reconstructed
+/// afterwards, because a favorable compiler row has TWO possible fates and only
+/// one of them is reconstructible by a reader. Demotion rewrites the row to
+/// `Unknown` and leaves it in place carrying the verbatim reason (`--json`
+/// shows it; `grep` counts it). But demotion runs BEFORE
+/// `elide_rows_proved_only_by`, which DELETES rows: a demoted hardened-panic
+/// twin whose direct sibling at the same span did publish is removed outright,
+/// leaving no row, no id and no reason. Counting the marker text alone would
+/// therefore silently UNDER-report, which is worse than not reporting at all —
+/// it reads as complete.
+///
+/// Conservation, held by construction and asserted in
+/// `publication_boundary_conservation_holds_across_both_fates`:
+/// `compiler_favorable == published_favorable + withheld_relabelled + withheld_elided`.
+///
+/// This is a DISCLOSURE record. Nothing here changes what a row claims, which
+/// rows are demoted, or which rows are elided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PublicationBoundary {
+    /// Favorable (`Proved`/`RuntimeChecked`) rows in the authenticated compiler
+    /// vector, EXCLUDING the exact zero-obligation inventory rows — those are
+    /// function inventory rather than logical obligations and are disclosed
+    /// separately as `zero_obligation_functions`.
+    pub(crate) compiler_favorable: usize,
+    /// Favorable rows that survived to publication.
+    pub(crate) published_favorable: usize,
+    /// Favorable compiler rows rewritten to `Unknown` and STILL PRESENT in the
+    /// published vector, carrying the verbatim demotion reason.
+    pub(crate) withheld_relabelled: usize,
+    /// Favorable compiler rows that were demoted and then DELETED outright by
+    /// the alias-elision passes. No row, no id, no reason survives — this is
+    /// the population a `--json` reader cannot recover.
+    pub(crate) withheld_elided: usize,
+    /// Rows the compiler did NOT report favorably that were elided as redundant
+    /// aliases. Pre-existing intended behaviour, disclosed for completeness.
+    pub(crate) alias_elided: usize,
+    /// Exact zero-obligation inventory rows removed (already disclosed through
+    /// `zero_obligation_functions`).
+    pub(crate) inventory_elided: usize,
+}
+
+impl PublicationBoundary {
+    /// Favorable compiler rows that did not reach publication, computed as a
+    /// DIFFERENCE of two independently counted populations rather than as a sum
+    /// of the attributed parts. A bookkeeping slip in the split can then show
+    /// up as unattributed residue instead of quietly shrinking the total.
+    pub(crate) fn withheld(self) -> usize {
+        self.compiler_favorable.saturating_sub(self.published_favorable)
+    }
+
+    /// Withheld rows the split failed to account for. Zero whenever the
+    /// conservation law above holds; rendered explicitly when it does not, so a
+    /// future edit that breaks the accounting is visible instead of silent.
+    pub(crate) fn unattributed_withheld(self) -> usize {
+        self.withheld().saturating_sub(self.withheld_relabelled + self.withheld_elided)
+    }
+}
+
+fn is_favorable_publication_row(result: &VerificationResult) -> bool {
+    matches!(result.outcome, VerificationOutcome::Proved | VerificationOutcome::RuntimeChecked)
+}
+
 /// Normalize rows from an authenticated compiler channel for publication.
 ///
 /// This transformation is deliberately monotone: it can only downgrade a
@@ -1588,18 +1654,34 @@ pub(crate) fn subsume_hardened_panic_twins(results: &mut [VerificationResult]) {
 /// an Unknown marker/twin was relabeled Proved without compiler proof authority
 /// and then counted by the terminal gate even though the canonical report
 /// correctly refused to publish it.
+///
+/// Trust (#220): returns the `PublicationBoundary` describing what it withheld,
+/// so the human report can disclose a boundary that used to be visible only in
+/// `--json` (and, for elided rows, not at all). The returned value is
+/// observational; ignoring it leaves behaviour exactly as before.
 pub(crate) fn normalize_authenticated_results_for_publication(
     results: &mut Vec<VerificationResult>,
     materialization_root: Option<&std::path::Path>,
-) {
+) -> PublicationBoundary {
     // `no_obligations` is function/coverage inventory, not a logical
     // obligation.  Keeping it as a synthetic Proved row inflated proof counts
     // and demanded proof evidence for a claim that does not exist.  Elide only
     // the compiler's exact structural shape; malformed lookalikes remain and
     // fail closed below.
+    let before_inventory = results.len();
     results.retain(|result| !is_exact_zero_obligation_inventory_row(result));
 
-    for result in results.iter_mut() {
+    let mut boundary = PublicationBoundary {
+        inventory_elided: before_inventory - results.len(),
+        compiler_favorable: results.iter().filter(|r| is_favorable_publication_row(r)).count(),
+        ..PublicationBoundary::default()
+    };
+
+    // Parallel to `results`: which rows THIS pass demoted. Carried through the
+    // elision passes so a deleted row's original fate is still attributable.
+    let mut demoted = vec![false; results.len()];
+
+    for (index, result) in results.iter_mut().enumerate() {
         if !matches!(
             result.outcome,
             VerificationOutcome::Proved | VerificationOutcome::RuntimeChecked
@@ -1625,11 +1707,34 @@ pub(crate) fn normalize_authenticated_results_for_publication(
             result.reason = Some(format!(
                 "compiler transport claimed a favorable outcome {defect}; downgraded before publication"
             ));
+            demoted[index] = true;
         }
     }
 
-    elide_rows_proved_only_by(results, subsume_hardened_panic_twins);
-    elide_rows_proved_only_by(results, subsume_redundant_postcondition_markers);
+    let panic_twins = elide_rows_proved_only_by(results, &mut demoted, subsume_hardened_panic_twins);
+    let postcondition_markers =
+        elide_rows_proved_only_by(results, &mut demoted, subsume_redundant_postcondition_markers);
+
+    boundary.withheld_elided = panic_twins.demoted + postcondition_markers.demoted;
+    boundary.alias_elided = panic_twins.other + postcondition_markers.other;
+    // A demoted row that survived elision is still visible (as `Unknown`, with
+    // the reason); one that did not is gone. Only the first is reconstructible
+    // from the published vector, which is exactly why both are counted here.
+    boundary.withheld_relabelled = demoted.iter().filter(|was_demoted| **was_demoted).count();
+    boundary.published_favorable =
+        results.iter().filter(|r| is_favorable_publication_row(r)).count();
+    boundary
+}
+
+/// How many rows one `elide_rows_proved_only_by` pass removed, split by whether
+/// this run's publication demotion had already rewritten them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ElidedRowCounts {
+    /// Removed rows that THIS run demoted from a favorable compiler outcome.
+    demoted: usize,
+    /// Removed rows the compiler had not reported favorably — ordinary
+    /// redundant aliases.
+    other: usize,
 }
 
 pub(crate) fn authenticated_zero_obligation_inventory(
@@ -1671,22 +1776,58 @@ fn has_exact_compiler_claim_identity(result: &VerificationResult) -> bool {
 /// remove only rows that checker changed from non-proof to Proved.  Every row
 /// retained for publication is byte-for-byte the authenticated compiler row;
 /// the Targo-derived Proved label is never retained.
+///
+/// Trust (#220): `demoted` is a parallel flag vector marking rows this run's
+/// publication demotion rewrote from a favorable compiler outcome to `Unknown`.
+/// It is filtered in lockstep with `results` and the removals are counted, so
+/// the caller can tell a DELETED demotion (invisible everywhere, including
+/// `--json`) from an ordinary redundant alias. The retain predicate below is
+/// unchanged — the flags are observational and cannot affect which rows stay.
 fn elide_rows_proved_only_by(
     results: &mut Vec<VerificationResult>,
+    demoted: &mut Vec<bool>,
     derive: fn(&mut [VerificationResult]),
-) {
+) -> ElidedRowCounts {
     let mut derived = results.clone();
     derive(&mut derived);
     debug_assert_eq!(results.len(), derived.len());
+    debug_assert_eq!(results.len(), demoted.len());
+
+    let keep: Vec<bool> = results
+        .iter()
+        .zip(derived.iter())
+        .map(|(original, candidate)| {
+            original.outcome.is_proved()
+                || !candidate.outcome.is_proved()
+                || !structured_transport_vc_kind_is_authority_safe(original)
+        })
+        .collect();
+
+    let mut counts = ElidedRowCounts::default();
+    for (index, kept) in keep.iter().enumerate() {
+        if !kept {
+            if demoted.get(index).copied().unwrap_or(false) {
+                counts.demoted += 1;
+            } else {
+                counts.other += 1;
+            }
+        }
+    }
 
     let mut index = 0usize;
-    results.retain(|original| {
-        let candidate = &derived[index];
+    results.retain(|_| {
+        let kept = keep.get(index).copied().unwrap_or(true);
         index += 1;
-        original.outcome.is_proved()
-            || !candidate.outcome.is_proved()
-            || !structured_transport_vc_kind_is_authority_safe(original)
+        kept
     });
+    let mut index = 0usize;
+    demoted.retain(|_| {
+        let kept = keep.get(index).copied().unwrap_or(true);
+        index += 1;
+        kept
+    });
+
+    counts
 }
 
 fn normalize_transport_outcome(
@@ -1745,11 +1886,24 @@ mod subsumption_tests {
 
     use super::{
         STRUCTURED_TRANSPORT_EVIDENCE_PREFIX, StructuredTransportEvidence, VerificationOutcome,
-        VerificationResult, authenticated_zero_obligation_inventory, elide_rows_proved_only_by,
+        VerificationResult, authenticated_zero_obligation_inventory,
         exact_structured_transport_vc_kind, normalize_authenticated_results_for_publication,
         structured_transport_evidence, structured_transport_vc_kind_is_authority_safe,
         subsume_hardened_panic_twins, subsume_redundant_postcondition_markers,
     };
+
+    /// Trust (#220): the pre-#220 two-argument shape, so the existing elision
+    /// tests below still read as assertions about the retain predicate and not
+    /// about the new demotion bookkeeping. The tests that DO exercise the
+    /// bookkeeping call the real function through
+    /// `normalize_authenticated_results_for_publication`.
+    fn elide_rows_proved_only_by(
+        results: &mut Vec<VerificationResult>,
+        derive: fn(&mut [VerificationResult]),
+    ) {
+        let mut demoted = vec![false; results.len()];
+        super::elide_rows_proved_only_by(results, &mut demoted, derive);
+    }
 
     fn span(line: u32, c0: u32, c1: u32) -> SourceSpan {
         SourceSpan {

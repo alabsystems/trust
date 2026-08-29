@@ -1,0 +1,5 @@
+# The three subject packages are COMPILED by the blob-equivalence harness's
+# end-to-end test (`targo trust spec --emit clean` on each), so each grows a
+# `target/` tree of incremental caches, rlibs and a trust-cache verdict file.
+# None of that is fixture input — the fixtures are the `src/` and the manifests.
+target/

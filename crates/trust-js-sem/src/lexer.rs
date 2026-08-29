@@ -8,9 +8,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::value::Units;
-use num_bigint::BigInt;
 use std::rc::Rc;
+
+use num_bigint::BigInt;
+
+use crate::value::Units;
 
 /// One piece of a template literal: a cooked string run, or the token stream
 /// of one `${...}` substitution.
@@ -367,10 +369,7 @@ impl<'a> Lexer<'a> {
             let (tok, nl) = lx.next_token()?;
             let is_eof = matches!(tok, Tok::Eof);
             lx.update_context(&tok, nl);
-            out.push(Token {
-                tok,
-                newline_before: nl,
-            });
+            out.push(Token { tok, newline_before: nl });
             if is_eof {
                 return Ok(out);
             }
@@ -448,8 +447,7 @@ impl<'a> Lexer<'a> {
             let (u, esc) = self.lex_string(c)?;
             return Ok((Tok::Str(u, esc), newline));
         }
-        if c.is_ascii_digit() || (c == '.' && self.peek_at(1).is_some_and(|d| d.is_ascii_digit()))
-        {
+        if c.is_ascii_digit() || (c == '.' && self.peek_at(1).is_some_and(|d| d.is_ascii_digit())) {
             return Ok((
                 match self.lex_number()? {
                     NumLit::Num(n) => Tok::Num(n),
@@ -460,9 +458,7 @@ impl<'a> Lexer<'a> {
         }
         if is_ident_start(c) || c == '\\' {
             let (id, escaped) = self.lex_identifier_name()?;
-            return Ok(
-                (if escaped { Tok::EscIdent(id) } else { Tok::Ident(id) }, newline),
-            );
+            return Ok((if escaped { Tok::EscIdent(id) } else { Tok::Ident(id) }, newline));
         }
         for p in PUNCTS {
             if self.src_matches(p) {
@@ -529,11 +525,7 @@ impl<'a> Lexer<'a> {
                             "identifier escape is a surrogate code point",
                         ));
                     };
-                    let valid = if out.is_empty() {
-                        is_ident_start(c)
-                    } else {
-                        is_ident_part(c)
-                    };
+                    let valid = if out.is_empty() { is_ident_start(c) } else { is_ident_part(c) };
                     if !valid {
                         // The escaped code point is not an identifier character
                         // (exact ID_Start/ID_Continue tables): a pinned
@@ -620,9 +612,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn src_matches(&self, p: &str) -> bool {
-        p.chars()
-            .enumerate()
-            .all(|(i, pc)| self.peek_at(i) == Some(pc))
+        p.chars().enumerate().all(|(i, pc)| self.peek_at(i) == Some(pc))
     }
 
     /// Lex a template literal after the opening backtick: cooked string runs
@@ -631,9 +621,7 @@ impl<'a> Lexer<'a> {
         let mut pieces: Vec<TplPiece> = Vec::new();
         let mut cur: Units = Vec::new();
         loop {
-            let c = self
-                .bump()
-                .ok_or_else(|| "unterminated template literal".to_string())?;
+            let c = self.bump().ok_or_else(|| "unterminated template literal".to_string())?;
             match c {
                 '`' => {
                     pieces.push(TplPiece::Str(cur));
@@ -688,29 +676,21 @@ impl<'a> Lexer<'a> {
                 Tok::Punct("}") => {
                     depth -= 1;
                     if depth == 0 {
-                        toks.push(Token {
-                            tok: Tok::Eof,
-                            newline_before: nl,
-                        });
+                        toks.push(Token { tok: Tok::Eof, newline_before: nl });
                         return Ok(toks);
                     }
                 }
                 _ => {}
             }
             self.update_context(&tok, nl);
-            toks.push(Token {
-                tok,
-                newline_before: nl,
-            });
+            toks.push(Token { tok, newline_before: nl });
         }
     }
 
     /// One escape sequence after the backslash. `in_template` refuses the
     /// template-specific ill-formed escapes rather than guessing.
     fn lex_escape(&mut self, out: &mut Units, in_template: bool) -> Result<(), String> {
-        let e = self
-            .bump()
-            .ok_or_else(|| "unterminated escape".to_string())?;
+        let e = self.bump().ok_or_else(|| "unterminated escape".to_string())?;
         match e {
             'n' => out.push(0x0a),
             't' => out.push(0x09),
@@ -747,9 +727,7 @@ impl<'a> Lexer<'a> {
                         if d == '}' {
                             break;
                         }
-                        let dv = d
-                            .to_digit(16)
-                            .ok_or_else(|| "bad \\u{} escape".to_string())?;
+                        let dv = d.to_digit(16).ok_or_else(|| "bad \\u{} escape".to_string())?;
                         v = v * 16 + dv;
                         if v > 0x10_ffff {
                             return Err("\\u{} escape out of range".to_string());
@@ -785,9 +763,7 @@ impl<'a> Lexer<'a> {
         let mut out: Units = Vec::new();
         let mut had_escape = false;
         loop {
-            let c = self
-                .bump()
-                .ok_or_else(|| "unterminated string".to_string())?;
+            let c = self.bump().ok_or_else(|| "unterminated string".to_string())?;
             if c == quote {
                 return Ok((out, had_escape));
             }
@@ -832,9 +808,7 @@ impl<'a> Lexer<'a> {
                     // A misplaced separator is a fully-specified early
                     // SyntaxError in every mode (12.9.3).
                     if out.is_empty() || !self.peek_at(1).is_some_and(|d| d.is_digit(radix)) {
-                        return Err(crate::parser::early_syntax(
-                            "misplaced numeric separator `_`",
-                        ));
+                        return Err(crate::parser::early_syntax("misplaced numeric separator `_`"));
                     }
                     self.pos += 1;
                 }
@@ -846,9 +820,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self) -> Result<NumLit, String> {
         if self.peek() == Some('0')
-            && self
-                .peek_at(1)
-                .is_some_and(|c| matches!(c, 'x' | 'X' | 'o' | 'O' | 'b' | 'B'))
+            && self.peek_at(1).is_some_and(|c| matches!(c, 'x' | 'X' | 'o' | 'O' | 'b' | 'B'))
         {
             let radix_char = self.peek_at(1).expect("checked");
             let radix = match radix_char {
@@ -927,18 +899,14 @@ impl<'a> Lexer<'a> {
             if !integer_only {
                 // A BigInt suffix on a fractional/exponential literal (`1.5n`,
                 // `1e3n`) is a fully-specified early SyntaxError.
-                return Err(crate::parser::early_syntax(
-                    "BigInt suffix on a non-integer literal",
-                ));
+                return Err(crate::parser::early_syntax("BigInt suffix on a non-integer literal"));
             }
             self.pos += 1;
             self.check_ident_after()?;
             return Ok(NumLit::Big(self.parse_big(&int_digits, 10)?));
         }
         self.check_number_tail()?;
-        text.parse::<f64>()
-            .map(NumLit::Num)
-            .map_err(|e| format!("number literal parse: {e}"))
+        text.parse::<f64>().map(NumLit::Num).map_err(|e| format!("number literal parse: {e}"))
     }
 
     /// Parse cleaned `digits` in `radix` into a BigInt, refusing an
@@ -958,9 +926,9 @@ impl<'a> Lexer<'a> {
         match self.peek() {
             // An IdentifierStart or DecimalDigit immediately after a BigInt
             // literal (`1n2`, `0x1fn9`) is a fully-specified early SyntaxError.
-            Some(c) if is_ident_start(c) || c.is_ascii_digit() => Err(crate::parser::early_syntax(
-                "identifier immediately after numeric literal",
-            )),
+            Some(c) if is_ident_start(c) || c.is_ascii_digit() => {
+                Err(crate::parser::early_syntax("identifier immediately after numeric literal"))
+            }
             _ => Ok(()),
         }
     }
@@ -999,16 +967,8 @@ fn push_code_point(out: &mut Units, v: u32) {
 fn is_ws(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\u{b}'
-            | '\u{c}'
-            | ' '
-            | '\u{a0}'
-            | '\u{feff}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
+        '\t' | '\u{b}' | '\u{c}' | ' ' | '\u{a0}' | '\u{feff}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
 }
 
@@ -1041,11 +1001,7 @@ mod tests {
     use crate::value::units_from_str;
 
     fn toks(src: &str) -> Vec<Tok> {
-        Lexer::tokenize(src)
-            .expect("lexes")
-            .into_iter()
-            .map(|t| t.tok)
-            .collect()
+        Lexer::tokenize(src).expect("lexes").into_iter().map(|t| t.tok).collect()
     }
 
     #[test]
@@ -1069,22 +1025,14 @@ mod tests {
             toks(r#""a\nbA\x42""#),
             vec![Tok::Str(units_from_str("a\nbAB"), true), Tok::Eof]
         );
-        assert_eq!(
-            toks("'plain'"),
-            vec![Tok::Str(units_from_str("plain"), false), Tok::Eof]
-        );
+        assert_eq!(toks("'plain'"), vec![Tok::Str(units_from_str("plain"), false), Tok::Eof]);
     }
 
     #[test]
     fn division_vs_regex() {
         assert_eq!(
             toks("a / b"),
-            vec![
-                Tok::Ident("a".into()),
-                Tok::Punct("/"),
-                Tok::Ident("b".into()),
-                Tok::Eof
-            ]
+            vec![Tok::Ident("a".into()), Tok::Punct("/"), Tok::Ident("b".into()), Tok::Eof]
         );
         // A regex literal now lexes to a Regex token in regex-goal position.
         assert_eq!(
@@ -1101,10 +1049,7 @@ mod tests {
         // A class hides the delimiter; `\/` is escaped; flags follow.
         assert_eq!(
             toks("/[a/b]\\/c/gi"),
-            vec![
-                Tok::Regex(units_from_str("[a/b]\\/c"), units_from_str("gi")),
-                Tok::Eof
-            ]
+            vec![Tok::Regex(units_from_str("[a/b]\\/c"), units_from_str("gi")), Tok::Eof]
         );
         // After a value, `/` is division, not a regex.
         assert_eq!(
@@ -1125,10 +1070,7 @@ mod tests {
         // Legacy octal / leading-zero remains out of slice.
         assert!(Lexer::tokenize("08").is_err());
         // BigInt literals now lex to a BigInt token; separators are legal.
-        assert!(matches!(
-            Lexer::tokenize("0o777n").unwrap()[0].tok,
-            Tok::BigInt(_)
-        ));
+        assert!(matches!(Lexer::tokenize("0o777n").unwrap()[0].tok, Tok::BigInt(_)));
         assert!(matches!(Lexer::tokenize("123n").unwrap()[0].tok, Tok::BigInt(_)));
         assert!(matches!(Lexer::tokenize("0x1fn").unwrap()[0].tok, Tok::BigInt(_)));
         assert!(matches!(Lexer::tokenize("1_000").unwrap()[0].tok, Tok::Num(_)));
@@ -1153,7 +1095,9 @@ mod tests {
             ts.iter().any(|t| match t {
                 Tok::Regex(..) => true,
                 Tok::Template(pieces) => pieces.iter().any(|p| match p {
-                    TplPiece::Sub(sub) => any_regex(&sub.iter().map(|t| t.tok.clone()).collect::<Vec<_>>()),
+                    TplPiece::Sub(sub) => {
+                        any_regex(&sub.iter().map(|t| t.tok.clone()).collect::<Vec<_>>())
+                    }
                     TplPiece::Str(_) => false,
                 }),
                 _ => false,

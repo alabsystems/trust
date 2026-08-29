@@ -264,9 +264,7 @@ fn main() {
             // The model ACCEPTED this instruction; the hardware must have
             // executed it. A fault here is the invariant class — x86 has no
             // separate exhaustive invariant harness, so it is a FAMILY here.
-            if record.outcome != natsem::OUT_EXECUTED
-                && record.outcome != natsem::OUT_ESCAPED
-            {
+            if record.outcome != natsem::OUT_EXECUTED && record.outcome != natsem::OUT_ESCAPED {
                 counts.compared += 1;
                 counts.mismatched += 1;
                 *counts.families.entry(format!("{family}:hardware_refused")).or_default() += 1;
@@ -280,7 +278,8 @@ fn main() {
             }
 
             counts.compared += 1;
-            counts.flag_bits_declined += usize::from((!predicted.flags_mask & 0b1111).count_ones() as u16) as usize;
+            counts.flag_bits_declined +=
+                usize::from((!predicted.flags_mask & 0b1111).count_ones() as u16) as usize;
             let mut wrong: Vec<String> = Vec::new();
 
             for r in 0..16 {

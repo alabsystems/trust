@@ -10,10 +10,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::{FxHashMap, FxHashSet};
-
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::fx::{FxHashMap, FxHashSet};
 use crate::model::{SourceSpan, Ty};
 
 // ---------------------------------------------------------------------------
@@ -364,16 +363,18 @@ pub fn collect_trait_impls(
     let mut seen_traits: FxHashSet<String> = FxHashSet::default();
 
     for block in &body.blocks {
-        if let crate::model::Terminator::Call { func, .. } = &block.terminator {
-            // Extract trait name from qualified method paths like "TraitName::method".
-            if let Some((trait_part, _method_part)) = func.rsplit_once("::") {
-                for imp in resolver.all_impls() {
-                    if imp.trait_name.ends_with(trait_part) || trait_part.ends_with(&imp.trait_name)
-                    {
-                        let key = format!("{}::{:?}", imp.trait_name, imp.implementing_type);
-                        if seen_traits.insert(key) {
-                            found.push(imp.clone());
-                        }
+        let func = match &block.terminator {
+            crate::model::Terminator::Call { func, .. }
+            | crate::model::Terminator::TailCall { func, .. } => func,
+            _ => continue,
+        };
+        // Extract trait name from qualified method paths like "TraitName::method".
+        if let Some((trait_part, _method_part)) = func.rsplit_once("::") {
+            for imp in resolver.all_impls() {
+                if imp.trait_name.ends_with(trait_part) || trait_part.ends_with(&imp.trait_name) {
+                    let key = format!("{}::{:?}", imp.trait_name, imp.implementing_type);
+                    if seen_traits.insert(key) {
+                        found.push(imp.clone());
                     }
                 }
             }
@@ -500,13 +501,29 @@ mod tests {
     fn test_build_vtable() {
         let mut resolver = TraitResolver::new();
         resolver.add_impl(make_iterator_impl(
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "VecIter".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new(),
+                name: "VecIter".to_string(),
+                fields: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             Ty::u32(),
         ));
         resolver.add_impl(make_iterator_impl(
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "SliceIter".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new(),
+                name: "SliceIter".to_string(),
+                fields: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             Ty::u32(),
         ));
 
@@ -521,10 +538,26 @@ mod tests {
     #[test]
     fn test_devirtualize() {
         let mut resolver = TraitResolver::new();
-        let vec_iter = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "VecIter".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, };
-        let slice_iter = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "SliceIter".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, };
+        let vec_iter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new(),
+            name: "VecIter".to_string(),
+            fields: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let slice_iter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new(),
+            name: "SliceIter".to_string(),
+            fields: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         resolver.add_impl(make_iterator_impl(vec_iter.clone(), Ty::u32()));
         resolver.add_impl(make_iterator_impl(slice_iter.clone(), Ty::u32()));
 
@@ -620,7 +653,11 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call {
+                    unwind: UnwindEdge::Unreachable,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                    is_foreign: false,
                     func: "std::clone::Clone::clone".to_string(),
                     args: vec![],
                     dest: Place::local(0),
@@ -644,8 +681,16 @@ mod tests {
         let mut resolver = TraitResolver::new();
         resolver.add_impl(make_clone_impl(Ty::i32()));
         resolver.add_impl(make_iterator_impl(
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "MyIter".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new(),
+                name: "MyIter".to_string(),
+                fields: vec![],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             Ty::u32(),
         ));
 

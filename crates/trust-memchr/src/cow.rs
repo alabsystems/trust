@@ -60,7 +60,7 @@ pub(crate) fn as_slice<'c>(cow: &'c CowBytes<'_>) -> &'c [u8] {
 #[cfg(not(feature = "alloc"))]
 #[inline(always)]
 pub(crate) fn as_slice<'c>(cow: &'c CowBytes<'_>) -> &'c [u8] {
-    cow.0 .0
+    cow.0.0
 }
 
 /// Take ownership of the byte string, copying it if it was borrowed.

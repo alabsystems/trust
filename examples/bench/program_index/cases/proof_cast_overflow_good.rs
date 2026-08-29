@@ -4,11 +4,7 @@
 // cast proof surface without std I/O noise.
 
 fn narrow_guarded(x: u32) -> u8 {
-    if x <= u8::MAX as u32 {
-        x as u8
-    } else {
-        u8::MAX
-    }
+    if x <= u8::MAX as u32 { x as u8 } else { u8::MAX }
 }
 
 fn main() {

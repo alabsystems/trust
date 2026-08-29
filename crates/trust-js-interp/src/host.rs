@@ -17,13 +17,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::generators::{GenExec, ResumeInput};
-use crate::interp::{Abrupt, Interp};
 use std::rc::Rc;
+
 use trust_js_reactor::{
     Capability, Completion, Host, PromiseId, Reactor, RejectionEvent, ThenLookup,
 };
 use trust_js_value::{ErrKind, JsValue, ObjId, ObjKind, PropKey};
+
+use crate::generators::{GenExec, ResumeInput};
+use crate::interp::{Abrupt, Interp};
 
 /// An async-function execution id (index into `Interp::async_execs`).
 pub type AsyncId = usize;

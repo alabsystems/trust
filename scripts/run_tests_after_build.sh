@@ -8,6 +8,7 @@
 # Tiers (in order — run all, then fail if any required tier failed):
 #   T0  tidy / format / lint sanity              ~ 5 min
 #   T1  targo test on Trust verifier crates      ~10 min
+#   T1d is_whnf mint-gate canary (release)       ~4 min warm / ~11 min COLD
 #   T2  ./x.py test library/std (stdlib)         ~30 min
 #   T3  Trust e2e shell scripts                  ~variable
 #   T3b certified-monitor release E2Es           ~variable
@@ -394,8 +395,28 @@ record_tier_status() {
 
 echo "$(date '+%H:%M:%S') waiting for in-flight x.py build to exit" | tee -a "${SUMMARY}"
 
-# Wait for x.py build (any attempt) to no longer be running.
-while pgrep -f "x\.py build --stage" >/dev/null 2>&1; do
+# Wait for an in-flight build to finish.
+#
+# The predicate here used to be `pgrep -f "x\.py build --stage"`, and it reported
+# "clear" against live builds. Two independent reasons, both measured 2026-08-20:
+#
+#   1. ADJACENCY. `x.py --stage 1 build` is ordinary usage — x.py's own preflight
+#      says so in a comment — and bootstrap.py builds its child argv as
+#      `[bootstrap_binary] + sys.argv[1:]`, so the words `build` and `--stage` are
+#      in whatever order the caller typed them. The pattern is a coin flip.
+#   2. THE PYTHON WRAPPER CAN DIE while its bootstrap child keeps building
+#      (observed 2026-08-01, attempt 8; see scripts/slim_build.py). Matching on
+#      x.py alone then sees nothing while the compiler is still being written.
+#
+# So: the LOCK is authoritative (x.py holds it for the whole build), and
+# `pgrep -x bootstrap` — matching the executable NAME, which assumes nothing
+# about argument order — is the backstop for a build that predates the lock.
+BUILD_LOCK="${REPO}/scripts/trust_build_lock.sh"
+while :; do
+    if [ -x "${BUILD_LOCK}" ] || [ -f "${BUILD_LOCK}" ]; then
+        sh "${BUILD_LOCK}" status >/dev/null 2>&1 || { sleep 60; continue; }
+    fi
+    pgrep -x bootstrap >/dev/null 2>&1 || break
     sleep 60
 done
 
@@ -532,10 +553,24 @@ run_tier_and_record T0_tidy \
     "${PY}" x.py test tidy --stage 2
 
 # T1: Trust verifier crate tests (compile with targo/trustc, fast)
+#
+# `trust-certify` is in this list because until 2026-08-24 NO gate script ran a
+# single trust-certify test: the only reference to the package anywhere under
+# scripts/ was the overnight kernel-derivation lane. The expensive kernel
+# derivations stay `#[ignore]`d and are opted into by T1d below and by
+# scripts/trust_kernel_derivation_lane.sh; what this adds is the inline half.
+#
+# MEASURED 2026-08-24 on this host, debug, exactly as invoked here: 382 s wall
+# (incremental build included) — 447 lib tests in 175.3 s with 89 ignored, plus
+# ~82 s across nine integration targets, all green. Not free, and not per-test
+# either: the lib suite's floor is ONE shared `base_env()` Int-arithmetic lemma
+# environment behind a `OnceLock`, which ~20 tests wait on together (each
+# reports ~163 s under `--report-time` while the suite's wall is 175 s). So the
+# marginal cost of this package is roughly its slowest single test.
 run_tier_and_record T1_trust_crates \
     "${CARGO_BIN}" --unverified test --manifest-path crates/Cargo.toml \
     --locked \
-    -p trust-loop -p trust-vcgen -p trust-router \
+    -p trust-loop -p trust-vcgen -p trust-router -p trust-certify \
     --no-fail-fast
 
 # T1b: Trust's own machine-checked proof corpora (trust-soundness apex proofs,
@@ -559,6 +594,28 @@ run_tier_and_record T1c_ny_bridge \
     --locked \
     -p trust-ny-bridge --features ny \
     --no-fail-fast
+
+# T1d: the `is_whnf` MINT-GATE canary — one release test that asks whether the
+# four anti-masquerade controls the MIR-grounded Certified mint is GATED on can
+# still be DEMONSTRATED, and whether a certificate therefore still issues.
+#
+# It has its own tier because the failure it detects is invisible everywhere
+# else. Control 3 pinned a positionally generated reflected-env constant; the
+# constant drifted, the control could no longer be demonstrated, and every
+# `is_whnf` certificate was silently withheld from July until 2026-08-23 — with
+# every test on that path `#[ignore]`d into the overnight lane and the one
+# non-ignored consumer independently red. See
+# reports/2026-08-23-is-whnf-mint-blocked-by-control-3.md.
+#
+# Cost, measured twice on this host 2026-08-24: 244 s and 236 s wall — a 24 s
+# warm incremental release build plus 220.03 s / 212.14 s of test, of which
+# `Specification::new()` alone was 219.4 s / 211.2 s and the control the lane
+# exists to run was 4 ms both times. Release is not an
+# optimization: the same spec build is 3.37x slower in debug (~12 min), which is
+# why the test cannot go inline in T1. Budget for a cold release build on a
+# fresh target dir.
+run_tier_and_record T1d_is_whnf_canary \
+    env TARGO="${TARGO}" bash scripts/trust_control_canary.sh
 
 # T2: stdlib regression
 run_tier_and_record T2_libstd \

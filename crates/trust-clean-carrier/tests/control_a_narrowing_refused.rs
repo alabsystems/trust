@@ -11,7 +11,7 @@
 //! used at `u64` is a build error or a wrong binary.
 
 use clean_kernel::{Expr, Name};
-use trust_clean_carrier::{carrier_at, CarrierRefused};
+use trust_clean_carrier::{CarrierRefused, carrier_at};
 use trust_types::Ty;
 
 fn nat() -> Expr {

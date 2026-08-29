@@ -4,11 +4,7 @@
 // arithmetic proof surface without std I/O noise.
 
 fn remainder_guarded(x: u32, y: u32) -> u32 {
-    if y == 0 {
-        0
-    } else {
-        x % y
-    }
+    if y == 0 { 0 } else { x % y }
 }
 
 fn main() {

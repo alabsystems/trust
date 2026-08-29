@@ -178,7 +178,9 @@ pub(crate) fn compute_summary(
 
     // Walk call sites and collect callee requirements
     for block in &func.body.blocks {
-        if let Terminator::Call { func: callee_name, .. } = &block.terminator {
+        if let Terminator::Call { func: callee_name, .. }
+        | Terminator::TailCall { func: callee_name, .. } = &block.terminator
+        {
             // Resolve against the complete function universe, not the
             // bottom-up cache. A duplicate short name must remain ambiguous
             // even if only one of its summaries happens to be cached so far.
@@ -270,6 +272,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],

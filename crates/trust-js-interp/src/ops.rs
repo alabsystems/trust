@@ -8,14 +8,16 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 use std::rc::Rc;
+
 use trust_js_value::{
-    bigint_binary, bigint_cmp_f64, bigint_eq_f64, bigint_is_zero, bigint_to_decimal, js_number_to_string,
-    string_to_bigint, to_int32, to_number_str, to_uint32, units_from_str, units_to_lossy, BigErr,
-    BigOp, ErrKind, FnData, FnFlavor, JsBigInt, JsValue, NativeFn, ObjKind, PropKey, SymId, Units,
-    WkSym,
+    BigErr, BigOp, ErrKind, FnData, FnFlavor, JsBigInt, JsValue, NativeFn, ObjKind, PropKey, SymId,
+    Units, WkSym, bigint_binary, bigint_cmp_f64, bigint_eq_f64, bigint_is_zero, bigint_to_decimal,
+    js_number_to_string, string_to_bigint, to_int32, to_number_str, to_uint32, units_from_str,
+    units_to_lossy,
 };
+
+use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 
 /// The result of ToNumeric (7.1.3): a Number or a BigInt.
 pub(crate) enum Numeric {
@@ -104,9 +106,7 @@ impl Interp {
             JsValue::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
             JsValue::Undefined => Ok(f64::NAN),
             JsValue::Null => Ok(0.0),
-            JsValue::Str(s) => {
-                to_number_str(&units_to_lossy_exactish(s)).map_err(Abrupt::Fatal)
-            }
+            JsValue::Str(s) => to_number_str(&units_to_lossy_exactish(s)).map_err(Abrupt::Fatal),
             JsValue::Sym(_) => Err(self.throw_type_error()),
             // ToNumber(BigInt) is a TypeError (7.1.4 step 1).
             JsValue::BigInt(_) => Err(self.throw_type_error()),
@@ -193,11 +193,8 @@ impl Interp {
             }
             return Err(self.throw_type_error());
         }
-        let order: [&str; 2] = if hint == Hint::String {
-            ["toString", "valueOf"]
-        } else {
-            ["valueOf", "toString"]
-        };
+        let order: [&str; 2] =
+            if hint == Hint::String { ["toString", "valueOf"] } else { ["valueOf", "toString"] };
         for m in order {
             let mv = self.get_prop(v, &PropKey::from_str(m))?;
             if let JsValue::Obj(mid) = &mv {
@@ -290,11 +287,7 @@ impl Interp {
     }
 
     pub(crate) fn require_object_coercible(&mut self, v: &JsValue) -> Result<(), Abrupt> {
-        if v.is_nullish() {
-            Err(self.throw_type_error())
-        } else {
-            Ok(())
-        }
+        if v.is_nullish() { Err(self.throw_type_error()) } else { Ok(()) }
     }
 
     // -- typeof --------------------------------------------------------------

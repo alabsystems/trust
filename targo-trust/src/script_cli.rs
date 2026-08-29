@@ -1,17 +1,18 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Unified Trust CLI adapters for repository maintenance scripts.
 //
 // These commands keep `targo trust` as the public control surface while the
 // existing Python implementations are migrated into Rust library code.
 
-use sha2::{Digest, Sha256};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::time::Duration;
-use std::{env, fs, io};
-
 #[cfg(test)]
 use std::time::Instant;
+use std::{env, fs, io};
+
+use sha2::{Digest, Sha256};
 
 use crate::bounded_process;
 use crate::stage2_tools::{discover_unique_repo_stage2_tool, validate_repo_stage2_tool};
@@ -433,9 +434,7 @@ pub(crate) fn run_verify_subcommand(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
         Some(alias @ ("preflight" | "full-preflight")) => {
-            eprintln!(
-                "targo trust verify {alias}: removed shell/Python-era release alias"
-            );
+            eprintln!("targo trust verify {alias}: removed shell/Python-era release alias");
             eprintln!(
                 "  Use Rust-native gates ({RUST_NATIVE_RELEASE_GATE_ADVICE}) for release evidence."
             );
@@ -463,9 +462,7 @@ pub(crate) fn run_verify_subcommand(args: &[String]) -> ExitCode {
 }
 
 fn removed_verify_alias(alias: &str, replacement: &str) -> ExitCode {
-    eprintln!(
-        "targo trust verify {alias}: removed alias; use `targo trust verify {replacement}`"
-    );
+    eprintln!("targo trust verify {alias}: removed alias; use `targo trust verify {replacement}`");
     ExitCode::from(2)
 }
 
@@ -509,8 +506,26 @@ fn removed_repo_alias(alias: &str, replacement: &str) -> ExitCode {
 
 pub(crate) fn run_bootstrap_subcommand(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
+        // The removed bootstrap aliases keep NAMING their replacement instead
+        // of falling through to the generic `unknown command` usage dump. Their
+        // only callers are users and scripts typing the pre-rename spelling, so
+        // they have no in-repo call site by construction — which is how the
+        // wave-1 dead-code sweep (fc5a9655a0) came to delete them alongside the
+        // repo, verify and gate arms. Those three were restored by 7444318c18,
+        // f8c831246c and e781d74c2f; these are the same regression.
+        Some("create-genesis") => removed_bootstrap_alias("create-genesis", "create-local-genesis"),
+        Some("discover-stage0-seed") => {
+            removed_bootstrap_alias("discover-stage0-seed", "discover-stage0")
+        }
         _ => run_maintenance_leaf_command("bootstrap", args, BOOTSTRAP_SPECS, BOOTSTRAP_USAGE),
     }
+}
+
+fn removed_bootstrap_alias(alias: &str, replacement: &str) -> ExitCode {
+    eprintln!(
+        "targo trust bootstrap {alias}: removed alias; use `targo trust bootstrap {replacement}`"
+    );
+    ExitCode::from(2)
 }
 
 pub(crate) fn run_gate_subcommand(args: &[String]) -> ExitCode {
@@ -523,6 +538,16 @@ pub(crate) fn run_gate_subcommand(args: &[String]) -> ExitCode {
         Some("scripts") => run_check_all_gate(&args[1..], false, "targo trust gate scripts"),
         Some("coherence") => run_coherence_gate(&args[1..]),
         Some("verify-examples") => crate::verify_examples_cli::run(&args[1..]),
+        // The removed aliases keep NAMING their replacement rather than falling
+        // through to `unknown command`. Their callers are users and scripts
+        // typing the pre-a3340a7559 spelling, so they have no in-repo call site
+        // by construction — which is why the wave-1 dead-code sweep
+        // (fc5a9655a0) deleted them along with the repo and verify arms. Those
+        // two were restored by 7444318c18 and f8c831246c; these are the same
+        // regression, and `targo trust repo` still answers its own removed
+        // aliases this way.
+        Some("script-syntax") => removed_gate_alias("script-syntax", "scripts"),
+        Some("examples") => removed_gate_alias("examples", "verify-examples"),
         Some(command) => {
             eprintln!("targo trust gate: unknown command `{command}`");
             eprint!("{GATE_USAGE}");
@@ -533,6 +558,11 @@ pub(crate) fn run_gate_subcommand(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn removed_gate_alias(alias: &str, replacement: &str) -> ExitCode {
+    eprintln!("targo trust gate {alias}: removed alias; use `targo trust gate {replacement}`");
+    ExitCode::from(2)
 }
 
 /// `targo trust gate coherence` — verify the recorded first-party submodule SHAs
@@ -826,6 +856,10 @@ fn run_release_validate_subcommand(args: &[String]) -> ExitCode {
             print!("{RELEASE_VALIDATE_USAGE}");
             ExitCode::SUCCESS
         }
+        // `ledger` was renamed to `ledger-expirations`; the removed spelling
+        // still names its replacement rather than landing in the generic
+        // `unknown command` usage dump (fc5a9655a0 regression).
+        Some("ledger") => removed_release_validate_alias("ledger", "ledger-expirations"),
         _ => run_leaf_command(
             "release validate",
             args,
@@ -833,6 +867,14 @@ fn run_release_validate_subcommand(args: &[String]) -> ExitCode {
             RELEASE_VALIDATE_USAGE,
         ),
     }
+}
+
+fn removed_release_validate_alias(alias: &str, replacement: &str) -> ExitCode {
+    eprintln!(
+        "targo trust release validate {alias}: removed alias; \
+         use `targo trust release validate {replacement}`"
+    );
+    ExitCode::from(2)
 }
 
 fn run_deps_rust_subcommand(args: &[String]) -> Option<ExitCode> {
@@ -847,8 +889,25 @@ fn run_deps_rust_subcommand(args: &[String]) -> Option<ExitCode> {
         "diff" | "upstream-plan" => Some(run_deps_report(command, &args[1..], false)),
         "export" | "import" | "lock" => Some(run_deps_mutation(command, &args[1..])),
         "validate" => Some(run_deps_report(command, &args[1..], true)),
+        // The removed deps aliases keep naming their replacement instead of
+        // falling through to `unknown command` (fc5a9655a0 regression).
+        "report" => Some(removed_deps_alias("report", "status")),
+        "verify" => Some(removed_deps_alias("verify", "validate")),
+        // `alignment status` was a two-token spelling of the same removed
+        // alias; echoing both tokens back is what makes the message match what
+        // the user actually typed.
+        "alignment" if args.get(1).is_some_and(|arg| arg == "status") => {
+            Some(removed_deps_alias("alignment status", "status"))
+        }
+        "alignment" => Some(removed_deps_alias("alignment", "status")),
+        "inventory" => Some(removed_deps_alias("inventory", "upstream-test-inventory")),
         _ => None,
     }
+}
+
+fn removed_deps_alias(alias: &str, replacement: &str) -> ExitCode {
+    eprintln!("targo trust deps {alias}: removed alias; use `targo trust deps {replacement}`");
+    ExitCode::from(2)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2735,9 +2794,8 @@ mod tests {
         assert_eq!(spec.runner, MaintenanceRunner::Shell);
         assert!(spec.fixed_args.is_empty());
 
-        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repository root");
+        let repository_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("repository root");
         let script = std::fs::read_to_string(repository_root.join(spec.script))
             .expect("read certified-monitor release gate");
         let lock_source_gate = std::fs::read_to_string(
@@ -2885,21 +2943,41 @@ mod tests {
             RELEASE_VALIDATE_SPECS.iter().any(|spec| spec.matches("ledger-expirations")),
             "canonical release validate ledger-expirations command must remain live"
         );
+        assert!(
+            !RELEASE_VALIDATE_SPECS.iter().any(|spec| spec.matches("ledger")),
+            "the removed release validate ledger spelling must not remain a live spec"
+        );
         assert_eq!(
             run_release_validate_subcommand(&["ledger".to_string()]),
             ExitCode::from(2),
-            "an unrecognized release validate leaf must fail closed"
+            "the removed release validate ledger alias must fail closed"
         );
 
         assert!(
             DEPS_SPECS.iter().any(|spec| spec.matches("upstream-test-inventory")),
             "canonical deps upstream-test-inventory command must remain live"
         );
+        assert!(
+            !DEPS_SPECS.iter().any(|spec| spec.matches("inventory")),
+            "the removed deps inventory spelling must not remain a live spec"
+        );
         assert_eq!(
             run_deps_subcommand(&["inventory".to_string()]),
             ExitCode::from(2),
-            "an unrecognized deps leaf must fail closed"
+            "the removed deps inventory alias must fail closed"
         );
+
+        for alias in ["create-genesis", "discover-stage0-seed"] {
+            assert!(
+                !BOOTSTRAP_SPECS.iter().any(|spec| spec.matches(alias)),
+                "the removed bootstrap alias {alias} must not remain a live spec"
+            );
+            assert_eq!(
+                run_bootstrap_subcommand(&[alias.to_string()]),
+                ExitCode::from(2),
+                "the removed bootstrap alias {alias} must fail closed"
+            );
+        }
     }
 
     #[test]

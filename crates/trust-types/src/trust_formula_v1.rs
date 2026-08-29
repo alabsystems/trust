@@ -11,12 +11,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, MapAccess, SeqAccess, Visitor},
-};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::formula::{Formula, Sort};

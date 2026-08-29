@@ -338,7 +338,18 @@ fn parse_spec_expr(input: &str) -> Result<SpecExpr, SpecParseError> {
     let mut parser = SpecExprParser::new(tokens);
     let expr = parser.parse_implies()?;
 
-    if parser.is_eof() { Ok(expr) } else { Err(SpecParseError::TrailingTokens) }
+    if parser.is_eof() {
+        return Ok(expr);
+    }
+    // Name the construct instead of reporting a bare "trailing tokens". This is
+    // the FIRST-CLASS clause lane (`fn f(..) requires idx <= u32::MAX as usize`),
+    // where the measured message pointed away from the cast entirely: `u32::MAX`
+    // alone parses here, so "trailing tokens after expression" read as a
+    // mystery. Still a refusal — see `SpecParseError::UnsupportedCast`.
+    if parser.peek() == Some(&Token::Ident("as".to_string())) {
+        return Err(SpecParseError::UnsupportedCast { clause: input.trim().to_string() });
+    }
+    Err(SpecParseError::TrailingTokens)
 }
 
 struct SpecExprParser {

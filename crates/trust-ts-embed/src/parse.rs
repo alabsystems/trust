@@ -11,8 +11,9 @@
 //! deterministic-int gate); a producer that knows a tighter width can post-narrow
 //! the `TsCore`.
 
-use crate::core::{TsExpr, TsFunction, TsStmt, TsTy, TsVar};
 use trust_types::BinOp;
+
+use crate::core::{TsExpr, TsFunction, TsStmt, TsTy, TsVar};
 
 /// Width `number` is modeled at (the deterministic integer gate). 16 bits keeps the
 /// SMT domain small (terminal coordinates fit); the structural refinement proofs are
@@ -338,7 +339,9 @@ fn parse_switch(p: &mut Parser) -> Result<TsStmt, ParseError> {
                 p.next();
                 default = Some(arm(p)?);
             }
-            other => return Err(ParseError(format!("switch: expected case/default, found {other:?}"))),
+            other => {
+                return Err(ParseError(format!("switch: expected case/default, found {other:?}")));
+            }
         }
     }
     p.eat_punct("}")?;
@@ -497,7 +500,9 @@ fn parse_primary(p: &mut Parser) -> Result<TsExpr, ParseError> {
             // unary minus on a literal (signed constant)
             match p.next() {
                 Some(Tok::Num(n)) => Ok(TsExpr::Int(-n, TsTy::sint(NUM_W))),
-                other => Err(ParseError(format!("expected number after unary `-`, found {other:?}"))),
+                other => {
+                    Err(ParseError(format!("expected number after unary `-`, found {other:?}")))
+                }
             }
         }
         Some(Tok::Ident(id)) => {
@@ -573,7 +578,11 @@ fn parse_enum_into(p: &mut Parser) -> Result<(), ParseError> {
             p.eat_punct("=")?;
             match p.next() {
                 Some(Tok::Num(n)) => n,
-                other => return Err(ParseError(format!("enum value must be a literal, found {other:?}"))),
+                other => {
+                    return Err(ParseError(format!(
+                        "enum value must be a literal, found {other:?}"
+                    )));
+                }
             }
         } else {
             next_val
@@ -720,6 +729,8 @@ mod tests {
         assert!(parse_function("function* g(): number { return 0; }").is_err()); // generator
         assert!(parse_function("function f(): number { return new Foo(); }").is_err()); // new
         // A PURE async function IS in-fragment (no real effect):
-        assert!(parse_function("async function f(c: number): Promise<number> { return c; }").is_ok());
+        assert!(
+            parse_function("async function f(c: number): Promise<number> { return c; }").is_ok()
+        );
     }
 }

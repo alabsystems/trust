@@ -50,12 +50,11 @@
 
 #![cfg(target_arch = "aarch64")]
 
+use clean_kernel::Environment;
 use clean_kernel::env::Declaration;
 use clean_kernel::expr::{BinderInfo, Expr, ExprKind};
 use clean_kernel::level::Level;
 use clean_kernel::name::Name;
-use clean_kernel::Environment;
-
 use trust_disasm::decode_aarch64;
 use trust_machine_sem::{Aarch64Semantics, ConcreteState, MachineState, Semantics};
 
@@ -249,26 +248,10 @@ fn build_lean_isa_env() -> Environment {
         "AArch64.bvNot",
         nat_xor(nat_mod(bvar(0), c("AArch64.W")), c("AArch64.AllOnes")),
     );
-    def2(
-        &mut env,
-        "AArch64.bvBic",
-        nat_land(a(), Expr::app(c("AArch64.bvNot"), b())),
-    );
-    def2(
-        &mut env,
-        "AArch64.bvOrn",
-        nat_lor(a(), Expr::app(c("AArch64.bvNot"), b())),
-    );
-    def2(
-        &mut env,
-        "AArch64.bvShl",
-        nat_mod(nat_shl(a(), nat_mod(b(), lit(64))), c("AArch64.W")),
-    );
-    def2(
-        &mut env,
-        "AArch64.bvLshr",
-        nat_shr(nat_mod(a(), c("AArch64.W")), nat_mod(b(), lit(64))),
-    );
+    def2(&mut env, "AArch64.bvBic", nat_land(a(), Expr::app(c("AArch64.bvNot"), b())));
+    def2(&mut env, "AArch64.bvOrn", nat_lor(a(), Expr::app(c("AArch64.bvNot"), b())));
+    def2(&mut env, "AArch64.bvShl", nat_mod(nat_shl(a(), nat_mod(b(), lit(64))), c("AArch64.W")));
+    def2(&mut env, "AArch64.bvLshr", nat_shr(nat_mod(a(), c("AArch64.W")), nat_mod(b(), lit(64))));
     // topSet / signFill / bvAsr (Bool.rec branch).
     def1_bool(
         &mut env,
@@ -283,21 +266,15 @@ fn build_lean_isa_env() -> Environment {
     {
         let s = || nat_mod(bvar(0), lit(64));
         let logical = || nat_shr(nat_mod(bvar(1), c("AArch64.W")), s());
-        let filled = nat_mod(
-            nat_lor(logical(), Expr::app(c("AArch64.signFill"), s())),
-            c("AArch64.W"),
-        );
+        let filled =
+            nat_mod(nat_lor(logical(), Expr::app(c("AArch64.signFill"), s())), c("AArch64.W"));
         let body = cond_nat(Expr::app(c("AArch64.topSet"), bvar(1)), filled, logical());
         def2(&mut env, "AArch64.bvAsr", body);
     }
     // UDIV / SDIV (no-trap).
     def2(&mut env, "AArch64.bvUdiv", {
         let bb = || nat_mod(bvar(0), c("AArch64.W"));
-        cond_nat(
-            nat_beq(bb(), lit(0)),
-            lit(0),
-            nat_div(nat_mod(bvar(1), c("AArch64.W")), bb()),
-        )
+        cond_nat(nat_beq(bb(), lit(0)), lit(0), nat_div(nat_mod(bvar(1), c("AArch64.W")), bb()))
     });
     // sMag — signed magnitude |x| (aarch64_isa.lean:332): 2^64 - x for negative x.
     def1(
@@ -319,23 +296,18 @@ fn build_lean_isa_env() -> Environment {
         // result expressions — VALUE-identical (the differential compares fully
         // reduced Nat values), avoiding Bool.beq/Bool.not kernel plumbing.
         let qm = || {
-            nat_div(
-                Expr::app(c("AArch64.sMag"), bvar(1)),
-                Expr::app(c("AArch64.sMag"), bvar(0)),
-            )
+            nat_div(Expr::app(c("AArch64.sMag"), bvar(1)), Expr::app(c("AArch64.sMag"), bvar(0)))
         };
         let pos = || nat_mod(qm(), c("AArch64.W"));
-        let neg = || nat_mod(nat_sub(c("AArch64.W"), nat_mod(qm(), c("AArch64.W"))), c("AArch64.W"));
+        let neg =
+            || nat_mod(nat_sub(c("AArch64.W"), nat_mod(qm(), c("AArch64.W"))), c("AArch64.W"));
         let signed_branch = cond_nat(
             Expr::app(c("AArch64.topSet"), bvar(1)),
             cond_nat(Expr::app(c("AArch64.topSet"), bvar(0)), pos(), neg()),
             cond_nat(Expr::app(c("AArch64.topSet"), bvar(0)), neg(), pos()),
         );
-        let body = cond_nat(
-            nat_beq(nat_mod(bvar(0), c("AArch64.W")), lit(0)),
-            lit(0),
-            signed_branch,
-        );
+        let body =
+            cond_nat(nat_beq(nat_mod(bvar(0), c("AArch64.W")), lit(0)), lit(0), signed_branch);
         def2(&mut env, "AArch64.bvSdiv", body);
     }
 
@@ -411,21 +383,15 @@ fn build_lean_isa_env() -> Environment {
     {
         let s = || nat_mod(bvar(0), lit(32));
         let logical = || nat_shr(nat_mod(bvar(1), c("AArch64.Ww")), s());
-        let filled = nat_mod(
-            nat_lor(logical(), Expr::app(c("AArch64.signFillW"), s())),
-            c("AArch64.Ww"),
-        );
+        let filled =
+            nat_mod(nat_lor(logical(), Expr::app(c("AArch64.signFillW"), s())), c("AArch64.Ww"));
         let body = cond_nat(Expr::app(c("AArch64.topSetW"), bvar(1)), filled, logical());
         def2(&mut env, "AArch64.bvAsrW", body);
     }
     // UDIV (W) — 32-bit no-trap unsigned divide (aarch64_isa.lean:349).
     def2(&mut env, "AArch64.bvUdivW", {
         let bb = || nat_mod(bvar(0), c("AArch64.Ww"));
-        cond_nat(
-            nat_beq(bb(), lit(0)),
-            lit(0),
-            nat_div(nat_mod(bvar(1), c("AArch64.Ww")), bb()),
-        )
+        cond_nat(nat_beq(bb(), lit(0)), lit(0), nat_div(nat_mod(bvar(1), c("AArch64.Ww")), bb()))
     });
     // sMagW / bvSdivW — 32-bit analogs (aarch64_isa.lean:355,359); same
     // value-identical branch reformulation as bvSdiv above.
@@ -440,10 +406,7 @@ fn build_lean_isa_env() -> Environment {
     );
     {
         let qm = || {
-            nat_div(
-                Expr::app(c("AArch64.sMagW"), bvar(1)),
-                Expr::app(c("AArch64.sMagW"), bvar(0)),
-            )
+            nat_div(Expr::app(c("AArch64.sMagW"), bvar(1)), Expr::app(c("AArch64.sMagW"), bvar(0)))
         };
         let pos = || nat_mod(qm(), c("AArch64.Ww"));
         let neg =
@@ -453,11 +416,8 @@ fn build_lean_isa_env() -> Environment {
             cond_nat(Expr::app(c("AArch64.topSetW"), bvar(0)), pos(), neg()),
             cond_nat(Expr::app(c("AArch64.topSetW"), bvar(0)), neg(), pos()),
         );
-        let body = cond_nat(
-            nat_beq(nat_mod(bvar(0), c("AArch64.Ww")), lit(0)),
-            lit(0),
-            signed_branch,
-        );
+        let body =
+            cond_nat(nat_beq(nat_mod(bvar(0), c("AArch64.Ww")), lit(0)), lit(0), signed_branch);
         def2(&mut env, "AArch64.bvSdivW", body);
     }
 
@@ -471,7 +431,10 @@ fn build_lean_isa_env() -> Environment {
         &mut env,
         "AArch64.bvMsub",
         nat_mod(
-            nat_add(bvar(2), nat_sub(c("AArch64.W"), nat_mod(nat_mul(bvar(1), bvar(0)), c("AArch64.W")))),
+            nat_add(
+                bvar(2),
+                nat_sub(c("AArch64.W"), nat_mod(nat_mul(bvar(1), bvar(0)), c("AArch64.W"))),
+            ),
             c("AArch64.W"),
         ),
     );
@@ -497,7 +460,10 @@ fn build_lean_isa_env() -> Environment {
                 nat_sub(
                     c("AArch64.Ww"),
                     nat_mod(
-                        nat_mul(nat_mod(bvar(1), c("AArch64.Ww")), nat_mod(bvar(0), c("AArch64.Ww"))),
+                        nat_mul(
+                            nat_mod(bvar(1), c("AArch64.Ww")),
+                            nat_mod(bvar(0), c("AArch64.Ww")),
+                        ),
                         c("AArch64.Ww"),
                     ),
                 ),
@@ -634,21 +600,21 @@ fn covered_ops() -> Vec<OpCase> {
     use Arity::*;
     vec![
         // ---- 64-bit (X) ----
-        OpCase { name: "add",  word: 0x8B02_0020, lean: "AArch64.bvAdd",  arity: Bin2, width: 64 },
-        OpCase { name: "sub",  word: 0xCB02_0020, lean: "AArch64.bvSub",  arity: Bin2, width: 64 },
-        OpCase { name: "mul",  word: 0x9B02_7C20, lean: "AArch64.bvMul",  arity: Bin2, width: 64 }, // MADD x0,x1,x2,xzr
-        OpCase { name: "and",  word: 0x8A02_0020, lean: "AArch64.bvAnd",  arity: Bin2, width: 64 },
-        OpCase { name: "orr",  word: 0xAA02_0020, lean: "AArch64.bvOr",   arity: Bin2, width: 64 },
-        OpCase { name: "eor",  word: 0xCA02_0020, lean: "AArch64.bvXor",  arity: Bin2, width: 64 },
-        OpCase { name: "bic",  word: 0x8A22_0020, lean: "AArch64.bvBic",  arity: Bin2, width: 64 },
-        OpCase { name: "orn",  word: 0xAA22_0020, lean: "AArch64.bvOrn",  arity: Bin2, width: 64 },
-        OpCase { name: "lslv", word: 0x9AC2_2020, lean: "AArch64.bvShl",  arity: Bin2, width: 64 },
+        OpCase { name: "add", word: 0x8B02_0020, lean: "AArch64.bvAdd", arity: Bin2, width: 64 },
+        OpCase { name: "sub", word: 0xCB02_0020, lean: "AArch64.bvSub", arity: Bin2, width: 64 },
+        OpCase { name: "mul", word: 0x9B02_7C20, lean: "AArch64.bvMul", arity: Bin2, width: 64 }, // MADD x0,x1,x2,xzr
+        OpCase { name: "and", word: 0x8A02_0020, lean: "AArch64.bvAnd", arity: Bin2, width: 64 },
+        OpCase { name: "orr", word: 0xAA02_0020, lean: "AArch64.bvOr", arity: Bin2, width: 64 },
+        OpCase { name: "eor", word: 0xCA02_0020, lean: "AArch64.bvXor", arity: Bin2, width: 64 },
+        OpCase { name: "bic", word: 0x8A22_0020, lean: "AArch64.bvBic", arity: Bin2, width: 64 },
+        OpCase { name: "orn", word: 0xAA22_0020, lean: "AArch64.bvOrn", arity: Bin2, width: 64 },
+        OpCase { name: "lslv", word: 0x9AC2_2020, lean: "AArch64.bvShl", arity: Bin2, width: 64 },
         OpCase { name: "lsrv", word: 0x9AC2_2420, lean: "AArch64.bvLshr", arity: Bin2, width: 64 },
-        OpCase { name: "asrv", word: 0x9AC2_2820, lean: "AArch64.bvAsr",  arity: Bin2, width: 64 },
+        OpCase { name: "asrv", word: 0x9AC2_2820, lean: "AArch64.bvAsr", arity: Bin2, width: 64 },
         OpCase { name: "udiv", word: 0x9AC2_0820, lean: "AArch64.bvUdiv", arity: Bin2, width: 64 },
         OpCase { name: "sdiv", word: 0x9AC2_0C20, lean: "AArch64.bvSdiv", arity: Bin2, width: 64 },
-        OpCase { name: "neg",  word: 0xCB01_03E0, lean: "AArch64.bvNeg",  arity: Un1,  width: 64 }, // SUB x0,xzr,x1
-        OpCase { name: "mvn",  word: 0xAA21_03E0, lean: "AArch64.bvNot",  arity: Un1,  width: 64 }, // ORN x0,xzr,x1
+        OpCase { name: "neg", word: 0xCB01_03E0, lean: "AArch64.bvNeg", arity: Un1, width: 64 }, // SUB x0,xzr,x1
+        OpCase { name: "mvn", word: 0xAA21_03E0, lean: "AArch64.bvNot", arity: Un1, width: 64 }, // ORN x0,xzr,x1
         OpCase { name: "madd", word: 0x9B02_0C20, lean: "AArch64.bvMadd", arity: Madd, width: 64 }, // MADD x0,x1,x2,x3
         OpCase { name: "msub", word: 0x9B02_8C20, lean: "AArch64.bvMsub", arity: Madd, width: 64 }, // MSUB x0,x1,x2,x3
         // ---- 32-bit (W) ----
@@ -656,17 +622,47 @@ fn covered_ops() -> Vec<OpCase> {
         OpCase { name: "subw", word: 0x4B02_0020, lean: "AArch64.bvSubW", arity: Bin2, width: 32 },
         OpCase { name: "mulw", word: 0x1B02_7C20, lean: "AArch64.bvMulW", arity: Bin2, width: 32 },
         OpCase { name: "andw", word: 0x0A02_0020, lean: "AArch64.bvAndW", arity: Bin2, width: 32 },
-        OpCase { name: "orrw", word: 0x2A02_0020, lean: "AArch64.bvOrW",  arity: Bin2, width: 32 },
+        OpCase { name: "orrw", word: 0x2A02_0020, lean: "AArch64.bvOrW", arity: Bin2, width: 32 },
         OpCase { name: "eorw", word: 0x4A02_0020, lean: "AArch64.bvXorW", arity: Bin2, width: 32 },
         OpCase { name: "lslvw", word: 0x1AC2_2020, lean: "AArch64.bvShlW", arity: Bin2, width: 32 },
-        OpCase { name: "lsrvw", word: 0x1AC2_2420, lean: "AArch64.bvLshrW", arity: Bin2, width: 32 },
+        OpCase {
+            name: "lsrvw",
+            word: 0x1AC2_2420,
+            lean: "AArch64.bvLshrW",
+            arity: Bin2,
+            width: 32,
+        },
         OpCase { name: "asrvw", word: 0x1AC2_2820, lean: "AArch64.bvAsrW", arity: Bin2, width: 32 },
-        OpCase { name: "negw", word: 0x4B01_03E0, lean: "AArch64.bvNegW", arity: Un1,  width: 32 },
-        OpCase { name: "mvnw", word: 0x2A21_03E0, lean: "AArch64.bvNotW", arity: Un1,  width: 32 },
-        OpCase { name: "udivw", word: 0x1AC2_0820, lean: "AArch64.bvUdivW", arity: Bin2, width: 32 },
-        OpCase { name: "sdivw", word: 0x1AC2_0C20, lean: "AArch64.bvSdivW", arity: Bin2, width: 32 },
-        OpCase { name: "maddw", word: 0x1B02_0C20, lean: "AArch64.bvMaddW", arity: Madd, width: 32 },
-        OpCase { name: "msubw", word: 0x1B02_8C20, lean: "AArch64.bvMsubW", arity: Madd, width: 32 },
+        OpCase { name: "negw", word: 0x4B01_03E0, lean: "AArch64.bvNegW", arity: Un1, width: 32 },
+        OpCase { name: "mvnw", word: 0x2A21_03E0, lean: "AArch64.bvNotW", arity: Un1, width: 32 },
+        OpCase {
+            name: "udivw",
+            word: 0x1AC2_0820,
+            lean: "AArch64.bvUdivW",
+            arity: Bin2,
+            width: 32,
+        },
+        OpCase {
+            name: "sdivw",
+            word: 0x1AC2_0C20,
+            lean: "AArch64.bvSdivW",
+            arity: Bin2,
+            width: 32,
+        },
+        OpCase {
+            name: "maddw",
+            word: 0x1B02_0C20,
+            lean: "AArch64.bvMaddW",
+            arity: Madd,
+            width: 32,
+        },
+        OpCase {
+            name: "msubw",
+            word: 0x1B02_8C20,
+            lean: "AArch64.bvMsubW",
+            arity: Madd,
+            width: 32,
+        },
     ]
 }
 

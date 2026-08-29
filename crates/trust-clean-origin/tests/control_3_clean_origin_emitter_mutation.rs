@@ -51,7 +51,7 @@
 
 use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Name};
 use trust_clean_origin::{
-    admit_lowering, plan_clean_origin_body, CleanOriginShape, EmitRefusal, GateRefusal,
+    CleanOriginShape, EmitRefusal, GateRefusal, admit_lowering, plan_clean_origin_body,
 };
 use trust_types::{
     BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty,
@@ -61,6 +61,11 @@ use trust_types::{
 /// `UInt64`, the Clean fixed-width type that carries exactly.
 fn uint64() -> Expr {
     Expr::const_(Name::from_string("UInt64"), vec![])
+}
+
+/// `UInt64.ofNat n` — the carrier numeral spelling.
+fn uint64_lit(n: u64) -> Expr {
+    Expr::app(Expr::const_(Name::from_string("UInt64.ofNat"), vec![]), Expr::nat_lit(n))
 }
 
 /// An environment holding
@@ -181,8 +186,11 @@ fn half_2_the_gate_catches_an_emitter_that_projects_the_wrong_parameter() {
          side B's producers and they are frozen against this lane.",
     );
 
-    assert!(refusal.is_compiler_defect(), "a mistranslation is a compiler defect, not a \
-        user error; {refusal:?}");
+    assert!(
+        refusal.is_compiler_defect(),
+        "a mistranslation is a compiler defect, not a \
+        user error; {refusal:?}"
+    );
     assert_eq!(refusal.name(), "fst_isl");
     assert!(
         matches!(refusal, EmitRefusal::LoweringShapeMismatch { .. }),
@@ -274,9 +282,10 @@ fn half_5_an_emitted_body_whose_arity_disagrees_with_the_signature_is_refused() 
     let mut wrong = emitted_projection(0);
     wrong.body.arg_count = 1;
 
-    let refusal = admit_lowering(&env, &plan, &wrong)
-        .expect_err("an arity disagreement between the signature and the emitted body \
-                     must refuse");
+    let refusal = admit_lowering(&env, &plan, &wrong).expect_err(
+        "an arity disagreement between the signature and the emitted body \
+                     must refuse",
+    );
     assert!(refusal.is_compiler_defect());
     assert!(
         matches!(refusal, EmitRefusal::LoweringShapeMismatch { .. }),
@@ -452,11 +461,7 @@ fn half_7_arithmetic_now_PLANS_and_the_boundary_moved_to_division() {
         value: Expr::lam(
             BinderInfo::Default,
             uint64(),
-            Expr::lam(
-                BinderInfo::Default,
-                uint64(),
-                op("mul", op("add", b(1), b(0)), b(1)),
-            ),
+            Expr::lam(BinderInfo::Default, uint64(), op("mul", op("add", b(1), b(0)), b(1))),
         ),
         is_reducible: true,
     })
@@ -505,11 +510,7 @@ fn half_7_arithmetic_now_PLANS_and_the_boundary_moved_to_division() {
         value: Expr::lam(
             BinderInfo::Default,
             nat.clone(),
-            Expr::lam(
-                BinderInfo::Default,
-                nat,
-                nat_op("mul", nat_op("div", b(1), b(0)), b(1)),
-            ),
+            Expr::lam(BinderInfo::Default, nat, nat_op("mul", nat_op("div", b(1), b(0)), b(1))),
         ),
         is_reducible: true,
     })
@@ -537,34 +538,78 @@ fn half_7_arithmetic_now_PLANS_and_the_boundary_moved_to_division() {
 }
 
 #[test]
-fn half_8_a_nullary_constant_is_refused_with_the_measured_reason() {
-    // The corpus measurement this whole slice rests on: `ConstantUint` is the
-    // shape that LOOKS simplest and is the one the kernel refuses under defeq
-    // against its reflected lowering (f04, f06-f09). Planning must refuse it up
-    // front rather than emitting a body that the gate would then reject, so the
-    // user gets a capability message instead of an internal-error one.
+fn half_8_a_nullary_NON_CONSTANT_is_refused_with_the_measured_reason() {
+    // RATCHET FLIPPED, §6f landing 2 (2026-08-22). This half used to pin "a
+    // nullary constant is outside the fragment", on the corpus reading that
+    // `ConstantUint` was the shape the kernel refused under defeq. That reading
+    // was superseded by MEASUREMENT before this landing: probe_e/probe_e2
+    // showed the bare kernel comparison ADMITs the constant in both numeral
+    // spellings, and probe_e3 located the real defect in the arity-erasing
+    // `ConstantUint -> admit_constant_function` ROUTING. Landing 2 repaired the
+    // routing (`landing2_selection_probes`), so `def six : UInt64 := 6` now
+    // PLANS — pinned by probe_e, and by `half_8c` below through the full gate.
+    //
+    // What this half pins now is the boundary landing 2 deliberately did NOT
+    // move, and the reason it exists: deleting the blanket arity-0 early return
+    // would have let a nullary body fall into readings stated over PARAMETERS,
+    // and `UInt64.add 1 2` would have started emitting as a `WrappingBinOp`
+    // over two `Const` leaves — a widening with no probe behind it. The guard
+    // is explicit and this is its control.
+    let mut env = Environment::new();
+    env.init_uint_arith().expect("uint arith");
+    env.add_decl(Declaration::Definition {
+        name: Name::from_string("nullary_sum"),
+        level_params: vec![],
+        type_: uint64(),
+        value: Expr::apps(
+            Expr::const_(Name::from_string("UInt64.add"), vec![]),
+            [uint64_lit(1), uint64_lit(2)],
+        ),
+        is_reducible: true,
+    })
+    .expect("`nullary_sum` is admissible");
+
+    let refusal = plan_clean_origin_body(&env, "nullary_sum").expect_err(
+        "a nullary body that is not a numeral is outside the measured callable fragment; if \
+         this ever plans, a nullary shape has been admitted WITHOUT a kernel measurement — \
+         which is the failure §6f's fast-lane-first discipline exists to prevent",
+    );
+    assert!(matches!(refusal, EmitRefusal::NotEmittable { .. }), "got {refusal:?}");
+    assert!(!refusal.is_compiler_defect());
+    let note = refusal.note();
+    assert!(
+        note.contains("options:"),
+        "v7/D3 applies to a fragment boundary as much as to a proof failure"
+    );
+    assert!(
+        note.contains("nullary") && note.contains("not a numeral"),
+        "the refusal must name the boundary it is about, so the next landing's work item is \
+         legible from the refusal itself: {note}"
+    );
+}
+
+#[test]
+fn half_8c_a_nullary_CONSTANT_now_plans_and_traverses_the_gate() {
+    // The other side of the flipped ratchet, through the FULL round trip
+    // rather than only the plan: the emitted whole-body inline scalar is read
+    // back by the recognizer, reflected by the frozen expr producer at ZERO
+    // parameters, and identified by the kernel with the Clean declaration.
     let mut env = Environment::new();
     env.init_uint_arith().expect("uint arith");
     env.add_decl(Declaration::Definition {
         name: Name::from_string("six"),
         level_params: vec![],
         type_: uint64(),
-        value: Expr::app(
-            Expr::const_(Name::from_string("UInt64.ofNat"), vec![]),
-            Expr::nat_lit(6),
-        ),
+        value: uint64_lit(6),
         is_reducible: true,
     })
     .expect("`six` is admissible");
 
-    let refusal = plan_clean_origin_body(&env, "six")
-        .expect_err("a nullary constant is outside the measured callable fragment");
-    assert!(matches!(refusal, EmitRefusal::NotEmittable { .. }), "got {refusal:?}");
-    assert!(!refusal.is_compiler_defect());
-    assert!(
-        refusal.note().contains("options:"),
-        "v7/D3 applies to a fragment boundary as much as to a proof failure"
-    );
+    let plan = plan_clean_origin_body(&env, "six")
+        .expect("§6f landing 2: a nullary carrier numeral is inside the measured fragment");
+    assert_eq!(plan.shape(), &CleanOriginShape::ConstantUint { value: 6 });
+    assert_eq!(plan.signature().arity(), 0, "a nullary def has no parameters");
+    assert_eq!(plan.return_ty(), &Ty::u64());
 }
 
 #[test]
@@ -613,10 +658,7 @@ fn half_8b_a_Nat_projection_plans_at_the_EXACT_bignum_carrier_never_a_width() {
     );
     assert_eq!(plan.return_ty(), &Ty::BignumNat);
     assert!(
-        !plan.param_tys().iter().chain([plan.return_ty()]).any(|ty| matches!(
-            ty,
-            Ty::Int { .. }
-        )),
+        !plan.param_tys().iter().chain([plan.return_ty()]).any(|ty| matches!(ty, Ty::Int { .. })),
         "a FIXED-WIDTH type in a `Nat` plan is the wrap-into-u64 miscompile this half \
          exists to make unreachable; got {plan:?}"
     );

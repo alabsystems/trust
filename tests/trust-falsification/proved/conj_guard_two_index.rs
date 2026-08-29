@@ -7,9 +7,5 @@
 // is the multi-guard case, where a guard-tracking bug (forgetting one conjunct) would
 // most likely hide. Pairs with mutant/conj_guard_two_index.rs (the j-guard dropped).
 pub fn conj_guard_two_index(s: &[u32], i: usize, j: usize) -> u32 {
-    if i < s.len() && j < s.len() {
-        s[i].wrapping_add(s[j])
-    } else {
-        0
-    }
+    if i < s.len() && j < s.len() { s[i].wrapping_add(s[j]) } else { 0 }
 }

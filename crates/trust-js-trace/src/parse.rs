@@ -16,10 +16,7 @@ pub enum TraceParseError {
     #[error("no trace sentinel in engine stdout (tail: {stdout_tail:?})")]
     NoSentinel { stdout_tail: String },
     #[error("trace JSON failed to parse: {source} (line tail: {line_tail:?})")]
-    Json {
-        source: serde_json::Error,
-        line_tail: String,
-    },
+    Json { source: serde_json::Error, line_tail: String },
     #[error("trace schema mismatch: got {got:?}, want {want}")]
     SchemaMismatch { got: String, want: &'static str },
 }
@@ -33,19 +30,11 @@ pub fn extract_trace(stdout: &[u8]) -> Result<ObservableTrace, TraceParseError> 
         .lines()
         .rev()
         .find_map(|l| l.trim_start().strip_prefix(TRACE_SENTINEL))
-        .ok_or_else(|| TraceParseError::NoSentinel {
-            stdout_tail: tail(&text, 512),
-        })?;
-    let trace: ObservableTrace =
-        serde_json::from_str(line).map_err(|source| TraceParseError::Json {
-            source,
-            line_tail: tail(line, 512),
-        })?;
+        .ok_or_else(|| TraceParseError::NoSentinel { stdout_tail: tail(&text, 512) })?;
+    let trace: ObservableTrace = serde_json::from_str(line)
+        .map_err(|source| TraceParseError::Json { source, line_tail: tail(line, 512) })?;
     if trace.schema != SCHEMA_VERSION {
-        return Err(TraceParseError::SchemaMismatch {
-            got: trace.schema,
-            want: SCHEMA_VERSION,
-        });
+        return Err(TraceParseError::SchemaMismatch { got: trace.schema, want: SCHEMA_VERSION });
     }
     Ok(trace)
 }

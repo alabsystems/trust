@@ -42,7 +42,7 @@ pub(super) fn product_proof_evidence_class_requirements() -> Vec<ProductProofEvi
             gates: &["native-contracts-pipeline-v2"],
             required_evidence: &[
                 "native TrustIr evidence",
-                "same-row trust-mc/trust-wp/trust-vc proof evidence",
+                "same-row trust-mc/trust-vc/TY proof evidence",
                 "replayable solver/proof artifacts",
             ],
             reason: None,
@@ -257,13 +257,7 @@ pub(super) fn product_proof_component_requirements() -> Vec<ProductProofComponen
         ProductProofComponent {
             component: "verifier engines",
             status: "missing_evidence".to_string(),
-            required_evidence: &[
-                "ay",
-                "trust-mc",
-                "trust-wp",
-                "trust-vc",
-                "model-checking engine locks",
-            ],
+            required_evidence: &["ay", "trust-mc", "trust-vc", "ty", "model-checking engine locks"],
         },
         ProductProofComponent {
             component: "upstream tests",

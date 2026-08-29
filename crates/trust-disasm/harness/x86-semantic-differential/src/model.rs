@@ -10,7 +10,7 @@ use trust_machine_sem::{
     ConcreteError, ConcreteState, Effect, MachineState, Semantics, X86_64Semantics,
 };
 
-use crate::ctx::{pattern_u64, scratch_range, Profile};
+use crate::ctx::{Profile, pattern_u64, scratch_range};
 use crate::mutate::Mutation;
 
 /// Why an instruction could not be compared. Never a verdict about it — only
@@ -115,7 +115,8 @@ pub fn predict(
             if let Effect::FlagUpdate { n, z, c, v } = effect {
                 let mut bit = |formula: &trust_types::Formula,
                                set: &mut dyn FnMut(&mut ConcreteState, bool),
-                               mask: u8| match pre.eval_bool(formula) {
+                               mask: u8| match pre.eval_bool(formula)
+                {
                     Ok(value) => {
                         set(&mut post, value);
                         Ok(())
@@ -203,7 +204,15 @@ pub fn predict(
     Ok((
         len,
         opcode,
-        Predicted { gpr, pc: post.pc, flags, flags_mask, mem, mem_outside_window, mem_read_outside_window },
+        Predicted {
+            gpr,
+            pc: post.pc,
+            flags,
+            flags_mask,
+            mem,
+            mem_outside_window,
+            mem_read_outside_window,
+        },
     ))
 }
 
@@ -220,8 +229,8 @@ fn opcode_name(op: trust_disasm::opcode::Opcode) -> &'static str {
         };
     }
     names!(
-        Mov, Add, Sub, Adc, Cmp, Test, And, Or, Xor, Shl, Shr, Sar, Lea, Push, Pop, Call,
-        Jmp, Jcc, Ret, Nop, Inc, Dec, Neg, Not, Imul, Mul, Div, Idiv, Movsx, Movzx, Xchg, Setcc,
-        Cmovcc, Endbr64, Syscall, Int3
+        Mov, Add, Sub, Adc, Cmp, Test, And, Or, Xor, Shl, Shr, Sar, Lea, Push, Pop, Call, Jmp, Jcc,
+        Ret, Nop, Inc, Dec, Neg, Not, Imul, Mul, Div, Idiv, Movsx, Movzx, Xchg, Setcc, Cmovcc,
+        Endbr64, Syscall, Int3
     )
 }

@@ -1237,9 +1237,7 @@ pub(crate) struct InherentTyOutsideRelevant {
 #[help(
     "consider defining a trait and implementing it for the type or using a newtype wrapper like `struct MyType(ExternalType);` and implement it"
 )]
-#[note(
-    "for more details about the orphan rules, see the Trust Reference's orphan rules section"
-)]
+#[note("for more details about the orphan rules, see the Trust Reference's orphan rules section")]
 pub(crate) struct InherentTyOutsideNew {
     #[primary_span]
     #[label("impl for type defined outside of crate")]
@@ -1481,9 +1479,7 @@ pub(crate) enum OnlyCurrentTraits {
         #[primary_span]
         span: Span,
         #[note("impl doesn't have any local type before any uncovered type parameters")]
-        #[note(
-            "for more information, see the Trust Reference's orphan rules section"
-        )]
+        #[note("for more information, see the Trust Reference's orphan rules section")]
         #[note("define and implement a trait or new type instead")]
         note: (),
     },
@@ -1492,9 +1488,7 @@ pub(crate) enum OnlyCurrentTraits {
         #[primary_span]
         span: Span,
         #[note("impl doesn't have any local type before any uncovered type parameters")]
-        #[note(
-            "for more information, see the Trust Reference's orphan rules section"
-        )]
+        #[note("for more information, see the Trust Reference's orphan rules section")]
         #[note("define and implement a trait or new type instead")]
         note: (),
     },
@@ -1503,9 +1497,7 @@ pub(crate) enum OnlyCurrentTraits {
         #[primary_span]
         span: Span,
         #[note("impl doesn't have any local type before any uncovered type parameters")]
-        #[note(
-            "for more information, see the Trust Reference's orphan rules section"
-        )]
+        #[note("for more information, see the Trust Reference's orphan rules section")]
         #[note("define and implement a trait or new type instead")]
         note: (),
     },

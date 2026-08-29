@@ -503,15 +503,14 @@ fn main() {
         t.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|l| {
-                u32::from_str_radix(l.split_whitespace().next().unwrap_or(l), 16).ok()
-            })
+            .filter_map(|l| u32::from_str_radix(l.split_whitespace().next().unwrap_or(l), 16).ok())
             .collect()
     } else if let Some(n) = flag("--stratify") {
         let cap: usize = n.parse().expect("--stratify N");
         stratified(cap, pc)
     } else {
-        let n: u64 = flag("--sample").expect("--sample N | --stratify N | --words F").parse().expect("N");
+        let n: u64 =
+            flag("--sample").expect("--sample N | --stratify N | --words F").parse().expect("N");
         let off: u64 = flag("--offset").and_then(|s| s.parse().ok()).unwrap_or(0);
         candidates(n, off, pc)
     };
@@ -560,7 +559,8 @@ fn main() {
 
     let digest = population_digest(&words);
     if let Some(path) = dump_population {
-        let mut s = format!("# stratified population, digest {digest:#018x}, {} words\n", words.len());
+        let mut s =
+            format!("# stratified population, digest {digest:#018x}, {} words\n", words.len());
         for w in &words {
             s.push_str(&format!("{w:08x}\n"));
         }
@@ -718,8 +718,7 @@ fn main() {
                                 continue;
                             }
                         };
-                        if p.mem_outside_window || p.mem_read_outside_window || rec.ndiff == 0xff
-                        {
+                        if p.mem_outside_window || p.mem_read_outside_window || rec.ndiff == 0xff {
                             local.unchecked_mem += 1;
                             continue;
                         }
@@ -861,7 +860,13 @@ fn main() {
         rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
         for ((op, kind), v) in rows.iter().take(40) {
             let e = v[0];
-            println!("{:>9}  {op:<14} {kind:<6} e.g. {:08x} [{}] {}", v.len(), e.word, e.profile, e.detail);
+            println!(
+                "{:>9}  {op:<14} {kind:<6} e.g. {:08x} [{}] {}",
+                v.len(),
+                e.word,
+                e.profile,
+                e.detail
+            );
         }
         let mut f = String::new();
         for x in m.iter() {
@@ -884,7 +889,10 @@ fn main() {
     println!("-- opcodes compared (count, mismatches) --");
     let mut line = String::new();
     for (op, (t, b)) in &cov {
-        line.push_str(&format!("{op}={t}{}  ", if *b > 0 { format!("/BAD{b}") } else { String::new() }));
+        line.push_str(&format!(
+            "{op}={t}{}  ",
+            if *b > 0 { format!("/BAD{b}") } else { String::new() }
+        ));
         if line.len() > 100 {
             println!("   {line}");
             line.clear();
@@ -1008,8 +1016,7 @@ fn opcode_of(word: u32, pc: u64) -> String {
 }
 
 fn is_candidate(word: u32, pc: u64, st: &MachineState) -> bool {
-    decode_aarch64(&word.to_le_bytes(), pc)
-        .is_ok_and(|i| Aarch64Semantics.effects(st, &i).is_ok())
+    decode_aarch64(&word.to_le_bytes(), pc).is_ok_and(|i| Aarch64Semantics.effects(st, &i).is_ok())
 }
 
 /// Uniform candidates: scan the Weyl permutation from `offset`, keep the words

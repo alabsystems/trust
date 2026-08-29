@@ -453,15 +453,12 @@ fn run(path: &Path, ratchet_root: Option<&Path>, tidy_ctx: TidyCtx) {
     let this_file = Path::new(file!());
     let codegen_file = Path::new("src/tools/tidy/src/codegen.rs");
 
-    let ratchet_name = ratchet_root.map(|root| {
-        path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
-    });
+    let ratchet_name = ratchet_root
+        .map(|root| path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/"));
     let counted = {
         let mut verdict = match &ratchet_name {
             None => StyleVerdict::Fail(&mut check),
-            Some(root) => {
-                StyleVerdict::Ratchet { check: &mut check, root: root.clone(), found: 0 }
-            }
+            Some(root) => StyleVerdict::Ratchet { check: &mut check, root: root.clone(), found: 0 },
         };
         walk_style_rules(path, skip, &mut verdict, &problematic_regex, this_file, codegen_file);
         match verdict {
@@ -822,7 +819,8 @@ fn walk_style_rules(
             verdict.error(format!("{}: ignoring tab characters unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_end_whitespace {
-            verdict.error(format!("{}: ignoring trailing whitespace unnecessarily", file.display()));
+            verdict
+                .error(format!("{}: ignoring trailing whitespace unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_trailing_newlines {
             verdict.error(format!("{}: ignoring trailing newlines unnecessarily", file.display()));

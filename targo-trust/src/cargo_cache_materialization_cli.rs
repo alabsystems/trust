@@ -1100,10 +1100,13 @@ fn revalidate_captured_tool_identities(audit: &mut RequiredToolIdentityAudit) ->
 }
 
 fn required_aliases_json(bin_dir: &Path) -> Value {
-    // Only these two same-sysroot aliases are part of the Trust toolchain
-    // contract. Every secondary tool is intentionally Trust-named only and
-    // retired upstream leaves are rejected by linked-surface discovery.
-    let aliases = [("cargo", "targo"), ("rustc", "trustc")];
+    // These three same-sysroot aliases are the whole compatibility contract:
+    // rustup refuses a toolchain without `cargo`/`rustc`, and cargo spawns a
+    // binary named `rustdoc` for its doctest phase, so bootstrap installs that
+    // alias into every stage >= 1 sysroot too (76d408e1cd). Every other
+    // secondary tool is intentionally Trust-named only, and retired upstream
+    // leaves are rejected by linked-surface discovery.
+    let aliases = [("cargo", "targo"), ("rustc", "trustc"), ("rustdoc", "trustdoc")];
     let mut map = BTreeMap::new();
     for (alias, canonical) in aliases {
         let path = bin_dir.join(host_executable_name(alias));
@@ -1328,7 +1331,6 @@ fn bounded_sha256_file(path: &Path, max_bytes: u64) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-
 fn exact_tool_sha256(path: &Path) -> Option<String> {
     const MAX_TOOL_BYTES: u64 = 1024 * 1024 * 1024;
     let before = fs::symlink_metadata(path).ok()?;
@@ -1495,11 +1497,15 @@ checksum = "{crate_checksum}"
             "passed"
         );
         assert_eq!(
+            proof["toolchain"]["required_compatibility_aliases"]["rustdoc"]["status"],
+            "passed"
+        );
+        assert_eq!(
             proof["toolchain"]["required_compatibility_aliases"]
                 .as_object()
                 .expect("compatibility alias object")
                 .len(),
-            2
+            3
         );
         assert_eq!(proof["cache_evidence"]["schema"], CACHE_HIT_MISS_SCHEMA);
         assert_eq!(proof["cache_evidence"]["machine_checkable"], true);
@@ -1908,6 +1914,7 @@ checksum = "{checksum}"
             "targo-trust",
             "trustd",
             "trustdoc",
+            "rustdoc",
             "trustfmt",
             "targo-fmt",
             "tippy",

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // targo trust report: verification report rendering
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -237,6 +238,27 @@ pub(crate) struct VerificationReport {
     /// crate-mode runs and never used as live proof authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cargo_proof_inventory: Option<trust_types::CargoProofInventoryReport>,
+    /// Trust (#220 — publication boundary): what the one publication
+    /// normalization withheld from this report, counted by that pass itself
+    /// (`crate::types::normalize_authenticated_results_for_publication`).
+    ///
+    /// `docs/TCB.md`'s "The publication boundary" section documents the rule:
+    /// `targo trust` applies a second evidence test after the compiler's verdict
+    /// vector and rewrites every favorable row that carries neither a
+    /// clean-kernel certificate nor publishable native evidence. `--json`
+    /// discloses the relabelled rows per row; the ones the alias-elision passes
+    /// then DELETE are disclosed nowhere, and the terminal disclosed neither.
+    /// This field is what the terminal line reads.
+    ///
+    /// `None` means the report was not built from an authenticated compiler
+    /// vector (internal gate probes and test fixtures). The terminal says so
+    /// rather than printing a zero — "0 withheld" and "not measured" are
+    /// different claims.
+    ///
+    /// Deliberately `#[serde(skip)]`: this is additive disclosure, and the
+    /// canonical sealed JSON report must be byte-identical to what it was.
+    #[serde(skip)]
+    pub(crate) publication_boundary: Option<crate::types::PublicationBoundary>,
     /// Explicit private root containing path-backed proof materializations for
     /// this run. This is runtime authority only and is never serialized.
     #[serde(skip)]
@@ -324,7 +346,9 @@ impl LiveTransportAuthority {
         results: &[VerificationResult],
         zero_obligation_functions: Vec<String>,
     ) -> Option<Self> {
-        if report_subject.trim().is_empty() || !trust_types::digest::is_stable_sha256_hex(verification_session) {
+        if report_subject.trim().is_empty()
+            || !trust_types::digest::is_stable_sha256_hex(verification_session)
+        {
             return None;
         }
         let row_receipts = results
@@ -501,7 +525,6 @@ fn compiler_claim_digest(result: &VerificationResult) -> Option<String> {
     evidence.claim_digest_sha256.filter(|digest| trust_types::digest::is_stable_sha256_hex(digest))
 }
 
-
 fn live_transport_row_receipt(
     report_subject: &str,
     verification_session: &str,
@@ -651,6 +674,15 @@ impl LiveCanonicalReport {
     /// Canonical rows for immediate Trust-on-Trust frontier reduction. The
     /// reducer must retain only derived measurements, never this report DTO.
     pub(crate) fn for_self_improve_reduction(&self) -> &trust_types::JsonProofReport {
+        &self.report
+    }
+
+    /// Canonical rows for `targo trust spec`'s failing-run disclosure. The
+    /// spec surface suppresses ordinary report rendering (no report artifacts
+    /// were requested), so on a failing verified run it reads the sealed rows
+    /// here to say WHY — a non-zero exit with no visible cause is the
+    /// fail-silent defect class, not a rendering choice.
+    pub(crate) fn for_spec_gate_disclosure(&self) -> &trust_types::JsonProofReport {
         &self.report
     }
 }
@@ -993,6 +1025,10 @@ impl VerificationReport {
             self.unknown,
             self.total
         ));
+        // Trust (#220 — publication boundary): the compiler's favorable verdict
+        // vector and the vector this report publishes are NOT the same set, and
+        // until now the terminal said nothing about the difference.
+        lines.push(self.publication_boundary_line());
         // Trust (verify-cache): informational cache-replay line. These obligations
         // were proved earlier on byte-identical inputs (sound-key hit) and skipped
         // this run; they are still counted conservatively above (no proof credit),
@@ -1028,6 +1064,57 @@ impl VerificationReport {
         lines.push(format!("Result: {}", self.terminal_status_label()));
         lines.push("=================================".to_string());
         lines
+    }
+
+    /// Trust (#220): the human report's publication-boundary line.
+    ///
+    /// Every other view of this boundary under-reports it. `terminal_result_line`
+    /// renders label/kind/message/location/solver/time and never `reason`, so a
+    /// demoted row is indistinguishable from a solver `unknown`; the `Summary:`
+    /// line has no bucket for one. And a reader who greps `--json` for the
+    /// demotion reason sees only the rows that SURVIVED — demotion runs before
+    /// `elide_rows_proved_only_by`, which deletes a demoted hardened-panic twin
+    /// whose sibling published, leaving no row at all. So the counts come from
+    /// the normalization pass itself, where both fates are still visible.
+    ///
+    /// Disclosure only: no verdict, no row, and no demotion criterion moves.
+    fn publication_boundary_line(&self) -> String {
+        let Some(boundary) = self.publication_boundary else {
+            return "Publication boundary: not measured (this report was not built from an \
+                    authenticated compiler vector)"
+                .to_string();
+        };
+        let withheld = boundary.withheld();
+        if withheld == 0 {
+            return format!(
+                "Publication boundary: {} obligation(s) passed the compiler, all {} published \
+                 (0 withheld)",
+                boundary.compiler_favorable, boundary.published_favorable,
+            );
+        }
+        let mut split = vec![
+            format!(
+                "{} relabelled unknown (visible in --json with the reason)",
+                boundary.withheld_relabelled
+            ),
+            format!(
+                "{} deleted as a redundant alias (NOT recoverable from any view)",
+                boundary.withheld_elided
+            ),
+        ];
+        let unattributed = boundary.unattributed_withheld();
+        if unattributed > 0 {
+            split.push(format!("{unattributed} unattributed — publication accounting defect"));
+        }
+        format!(
+            "Publication boundary: {} obligation(s) passed the compiler, {} published, \
+             {} WITHHELD for want of clean-kernel or publishable native proof evidence \
+             ({}). See docs/TCB.md \"The publication boundary\".",
+            boundary.compiler_favorable,
+            boundary.published_favorable,
+            withheld,
+            split.join("; "),
+        )
     }
 
     /// Trust (assertion-grade coverage): the human report's coverage line.
@@ -2562,18 +2649,20 @@ fn structured_native_proof_is_publishable(
     materialization_root: Option<&Path>,
 ) -> bool {
     let canonical_suite = proof.suite.trim().to_ascii_lowercase();
-    let canonical_identity =
-        matches!(canonical_suite.as_str(), "trust-wp" | "trust-mc" | "trust-vc")
-            && proof.request_id.as_deref().is_some_and(nonempty)
-            && proof.proof_id.as_deref().is_some_and(nonempty)
-            && proof.native_id.as_deref().is_some_and(|native_id| {
-                native_id
-                    == format!(
-                        "trust_ir-native-{canonical_suite}-request-{}-proof-{}",
-                        proof.request_id.as_deref().unwrap_or_default(),
-                        proof.proof_id.as_deref().unwrap_or_default(),
-                    )
-            });
+    // Historical TrustWP transport rows remain decodable, but the retired
+    // suite is not a current proof authority. Publication is restricted to
+    // the native suites that own v6/D3 obligations.
+    let canonical_identity = matches!(canonical_suite.as_str(), "trust-mc" | "trust-vc")
+        && proof.request_id.as_deref().is_some_and(nonempty)
+        && proof.proof_id.as_deref().is_some_and(nonempty)
+        && proof.native_id.as_deref().is_some_and(|native_id| {
+            native_id
+                == format!(
+                    "trust_ir-native-{canonical_suite}-request-{}-proof-{}",
+                    proof.request_id.as_deref().unwrap_or_default(),
+                    proof.proof_id.as_deref().unwrap_or_default(),
+                )
+        });
     let binding_matches_native_id = proof.native_id.as_deref().is_some_and(|native_id| {
         proof.artifacts.iter().all(|artifact| {
             artifact
@@ -4095,7 +4184,6 @@ fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -4192,6 +4280,7 @@ mod tests {
             cached: 0,
             total: 1,
             results: vec![result],
+            publication_boundary: None,
             zero_obligation_functions: Vec::new(),
             compiler_diagnostics: vec![CompilerDiagnostic {
                 level: "note".into(),
@@ -4291,6 +4380,7 @@ mod tests {
             cached: 0,
             total: counts.total,
             results,
+            publication_boundary: None,
             zero_obligation_functions: Vec::new(),
             compiler_diagnostics,
             duration_ms: 11,
@@ -4316,10 +4406,15 @@ mod tests {
         let authenticated_compiler_results = report.results.clone();
         report.zero_obligation_functions =
             crate::types::authenticated_zero_obligation_inventory(&authenticated_compiler_results);
-        crate::types::normalize_authenticated_results_for_publication(
-            &mut report.results,
-            report.proof_artifact_root.as_deref(),
-        );
+        // Trust (#220): this helper is the fixtures' stand-in for the real
+        // publication step, so it records the boundary exactly as `run_compiler`
+        // does — otherwise a terminal-rendering test would exercise a code path
+        // production never takes.
+        report.publication_boundary =
+            Some(crate::types::normalize_authenticated_results_for_publication(
+                &mut report.results,
+                report.proof_artifact_root.as_deref(),
+            ));
         let (counts, _defects) =
             crate::pipeline::hardened::partition_outcome_counts(&report.results);
         report.total = counts.total;
@@ -5123,18 +5218,18 @@ mod tests {
     }
 
     fn native_full_verifier_transport() -> trust_types::TransportObligationResult {
-        let owner = "trust_ir-native-trust-wp-request-7-proof-42";
-        let native_id = "trust_ir-native-trust-wp-request-7-proof-42";
+        let owner = "trust_ir-native-trust-mc-request-7-proof-42";
+        let native_id = "trust_ir-native-trust-mc-request-7-proof-42";
         let input = bound_test_artifact(
             "NormalizedObligation",
-            b"exact normalized trust-wp obligation",
+            b"exact normalized trust-mc obligation",
             native_id,
             owner,
             vec![],
         );
         let transcript = bound_test_artifact(
             "SolverTranscript",
-            b"exact trust-wp solver transcript",
+            b"exact trust-mc solver transcript",
             native_id,
             owner,
             vec![trust_types::TransportArtifactReference {
@@ -5144,7 +5239,7 @@ mod tests {
         );
         let check = bound_test_artifact(
             "ProofCheckReport",
-            b"exact trust-wp proof-check report",
+            b"exact trust-mc proof-check report",
             native_id,
             owner,
             vec![trust_types::TransportArtifactReference {
@@ -5168,32 +5263,32 @@ mod tests {
                 col_end: 12,
             }),
             outcome: trust_types::Outcome::Proved,
-            solver: "trust-wp".into(),
+            solver: "trust-mc".into(),
             time_ms: 0,
             counterexample: None,
             counterexample_model: None,
             reason: Some("native full verifier status: Proved".into()),
             design_mandate: false,
             native_trust_ir: Some(trust_types::TransportNativeTrustIrEvidence {
-                suite: "trust-wp".into(),
-                backend: "trust-wp".into(),
+                suite: "trust-mc".into(),
+                backend: "trust-mc".into(),
                 request_id: Some("7".into()),
-                native_id: Some("trust_ir-native-trust-wp-request-7-proof-42".into()),
+                native_id: Some("trust_ir-native-trust-mc-request-7-proof-42".into()),
                 present: true,
-                artifacts: native_trust_ir_shape_artifacts("trust-wp", "7", "42"),
+                artifacts: native_trust_ir_shape_artifacts("trust-mc", "7", "42"),
                 diagnostics: vec![trust_types::TransportEvidenceDiagnostic {
                     code: "native_trust_ir.accepted".into(),
                     severity: trust_types::TransportEvidenceDiagnosticSeverity::Info,
                     message: "typed TrustIr native request accepted".into(),
-                    detail: Some("suite=trust-wp request_id=7 proof_obligation_id=42".into()),
+                    detail: Some("suite=trust-mc request_id=7 proof_obligation_id=42".into()),
                 }],
             }),
             proof_evidence: Some(trust_types::TransportProofEvidence {
-                suite: "trust-wp".into(),
-                backend: "trust-wp".into(),
+                suite: "trust-mc".into(),
+                backend: "trust-mc".into(),
                 request_id: Some("7".into()),
                 proof_id: Some("42".into()),
-                native_id: Some("trust_ir-native-trust-wp-request-7-proof-42".into()),
+                native_id: Some("trust_ir-native-trust-mc-request-7-proof-42".into()),
                 status: trust_types::TransportProofStatus::Proved,
                 strength: Some(ProofStrength::deductive()),
                 evidence: Some(trust_types::ProofEvidence::from(ProofStrength::deductive())),
@@ -5201,8 +5296,8 @@ mod tests {
                 diagnostics: vec![trust_types::TransportEvidenceDiagnostic {
                     code: "suite.accepted".into(),
                     severity: trust_types::TransportEvidenceDiagnosticSeverity::Info,
-                    message: "trust-wp suite produced accepted proof evidence".into(),
-                    detail: Some("primary owner trust-wp@7".into()),
+                    message: "trust-mc suite produced accepted proof evidence".into(),
+                    detail: Some("primary owner trust-mc@7".into()),
                 }],
             }),
             monitor: None,
@@ -5409,7 +5504,7 @@ mod tests {
 
     fn hardened_transport_result_with_context() -> VerificationResult {
         let owner = "crate::paths::render:hardened0";
-        let native_id = "trust_ir-native-trust-wp-request-8-proof-9";
+        let native_id = "trust_ir-native-trust-mc-request-8-proof-9";
         let input = bound_test_artifact(
             "NormalizedObligation",
             b"exact hardened normalized obligation",
@@ -5454,19 +5549,19 @@ mod tests {
                 col_end: 32,
             }),
             outcome: trust_types::Outcome::Proved,
-            solver: "trust-wp".into(),
+            solver: "trust-mc".into(),
             time_ms: 4,
             counterexample: None,
             counterexample_model: None,
             reason: None,
             design_mandate: false,
             native_trust_ir: Some(trust_types::TransportNativeTrustIrEvidence {
-                suite: "trust-wp".into(),
-                backend: "trust-wp".into(),
+                suite: "trust-mc".into(),
+                backend: "trust-mc".into(),
                 request_id: Some("8".into()),
-                native_id: Some("trust_ir-native-trust-wp-request-8-proof-9".into()),
+                native_id: Some("trust_ir-native-trust-mc-request-8-proof-9".into()),
                 present: true,
-                artifacts: native_trust_ir_shape_artifacts("trust-wp", "8", "9"),
+                artifacts: native_trust_ir_shape_artifacts("trust-mc", "8", "9"),
                 diagnostics: vec![trust_types::TransportEvidenceDiagnostic {
                     code: "unix.model_assumption".into(),
                     severity: trust_types::TransportEvidenceDiagnosticSeverity::Info,
@@ -5475,11 +5570,11 @@ mod tests {
                 }],
             }),
             proof_evidence: Some(trust_types::TransportProofEvidence {
-                suite: "trust-wp".into(),
-                backend: "trust-wp".into(),
+                suite: "trust-mc".into(),
+                backend: "trust-mc".into(),
                 request_id: Some("8".into()),
                 proof_id: Some("9".into()),
-                native_id: Some("trust_ir-native-trust-wp-request-8-proof-9".into()),
+                native_id: Some("trust_ir-native-trust-mc-request-8-proof-9".into()),
                 status: TransportProofStatus::Proved,
                 strength: Some(ProofStrength::deductive()),
                 evidence: Some(trust_types::ProofEvidence::from(ProofStrength::deductive())),
@@ -5538,20 +5633,20 @@ mod tests {
 
         assert_eq!(
             obligation.obligation_id.as_deref(),
-            Some("trust_ir-native-trust-wp-request-7-proof-42")
+            Some("trust_ir-native-trust-mc-request-7-proof-42")
         );
-        assert_eq!(obligation.solver, "trust-wp");
+        assert_eq!(obligation.solver, "trust-mc");
         assert_eq!(obligation.kind, "postcondition");
         assert_eq!(obligation.proof_level, trust_types::ProofLevel::L1Functional);
         assert_eq!(obligation.description, "postcondition");
         let evidence = obligation.proof_evidence.as_ref().expect("full verifier evidence");
-        assert_eq!(evidence.suite.as_deref(), Some("trust-wp"));
-        assert_eq!(evidence.backend, "trust-wp");
+        assert_eq!(evidence.suite.as_deref(), Some("trust-mc"));
+        assert_eq!(evidence.backend, "trust-mc");
         assert_eq!(evidence.request_id.as_deref(), Some("7"));
         assert_eq!(evidence.proof_id.as_deref(), Some("42"));
         assert_eq!(
             evidence.native_id.as_deref(),
-            Some("trust_ir-native-trust-wp-request-7-proof-42")
+            Some("trust_ir-native-trust-mc-request-7-proof-42")
         );
         assert_eq!(evidence.status, Some(TransportProofStatus::Proved));
         assert_eq!(evidence.strength, ProofStrength::deductive());
@@ -5565,7 +5660,7 @@ mod tests {
         );
         match &evidence.provenance {
             ObligationEvidenceProvenanceReport::NativeBackend { verifier } => {
-                assert_eq!(verifier, "trust-wp");
+                assert_eq!(verifier, "trust-mc");
             }
             other => panic!("unexpected provenance: {other:?}"),
         }
@@ -5579,13 +5674,13 @@ mod tests {
         let json = serde_json::to_value(&trust_report).expect("serialize trust report");
         assert_eq!(
             json["functions"][0]["obligations"][0]["obligation_id"],
-            "trust_ir-native-trust-wp-request-7-proof-42"
+            "trust_ir-native-trust-mc-request-7-proof-42"
         );
         assert_eq!(
             json["functions"][0]["obligations"][0]["proof_evidence"]["strength"]["reasoning"],
             "Deductive"
         );
-        assert_eq!(json["functions"][0]["obligations"][0]["proof_evidence"]["suite"], "trust-wp");
+        assert_eq!(json["functions"][0]["obligations"][0]["proof_evidence"]["suite"], "trust-mc");
         assert_eq!(json["functions"][0]["obligations"][0]["proof_evidence"]["status"], "proved");
         assert_eq!(
             json["functions"][0]["obligations"][0]["proof_evidence"]["native_trust_ir"]["request_id"],
@@ -6463,7 +6558,7 @@ mod tests {
 
     #[test]
     fn publishable_native_proof_ignores_unmaterialized_legacy_structural_descriptors() {
-        for suite in ["trust-mc", "trust-wp"] {
+        for suite in ["trust-mc", "trust-vc"] {
             let mut transport = native_transport_for_suite(suite);
             if let Some(proof) = transport.proof_evidence.as_mut() {
                 proof.artifacts.push(trust_types::TransportEvidenceArtifact {
@@ -6497,7 +6592,7 @@ mod tests {
         // proof artifacts (solver transcript / certificate / check / replay)
         // must remain sha256, even though structural artifacts may use
         // trust_ir-stable-v1. This is the soundness guardrail on the relaxation.
-        for suite in ["trust-mc", "trust-wp"] {
+        for suite in ["trust-mc", "trust-vc"] {
             let mut transport = native_transport_for_suite(suite);
             if let Some(proof) = transport.proof_evidence.as_mut() {
                 for artifact in proof.artifacts.iter_mut() {
@@ -6520,7 +6615,7 @@ mod tests {
 
     #[test]
     fn publishable_native_proof_requires_transcript_and_replay_or_check_artifacts() {
-        for suite in ["trust-mc", "trust-wp"] {
+        for suite in ["trust-mc", "trust-vc"] {
             let transport = native_transport_for_suite(suite);
             assert!(
                 promoted_proof_evidence_for_transport(transport).is_some(),
@@ -6548,6 +6643,18 @@ mod tests {
             }
             assert!(promoted_proof_evidence_for_transport(unchecked_label).is_none(), "{suite}");
         }
+    }
+
+    #[test]
+    fn historical_trust_wp_transport_is_never_publication_grade() {
+        let transport = native_transport_for_suite("trust-wp");
+        assert_eq!(transport.outcome, trust_types::Outcome::Proved);
+        assert!(transport.native_trust_ir.as_ref().is_some_and(|native| native.present));
+        assert!(transport.proof_evidence.is_some());
+        assert!(
+            promoted_proof_evidence_for_transport(transport).is_none(),
+            "a structurally valid historical TrustWP row must remain decodable without reviving publication authority"
+        );
     }
 
     #[test]
@@ -6932,7 +7039,7 @@ mod tests {
         assert_eq!(evidence.proof_id.as_deref(), Some("9"));
         assert_eq!(
             evidence.native_id.as_deref(),
-            Some("trust_ir-native-trust-wp-request-8-proof-9")
+            Some("trust_ir-native-trust-mc-request-8-proof-9")
         );
         assert_eq!(evidence.strength, ProofStrength::deductive());
         assert!(!evidence.artifacts.is_empty());
@@ -7043,6 +7150,256 @@ mod tests {
         assert_eq!(inventory_proof.proof_evidence_id.as_deref(), Some(raw_id.as_str()));
         let inventory_entry_id = format!("hardened-proof-evidence:{raw_id}");
         assert_eq!(inventory_proof.id.as_deref(), Some(inventory_entry_id.as_str()));
+    }
+
+    // ---- Trust (#220): the publication boundary, and the fate `--json` cannot show.
+
+    fn publication_probe_span() -> SourceSpan {
+        SourceSpan {
+            file: "src/probe.rs".into(),
+            line_start: 41,
+            col_start: 9,
+            line_end: 41,
+            col_end: 20,
+        }
+    }
+
+    /// A per-statement bounds VC that PUBLISHES: it carries the content-addressed
+    /// clean-CIC kernel artifact `authenticated_proved_row_has_publication_evidence`
+    /// demands, so publication normalization leaves it `Proved`.
+    fn publishing_bounds_sibling() -> VerificationResult {
+        let mut transport = clean_cic_hardened_transport();
+        transport.obligation_id = Some("vc:crate::probe:bounds_check:0".into());
+        transport.kind = "bounds".into();
+        transport.description = "slice bounds check".into();
+        transport.location = Some(publication_probe_span());
+        transport_to_verification_result("crate::probe", &transport)
+    }
+
+    /// The hardened `mir_assert::BoundsCheck` twin at the SAME span. The compiler
+    /// reported it `Proved` (an `ay-in-process` decision), but it carries no
+    /// kernel or native evidence, so publication demotes it.
+    fn evidence_free_bounds_twin(outcome: trust_types::Outcome) -> VerificationResult {
+        let transport = trust_types::TransportObligationResult {
+            obligation_id: Some("vc:crate::probe:panic_boundary:0".into()),
+            claim_digest_sha256: Some("d".repeat(64)),
+            kind: "hardened_panic_boundary".into(),
+            typed_kind: None,
+            description: "hardened boundary (panic_boundary): mir_assert::BoundsCheck: MIR \
+                          bounds assert can panic"
+                .into(),
+            location: Some(publication_probe_span()),
+            outcome,
+            solver: "ay-in-process".into(),
+            time_ms: 2,
+            counterexample: None,
+            counterexample_model: None,
+            reason: None,
+            design_mandate: false,
+            native_trust_ir: None,
+            proof_evidence: None,
+            monitor: None,
+        };
+        transport_to_verification_result("crate::probe", &transport)
+    }
+
+    /// THE CRUX of #220. A favorable compiler row has two possible fates at the
+    /// publication boundary, and they are not equally visible:
+    ///
+    ///   * relabelled — stays in the vector as `Unknown` carrying the verbatim
+    ///     demotion reason, which `--json` shows and a reader can grep;
+    ///   * DELETED — demotion runs before `elide_rows_proved_only_by`, so a
+    ///     demoted hardened twin whose direct sibling published is removed
+    ///     outright. No row, no id, no reason survives anywhere.
+    ///
+    /// Counting the demotion marker therefore UNDER-reports, and an
+    /// under-reporting disclosure is worse than none because it reads as
+    /// complete. This test pins the second fate: it asserts the row is gone AND
+    /// that the boundary record is the only surviving evidence of it.
+    #[test]
+    fn a_demoted_hardened_twin_is_deleted_outright_when_its_sibling_publishes() {
+        let mut results = vec![publishing_bounds_sibling(), evidence_free_bounds_twin(
+            trust_types::Outcome::Proved,
+        )];
+        assert!(
+            results.iter().all(|result| result.outcome.is_proved()),
+            "premise: BOTH rows leave the compiler with a favorable outcome"
+        );
+
+        let boundary =
+            crate::types::normalize_authenticated_results_for_publication(&mut results, None);
+
+        assert_eq!(results.len(), 1, "the hardened twin must be gone, not merely relabelled");
+        assert_eq!(results[0].kind, "bounds");
+        assert!(results[0].outcome.is_proved(), "the kernel-certified sibling publishes");
+        assert!(
+            !results.iter().any(|result| result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("downgraded before publication"))),
+            "the deleted row leaves NO demotion reason behind — this is exactly why counting \
+             the marker text under-reports"
+        );
+
+        assert_eq!(boundary.compiler_favorable, 2);
+        assert_eq!(boundary.published_favorable, 1);
+        assert_eq!(boundary.withheld(), 1);
+        assert_eq!(
+            boundary.withheld_elided, 1,
+            "the withheld row must be attributed to the DELETED fate"
+        );
+        assert_eq!(boundary.withheld_relabelled, 0);
+        assert_eq!(boundary.alias_elided, 0);
+        assert_eq!(boundary.unattributed_withheld(), 0);
+    }
+
+    /// Controls for the test above, each isolating one premise of the deletion.
+    #[test]
+    fn a_demoted_hardened_twin_stays_visible_when_its_sibling_does_not_publish() {
+        // Same pair, except the direct sibling carries no publishable evidence
+        // either. It is demoted too, so it cannot subsume, so nothing is deleted
+        // and BOTH withheld rows are recoverable from the published vector.
+        let mut sibling = publishing_bounds_sibling();
+        let mut evidence =
+            crate::types::structured_transport_evidence(&sibling).expect("structured row");
+        evidence.proof_evidence = None;
+        crate::types::replace_structured_transport_evidence(&mut sibling, &evidence)
+            .expect("re-encode structured evidence");
+
+        let mut results = vec![sibling, evidence_free_bounds_twin(trust_types::Outcome::Proved)];
+        let boundary =
+            crate::types::normalize_authenticated_results_for_publication(&mut results, None);
+
+        assert_eq!(results.len(), 2, "with no publishing sibling, nothing is elided");
+        assert_eq!(boundary.compiler_favorable, 2);
+        assert_eq!(boundary.published_favorable, 0);
+        assert_eq!(boundary.withheld(), 2);
+        assert_eq!(boundary.withheld_relabelled, 2);
+        assert_eq!(boundary.withheld_elided, 0);
+        assert_eq!(boundary.unattributed_withheld(), 0);
+    }
+
+    /// A twin the COMPILER already reported `Unknown` is elided by the same
+    /// retain predicate, but it is not a withheld proof — it is the pass's
+    /// pre-existing redundant-alias removal. Keeping the two apart is what makes
+    /// the disclosed split meaningful rather than a restatement of `results.len()`.
+    #[test]
+    fn an_unknown_twin_elided_as_an_alias_is_not_counted_as_withheld() {
+        let mut results = vec![publishing_bounds_sibling(), evidence_free_bounds_twin(
+            trust_types::Outcome::Unknown,
+        )];
+        let boundary =
+            crate::types::normalize_authenticated_results_for_publication(&mut results, None);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(boundary.compiler_favorable, 1);
+        assert_eq!(boundary.published_favorable, 1);
+        assert_eq!(boundary.withheld(), 0);
+        assert_eq!(boundary.withheld_elided, 0);
+        assert_eq!(boundary.alias_elided, 1);
+    }
+
+    /// Conservation. `compiler_favorable` must equal the published favorable rows
+    /// plus BOTH withheld fates, over a vector that exercises every branch at
+    /// once: a publishing row, a demoted-and-deleted row, a demoted-but-visible
+    /// row, and a zero-obligation inventory row (which is inventory, not an
+    /// obligation, and must not enter the withheld arithmetic at all).
+    #[test]
+    fn publication_boundary_conservation_holds_across_both_fates() {
+        let mut lone_demotion = evidence_free_bounds_twin(trust_types::Outcome::Proved);
+        // A different function, so it has no sibling to be subsumed by and stays
+        // in the vector as a relabelled Unknown.
+        lone_demotion.function = "crate::other".into();
+
+        let mut results = vec![
+            publishing_bounds_sibling(),
+            evidence_free_bounds_twin(trust_types::Outcome::Proved),
+            lone_demotion,
+            VerificationResult {
+                function: "crate::empty".into(),
+                kind: "no_obligations".into(),
+                message: "function has no panic obligations (trivially panic-free)".into(),
+                outcome: VerificationOutcome::Proved,
+                backend: "trust-structural".into(),
+                time_ms: Some(0),
+                location: None,
+                counterexample: None,
+                reason: Some("verified: zero panic obligations".into()),
+                raw_line: String::new(),
+            },
+        ];
+
+        let boundary =
+            crate::types::normalize_authenticated_results_for_publication(&mut results, None);
+
+        assert_eq!(boundary.inventory_elided, 1, "inventory is removed before any counting");
+        assert_eq!(boundary.compiler_favorable, 3, "and never counted as an obligation");
+        assert_eq!(boundary.published_favorable, 1);
+        assert_eq!(boundary.withheld_relabelled, 1);
+        assert_eq!(boundary.withheld_elided, 1);
+        assert_eq!(
+            boundary.compiler_favorable,
+            boundary.published_favorable
+                + boundary.withheld_relabelled
+                + boundary.withheld_elided,
+            "conservation: every favorable compiler row is published, relabelled, or deleted"
+        );
+        assert_eq!(boundary.unattributed_withheld(), 0);
+    }
+
+    /// The ticket itself: the human terminal used to say NOTHING about any of
+    /// this. `terminal_result_line` renders label/kind/message/location/solver/
+    /// time and never `reason`, and `Summary:` has no withheld bucket — so a
+    /// demoted row read exactly like a solver `unknown`, and a deleted one like
+    /// an obligation that never existed.
+    #[test]
+    fn the_terminal_report_discloses_the_publication_boundary() {
+        let mut results = vec![publishing_bounds_sibling(), evidence_free_bounds_twin(
+            trust_types::Outcome::Proved,
+        )];
+        let boundary =
+            crate::types::normalize_authenticated_results_for_publication(&mut results, None);
+        let mut report = report_with_results_and_diagnostics(results, Vec::new());
+        report.publication_boundary = Some(boundary);
+
+        let rendered = report.terminal_lines().join("\n");
+        assert!(
+            rendered.contains("Publication boundary:"),
+            "the terminal must name the boundary at all; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("2 obligation(s) passed the compiler")
+                && rendered.contains("1 published")
+                && rendered.contains("1 WITHHELD"),
+            "the terminal must report compiler-passed vs published and the delta; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("1 deleted as a redundant alias"),
+            "the DELETED fate is the one no other view can show, so it must be named \
+             explicitly; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("0 relabelled unknown"),
+            "and the split must be stated even when one side is zero; got:\n{rendered}"
+        );
+    }
+
+    /// A report that never went through a publication pass says so rather than
+    /// printing a zero: "0 withheld" and "not measured" are different claims.
+    #[test]
+    fn an_unmeasured_publication_boundary_is_disclosed_as_unmeasured() {
+        let report =
+            report_with_results_and_diagnostics(vec![publishing_bounds_sibling()], Vec::new());
+        assert_eq!(report.publication_boundary, None);
+        let rendered = report.terminal_lines().join("\n");
+        assert!(
+            rendered.contains("Publication boundary: not measured"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("0 withheld"),
+            "an unmeasured boundary must never render as a clean zero; got:\n{rendered}"
+        );
     }
 
     #[test]

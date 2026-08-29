@@ -32,11 +32,10 @@ use trust_disasm::Instruction;
 use trust_disasm::operand::{Operand, RegKind};
 use trust_types::{Formula, RoundingMode};
 
+use super::{Aarch64Semantics, condition_to_formula, extract_condition, pc_advance};
 use crate::effect::Effect;
 use crate::error::SemError;
 use crate::state::MachineState;
-
-use super::{Aarch64Semantics, condition_to_formula, extract_condition, pc_advance};
 
 impl Aarch64Semantics {
     // -------------------------------------------------------------------
@@ -147,8 +146,8 @@ impl Aarch64Semantics {
         build: impl FnOnce(FpFormat, Formula, Formula) -> Formula,
     ) -> Result<Vec<Effect>, SemError> {
         let (dst_idx, width) = extract_fp_dst(insn)?;
-        let fmt = FpFormat::for_width(width).ok_or_else(|| {
-            SemError::UnsupportedAarch64ProofBlocker {
+        let fmt =
+            FpFormat::for_width(width).ok_or_else(|| SemError::UnsupportedAarch64ProofBlocker {
                 opcode: insn.opcode,
                 category: "fp-scalar-width",
                 detail: format!(
@@ -156,8 +155,7 @@ impl Aarch64Semantics {
                      (S-lane, width 32) and f64 (D-lane, width 64); width {width} \
                      (f16) unsupported"
                 ),
-            }
-        })?;
+            })?;
         let fn_bv = read_fp_operand(state, insn, 1, width)?;
         let fm_bv = read_fp_operand(state, insn, 2, width)?;
         let result = build(fmt, fn_bv, fm_bv);
@@ -215,19 +213,16 @@ impl Aarch64Semantics {
         //   Z = fp.eq            (false when unordered, as required)
         //   C = NOT fp.lt        (true for eq, gt, AND unordered)
         //   V = isNaN(a) OR isNaN(b)
-        let (eb, sb) = FpFormat::for_width(width)
-            .ok_or(SemError::UnsupportedOpcode(insn.opcode))?
-            .eb_sb();
+        let (eb, sb) =
+            FpFormat::for_width(width).ok_or(SemError::UnsupportedOpcode(insn.opcode))?.eb_sb();
         let fp_a = Formula::FpFromBits { bits: Box::new(fn_val), eb, sb };
         let fp_b = Formula::FpFromBits { bits: Box::new(fm_val), eb, sb };
         let lt = Formula::FpLt(Box::new(fp_a.clone()), Box::new(fp_b.clone()));
         let n = lt.clone();
         let z = Formula::FpEq(Box::new(fp_a.clone()), Box::new(fp_b.clone()));
         let c = Formula::Not(Box::new(lt));
-        let v = Formula::Or(vec![
-            Formula::FpIsNaN(Box::new(fp_a)),
-            Formula::FpIsNaN(Box::new(fp_b)),
-        ]);
+        let v =
+            Formula::Or(vec![Formula::FpIsNaN(Box::new(fp_a)), Formula::FpIsNaN(Box::new(fp_b))]);
 
         let mut effects = vec![Effect::FlagUpdate { n, z, c, v }];
         effects.push(pc_advance(state, insn));
@@ -407,9 +402,8 @@ impl Aarch64Semantics {
     ) -> Result<Vec<Effect>, SemError> {
         let (dst_idx, width) = extract_fp_dst(insn)?;
         let fn_val = read_fp_operand(state, insn, 1, width)?;
-        let (eb, sb) = FpFormat::for_width(width)
-            .ok_or(SemError::UnsupportedOpcode(insn.opcode))?
-            .eb_sb();
+        let (eb, sb) =
+            FpFormat::for_width(width).ok_or(SemError::UnsupportedOpcode(insn.opcode))?.eb_sb();
 
         let result = Formula::FpToIeeeBv(Box::new(Formula::FpSqrt(
             Box::new(Formula::FpRoundingMode(trust_types::RoundingMode::RNE)),
@@ -482,9 +476,8 @@ impl Aarch64Semantics {
 
         let dst_width = u32::from(dst.width);
         let src_width = u32::from(src.width);
-        let (eb, sb) = FpFormat::for_width(src_width)
-            .ok_or(SemError::UnsupportedOpcode(insn.opcode))?
-            .eb_sb();
+        let (eb, sb) =
+            FpFormat::for_width(src_width).ok_or(SemError::UnsupportedOpcode(insn.opcode))?.eb_sb();
         let src_val = state.read_fpr(src.index, src_width);
 
         let rm = Box::new(Formula::FpRoundingMode(trust_types::RoundingMode::RTZ));
@@ -555,9 +548,8 @@ impl Aarch64Semantics {
 
         let dst_width = u32::from(dst.width);
         let src_width = u32::from(src.width);
-        let (eb, sb) = FpFormat::for_width(dst_width)
-            .ok_or(SemError::UnsupportedOpcode(insn.opcode))?
-            .eb_sb();
+        let (eb, sb) =
+            FpFormat::for_width(dst_width).ok_or(SemError::UnsupportedOpcode(insn.opcode))?.eb_sb();
         let src_val = state.read_gpr(src.index, src_width);
 
         let rm = Box::new(Formula::FpRoundingMode(trust_types::RoundingMode::RNE));
@@ -590,12 +582,10 @@ impl Aarch64Semantics {
         // diverged. `FpConvert` is SMT's `to_fp` between formats: NaN
         // propagates, overflow goes to infinity, rounding is RNE — exactly
         // FCVT's behaviour with FPCR at its default.
-        let (src_eb, src_sb) = FpFormat::for_width(src_width)
-            .ok_or(SemError::UnsupportedOpcode(insn.opcode))?
-            .eb_sb();
-        let (dst_eb, dst_sb) = FpFormat::for_width(dst_width)
-            .ok_or(SemError::UnsupportedOpcode(insn.opcode))?
-            .eb_sb();
+        let (src_eb, src_sb) =
+            FpFormat::for_width(src_width).ok_or(SemError::UnsupportedOpcode(insn.opcode))?.eb_sb();
+        let (dst_eb, dst_sb) =
+            FpFormat::for_width(dst_width).ok_or(SemError::UnsupportedOpcode(insn.opcode))?.eb_sb();
         let value = Formula::FpToIeeeBv(Box::new(Formula::FpConvert {
             rm: Box::new(Formula::FpRoundingMode(trust_types::RoundingMode::RNE)),
             value: Box::new(Formula::FpFromBits {
@@ -804,7 +794,8 @@ fn expand_fp_imm8(imm8: u64, width: u32) -> Formula {
         // E=8, F=23: exponent bits 30..23, fraction bits 22..0.
         32 => {
             let sign = a << 31;
-            let exp = ((!b & 1) << 30) | (if b == 1 { 0x1F << 25 } else { 0 }) | (c << 24) | (d << 23);
+            let exp =
+                ((!b & 1) << 30) | (if b == 1 { 0x1F << 25 } else { 0 }) | (c << 24) | (d << 23);
             let frac = efgh << 19;
             (sign | exp | frac) as i128
         }
@@ -821,7 +812,8 @@ fn expand_fp_imm8(imm8: u64, width: u32) -> Formula {
         // expansion of anything.
         16 => {
             let sign = a << 15;
-            let exp = ((!b & 1) << 14) | (if b == 1 { 0b11 << 12 } else { 0 }) | (c << 11) | (d << 10);
+            let exp =
+                ((!b & 1) << 14) | (if b == 1 { 0b11 << 12 } else { 0 }) | (c << 11) | (d << 10);
             let frac = efgh << 6;
             (sign | exp | frac) as i128
         }
@@ -833,12 +825,13 @@ fn expand_fp_imm8(imm8: u64, width: u32) -> Formula {
 
 #[cfg(test)]
 mod fp_semantics_tests {
+    use trust_disasm::decode_aarch64;
+
     use super::*;
+    use crate::Aarch64Semantics;
     use crate::concrete::ConcreteState;
     use crate::semantics::Semantics;
-    use crate::Aarch64Semantics;
     use crate::state::MachineState;
-    use trust_disasm::decode_aarch64;
 
     /// VFPExpandImm against hardware-known constants (ARM DDI 0487).
     ///
@@ -951,17 +944,17 @@ mod fp_semantics_tests {
 
 #[cfg(test)]
 mod fp_conversion_tests {
+    use trust_disasm::decode_aarch64;
+
     use super::*;
+    use crate::Aarch64Semantics;
     use crate::concrete::ConcreteState;
     use crate::semantics::Semantics;
     use crate::state::MachineState;
-    use crate::Aarch64Semantics;
-    use trust_disasm::decode_aarch64;
 
     fn run_to_gpr(word: u32, fpr: (u8, u32, u64)) -> u128 {
         let insn = decode_aarch64(&word.to_le_bytes(), 0x1000).expect("decodes");
-        let effects =
-            Aarch64Semantics.effects(&MachineState::symbolic(), &insn).expect("models");
+        let effects = Aarch64Semantics.effects(&MachineState::symbolic(), &insn).expect("models");
         let mut concrete = ConcreteState::new();
         concrete.write_fpr(fpr.0, fpr.1, u128::from(fpr.2)).unwrap();
         let value = effects
@@ -983,8 +976,7 @@ mod fp_conversion_tests {
 
     fn run_to_fpr(word: u32, gpr: (u8, u32, u64)) -> u128 {
         let insn = decode_aarch64(&word.to_le_bytes(), 0x1000).expect("decodes");
-        let effects =
-            Aarch64Semantics.effects(&MachineState::symbolic(), &insn).expect("models");
+        let effects = Aarch64Semantics.effects(&MachineState::symbolic(), &insn).expect("models");
         let mut concrete = ConcreteState::new();
         concrete.write_gpr(gpr.0, gpr.1, u128::from(gpr.2)).unwrap();
         let value = effects
@@ -1084,8 +1076,9 @@ mod fp_conversion_tests {
 
 #[cfg(test)]
 mod fp_format_tests {
-    use super::FpFormat;
     use trust_types::Formula;
+
+    use super::FpFormat;
 
     #[test]
     fn for_width_maps_f32_and_f64_and_rejects_f16() {

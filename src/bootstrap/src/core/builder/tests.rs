@@ -2294,7 +2294,6 @@ mod snapshot {
         [test] compiletest-rustdoc-html 2 <host>
         [test] compiletest-coverage-run-rustdoc 2 <host>
         [test] compiletest-pretty 2 <host>
-        [build] rustc 2 <host> -> std 2 <host>
         [build] rustc 1 <host> -> std 1 <host>
         [build] rustdoc 1 <host>
         [test] rustc 1 <host> -> CrateLibrustc 2 <host>

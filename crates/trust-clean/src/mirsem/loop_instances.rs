@@ -15,7 +15,10 @@ use super::*;
 /// the hypothesis `hI` itself. `claimed_local` builds the proof against the SAME
 /// `λ e hI _. hI` shape but for a possibly-WRONG local; the kernel rejects when that
 /// local IS assigned (the def-eq reduction no longer collapses to `I e`).
-pub(super) fn loop_instance_preservation_proof(lf: &SemLoopFunction, claimed_local: Option<u64>) -> Expr {
+pub(super) fn loop_instance_preservation_proof(
+    lf: &SemLoopFunction,
+    claimed_local: Option<u64>,
+) -> Expr {
     // SYNTHESIZED invariant: a GENUINE arithmetic preservation proof (NOT `hI`).
     match &lf.synth_inv {
         Some(SynthInvariant::CounterGeConst { i_idx, c }) => {
@@ -112,7 +115,11 @@ pub(super) fn loop_instance_preservation_proof(lf: &SemLoopFunction, claimed_loc
 /// inferrer only proposes the ACTUAL inferred bound, and (b) the
 /// `wrong_synth_invariant_*` test confirms a non-preserved synthesized invariant
 /// (one whose `Int.le_self_add_one` chain does not retype) is KernelRejected.
-pub(super) fn counter_ge_const_preservation_proof(lf: &SemLoopFunction, i_idx: u64, c: i128) -> Expr {
+pub(super) fn counter_ge_const_preservation_proof(
+    lf: &SemLoopFunction,
+    i_idx: u64,
+    c: i128,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(None);
     let cond_expr = lf.cond.to_cond_expr();
@@ -159,7 +166,11 @@ pub(super) fn counter_ge_const_preservation_proof(lf: &SemLoopFunction, i_idx: u
 /// non-`Lt` guard makes `eval_cond` not reduce to a `decide (Int.lt …)`, so
 /// `of_decide_eq_true` does not apply ⇒ KernelRejected. See the `wrong_synth_upper_*`
 /// tests.
-pub(super) fn counter_le_bound_preservation_proof(lf: &SemLoopFunction, i_idx: u64, bound_idx: u64) -> Expr {
+pub(super) fn counter_le_bound_preservation_proof(
+    lf: &SemLoopFunction,
+    i_idx: u64,
+    bound_idx: u64,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(None);
     let cond_expr = lf.cond.to_cond_expr();
@@ -586,7 +597,11 @@ pub(super) fn cond_update_ge_const_preservation_proof(
 /// guard — kept only so the proof has the EXACT preservation type). FAIL-CLOSED: a WRONG
 /// `c` makes the TRUE-arm's `Int.le_trans` chain not retype against the reduced codomain
 /// ⇒ ill-typed ⇒ KernelRejected.
-pub(super) fn cond_incr_ge_const_preservation_proof(lf: &SemLoopFunction, count_idx: u64, c: i128) -> Expr {
+pub(super) fn cond_incr_ge_const_preservation_proof(
+    lf: &SemLoopFunction,
+    count_idx: u64,
+    c: i128,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(None);
     let cond_expr = lf.cond.to_cond_expr(); // the OUTER loop guard `i < n`.
@@ -755,7 +770,11 @@ pub(super) fn counter_in_range_succ_preservation_proof(
 /// false at the terminal `i = 0`) has codomain `Int.le c (i-1)` that `countdownGe0` (which
 /// proves only `0 ≤ i-1`) does not retype against ⇒ KernelRejected; an INCREMENT body has
 /// codomain `Int.le 0 (i+1)` ≠ `Int.le 0 (i-1)` ⇒ KernelRejected.
-pub(super) fn countdown_ge_const_preservation_proof(lf: &SemLoopFunction, i_idx: u64, c: i128) -> Expr {
+pub(super) fn countdown_ge_const_preservation_proof(
+    lf: &SemLoopFunction,
+    i_idx: u64,
+    c: i128,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(None);
     let cond_expr = lf.cond.to_cond_expr();
@@ -788,7 +807,12 @@ pub(super) fn countdown_ge_const_preservation_proof(lf: &SemLoopFunction, i_idx:
 /// `Int.le_self_add_one`). FAIL-CLOSED: a DECREMENT body's codomain `Int.le c (i-k)` ≠
 /// `Int.le c (i+k)` ⇒ KernelRejected; `strideSelfLe` is built per-`k` and only type-checks
 /// for the ACTUAL stride.
-pub(super) fn stride_ge_const_preservation_proof(lf: &SemLoopFunction, i_idx: u64, c: i128, k: i128) -> Expr {
+pub(super) fn stride_ge_const_preservation_proof(
+    lf: &SemLoopFunction,
+    i_idx: u64,
+    c: i128,
+    k: i128,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(None);
     let cond_expr = lf.cond.to_cond_expr();
@@ -816,7 +840,10 @@ pub(super) fn stride_ge_const_preservation_proof(lf: &SemLoopFunction, i_idx: u6
 /// preservation proof into `loopInvariantRule` (the application carries the type
 /// implicitly), so this standalone builder is test-only.
 #[cfg(test)]
-pub(super) fn loop_instance_preservation_type(lf: &SemLoopFunction, claimed_local: Option<u64>) -> Expr {
+pub(super) fn loop_instance_preservation_type(
+    lf: &SemLoopFunction,
+    claimed_local: Option<u64>,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(claimed_local);
     let cond_expr = lf.cond.to_cond_expr();
@@ -840,7 +867,10 @@ pub(super) fn loop_instance_preservation_type(lf: &SemLoopFunction, claimed_loca
 /// loop-carried invariant maintained for an ARBITRARY iteration count `n` — the
 /// per-function instance the certificate kernel-checks. `claimed_local` overrides the
 /// invariant local (fail-closed hook).
-pub(super) fn loop_instance_conclusion_type(lf: &SemLoopFunction, claimed_local: Option<u64>) -> Expr {
+pub(super) fn loop_instance_conclusion_type(
+    lf: &SemLoopFunction,
+    claimed_local: Option<u64>,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = lf.invariant_expr(claimed_local);
     let cond_expr = lf.cond.to_cond_expr();
@@ -1319,7 +1349,10 @@ pub(super) fn nested_inner_preservation_proof(nlf: &SemNestedLoopFunction, e_ref
 ///   proof       := Eq.trans … inner_keeps hI
 ///                  : Eq Int ((exec_loop …) t_idx) (int_lit t_const).
 /// `fuel_ref` is at the depth BEFORE the `λ e λ hI λ _hg` this builder introduces.
-pub(super) fn nested_outer_preservation_proof(nlf: &SemNestedLoopFunction, fuel_ref: &Expr) -> Expr {
+pub(super) fn nested_outer_preservation_proof(
+    nlf: &SemNestedLoopFunction,
+    fuel_ref: &Expr,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = nlf.invariant_expr();
     let cond_outer = nlf.cond_outer.to_cond_expr();
@@ -1515,7 +1548,10 @@ pub(super) fn monotone_inner_preservation_proof(mlf: &SemMonotoneNestedLoopFunct
 ///                  ≡ Int.le c ((exec_loop …) s_idx).
 /// `hI : I e ≡ Ir e` is fed DIRECTLY as the base (no `Eq.refl`/`Eq.trans` — `I` and `Ir`
 /// are the SAME predicate). `fuel_ref` is at the depth BEFORE `λ e λ hI λ _hg`.
-pub(super) fn monotone_outer_preservation_proof(mlf: &SemMonotoneNestedLoopFunction, fuel_ref: &Expr) -> Expr {
+pub(super) fn monotone_outer_preservation_proof(
+    mlf: &SemMonotoneNestedLoopFunction,
+    fuel_ref: &Expr,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let i_expr = mlf.invariant_expr();
     let cond_outer = mlf.cond_outer.to_cond_expr();

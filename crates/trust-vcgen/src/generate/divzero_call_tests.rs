@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Sort, SourceSpan,
-    Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::generate_vcs;
@@ -53,6 +52,7 @@ fn method_div_func(
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -92,6 +92,7 @@ fn step_by_func(step: Operand) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -138,8 +139,7 @@ fn checked_div_is_total_no_obligation() {
     // it must emit NO DivisionByZero obligation even when the divisor is a fully
     // unconstrained runtime value. (Regression pin for the false refutation of
     // `n.checked_div(&x).unwrap_or_else(BigUint::zero)`, which is panic-free.)
-    let func =
-        method_div_func("checked_div", Ty::u32(), Operand::Copy(Place::local(2)), vec![]);
+    let func = method_div_func("checked_div", Ty::u32(), Operand::Copy(Place::local(2)), vec![]);
     assert_eq!(
         divzero_vc_count(&func),
         0,
@@ -164,12 +164,8 @@ fn flags_unguarded_div_ceil() {
 fn allows_const_nonzero_div_ceil() {
     // `a.div_ceil(4)` — literal nonzero divisor is provably safe; no obligation
     // (drop-in: a guarded/const `div_ceil` still compiles).
-    let func = method_div_func(
-        "div_ceil",
-        Ty::u32(),
-        Operand::Constant(ConstValue::Uint(4, 32)),
-        vec![],
-    );
+    let func =
+        method_div_func("div_ceil", Ty::u32(), Operand::Constant(ConstValue::Uint(4, 32)), vec![]);
     assert_eq!(
         divzero_vc_count(&func),
         0,
@@ -181,8 +177,7 @@ fn allows_const_nonzero_div_ceil() {
 fn checked_rem_is_total_no_obligation() {
     // `a.checked_rem(b)` returns `None` on a zero divisor — it NEVER panics, so
     // it must emit NO RemainderByZero obligation. Total twin of `checked_div`.
-    let func =
-        method_div_func("checked_rem", Ty::u32(), Operand::Copy(Place::local(2)), vec![]);
+    let func = method_div_func("checked_rem", Ty::u32(), Operand::Copy(Place::local(2)), vec![]);
     assert_eq!(
         divzero_vc_count(&func),
         0,
@@ -230,8 +225,7 @@ fn allows_const_nonzero_step_by() {
 fn ignores_ordinary_call() {
     // An ordinary (non-division) method call must not produce any div-by-zero
     // obligation — the recognizer must not broadly fail-close on every Call.
-    let func =
-        method_div_func("wrapping_add", Ty::i32(), Operand::Copy(Place::local(2)), vec![]);
+    let func = method_div_func("wrapping_add", Ty::i32(), Operand::Copy(Place::local(2)), vec![]);
     assert_eq!(
         divzero_vc_count(&func),
         0,
@@ -267,8 +261,7 @@ fn precondition_b_nonzero_carries_into_div_euclid_vc() {
         Box::new(Formula::Var("b".into(), Sort::Int)),
         Box::new(Formula::Int(0)),
     )));
-    let func =
-        method_div_func("div_euclid", Ty::i32(), Operand::Copy(Place::local(2)), vec![pre]);
+    let func = method_div_func("div_euclid", Ty::i32(), Operand::Copy(Place::local(2)), vec![pre]);
     let vcs = generate_vcs(&func);
     let vc = vcs
         .iter()
@@ -319,15 +312,13 @@ fn dominating_nonzero_guard_carries_into_div_euclid_vc() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         func: "core::num::<impl i32>::div_euclid".to_string(),
-                        args: vec![
-                            Operand::Copy(Place::local(1)),
-                            Operand::Copy(Place::local(2)),
-                        ],
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },

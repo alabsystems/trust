@@ -242,86 +242,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::level::Level",
-              "variants": [
-                [
-                  "Zero",
-                  []
-                ],
-                [
-                  "Succ",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ],
-                [
-                  "Max",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ],
-                    [
-                      "1",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ],
-                [
-                  "IMax",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ],
-                    [
-                      "1",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ],
-                [
-                  "Param",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::name::Name",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": "l"
@@ -343,7 +264,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -591,6 +513,93 @@
             ]
           ]
         }
+      },
+      "datatype_defs": {
+        "clean_kernel::level::Level": {
+          "Datatype": {
+            "name": "clean_kernel::level::Level",
+            "variants": [
+              [
+                "Zero",
+                []
+              ],
+              [
+                "Succ",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ],
+              [
+                "Max",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ],
+              [
+                "IMax",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ],
+              [
+                "Param",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::name::Name",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ]
+            ]
+          }
+        }
       }
     },
     "contracts": [],
@@ -619,31 +628,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::Expr",
-              "variants": [
-                [
-                  "Expr",
-                  [
-                    [
-                      "kind",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ],
-                    [
-                      "meta",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::meta::ExprMeta",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": null
@@ -653,86 +638,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::level::Level",
-              "variants": [
-                [
-                  "Zero",
-                  []
-                ],
-                [
-                  "Succ",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ],
-                [
-                  "Max",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ],
-                    [
-                      "1",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ],
-                [
-                  "IMax",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ],
-                    [
-                      "1",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::level::Level",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ],
-                [
-                  "Param",
-                  [
-                    [
-                      "0",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::name::Name",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": "l"
@@ -755,7 +661,10 @@
               ],
               "variants": [],
               "disc_index_safe": false,
-              "faithful_enum_repr": null
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
             }
           },
           "name": "m"
@@ -1003,7 +912,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     [
@@ -1037,7 +947,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::Expr",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::Expr"
                       }
                     },
                     [
@@ -1073,31 +984,124 @@
       "return_ty": {
         "Datatype": {
           "name": "clean_kernel::expr::Expr",
-          "variants": [
-            [
-              "Expr",
+          "variants": []
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::Expr": {
+          "Datatype": {
+            "name": "clean_kernel::expr::Expr",
+            "variants": [
               [
+                "Expr",
                 [
-                  "kind",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": []
+                  [
+                    "kind",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variants": []
+                      }
                     }
-                  }
-                ],
-                [
-                  "meta",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::meta::ExprMeta",
-                      "variants": []
+                  ],
+                  [
+                    "meta",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::meta::ExprMeta",
+                        "variants": []
+                      }
                     }
-                  }
+                  ]
                 ]
               ]
             ]
-          ]
+          }
+        },
+        "clean_kernel::level::Level": {
+          "Datatype": {
+            "name": "clean_kernel::level::Level",
+            "variants": [
+              [
+                "Zero",
+                []
+              ],
+              [
+                "Succ",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ],
+              [
+                "Max",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ],
+              [
+                "IMax",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::level::Level",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ],
+              [
+                "Param",
+                [
+                  [
+                    "0",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::name::Name",
+                        "variants": []
+                      }
+                    }
+                  ]
+                ]
+              ]
+            ]
+          }
         }
       }
     },
@@ -1365,7 +1369,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::kind::ExprKind",
                         "variant": 8,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::kind::ExprKind"
                       }
                     },
                     []
@@ -1634,31 +1639,7 @@
           "ty": {
             "Datatype": {
               "name": "clean_kernel::expr::Expr",
-              "variants": [
-                [
-                  "Expr",
-                  [
-                    [
-                      "kind",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::kind::ExprKind",
-                          "variants": []
-                        }
-                      }
-                    ],
-                    [
-                      "meta",
-                      {
-                        "Datatype": {
-                          "name": "clean_kernel::expr::meta::ExprMeta",
-                          "variants": []
-                        }
-                      }
-                    ]
-                  ]
-                ]
-              ]
+              "variants": []
             }
           },
           "name": null
@@ -1907,7 +1888,10 @@
               ],
               "variants": [],
               "disc_index_safe": false,
-              "faithful_enum_repr": null
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
             }
           },
           "name": "m"
@@ -1929,7 +1913,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::Expr",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::Expr"
                       }
                     },
                     [
@@ -1965,31 +1950,39 @@
       "return_ty": {
         "Datatype": {
           "name": "clean_kernel::expr::Expr",
-          "variants": [
-            [
-              "Expr",
+          "variants": []
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::Expr": {
+          "Datatype": {
+            "name": "clean_kernel::expr::Expr",
+            "variants": [
               [
+                "Expr",
                 [
-                  "kind",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::kind::ExprKind",
-                      "variants": []
+                  [
+                    "kind",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::kind::ExprKind",
+                        "variants": []
+                      }
                     }
-                  }
-                ],
-                [
-                  "meta",
-                  {
-                    "Datatype": {
-                      "name": "clean_kernel::expr::meta::ExprMeta",
-                      "variants": []
+                  ],
+                  [
+                    "meta",
+                    {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::meta::ExprMeta",
+                        "variants": []
+                      }
                     }
-                  }
+                  ]
                 ]
               ]
             ]
-          ]
+          }
         }
       }
     },

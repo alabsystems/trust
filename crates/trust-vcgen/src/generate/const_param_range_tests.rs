@@ -61,7 +61,9 @@ fn usize_const_param_pinned_to_type_range() {
     assert_eq!(facts.len(), 2, "lower + upper bound; got {facts:?}");
     let rendered: Vec<String> = facts.iter().map(|f| format!("{f:?}")).collect();
     assert!(
-        rendered.iter().any(|s| s.contains("__trust_constparam_0_N") && s.contains("18446744073709551615")),
+        rendered
+            .iter()
+            .any(|s| s.contains("__trust_constparam_0_N") && s.contains("18446744073709551615")),
         "upper bound must be u64::MAX; got {rendered:?}"
     );
     assert!(

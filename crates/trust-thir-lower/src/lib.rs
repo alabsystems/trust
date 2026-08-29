@@ -79,6 +79,11 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use rustc_ast::LitKind;
+// Trust (wave-UD): the HIR-level capture-place projection kind. A closure CAPTURE place is a
+// `rustc_middle::hir::place::Place`, NOT a MIR place, so its projection alphabet lives here
+// (`compiler/rustc_middle/src/hir/place.rs:22`). Aliased to keep it distinct from every other
+// `ProjectionKind` in scope.
+use rustc_middle::hir::place::ProjectionKind as HirProjectionKind;
 use rustc_middle::middle::region;
 // Trust: the compound-assignment operator kind (`+=`, `/=`, …) carried by `ExprKind::AssignOp`;
 // `MirBinOp::from(op)` recovers the underlying binary op (the exact conversion rustc's own
@@ -89,11 +94,6 @@ use rustc_middle::thir::{
     ArmId, BodyTy, Expr, ExprId, ExprKind, LocalVarId, LogicalOp, Pat, PatKind, StmtId, StmtKind,
     Thir,
 };
-// Trust (wave-UD): the HIR-level capture-place projection kind. A closure CAPTURE place is a
-// `rustc_middle::hir::place::Place`, NOT a MIR place, so its projection alphabet lives here
-// (`compiler/rustc_middle/src/hir/place.rs:22`). Aliased to keep it distinct from every other
-// `ProjectionKind` in scope.
-use rustc_middle::hir::place::ProjectionKind as HirProjectionKind;
 // Trust: the array-to-slice unsizing coercion kind (`PointerCoercion::Unsize`) the slice fat-pointer
 // lowering matches on (the `ExprKind::PointerCoercion` arm).
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -116,7 +116,6 @@ use trust_ir::{
     CastOp,
     Constant,
     FCmpOp,
-    ScopeData,
     FuncId,
     FuncTy,
     FuncTyId,
@@ -126,11 +125,12 @@ use trust_ir::{
     ICmpOp,
     Inst,
     InstrNode,
-    SourceSpan,
-    SourceLoopProvenance,
     Linkage,
     Module,
     OverflowOp,
+    ScopeData,
+    SourceLoopProvenance,
+    SourceSpan,
     SwitchCase,
     Ty,
     UnOp,
@@ -138,10 +138,17 @@ use trust_ir::{
 };
 
 mod artifact_publication;
+// Trust (IR-1/IR-3, docs/design/2026-08-27-two-language-direct-to-trust-ir.md):
+// the Clean-origin append seam and the authored-contract disclosure. New
+// modules so the frozen `crate_module.rs` carries plumbing only.
+pub mod clean_origin_join;
+pub mod contract_disclosure;
 pub mod crate_module;
 pub mod differential;
 pub mod flip;
 pub mod flip_registry;
+pub mod instance_flip;
+pub mod instance_probe;
 pub mod lineage;
 pub mod mir_differential;
 pub mod remap_certificate;
@@ -979,12 +986,7 @@ fn or_alt_witness<'tcx>(
         let Some(mapped) = vfields.get(*field as usize).cloned() else {
             return Err("EnumMatch(or-pattern witness desync)");
         };
-        rows.push(OrAltBind {
-            var: *var,
-            mapped,
-            ground: *bind_ty,
-            by_ref: off.is_some(),
-        });
+        rows.push(OrAltBind { var: *var, mapped, ground: *bind_ty, by_ref: off.is_some() });
     }
     Ok(rows)
 }
@@ -1899,6 +1901,14 @@ pub(crate) fn param_lane_forces_not_interpretable(
 }
 
 /// A lowered `trust_ir::Module` plus the fail-closed coverage report (the migration ratchet).
+///
+/// Trust (wall A, instance flip seam): `Clone` exists so ONE lane can keep an intact hook-time
+/// `Lowered` alive past the hook — [`instance_flip`], whose per-INSTANCE differential must hand
+/// the FROZEN comparator (`mir_differential::compare_derived`) the real hook-time object rather
+/// than a reconstruction, so the comparator's own producer-coverage and pending-const gates read
+/// the producer's values and not values this crate minted. The clone is taken only for the
+/// wall-A population (generic `agreed` bodies), never per lowered body.
+#[derive(Clone)]
 pub struct Lowered {
     pub module: Module,
     /// Trust: fn body vs const/static initializer body (see [`BodyKind`]).
@@ -2409,6 +2419,25 @@ pub enum SiteTy {
     Tuple(Vec<SiteTy>),
     Array(Box<SiteTy>, u64),
     Slice(Box<SiteTy>),
+    /// Trust (wave-CRT): a REFERENCE `&'a T` / `&'a mut T`, encoded REGION-FREE — the pointee
+    /// plus the mutability, with the region dropped and rebuilt as `ReErased`.
+    ///
+    /// This is `SiteArg::ErasedRegion`'s argument one level deeper, and it is sound for the same
+    /// reason, not a new assumption: the differential's raw-call channel calls `erase_regions` on
+    /// BOTH sides before pinning callee identity (`mir_differential::raw_calls_in_dfs_order`), and
+    /// `erase_regions` is a DEEP traversal — it replaces regions wherever they occur, including
+    /// inside a `&'a T`. So a rebuilt `&'erased T` and the built MIR's `&'a T` are equal after the
+    /// erasure the comparator already performs. Two `FnDef`s differing ONLY in regions codegen
+    /// byte-identically, so admitting one cannot make a WRONG flip; a different pointee type or
+    /// mutability still differs after erasure and is still rejected.
+    ///
+    /// WHY IT WAS MISSING AND WHAT IT UNBLOCKS: wave-C's first slice took type args only and
+    /// wave-CR added top-level lifetime ARGS, but a lifetime *inside* a type kept the whole site
+    /// un-encodable. That is what made `<level::LevelArc as Deref>::deref` `derived_mir:
+    /// unsupported` — it calls `Option::<&Level>::expect`, whose site arg is `&Level`, a reference
+    /// — and therefore what made `level::Level::is_zero`'s reachable closure non-bodyful, the one
+    /// A0 criterion the crystal's designated target has never satisfied.
+    Ref(Box<SiteTy>, ty::Mutability),
 }
 
 /// Trust (wave-C): encode a site's `GenericArgs` (the raw `node_args`) to the lifetime-free form.
@@ -2485,6 +2514,11 @@ fn encode_ty<'tcx>(tcx: TyCtxt<'tcx>, t: ty::Ty<'tcx>) -> Option<SiteTy> {
             Some(SiteTy::Tuple(v))
         }
         ty::Slice(el) => Some(SiteTy::Slice(Box::new(encode_ty(tcx, *el)?))),
+        // Trust (wave-CRT): a reference encodes region-free — see `SiteTy::Ref`. The region is
+        // DROPPED here and rebuilt as `ReErased`; the comparator erases regions on both sides.
+        ty::Ref(_region, pointee, mutbl) => {
+            Some(SiteTy::Ref(Box::new(encode_ty(tcx, *pointee)?), *mutbl))
+        }
         ty::Array(el, len) => {
             let n = len.try_to_target_usize(tcx)?;
             Some(SiteTy::Array(Box::new(encode_ty(tcx, *el)?), n))
@@ -2599,6 +2633,17 @@ thread_local! {
     ///
     /// Thread-local, not global: rustc builds MIR on parallel worker threads and each owns its
     /// own query stack, so cross-thread entries would be both wrong and a false decline.
+    ///
+    /// NECESSARY, NOT SUFFICIENT — do not read this stack as the whole answer to the cycle class.
+    /// It sees only the defs the PRODUCER is lowering, and a query the producer issues can demand
+    /// `mir_built` for defs that were never on it. `eval_static_initializer(S)` is the measured
+    /// case: it demands `mir_borrowck(S)`, which descends into every closure inside S's
+    /// initializer, and it CTFE-calls const fns, each demanding its own `mir_built` — so the
+    /// re-entered frame may be `S::{closure#0}` (`core::task::wake`) or a module-level sibling of
+    /// S with no ancestry between them at all. Neither is on this stack when the demand is issued.
+    /// The completing rule for that call site is LOCALITY, at `lower_static_ref`; this stack stays
+    /// as the outer guard. Any future site that forces a CTFE-ish query from inside `mir_built`
+    /// needs its own argument — this stack will not supply one.
     static LOWERING_BODIES: std::cell::RefCell<Vec<rustc_span::def_id::DefId>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -2626,6 +2671,23 @@ impl Drop for LoweringBodyGuard {
 /// producer stack. Callers MUST decline rather than issue the query.
 fn would_reenter_lowering(def_id: rustc_span::def_id::DefId) -> bool {
     LOWERING_BODIES.with(|s| s.borrow().contains(&def_id))
+}
+
+/// Trust (LANE 1): enter the MIR-side oracle's CTFE FREEZE for the duration of one `mir_built`
+/// hook invocation. See [`trust_mir_extract::ctfe_reentrancy`] for the full rationale.
+///
+/// The `mir_built` hook does two things that reach the query system: it lowers THIR (this crate,
+/// whose own CTFE demands are gated per-lane on locality/deferral), and it extracts the MIR-side
+/// ORACLE through `trust-mir-extract` — a crate written for the VERIFIER, which runs at
+/// `optimized_mir` time where forcing CTFE is safe and load-bearing. That crate therefore cannot
+/// decide the question from what it is looking at; the answer depends on WHO called it. This is
+/// the seam that tells it, and it is entered at the hook rather than around each oracle call so a
+/// future oracle demand is covered by construction rather than by remembering.
+///
+/// Re-exported for `rustc_mir_build::builder::build_mir_inner_impl`, which is the only caller.
+#[must_use]
+pub fn enter_mir_built_ctfe_freeze() -> trust_mir_extract::ctfe_reentrancy::Freeze {
+    trust_mir_extract::ctfe_reentrancy::enter()
 }
 
 fn lower_module_inner<'tcx>(
@@ -2774,6 +2836,7 @@ fn lower_module_inner<'tcx>(
         // Trust (wave-25b): derived interior-pointer return allow-list (`&self.field` @ offset != 0).
         interior_ptrs: Vec::new(),
         promoted: Vec::new(),
+        promote_wanted: Vec::new(),
         promoted_slots: Vec::new(),
         promoted_tys: Vec::new(),
         mut_borrow_ptrs: Vec::new(),
@@ -2843,14 +2906,12 @@ fn lower_module_inner<'tcx>(
     // source loops fail the body closed before any flip can consume it.
     if !cx.source_loop_plans.is_empty() {
         let exact_loops = cx.source_loop_provenance.len() == cx.source_loop_plans.len()
-            && cx
-                .source_loop_provenance
-                .iter()
-                .zip(&cx.source_loop_plans)
-                .all(|(actual, expected)| {
+            && cx.source_loop_provenance.iter().zip(&cx.source_loop_plans).all(
+                |(actual, expected)| {
                     actual.source_loop_id == expected.source_loop_id
                         && actual.hir_local_id == expected.hir_local_id
-                });
+                },
+            );
         if !exact_loops {
             cx.unsupported.push(("body".to_string(), "SourceProvenance(loop mapping)"));
         } else if source_provenance::seal_source_provenance(
@@ -3021,7 +3082,7 @@ enum PointeeMeta {
 /// direct `*const dyn` arm has always failed closed rather than respell it thin.
 fn container_pointee_ty(meta: PointeeMeta) -> Option<Ty> {
     match meta {
-        PointeeMeta::Len => Some(Ty::Tuple(vec![Ty::Ptr, Ty::I64])),
+        PointeeMeta::Len => Some(Ty::FatPtr(trust_ir::FatPtrKind::ContainerLen)),
         PointeeMeta::Vtable => None,
         // Thin: genuinely an address. Unknown: keep the PRE-EXISTING spelling — a change of
         // spelling must rest on a determination, never on the absence of one.
@@ -3631,6 +3692,15 @@ struct LowerCx<'a, 'tcx> {
     /// appears in `locals` and is therefore automatically excluded from every SSA block-param merge
     /// (`if`/`match`/loop) — the memory model is its single source of truth.
     promoted: Vec<LocalVarId>,
+    /// Trust (wave-NB): locals whose promotion is WANTED opportunistically — a field of them is
+    /// borrowed or assigned somewhere (`&a.b` / `a.b = v` need a real address). Distinct from
+    /// `promoted` on purpose: a `&mut`-borrowed local MUST slot or fail closed (a write through
+    /// the pointer is otherwise lost), while a field-shape local may simply stay SSA when its
+    /// binding shape cannot slot (tuple destructure, non-snapshotable type) — every field
+    /// access then fails closed at its own site with its pre-wave tag, and every other consumer
+    /// behaves exactly pre-wave. A wanted local that DOES slot at its `let`/param joins
+    /// `promoted` at that moment and is memory-backed from then on.
+    promote_wanted: Vec<LocalVarId>,
     /// Trust: promoted local → its `Alloca` slot `ValueId` (a `Ty::Ptr`), recorded once when the local's
     /// `let`/param emits the slot. Reads/writes/`&mut` of the local resolve their slot here.
     promoted_slots: Vec<(LocalVarId, ValueId)>,
@@ -3703,7 +3773,13 @@ enum ReborrowTarget {
     /// `Deref{ e }` of a NON-borrow, `ty::Ref`-typed expr (a ref binding): the place's address
     /// IS `e`'s value — lower it and require a known borrow pointer.
     Ptr(ExprId),
-    /// A genuinely non-local place (`&a.b`, `&a[i]`, through a raw pointer) — fail closed.
+    /// Trust (wave-NB): a SINGLE-LEVEL field of a bare struct LOCAL (`&a.b` / `&mut a.b` where
+    /// `a` is a `VarRef` of `ty::Adt`-struct type). `base` is the Field's lhs ExprId (for the
+    /// struct rustc ty); `field` the source-declaration index. The Borrow arms route this to
+    /// [`LowerCx::lower_field_of_local_addr`], which fails closed unless the base local is
+    /// memory-PROMOTED with a registered all-scalar layout whose offset table agrees.
+    FieldOfLocal { var: LocalVarId, field: u32, base: ExprId },
+    /// A genuinely non-local place (`&a[i]`, nested `&a.b.c`, through a raw pointer) — fail closed.
     NotAPlace,
 }
 
@@ -3844,9 +3920,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let path = trust_mir_extract::faithful_principal_key(self.tcx, preds, &owner)?;
         let id = trust_ir::stable_trait_object_id(&path);
         match self.trait_object_ids.iter().find(|(existing_id, _)| *existing_id == id) {
-            Some((_, existing_path)) if *existing_path != path => {
-                Err("Ty(dyn trait-id collision)")
-            }
+            Some((_, existing_path)) if *existing_path != path => Err("Ty(dyn trait-id collision)"),
             Some(_) => Ok(id),
             None => {
                 self.trait_object_ids.push((id, path));
@@ -4109,9 +4183,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 let ty::Dynamic(preds, ..) = pointee.kind() else { unreachable!() };
                 match preds.principal_def_id() {
                     Some(_) => match self.trait_object_id(preds) {
-                        Ok(trait_id) => {
-                            Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id })
-                        }
+                        Ok(trait_id) => Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id }),
                         Err(tag) => {
                             self.unsupported.push((format!("{ty:?}"), tag));
                             Ty::Unit
@@ -4244,9 +4316,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // pair must stay uncompared rather than share a sentinel id).
                 ty::Dynamic(preds, ..) => match preds.principal_def_id() {
                     Some(_) => match self.trait_object_id(preds) {
-                        Ok(trait_id) => {
-                            Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id })
-                        }
+                        Ok(trait_id) => Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id }),
                         Err(tag) => {
                             self.unsupported.push((format!("{ty:?}"), tag));
                             Ty::Unit
@@ -4689,7 +4759,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // (`NonNull<Context>` → `Ty::Struct`), a NON-scalar the interpreter differential opacity
             // gate refuses → the body is forced `NotRun` BEFORE any signature comparison, so the
             // `Unit`-env producer sig vs the oracle's `Struct(zero-field)` coroutine-env sig is never
-            // compared → 0 new divergence. A non-async coroutine (`gen {}`, bare `#[coroutine] || {}`)
+            // compared → 0 new divergence.
+            //
+            // ^^^ THAT PREMISE IS NO LONGER TRUE, and the carve-out survives for a DIFFERENT
+            // reason. MEASURED 2026-08-21: the aggregate-param batch (b38db06a6d) admits struct
+            // params — including this `ResumeTy` — so these bodies DO now reach the signature
+            // comparison. 40 of them sit in `clean-skip-sig-incomparable`, and every one is
+            // `params[0] == Ty::Unit` against the oracle's zero-field `coroutine::{name}` struct.
+            //
+            // The ONLY thing standing between that and 40 manufactured `signature divergence`
+            // rows — against a gate that says divergences 0 — is the G0 spelling-split quarantine
+            // in `differential.rs`, which exists for an UNRELATED reason (nested enum provenance)
+            // and happens to catch the `Unit`/`Struct` shape on its way past.
+            //
+            // SO: anyone narrowing G0 to require real enum provenance MUST keep the `Unit`/`Struct`
+            // shape refused, or they open that channel. This is a load-bearing accident, not a
+            // design, and it is written down here because the comment above it was the safety
+            // argument and a change elsewhere invalidated it silently.
+            //
+            // A non-async coroutine (`gen {}`, bare `#[coroutine] || {}`)
             // has resume type `()` → params `[Unit, Unit]` reach the signature comparison and would
             // record a NEW `MirOracle` divergence (`Unit` vs `Struct`). All corpus coroutine bodies
             // are async, so this restriction costs 0 yield and closes that hole fail-closed.
@@ -4854,10 +4942,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     } else {
                         Some(self.tcx.fn_sig(def_id).skip_binder().abi())
                     };
-                    matches!(
-                        abi,
-                        Some(ExternAbi::Rust | ExternAbi::RustCall | ExternAbi::RustCold)
-                    )
+                    matches!(abi, Some(ExternAbi::Rust | ExternAbi::RustCall | ExternAbi::RustCold))
                 },
             });
         }
@@ -4985,8 +5070,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // at the call site. `fn_sig` hands back an `Unnormalized<_>` precisely so that reading it
         // raw is a deliberate act, and reading it raw is what keeps this out of the E0391 family.
         let sig = tcx.fn_sig(callee);
-        let identity = tcx.erase_and_anonymize_regions(sig.instantiate_identity().skip_normalization());
-        let at_site = tcx.erase_and_anonymize_regions(sig.instantiate(tcx, args).skip_normalization());
+        let identity =
+            tcx.erase_and_anonymize_regions(sig.instantiate_identity().skip_normalization());
+        let at_site =
+            tcx.erase_and_anonymize_regions(sig.instantiate(tcx, args).skip_normalization());
         if identity == at_site {
             return true;
         }
@@ -5412,6 +5499,17 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // defensive — its (env, declared…) convention is not this call's
                         // shape, never link it.
                         Err(fail("Call(closure call)"))
+                    } else if resolved.as_local().is_some_and(|l| {
+                        matches!(self.tcx.hir_node_by_def_id(l), rustc_hir::Node::Synthetic)
+                    }) {
+                        // Trust (wave-B4.3 fallout, root-caused): a resolution landing on a
+                        // SYNTHETIC HIR def — the `iter!` gen-block machinery mints one for
+                        // its `next` — has no `fn_sig()` (the query ICEs: "unexpected sort
+                        // of node in fn_sig(): Synthetic", collect.rs). Nothing reached this
+                        // arm with one before the aggregate-borrow admission let
+                        // `assert_eq!(i.next(), …)` operands lower this far; fail closed
+                        // BEFORE `sig_shapes_coherent`'s signature queries, never ICE.
+                        Err(fail("Call(synthetic callee)"))
                     } else if !self.sig_shapes_coherent(resolved, inst.args) {
                         // Trust (wave-19): the concrete monomorphized signature is ABI-INCOHERENT
                         // with the callee's IDENTITY-lowered crate-module record. `map_ty` signs a
@@ -5494,9 +5592,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `site_args=None`, so the to_mir shim fail-closes the Call (plus the
                 // explicit force_havoc reject there); a derived DIRECT call in built
                 // MIR's vtable-dispatch position would be a miscompile. The routed body
-                // lowers CLEAN and the seam's declaration gate classes it
-                // clean-skip-extern-callee (coverage-only) — never interpreted, never
-                // flipped, never counted verified. The `vdef == def_id` tripwire keeps
+                // lowers CLEAN and the seam's declaration gate classes it coverage-only
+                // — never interpreted, never flipped, never counted verified.
+                //
+                // Trust (B8 step 1): that class used to be spelled `clean-skip-extern-callee`,
+                // which was the wrong name for this lane — a forced-havoc admit is a
+                // `DeclKind::Havoc` declaration, not an extern one. The scorecard now says
+                // `clean-skip-seam-decl-havoc`, and bodies routed HERE are a known contributor
+                // to that bucket. See docs/TRUST_IR_V2.md § "The seam declaration gate".
+                //
+                // The `vdef == def_id` tripwire keeps
                 // any resolution REDIRECT (a Virtual instance whose def differs from the
                 // site-spelled trait method) fail-closed: the ledger records the SITE
                 // def_id, and a silent redirect would change the assembly identity.
@@ -5567,8 +5672,24 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return Err("Call(rust-call ABI)");
         }
         // A generic CALLER's call site (`F: Fn(…)` bound) — no concrete instance to resolve.
+        // Trust (wave-GH): admit it as a FORCED-HAVOC callee on the ClosureCall (untupled)
+        // spelling instead of failing closed — the wave-20 posture, carried across the
+        // rust-call ABI gate. The arity-lie objection that diverted rust-call away from the
+        // plain havoc arm applies to LINKING A REAL BODY; a havoc decl claims no body and no
+        // ABI (`force_havoc` joins the dedup key, the seam declaration gate refuses linkage),
+        // and the ClosureCall arm's call site performs the untupling honestly anyway: env is
+        // the wave-5 fresh unit slot (the receiver must prove effect-free or the arm fails
+        // closed with its own tag), args are the per-element literal-tuple desugar. Sound at
+        // EVERY monomorphization for wave-20's reasons: the emitted `Inst::Call` sets
+        // `contains_call` → the differential forces `mode=NotRun` (never a wrong Agreed), and
+        // the flip shim rejects a generic callee (`generics_of != 0`) → the body never flips.
+        // A param-bearing `dyn Fn*` receiver (which used to share this tag — the guard fires
+        // before the receiver-shape check) rides the same havoc admission, identically sound.
         if gen_args.has_non_region_param() || gen_args.has_non_region_infer() {
-            return Err("Call(generic callee)");
+            return Ok(CalleeKind::ClosureCall {
+                callee: self.admit_havoc_callee(def_id),
+                capturing: false,
+            });
         }
         // Same E0391 query-cycle guard as the main path (e.g. calling an RPIT-returned
         // closure: `Self` is the defining fn's opaque type).
@@ -5700,7 +5821,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return None;
         }
         let slot = self.fresh();
-        self.push_node(InstrNode::new(Inst::Alloca { ty: env_ty.clone(), count: None, align: None })
+        self.push_node(
+            InstrNode::new(Inst::Alloca { ty: env_ty.clone(), count: None, align: None })
                 .with_result(slot),
         );
         self.push_node(InstrNode::new(Inst::Store {
@@ -5844,7 +5966,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let mut vals = Vec::with_capacity(field_tys.len());
         for (i, fty) in field_tys.iter().enumerate() {
             let v = self.fresh();
-            self.push_node(InstrNode::new(Inst::ExtractField {
+            self.push_node(
+                InstrNode::new(Inst::ExtractField {
                     ty: fty.clone(),
                     aggregate: agg,
                     field: i as u32,
@@ -6132,7 +6255,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // then `ExtractField` the lane (the opaque `Ty::Unit` unit, or the `Ty::Bool` discriminant).
         let holder = self.lower_expr(lhs)?;
         let recv = self.fresh();
-        self.push_node(InstrNode::new(Inst::ExtractField {
+        self.push_node(
+            InstrNode::new(Inst::ExtractField {
                 ty: lane_ty.clone(),
                 aggregate: holder,
                 field: field_idx,
@@ -6199,15 +6323,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return Some(recv);
             }
             let false_const = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
                     .with_result(false_const),
             );
             let true_const = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                     .with_result(true_const),
             );
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::Select {
+            self.push_node(
+                InstrNode::new(Inst::Select {
                     ty: Ty::Bool,
                     cond: recv,
                     then_val: false_const,
@@ -6359,15 +6486,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // `let None = …`: the negation, spelled as the read side's
                     // const-false/const-true `select` idiom.
                     let false_const = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
                             .with_result(false_const),
                     );
                     let true_const = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                             .with_result(true_const),
                     );
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Select {
+                    self.push_node(
+                        InstrNode::new(Inst::Select {
                             ty: Ty::Bool,
                             cond: sv,
                             then_val: false_const,
@@ -7272,9 +7402,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // zero args and `unsupported: []`. Those bodies were skipped by the seam for
                     // INCIDENTAL reasons (callee-set asymmetry, live havoc) — luck, not a gate.
                     // Restore the premise by testing it instead of asserting it.
-                    if (diverges || unit_sink)
-                        && !callee_is_local
-                        && self.is_read_only_plumbing(a)
+                    if (diverges || unit_sink) && !callee_is_local && self.is_read_only_plumbing(a)
                     {
                         self.unsupported.truncate(mark);
                         continue;
@@ -8062,9 +8190,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
 
         let name = format!(
             "{}::{{fnptr-adapter}}",
-            rustc_middle::ty::print::with_no_trimmed_paths!(
-                self.tcx.def_path_str(closure_def_id)
-            )
+            rustc_middle::ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(closure_def_id))
         );
         // `ty: sig_id` — the adapter is signed with the fn pointer's OWN signature id, which is
         // what makes the constant below arity-honest by construction rather than by inspection.
@@ -8085,8 +8211,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
 
         let res = self.fresh();
         self.push_node(
-            InstrNode::new(Inst::Const { ty: Ty::Func(sig_id), value: Constant::FnDef(adapter_id) })
-                .with_result(res),
+            InstrNode::new(Inst::Const {
+                ty: Ty::Func(sig_id),
+                value: Constant::FnDef(adapter_id),
+            })
+            .with_result(res),
         );
         Some(res)
     }
@@ -8102,6 +8231,44 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 ExprKind::Scope { value, .. } => place = *value,
                 ExprKind::Use { source } => place = *source,
                 ExprKind::VarRef { id } => return Some(*id),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Trust (wave-NB): resolve a place to the SINGLE-LEVEL struct-field-of-local shape —
+    /// `a.b` where `a` is a bare `VarRef` of `ty::Adt`-struct type. Returns
+    /// `(base local, field index, base ExprId)`. `None` for every other place: nested fields,
+    /// indexes, derefs, tuple/enum lhs — those keep their existing fail-closed sites. Used by
+    /// the promotion pre-pass (a borrowed or assigned field means the base local needs a real
+    /// address, hence a memory slot) and by the Assign/Borrow field arms.
+    fn place_field_base(&self, mut place: ExprId) -> Option<(LocalVarId, u32, ExprId)> {
+        loop {
+            match &self.thir.exprs[place].kind {
+                ExprKind::Scope { value, .. } => place = *value,
+                ExprKind::Use { source } => place = *source,
+                ExprKind::Field { lhs, name, .. } => {
+                    let field = name.as_u32();
+                    let mut inner = *lhs;
+                    loop {
+                        match &self.thir.exprs[inner].kind {
+                            ExprKind::Scope { value, .. } => inner = *value,
+                            ExprKind::Use { source } => inner = *source,
+                            _ => break,
+                        }
+                    }
+                    return match &self.thir.exprs[inner].kind {
+                        ExprKind::VarRef { id }
+                            if matches!(
+                                self.thir.exprs[inner].ty.kind(),
+                                ty::Adt(adt, _) if adt.is_struct()
+                            ) =>
+                        {
+                            Some((*id, field, inner))
+                        }
+                        _ => None,
+                    };
+                }
                 _ => return None,
             }
         }
@@ -8166,6 +8333,35 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         ) =>
                         {
                             return ReborrowTarget::Ptr(inner);
+                        }
+                        _ => return ReborrowTarget::NotAPlace,
+                    }
+                }
+                // Trust (wave-NB): `&a.b` / `&mut a.b` — a SINGLE-LEVEL field projection over a
+                // bare struct local. Only the exact shape Field{VarRef} qualifies: a nested
+                // `a.b.c`, an index, an enum downcast, or a deref-rooted lhs all keep the
+                // fail-closed NotAPlace below. The MUTABILITY question does not arise here the
+                // way it does for the Ptr case (no inner borrow is being adopted — the address
+                // is derived fresh from the local's own slot), so both `&` and `&mut` return
+                // the variant and the emission site applies its own gates.
+                ExprKind::Field { lhs, name, .. } => {
+                    let (field, base) = (name.as_u32(), *lhs);
+                    let mut inner = base;
+                    loop {
+                        match &self.thir.exprs[inner].kind {
+                            ExprKind::Scope { value, .. } => inner = *value,
+                            ExprKind::Use { source } => inner = *source,
+                            _ => break,
+                        }
+                    }
+                    match &self.thir.exprs[inner].kind {
+                        ExprKind::VarRef { id }
+                            if matches!(
+                                self.thir.exprs[inner].ty.kind(),
+                                ty::Adt(adt, _) if adt.is_struct()
+                            ) =>
+                        {
+                            return ReborrowTarget::FieldOfLocal { var: *id, field, base: inner };
                         }
                         _ => return ReborrowTarget::NotAPlace,
                     }
@@ -8480,14 +8676,40 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///
     /// `None` is a REFUSAL at every call site, never a pass: an unregistered instantiation has no
     /// declaration table for [`struct_field_offset_agrees`] to consult.
+    /// Trust (wave-B4.3): is `ty` a PURE-VALUE aggregate the shared-borrow
+    /// snapshot can round-trip through an `Alloca` slot — a tuple of scalars, or
+    /// a REGISTERED struct whose every field is scalar. Components are held to
+    /// `is_scalar_ty` (the same set the scalar gate admits — deliberately no
+    /// floats, no pointers, no nesting): a pointer component would smuggle an
+    /// address past the immediate-deref-only contract, and nesting multiplies
+    /// the layout-agreement surface for no pre-registered population.
+    fn snapshotable_aggregate_pointee(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Tuple(elems) => !elems.is_empty() && elems.iter().all(is_scalar_ty),
+            // A registered struct whose fields are all scalar — INCLUDING the
+            // fieldless (unit-struct) case: `assert_eq!(f(a), Bar)` on a
+            // `struct Bar;` was measured as a whole residual class, and a
+            // zero-field store/load round-trips trivially.
+            Ty::Struct(sid) => self
+                .pending_structs
+                .iter()
+                .find(|sd| sd.id == *sid)
+                .is_some_and(|sd| sd.fields.iter().all(|f| is_scalar_ty(&f.ty))),
+            // A FIRST-CLASS enum value: the interpreter round-trips `Ty::Enum`
+            // through memory (B3-1's pinned tests — the same evidence the Deref
+            // arm's `Ty::Enum(_)` Load admission cites), and the value's own
+            // construction lane already gated its payloads. The B2-2/B3-2a
+            // lesson applied on the Store side.
+            Ty::Enum(_) => true,
+            _ => false,
+        }
+    }
+
     fn registered_struct_id(&self, struct_rty: RustcTy<'tcx>) -> Option<trust_ir::StructId> {
         let ty::Adt(adt, args) = struct_rty.kind() else {
             return None;
         };
-        self.struct_ids
-            .iter()
-            .find(|(d, a, _)| *d == adt.did() && a == args)
-            .map(|(_, _, id)| *id)
+        self.struct_ids.iter().find(|(d, a, _)| *d == adt.did() && a == args).map(|(_, _, id)| *id)
     }
 
     /// Trust (wave-SG): THE STRUCT-INTERIOR OFFSET GATE, in one place, called by BOTH struct
@@ -8523,6 +8745,77 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
         let Some(sid) = sid else { return false };
         struct_field_offset_agrees(&self.pending_structs, sid, field as usize, off)
+    }
+
+    /// Trust (wave-NB): the ADDRESS of `a.b` — a single-level scalar field of a memory-PROMOTED
+    /// struct local — as a flat-I8 `GEP` off the local's whole-lifetime slot. The one new
+    /// address-producing site this wave adds, shared by the `&a.b` / `&mut a.b` Borrow arms and
+    /// the `a.b = v` Assign arm so no gate can drift between them.
+    ///
+    /// Gates, each a fail-closed `None` (callers keep their existing census tags):
+    ///   * the base local is promoted AND its slot exists — the pre-pass collects every
+    ///     field-borrowed/field-assigned base, but the `let`/param admission may still have
+    ///     declined the aggregate (non-pure, unregistered), leaving it promoted-but-slotless;
+    ///   * the base struct is REGISTERED for this exact instantiation
+    ///     ([`Self::registered_struct_id`] — a pure ledger scan, wave-SG discipline);
+    ///   * the projected field's mapped ty is a MODELED SCALAR (the interior pointer's every
+    ///     consumer — Deref `Load`, `*r = v` `Store` — is scalar-typed);
+    ///   * the byte offset comes from rustc's layout and the declaration table AGREES
+    ///     ([`Self::struct_interior_offset_admissible`], the wave-SG soundness line).
+    ///
+    /// Deliberately NO wave-25 field-0 tautology shortcut: the base slot Ptr aliases the WHOLE
+    /// struct cell, and returning it for a scalar-typed use would ask the interpreter to read a
+    /// scalar from a struct-typed cell. Always emitting the GEP keeps every interior address
+    /// visible to `first_adt_interior_byte_arithmetic`, which governs the interpreter channel
+    /// for derived interior pointers — conservative on samples, never a wrong flip.
+    /// Returns the interior pointer AND the field's mapped scalar `Ty` (the Assign arm's
+    /// `Store` needs the leaf type; the Borrow arms discard it).
+    fn lower_field_of_local_addr(
+        &mut self,
+        var: LocalVarId,
+        field: u32,
+        base: ExprId,
+        mutable: bool,
+    ) -> Option<(ValueId, Ty)> {
+        let slot = self.promoted_slot(var)?;
+        let struct_rty = self.thir.exprs[base].ty;
+        let sid = self.registered_struct_id(struct_rty)?;
+        let ty::Adt(adt, args) = struct_rty.kind() else { return None };
+        let leaf_rty = adt
+            .non_enum_variant()
+            .fields
+            .get(rustc_abi::FieldIdx::from_u32(field))?
+            .ty(self.tcx, args)
+            .skip_normalization();
+        let leaf_ty = self.map_ty(leaf_rty);
+        if !is_scalar_ty(&leaf_ty) {
+            return None;
+        }
+        let (off, source) = self.field_byte_offset(struct_rty, field)?;
+        if !self.struct_interior_offset_admissible(Some(sid), field, off, source) {
+            return None;
+        }
+        let off_val = self.fresh();
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(off as i128) })
+                .with_result(off_val),
+        );
+        let iptr = self.fresh();
+        self.push_node(
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::I8,
+                base: slot,
+                indices: vec![off_val],
+                inbounds: true,
+            })
+            .with_result(iptr),
+        );
+        self.borrow_ptrs.push(iptr);
+        self.interior_ptrs.push(iptr);
+        if mutable {
+            self.mut_borrow_ptrs.push(iptr);
+        }
+        Some((iptr, leaf_ty))
     }
 
     /// Trust (wave-DP): is the body CURRENTLY being lowered a `Deref::deref` /
@@ -8691,9 +8984,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         Some(format!(
             "TRUSTCOV25 class={class} off={off} declared={declared:?} would={would:?} \
              field={field} struct={name} body={}",
-            rustc_middle::ty::print::with_no_trimmed_paths!(
-                self.tcx.def_path_str(self.body_def)
-            ),
+            rustc_middle::ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(self.body_def)),
         ))
     }
 
@@ -8874,12 +9165,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         );
         let ptr = self.fresh();
         self.push_node(
-            InstrNode::new(Inst::ExtractField {
-                ty: Ty::Ptr,
-                aggregate: agg,
-                field: index as u32,
-            })
-            .with_result(ptr),
+            InstrNode::new(Inst::ExtractField { ty: Ty::Ptr, aggregate: agg, field: index as u32 })
+                .with_result(ptr),
         );
         // `borrow_ptrs` ONLY: every escape guard fails closed on it, and in particular the two
         // return-escape guards (which except `ref_param_ptrs`/`global_ptrs`/`interior_ptrs`)
@@ -9221,11 +9508,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
         // THE PROJECTION WITNESS (dead for execution; carries K + the struct ids).
         let w0 = self.fresh();
-        self.push_node(InstrNode::new(Inst::Load { ty: struct_ty, ptr: pv, volatile: false, align: None })
+        self.push_node(
+            InstrNode::new(Inst::Load { ty: struct_ty, ptr: pv, volatile: false, align: None })
                 .with_result(w0),
         );
         let w1 = self.fresh();
-        self.push_node(InstrNode::new(Inst::ExtractField { ty: leaf_ty, aggregate: w0, field })
+        self.push_node(
+            InstrNode::new(Inst::ExtractField { ty: leaf_ty, aggregate: w0, field })
                 .with_result(w1),
         );
         // Trust (wave-DZ): the wave-25 tautology is a tautology for the CONSUMER too only when
@@ -9240,11 +9529,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return Some(pv);
         }
         let off_val = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(off as i128) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(off as i128) })
                 .with_result(off_val),
         );
         let iptr = self.fresh();
-        self.push_node(InstrNode::new(Inst::GEP {
+        self.push_node(
+            InstrNode::new(Inst::GEP {
                 pointee_ty: Ty::I8,
                 base: pv,
                 indices: vec![off_val],
@@ -9459,7 +9750,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return;
         }
         let slot = self.fresh();
-        self.push_node(InstrNode::new(Inst::Alloca { ty: ty.clone(), count: None, align: None })
+        self.push_node(
+            InstrNode::new(Inst::Alloca { ty: ty.clone(), count: None, align: None })
                 .with_result(slot),
         );
         self.push_node(InstrNode::new(Inst::Store {
@@ -9675,16 +9967,34 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // SCALAR locals (the slot Load/Store round-trips a scalar); a `&mut` of a non-scalar local
         // fails closed at the `Borrow{Mut}` arm. Pointer-flavored types (a `&mut` of a reference) are
         // likewise excluded so we never promote a slot whose value is itself a pointer.
-        self.promoted = self.collect_mut_borrowed(body);
+        let (promoted, promote_wanted) = self.collect_mut_borrowed(body);
+        self.promoted = promoted;
+        self.promote_wanted = promote_wanted;
 
         for (i, var, rty) in param_vars {
             // The param's `Ty` is `params[i]` (the mapped sig type).
             let ty = params.get(i).cloned().unwrap_or(Ty::Unit);
+            // Trust (wave-NB): opportunistic promotion for a by-value aggregate param whose
+            // FIELD is borrowed/assigned in the body — same posture as the `let` site: slot on
+            // success, silently stay SSA on a miss (each field access then fails closed at its
+            // own site with its pre-wave tag).
+            if !self.is_promoted(var)
+                && self.promote_wanted.contains(&var)
+                && self.snapshotable_aggregate_pointee(&ty)
+            {
+                self.promoted.push(var);
+                self.alloc_promoted(var, ty.clone(), ValueId::new(i as u32));
+                continue;
+            }
             if self.is_promoted(var) {
                 // A `&mut`-borrowed PARAMETER: promote it at entry — Alloca a slot, Store the incoming
                 // param value. Only scalars are promotable; a non-scalar promoted param fails closed
                 // (its `&mut` site would too, but guard here so we never emit a non-scalar slot).
-                if is_scalar_ty(&ty) {
+                if is_scalar_ty(&ty) || self.snapshotable_aggregate_pointee(&ty) {
+                    // Trust (wave-NB): the aggregate disjunct — a by-value param of pure-value
+                    // aggregate type joins the same whole-lifetime-slot model the `let` admission
+                    // grants (same `snapshotable_aggregate_pointee` gate, same round-trip
+                    // evidence). The incoming SSA param value is the slot's initial store.
                     self.alloc_promoted(var, ty, ValueId::new(i as u32));
                 } else {
                     self.unsupported.push(("param".to_string(), "Promote(non-scalar &mut param)"));
@@ -10004,7 +10314,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
 
         // Same `&mut`-promotion pre-pass as fn bodies: a const body may contain
         // `let mut y = …; let r = &mut y; *r = …` blocks, whose locals must be memory-backed.
-        self.promoted = self.collect_mut_borrowed(body);
+        let (promoted, promote_wanted) = self.collect_mut_borrowed(body);
+        self.promoted = promoted;
+        self.promote_wanted = promote_wanted;
 
         self.finish_body(module, def, func_ty_id, body);
     }
@@ -10050,11 +10362,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             }
             // Unit- AND never-returning fns return no values (see `fn_returns_no_values`).
-            let values = if self.fn_returns_no_values() {
-                Vec::new()
-            } else {
-                tail.into_iter().collect()
-            };
+            let values =
+                if self.fn_returns_no_values() { Vec::new() } else { tail.into_iter().collect() };
             // Trust (C2-spans): the epilogue seals OUTSIDE any expr scope (the `lower_expr`
             // wrapper restored `cur_span` on exit), which left the implicit tail `Return` as
             // the one structurally unstamped terminator.
@@ -10597,6 +10906,30 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let r = adt.repr();
             if r.transparent() {
                 trust_ir::StructRepr::Transparent
+            } else if r.simd() {
+                // `repr(simd)` OUTRANKS the pack clamp, and reporting `Packed`
+                // here states something FALSE. rustc lays a non-power-of-two
+                // vector out with `pack = Some(1)` AND a real alignment taken
+                // from the vector, not from the clamp: measured on
+                // tests/ui/consts/const-eval/simd/simd-packed-non-pow2.rs,
+                // `Simd<i32, 3>` is size 12 / align 4 / `pack = Some(1)`. The
+                // old mapping signed `Packed(1)`, which asserts align <= 1, so
+                // the module contradicted itself and the layout validator was
+                // right to reject it (`struct alignment exceeds the
+                // repr(packed) clamp`).
+                //
+                // `StructRepr` carries ONE hint and there is no SIMD variant,
+                // so the honest spelling is the one that claims nothing: the
+                // truth is already carried by the size/align/offsets filled
+                // from rustc's authoritative layout just above. A hint that
+                // asserts a clamp rustc does not honour is strictly worse than
+                // no hint. Falls through to C/Rust so an explicit
+                // `repr(C, simd)` still records C.
+                if r.c() {
+                    trust_ir::StructRepr::C
+                } else {
+                    trust_ir::StructRepr::Rust
+                }
             } else if let Some(pack) = r.pack {
                 trust_ir::StructRepr::Packed(pack.bytes() as u32)
             } else if r.c() {
@@ -11957,6 +12290,24 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 if let Some(v) = self.lower_expr(init) {
                     if let Some(var) = var {
                         let ty = self.map_ty(init_rty);
+                        // Trust (wave-NB): OPPORTUNISTIC promotion — a field of this local is
+                        // borrowed/assigned somewhere (`promote_wanted`), and the binding shape
+                        // and type both admit a faithful whole-lifetime slot. On success the
+                        // local JOINS `promoted` here and is memory-backed from this point on.
+                        // On any miss (borrow-ptr init, non-snapshotable type) NOTHING is
+                        // tagged: the local binds SSA exactly as pre-wave, and each field
+                        // access fails closed at its own site with its pre-wave tag. Only the
+                        // `&mut`-collected `promoted` set may hard-fail a binding — a lost
+                        // write is a soundness hole, a lost field borrow is only coverage.
+                        if !self.is_promoted(var)
+                            && self.promote_wanted.contains(&var)
+                            && !self.is_borrow_ptr(v)
+                            && self.snapshotable_aggregate_pointee(&ty)
+                        {
+                            self.promoted.push(var);
+                            self.alloc_promoted(var, ty, v);
+                            return;
+                        }
                         if self.is_promoted(var) {
                             // Trust: a `&mut`-borrowed local — promote it to memory. `Alloca` a slot
                             // and `Store` the init value; reads/writes/`&mut` route through the slot.
@@ -11968,6 +12319,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                     "Promote(init is borrow ptr)",
                                 ));
                             } else if is_scalar_ty(&ty) {
+                                self.alloc_promoted(var, ty, v);
+                            } else if self.snapshotable_aggregate_pointee(&ty) {
+                                // Trust (wave-NB): a PURE-VALUE aggregate local (tuple of
+                                // scalars, registered all-scalar struct, or first-class enum —
+                                // exactly the set the shared-borrow snapshot already round-trips
+                                // through an `Alloca`, on wave-B4.3/B3-1's evidence) gets a REAL
+                                // whole-lifetime slot. This is what gives `&a.b` / `a.b = v` an
+                                // address to derive from; the field arms then gate on layout
+                                // agreement per access. A non-pure aggregate keeps the opaque
+                                // arms below.
                                 self.alloc_promoted(var, ty, v);
                             } else if let Some(oty) = self.opaque_local_aggregate_ty(init_rty) {
                                 // Trust (realbody store move-out): a `&mut` NON-scalar local whose type
@@ -12136,7 +12497,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                     let cty = comp_tys[idx].clone();
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ExtractField {
+                    self.push_node(
+                        InstrNode::new(Inst::ExtractField {
                             ty: cty.clone(),
                             aggregate: v,
                             field: u32::try_from(idx).expect("tuple arity fits u32"),
@@ -12332,13 +12694,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // tuple/struct shapes keep `ExtractField`. Same read, same index, same type.
                     if first_class_array {
                         let idx_val = self.fresh();
-                        self.push_node(InstrNode::new(Inst::Const {
+                        self.push_node(
+                            InstrNode::new(Inst::Const {
                                 ty: Ty::I64,
                                 value: Constant::Int(i128::from(*idx)),
                             })
                             .with_result(idx_val),
                         );
-                        self.push_node(InstrNode::new(Inst::ExtractElement {
+                        self.push_node(
+                            InstrNode::new(Inst::ExtractElement {
                                 ty: fty.clone(),
                                 array: val,
                                 index: idx_val,
@@ -12346,7 +12710,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             .with_result(res),
                         );
                     } else {
-                        self.push_node(InstrNode::new(Inst::ExtractField {
+                        self.push_node(
+                            InstrNode::new(Inst::ExtractField {
                                 ty: fty.clone(),
                                 aggregate: val,
                                 field: *idx,
@@ -12664,8 +13029,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         Some(res)
                     }
                     Some(_) => {
-                        self.unsupported
-                            .push((format!("{expr_span:?}"), "ZstLiteral(seed not sole inhabitant)"));
+                        self.unsupported.push((
+                            format!("{expr_span:?}"),
+                            "ZstLiteral(seed not sole inhabitant)",
+                        ));
                         None
                     }
                     None => {
@@ -12913,7 +13280,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // Load the closure struct (tuple) through the env ptr (`ValueId(0)`).
                     let env_tuple = Ty::Tuple(elem_tys);
                     let agg = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Load {
+                    self.push_node(
+                        InstrNode::new(Inst::Load {
                             ty: env_tuple,
                             ptr: env,
                             volatile: false,
@@ -12924,7 +13292,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     agg
                 };
                 let field = self.fresh();
-                self.push_node(InstrNode::new(Inst::ExtractField {
+                self.push_node(
+                    InstrNode::new(Inst::ExtractField {
                         ty: field_ty.clone(),
                         aggregate: agg,
                         field: index as u32,
@@ -12938,7 +13307,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
                 if field_ty == Ty::Ptr && is_scalar_ty(&upvar_ref_ty) {
                     let v = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Load {
+                    self.push_node(
+                        InstrNode::new(Inst::Load {
                             ty: upvar_ref_ty,
                             ptr: field,
                             volatile: false,
@@ -12982,7 +13352,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         }
                     };
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Load { ty, ptr: slot, volatile: false, align: None })
+                    self.push_node(
+                        InstrNode::new(Inst::Load { ty, ptr: slot, volatile: false, align: None })
                             .with_result(res),
                     );
                     return Some(res);
@@ -13027,7 +13398,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 } else if let LitKind::Bool(b) = lit.node {
                     // `true` / `false` — common in `if`/`&&`/`||` arms. `neg` never applies to bool.
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(b) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(b) })
                             .with_result(res),
                     );
                     Some(res)
@@ -13036,7 +13408,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // code point as 32 unsigned bits, matching the faithful MIR extraction
                     // without collapsing the type to `U32`. `neg` never applies to char.
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
+                    self.push_node(
+                        InstrNode::new(Inst::Const {
                             ty: Ty::Char,
                             value: Constant::Int(c as u32 as i128),
                         })
@@ -13073,7 +13446,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     match value {
                         Some(v) => {
                             let res = self.fresh();
-                            self.push_node(InstrNode::new(Inst::Const { ty, value: Constant::Float(v) })
+                            self.push_node(
+                                InstrNode::new(Inst::Const { ty, value: Constant::Float(v) })
                                     .with_result(res),
                             );
                             Some(res)
@@ -13089,7 +13463,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // `Ty::U8` constant (the trivial near-miss of the string/byte-literal blocker;
                     // no global, no pointer). `neg` never applies to a byte literal.
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::U8, value: Constant::Int(b as i128) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::U8, value: Constant::Int(b as i128) })
                             .with_result(res),
                     );
                     Some(res)
@@ -13108,7 +13483,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     match self.emit_bytes_global(&bytes) {
                         Some(data_ptr) => {
                             let len_val = self.fresh();
-                            self.push_node(InstrNode::new(Inst::Const {
+                            self.push_node(
+                                InstrNode::new(Inst::Const {
                                     ty: Ty::U64,
                                     value: Constant::Int(bytes.len() as i128),
                                 })
@@ -13116,7 +13492,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             );
                             let fat_ty = Ty::FatPtr(trust_ir::FatPtrKind::Str);
                             let fat = self.fresh();
-                            self.push_node(InstrNode::new(Inst::PtrFromParts {
+                            self.push_node(
+                                InstrNode::new(Inst::PtrFromParts {
                                     ptr_ty: fat_ty,
                                     metadata_ty: Ty::U64,
                                     data: data_ptr,
@@ -13197,7 +13574,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             return None;
                         }
                         let res = self.fresh();
-                        self.push_node(InstrNode::new(Inst::FCmp { op: fcmp, ty, lhs: l, rhs: r })
+                        self.push_node(
+                            InstrNode::new(Inst::FCmp { op: fcmp, ty, lhs: l, rhs: r })
                                 .with_result(res),
                         );
                         return Some(res);
@@ -13205,7 +13583,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 } else if let Some(icmp) = map_icmp(*op, signed) {
                     let ty = self.map_ty(lhs_rty);
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ICmp { op: icmp, ty, lhs: l, rhs: r })
+                    self.push_node(
+                        InstrNode::new(Inst::ICmp { op: icmp, ty, lhs: l, rhs: r })
                             .with_result(res),
                     );
                     return Some(res);
@@ -13284,8 +13663,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // call ZERO results (the IR's unit convention); a non-unit call gets one.
                         // An opaque-lane Option is a non-unit rustc type, so the wave-SEAM ledger
                         // below layers cleanly onto the `Some(res)` it returns.
-                        let res =
-                            self.emit_call_at(*fn_span, Inst::Call { callee, args: arg_vals }, expr_ty);
+                        let res = self.emit_call_at(
+                            *fn_span,
+                            Inst::Call { callee, args: arg_vals },
+                            expr_ty,
+                        );
                         // Trust (wave-SEAM): ledger a LOCAL callee's opaque-lane-Option result
                         // as a PROVEN discriminant value (`option_lane_values`). A LOCAL fn's
                         // declaration carries `lower_fn`'s mapped signature, whose return for
@@ -13365,7 +13747,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 return None;
                             }
                             let e = self.fresh();
-                            self.push_node(InstrNode::new(Inst::Alloca {
+                            self.push_node(
+                                InstrNode::new(Inst::Alloca {
                                     ty: Ty::Unit,
                                     count: None,
                                     align: None,
@@ -13471,11 +13854,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 };
                 // Unit- AND never-returning fns return no values (see `fn_returns_no_values`) —
                 // covers `return;`, `return unit_expr;`, and a `return` in a `-> !` fn alike.
-                let values = if self.fn_returns_no_values() {
-                    Vec::new()
-                } else {
-                    values
-                };
+                let values = if self.fn_returns_no_values() { Vec::new() } else { values };
                 // The value walk may itself have sealed the block: a diverging value
                 // (`return (return x)`) seals via its own terminator, and a value
                 // `if`/`match` whose arms ALL sealed (each diverged or failed closed —
@@ -13795,7 +14174,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         match disc {
                             // Trust (wave-OPTFLAG): the static discriminant IS the stored scalar.
                             Some(d) => {
-                                self.push_node(InstrNode::new(Inst::Const {
+                                self.push_node(
+                                    InstrNode::new(Inst::Const {
                                         ty: Ty::Bool,
                                         value: Constant::Bool(d),
                                     })
@@ -13810,7 +14190,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             // (and the pre-wave opaque arm) applies to the payload expr.
                             None => {
                                 self.contains_call = true;
-                                self.push_node(InstrNode::new(Inst::Undef { ty: Ty::Bool }).with_result(c),
+                                self.push_node(
+                                    InstrNode::new(Inst::Undef { ty: Ty::Bool }).with_result(c),
                                 );
                             }
                         }
@@ -13840,7 +14221,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // Load the root, then extract DOWN the chain to the leaf's parent aggregate.
                     // `aggs[i]` = the pre-state aggregate VALUE at depth i (aggs[0] = the root).
                     let root = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Load {
+                    self.push_node(
+                        InstrNode::new(Inst::Load {
                             ty: struct_ty.clone(),
                             ptr,
                             volatile: false,
@@ -13851,7 +14233,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     let mut aggs: Vec<ValueId> = vec![root];
                     for i in 0..chain.len() - 1 {
                         let sub = self.fresh();
-                        self.push_node(InstrNode::new(Inst::ExtractField {
+                        self.push_node(
+                            InstrNode::new(Inst::ExtractField {
                                 // Result-typed, matching the `Field` read arm's convention.
                                 ty: agg_tys[i + 1].clone(),
                                 aggregate: aggs[i],
@@ -13884,12 +14267,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             if let Some(cty) = leaf_container.clone() {
                                 self.contains_call = true;
                                 let leaf = self.fresh();
-                                self.push_node(InstrNode::new(Inst::Undef { ty: cty }).with_result(leaf),
+                                self.push_node(
+                                    InstrNode::new(Inst::Undef { ty: cty }).with_result(leaf),
                                 );
                                 leaf
                             } else {
                                 let leaf = self.fresh();
-                                self.push_node(InstrNode::new(Inst::ExtractField {
+                                self.push_node(
+                                    InstrNode::new(Inst::ExtractField {
                                         ty: Ty::Unit,
                                         aggregate: aggs[chain.len() - 1],
                                         field: chain[chain.len() - 1].1,
@@ -13905,7 +14290,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     let mut newval = newleaf;
                     for i in (0..chain.len()).rev() {
                         let next = self.fresh();
-                        self.push_node(InstrNode::new(Inst::InsertField {
+                        self.push_node(
+                            InstrNode::new(Inst::InsertField {
                                 ty: agg_tys[i].clone(),
                                 aggregate: aggs[i],
                                 field: chain[i].1,
@@ -13923,6 +14309,42 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         align: None,
                     }));
                     return None;
+                }
+                // Trust (wave-NB): `a.b = v` — a single-level scalar-field WRITE on a promoted
+                // struct local: `Store` through the same gated interior GEP the Borrow arms
+                // derive (one shared emission site, so no gate can drift). The RHS must itself
+                // lower, be scalar-typed, and not be a borrow pointer (the promoted-slot
+                // discipline: a slot never holds an address). Every gate failure keeps the
+                // pre-wave `Assign(non-local place)` tag.
+                if let Some((fvar, ffield, fbase)) = self.place_field_base(lhs) {
+                    if self.is_promoted(fvar) && self.promoted_slot(fvar).is_some() {
+                        let rv = match self.lower_expr(rhs) {
+                            Some(v) => v,
+                            None => {
+                                // The RHS recorded its own precise gap; this row is the echo.
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "Assign(non-local place)"));
+                                return None;
+                            }
+                        };
+                        match self.lower_field_of_local_addr(fvar, ffield, fbase, true) {
+                            Some((iptr, leaf_ty)) if !self.is_borrow_ptr(rv) => {
+                                self.push_node(InstrNode::new(Inst::Store {
+                                    ty: leaf_ty,
+                                    ptr: iptr,
+                                    value: rv,
+                                    volatile: false,
+                                    align: None,
+                                }));
+                                return None;
+                            }
+                            _ => {
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "Assign(non-local place)"));
+                                return None;
+                            }
+                        }
+                    }
                 }
                 let var = match self.place_local(lhs) {
                     Some(v) => v,
@@ -14150,7 +14572,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                 };
                 let mut agg = self.fresh();
-                self.push_node(InstrNode::new(Inst::Const {
+                self.push_node(
+                    InstrNode::new(Inst::Const {
                         ty: tuple_ty.clone(),
                         value: Constant::Aggregate(seed_consts),
                     })
@@ -14161,7 +14584,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // Trust (wave-UF): skip a value-less unit element — its PhantomData seed is final.
                     let Some(val) = val else { continue };
                     let next = self.fresh();
-                    self.push_node(InstrNode::new(Inst::InsertField {
+                    self.push_node(
+                        InstrNode::new(Inst::InsertField {
                             ty: tuple_ty.clone(),
                             aggregate: agg,
                             field: i as u32,
@@ -14369,7 +14793,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             return None;
                         }
                         let res = self.fresh();
-                        self.push_node(InstrNode::new(Inst::ExtractField {
+                        self.push_node(
+                            InstrNode::new(Inst::ExtractField {
                                 ty: fty,
                                 aggregate: base_val,
                                 field: i as u32,
@@ -14498,7 +14923,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                 };
                 let mut agg = self.fresh();
-                self.push_node(InstrNode::new(Inst::Const {
+                self.push_node(
+                    InstrNode::new(Inst::Const {
                         ty: agg_ty.clone(),
                         value: Constant::Aggregate(seed_consts),
                     })
@@ -14509,7 +14935,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // slot is the final value, so emit no `InsertField` for it.
                     let Some(val) = val else { continue };
                     let next = self.fresh();
-                    self.push_node(InstrNode::new(Inst::InsertField {
+                    self.push_node(
+                        InstrNode::new(Inst::InsertField {
                             ty: agg_ty.clone(),
                             aggregate: agg,
                             field: i as u32,
@@ -14672,7 +15099,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 self.contains_call = true;
                             }
                             let res = self.fresh();
-                            self.push_node(InstrNode::new(Inst::ExtractField {
+                            self.push_node(
+                                InstrNode::new(Inst::ExtractField {
                                     ty: lane_ty,
                                     aggregate: agg,
                                     field,
@@ -14732,14 +15160,17 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             .and_then(|sd| sd.fields.get(field as usize))
                             .map(|f| f.ty.clone());
                         if declared.as_ref().is_some_and(|d| *d != field_ty) {
-                            self.unsupported
-                                .push((format!("{expr_span:?}"), "Field(aggregate lane disagrees)"));
+                            self.unsupported.push((
+                                format!("{expr_span:?}"),
+                                "Field(aggregate lane disagrees)",
+                            ));
                             return None;
                         }
                     }
                 }
                 let res = self.fresh();
-                self.push_node(InstrNode::new(Inst::ExtractField { ty: field_ty, aggregate: agg, field })
+                self.push_node(
+                    InstrNode::new(Inst::ExtractField { ty: field_ty, aggregate: agg, field })
                         .with_result(res),
                 );
                 Some(res)
@@ -14772,7 +15203,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                     if *n == 0 {
                         let res = self.fresh();
-                        self.push_node(InstrNode::new(Inst::Const {
+                        self.push_node(
+                            InstrNode::new(Inst::Const {
                                 ty: array_ty.clone(),
                                 value: Constant::Array(Vec::new()),
                             })
@@ -14812,7 +15244,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             }
                         }
                     }
-                    return self.build_array_first_class(expr_span, &array_ty, &elem_ty, &elem_vals);
+                    return self
+                        .build_array_first_class(expr_span, &array_ty, &elem_ty, &elem_vals);
                 }
                 let Ty::Tuple(elem_tys) = array_ty.clone() else {
                     self.unsupported.push((format!("{expr_span:?}"), "Array(non-tuple mapped ty)"));
@@ -14895,7 +15328,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     };
                     if *n == 0 {
                         let res = self.fresh();
-                        self.push_node(InstrNode::new(Inst::Const {
+                        self.push_node(
+                            InstrNode::new(Inst::Const {
                                 ty: array_ty.clone(),
                                 value: Constant::Array(Vec::new()),
                             })
@@ -14929,7 +15363,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         }
                     };
                     let elem_vals: Vec<ValueId> = vec![elem; *n as usize];
-                    return self.build_array_first_class(expr_span, &array_ty, &elem_ty, &elem_vals);
+                    return self
+                        .build_array_first_class(expr_span, &array_ty, &elem_ty, &elem_vals);
                 }
                 let Ty::Tuple(elem_tys) = array_ty.clone() else {
                     self.unsupported
@@ -15057,14 +15492,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // which the pinned interpreter serves natively and traps out-of-bounds —
                     // though the #191 bounds gate above means an OOB index never reaches here.
                     let idx = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
+                    self.push_node(
+                        InstrNode::new(Inst::Const {
                             ty: Ty::I64,
                             value: Constant::Int(i128::from(k)),
                         })
                         .with_result(idx),
                     );
                     let res = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ExtractElement {
+                    self.push_node(
+                        InstrNode::new(Inst::ExtractElement {
                             ty: elem_ty,
                             array: agg,
                             index: idx,
@@ -15231,6 +15668,27 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 }
                             }
                         }
+                        ReborrowTarget::FieldOfLocal { var, field, base } => {
+                            // Trust (wave-NB): `&mut a.b` on a PROMOTED struct local — the
+                            // field's address is a gated interior GEP off the local's slot. On
+                            // any gate miss (unpromoted base, unregistered struct, offset
+                            // disagreement, non-scalar leaf) this is NOT a refusal: fall
+                            // through to the pre-wave NotAPlace handling, so every body that
+                            // lowered before this wave lowers identically after it.
+                            if let Some((v, _)) =
+                                self.lower_field_of_local_addr(var, field, base, true)
+                            {
+                                return Some(v);
+                            }
+                            if let Some(v) =
+                                self.try_lower_deref_accessor_interior_mut(expr_span, expr_ty, arg)
+                            {
+                                return Some(v);
+                            }
+                            self.unsupported
+                                .push((format!("{expr_span:?}"), "Borrow(&mut non-local place)"));
+                            return None;
+                        }
                         ReborrowTarget::NotAPlace => {
                             // Trust (wave-DP): `&mut (*self).fieldK` INSIDE a `Deref`/`DerefMut`
                             // ACCESSOR body lowers as the projection WITNESS + interior ptr
@@ -15278,7 +15736,31 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     return None;
                 }
                 // Trust: same reborrow peel on the SHARED side (`f(&x)` / `f(r)` shapes).
-                let var = match self.reborrow_target(arg, false) {
+                let shared_target = {
+                    // Trust (wave-NB): `&a.b` on a promoted struct local — try the gated
+                    // interior GEP; on any gate miss DEMOTE to NotAPlace so the pre-wave
+                    // lanes (wave-16 const promotion, the B4.3 value-snapshot) run
+                    // unchanged and no pre-wave-clean body can regress.
+                    //
+                    // The variant is imported under an alias because the thin-reborrow wiring
+                    // pin (`test_the_thin_reborrow_arm_is_actually_wired`) windows this arm
+                    // from `reborrow_target(arg, false)` to the FIRST literal spelling of
+                    // the NotAPlace variant — a demotion spelled verbatim here would truncate
+                    // that window before the `Ptr` arm's gate call and break the pin's
+                    // meaning, not just its color.
+                    use ReborrowTarget::NotAPlace as DemotedFieldOfLocal;
+                    let t = self.reborrow_target(arg, false);
+                    if let ReborrowTarget::FieldOfLocal { var, field, base } = t {
+                        if let Some((v, _)) = self.lower_field_of_local_addr(var, field, base, false)
+                        {
+                            return Some(v);
+                        }
+                        DemotedFieldOfLocal
+                    } else {
+                        t
+                    }
+                };
+                let var = match shared_target {
                     ReborrowTarget::Local(v) => v,
                     ReborrowTarget::Ptr(inner) => {
                         // `&*r` — the shared reborrow of an existing borrow pointer IS that
@@ -15466,7 +15948,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             });
                             let global = GlobalId::new(idx as u32);
                             let result = self.fresh();
-                            self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(result),
+                            self.push_node(
+                                InstrNode::new(Inst::GlobalAddr { global }).with_result(result),
                             );
                             // Register the `'static` address so the return-escape guards ADMIT
                             // returning it (via `global_ptrs`) while every OTHER borrow-ptr escape
@@ -15512,7 +15995,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 if let Some(cval) = self.lower_expr(arg) {
                                     if !self.is_borrow_ptr(cval) {
                                         let ptr = self.fresh();
-                                        self.push_node(InstrNode::new(Inst::Alloca {
+                                        self.push_node(
+                                            InstrNode::new(Inst::Alloca {
                                                 ty: pty.clone(),
                                                 count: None,
                                                 align: None,
@@ -15644,14 +16128,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                             // fields), but keeps the thin-pointer invariant local.
                                             if matches!(self.map_ty(expr_ty), Ty::Ptr) {
                                                 let off_val = self.fresh();
-                                                self.push_node(InstrNode::new(Inst::Const {
+                                                self.push_node(
+                                                    InstrNode::new(Inst::Const {
                                                         ty: Ty::I64,
                                                         value: Constant::Int(off as i128),
                                                     })
                                                     .with_result(off_val),
                                                 );
                                                 let iptr = self.fresh();
-                                                self.push_node(InstrNode::new(Inst::GEP {
+                                                self.push_node(
+                                                    InstrNode::new(Inst::GEP {
                                                         pointee_ty: Ty::I8,
                                                         base: pv,
                                                         indices: vec![off_val],
@@ -15698,6 +16184,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         //     call → `NotRun`. `lower_expr(arg)` failing records its own precise gap and
                         //     falls through to the tag below (masking, unchanged).
                         let arg_ty = self.map_ty(self.thir.exprs[arg].ty);
+                        // Trust (wave-B4.3): PURE-VALUE aggregates of scalars join the
+                        // admission — the same Alloca+Store snapshot over the aggregate SSA
+                        // value (wave-CF already round-trips `Ty::Tuple` through a slot).
+                        // This is the majority class of the pre-registered assert-machinery
+                        // population (65 of 99 bodies on the locked corpus: `&f(...)` and
+                        // `&STRUCT_LITERAL` rvalue borrows in assert_eq!/assert_ne!). The
+                        // soundness argument is UNCHANGED from the scalar case above: the
+                        // ptr enters `borrow_ptrs` only, escape guards fail closed, and the
+                        // only non-failing use round-trips the exact stored value.
                         if matches!(
                             arg_ty,
                             Ty::Bool
@@ -15716,11 +16211,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 | Ty::Char
                                 | Ty::F32
                                 | Ty::F64
-                        ) {
+                        ) || self.snapshotable_aggregate_pointee(&arg_ty)
+                        {
                             if let Some(cval) = self.lower_expr(arg) {
                                 if !self.is_borrow_ptr(cval) {
                                     let ptr = self.fresh();
-                                    self.push_node(InstrNode::new(Inst::Alloca {
+                                    self.push_node(
+                                        InstrNode::new(Inst::Alloca {
                                             ty: arg_ty.clone(),
                                             count: None,
                                             align: None,
@@ -15745,8 +16242,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // value the wave-CE read arm produces, so every currently-accepted borrow
                         // stays byte-identical) and BEFORE the tag, so this can only fire on
                         // shapes that reach the reject below today.
-                        if let Some(v) =
-                            self.try_lower_upvar_shared_borrow(expr_span, expr_ty, arg)
+                        if let Some(v) = self.try_lower_upvar_shared_borrow(expr_span, expr_ty, arg)
                         {
                             return Some(v);
                         }
@@ -15754,6 +16250,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             .push((format!("{expr_span:?}"), "Borrow(non-local place)"));
                         return None;
                     }
+                    // Demoted to NotAPlace in the shared_target hoist above; the type cannot
+                    // carry that fact.
+                    ReborrowTarget::FieldOfLocal { .. } => unreachable!(
+                        "FieldOfLocal is resolved or demoted before this match (wave-NB hoist)"
+                    ),
                 };
                 // The local's CURRENT value + declared `Ty`. A memory-PROMOTED local (it is
                 // `&mut`-borrowed elsewhere in the body) lives in its slot, not the SSA env —
@@ -15764,7 +16265,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     match (self.promoted_slot(var), self.promoted_ty(var)) {
                         (Some(slot), Some(pty)) => {
                             let cur = self.fresh();
-                            self.push_node(InstrNode::new(Inst::Load {
+                            self.push_node(
+                                InstrNode::new(Inst::Load {
                                     ty: pty.clone(),
                                     ptr: slot,
                                     volatile: false,
@@ -15806,25 +16308,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         }
                     }
                 };
-                // Only borrow scalars: the slot store/load round-trips a scalar value through memory.
-                // Aggregates/pointers as pointees are out of scope (fail-closed).
-                if !matches!(
-                    pointee_ty,
-                    Ty::Bool
-                        | Ty::I8
-                        | Ty::I16
-                        | Ty::I32
-                        | Ty::I64
-                        | Ty::I128
-                        | Ty::U8
-                        | Ty::U16
-                        | Ty::U32
-                        | Ty::U64
-                        | Ty::U128
-                        | Ty::Isize
-                        | Ty::Usize
-                        | Ty::Char
-                ) {
+                // Only borrow scalars — and (wave-B4.3) PURE-VALUE aggregates of scalars:
+                // the slot store/load round-trips the whole SSA value through memory either
+                // way (the wave-CF closure-env lane already stores/loads `Ty::Tuple` through
+                // an `Alloca` slot, so the Inst support is measured, not hoped). The
+                // pre-registered population is the assert_eq!/assert_ne! machinery over
+                // struct/tuple operands — 99 bodies on the locked corpus whose EVERY blocker
+                // sits in that expansion (scripts/trust_ir_b4_classifier.py; the tuple-match
+                // side is wave-27's fast-path, which already binds the borrow ptrs, so this
+                // gate was the whole chain). Pointer-carrying and NESTED aggregates stay
+                // fail-closed below — a `Ty::Ptr` smuggled through the slot would escape the
+                // immediate-deref-only contract exactly as `Borrow(of a borrow ptr)` refuses
+                // at top level.
+                if !(is_scalar_ty(&pointee_ty)
+                    // Trust (wave-FD): float LOCALS — wave-SB's rvalue arm has
+                    // admitted F32/F64 from the start; the local arm never did,
+                    // an asymmetry with no argument behind it.
+                    || matches!(pointee_ty, Ty::F32 | Ty::F64)
+                    || self.snapshotable_aggregate_pointee(&pointee_ty))
+                {
                     self.unsupported.push((format!("{expr_span:?}"), "Borrow(non-scalar pointee)"));
                     return None;
                 }
@@ -15835,7 +16337,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     return None;
                 }
                 let ptr = self.fresh();
-                self.push_node(InstrNode::new(Inst::Alloca {
+                self.push_node(
+                    InstrNode::new(Inst::Alloca {
                         ty: pointee_ty.clone(),
                         count: None,
                         align: None,
@@ -15912,6 +16415,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     Ty::Bool | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128
                         | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128
                         | Ty::Isize | Ty::Usize | Ty::Char
+                    // Trust (wave-FD): FLOAT pointees. Wave-SB has always stored
+                    // F32/F64 through its snapshot slot, but nothing could ever
+                    // read one back — this list omitted them, so every float
+                    // `assert_eq!` died at `*left_val` with Deref(non-scalar
+                    // pointee). A float Load is the same scalar round-trip the
+                    // store already performs.
+                    | Ty::F32 | Ty::F64
                     // Trust (B2-2): a FAT-POINTER pointee (`*r` where `r: &&str`/`&&[T]`)
                     // Loads the 16-byte two-lane fat value — the interpreter's B2
                     // memory arms execute it (byte layout + decode). Pre-B2 the same
@@ -15921,7 +16431,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // TraitObject pointee (`**r` on `&&dyn`) is excluded this slice —
                     // no legitimate dyn fat value can reach memory yet (construction
                     // is fail-closed), so admitting it would only ever Load garbage.
-                    | Ty::FatPtr(trust_ir::FatPtrKind::Slice(_) | trust_ir::FatPtrKind::Str)
+                    // ContainerLen (v38) joins the length-metadata kinds, and this is
+                    // PARITY not expansion: the final `|| matches!(pointee_ty,
+                    // Ty::Struct(_) | Ty::Tuple(_))` below already admitted this exact
+                    // class while the spelling was an anonymous `(ptr, i64)` tuple.
+                    | Ty::FatPtr(
+                        trust_ir::FatPtrKind::Slice(_)
+                            | trust_ir::FatPtrKind::Str
+                            | trust_ir::FatPtrKind::ContainerLen,
+                    )
                     // Trust (B3-2a): a FIRST-CLASS enum pointee (`*r` on `&E`) — the
                     // B2-2 lesson replayed on the new type: pre-flip these pointees
                     // rode the legacy Tuple admission; the interpreter round-trips
@@ -15934,7 +16452,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     return None;
                 }
                 let res = self.fresh();
-                self.push_node(InstrNode::new(Inst::Load {
+                self.push_node(
+                    InstrNode::new(Inst::Load {
                         ty: pointee_ty,
                         ptr,
                         volatile: false,
@@ -16021,14 +16540,17 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // computes `!raw` then masks to width); only the bool case needs the `Select` form.
                 if matches!(op, MirUnOp::Not) && ty == Ty::Bool {
                     let false_const = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
                             .with_result(false_const),
                     );
                     let true_const = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                             .with_result(true_const),
                     );
-                    self.push_node(InstrNode::new(Inst::Select {
+                    self.push_node(
+                        InstrNode::new(Inst::Select {
                             ty: Ty::Bool,
                             cond: operand,
                             then_val: false_const,
@@ -16046,14 +16568,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 if matches!(op, MirUnOp::Neg) && !is_float && self.tcx.sess.overflow_checks() {
                     if let Some(min) = int_min_value(&ty) {
                         let min_c = self.fresh();
-                        self.push_node(InstrNode::new(Inst::Const {
+                        self.push_node(
+                            InstrNode::new(Inst::Const {
                                 ty: ty.clone(),
                                 value: Constant::Int(min),
                             })
                             .with_result(min_c),
                         );
                         let ok = self.fresh();
-                        self.push_node(InstrNode::new(Inst::ICmp {
+                        self.push_node(
+                            InstrNode::new(Inst::ICmp {
                                 op: ICmpOp::Ne,
                                 ty: ty.clone(),
                                 lhs: operand,
@@ -16061,7 +16585,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             })
                             .with_result(ok),
                         );
-                        self.push_node(InstrNode::new(Inst::Assert { cond: ok })
+                        self.push_node(
+                            InstrNode::new(Inst::Assert { cond: ok })
                                 .with_proof(ProofAnnotation::NoOverflow),
                         );
                     } else {
@@ -16227,11 +16752,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             // outside the closed structural grammar — nominal types, whose
                             // generics-erased names would merge distinct vtables) falls back
                             // to the slice-2 per-site symbolic carrier, byte-identically.
-                            let metadata = self
-                                .emit_vtable_identity_load(expr_ty, src_ty)
-                                .unwrap_or_else(|| {
-                                    self.emit_symbolic_opaque_load(Ty::Ptr, "unsize-dyn-vtable")
-                                });
+                            let metadata =
+                                self.emit_vtable_identity_load(expr_ty, src_ty).unwrap_or_else(
+                                    || self.emit_symbolic_opaque_load(Ty::Ptr, "unsize-dyn-vtable"),
+                                );
                             let fat = self.fresh();
                             self.push_node(
                                 InstrNode::new(Inst::PtrFromParts {
@@ -16307,7 +16831,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     Ok(resolved) => {
                         let func_id = self.admit_callee(resolved);
                         let res = self.fresh();
-                        self.push_node(InstrNode::new(Inst::Const {
+                        self.push_node(
+                            InstrNode::new(Inst::Const {
                                 ty: fnptr_ty,
                                 value: Constant::FnDef(func_id),
                             })
@@ -16341,7 +16866,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // adapter budget — falls through to the SAME tag this arm always pushed, so the
             // census reads as "still blocked" for exactly the bodies that are.
             ExprKind::PointerCoercion {
-                cast: cast @ PointerCoercion::ClosureFnPointer(_), source, ..
+                cast: cast @ PointerCoercion::ClosureFnPointer(_),
+                source,
+                ..
             } => match self.lower_closure_fn_pointer(expr_ty, *source) {
                 Some(v) => Some(v),
                 None => {
@@ -16350,7 +16877,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     None
                 }
             },
-            ExprKind::PointerCoercion { cast: cast @ PointerCoercion::MutToConstPointer, .. } => {
+            ExprKind::PointerCoercion {
+                cast: cast @ PointerCoercion::MutToConstPointer, ..
+            } => {
                 let tag = pointer_coercion_refusal_tag(*cast);
                 self.unsupported.push((format!("{expr_span:?}"), tag));
                 None
@@ -16449,7 +16978,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     return None;
                 }
                 let res = self.fresh();
-                self.push_node(InstrNode::new(Inst::Cast { op: cast_op, src_ty, dst_ty, operand })
+                self.push_node(
+                    InstrNode::new(Inst::Cast { op: cast_op, src_ty, dst_ty, operand })
                         .with_result(res),
                 );
                 Some(res)
@@ -16599,7 +17129,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                 }
                 let mut agg = self.fresh();
-                self.push_node(InstrNode::new(Inst::Const {
+                self.push_node(
+                    InstrNode::new(Inst::Const {
                         ty: env_ty.clone(),
                         value: Constant::Aggregate(seed_consts),
                     })
@@ -16614,7 +17145,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         return None;
                     };
                     let next = self.fresh();
-                    self.push_node(InstrNode::new(Inst::InsertField {
+                    self.push_node(
+                        InstrNode::new(Inst::InsertField {
                             ty: env_ty.clone(),
                             aggregate: agg,
                             field: i as u32,
@@ -16722,7 +17254,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 let overflowed = self.fresh();
                 // `Inst::Overflow` → (result, overflowed: bool). `ty` carries the integer
                 // width+signedness the interpreter needs to decide overflow.
-                self.push_node(InstrNode::new(Inst::Overflow { op: ov, ty: ty.clone(), lhs: l, rhs: r })
+                self.push_node(
+                    InstrNode::new(Inst::Overflow { op: ov, ty: ty.clone(), lhs: l, rhs: r })
                         .with_results([res, overflowed]),
                 );
                 // Assert no overflow, mirroring MIR's `assert(overflowed == false)`. We need the
@@ -16733,7 +17266,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `Select(overflowed ? false : true)`, which is interpretable and gives the same
                 // trap-iff-overflow semantics as MIR's overflow assert.
                 let ok = self.emit_bool_not(overflowed);
-                self.push_node(InstrNode::new(Inst::Assert { cond: ok })
+                self.push_node(
+                    InstrNode::new(Inst::Assert { cond: ok })
                         .with_proof(ProofAnnotation::NoOverflow),
                 );
                 return Some(res);
@@ -16745,14 +17279,17 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // `Assert(rhs != 0)` — MIR computes `is_zero = Eq(rhs, 0)` and asserts it FALSE; the
             // `Ne` form is the same predicate with the interpretable polarity (no bool negation).
             let zero_c = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(0) })
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(0) })
                     .with_result(zero_c),
             );
             let nonzero = self.fresh();
-            self.push_node(InstrNode::new(Inst::ICmp { op: ICmpOp::Ne, ty: ty.clone(), lhs: r, rhs: zero_c })
+            self.push_node(
+                InstrNode::new(Inst::ICmp { op: ICmpOp::Ne, ty: ty.clone(), lhs: r, rhs: zero_c })
                     .with_result(nonzero),
             );
-            self.push_node(InstrNode::new(Inst::Assert { cond: nonzero })
+            self.push_node(
+                InstrNode::new(Inst::Assert { cond: nonzero })
                     .with_proof(ProofAnnotation::DivNonZero),
             );
             if signed {
@@ -16761,15 +17298,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // defensive only (an unsigned `ty` cannot reach here with `signed` set).
                 if let Some(min) = int_min_value(&ty) {
                     let neg1_c = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(-1) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(-1) })
                             .with_result(neg1_c),
                     );
                     let min_c = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(min) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(min) })
                             .with_result(min_c),
                     );
                     let not_neg1 = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ICmp {
+                    self.push_node(
+                        InstrNode::new(Inst::ICmp {
                             op: ICmpOp::Ne,
                             ty: ty.clone(),
                             lhs: r,
@@ -16778,7 +17318,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         .with_result(not_neg1),
                     );
                     let not_min = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ICmp {
+                    self.push_node(
+                        InstrNode::new(Inst::ICmp {
                             op: ICmpOp::Ne,
                             ty: ty.clone(),
                             lhs: l,
@@ -16789,11 +17330,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // Disjunction via `Select` (bool `BinOp::Or` is not interpretable):
                     // `ok = not_neg1 ? true : not_min`.
                     let true_c = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                    self.push_node(
+                        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                             .with_result(true_c),
                     );
                     let ok = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Select {
+                    self.push_node(
+                        InstrNode::new(Inst::Select {
                             ty: Ty::Bool,
                             cond: not_neg1,
                             then_val: true_c,
@@ -16801,13 +17344,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         })
                         .with_result(ok),
                     );
-                    self.push_node(InstrNode::new(Inst::Assert { cond: ok })
+                    self.push_node(
+                        InstrNode::new(Inst::Assert { cond: ok })
                             .with_proof(ProofAnnotation::NoOverflow),
                     );
                 }
             }
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::BinOp { op: map_binop(op, signed), ty, lhs: l, rhs: r })
+            self.push_node(
+                InstrNode::new(Inst::BinOp { op: map_binop(op, signed), ty, lhs: l, rhs: r })
                     .with_result(res),
             );
             return Some(res);
@@ -16842,7 +17387,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                 };
                 let cast = self.fresh();
-                self.push_node(InstrNode::new(Inst::Cast {
+                self.push_node(
+                    InstrNode::new(Inst::Cast {
                         op: CastOp::Bitcast,
                         src_ty: rhs_ty.clone(),
                         dst_ty: u_ty.clone(),
@@ -16857,11 +17403,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // `is_int` guarantees `int_scalar_bits(&ty)` is `Some`; 0 is the defensive fallback.
             let lhs_bits = int_scalar_bits(&ty).map(|(b, _)| b).unwrap_or(0) as i128;
             let bits_c = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty: u_ty.clone(), value: Constant::Int(lhs_bits) })
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: u_ty.clone(), value: Constant::Int(lhs_bits) })
                     .with_result(bits_c),
             );
             let inbounds = self.fresh();
-            self.push_node(InstrNode::new(Inst::ICmp {
+            self.push_node(
+                InstrNode::new(Inst::ICmp {
                     op: ICmpOp::Ult,
                     ty: u_ty.clone(),
                     lhs: amount_u,
@@ -16869,7 +17417,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 })
                 .with_result(inbounds),
             );
-            self.push_node(InstrNode::new(Inst::Assert { cond: inbounds })
+            self.push_node(
+                InstrNode::new(Inst::Assert { cond: inbounds })
                     .with_proof(ProofAnnotation::ShiftInRange),
             );
             // Trust: the shift `BinOp`'s AMOUNT must be typed `ty` — trust-ir's `eval_binop`
@@ -16896,7 +17445,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             };
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::BinOp {
+            self.push_node(
+                InstrNode::new(Inst::BinOp {
                     op: map_binop(op, signed),
                     ty,
                     lhs: l,
@@ -16928,7 +17478,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // Bitwise ops and every overflow-checks-off path: the plain wrapping `BinOp` (MIR's `_`
         // arm in `build_binary_op`).
         let res = self.fresh();
-        self.push_node(InstrNode::new(Inst::BinOp { op: map_binop(op, signed), ty, lhs: l, rhs: r })
+        self.push_node(
+            InstrNode::new(Inst::BinOp { op: map_binop(op, signed), ty, lhs: l, rhs: r })
                 .with_result(res),
         );
         Some(res)
@@ -16987,7 +17538,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         };
         let res = self.fresh();
-        self.push_node(InstrNode::new(Inst::BinOp { op: fop, ty, lhs: l, rhs: r }).with_result(res));
+        self.push_node(
+            InstrNode::new(Inst::BinOp { op: fop, ty, lhs: l, rhs: r }).with_result(res),
+        );
         Some(res)
     }
 
@@ -16997,15 +17550,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// form is the producer's canonical `!b`.
     fn emit_bool_not(&mut self, cond: ValueId) -> ValueId {
         let false_const = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
                 .with_result(false_const),
         );
         let true_const = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                 .with_result(true_const),
         );
         let res = self.fresh();
-        self.push_node(InstrNode::new(Inst::Select {
+        self.push_node(
+            InstrNode::new(Inst::Select {
                 ty: Ty::Bool,
                 cond,
                 then_val: false_const,
@@ -17080,7 +17636,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
             // Read-modify-write through the slot: Load, checked binop, Store.
             let cur = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load { ty: ty.clone(), ptr, volatile: false, align: None })
+            self.push_node(
+                InstrNode::new(Inst::Load { ty: ty.clone(), ptr, volatile: false, align: None })
                     .with_result(cur),
             );
             let result =
@@ -17151,7 +17708,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
             let agg = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load {
+            self.push_node(
+                InstrNode::new(Inst::Load {
                     ty: struct_ty.clone(),
                     ptr,
                     volatile: false,
@@ -17160,13 +17718,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 .with_result(agg),
             );
             let cur = self.fresh();
-            self.push_node(InstrNode::new(Inst::ExtractField { ty: ty.clone(), aggregate: agg, field })
+            self.push_node(
+                InstrNode::new(Inst::ExtractField { ty: ty.clone(), aggregate: agg, field })
                     .with_result(cur),
             );
             let result =
                 self.emit_arith_binop(span, bin_op, ty.clone(), signed, rhs_rty, cur, r)?;
             let newagg = self.fresh();
-            self.push_node(InstrNode::new(Inst::InsertField {
+            self.push_node(
+                InstrNode::new(Inst::InsertField {
                     ty: struct_ty.clone(),
                     aggregate: agg,
                     field,
@@ -17278,7 +17838,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
             // Load the root, extract DOWN to the leaf's parent aggregate.
             let root = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load {
+            self.push_node(
+                InstrNode::new(Inst::Load {
                     ty: struct_ty.clone(),
                     ptr,
                     volatile: false,
@@ -17289,7 +17850,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let mut aggs: Vec<ValueId> = vec![root];
             for i in 0..chain.len() - 1 {
                 let sub = self.fresh();
-                self.push_node(InstrNode::new(Inst::ExtractField {
+                self.push_node(
+                    InstrNode::new(Inst::ExtractField {
                         ty: agg_tys[i + 1].clone(),
                         aggregate: aggs[i],
                         field: chain[i].1,
@@ -17300,7 +17862,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
             // Extract the leaf scalar, apply the checked binop, then re-insert the result UP the chain.
             let cur = self.fresh();
-            self.push_node(InstrNode::new(Inst::ExtractField {
+            self.push_node(
+                InstrNode::new(Inst::ExtractField {
                     ty: ty.clone(),
                     aggregate: aggs[chain.len() - 1],
                     field: chain[chain.len() - 1].1,
@@ -17312,7 +17875,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let mut newval = result;
             for i in (0..chain.len()).rev() {
                 let next = self.fresh();
-                self.push_node(InstrNode::new(Inst::InsertField {
+                self.push_node(
+                    InstrNode::new(Inst::InsertField {
                         ty: agg_tys[i].clone(),
                         aggregate: aggs[i],
                         field: chain[i].1,
@@ -17365,7 +17929,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             };
             let cur = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load {
+            self.push_node(
+                InstrNode::new(Inst::Load {
                     ty: slot_ty.clone(),
                     ptr: slot,
                     volatile: false,
@@ -17619,29 +18184,29 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // its own DefId alone, and sharing the ledger keeps ONE symbolic-body rule for both
         // lanes (`Lowered::symbolic` is `!symbolic_consts.is_empty()`).
         let args = ty::List::empty();
-        let global = match self.symbolic_consts.iter().find(|(d, a, _)| *d == def_id && a.is_empty())
-        {
-            Some((_, _, g)) => *g,
-            None => {
-                let idx = self.pending_globals.len();
-                let name = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
-                    "__trust_constparam_{idx}__{}",
-                    self.tcx.def_path_str(def_id)
-                ));
-                self.pending_globals.push(Global {
-                    name,
-                    ty: ty.clone(),
-                    mutable: false,
-                    initializer: None,
-                    linkage: Linkage::External,
-                    tls: None,
-                    align: None,
-                });
-                let g = GlobalId::new(idx as u32);
-                self.symbolic_consts.push((def_id, args, g));
-                g
-            }
-        };
+        let global =
+            match self.symbolic_consts.iter().find(|(d, a, _)| *d == def_id && a.is_empty()) {
+                Some((_, _, g)) => *g,
+                None => {
+                    let idx = self.pending_globals.len();
+                    let name = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
+                        "__trust_constparam_{idx}__{}",
+                        self.tcx.def_path_str(def_id)
+                    ));
+                    self.pending_globals.push(Global {
+                        name,
+                        ty: ty.clone(),
+                        mutable: false,
+                        initializer: None,
+                        linkage: Linkage::External,
+                        tls: None,
+                        align: None,
+                    });
+                    let g = GlobalId::new(idx as u32);
+                    self.symbolic_consts.push((def_id, args, g));
+                    g
+                }
+            };
         let ptr = self.fresh();
         self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
         let res = self.fresh();
@@ -17705,9 +18270,63 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "StaticRef(self-referential static)"));
             return None;
         }
-        // LOCAL statics are otherwise admitted here (unlike local CONSTS): `lower_named_const`'s
-        // E0391 hazard is specific to inline/anon consts, which are CHILDREN of the body being
-        // built. The read below uses `eval_static_initializer`, which is the query
+        // Trust (LANE 1, the `library/core` step-ZERO blocker): a LOCAL static FAILS CLOSED.
+        //
+        // The reentrancy STACK above is necessary but NOT sufficient, and the comment that used to
+        // stand here said the opposite: "LOCAL statics are otherwise admitted here (unlike local
+        // CONSTS): `lower_named_const`'s E0391 hazard is specific to inline/anon consts, which are
+        // CHILDREN of the body being built." Both halves are false, and each was measured:
+        //
+        //   (a) NESTED BODIES. `eval_static_initializer(S)` demands `mir_for_ctfe(S)` ->
+        //       `mir_borrowck(S)`, and borrowck descends into every closure / const block inside
+        //       S's initializer, demanding THEIR `mir_built`. So lowering a body NESTED in S's
+        //       initializer re-enters via a def the stack has never seen — `LOWERING_BODIES` holds
+        //       `{closure#0}`, not `S`. This is exactly `core::task::wake`:
+        //           static VTABLE: RawWakerVTable =
+        //               RawWakerVTable::new(|this| RawWaker::new(this, &VTABLE), ..);
+        //       `Waker::from_fn_ptr` (wake.rs:596) and `LocalWaker::from_fn_ptr` (:913). Those two
+        //       `#[unstable]` functions turned the whole of `library/core` into a hard error[E0391]
+        //       with ZERO obligations evaluated, and `trust.toml` cannot narrow scope
+        //       (docs/design/2026-08-20-core-slice-blocker-histogram.md §0.1, §6, work item 0).
+        //
+        //   (b) NO NESTING AT ALL. CTFE of S's initializer CALLS const fns, and each demands its
+        //       own `mir_built`. Two sibling module-level items with no ancestry between them
+        //       cycle just as well:
+        //           static S: u32 = g();
+        //           const fn g() -> u32 { let _p: *const u32 = &S; 7 }
+        //       Vanilla rustc compiles that file; `-Ztrust-ir-lower=on` makes it E0391. So no
+        //       ancestor/def-path rule can be complete either — the demanded-`mir_built` set of
+        //       `eval_static_initializer` is the CTFE reachability set, which is not a shape.
+        //
+        // The rule that IS complete is locality, and it is the rule this lane's own siblings
+        // already follow: `eval_nonlocal_scalar_const`, `lower_named_const` and
+        // `lower_composite_named_const` all refuse to CTFE a LOCAL def from inside
+        // `mir_built` — the scalar/composite legs defer it to the crate-finalize seam, where
+        // `crate_module::finalize_and_dump` evaluates it after `run_required_analyses` has forced
+        // `mir_built` for every body owner. A NON-LOCAL static cannot cycle: its provider is the
+        // metadata decoder (`rustc_metadata::rmeta::decoder::cstore_impl`, the
+        // `eval_static_initializer` table), which decodes an already-computed `ConstAllocation`
+        // and demands no local query at all.
+        //
+        // This is a DECLINE, not a skip: it pushes a precise `unsupported` tag, so the body is
+        // recorded as a coverage gap (and is a hard `span_err` under `-Ztrust-ir-lower=strict`),
+        // it is refused by the flip registry and by both differentials, and nothing about it reads
+        // as "lowered clean". The value model is what is withheld, never an obligation.
+        //
+        // FOLLOW-UP (coverage, not soundness): the local case can be RECOVERED the way the scalar,
+        // composite and `&str` const legs recover theirs — defer to `resolve_pending_consts` and
+        // patch the global's initializer at the seam, exactly as the wave-SC `str_global` leg
+        // patches its bytes global (`crate_module::resolve_pending_consts` + the positive
+        // `check_str_global_ledger` tripwire that stops an unpatched placeholder reading as a real
+        // value). Until that lands, a local static read is an honest, tagged gap.
+        if def_id.is_local() {
+            self.unsupported.push((
+                format!("{span:?}"),
+                "StaticRef(local static: CTFE deferral not implemented)",
+            ));
+            return None;
+        }
+        // The read below uses `eval_static_initializer`, which is the query
         // designed for statics — NOT `const_eval_poly`, which asserts against statics outright
         // ("statics are conceptually places, not values -- so what we do here could break
         // pointer identity", rustc_const_eval eval_queries.rs). An eval error declines below.
@@ -17921,7 +18540,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let ptr = self.fresh();
             self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load { ty, ptr, volatile: false, align: None })
+            self.push_node(
+                InstrNode::new(Inst::Load { ty, ptr, volatile: false, align: None })
                     .with_result(res),
             );
             return Some(res);
@@ -17982,7 +18602,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if def_id.is_local() {
             if !self.tcx.is_type_const(def_id) && args.iter().all(|a| a.as_region().is_some()) {
                 let res = self.fresh();
-                self.push_node(InstrNode::new(Inst::Const { ty, value: Constant::PhantomData })
+                self.push_node(
+                    InstrNode::new(Inst::Const { ty, value: Constant::PhantomData })
                         .with_result(res),
                 );
                 self.pending_consts.push(PendingConst {
@@ -18031,7 +18652,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             };
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(b) })
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(b) })
                     .with_result(res),
             );
             return Some(res);
@@ -18081,7 +18703,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
             };
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty, value: Constant::Float(v) }).with_result(res),
+            self.push_node(
+                InstrNode::new(Inst::Const { ty, value: Constant::Float(v) }).with_result(res),
             );
             return Some(res);
         }
@@ -18321,7 +18944,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // struct/enum tables. Same all-region/mgca gates as the scalar leg.
             if !self.tcx.is_type_const(def_id) && args.iter().all(|a| a.as_region().is_some()) {
                 let res = self.fresh();
-                self.push_node(InstrNode::new(Inst::Const { ty, value: Constant::PhantomData })
+                self.push_node(
+                    InstrNode::new(Inst::Const { ty, value: Constant::PhantomData })
                         .with_result(res),
                 );
                 self.pending_consts.push(PendingConst {
@@ -18774,6 +19398,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // immutable, non-thread-local and `Freeze` — under those gates the initial bytes are the
         // value for all time.
         let _ = span;
+        // LOCAL statics: fail closed, for the same reason the twin does
+        // (`eval_nonlocal_scalar_const` below: "LOCAL consts: fail closed (no global-initializer
+        // deferral; re-entrancy risk)").
+        // The doc above says this helper is the twin's "args-free" version and that they share a
+        // decode "so the two lanes can never drift apart" — but the twin's LOCALITY gate was the
+        // one thing that did not come across, and that omission is the `library/core` E0391 (see
+        // `lower_static_ref`'s call site for the two measured cycle shapes). This is defense in
+        // depth: the call site already declines, so no reachable caller can arrive here with a
+        // local def. It stays because the whole class is "a future caller forces CTFE from inside
+        // `mir_built`", and a guard only at the call site is one refactor away from being gone.
+        if def_id.is_local() {
+            return None;
+        }
         let alloc = self.tcx.eval_static_initializer(def_id).ok()?;
         let inner = alloc.inner();
         let ty = self.map_ty(rty);
@@ -19003,7 +19640,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         };
         let res = self.fresh();
         let elem_tid = self.pend_ty(elem_ty);
-        self.push_node(InstrNode::new(Inst::Const {
+        self.push_node(
+            InstrNode::new(Inst::Const {
                 ty: Ty::Array(elem_tid, n),
                 value: Constant::Array(vec![c; n as usize]),
             })
@@ -19051,7 +19689,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         };
         let mut agg = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const {
+        self.push_node(
+            InstrNode::new(Inst::Const {
                 ty: array_ty.clone(),
                 value: Constant::Aggregate(seed_consts),
             })
@@ -19059,7 +19698,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         );
         for (i, val) in elem_vals.iter().enumerate() {
             let next = self.fresh();
-            self.push_node(InstrNode::new(Inst::InsertField {
+            self.push_node(
+                InstrNode::new(Inst::InsertField {
                     ty: array_ty.clone(),
                     aggregate: agg,
                     field: i as u32,
@@ -19100,7 +19740,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return None;
         };
         let mut agg = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const {
+        self.push_node(
+            InstrNode::new(Inst::Const {
                 ty: array_ty.clone(),
                 value: Constant::Array(vec![zero; elem_vals.len()]),
             })
@@ -19108,14 +19749,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         );
         for (i, val) in elem_vals.iter().enumerate() {
             let idx = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const {
-                    ty: Ty::I64,
-                    value: Constant::Int(i as i128),
-                })
-                .with_result(idx),
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(i as i128) })
+                    .with_result(idx),
             );
             let next = self.fresh();
-            self.push_node(InstrNode::new(Inst::InsertElement {
+            self.push_node(
+                InstrNode::new(Inst::InsertElement {
                     ty: array_ty.clone(),
                     array: agg,
                     index: idx,
@@ -19143,26 +19783,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let v = self.fresh();
         if first_class_array {
             let idx_val = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const {
-                    ty: Ty::I64,
-                    value: Constant::Int(i128::from(idx)),
-                })
-                .with_result(idx_val),
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(i128::from(idx)) })
+                    .with_result(idx_val),
             );
-            self.push_node(InstrNode::new(Inst::ExtractElement {
-                    ty: ty.clone(),
-                    array: agg,
-                    index: idx_val,
-                })
-                .with_result(v),
+            self.push_node(
+                InstrNode::new(Inst::ExtractElement { ty: ty.clone(), array: agg, index: idx_val })
+                    .with_result(v),
             );
         } else {
-            self.push_node(InstrNode::new(Inst::ExtractField {
-                    ty: ty.clone(),
-                    aggregate: agg,
-                    field: idx,
-                })
-                .with_result(v),
+            self.push_node(
+                InstrNode::new(Inst::ExtractField { ty: ty.clone(), aggregate: agg, field: idx })
+                    .with_result(v),
             );
         }
         v
@@ -19231,7 +19863,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             // `Ty::FatPtr(Slice(U8))` — canonical U64 length +
                             // `PtrFromParts` (the tuple chain retires for this lane).
                             let len_val = self.fresh();
-                            self.push_node(InstrNode::new(Inst::Const {
+                            self.push_node(
+                                InstrNode::new(Inst::Const {
                                     ty: Ty::U64,
                                     value: Constant::Int(bytes.len() as i128),
                                 })
@@ -19347,7 +19980,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // Lower the literal as a value (the `ExprKind::Array`/`Repeat` arm).
         let arr_val = self.lower_expr(arr_expr)?;
         let data_ptr = self.fresh();
-        self.push_node(InstrNode::new(Inst::Alloca { ty: array_ty.clone(), count: None, align: None })
+        self.push_node(
+            InstrNode::new(Inst::Alloca { ty: array_ty.clone(), count: None, align: None })
                 .with_result(data_ptr),
         );
         self.push_node(InstrNode::new(Inst::Store {
@@ -19358,7 +19992,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             align: None,
         }));
         let len_val = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(len as i128) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(len as i128) })
                 .with_result(len_val),
         );
         self.build_slice_fat_value(elem_ty, data_ptr, len_val)
@@ -19436,7 +20071,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
         // Alloca + Store the array aggregate; the slot pointer is the REAL data address.
         let data_ptr = self.fresh();
-        self.push_node(InstrNode::new(Inst::Alloca { ty: array_ty.clone(), count: None, align: None })
+        self.push_node(
+            InstrNode::new(Inst::Alloca { ty: array_ty.clone(), count: None, align: None })
                 .with_result(data_ptr),
         );
         self.push_node(InstrNode::new(Inst::Store {
@@ -19450,7 +20086,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // assembled via the FORMAT's own constructor (`PtrFromParts`) at the first-class
         // `Ty::FatPtr(Slice)` type — retiring the tuple seed + InsertField chain here.
         let len_val = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(len as i128) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(len as i128) })
                 .with_result(len_val),
         );
         self.build_slice_fat_value(elem_ty, data_ptr, len_val)
@@ -19470,7 +20107,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let tid = self.pend_ty(elem_ty);
         let fat_ty = Ty::FatPtr(trust_ir::FatPtrKind::Slice(tid));
         let fat = self.fresh();
-        self.push_node(InstrNode::new(Inst::PtrFromParts {
+        self.push_node(
+            InstrNode::new(Inst::PtrFromParts {
                 ptr_ty: fat_ty,
                 metadata_ty: Ty::U64,
                 data: data_ptr,
@@ -19586,7 +20224,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return None;
         }
         let len_u64 = self.fresh();
-        self.push_node(InstrNode::new(Inst::PtrMetadata {
+        self.push_node(
+            InstrNode::new(Inst::PtrMetadata {
                 ptr_ty: fat_ty,
                 metadata_ty: Ty::U64,
                 ptr: slice_val,
@@ -19598,7 +20237,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // was `Trunc` on the grounds that the interpreter treats an equal-width `Trunc` as the
         // identity, but the VALIDATOR rejects it, so those modules were ill-formed.
         let res = self.fresh();
-        self.push_node(InstrNode::new(Inst::Cast {
+        self.push_node(
+            InstrNode::new(Inst::Cast {
                 op: CastOp::Bitcast,
                 src_ty: Ty::U64,
                 dst_ty: result_ty,
@@ -19673,7 +20313,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // Emit as the call's result type (`usize` → `map_ty` → U64). No `Inst::Call`.
         let ty = self.map_ty(expr_ty);
         let res = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty, value: Constant::Int(offset as i128) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty, value: Constant::Int(offset as i128) })
                 .with_result(res),
         );
         Some(res)
@@ -19743,7 +20384,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return None;
         }
         let data_ptr = self.fresh();
-        self.push_node(InstrNode::new(Inst::PtrData { ptr_ty: fat_ty, ptr: slice_val }).with_result(data_ptr),
+        self.push_node(
+            InstrNode::new(Inst::PtrData { ptr_ty: fat_ty, ptr: slice_val }).with_result(data_ptr),
         );
         // Lower the index. GEP scales each index by `byte_size(elem_ty)`, so the index value must be an
         // integer in the same domain — `usize` maps to a fixed-width int, which is what we want.
@@ -19760,7 +20402,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
         // GEP to element `index`: base + index * size_of(elem_ty).
         let elem_ptr = self.fresh();
-        self.push_node(InstrNode::new(Inst::GEP {
+        self.push_node(
+            InstrNode::new(Inst::GEP {
                 pointee_ty: elem_ty.clone(),
                 base: data_ptr,
                 indices: vec![idx_val],
@@ -19770,7 +20413,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         );
         // Load the element (an OOB address traps here — MIR's bounds-check panic equivalent).
         let res = self.fresh();
-        self.push_node(InstrNode::new(Inst::Load { ty: elem_ty, ptr: elem_ptr, volatile: false, align: None })
+        self.push_node(
+            InstrNode::new(Inst::Load { ty: elem_ty, ptr: elem_ptr, volatile: false, align: None })
                 .with_result(res),
         );
         Some(res)
@@ -19869,7 +20513,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let is_some = variant_index.as_u32() == 1;
             self.contains_call = true;
             let res = self.fresh();
-            self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(is_some) })
+            self.push_node(
+                InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(is_some) })
                     .with_result(res),
             );
             self.option_lane_values.push(res);
@@ -20055,7 +20700,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         }
         let mut agg = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: enum_ty.clone(), value: Constant::Aggregate(seed) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: enum_ty.clone(), value: Constant::Aggregate(seed) })
                 .with_result(agg),
         );
         // Insert each payload value over the seed at its positional slot (1 + field
@@ -20063,7 +20709,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         for (i, val) in field_vals.iter().enumerate() {
             let Some(val) = val else { continue };
             let next = self.fresh();
-            self.push_node(InstrNode::new(Inst::InsertField {
+            self.push_node(
+                InstrNode::new(Inst::InsertField {
                     ty: enum_ty.clone(),
                     aggregate: agg,
                     field: (1 + i) as u32,
@@ -20816,8 +21463,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // See `dominating` above: this operand rebound a local from a block that does not
                 // dominate the join. Refuse rather than emit a value whose definition does not
                 // dominate its later reads.
-                self.unsupported
-                    .push((format!("{span:?}"), "LogicalOp(short-circuit operand rebinds a local)"));
+                self.unsupported.push((
+                    format!("{span:?}"),
+                    "LogicalOp(short-circuit operand rebinds a local)",
+                ));
                 return None;
             }
         }
@@ -20933,7 +21582,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // 4. Short-circuit arm: emit the constant `true`/`false`. It always reaches the join.
         self.start_block(short_id, vec![]);
         let const_val = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(constant) })
+        self.push_node(
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(constant) })
                 .with_result(const_val),
         );
         let short_arm = self.capture_arm(span, true, Some(const_val), "LogicalOp(short no value)");
@@ -21221,7 +21871,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return None;
         }
         let tag_val = self.fresh();
-        self.push_node(InstrNode::new(Inst::ExtractField { ty: tag_ty.clone(), aggregate: op_val, field: 0 })
+        self.push_node(
+            InstrNode::new(Inst::ExtractField { ty: tag_ty.clone(), aggregate: op_val, field: 0 })
                 .with_result(tag_val),
         );
 
@@ -21248,7 +21899,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.seal_with(Inst::Br { target: join_id, args: vec![] });
         } else {
             let ok_payload = self.fresh();
-            self.push_node(InstrNode::new(Inst::ExtractField {
+            self.push_node(
+                InstrNode::new(Inst::ExtractField {
                     ty: ok_field_ty.clone(),
                     aggregate: op_val,
                     field: 1,
@@ -21266,7 +21918,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             seeds.push(seed);
         }
         let err_const = self.fresh();
-        self.push_node(InstrNode::new(Inst::Const {
+        self.push_node(
+            InstrNode::new(Inst::Const {
                 ty: Ty::Enum(ret_eid),
                 value: Constant::Aggregate(seeds),
             })
@@ -21274,11 +21927,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         );
         let err_enum = if let Some(err_fty) = err_field_ty {
             let err_payload = self.fresh();
-            self.push_node(InstrNode::new(Inst::ExtractField { ty: err_fty, aggregate: op_val, field: 1 })
+            self.push_node(
+                InstrNode::new(Inst::ExtractField { ty: err_fty, aggregate: op_val, field: 1 })
                     .with_result(err_payload),
             );
             let filled = self.fresh();
-            self.push_node(InstrNode::new(Inst::InsertField {
+            self.push_node(
+                InstrNode::new(Inst::InsertField {
                     ty: Ty::Enum(ret_eid),
                     aggregate: err_const,
                     field: 1,
@@ -21767,7 +22422,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
             let loaded = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load {
+            self.push_node(
+                InstrNode::new(Inst::Load {
                     ty: scrut_ty.clone(),
                     ptr: scrut_val,
                     volatile: false,
@@ -22021,7 +22677,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     self.locals = pre_locals.clone();
                     self.start_block(*lo_blk, vec![]);
                     let lo_c = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
+                    self.push_node(
+                        InstrNode::new(Inst::Const {
                             ty: scrut_ty.clone(),
                             value: integer_constant_from_bits(*lo, scrut_signed, scrut_bits),
                         })
@@ -22029,7 +22686,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     );
                     let lo_le = self.fresh();
                     let le_op = if scrut_signed { ICmpOp::Sle } else { ICmpOp::Ule };
-                    self.push_node(InstrNode::new(Inst::ICmp {
+                    self.push_node(
+                        InstrNode::new(Inst::ICmp {
                             op: le_op,
                             ty: scrut_ty.clone(),
                             lhs: lo_c,
@@ -22049,7 +22707,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     self.locals = pre_locals.clone();
                     self.start_block(*hi_blk, vec![]);
                     let hi_c = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
+                    self.push_node(
+                        InstrNode::new(Inst::Const {
                             ty: scrut_ty.clone(),
                             value: integer_constant_from_bits(*hi, scrut_signed, scrut_bits),
                         })
@@ -22062,7 +22721,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         (false, true) => ICmpOp::Slt,
                         (false, false) => ICmpOp::Ult,
                     };
-                    self.push_node(InstrNode::new(Inst::ICmp {
+                    self.push_node(
+                        InstrNode::new(Inst::ICmp {
                             op: hi_op,
                             ty: scrut_ty.clone(),
                             lhs: scrut_val,
@@ -23269,7 +23929,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 return None;
                             };
                             let agg = self.fresh();
-                            self.push_node(InstrNode::new(Inst::ExtractField {
+                            self.push_node(
+                                InstrNode::new(Inst::ExtractField {
                                     ty: field_ty.clone(),
                                     aggregate: scrut_val,
                                     field: idx,
@@ -23277,7 +23938,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 .with_result(agg),
                             );
                             let tag = self.fresh();
-                            self.push_node(InstrNode::new(Inst::ExtractField {
+                            self.push_node(
+                                InstrNode::new(Inst::ExtractField {
                                     ty: tag_ty.clone(),
                                     aggregate: agg,
                                     field: 0,
@@ -23355,14 +24017,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         .push((format!("{span:?}"), "TupleMatch(non-integer tested field)"));
                     return None;
                 };
-                self.push_node(InstrNode::new(Inst::Const {
+                self.push_node(
+                    InstrNode::new(Inst::Const {
                         ty: field_ty.clone(),
                         value: integer_constant_from_bits(*lit, signed, bits),
                     })
                     .with_result(c),
                 );
                 let ok = self.fresh();
-                self.push_node(InstrNode::new(Inst::ICmp {
+                self.push_node(
+                    InstrNode::new(Inst::ICmp {
                         op: ICmpOp::Eq,
                         ty: field_ty,
                         lhs: field_val,
@@ -23573,9 +24237,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // consequence of the thinness check. FAT half only — the unit half stays
                     // where it already fires on this path (the emitter), so no pre-existing
                     // reject moves.
-                    if let Some(tag) = vfields
-                        .get(sp.field.as_u32() as usize)
-                        .and_then(fat_payload_binding_reject)
+                    if let Some(tag) =
+                        vfields.get(sp.field.as_u32() as usize).and_then(fat_payload_binding_reject)
                     {
                         return Err(tag);
                     }
@@ -23819,7 +24482,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 )
                                 .is_none()
                                 {
-                                    return Err("EnumMatch(nested payload ref outer layout absent)");
+                                    return Err(
+                                        "EnumMatch(nested payload ref outer layout absent)",
+                                    );
                                 }
                                 if declared_variant_field_offset(
                                     enums,
@@ -23829,7 +24494,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 )
                                 .is_none()
                                 {
-                                    return Err("EnumMatch(nested payload ref nested layout absent)");
+                                    return Err(
+                                        "EnumMatch(nested payload ref nested layout absent)",
+                                    );
                                 }
                                 // The two rustc offsets, through the SHARED single-level machinery
                                 // (`layout_query_is_reentrant_safe` gates BOTH `layout_of` calls
@@ -23884,7 +24551,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                     nested_field as usize,
                                     inner_off,
                                 ) {
-                                    return Err("EnumMatch(nested payload ref layout disagreement)");
+                                    return Err(
+                                        "EnumMatch(nested payload ref layout disagreement)",
+                                    );
                                 }
                                 let composed = compose_nested_payload_offset(outer_off, inner_off)?;
                                 nested_binds.push((*var, nested_field, Some(composed)));
@@ -24350,9 +25019,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         if !binds.is_empty() {
                             let already_routed: Vec<usize> =
                                 variant_arms.iter().map(|a| a.0).collect();
-                            if let Some(tag) =
-                                or_payload_alt_claim_reject(&already_routed, v)
-                            {
+                            if let Some(tag) = or_payload_alt_claim_reject(&already_routed, v) {
                                 self.unsupported.push((format!("{span:?}"), tag));
                                 return None;
                             }
@@ -24406,12 +25073,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if !self.promoted.is_empty() {
             // Arm counts are small (bounded by the enum's variant count), so the pairwise scan
             // is cheaper than hashing and needs only `PartialEq` on `ExprId`.
-            let duplicated = variant_arms
-                .iter()
-                .enumerate()
-                .any(|(i, (_, _, _, _, b))| {
-                    variant_arms[..i].iter().any(|(_, _, _, _, previous)| previous == b)
-                });
+            let duplicated = variant_arms.iter().enumerate().any(|(i, (_, _, _, _, b))| {
+                variant_arms[..i].iter().any(|(_, _, _, _, previous)| previous == b)
+            });
             if duplicated {
                 let tag = "EnumMatch(or-arm body duplicated with promoted local)";
                 self.unsupported.push((format!("{span:?}"), tag));
@@ -24442,7 +25106,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
             let loaded = self.fresh();
-            self.push_node(InstrNode::new(Inst::Load {
+            self.push_node(
+                InstrNode::new(Inst::Load {
                     ty: Ty::Enum(eid),
                     ptr: scrut_val0,
                     volatile: false,
@@ -24459,7 +25124,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             scrut_val0
         };
         let tag_val = self.fresh();
-        self.push_node(InstrNode::new(Inst::ExtractField { ty: tag_ty, aggregate: scrut_val, field: 0 })
+        self.push_node(
+            InstrNode::new(Inst::ExtractField { ty: tag_ty, aggregate: scrut_val, field: 0 })
                 .with_result(tag_val),
         );
 
@@ -24951,7 +25617,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // Byte-identical to the pre-L4G path.
                 None => {
                     let bound = self.fresh();
-                    self.push_node(InstrNode::new(Inst::ExtractField {
+                    self.push_node(
+                        InstrNode::new(Inst::ExtractField {
                             ty: field_ty.clone(),
                             aggregate: scrut_val,
                             field: 1 + *field_idx,
@@ -24968,14 +25635,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // memory). The bound local is a thin `Ty::Ptr` (the field is a Sized scalar/thin ref).
                 Some(off) => {
                     let off_val = self.fresh();
-                    self.push_node(InstrNode::new(Inst::Const {
+                    self.push_node(
+                        InstrNode::new(Inst::Const {
                             ty: Ty::I64,
                             value: Constant::Int(*off as i128),
                         })
                         .with_result(off_val),
                     );
                     let iptr = self.fresh();
-                    self.push_node(InstrNode::new(Inst::GEP {
+                    self.push_node(
+                        InstrNode::new(Inst::GEP {
                             pointee_ty: Ty::I8,
                             base: scrut_val0,
                             indices: vec![off_val],
@@ -25399,13 +26068,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// a `&mut local` anywhere in the function forces promotion of that local for its whole lifetime.
     /// (Type-based promotability — only scalar locals are promotable — is enforced at the local's
     /// `let`/param site via `is_scalar_ty`; a non-scalar `&mut` local then fails closed there.)
-    fn collect_mut_borrowed(&self, body: ExprId) -> Vec<LocalVarId> {
+    fn collect_mut_borrowed(&self, body: ExprId) -> (Vec<LocalVarId>, Vec<LocalVarId>) {
         let mut out: Vec<LocalVarId> = Vec::new();
-        self.collect_mut_borrowed_into(body, &mut out);
-        out
+        let mut wanted: Vec<LocalVarId> = Vec::new();
+        self.collect_mut_borrowed_into(body, &mut out, &mut wanted);
+        (out, wanted)
     }
 
-    fn collect_mut_borrowed_into(&self, e: ExprId, out: &mut Vec<LocalVarId>) {
+    fn collect_mut_borrowed_into(
+        &self,
+        e: ExprId,
+        out: &mut Vec<LocalVarId>,
+        wanted: &mut Vec<LocalVarId>,
+    ) {
         match &self.thir.exprs[e].kind {
             ExprKind::Borrow { borrow_kind, arg } => {
                 if matches!(borrow_kind, rustc_middle::mir::BorrowKind::Mut { .. }) {
@@ -25415,81 +26090,100 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         }
                     }
                 }
+                // Trust (wave-NB): ANY borrow of a single-level struct-field place (`&a.b` /
+                // `&mut a.b`) needs the BASE local in memory — a field address cannot be derived
+                // from an SSA value. Shared borrows of a WHOLE local deliberately stay off this
+                // path (the snapshot lane models them without promotion); only the field shape
+                // promotes. Over-collection is safe by construction: promotion changes which
+                // admission a `let` takes, and every admission either allocates a faithful slot
+                // or fails closed with its existing tag.
+                if let Some((var, _, _)) = self.place_field_base(*arg) {
+                    if !wanted.contains(&var) {
+                        wanted.push(var);
+                    }
+                }
                 // Descend into the borrowed place too (e.g. `&mut *r` — though that fails closed at
                 // lowering, collecting any inner `&mut local` keeps the set complete).
-                self.collect_mut_borrowed_into(*arg, out);
+                self.collect_mut_borrowed_into(*arg, out, wanted);
             }
-            ExprKind::Deref { arg } => self.collect_mut_borrowed_into(*arg, out),
+            ExprKind::Deref { arg } => self.collect_mut_borrowed_into(*arg, out, wanted),
             ExprKind::Assign { lhs, rhs } => {
-                self.collect_mut_borrowed_into(*lhs, out);
-                self.collect_mut_borrowed_into(*rhs, out);
+                // Trust (wave-NB): a field WRITE `a.b = v` likewise stores through the base
+                // local's slot — collect the base so the `let` promotes it.
+                if let Some((var, _, _)) = self.place_field_base(*lhs) {
+                    if !wanted.contains(&var) {
+                        wanted.push(var);
+                    }
+                }
+                self.collect_mut_borrowed_into(*lhs, out, wanted);
+                self.collect_mut_borrowed_into(*rhs, out, wanted);
             }
             ExprKind::AssignOp { lhs, rhs, .. } => {
-                self.collect_mut_borrowed_into(*lhs, out);
-                self.collect_mut_borrowed_into(*rhs, out);
+                self.collect_mut_borrowed_into(*lhs, out, wanted);
+                self.collect_mut_borrowed_into(*rhs, out, wanted);
             }
             ExprKind::Scope { value, .. }
             | ExprKind::Use { source: value }
-            | ExprKind::NeverToAny { source: value } => self.collect_mut_borrowed_into(*value, out),
+            | ExprKind::NeverToAny { source: value } => self.collect_mut_borrowed_into(*value, out, wanted),
             ExprKind::Block { block } => {
                 let blk = &self.thir.blocks[*block];
                 for s in blk.stmts.iter() {
                     match &self.thir.stmts[*s].kind {
-                        StmtKind::Expr { expr, .. } => self.collect_mut_borrowed_into(*expr, out),
+                        StmtKind::Expr { expr, .. } => self.collect_mut_borrowed_into(*expr, out, wanted),
                         StmtKind::Let { initializer, .. } => {
                             if let Some(init) = initializer {
-                                self.collect_mut_borrowed_into(*init, out);
+                                self.collect_mut_borrowed_into(*init, out, wanted);
                             }
                         }
                     }
                 }
                 if let Some(t) = blk.expr {
-                    self.collect_mut_borrowed_into(t, out);
+                    self.collect_mut_borrowed_into(t, out, wanted);
                 }
             }
             ExprKind::If { cond, then, else_opt, .. } => {
-                self.collect_mut_borrowed_into(*cond, out);
-                self.collect_mut_borrowed_into(*then, out);
+                self.collect_mut_borrowed_into(*cond, out, wanted);
+                self.collect_mut_borrowed_into(*then, out, wanted);
                 if let Some(e) = else_opt {
-                    self.collect_mut_borrowed_into(*e, out);
+                    self.collect_mut_borrowed_into(*e, out, wanted);
                 }
             }
             ExprKind::Match { scrutinee, arms, .. } => {
-                self.collect_mut_borrowed_into(*scrutinee, out);
+                self.collect_mut_borrowed_into(*scrutinee, out, wanted);
                 for arm_id in arms.iter() {
-                    self.collect_mut_borrowed_into(self.thir.arms[*arm_id].body, out);
+                    self.collect_mut_borrowed_into(self.thir.arms[*arm_id].body, out, wanted);
                 }
             }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::LogicalOp { lhs, rhs, .. } => {
-                self.collect_mut_borrowed_into(*lhs, out);
-                self.collect_mut_borrowed_into(*rhs, out);
+                self.collect_mut_borrowed_into(*lhs, out, wanted);
+                self.collect_mut_borrowed_into(*rhs, out, wanted);
             }
-            ExprKind::Unary { arg, .. } => self.collect_mut_borrowed_into(*arg, out),
-            ExprKind::Field { lhs, .. } => self.collect_mut_borrowed_into(*lhs, out),
+            ExprKind::Unary { arg, .. } => self.collect_mut_borrowed_into(*arg, out, wanted),
+            ExprKind::Field { lhs, .. } => self.collect_mut_borrowed_into(*lhs, out, wanted),
             ExprKind::Call { fun, args, .. } => {
-                self.collect_mut_borrowed_into(*fun, out);
+                self.collect_mut_borrowed_into(*fun, out, wanted);
                 for a in args.iter() {
-                    self.collect_mut_borrowed_into(*a, out);
+                    self.collect_mut_borrowed_into(*a, out, wanted);
                 }
             }
             ExprKind::Tuple { fields } => {
                 for f in fields.iter() {
-                    self.collect_mut_borrowed_into(*f, out);
+                    self.collect_mut_borrowed_into(*f, out, wanted);
                 }
             }
             ExprKind::Adt(adt_expr) => {
                 for f in adt_expr.fields.iter() {
-                    self.collect_mut_borrowed_into(f.expr, out);
+                    self.collect_mut_borrowed_into(f.expr, out, wanted);
                 }
             }
             ExprKind::Return { value } => {
                 if let Some(v) = value {
-                    self.collect_mut_borrowed_into(*v, out);
+                    self.collect_mut_borrowed_into(*v, out, wanted);
                 }
             }
             // A `loop`'s body may `&mut`-borrow an outer local; descend (unlike the carried-locals
             // pre-pass, which scopes assignments to the current loop — here we want the WHOLE function).
-            ExprKind::Loop { body } => self.collect_mut_borrowed_into(*body, out),
+            ExprKind::Loop { body } => self.collect_mut_borrowed_into(*body, out, wanted),
             _ => {}
         }
     }
@@ -26005,6 +26699,31 @@ pub(crate) fn cycle_safe_layout_of<'tcx>(
     if !layout_query_is_reentrant_safe_deep(tcx, ty) {
         return None;
     }
+    // Trust (lane MKG, 2026-08-27): `layout_of`'s PRECONDITION, which this funnel did not
+    // check. `tcx.layout_of` wraps its input in a dummy binder, and `Binder::dummy` ASSERTS
+    // the value has no escaping bound vars. A type that does is not a `LayoutError` — it is
+    // an ICE, so the `.ok()` below cannot catch it:
+    //
+    //     thread 'rustc' panicked at rustc_middle/src/ty/predicate.rs:492:9:
+    //     `<dyn core::fmt::Write as core::marker::Sized>` has escaping bound vars,
+    //     so it cannot be wrapped in a dummy binder.
+    //
+    // MEASURED with a control (same driver, same corpus, same `-Zbuild-std=core,alloc,std`;
+    // the ONLY delta is the flag): `-Ztrust-ir-lower=off` builds `std` in 12.71 s;
+    // `-Ztrust-ir-lower=on` ICEs above. It has gone unseen because nothing had ever lowered
+    // `std` — the reachable path is `thin_ref_ret_ty`, which pulls a POINTEE out of a
+    // `ty::Ref` that still sits under its binder, so `&mut dyn Write` yields a `dyn Write`
+    // carrying late-bound regions. The existing guards test reentrancy (TAITs) and, at the
+    // flip.rs sites, non-REGION params and infers — none of them tests bound vars.
+    //
+    // Declining is the CORRECT answer here, not merely the safe one: every caller of this
+    // funnel is asking a layout question whose contract already says an unresolvable pointee
+    // returns `None` (see `thin_ref_ret_ty`'s doc), and a `dyn` pointee is unsized in any
+    // case, so the fat/thin verdict is unchanged. Fixed at the funnel rather than at the four
+    // call sites so no future caller can reintroduce it.
+    if ty.has_escaping_bound_vars() {
+        return None;
+    }
     tcx.layout_of(te.as_query_input(ty)).ok()
 }
 
@@ -26110,9 +26829,7 @@ fn producer_enum_layout_descriptor<'tcx>(
         // the AdtDef variant has fields (uninhabited / degenerate variants),
         // and an IndexVec index would panic. Decline the whole descriptor.
         let offs: Option<Vec<u64>> = (0..variant.fields.len())
-            .map(|i| {
-                vl.field_offsets.get(rustc_abi::FieldIdx::from_usize(i)).map(|o| o.bytes())
-            })
+            .map(|i| vl.field_offsets.get(rustc_abi::FieldIdx::from_usize(i)).map(|o| o.bytes()))
             .collect();
         variant_field_offsets.push(offs?);
     }
@@ -26286,9 +27003,9 @@ pub(crate) fn projection_reaches_opaque<'tcx>(tcx: TyCtxt<'tcx>, t: RustcTy<'tcx
             return false;
         };
         let assoc_def_id = def_id;
-        let Some(trait_def_id) = tcx.opt_associated_item(assoc_def_id).and_then(|item| {
-            item.trait_container(tcx)
-        }) else {
+        let Some(trait_def_id) =
+            tcx.opt_associated_item(assoc_def_id).and_then(|item| item.trait_container(tcx))
+        else {
             return false;
         };
         let impls = tcx.trait_impls_of(trait_def_id);
@@ -27679,9 +28396,7 @@ mod try_question_facts_tests {
         let op = result_def(1, Ty::U64, Ty::Enum(trust_ir::EnumId::new(0)));
         let ret = result_def(2, Ty::U64, Ty::Enum(trust_ir::EnumId::new(0)));
         let enum_seed = |t: &Ty| match t {
-            Ty::Enum(_) => {
-                Some(Constant::Aggregate(vec![Constant::Int(0), Constant::Int(0)]))
-            }
+            Ty::Enum(_) => Some(Constant::Aggregate(vec![Constant::Int(0), Constant::Int(0)])),
             _ => seed_constant(t),
         };
         let facts =
@@ -27718,8 +28433,9 @@ mod try_question_facts_tests {
     fn a_fat_err_field_is_refused_even_when_the_caller_seeder_would_seed_it() {
         let str_fat = Ty::FatPtr(trust_ir::FatPtrKind::Str);
         let def = result_def(0, Ty::U64, str_fat.clone());
-        let permissive =
-            |t: &Ty| Some(seed_constant(t).unwrap_or(Constant::Bytes { data: b"e".to_vec(), utf8: true }));
+        let permissive = |t: &Ty| {
+            Some(seed_constant(t).unwrap_or(Constant::Bytes { data: b"e".to_vec(), utf8: true }))
+        };
         // The seeder really would have produced a value for the fat lane.
         assert!(permissive(&str_fat).is_some(), "the control seeder must be permissive");
         assert_eq!(
@@ -27985,19 +28701,23 @@ mod container_pointee_spelling_tests {
     /// Asserted structurally (two pointer-width lanes), not as a magic number.
     #[test]
     fn len_metadata_pointee_is_a_two_lane_pointer_pair() {
+        // Re-blessed to the v38 FIRST-CLASS spelling: `cebe4578f45` moved the production from
+        // the `Ty::Tuple([Ptr, I64])` pair to `Ty::FatPtr(ContainerLen)` without moving this
+        // pin (no pre-push lane runs a crates/ test — the CLAUDE.md corollary, observed live).
+        // The structural fact the test guards is UNCHANGED: the spelling must carry the full
+        // 16-byte (data, len) width, which `Ty::FatPtr` does by definition
+        // (`bit_width_with = 2 * pointer_bits`).
         let spelled = container_pointee_ty(PointeeMeta::Len).expect("Len must not fail closed");
-        let Ty::Tuple(lanes) = &spelled else {
-            panic!("a Len-metadata pointee must be spelled as a pair, got {:?}", spelled);
-        };
-        assert_eq!(lanes.len(), 2, "a fat pointer has exactly two lanes: data and metadata");
-        let lane_bits: Vec<Option<u32>> =
-            lanes.iter().map(|l| l.bit_width_with(POINTER_BITS)).collect();
         assert_eq!(
-            lane_bits,
-            vec![Some(POINTER_BITS), Some(POINTER_BITS)],
-            "both lanes must be pointer-width ({} bits each) = the 16 bytes rustc lays out for \
-             a pointer to a str/slice-tailed pointee",
-            POINTER_BITS,
+            spelled,
+            Ty::FatPtr(trust_ir::FatPtrKind::ContainerLen),
+            "a Len-metadata pointee is the first-class container-tail fat pointer",
+        );
+        assert_eq!(
+            spelled.bit_width_with(POINTER_BITS),
+            Some(2 * POINTER_BITS),
+            "the spelling must carry the 16 bytes rustc lays out for a pointer to a \
+             str/slice-tailed pointee",
         );
     }
 
@@ -28008,12 +28728,12 @@ mod container_pointee_spelling_tests {
     fn thin_pointee_is_one_pointer_lane_and_is_half_the_fat_width() {
         assert_eq!(container_pointee_ty(PointeeMeta::Thin), Some(Ty::Ptr));
         assert_eq!(Ty::Ptr.bit_width_with(POINTER_BITS), Some(POINTER_BITS));
+        // v38 re-bless: the fat side is now the first-class spelling; the CONTROL fact —
+        // fat is exactly twice thin, the width the old catch-all dropped — is unchanged.
         let fat = container_pointee_ty(PointeeMeta::Len).expect("Len must not fail closed");
-        let Ty::Tuple(lanes) = &fat else { panic!("expected the pair spelling") };
-        let fat_bits: u32 = lanes.iter().filter_map(|l| l.bit_width_with(POINTER_BITS)).sum();
         assert_eq!(
-            fat_bits,
-            2 * POINTER_BITS,
+            fat.bit_width_with(POINTER_BITS),
+            Some(2 * POINTER_BITS),
             "the fat spelling must be twice the thin one — the width the old catch-all dropped",
         );
     }
@@ -28157,13 +28877,7 @@ mod thin_shared_reborrow_tests {
     #[test]
     fn test_thin_reborrow_gate_admits_exactly_the_all_true_vector() {
         for bits in 0u8..32 {
-            let v = [
-                bits & 1 != 0,
-                bits & 2 != 0,
-                bits & 4 != 0,
-                bits & 8 != 0,
-                bits & 16 != 0,
-            ];
+            let v = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0, bits & 16 != 0];
             assert_eq!(
                 admits(v),
                 v.iter().all(|b| *b),
@@ -29317,10 +30031,7 @@ mod enum_payload_binding_tests {
     /// same tag string, which is a census key. wave-EF must not renumber an unrelated reject.
     #[test]
     fn the_unit_refusal_keeps_its_exact_pre_existing_tag() {
-        assert_eq!(
-            enum_payload_binding_reject(&Ty::Unit),
-            Some("EnumMatch(zst payload binding)"),
-        );
+        assert_eq!(enum_payload_binding_reject(&Ty::Unit), Some("EnumMatch(zst payload binding)"),);
     }
 
     /// The by-REF (wave-L4G) half is the FAT refusal ALONE. A unit field must read `None`
@@ -29403,10 +30114,7 @@ mod or_payload_alternative_tests {
     /// this the whole module could pass by refusing everything.
     #[test]
     fn agreeing_alternatives_share_one_body() {
-        let wit = vec![
-            vec![row(1, Ty::U32, 100, false)],
-            vec![row(1, Ty::U32, 100, false)],
-        ];
+        let wit = vec![vec![row(1, Ty::U32, 100, false)], vec![row(1, Ty::U32, 100, false)]];
         assert_eq!(or_alt_binds_reject(&wit, &alts_one_bind(&[0, 1])), None);
     }
 
@@ -29450,10 +30158,7 @@ mod or_payload_alternative_tests {
     /// and still admit this.
     #[test]
     fn equal_bind_counts_naming_different_locals_are_refused() {
-        let wit = vec![
-            vec![row(1, Ty::U32, 100, false)],
-            vec![row(2, Ty::U32, 100, false)],
-        ];
+        let wit = vec![vec![row(1, Ty::U32, 100, false)], vec![row(2, Ty::U32, 100, false)]];
         assert_eq!(
             or_alt_binds_reject(&wit, &alts_one_bind(&[0, 1])),
             Some("EnumMatch(or-pattern alternative bind set desync)"),
@@ -29466,10 +30171,7 @@ mod or_payload_alternative_tests {
     /// the FIRST alternative's type off an SSA value carrying the second's `ExtractField` type.
     #[test]
     fn one_local_at_two_mapped_types_is_refused() {
-        let wit = vec![
-            vec![row(1, Ty::U32, 100, false)],
-            vec![row(1, Ty::U64, 100, false)],
-        ];
+        let wit = vec![vec![row(1, Ty::U32, 100, false)], vec![row(1, Ty::U64, 100, false)]];
         assert_eq!(
             or_alt_binds_reject(&wit, &alts_one_bind(&[0, 1])),
             Some("EnumMatch(or-pattern alternative bind ty desync)"),
@@ -29483,10 +30185,7 @@ mod or_payload_alternative_tests {
     /// collapsing where the ground truth does not is the wave-UB defect class verbatim.
     #[test]
     fn two_ground_types_collapsing_to_one_mapped_ptr_are_refused() {
-        let wit = vec![
-            vec![row(1, Ty::Ptr, 100, false)],
-            vec![row(1, Ty::Ptr, 200, false)],
-        ];
+        let wit = vec![vec![row(1, Ty::Ptr, 100, false)], vec![row(1, Ty::Ptr, 200, false)]];
         assert_eq!(
             or_alt_binds_reject(&wit, &alts_one_bind(&[0, 1])),
             Some("EnumMatch(or-pattern alternative bind ground-ty desync)"),
@@ -29497,10 +30196,7 @@ mod or_payload_alternative_tests {
     /// hands it a `Ty::Ptr` interior pointer. One body cannot read both.
     #[test]
     fn one_local_bound_by_value_and_by_ref_is_refused() {
-        let wit = vec![
-            vec![row(1, Ty::Ptr, 100, false)],
-            vec![row(1, Ty::Ptr, 100, true)],
-        ];
+        let wit = vec![vec![row(1, Ty::Ptr, 100, false)], vec![row(1, Ty::Ptr, 100, true)]];
         assert_eq!(
             or_alt_binds_reject(&wit, &alts_one_bind(&[0, 1])),
             Some("EnumMatch(or-pattern alternative bind mode desync)"),
@@ -29513,10 +30209,7 @@ mod or_payload_alternative_tests {
     /// into the join — an orphan join predecessor.
     #[test]
     fn two_payload_alternatives_on_one_variant_index_are_refused() {
-        let wit = vec![
-            vec![row(1, Ty::U32, 100, false)],
-            vec![row(1, Ty::U32, 100, false)],
-        ];
+        let wit = vec![vec![row(1, Ty::U32, 100, false)], vec![row(1, Ty::U32, 100, false)]];
         assert_eq!(
             or_alt_binds_reject(&wit, &alts_one_bind(&[3, 3])),
             Some("EnumMatch(or-pattern duplicate variant with payload)"),
@@ -29755,8 +30448,7 @@ mod seed_final_value_tests {
             Constant::Aggregate(vec![Constant::Int(0)]),
         ])]);
         assert!(!constant_is_sole_inhabitant(&deep));
-        let array_lane =
-            Constant::Array(vec![Constant::PhantomData, Constant::Bool(false)]);
+        let array_lane = Constant::Array(vec![Constant::PhantomData, Constant::Bool(false)]);
         assert!(!constant_is_sole_inhabitant(&array_lane));
     }
 
@@ -29826,10 +30518,9 @@ mod seed_final_value_tests {
 mod pointer_coercion_refusal_tests {
     use rustc_hir::Safety;
     use rustc_hir::def::DefKind;
+    use rustc_middle::ty::ClosureKind;
     use rustc_middle::ty::adjustment::PointerCoercion;
     use trust_ir::{FuncTy, Ty};
-
-    use rustc_middle::ty::ClosureKind;
 
     use super::{
         ADAPTER_FUNC_ID_BASE, ADAPTER_FUNC_ID_COUNT, closure_fnptr_adapter_admits,
@@ -30153,10 +30844,7 @@ mod union_lane_tests {
         }
         assert!(!union_lane_ty_transitive(&taint, &Ty::Tuple(vec![Ty::Unit])));
         // ... but containment is caught, at either nesting level.
-        assert!(union_lane_ty_transitive(
-            &taint,
-            &Ty::Tuple(vec![Ty::Struct(StructId::new(0))])
-        ));
+        assert!(union_lane_ty_transitive(&taint, &Ty::Tuple(vec![Ty::Struct(StructId::new(0))])));
         assert!(union_lane_ty_transitive(
             &taint,
             &Ty::Tuple(vec![Ty::I64, Ty::Tuple(vec![Ty::Struct(StructId::new(1))])])
@@ -30304,9 +30992,11 @@ mod enum_param_lane_tests {
             StructId::new(1),
             &[Ty::U64, Ty::Ptr],
         );
-        assert!(
-            !param_lane_ty_transitive(&enum_taint, &struct_taint, &Ty::Struct(StructId::new(1)))
-        );
+        assert!(!param_lane_ty_transitive(
+            &enum_taint,
+            &struct_taint,
+            &Ty::Struct(StructId::new(1))
+        ));
     }
 
     /// `param_lane_ty_transitive` fires on BY-VALUE containment and on nothing else. The pointer
@@ -30554,10 +31244,7 @@ mod enum_field_read_tests {
             // `[Struct(7); 2]`, which `map_ty` spells as a tuple.
             enum_def(
                 2,
-                vec![variant(
-                    "Arr",
-                    vec![Ty::Tuple(vec![Ty::Struct(StructId::new(7)); 2])],
-                )],
+                vec![variant("Arr", vec![Ty::Tuple(vec![Ty::Struct(StructId::new(7)); 2])])],
             ),
         ];
         assert!(tainted(&taint, &enums, 1), "a nested enum payload must propagate the lane");
@@ -30698,10 +31385,7 @@ mod enum_field_read_tests {
             enum_def(0, vec![variant("A", vec![Ty::Enum(EnumId::new(1))])]),
             enum_def(
                 1,
-                vec![variant(
-                    "B",
-                    vec![Ty::Enum(EnumId::new(0)), Ty::Struct(StructId::new(7))],
-                )],
+                vec![variant("B", vec![Ty::Enum(EnumId::new(0)), Ty::Struct(StructId::new(7))])],
             ),
         ];
         assert!(tainted(&taint, &cyclic_laned, 0), "the back edge must not mask a sibling lane");
@@ -30923,7 +31607,8 @@ mod enum_field_read_tests {
     fn to_mir_refuses_a_non_scalar_extractfield_on_ground_truth() {
         let shim = include_str!("to_mir.rs");
 
-        let ground_truth = format!("variant.fields[fidx].ty(tcx, *args).{}()", "skip_normalization");
+        let ground_truth =
+            format!("variant.fields[fidx].ty(tcx, *args).{}()", "skip_normalization");
         assert_eq!(
             shim.matches(ground_truth.as_str()).count(),
             1,
@@ -30948,8 +31633,9 @@ mod enum_field_read_tests {
 
 #[cfg(test)]
 mod enum_decline_census_tests {
-    use super::*;
     use std::ffi::OsStr;
+
+    use super::*;
 
     /// The flag gates a MEASUREMENT, not a power, so ONLY the exact `1` may arm it — a census
     /// that appears because someone exported a truthy-looking value cannot be diffed against the
@@ -31029,8 +31715,9 @@ mod enum_decline_census_tests {
 
 #[cfg(test)]
 mod resolved_fn_ptr_wall_tests {
-    use super::*;
     use trust_ir::{EnumDef, EnumId, EnumVariant, FieldDef, StructDef, StructId};
+
+    use super::*;
 
     fn sdef(id: u32, fields: &[Ty]) -> StructDef {
         StructDef {
@@ -31265,8 +31952,9 @@ mod resolved_fn_ptr_wall_tests {
 
 #[cfg(test)]
 mod str_const_lane_tests {
-    use super::str_const_mapped_ty_ok;
     use trust_ir::{FatPtrKind, Ty};
+
+    use super::str_const_mapped_ty_ok;
 
     /// Gate 1 of `lower_str_named_const`, on the MAPPED type. The caller's arm keys on the
     /// ground-truth rustc type; this predicate is the second key, and it admits exactly one
@@ -31382,14 +32070,20 @@ mod seed_lane_tests {
     #[test]
     fn the_pointer_seed_is_gated_on_the_overwritten_lane() {
         let producer = include_str!("lib.rs");
-        let arm = format!("Ty::{} if lane == SeedLane::{} => Some(Constant::Int(0))", "Ptr", "Overwritten");
+        let arm = format!(
+            "Ty::{} if lane == SeedLane::{} => Some(Constant::Int(0))",
+            "Ptr", "Overwritten"
+        );
         assert_eq!(
             producer.matches(arm.as_str()).count(),
             1,
             "the pointer seed must exist exactly once and carry its lane guard",
         );
         // And the strict entry point must not reach it by any other spelling.
-        let strict = format!("fn {}(&self, ty: &Ty, depth: usize) -> Option<Constant> {{\n        self.seed_lane_ty(ty, depth, SeedLane::{})", "seed_constant_ty", "Strict");
+        let strict = format!(
+            "fn {}(&self, ty: &Ty, depth: usize) -> Option<Constant> {{\n        self.seed_lane_ty(ty, depth, SeedLane::{})",
+            "seed_constant_ty", "Strict"
+        );
         assert!(
             producer.contains(strict.as_str()),
             "`seed_constant_ty` must delegate with SeedLane::Strict",
@@ -31409,7 +32103,10 @@ mod seed_lane_tests {
         let window_start = tag_at.saturating_sub(1400);
         let window = &producer[window_start..tag_at];
         let witness = format!("if field_vals[i].{}() {{", "is_some");
-        assert!(window.contains(witness.as_str()), "the Adt site must gate on the overwrite witness");
+        assert!(
+            window.contains(witness.as_str()),
+            "the Adt site must gate on the overwrite witness"
+        );
         assert!(
             window.contains(&format!("self.{}(t, 0)", "seed_overwritten_ty")),
             "the overwritten branch must use the widened seeder",
@@ -31598,11 +32295,12 @@ mod seed_lane_tests {
 /// describe.
 #[cfg(test)]
 mod str_match_lane_tests {
+    use trust_ir::{FatPtrKind, Ty};
+
     use super::{
         STR_MATCH_UNROLL_CAP, str_match_scrut_ty_ok, str_match_unroll_cost,
         str_match_within_unroll_budget,
     };
-    use trust_ir::{FatPtrKind, Ty};
 
     /// Gate 1's MAPPED half admits exactly the fat-pointer kinds WHOSE METADATA IS A LENGTH, which
     /// is what the emitted `PtrMetadata` + `ICmp Eq U64` reads.
@@ -31636,10 +32334,7 @@ mod str_match_lane_tests {
             Ty::Unit,
             Ty::Array(trust_ir::value::TyId::new(0), 4),
         ] {
-            assert!(
-                !str_match_scrut_ty_ok(&refused),
-                "{refused:?} has no length metadata lane",
-            );
+            assert!(!str_match_scrut_ty_ok(&refused), "{refused:?} has no length metadata lane",);
         }
     }
 
@@ -31703,7 +32398,11 @@ mod str_match_lane_tests {
     #[test]
     fn test_str_match_unroll_cost_is_one_block_per_byte_plus_one_length_block() {
         assert_eq!(str_match_unroll_cost(&[]), 0, "no literal arms synthesize no test blocks");
-        assert_eq!(str_match_unroll_cost(&[0]), 1, "`\"\" => …` is decided by its length block alone");
+        assert_eq!(
+            str_match_unroll_cost(&[0]),
+            1,
+            "`\"\" => …` is decided by its length block alone"
+        );
         assert_eq!(str_match_unroll_cost(&[4]), 5, "one length block + four byte blocks");
         assert_eq!(str_match_unroll_cost(&[4, 4, 4]), 15);
         assert_eq!(str_match_unroll_cost(&[1, 2, 3]), 9);
@@ -31933,8 +32632,9 @@ mod str_match_lane_tests {
 /// instruction order) are source-pinned against comment-stripped production text.
 #[cfg(test)]
 mod nested_payload_lane_tests {
-    use super::{NestedPayloadEnum, nested_payload_enum_id, resolve_nested_payload_enum};
     use trust_ir::Ty;
+
+    use super::{NestedPayloadEnum, nested_payload_enum_id, resolve_nested_payload_enum};
 
     fn variant(name: &str, fields: Vec<Ty>) -> trust_ir::EnumVariant {
         trust_ir::EnumVariant { name: name.to_string(), fields, field_names: Vec::new() }
@@ -32396,7 +33096,10 @@ mod nested_payload_lane_tests {
                 format!("{}(", "enum_variant_field_byte_offset"),
                 "no rustc offset may be queried at the emitter",
             ),
-            (format!("Inst::{} {{", "GEP"), "the interior GEP is the shared emitter's, not this one"),
+            (
+                format!("Inst::{} {{", "GEP"),
+                "the interior GEP is the shared emitter's, not this one",
+            ),
         ] {
             assert_eq!(
                 arm.matches(forbidden.as_str()).count(),
@@ -32420,12 +33123,13 @@ mod nested_payload_lane_tests {
 /// text, via the SAME `production_code`/`fn_span` helpers, for the same reason.
 #[cfg(test)]
 mod nested_payload_ref_lane_tests {
+    use trust_ir::Ty;
+
     use super::nested_payload_lane_tests::{fn_span, production_code};
     use super::{
         VariantFieldOffsetErr, compose_nested_payload_offset, declared_variant_field_offset,
         nested_ref_payload_offset_tag, ref_payload_offset_tag, variant_field_offset_agrees,
     };
-    use trust_ir::Ty;
 
     fn variant(name: &str, fields: Vec<Ty>) -> trust_ir::EnumVariant {
         trust_ir::EnumVariant { name: name.to_string(), fields, field_names: Vec::new() }
@@ -32551,12 +33255,17 @@ mod nested_payload_ref_lane_tests {
     /// The def is the real corpus shape (`def_with_layout`, offsets 8/16 and 40), so the numbers
     /// that disagree are the numbers a real descriptor carries.
     #[test]
-    fn test_variant_field_offset_agrees_refuses_a_descriptor_that_disagrees_with_the_emitted_byte() {
+    fn test_variant_field_offset_agrees_refuses_a_descriptor_that_disagrees_with_the_emitted_byte()
+    {
         let enums = vec![def_with_layout(3)];
         let eid = trust_ir::EnumId::new(3);
         // The descriptor SAYS 8 for (variant 0, field 0). Every other emitted byte is a wrong
         // address, and the presence gate cannot tell — it answers `Some(8)` in all of these.
-        assert_eq!(declared_variant_field_offset(&enums, eid, 0, 0), Some(8), "presence is satisfied");
+        assert_eq!(
+            declared_variant_field_offset(&enums, eid, 0, 0),
+            Some(8),
+            "presence is satisfied"
+        );
         for wrong in [0u64, 4, 7, 9, 16, 40, u64::MAX] {
             assert!(
                 !variant_field_offset_agrees(&enums, eid, 0, 0, wrong),
@@ -32648,7 +33357,10 @@ mod nested_payload_ref_lane_tests {
         // ORDER: after the offset query (there is nothing to compare before it), and before the
         // bind that hands the displacement to the emitter.
         let query_at = classifier
-            .find(&format!("let off = {}( tcx, enum_rty, variant_index,", "enum_variant_field_byte_offset"))
+            .find(&format!(
+                "let off = {}( tcx, enum_rty, variant_index,",
+                "enum_variant_field_byte_offset"
+            ))
             .expect("the single-level offset query must exist");
         let agree_at = classifier.find(agree.as_str()).expect("just counted it");
         let bind_at = classifier
@@ -32687,8 +33399,16 @@ mod nested_payload_ref_lane_tests {
     fn test_compose_nested_payload_offset_is_the_sum_of_both_levels() {
         assert_eq!(compose_nested_payload_offset(8, 40), Ok(48));
         assert_eq!(compose_nested_payload_offset(40, 8), Ok(48));
-        assert_eq!(compose_nested_payload_offset(0, 0), Ok(0), "a zero-zero path is still an address");
-        assert_eq!(compose_nested_payload_offset(8, 0), Ok(8), "an inner offset of 0 is not a refusal");
+        assert_eq!(
+            compose_nested_payload_offset(0, 0),
+            Ok(0),
+            "a zero-zero path is still an address"
+        );
+        assert_eq!(
+            compose_nested_payload_offset(8, 0),
+            Ok(8),
+            "an inner offset of 0 is not a refusal"
+        );
     }
 
     /// A wrapped displacement is a wild pointer with no diagnostic. Checked, not wrapping.
@@ -32993,10 +33713,30 @@ mod nested_payload_ref_lane_tests {
             align: 8,
             // clean_kernel::ExprKind, verbatim. Variant 8 is `Lit`.
             variant_field_offsets: vec![
-                vec![8], vec![8], vec![8], vec![96, 0], vec![8, 16], vec![24, 8, 16],
-                vec![24, 8, 16], vec![8, 48, 56, 64, 72], vec![8], vec![8, 56, 48], vec![8, 32],
-                vec![], vec![8], vec![], vec![], vec![], vec![8, 16, 24], vec![8], vec![8, 16],
-                vec![8, 16, 24, 32], vec![8, 16, 24], vec![8, 16, 24, 32], vec![8], vec![8, 16],
+                vec![8],
+                vec![8],
+                vec![8],
+                vec![96, 0],
+                vec![8, 16],
+                vec![24, 8, 16],
+                vec![24, 8, 16],
+                vec![8, 48, 56, 64, 72],
+                vec![8],
+                vec![8, 56, 48],
+                vec![8, 32],
+                vec![],
+                vec![8],
+                vec![],
+                vec![],
+                vec![],
+                vec![8, 16, 24],
+                vec![8],
+                vec![8, 16],
+                vec![8, 16, 24, 32],
+                vec![8, 16, 24],
+                vec![8, 16, 24, 32],
+                vec![8],
+                vec![8, 16],
                 vec![8, 16],
             ],
         });
@@ -34120,9 +34860,10 @@ mod option_flag_sibling_position_tests {
 ///   evaluated after the bind is not a gate.
 #[cfg(test)]
 mod wave_sg_struct_interior_offset_tests {
+    use trust_ir::Ty;
+
     use super::nested_payload_lane_tests::{fn_span, production_code};
     use super::{declared_struct_field_offset, struct_field_offset_agrees};
-    use trust_ir::Ty;
 
     /// Stripped production text with every run of whitespace collapsed to ONE space, so a needle
     /// can pin an ARGUMENT LIST without also pinning rustfmt's choice of line breaks.
@@ -34143,10 +34884,7 @@ mod wave_sg_struct_interior_offset_tests {
         trust_ir::StructDef {
             id: trust_ir::StructId::new(id),
             name: "RawVecInner".into(),
-            fields: vec![
-                field("ptr", Ty::Ptr, Some(8)),
-                field("cap", Ty::Usize, Some(0)),
-            ],
+            fields: vec![field("ptr", Ty::Ptr, Some(8)), field("cap", Ty::Usize, Some(0))],
             size: Some(16),
             align: Some(8),
             repr: Default::default(),
@@ -34301,9 +35039,8 @@ mod wave_sg_struct_interior_offset_tests {
         let mut seen = 0usize;
         while let Some(rel) = code[at..].find(query.as_str()) {
             let q = at + rel;
-            let g = code[q..]
-                .find(gep)
-                .unwrap_or_else(|| panic!("offset query at {q} reaches no GEP"));
+            let g =
+                code[q..].find(gep).unwrap_or_else(|| panic!("offset query at {q} reaches no GEP"));
             let window = &code[q..q + g];
             assert!(
                 window.contains(gate.as_str()),
@@ -34313,8 +35050,9 @@ mod wave_sg_struct_interior_offset_tests {
             at = q + query.len();
         }
         assert_eq!(
-            seen, 2,
-            "there are exactly two struct interior-borrow emission sites (wave-25/25b and wave-DP)",
+            seen, 3,
+            "there are exactly three struct interior-borrow emission sites (wave-25/25b, \
+             wave-DP, and the wave-NB field-of-local lane)",
         );
     }
 
@@ -34328,8 +35066,9 @@ mod wave_sg_struct_interior_offset_tests {
         let code = flat(&production_code());
         assert_eq!(
             code.matches(&format!("self.{}(", "struct_interior_offset_admissible")).count(),
-            2,
-            "both emission sites must call the ONE gate implementation",
+            3,
+            "all three emission sites (wave-25/25b, wave-DP, wave-NB field-of-local) must call \
+             the ONE gate implementation",
         );
         // One DEFINITION plus one CALL. The definition matches the same needle, so it is
         // subtracted rather than assumed away.
@@ -34403,12 +35142,10 @@ mod wave_sg_struct_interior_offset_tests {
         let query = site
             .find(&format!("self.{}(struct_rty, field)", "field_byte_offset"))
             .expect("the offset query");
-        let register = site
-            .find(&format!("self.{}(", "struct_ty_rmw_opaque"))
-            .expect("the registration");
-        let gate = site
-            .find(&format!("self.{}(", "struct_interior_offset_admissible"))
-            .expect("the gate");
+        let register =
+            site.find(&format!("self.{}(", "struct_ty_rmw_opaque")).expect("the registration");
+        let gate =
+            site.find(&format!("self.{}(", "struct_interior_offset_admissible")).expect("the gate");
         let lower =
             site.find(&format!("self.{}(ptr_expr)", "lower_expr")).expect("the base lowering");
         assert!(query < register, "the query must not be moved below the registration");
@@ -34465,8 +35202,8 @@ mod wave_sg_struct_interior_offset_tests {
 /// source-pinned at the ORDER).
 #[cfg(test)]
 mod wave_cov_registration_on_miss_tests {
-    use super::nested_payload_lane_tests::{fn_span, production_code};
     use super::declared_field_offset_admits_size;
+    use super::nested_payload_lane_tests::{fn_span, production_code};
 
     /// Stripped production text with every run of whitespace collapsed to ONE space, so a needle
     /// can pin an ARGUMENT LIST without also pinning rustfmt's choice of line breaks.
@@ -34615,11 +35352,8 @@ mod wave_cov_registration_on_miss_tests {
     #[test]
     fn test_the_resolver_scans_then_prechecks_then_registers_through_the_shared_funnel() {
         let code = production_code();
-        let body = flat(fn_span(
-            &code,
-            "struct_id_for_interior_offset",
-            "interior_offset_census_row",
-        ));
+        let body =
+            flat(fn_span(&code, "struct_id_for_interior_offset", "interior_offset_census_row"));
         let scan = body
             .find(&format!("self.{}(struct_rty)", "registered_struct_id"))
             .expect("the ledger scan");
@@ -34651,11 +35385,8 @@ mod wave_cov_registration_on_miss_tests {
     #[test]
     fn test_the_resolver_never_writes_the_offset_it_will_be_checked_against() {
         let code = production_code();
-        let body = flat(fn_span(
-            &code,
-            "struct_id_for_interior_offset",
-            "interior_offset_census_row",
-        ));
+        let body =
+            flat(fn_span(&code, "struct_id_for_interior_offset", "interior_offset_census_row"));
         for forbidden in [
             "FieldDef {",
             "offset:",
@@ -34702,14 +35433,14 @@ mod wave_cov_registration_on_miss_tests {
         }
         // The flag is the STRICT parser: only the exact `1` arms it. Shared with the enum-decline
         // census so the two measurement channels cannot drift on what "on" means.
-        let flag = flat(fn_span(
-            &code,
-            "interior_offset_census_enabled",
-            "enum_decline_census_enabled",
-        ));
+        let flag =
+            flat(fn_span(&code, "interior_offset_census_enabled", "enum_decline_census_enabled"));
         assert!(
             flag.contains(&format!("{}(std::env::var_os(", "enum_decline_census_from_env")),
             "the census flag must reuse the strict `=1` parser, not invent a second one",
         );
     }
 }
+
+#[cfg(test)]
+mod mir_differential_tailcall_ratification_tests;

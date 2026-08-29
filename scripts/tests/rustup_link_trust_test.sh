@@ -205,4 +205,69 @@ grep -q -- '--sysroot is mutually exclusive with stage1/stage2' "$fixture/stage-
     || fail "external stage-selection rejection was not explicit"
 [ ! -e "$fixture/rustup-call.log" ] || fail "rustup ran after stage/sysroot rejection"
 
+# The Trust brand parenthetical carries a VERSION on every ordinary build.
+# rustc_driver_impl emits " ({display_binary} {trust_version})" when
+# CFG_TRUST_VERSION is set and " ({display_binary})" only when it is not
+# (compiler/rustc_driver_impl/src/lib.rs:2382-2389), so a check written against
+# the literal "(trustc)" refused every real toolchain built since that version
+# was threaded through -- measured 2026-08-22 on a stage1 sysroot that passes
+# tools/verify-toolchain.sh in full. Both shapes must link.
+fixture="$(new_external_stage2_fixture external-versioned-brand)"
+external_sysroot="$fixture/external/trust"
+sed -e 's/(trustc)/(trustc 0.1.0)/' -e 's/(trustdoc)/(trustdoc 0.1.0)/' \
+    "$external_sysroot/bin/tool-dispatch" >"$fixture/tool-dispatch.versioned"
+cat "$fixture/tool-dispatch.versioned" >"$external_sysroot/bin/tool-dispatch"
+if ! run_link "$fixture" --name trust-versioned --sysroot "$external_sysroot" \
+    >"$fixture/stdout" 2>"$fixture/stderr"; then
+    sed 's/^/    /' "$fixture/stderr" >&2
+    fail "versioned Trust brand '(trustc 0.1.0)' was refused"
+fi
+grep -q '^toolchain link trust-versioned .*/external/trust$' "$fixture/rustup-call.log" \
+    || fail "versioned Trust brand '(trustc 0.1.0)' was not accepted for linking"
+
+# An unbranded rustc is still refused: the brand is what distinguishes a Trust
+# compiler from a stock one wearing the same banner.
+fixture="$(new_external_stage2_fixture external-unbranded)"
+external_sysroot="$fixture/external/trust"
+sed -e 's/ (trustc)//' "$external_sysroot/bin/tool-dispatch" \
+    >"$fixture/tool-dispatch.unbranded"
+cat "$fixture/tool-dispatch.unbranded" >"$external_sysroot/bin/tool-dispatch"
+if run_link "$fixture" --name trust-unbranded --sysroot "$external_sysroot" \
+    >"$fixture/stdout" 2>"$fixture/stderr"; then
+    fail "an unbranded rustc was linked as a Trust toolchain"
+fi
+grep -q "trustc --version must carry the Trust brand" "$fixture/stderr" \
+    || fail "unbranded rejection was not explicit"
+[ ! -e "$fixture/rustup-call.log" ] || fail "rustup ran after an unbranded rejection"
+
+# Closing guidance follows the SYSROOT, not the internal stage forcing.
+# --sysroot sets STAGE=stage2 as a VALIDATION LEVEL (the full same-surface
+# contract), which is not a claim about provenance -- but it used to drive the
+# daily-driver advice, so `install-trust-toolchain.sh --stage 1`, which links
+# build/<triple>/stage1 through --sysroot, produced two contradictory
+# instructions in one run: "rustup default trust" from here, and "stage1 is a
+# DEVELOPER artifact, rustup default should not point at it" from the installer.
+fixture="$(new_external_stage2_fixture external-stage1-path)"
+mv "$fixture/external/trust" "$fixture/external/stage1"
+run_link "$fixture" --name trust-stage1-path --sysroot "$fixture/external/stage1" \
+    >"$fixture/stdout" 2>"$fixture/stderr"
+grep -q 'stage1 is developer-only' "$fixture/stdout" \
+    || fail "a stage1-named external sysroot did not get the developer-only guidance"
+grep -q 'rustup default' "$fixture/stdout" \
+    && fail "a stage1-named external sysroot was recommended as the default toolchain"
+
+# A stage2-named external sysroot is the case where the default advice is right.
+fixture="$(new_external_stage2_fixture external-stage2-path)"
+mv "$fixture/external/trust" "$fixture/external/stage2"
+run_link "$fixture" --name trust-stage2-path --sysroot "$fixture/external/stage2" \
+    >"$fixture/stdout" 2>"$fixture/stderr"
+grep -q 'rustup default trust-stage2-path' "$fixture/stdout" \
+    || fail "a stage2-named external sysroot lost its make-default guidance"
+
+# And when the path names no stage, say what cannot be known instead of guessing.
+grep -q 'cannot tell a complete stage2' "$TMP_ROOT/external-read-only/stdout" \
+    || fail "an unstaged external sysroot did not state what this script cannot know"
+grep -q 'rustup default' "$TMP_ROOT/external-read-only/stdout" \
+    && fail "an unstaged external sysroot was recommended as the default toolchain"
+
 echo "rustup-link-trust tests: ok"

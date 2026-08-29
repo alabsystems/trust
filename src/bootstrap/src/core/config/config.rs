@@ -2313,9 +2313,9 @@ fn min_stage0_rustc_version(
     }
     match semver::Version::parse(raw) {
         Ok(version) => version,
-        Err(err) => {
-            fail(&format!("src/stage0 `min_stage0_rustc_version` ({raw:?}) is not a version: {err}"))
-        }
+        Err(err) => fail(&format!(
+            "src/stage0 `min_stage0_rustc_version` ({raw:?}) is not a version: {err}"
+        )),
     }
 }
 

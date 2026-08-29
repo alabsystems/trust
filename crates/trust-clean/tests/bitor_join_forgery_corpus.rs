@@ -197,10 +197,7 @@ fn parameter_join_operand_declines() {
             *a = Operand::Copy(Place { local: 1, projections: Vec::new() });
         }
     });
-    assert!(
-        !certifies(&forged),
-        "a parameter operand is not branch-computed and must DECLINE"
-    );
+    assert!(!certifies(&forged), "a parameter operand is not branch-computed and must DECLINE");
 }
 
 /// `_0` as its own operand is a self-reference, not a convergence temp.
@@ -306,8 +303,9 @@ fn load_named(dir: &str, name: &str) -> Option<VerifiableFunction> {
 /// POSITIVE CONTROL. Without it every decline below is vacuous.
 #[test]
 fn short_circuit_or_chain_certifies_via_trustir() {
-    let func = load_named("fixtures/mass-harvest-2026-07-17/char-ascii/dumps", "is_ascii_punctuation")
-        .expect("`is_ascii_punctuation` fixture must be present");
+    let func =
+        load_named("fixtures/mass-harvest-2026-07-17/char-ascii/dumps", "is_ascii_punctuation")
+            .expect("`is_ascii_punctuation` fixture must be present");
     assert!(
         certifies(&func),
         "the four-range short-circuit OR chain must certify via trust-ir; if this \

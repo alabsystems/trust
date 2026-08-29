@@ -30,10 +30,8 @@ fn complete_positive_spine_projection_pins_ground_the_postcondition() {
 #[test]
 fn missing_sibling_projection_pin_fails_closed() {
     let postcondition = two_field_postcondition();
-    let formula = Formula::And(vec![
-        eq("_0.0", "x"),
-        Formula::Not(Box::new(postcondition.clone())),
-    ]);
+    let formula =
+        Formula::And(vec![eq("_0.0", "x"), Formula::Not(Box::new(postcondition.clone()))]);
 
     assert!(!formula_has_complete_return_projection_pins(&formula, &postcondition));
 }
@@ -46,10 +44,7 @@ fn negated_or_cyclic_equalities_are_not_projection_pins() {
         Formula::Not(Box::new(eq("_0.1", "x"))),
         Formula::Not(Box::new(postcondition.clone())),
     ]);
-    assert!(!formula_has_complete_return_projection_pins(
-        &negated_pin,
-        &postcondition
-    ));
+    assert!(!formula_has_complete_return_projection_pins(&negated_pin, &postcondition));
 
     let cyclic = Formula::And(vec![
         eq("_0.0", "_0.1"),
@@ -62,17 +57,11 @@ fn negated_or_cyclic_equalities_are_not_projection_pins() {
 #[test]
 fn projection_pins_do_not_replace_a_required_whole_slot_pin() {
     let postcondition = Formula::And(vec![eq("_0.0", "x"), eq("_0", "x")]);
-    let projections_only = Formula::And(vec![
-        eq("_0.0", "x"),
-        Formula::Not(Box::new(postcondition.clone())),
-    ]);
-    assert!(!formula_has_complete_return_projection_pins(
-        &projections_only,
-        &postcondition
-    ));
+    let projections_only =
+        Formula::And(vec![eq("_0.0", "x"), Formula::Not(Box::new(postcondition.clone()))]);
+    assert!(!formula_has_complete_return_projection_pins(&projections_only, &postcondition));
     assert!(!formula_has_return_slot_pin(&projections_only));
 
-    let with_whole_slot =
-        Formula::And(vec![eq("_0", "x"), eq("_0.0", "x"), projections_only]);
+    let with_whole_slot = Formula::And(vec![eq("_0", "x"), eq("_0.0", "x"), projections_only]);
     assert!(formula_has_return_slot_pin(&with_whole_slot));
 }

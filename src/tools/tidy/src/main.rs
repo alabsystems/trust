@@ -165,6 +165,13 @@ fn main() {
 
         check!(triagebot, &root_path);
         check!(filenames, &root_path);
+        // Trust: `trust_prose_annotations` is registered ONCE, up with the other
+        // "checks over tests". A second `check!` here made two threads claim the
+        // same `CheckId`, which `diagnostics.rs:153` rejects by panicking — and
+        // because that panic poisons the shared diagnostics mutex, every other
+        // in-flight check died with a `PoisonError` and the process aborted
+        // before printing a single lane verdict. A duplicated check does not
+        // report twice; it takes the whole run down.
 
         let collected = {
             drain_handles(&mut handles);

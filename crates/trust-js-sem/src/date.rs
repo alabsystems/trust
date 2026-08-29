@@ -41,8 +41,7 @@ fn days_in_year(y: f64) -> f64 {
 }
 
 fn day_from_year(y: f64) -> f64 {
-    365.0 * (y - 1970.0) + ((y - 1969.0) / 4.0).floor()
-        - ((y - 1901.0) / 100.0).floor()
+    365.0 * (y - 1970.0) + ((y - 1969.0) / 4.0).floor() - ((y - 1901.0) / 100.0).floor()
         + ((y - 1601.0) / 400.0).floor()
 }
 
@@ -76,11 +75,7 @@ fn days_before_month(m: i64, leap: bool) -> f64 {
     let cum: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     #[allow(clippy::cast_precision_loss)]
     let base = cum[m.rem_euclid(12) as usize] as f64;
-    if leap && m.rem_euclid(12) >= 2 {
-        base + 1.0
-    } else {
-        base
-    }
+    if leap && m.rem_euclid(12) >= 2 { base + 1.0 } else { base }
 }
 
 fn month_from_time(t: f64) -> f64 {
@@ -311,10 +306,8 @@ impl Interp {
                 // is false under the oracle. (pending_new_target is cleared by
                 // construct_with_target after dispatch.)
                 let _ = self.pending_new_target.take();
-                let oid = self.alloc(Object::new(
-                    ObjKind::DateObj(time_clip(t)),
-                    Some(self.intr.date_proto),
-                ));
+                let oid = self
+                    .alloc(Object::new(ObjKind::DateObj(time_clip(t)), Some(self.intr.date_proto)));
                 Ok(Value::Obj(oid))
             }
             Builtin::DateNow => Ok(Value::Num(self.clock_now())),
@@ -332,10 +325,7 @@ impl Interp {
                     ));
                 }
                 let yr = two_digit_year(y);
-                Ok(Value::Num(time_clip(make_date(
-                    make_day(yr, m, dt),
-                    make_time(h, mi, s, ms),
-                ))))
+                Ok(Value::Num(time_clip(make_date(make_day(yr, m, dt), make_time(h, mi, s, ms)))))
             }
             Builtin::DateParse => {
                 let s = self.to_string_units(&arg(0))?;
@@ -410,7 +400,12 @@ impl Interp {
             }
             DateOp::SetMilliseconds => {
                 let (a, t) = self.coerce_setter_args(this, 1, args)?;
-                let time = make_time(hours_from_time(t), min_from_time(t), sec_from_time(t), a.first().copied().unwrap_or(f64::NAN));
+                let time = make_time(
+                    hours_from_time(t),
+                    min_from_time(t),
+                    sec_from_time(t),
+                    a.first().copied().unwrap_or(f64::NAN),
+                );
                 let nd = make_date(day(t), time);
                 let v = self.set_date_value(this, nd)?;
                 Ok(Value::Num(v))
@@ -418,7 +413,12 @@ impl Interp {
             DateOp::SetSeconds => {
                 let (a, t) = self.coerce_setter_args(this, 2, args)?;
                 let ms = a.get(1).copied().unwrap_or_else(|| ms_from_time(t));
-                let time = make_time(hours_from_time(t), min_from_time(t), a.first().copied().unwrap_or(f64::NAN), ms);
+                let time = make_time(
+                    hours_from_time(t),
+                    min_from_time(t),
+                    a.first().copied().unwrap_or(f64::NAN),
+                    ms,
+                );
                 let nd = make_date(day(t), time);
                 let v = self.set_date_value(this, nd)?;
                 Ok(Value::Num(v))
@@ -427,7 +427,8 @@ impl Interp {
                 let (a, t) = self.coerce_setter_args(this, 3, args)?;
                 let s = a.get(1).copied().unwrap_or_else(|| sec_from_time(t));
                 let ms = a.get(2).copied().unwrap_or_else(|| ms_from_time(t));
-                let time = make_time(hours_from_time(t), a.first().copied().unwrap_or(f64::NAN), s, ms);
+                let time =
+                    make_time(hours_from_time(t), a.first().copied().unwrap_or(f64::NAN), s, ms);
                 let nd = make_date(day(t), time);
                 let v = self.set_date_value(this, nd)?;
                 Ok(Value::Num(v))
@@ -445,7 +446,11 @@ impl Interp {
             DateOp::SetDate => {
                 let (a, t) = self.coerce_setter_args(this, 1, args)?;
                 let nd = make_date(
-                    make_day(year_from_time(t), month_from_time(t), a.first().copied().unwrap_or(f64::NAN)),
+                    make_day(
+                        year_from_time(t),
+                        month_from_time(t),
+                        a.first().copied().unwrap_or(f64::NAN),
+                    ),
                     time_within_day(t),
                 );
                 let v = self.set_date_value(this, nd)?;
@@ -454,7 +459,10 @@ impl Interp {
             DateOp::SetMonth => {
                 let (a, t) = self.coerce_setter_args(this, 2, args)?;
                 let dt = a.get(1).copied().unwrap_or_else(|| date_from_time(t));
-                let nd = make_date(make_day(year_from_time(t), a.first().copied().unwrap_or(f64::NAN), dt), time_within_day(t));
+                let nd = make_date(
+                    make_day(year_from_time(t), a.first().copied().unwrap_or(f64::NAN), dt),
+                    time_within_day(t),
+                );
                 let v = self.set_date_value(this, nd)?;
                 Ok(Value::Num(v))
             }
@@ -464,7 +472,10 @@ impl Interp {
                 let t = if t0.is_nan() { 0.0 } else { t0 };
                 let m = a.get(1).copied().unwrap_or_else(|| month_from_time(t));
                 let dt = a.get(2).copied().unwrap_or_else(|| date_from_time(t));
-                let nd = make_date(make_day(a.first().copied().unwrap_or(f64::NAN), m, dt), time_within_day(t));
+                let nd = make_date(
+                    make_day(a.first().copied().unwrap_or(f64::NAN), m, dt),
+                    time_within_day(t),
+                );
                 let v = self.set_date_value(this, nd)?;
                 Ok(Value::Num(v))
             }
@@ -482,7 +493,7 @@ impl Interp {
                 let oid = match this {
                     Value::Obj(o) => *o,
                     Value::Undefined | Value::Null => {
-                        return Err(self.throw_native(NativeErrorKind::TypeError))
+                        return Err(self.throw_native(NativeErrorKind::TypeError));
                     }
                     Value::Sym(s) => {
                         let s = *s;
@@ -532,11 +543,7 @@ fn two_digit_year(y: f64) -> f64 {
         return f64::NAN;
     }
     let iy = y.trunc();
-    if (0.0..=99.0).contains(&iy) {
-        1900.0 + iy
-    } else {
-        y
-    }
+    if (0.0..=99.0).contains(&iy) { 1900.0 + iy } else { y }
 }
 
 /// ISO 8601 extended-format string for a finite time value.
@@ -555,16 +562,7 @@ fn iso_string(t: f64) -> String {
     let s = sec_from_time(t) as i64;
     #[allow(clippy::cast_possible_truncation)]
     let ms = ms_from_time(t) as i64;
-    format!(
-        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        iso_year(y),
-        mo,
-        d,
-        h,
-        mi,
-        s,
-        ms
-    )
+    format!("{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", iso_year(y), mo, d, h, mi, s, ms)
 }
 
 enum ParseResult {

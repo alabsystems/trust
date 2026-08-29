@@ -89,6 +89,20 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
             // THIR of the parent function without a cycle.
             let thir = thir.borrow();
             let mir = build_mir(&thir);
+            // Trust (LANE 1): THE CTFE FREEZE. Everything below runs INSIDE the `mir_built`
+            // query, so any const-evaluation it forces demands `mir_for_ctfe` -> `mir_borrowck`
+            // of the evaluated item, and borrowck descends into that item's nested closures and
+            // demands THEIR `mir_built`. On a self-referential const or static that closes a
+            // cycle on rustc's own query stack — a hard `error[E0391]`, i.e. `-Ztrust-ir-lower`
+            // turning a program vanilla rustc compiles into a failing one, with no obligation
+            // ever evaluated. `library/core` was blocked on exactly this
+            // (`docs/design/2026-08-20-core-slice-blocker-histogram.md`, work item 0).
+            //
+            // The freeze is scoped HERE, at the seam, because the hazard is a property of the
+            // caller and not of the code being looked at: `trust-mir-extract` is shared with the
+            // VERIFIER, which runs at `optimized_mir` time where forcing CTFE is both safe and
+            // load-bearing. That lane never enters this guard and is untouched.
+            let _trust_ctfe_freeze = trust_thir_lower::enter_mir_built_ctfe_freeze();
             // Trust (F1): WARM `trust_ir_of` FOR THE TRUST-CG TRUST-IR CODEGEN FRONTEND.
             //
             // `-Ztrust-cg-frontend=trust-ir` makes the backend consume `trust_ir_of` — but a
@@ -287,12 +301,12 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                                 // this calls the single table
                                 // `trust_thir_lower::crate_module::CASCADE_TAGS` /
                                 // `is_cascade_tag`, which its own tests pin exactly.
-                                let class =
-                                    if trust_thir_lower::crate_module::is_cascade_tag(what) {
-                                        "cascade"
-                                    } else {
-                                        "primary"
-                                    };
+                                let class = if trust_thir_lower::crate_module::is_cascade_tag(what)
+                                {
+                                    "cascade"
+                                } else {
+                                    "primary"
+                                };
                                 tracing::debug!(
                                     ?def,
                                     what,
@@ -395,7 +409,41 @@ pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> 
                             derived_report.markers_exact,
                             derived_report.source_header_correspondence.as_ref(),
                         );
+                        // Trust (wall A, the INSTANCE flip seam): a GENERIC `agreed` body cannot
+                        // be installed by the `DefId`-seam flip — `to_mir::rederive_abi_sig`
+                        // refuses every generic identity signature, which is the whole wall — so
+                        // it records into a SEPARATE registry here, together with a retained
+                        // clone of the body just built. `codegen_mir` then derives and installs
+                        // it PER INSTANCE, after re-minting the differential verdict at that
+                        // instance's concrete args. The two registries partition on exactly the
+                        // predicate the `DefId` seam refuses on, so no body can ever be installed
+                        // by both.
+                        trust_thir_lower::instance_flip::record_green_instance(
+                            tcx,
+                            def,
+                            &lowered,
+                            &mir,
+                            derived_report.markers_exact,
+                            derived_report.source_header_correspondence.as_ref(),
+                        );
                     }
+                    // Trust (wall A, instance-flip probe — MEASUREMENT ONLY, off unless
+                    // `-Ztrust-instance-flip-probe` is set): for a generic `agreed` body,
+                    // measure whether the FROZEN comparator still agrees once BOTH sides
+                    // are instantiated at a concrete local instance, and stash the
+                    // lifetime-free pieces for the post-codegen mono-instance census.
+                    // Placed here because this hook is the only seam holding the freshly
+                    // BUILT body (the phase `compare_derived` is written for), and BEFORE
+                    // `record` below moves `lowered`. Installs nothing; prints
+                    // TRUST-WALLA-PROBE lines to stderr.
+                    trust_thir_lower::instance_probe::hook_probe(
+                        tcx,
+                        def,
+                        &lowered,
+                        &mir,
+                        derived_report.verdict
+                            == trust_thir_lower::mir_differential::DerivedVerdict::DerivedAgreed,
+                    );
                     // Trust: P1 Phase-0 — hand the per-body result to the crate-level registry.
                     // It is assembled into ONE crate `trust_ir::Module` (+ coverage sidecar) at the
                     // `rustc_interface::passes::analysis` seam; the artifact is dumped there when

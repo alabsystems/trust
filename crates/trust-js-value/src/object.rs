@@ -7,10 +7,12 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::units::{array_index_of, Units};
-use crate::value::{EnvId, JsValue, ObjId, SymId};
-use indexmap::IndexMap;
 use std::rc::Rc;
+
+use indexmap::IndexMap;
+
+use crate::units::{Units, array_index_of};
+use crate::value::{EnvId, JsValue, ObjId, SymId};
 
 /// A property key: a string (code units) or a symbol identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,7 +65,12 @@ impl Property {
 
     /// Data property with explicit attributes.
     #[must_use]
-    pub fn with_attrs(value: JsValue, writable: bool, enumerable: bool, configurable: bool) -> Property {
+    pub fn with_attrs(
+        value: JsValue,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    ) -> Property {
         Property {
             v: PropValue::Data { value, writable },
             enumerable,
@@ -86,13 +93,13 @@ impl Property {
 
     /// Accessor property.
     #[must_use]
-    pub fn accessor(get: Option<ObjId>, set: Option<ObjId>, enumerable: bool, configurable: bool) -> Property {
-        Property {
-            v: PropValue::Accessor { get, set },
-            enumerable,
-            configurable,
-            synthetic: false,
-        }
+    pub fn accessor(
+        get: Option<ObjId>,
+        set: Option<ObjId>,
+        enumerable: bool,
+        configurable: bool,
+    ) -> Property {
+        Property { v: PropValue::Accessor { get, set }, enumerable, configurable, synthetic: false }
     }
 
     /// The data value, if this is a data property.
@@ -138,7 +145,9 @@ pub enum FnFlavor {
     Arrow,
     /// Class constructor: [[Call]] throws; `derived` = has an `extends`
     /// heritage (this-TDZ until `super()`).
-    ClassCtor { derived: bool },
+    ClassCtor {
+        derived: bool,
+    },
 }
 
 /// A user closure over the AST. `home` is the [[HomeObject]] for `super.x`
@@ -484,12 +493,7 @@ pub struct JsObject {
 impl JsObject {
     #[must_use]
     pub fn new(kind: ObjKind, proto: Option<ObjId>) -> JsObject {
-        JsObject {
-            proto,
-            extensible: true,
-            props: IndexMap::new(),
-            kind,
-        }
+        JsObject { proto, extensible: true, props: IndexMap::new(), kind }
     }
 
     #[must_use]
@@ -544,21 +548,14 @@ mod tests {
     #[test]
     fn own_key_order_is_indices_then_insertion_then_symbols() {
         let mut o = JsObject::new(ObjKind::Plain, None);
+        o.props.insert(PropKey::from_str("b"), Property::data(JsValue::Null));
+        o.props.insert(PropKey::from_str("2"), Property::data(JsValue::Null));
         o.props
-            .insert(PropKey::from_str("b"), Property::data(JsValue::Null));
-        o.props
-            .insert(PropKey::from_str("2"), Property::data(JsValue::Null));
-        o.props.insert(
-            PropKey::Sym(SymId::WellKnown(WkSym::Iterator)),
-            Property::data(JsValue::Null),
-        );
-        o.props
-            .insert(PropKey::from_str("a"), Property::data(JsValue::Null));
-        o.props
-            .insert(PropKey::from_str("0"), Property::data(JsValue::Null));
+            .insert(PropKey::Sym(SymId::WellKnown(WkSym::Iterator)), Property::data(JsValue::Null));
+        o.props.insert(PropKey::from_str("a"), Property::data(JsValue::Null));
+        o.props.insert(PropKey::from_str("0"), Property::data(JsValue::Null));
         // Non-canonical numeric strings are plain string keys.
-        o.props
-            .insert(PropKey::from_str("01"), Property::data(JsValue::Null));
+        o.props.insert(PropKey::from_str("01"), Property::data(JsValue::Null));
         let keys = ordered_own_keys(&o);
         assert_eq!(
             keys,

@@ -7,9 +7,5 @@
 // must NOT prove it.
 #[core::contracts::ensures(move |r: &i32| *r == -2 || *r == 1)]
 pub fn negation_predicate_contract(b: bool) -> i32 {
-    if b {
-        -1
-    } else {
-        1
-    }
+    if b { -1 } else { 1 }
 }

@@ -28,8 +28,8 @@
 //! `held_by_kernel_recheck()` in non-test code to make something compile, that
 //! is the bug, not the seal.
 
-use trust_clean_carrier::{carrier_at, CarrierRefused};
-use trust_clean_origin::{decide_mint, MintRefusal};
+use trust_clean_carrier::{CarrierRefused, carrier_at};
+use trust_clean_origin::{MintRefusal, decide_mint};
 use trust_symbols::{
     Assumption, AxiomClosure, CicKernelRecheck, KernelAuthority, KernelStatus, TermDigest,
 };
@@ -126,7 +126,7 @@ fn refuse_unrecorded_axiom_closure_distinctly_from_nonempty() {
 #[test]
 fn refuse_nonempty_axiom_closure_and_disclose_the_assumptions_by_name() {
     let closure = AxiomClosure::audited([
-        Assumption::domain_axiom("key_lemma").expect("a nameable domain axiom"),
+        Assumption::domain_axiom("key_lemma").expect("a nameable domain axiom")
     ]);
     let refusal = decide_mint("f", &kernel_checked(closure), carrier_at(&uint64_ty(), &u64_ty()))
         .expect_err("a declaration resting on an undischarged assumption must refuse");
@@ -186,9 +186,9 @@ fn every_refusal_note_offers_at_least_two_options() {
         .unwrap_err(),
         decide_mint(
             "f",
-            &kernel_checked(AxiomClosure::audited([
-                Assumption::domain_axiom("key_lemma").unwrap()
-            ])),
+            &kernel_checked(AxiomClosure::audited(
+                [Assumption::domain_axiom("key_lemma").unwrap()],
+            )),
             carrier_at(&uint64_ty(), &u64_ty()),
         )
         .unwrap_err(),
@@ -203,13 +203,7 @@ fn every_refusal_note_offers_at_least_two_options() {
     for refusal in &refusals {
         let note = refusal.note();
         let options = note.matches("\n- ").count();
-        assert!(
-            options >= 2,
-            "v7/D3 requires OPTIONS; {refusal:?} offered {options}:\n{note}"
-        );
-        assert!(
-            note.contains('f'),
-            "the note must name the declaration it is about:\n{note}"
-        );
+        assert!(options >= 2, "v7/D3 requires OPTIONS; {refusal:?} offered {options}:\n{note}");
+        assert!(note.contains('f'), "the note must name the declaration it is about:\n{note}");
     }
 }

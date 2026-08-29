@@ -10,14 +10,16 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{hoist, Abrupt, Ctx, ERes, Interp};
-use crate::private::{PrivElem, PrivEnvId, PrivName};
-use crate::props::PartialDesc;
 use std::rc::Rc;
+
 use trust_js_parse::ast::{Class, ClassElement, Expr, Func, MethodKind, PropKey as AstKey, Stmt};
 use trust_js_value::{
     Binding, EnvId, FnFlavor, JsObject, JsValue, ObjId, ObjKind, PropKey, Property,
 };
+
+use crate::interp::{Abrupt, Ctx, ERes, Interp, hoist};
+use crate::private::{PrivElem, PrivEnvId, PrivName};
+use crate::props::PartialDesc;
 
 /// Per-class-constructor metadata, keyed by the constructor's ObjId.
 #[derive(Debug)]
@@ -77,12 +79,7 @@ impl Interp {
     /// ClassDefinitionEvaluation. `name_override` implements NamedEvaluation
     /// for anonymous class expressions.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn eval_class(
-        &mut self,
-        c: &Class,
-        ctx: &Ctx,
-        name_override: Option<&str>,
-    ) -> ERes {
+    pub(crate) fn eval_class(&mut self, c: &Class, ctx: &Ctx, name_override: Option<&str>) -> ERes {
         // Refusal scan: out-of-slice class surface refuses before any
         // observable side effect. Private (non-generator, non-async) methods,
         // accessors, fields, AND static initialization blocks ARE in slice.
@@ -101,15 +98,9 @@ impl Interp {
         // Class scope with the (immutable) inner class binding in TDZ.
         let class_env = self.alloc_env(Some(ctx.env));
         if let Some(n) = &c.name {
-            self.heap
-                .env_mut(class_env)
-                .bindings
-                .insert(n.clone(), Binding::tdz(false));
+            self.heap.env_mut(class_env).bindings.insert(n.clone(), Binding::tdz(false));
         }
-        let cctx = Ctx {
-            env: class_env,
-            strict: true,
-        };
+        let cctx = Ctx { env: class_env, strict: true };
 
         // Heritage: protoParent + constructorParent. Evaluated with the
         // OUTER PrivateEnvironment (class_env's own is not yet attached), so a
@@ -121,10 +112,9 @@ impl Interp {
                 match &sv {
                     JsValue::Null => (None, self.intr.function_proto, true),
                     _ if self.is_constructor(&sv) => {
-                        let JsValue::Obj(sc) = sv else {
-                            unreachable!("constructors are objects")
-                        };
-                        let pp = self.get_prop(&JsValue::Obj(sc), &PropKey::from_str("prototype"))?;
+                        let JsValue::Obj(sc) = sv else { unreachable!("constructors are objects") };
+                        let pp =
+                            self.get_prop(&JsValue::Obj(sc), &PropKey::from_str("prototype"))?;
                         match pp {
                             JsValue::Obj(p) => (Some(p), sc, true),
                             JsValue::Null => (None, sc, true),
@@ -155,17 +145,10 @@ impl Interp {
         let proto = self.alloc_obj(JsObject::new(ObjKind::Plain, proto_parent))?;
 
         // The constructor function object.
-        let class_name: String = c
-            .name
-            .clone()
-            .or_else(|| name_override.map(str::to_string))
-            .unwrap_or_default();
+        let class_name: String =
+            c.name.clone().or_else(|| name_override.map(str::to_string)).unwrap_or_default();
         let ctor_el = c.elements.iter().find_map(|el| match el {
-            ClassElement::Method {
-                kind: MethodKind::Constructor,
-                func,
-                ..
-            } => Some(func),
+            ClassElement::Method { kind: MethodKind::Constructor, func, .. } => Some(func),
             _ => None,
         });
         let default_ctor = ctor_el.is_none();
@@ -197,10 +180,10 @@ impl Interp {
         // F.[[Prototype]] = constructorParent; MakeClassConstructor +
         // MakeConstructor(F, false, proto).
         self.heap.obj_mut(fobj).proto = Some(ctor_parent);
-        self.heap.obj_mut(fobj).props.insert(
-            PropKey::from_str("prototype"),
-            Property::frozen(JsValue::Obj(proto)),
-        );
+        self.heap
+            .obj_mut(fobj)
+            .props
+            .insert(PropKey::from_str("prototype"), Property::frozen(JsValue::Obj(proto)));
         self.heap.obj_mut(proto).props.insert(
             PropKey::from_str("constructor"),
             Property::with_attrs(JsValue::Obj(fobj), true, false, true),
@@ -217,12 +200,7 @@ impl Interp {
                 ClassElement::StaticBlock(body) => {
                     static_elems.push(StaticItem::Block(Rc::new(body.clone())));
                 }
-                ClassElement::Method {
-                    is_static,
-                    kind,
-                    key: AstKey::Private(pname),
-                    func,
-                } => {
+                ClassElement::Method { is_static, kind, key: AstKey::Private(pname), func } => {
                     let target = if *is_static { fobj } else { proto };
                     let id = self.priv_env_bind(penv, pname);
                     let (fname, flavor) = match kind {
@@ -246,12 +224,7 @@ impl Interp {
                     };
                     add_priv_method(list, id, kind, fo);
                 }
-                ClassElement::Method {
-                    is_static,
-                    kind,
-                    key,
-                    func,
-                } => {
+                ClassElement::Method { is_static, kind, key, func } => {
                     let (k, name, lossy) = self.eval_prop_key(key, &cctx)?;
                     if lossy {
                         return Err(Abrupt::Fatal(
@@ -323,11 +296,7 @@ impl Interp {
                         MethodKind::Constructor => unreachable!("filtered above"),
                     }
                 }
-                ClassElement::Field {
-                    is_static,
-                    key: AstKey::Private(pname),
-                    init,
-                } => {
+                ClassElement::Field { is_static, key: AstKey::Private(pname), init } => {
                     let id = self.priv_env_bind(penv, pname);
                     let pfd = PrivFieldDef {
                         name: id,
@@ -342,11 +311,7 @@ impl Interp {
                         instance_elems.push(InstanceElem::Private(pfd));
                     }
                 }
-                ClassElement::Field {
-                    is_static,
-                    key,
-                    init,
-                } => {
+                ClassElement::Field { is_static, key, init } => {
                     let (k, name, lossy) = self.eval_prop_key(key, &cctx)?;
                     let fd = FieldDef {
                         key: k,
@@ -367,11 +332,7 @@ impl Interp {
 
         self.class_info.insert(
             fobj,
-            Rc::new(ClassInfo {
-                default_ctor,
-                instance_elems,
-                instance_priv_methods,
-            }),
+            Rc::new(ClassInfo { default_ctor, instance_elems, instance_priv_methods }),
         );
 
         // Static private methods land on F before the class binding
@@ -432,10 +393,7 @@ impl Interp {
             }
         }
         for (n, mutable) in lexical {
-            self.heap
-                .env_mut(senv)
-                .bindings
-                .insert(n, Binding::tdz(mutable));
+            self.heap.env_mut(senv).bindings.insert(n, Binding::tdz(mutable));
         }
         for g in &analysis.funcs {
             let fo = self.instantiate_hoisted_function(g, senv)?;
@@ -444,10 +402,7 @@ impl Interp {
                 Binding::var(JsValue::Obj(fo)),
             );
         }
-        let ctx = Ctx {
-            env: senv,
-            strict: true,
-        };
+        let ctx = Ctx { env: senv, strict: true };
         let mut v: Option<JsValue> = None;
         // A static block cannot `return` (an early error), so any abrupt
         // completion is a throw/fatal that propagates out of the class
@@ -503,10 +458,7 @@ impl Interp {
                     fr.new_target = Some(JsValue::Undefined);
                     fr.home_object = Some(home);
                 }
-                let fctx = Ctx {
-                    env: fenv,
-                    strict: true,
-                };
+                let fctx = Ctx { env: fenv, strict: true };
                 self.eval_expr_named(e, name, &fctx)
             }
         }
@@ -556,11 +508,10 @@ impl Interp {
         args: Vec<JsValue>,
         nt: JsValue,
     ) -> ERes {
-        let info = self
-            .class_info
-            .get(&fid)
-            .cloned()
-            .ok_or_else(|| Abrupt::Fatal("class metadata missing (interpreter bug)".to_string()))?;
+        let info =
+            self.class_info.get(&fid).cloned().ok_or_else(|| {
+                Abrupt::Fatal("class metadata missing (interpreter bug)".to_string())
+            })?;
         if derived {
             if info.default_ctor {
                 // constructor(...args) { super(...args) }
@@ -606,9 +557,8 @@ fn add_priv_method(
     match kind {
         MethodKind::Method => list.push((name, PrivElem::Method(fo))),
         MethodKind::Get => {
-            if let Some((_, PrivElem::Accessor { get, .. })) = list
-                .iter_mut()
-                .find(|(n, e)| *n == name && matches!(e, PrivElem::Accessor { .. }))
+            if let Some((_, PrivElem::Accessor { get, .. })) =
+                list.iter_mut().find(|(n, e)| *n == name && matches!(e, PrivElem::Accessor { .. }))
             {
                 *get = Some(fo);
             } else {
@@ -616,9 +566,8 @@ fn add_priv_method(
             }
         }
         MethodKind::Set => {
-            if let Some((_, PrivElem::Accessor { set, .. })) = list
-                .iter_mut()
-                .find(|(n, e)| *n == name && matches!(e, PrivElem::Accessor { .. }))
+            if let Some((_, PrivElem::Accessor { set, .. })) =
+                list.iter_mut().find(|(n, e)| *n == name && matches!(e, PrivElem::Accessor { .. }))
             {
                 *set = Some(fo);
             } else {

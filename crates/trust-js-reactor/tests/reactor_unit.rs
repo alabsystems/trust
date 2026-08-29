@@ -6,7 +6,7 @@
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 mod common;
-use common::{reaction, s, void, Rt, TestVal};
+use common::{Rt, TestVal, reaction, s, void};
 use trust_js_reactor::{Completion, PromiseStatus, Reactor, ReactorError};
 
 fn ord(v: &[&str]) -> Vec<String> {

@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
-    Rvalue, SourceSpan, Statement, Terminator, Ty, VariantDef, VcKind, VerifiableBody,
+    Rvalue, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VariantDef, VcKind, VerifiableBody,
     VerifiableFunction,
 };
 
@@ -16,7 +15,9 @@ const RESULT_UNWRAP: &str = "core::result::Result::<T, E>::unwrap";
 /// `Result<u64, ()>` in the flattened `lower_enum_adt` shape (`Ok` = 0,
 /// `Err` = 1) — identical to the unwrap panic-freedom fixtures.
 fn std_result_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -36,7 +37,9 @@ fn std_result_ty() -> Ty {
             },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn i128_ty() -> Ty {
@@ -77,6 +80,7 @@ fn call_term(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Te
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     }
 }
@@ -96,7 +100,13 @@ fn func_of(
         name: name.rsplit("::").next().unwrap_or(name).into(),
         def_path: name.into(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -173,11 +183,7 @@ fn unconditional_fn(variant: usize) -> VerifiableFunction {
 /// `fn caller(..) { let r = rat_new(1, <d>); r.unwrap() }` — the call-result
 /// receiver shape. `d_arg` is the second actual; `arg_count`/locals decide
 /// whether the caller has its own `d` parameter.
-fn caller_fn(
-    d_arg: Operand,
-    extra_locals: Vec<LocalDecl>,
-    arg_count: usize,
-) -> VerifiableFunction {
+fn caller_fn(d_arg: Operand, extra_locals: Vec<LocalDecl>, arg_count: usize) -> VerifiableFunction {
     let r_local = extra_locals.len() + 1; // after ret + params
     let x_local = r_local + 1;
     let mut locals = vec![LocalDecl { index: 0, ty: Ty::u64(), name: None }];
@@ -263,8 +269,8 @@ fn ite_body_with(f: &Formula, lhs_pred: &dyn Fn(&Formula) -> bool) -> bool {
 /// `tag == ite(d == 0, ERR, OK)` over the callee's own formals.
 #[test]
 fn rat_new_shape_yields_guard_conditioned_summary() {
-    let s = function_return_disc_summary(&rat_new_fn())
-        .expect("the Rat::new shape must be summarized");
+    let s =
+        function_return_disc_summary(&rat_new_fn()).expect("the Rat::new shape must be summarized");
     assert_eq!(s.enum_name, "core::result::Result");
     assert_eq!(s.params, vec!["n".to_string(), "d".to_string()]);
     let ReturnDiscCases::GuardConditioned { cond, then_tag, else_tag } = &s.cases else {
@@ -535,8 +541,7 @@ fn unsummarized_callee_falls_back_to_unsupported_row() {
 #[test]
 fn unconditional_callee_pins_receiver_tag() {
     let caller = caller_fn(Operand::Constant(ConstValue::Int(2)), vec![], 0);
-    let vcs =
-        with_summaries(&[unconditional_fn(0)], || generate_unwrap_panic_freedom_vcs(&caller));
+    let vcs = with_summaries(&[unconditional_fn(0)], || generate_unwrap_panic_freedom_vcs(&caller));
     assert_eq!(vcs.len(), 1);
     assert!(
         has_and_conjunct(&vcs[0].formula, &|f| matches!(f, Formula::Eq(l, r)
@@ -544,8 +549,7 @@ fn unconditional_callee_pins_receiver_tag() {
         "always-Ok callee must yield the ground body `0 == 1`: {:?}",
         vcs[0].formula
     );
-    let vcs =
-        with_summaries(&[unconditional_fn(1)], || generate_unwrap_panic_freedom_vcs(&caller));
+    let vcs = with_summaries(&[unconditional_fn(1)], || generate_unwrap_panic_freedom_vcs(&caller));
     assert_eq!(vcs.len(), 1);
     assert!(
         has_and_conjunct(&vcs[0].formula, &|f| matches!(f, Formula::Eq(l, r)

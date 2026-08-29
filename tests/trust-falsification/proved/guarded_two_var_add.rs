@@ -7,9 +7,5 @@
 // `Int.add_le_add_right`/`_left` + `Int.le_trans`) contradicts `a+b>MAX`, and
 // `0<=a ∧ 0<=b ⟹ 0<=a+b` contradicts `a+b<0`. -full kernel-Certified (task #38).
 pub fn guarded_two_var_add(a: u32, b: u32) -> u32 {
-    if a < 1000 {
-        if b < 1000 { a + b } else { 0 }
-    } else {
-        0
-    }
+    if a < 1000 { if b < 1000 { a + b } else { 0 } } else { 0 }
 }

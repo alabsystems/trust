@@ -30,4 +30,81 @@
 # "rather than panicking inside chc::binop_to_formula -- the verifier core", and
 # the two remaining in-crate sites now pass the Result straight through their
 # match arms. Test call sites unwrap, which is where unwrapping belongs.
-283
+# 2026-08-26: 283 -> 281. TWO separate things happened; read both, because the
+#   number moved DOWN while the real panic surface had gone UP.
+#
+#   1. THE COUNTER WAS WRONG, and it over-counted. The cfg(test) stripper cleared
+#      its `pend` flag after exactly ONE line, so it only stripped a
+#      `#[cfg(test)]` item whose brace sat on the very next line. The ubiquitous
+#          #[cfg(test)]
+#          #[test]
+#          fn t() { ... a.unwrap() ... }
+#      form therefore leaked its ENTIRE BODY into the production count: `#[test]`
+#      carries no brace, `pend` reset, and `fn t() {` was read as production
+#      code. That contradicted the gate's own docstring ("every `#[cfg(test)]`
+#      item -- `mod`, `fn`, `impl`, anything -- is dropped whole"). It now scans
+#      forward to the item, which is bounded because an item is either braced or
+#      `;`-terminated. Mutation-proved on four shapes: attributed fn, plain
+#      `mod`, multi-line attribute, and `mod tests;`.
+#
+#   2. THERE WAS ALSO A REAL REGRESSION, and the counter bug was hiding its size
+#      rather than causing it. Measured with the CORRECTED lexer on both trees:
+#      the baseline commit 823eafeeff measures 281, HEAD measured 303 -- a
+#      genuine +22 of production panic surface, not +27 and not 0. Per-root:
+#      trust_verify.rs +6, trust-vcgen +6, trust-ir-bridge +5, trust-types +3,
+#      trust-cg-bridge +2.
+#
+#   The +22 was PAID DOWN rather than absorbed, since this ratchet only ever goes
+#   down. Every replacement is TOTAL, not relocated -- no counted panic was
+#   swapped for an uncounted one (an index, a bare `+`, a `saturating_*` that
+#   loops), which would game the metric instead of reducing risk:
+#     * `_ => unreachable!()` arms under an outer `32 | 64` / `Add | Sub` binding
+#       -> two-way `if`/`else`, total by the outer pattern (float_overflow.rs x3,
+#       lower.rs x2).
+#     * `len() == 1` followed by "therefore Some" -> let `pop` decide the shape
+#       (guards.rs x3, lower.rs x1). Semantics identical, no assertion step.
+#     * solver `try_not`/`try_assert_term` `.expect()` -> fail CLOSED to
+#       `Discharge::Unknown`, matching `Solver::try_new` two lines above
+#       (verify_output.rs x2).
+#     * `char::from_digit(nibble, 16).expect("nibble < 16")` -> a 16-element
+#       table; both nibbles of a u8 are statically in 0..=15 (model.rs x4).
+#     * `checked_add(1).expect("a finite MIR body must have an unoccupied block
+#        identity")` -> `smallest_free_block_id`, which STATES the pigeonhole
+#       argument the expect stood in for (model.rs x2).
+#     * `let ... else { unreachable!() }` where an arm guard already established
+#       the shape -> take the documented fail-visible fallback (`TrustIrTy::Ptr`,
+#       `return None`, `continue`) instead of aborting mid-proof.
+#   281 is therefore the honest count AND, by coincidence worth noting, exactly
+#   what the previous baseline's own tree measures once counted correctly.
+#
+#   STILL OUTSTANDING, deliberately not counted as fixed: the 8 added sites in
+#   compiler/rustc_mir_transform/src/trust_verify.rs. Validating a change there
+#   needs an `x.py` build rather than a cargo check, so they are a separate
+#   piece of work; the ratchet is green without them because the crates-side
+#   paydown covered the whole regression.
+# 2026-08-26 (later): 281 -> 272. The trust_verify.rs work named above as
+#   outstanding is now DONE — that file goes 24 -> 15. Nine sites, each taking a
+#   fail-closed path the enclosing function ALREADY had, so no new error
+#   vocabulary was invented:
+#     * `best.next().expect(..)` and the `Unmonitored` evidence arm -> `Err(..)`
+#       in two `Result<_, String>` functions that already return `Err` a few
+#       lines above.
+#     * `evidence.expect("PublishContractRow is only reachable with evidence")`
+#       -> `return None` in an `Option`-returning function whose sibling arm is
+#       already `None`.
+#     * the `TailCall` `let ... else { unreachable!() }` -> `continue`; the loop
+#       is iterating a list FILTERED on exactly that shape.
+#     * `dfs_stack.last_mut().expect("nonempty DFS stack")` -> match with
+#       `None => break`, in a helper whose own comment already promised to stay
+#       "fail-closed and total for malformed test/future callers".
+#     * four `_ => unreachable!()` arms whose outer arm had already restricted
+#       the scrutinee (five arithmetic Formula variants, five comparison
+#       variants, the three USize carriers, the three ISize carriers) -> `Err`.
+#   Validated with `./x.py check --stage 1`: 13m04s, exit 0, zero errors, and
+#   the log shows `Checking rustc_mir_transform` so the crate really was
+#   compiled. Then MUTATION-PROVED that this validation can fail at all, because
+#   twice this session a gate passed without looking: a deliberate type error
+#   planted in this same file takes the scoped
+#   `./x.py check --stage 1 compiler/rustc_mir_transform` to rc=1 with 2 errors,
+#   and the restored file back to rc=0.
+272

@@ -1,7 +1,7 @@
 // NonZero family harvest v2 — breadth minus the transmute gap.
 // NonZeroU8/U16/I32: new (safe), get, bit-method delegation
 // (count_ones/leading_zeros/trailing_zeros), Ord comparisons.
-use std::num::{NonZeroI32, NonZeroU16, NonZeroU32, NonZeroU8};
+use std::num::{NonZeroI32, NonZeroU8, NonZeroU16, NonZeroU32};
 
 #[inline(never)]
 fn nz_u8_new(x: u8) -> Option<NonZeroU8> {

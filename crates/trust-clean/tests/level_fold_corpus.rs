@@ -44,9 +44,9 @@ use std::path::{Path, PathBuf};
 use trust_clean::prove_dump_dir;
 use trust_clean::trustir_anchor::RefinementVerdict;
 use trust_clean::trustir_fold::{
-    check_structural_fold_refinement, sem_stack_safe_wrapper_of, sem_structural_fold_shape_of,
-    sem_structural_fold_shape_of_with_bodies, DumpBodies, FoldDecline, FoldExpr, FoldFieldKind,
-    FoldSort,
+    DumpBodies, FoldDecline, FoldExpr, FoldFieldKind, FoldSort, check_structural_fold_refinement,
+    sem_stack_safe_wrapper_of, sem_structural_fold_shape_of,
+    sem_structural_fold_shape_of_with_bodies,
 };
 use trust_types::VerifiableFunction;
 
@@ -56,8 +56,7 @@ fn corpus_dir() -> PathBuf {
 
 fn load(name: &str) -> VerifiableFunction {
     let path = corpus_dir().join(format!("{name}.json"));
-    let bytes =
-        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
@@ -154,10 +153,7 @@ fn is_zero_shape_is_the_level_mirror() {
     assert_eq!(tags, [0, 1, 2, 3, 4], "the LOGICAL discriminants, niche layout notwithstanding");
     // Field classification: Succ/Max/IMax children recursive; Param opaque.
     assert_eq!(shape.variants[1].fields, vec![FoldFieldKind::Recursive]);
-    assert_eq!(
-        shape.variants[2].fields,
-        vec![FoldFieldKind::Recursive, FoldFieldKind::Recursive]
-    );
+    assert_eq!(shape.variants[2].fields, vec![FoldFieldKind::Recursive, FoldFieldKind::Recursive]);
     assert_eq!(shape.variants[4].fields, vec![FoldFieldKind::PayloadOpaque]);
     // Arms: Zero => true; Succ => false; Max(a,b) => f(a) && f(b);
     // IMax(_,b) => f(b); Param(_) => false.
@@ -255,9 +251,9 @@ fn has_params_wrapper_recognizes_the_delegation() {
 fn mutated_trampoline_literal_is_stack_safe_drift() {
     let mut bodies = all_bodies();
     {
-        let tramp = bodies.get_mut("extract_foldmemo::expr::stack_safe").expect("stack_safe dump present");
-        let trust_types::Terminator::Call { args, .. } =
-            &mut tramp.body.blocks[0].terminator
+        let tramp =
+            bodies.get_mut("extract_foldmemo::expr::stack_safe").expect("stack_safe dump present");
+        let trust_types::Terminator::Call { args, .. } = &mut tramp.body.blocks[0].terminator
         else {
             panic!("stack_safe bb0 must be a call");
         };
@@ -271,11 +267,9 @@ fn mutated_trampoline_literal_is_stack_safe_drift() {
         );
         args[0] = trust_types::Operand::Constant(trust_types::ConstValue::Uint(999, 64));
     }
-    let d = sem_structural_fold_shape_of_with_bodies(
-        &load("level__Level__has_params_impl"),
-        &bodies,
-    )
-    .expect_err("a mutated trampoline must decline");
+    let d =
+        sem_structural_fold_shape_of_with_bodies(&load("level__Level__has_params_impl"), &bodies)
+            .expect_err("a mutated trampoline must decline");
     assert_eq!(d.name(), "stack_safe_drift", "mutated trampoline: {d:?}");
     // MEANINGFUL, not merely red: the decline must be the LITERAL check, which
     // only runs once the instantiated callee has already JOINED the mutated
@@ -307,8 +301,7 @@ fn retargeted_closure_body_is_stack_safe_drift() {
         let cl = bodies
             .get_mut("extract_foldmemo::level::Level::has_params_impl::{closure#0}")
             .expect("closure dump present");
-        let trust_types::Terminator::Call { func, .. } = &mut cl.body.blocks[1].terminator
-        else {
+        let trust_types::Terminator::Call { func, .. } = &mut cl.body.blocks[1].terminator else {
             panic!("closure bb1 must be a call");
         };
         assert_eq!(
@@ -317,11 +310,9 @@ fn retargeted_closure_body_is_stack_safe_drift() {
         );
         *func = "extract_foldmemo::level::Level::is_zero".to_string();
     }
-    let d = sem_structural_fold_shape_of_with_bodies(
-        &load("level__Level__has_params_impl"),
-        &bodies,
-    )
-    .expect_err("a re-targeted closure must decline");
+    let d =
+        sem_structural_fold_shape_of_with_bodies(&load("level__Level__has_params_impl"), &bodies)
+            .expect_err("a re-targeted closure must decline");
     assert_eq!(d.name(), "stack_safe_drift", "re-targeted closure: {d:?}");
     // MEANINGFUL, not merely red: reaching the closure's recursive-call target
     // at all means the instantiated trampoline callee already JOINED its
@@ -341,8 +332,8 @@ fn retargeted_closure_body_is_stack_safe_drift() {
 #[test]
 fn is_zero_wrong_polarity_claim_is_kernel_rejected() {
     use trust_clean::trustir_fold::{check_structural_fold_refinement_claimed, probe_arm_rhs};
-    let honest = sem_structural_fold_shape_of(&load("level__Level__is_zero"))
-        .expect("is_zero recognizes");
+    let honest =
+        sem_structural_fold_shape_of(&load("level__Level__is_zero")).expect("is_zero recognizes");
     let mut wrong = honest.clone();
     wrong.variants[0].arm = FoldExpr::BoolConst(false);
     let claims = vec![Some(probe_arm_rhs(&wrong, 0).expect("wrong RHS renders"))];
@@ -486,10 +477,7 @@ fn instantiated_callees_join_the_one_generic_stack_safe_body() {
         // stable crate id, which the derivation retains and no dump carries.
         "__trust_crate@0123456789abcdef::extract_foldmemo::expr::stack_safe::<bool>::<__trust_args@8a2184a43a70782505085d99a82ff886>",
     ] {
-        assert!(
-            sibling_body(&bodies, absent).is_none(),
-            "{absent} must NOT join any sibling body",
-        );
+        assert!(sibling_body(&bodies, absent).is_none(), "{absent} must NOT join any sibling body",);
     }
 }
 
@@ -529,9 +517,8 @@ fn without_the_generic_body_the_instantiated_trampoline_declines_by_name() {
         );
     }
 
-    let tramp = bodies
-        .remove("extract_foldmemo::expr::stack_safe")
-        .expect("stack_safe dump present");
+    let tramp =
+        bodies.remove("extract_foldmemo::expr::stack_safe").expect("stack_safe dump present");
     bodies.insert(mono.to_string(), tramp);
     assert!(
         trust_clean::trustir_fold::sibling_body(&bodies, mono).is_some(),

@@ -339,9 +339,7 @@ impl GradeRecord {
         Self {
             validation: ProofValidation::CitedKernelTheorem,
             axiom_closure: AxiomClosure::Named(
-                [format!("cites:{theorem}"), format!("residual:{residual}")]
-                    .into_iter()
-                    .collect(),
+                [format!("cites:{theorem}"), format!("residual:{residual}")].into_iter().collect(),
             ),
             coverage: CoverageBound::Unbounded,
             executability: Executability::Unrecorded,
@@ -818,4 +816,3 @@ mod cited_kernel_theorem_tests {
         assert!(GradeRecord::kernel_certified().is_certified());
     }
 }
-

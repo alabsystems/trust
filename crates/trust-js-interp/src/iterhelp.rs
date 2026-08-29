@@ -25,12 +25,13 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use trust_js_value::{
+    ErrKind, JsObject, JsValue, NativeFn, ObjId, ObjKind, PropKey, Property, SymId, WkSym,
+    to_integer_or_infinity, units_from_str,
+};
+
 use crate::destr::FastIter;
 use crate::interp::{Abrupt, ERes, Interp};
-use trust_js_value::{
-    to_integer_or_infinity, units_from_str, ErrKind, JsObject, JsValue, NativeFn, ObjId, ObjKind,
-    PropKey, Property, SymId, WkSym,
-};
 
 /// Which lazy adapter a helper object drives.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -137,11 +138,7 @@ impl Interp {
         next: &JsValue,
         done: &mut bool,
     ) -> Result<Option<JsValue>, Abrupt> {
-        let mut fi = FastIter::User {
-            iter,
-            next: next.clone(),
-            done: *done,
-        };
+        let mut fi = FastIter::User { iter, next: next.clone(), done: *done };
         let r = self.iter_step_marking_done(&mut fi);
         if let FastIter::User { done: d, .. } = &fi {
             *done = *d;
@@ -150,11 +147,7 @@ impl Interp {
     }
 
     fn under_record(h: &IterHelper) -> FastIter {
-        FastIter::User {
-            iter: h.under_iter,
-            next: h.under_next.clone(),
-            done: h.under_done,
-        }
+        FastIter::User { iter: h.under_iter, next: h.under_next.clone(), done: h.under_done }
     }
 
     /// Argument validation failing after the O-is-Object check closes the
@@ -165,11 +158,7 @@ impl Interp {
     /// IteratorClose with the throw swallows any `return` error; the original
     /// completion (the TypeError / RangeError / coercion throw) propagates.
     fn close_on_arg_failure(&mut self, o: ObjId, err: Abrupt) -> Abrupt {
-        let fi = FastIter::User {
-            iter: o,
-            next: JsValue::Undefined,
-            done: false,
-        };
+        let fi = FastIter::User { iter: o, next: JsValue::Undefined, done: false };
         self.close_after_body_abrupt(&fi, err)
     }
 
@@ -309,11 +298,7 @@ impl Interp {
         let result = if let (HelperKind::FlatMap, Some((in_iter, in_next, in_done))) =
             (h.kind, h.inner.take())
         {
-            let inner_fi = FastIter::User {
-                iter: in_iter,
-                next: in_next,
-                done: in_done,
-            };
+            let inner_fi = FastIter::User { iter: in_iter, next: in_next, done: in_done };
             let outer_fi = Self::under_record(&h);
             match self.iterator_close(&inner_fi, false) {
                 Ok(()) => self.iterator_close(&outer_fi, false),
@@ -336,16 +321,19 @@ impl Interp {
     fn helper_step(&mut self, h: &mut IterHelper) -> ERes {
         match h.kind {
             HelperKind::Map => {
-                let v = match self.direct_step_value(h.under_iter, &h.under_next, &mut h.under_done)?
-                {
-                    None => {
-                        h.phase = Phase::Completed;
-                        return self.create_iter_result(JsValue::Undefined, true);
-                    }
-                    Some(v) => v,
-                };
-                let mapped =
-                    self.call_value(&h.fn_arg, JsValue::Undefined, vec![v, JsValue::Num(h.counter)]);
+                let v =
+                    match self.direct_step_value(h.under_iter, &h.under_next, &mut h.under_done)? {
+                        None => {
+                            h.phase = Phase::Completed;
+                            return self.create_iter_result(JsValue::Undefined, true);
+                        }
+                        Some(v) => v,
+                    };
+                let mapped = self.call_value(
+                    &h.fn_arg,
+                    JsValue::Undefined,
+                    vec![v, JsValue::Num(h.counter)],
+                );
                 let mapped = match mapped {
                     Ok(m) => m,
                     Err(a) => {
@@ -358,14 +346,14 @@ impl Interp {
             }
             HelperKind::Filter => loop {
                 self.charge_loop()?;
-                let v = match self.direct_step_value(h.under_iter, &h.under_next, &mut h.under_done)?
-                {
-                    None => {
-                        h.phase = Phase::Completed;
-                        return self.create_iter_result(JsValue::Undefined, true);
-                    }
-                    Some(v) => v,
-                };
+                let v =
+                    match self.direct_step_value(h.under_iter, &h.under_next, &mut h.under_done)? {
+                        None => {
+                            h.phase = Phase::Completed;
+                            return self.create_iter_result(JsValue::Undefined, true);
+                        }
+                        Some(v) => v,
+                    };
                 let selected = self.call_value(
                     &h.fn_arg,
                     JsValue::Undefined,
@@ -508,7 +496,8 @@ impl Interp {
                 io
             }
         };
-        let next = self.get_from_object(iterator, &PropKey::from_str("next"), JsValue::Obj(iterator))?;
+        let next =
+            self.get_from_object(iterator, &PropKey::from_str("next"), JsValue::Obj(iterator))?;
         Ok((iterator, next, false))
     }
 
@@ -550,11 +539,7 @@ impl Interp {
             acc = match result {
                 Ok(r) => r,
                 Err(a) => {
-                    let fi = FastIter::User {
-                        iter: o,
-                        next: next.clone(),
-                        done,
-                    };
+                    let fi = FastIter::User { iter: o, next: next.clone(), done };
                     return Err(self.close_after_body_abrupt(&fi, a));
                 }
             };
@@ -582,9 +567,9 @@ impl Interp {
                 .obj_mut(arr)
                 .props
                 .insert(PropKey::Str(units_from_str(&n.to_string())), Property::data(value));
-            n = n
-                .checked_add(1)
-                .ok_or_else(|| Abrupt::Fatal("Iterator.prototype.toArray length overflow".to_string()))?;
+            n = n.checked_add(1).ok_or_else(|| {
+                Abrupt::Fatal("Iterator.prototype.toArray length overflow".to_string())
+            })?;
         }
         self.set_array_length_raw(arr, f64::from(n));
         Ok(JsValue::Obj(arr))
@@ -613,11 +598,7 @@ impl Interp {
             let result =
                 self.call_value(&f, JsValue::Undefined, vec![value, JsValue::Num(counter)]);
             if let Err(a) = result {
-                let fi = FastIter::User {
-                    iter: o,
-                    next: next.clone(),
-                    done,
-                };
+                let fi = FastIter::User { iter: o, next: next.clone(), done };
                 return Err(self.close_after_body_abrupt(&fi, a));
             }
             counter += 1.0;
@@ -659,11 +640,7 @@ impl Interp {
             let result = match result {
                 Ok(r) => r,
                 Err(a) => {
-                    let fi = FastIter::User {
-                        iter: o,
-                        next: next.clone(),
-                        done,
-                    };
+                    let fi = FastIter::User { iter: o, next: next.clone(), done };
                     return Err(self.close_after_body_abrupt(&fi, a));
                 }
             };
@@ -678,11 +655,7 @@ impl Interp {
                     PredKind::Every => JsValue::Bool(false),
                     PredKind::Find => value,
                 };
-                let fi = FastIter::User {
-                    iter: o,
-                    next: next.clone(),
-                    done,
-                };
+                let fi = FastIter::User { iter: o, next: next.clone(), done };
                 self.iterator_close(&fi, false)?;
                 return Ok(ret);
             }

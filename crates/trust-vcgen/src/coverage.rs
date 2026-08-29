@@ -1,12 +1,12 @@
-// trust_vcgen/coverage.rs: MIR-to-Formula coverage matrix
+// trust_vcgen/coverage.rs: MIR handling coverage matrix
 //
-// Systematic gap analysis for VC generation. Enumerates all Rvalue, Terminator,
-// and BinOp variants from trust-types and checks which ones have corresponding
-// verification condition generation in the trust_vcgen pipeline.
+// Systematic gap analysis for verifier handling. Enumerates all Rvalue,
+// Terminator, BinOp, and UnOp variants from trust-types and records their
+// direct-VC, explicit fail-closed, value-formula, or CFG handling.
 //
 // This module does NOT modify VC generation -- it only analyzes what exists.
 //
-// Part of #468: MIR-to-Formula coverage matrix.
+// Part of #468: MIR handling coverage matrix.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -16,22 +16,32 @@ use std::fmt;
 /// Coverage status for a single variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoverageStatus {
-    /// Full VC generation exists for this variant.
+    /// Explicit VC handling exists for this variant. This includes both
+    /// semantic safety VCs and fail-closed `UnsupportedMir` rows; neither may
+    /// be silently omitted from the report.
     Covered {
-        /// Which module(s) handle this variant.
+        /// Principal implementation paths establishing this classification.
+        /// Auxiliary dataflow consumers are intentionally not exhaustive.
+        /// The historical field name is retained for public API compatibility;
+        /// entries may be validation or fail-closed paths as well as modules.
         modules: Vec<&'static str>,
-        /// What kind of VCs are generated.
+        /// Principal verification effects: direct VC kinds, explicit
+        /// fail-closed rows, or conditional value/guard semantics paired with
+        /// those rows. This is a classification witness, not an exhaustive list
+        /// of every downstream consumer.
+        /// The historical field name is retained for public API compatibility;
+        /// entries may include non-VC effects.
         vc_kinds: Vec<&'static str>,
     },
-    /// Formula translation exists (in chc::rvalue_to_formula or sp transformer)
-    /// but no safety VC is generated. This is expected for safe operations.
+    /// The variant is modeled without a direct safety VC. Depending on the MIR
+    /// category, that handling is a value formula or explicit CFG semantics.
     FormulaOnly {
-        /// Module that handles the formula translation.
+        /// Implementation path that handles the value or CFG semantics.
         module: &'static str,
-        /// Why no safety VC is needed.
+        /// Why no direct safety VC is needed.
         reason: &'static str,
     },
-    /// No VC generation and no formula translation. A gap.
+    /// No direct VC, fail-closed row, value model, or CFG semantics. A gap.
     NotCovered {
         /// Why this is a gap and what would be needed.
         gap_description: &'static str,
@@ -48,10 +58,19 @@ impl CoverageStatus {
         matches!(self, CoverageStatus::Covered { .. })
     }
 
-    /// Returns true if this variant has at least formula translation.
+    /// Returns true if this variant is handled either semantically or through
+    /// an explicit fail-closed VC.
+    #[must_use]
+    pub fn is_handled(&self) -> bool {
+        matches!(self, CoverageStatus::Covered { .. } | CoverageStatus::FormulaOnly { .. })
+    }
+
+    /// Legacy spelling for [`Self::is_handled`]. The name predates CFG-only
+    /// rows such as `Resume`; it reports explicit handling, not necessarily a
+    /// literal formula.
     #[must_use]
     pub fn has_formula(&self) -> bool {
-        matches!(self, CoverageStatus::Covered { .. } | CoverageStatus::FormulaOnly { .. })
+        self.is_handled()
     }
 
     /// Returns true if this is a gap (no coverage at all).
@@ -90,10 +109,16 @@ impl CoverageReport {
         self.rvalue_coverage.iter().filter(|v| v.status.has_vc_generation()).count()
     }
 
-    /// Count of Rvalue variants with at least formula translation.
+    /// Count of Rvalue variants with explicit handling.
+    #[must_use]
+    pub fn rvalue_handled_count(&self) -> usize {
+        self.rvalue_coverage.iter().filter(|v| v.status.is_handled()).count()
+    }
+
+    /// Legacy spelling for [`Self::rvalue_handled_count`].
     #[must_use]
     pub fn rvalue_formula_count(&self) -> usize {
-        self.rvalue_coverage.iter().filter(|v| v.status.has_formula()).count()
+        self.rvalue_handled_count()
     }
 
     /// Count of Rvalue variants that are gaps.
@@ -126,6 +151,18 @@ impl CoverageReport {
         self.binop_coverage.iter().filter(|v| v.status.is_gap()).count()
     }
 
+    /// Count of UnOp variants with explicit VC handling.
+    #[must_use]
+    pub fn unop_covered_count(&self) -> usize {
+        self.unop_coverage.iter().filter(|v| v.status.has_vc_generation()).count()
+    }
+
+    /// Count of UnOp variants that are gaps.
+    #[must_use]
+    pub fn unop_gap_count(&self) -> usize {
+        self.unop_coverage.iter().filter(|v| v.status.is_gap()).count()
+    }
+
     /// All identified gaps across all categories.
     #[must_use]
     pub fn all_gaps(&self) -> Vec<&VariantCoverage> {
@@ -147,16 +184,22 @@ impl CoverageReport {
             + self.unop_coverage.len()
     }
 
-    /// Total count of variants with at least formula coverage.
+    /// Total count of variants with explicit handling.
     #[must_use]
-    pub fn total_formula_count(&self) -> usize {
+    pub fn total_handled_count(&self) -> usize {
         self.rvalue_coverage
             .iter()
             .chain(self.terminator_coverage.iter())
             .chain(self.binop_coverage.iter())
             .chain(self.unop_coverage.iter())
-            .filter(|v| v.status.has_formula())
+            .filter(|v| v.status.is_handled())
             .count()
+    }
+
+    /// Legacy spelling for [`Self::total_handled_count`].
+    #[must_use]
+    pub fn total_formula_count(&self) -> usize {
+        self.total_handled_count()
     }
 
     /// Total count of gaps across all categories.
@@ -168,15 +211,15 @@ impl CoverageReport {
 
 impl fmt::Display for CoverageReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== MIR-to-Formula Coverage Report ===")?;
+        writeln!(f, "=== MIR Handling Coverage Report ===")?;
         writeln!(f)?;
 
         writeln!(
             f,
-            "Rvalue:     {}/{} covered, {}/{} with formula, {} gaps",
+            "Rvalue:     {}/{} covered, {}/{} handled, {} gaps",
             self.rvalue_covered_count(),
             self.rvalue_coverage.len(),
-            self.rvalue_formula_count(),
+            self.rvalue_handled_count(),
             self.rvalue_coverage.len(),
             self.rvalue_gap_count(),
         )?;
@@ -193,6 +236,13 @@ impl fmt::Display for CoverageReport {
             self.binop_covered_count(),
             self.binop_coverage.len(),
             self.binop_gap_count(),
+        )?;
+        writeln!(
+            f,
+            "UnOp:       {}/{} covered, {} gaps",
+            self.unop_covered_count(),
+            self.unop_coverage.len(),
+            self.unop_gap_count(),
         )?;
         writeln!(f)?;
 
@@ -218,67 +268,106 @@ impl fmt::Display for CoverageReport {
 
 /// Analyze Rvalue variant coverage in the VC generation pipeline.
 ///
-/// Each Rvalue variant is checked against the modules in trust_vcgen that
-/// handle it: overflow.rs, divzero.rs, shifts.rs, casts.rs, negation.rs,
-/// rvalue_safety.rs, bounds.rs, and chc.rs (formula translation).
+/// Each Rvalue variant is checked against the current `trust_vcgen` handling
+/// paths: `generate::safety`, `generate::unsupported`, `rvalue_safety`,
+/// `sep_engine`, `guards`, and `chc` (formula translation).
 #[must_use]
 fn analyze_rvalue_coverage() -> Vec<VariantCoverage> {
     vec![
         VariantCoverage {
             variant_name: "Rvalue::Use",
-            status: CoverageStatus::FormulaOnly {
-                module: "chc",
-                reason: "Simple copy/move -- no safety property to check",
+            status: CoverageStatus::Covered {
+                modules: vec!["chc", "rvalue_safety"],
+                vc_kinds: vec![
+                    "Value copy/move formula",
+                    "IndexOutOfBounds for projection-bearing operands",
+                ],
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::BinaryOp",
             status: CoverageStatus::Covered {
-                modules: vec!["overflow", "divzero", "shifts"],
+                modules: vec!["generate::safety", "generate::overflow_vc"],
                 vc_kinds: vec![
                     "ArithmeticOverflow (Add/Sub/Mul)",
                     "DivisionByZero",
                     "RemainderByZero",
                     "ArithmeticOverflow (signed Div/Rem INT_MIN/-1)",
                     "ShiftOverflow (Shl/Shr)",
+                    "FloatOverflowToInfinity (float Add/Sub/Mul/Div)",
+                    "UnsupportedMir for identity-less opaque arithmetic operands",
                 ],
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::CheckedBinaryOp",
             status: CoverageStatus::Covered {
-                modules: vec!["overflow", "divzero", "shifts"],
+                modules: vec!["validate_function", "generate::safety", "generate::checked_vcs"],
                 vc_kinds: vec![
-                    "ArithmeticOverflow (Add/Sub/Mul)",
-                    "DivisionByZero",
-                    "RemainderByZero",
-                    "ShiftOverflow (Shl/Shr)",
+                    "ArithmeticOverflow (Add/Sub/Mul WithOverflow carriers)",
+                    "MalformedTrustIr for non-Add/Sub/Mul checked carriers \
+                     (shift obligations arise only from the plain BinaryOp spelling)",
+                    "UnsupportedMir for unmodeled checked carriers or identity-less opaque operands",
+                ],
+            },
+        },
+        VariantCoverage {
+            variant_name: "Rvalue::UncheckedBinaryOp",
+            status: CoverageStatus::Covered {
+                modules: vec![
+                    "validate_function",
+                    "generate::safety",
+                    "generate::unsupported",
+                    "generate::slice_conversion",
+                ],
+                vc_kinds: vec![
+                    "MalformedTrustIr for non-Add/Sub/Mul or invalid integer carriers",
+                    "UncheckedArithmeticOverflow (unchecked Add/Sub/Mul; UB on overflow, no runtime guard)",
+                    "UnsupportedMir for an explicit unsupported operand",
                 ],
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::UnaryOp",
             status: CoverageStatus::Covered {
-                modules: vec!["negation"],
-                vc_kinds: vec!["NegationOverflow (Neg on signed INT_MIN)"],
+                modules: vec![
+                    "chc",
+                    "generate::safety",
+                    "generate::checked_vcs",
+                    "generate::unsupported",
+                    "generate::slice_conversion",
+                    "guards",
+                ],
+                vc_kinds: vec![
+                    "Not value formula",
+                    "NegationOverflow (Neg on signed INT_MIN)",
+                    "PtrMetadata slice/str/array length model or fail-closed UnsupportedMir",
+                ],
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::Ref",
-            status: CoverageStatus::FormulaOnly {
-                module: "chc",
-                reason: "Reference creation is safe in safe Rust; \
-                         aliasing/borrow VCs are handled by ownership module",
+            status: CoverageStatus::Covered {
+                modules: vec!["chc", "rvalue_safety"],
+                vc_kinds: vec![
+                    "Reference value model",
+                    "IndexOutOfBounds for projection-bearing referents",
+                ],
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::Cast",
             status: CoverageStatus::Covered {
-                modules: vec!["casts"],
+                modules: vec![
+                    "chc",
+                    "guards",
+                    "generate::checked_vcs",
+                    "generate::unsupported",
+                    "generate::slice_conversion",
+                ],
                 vc_kinds: vec![
-                    "CastOverflow (narrowing)",
-                    "CastOverflow (signed-to-unsigned)",
-                    "CastOverflow (unsigned-to-signed)",
+                    "Defined Rust cast value/range model",
+                    "UnsupportedMir for unmodeled carrier or provenance semantics",
                 ],
             },
         },
@@ -307,24 +396,47 @@ fn analyze_rvalue_coverage() -> Vec<VariantCoverage> {
         VariantCoverage {
             variant_name: "Rvalue::Repeat",
             status: CoverageStatus::FormulaOnly {
-                module: "chc",
-                reason: "Array repetition [val; N] is safe if val is valid; \
-                         N is a compile-time constant",
+                module: "guards",
+                reason: "Array repetition [val; N] is modeled by guards' conditional \
+                         Store-chain seed for eligible array-theory locals (free base \
+                         otherwise -- sound, false-FAIL only); the chc scalar bridge \
+                         fails closed pending destination-aware array Store semantics",
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::AddressOf",
             status: CoverageStatus::Covered {
-                modules: vec!["sep_engine"],
-                vc_kinds: vec!["SeparationLogic(AddressOfSourceLiveness)"],
+                modules: vec!["rvalue_safety", "sep_engine"],
+                vc_kinds: vec![
+                    "IndexOutOfBounds for projection-bearing sources",
+                    "SeparationLogic(AddressOfSourceLiveness)",
+                ],
             },
         },
         VariantCoverage {
             variant_name: "Rvalue::CopyForDeref",
-            status: CoverageStatus::FormulaOnly {
-                module: "chc",
-                reason: "Compiler-inserted copy for deref; semantically equivalent \
-                         to Use(Copy(place))",
+            status: CoverageStatus::Covered {
+                modules: vec!["chc", "rvalue_safety"],
+                vc_kinds: vec![
+                    "Compiler-inserted dereference copy model",
+                    "IndexOutOfBounds for projection-bearing places",
+                ],
+            },
+        },
+        VariantCoverage {
+            variant_name: "Rvalue::PtrOffset",
+            status: CoverageStatus::Covered {
+                modules: vec!["generate::unsupported", "generate::slice_conversion"],
+                vc_kinds: vec!["UnsupportedMir (pointer-offset bounds unresolved; fail-closed)"],
+            },
+        },
+        VariantCoverage {
+            variant_name: "Rvalue::Unsupported",
+            status: CoverageStatus::Covered {
+                modules: vec!["generate::unsupported", "generate::slice_conversion", "chc"],
+                vc_kinds: vec![
+                    "UnsupportedMir (preserved kind/detail/operands; sealed ThreadLocalRef thin-address exception)",
+                ],
             },
         },
     ]
@@ -337,63 +449,98 @@ fn analyze_terminator_coverage() -> Vec<VariantCoverage> {
         VariantCoverage {
             variant_name: "Terminator::Goto",
             status: CoverageStatus::FormulaOnly {
-                module: "sp",
-                reason: "Unconditional jump -- no safety property, \
-                         propagated through SP transformer",
+                module: "generate::path_defs",
+                reason: "Unconditional CFG edge with no direct safety assertion",
             },
         },
         VariantCoverage {
             variant_name: "Terminator::SwitchInt",
-            status: CoverageStatus::Covered {
-                modules: vec!["guards", "sp"],
-                vc_kinds: vec!["Path condition extraction (SwitchIntMatch, SwitchIntOtherwise)"],
+            status: CoverageStatus::FormulaOnly {
+                module: "trust_types::model::discovered_clauses / guards / generate::path_defs",
+                reason: "SwitchIntMatch/SwitchIntOtherwise are explicit CFG path conditions, not standalone VCs",
             },
         },
         VariantCoverage {
             variant_name: "Terminator::Return",
             status: CoverageStatus::Covered {
-                modules: vec!["contracts", "sp"],
+                modules: vec!["generate::contract_vcs"],
                 vc_kinds: vec!["Postcondition (from #[ensures])"],
             },
         },
         VariantCoverage {
             variant_name: "Terminator::Call",
             status: CoverageStatus::Covered {
-                modules: vec!["contracts", "sp", "interprocedural"],
-                vc_kinds: vec!["Precondition (callee's #[requires])", "Uninterpreted result in SP"],
+                modules: vec![
+                    "generate::callsite",
+                    "generate::path_defs",
+                    "generate::semantic_guard",
+                    "interprocedural",
+                ],
+                vc_kinds: vec!["Precondition (callee's #[requires])"],
+            },
+        },
+        VariantCoverage {
+            variant_name: "Terminator::TailCall",
+            status: CoverageStatus::Covered {
+                modules: vec![
+                    "trust_types::model::with_tail_calls_expanded",
+                    "generate::callsite",
+                    "generate::contract_vcs",
+                    "termination",
+                    "interprocedural",
+                ],
+                vc_kinds: vec![
+                    "Precondition (callee's #[requires])",
+                    "Postcondition (call result returned to caller)",
+                    "Direct-self recursion decreases",
+                ],
             },
         },
         VariantCoverage {
             variant_name: "Terminator::Assert",
             status: CoverageStatus::Covered {
-                modules: vec!["asserts", "guards"],
+                modules: vec![
+                    "generate::safety",
+                    "generate::checked_vcs",
+                    "generate::unsupported",
+                    "guards",
+                ],
                 vc_kinds: vec![
+                    "DivisionByZero / RemainderByZero",
+                    "ArithmeticOverflow / ShiftOverflow / NegationOverflow",
                     "IndexOutOfBounds (BoundsCheck)",
                     "Assertion (Custom message)",
-                    "AssertHolds/AssertFails guard extraction",
+                    "UnsupportedMir (unmodeled safety assert or operand)",
+                    "AssertHolds/AssertFails CFG guard extraction",
                 ],
             },
         },
         VariantCoverage {
             variant_name: "Terminator::Drop",
             status: CoverageStatus::FormulaOnly {
-                module: "sp",
-                reason: "Drop glue is compiler-generated and safe; \
-                         drop ordering checked by ownership module",
+                module: "generate::path_defs",
+                reason: "Drop is an explicit normal/unwind CFG effect; compiler-side drop-glue panic obligations are checked separately",
             },
         },
         VariantCoverage {
             variant_name: "Terminator::Opaque",
             status: CoverageStatus::Covered {
-                modules: vec!["vcgen", "cfg"],
+                modules: vec!["generate::unsupported", "unsafe_verify::detection"],
                 vc_kinds: vec!["UnsupportedMir with preserved CFG successors"],
             },
         },
         VariantCoverage {
             variant_name: "Terminator::Unreachable",
             status: CoverageStatus::Covered {
-                modules: vec!["unreachable"],
+                modules: vec!["generate::safety", "generate::overflow_vc"],
                 vc_kinds: vec!["Unreachable (reachability check via path conditions)"],
+            },
+        },
+        VariantCoverage {
+            variant_name: "Terminator::Resume",
+            status: CoverageStatus::FormulaOnly {
+                module: "generate::path_defs",
+                reason: "UnwindResume is a terminal re-raise with no in-CFG successor or direct safety assertion; cleanup Drop sites are handled separately",
             },
         },
     ]
@@ -409,36 +556,43 @@ fn analyze_binop_coverage() -> Vec<VariantCoverage> {
         VariantCoverage {
             variant_name: "BinOp::Add",
             status: CoverageStatus::Covered {
-                modules: vec!["overflow"],
-                vc_kinds: vec!["ArithmeticOverflow"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
+                vc_kinds: vec!["ArithmeticOverflow", "FloatOverflowToInfinity"],
             },
         },
         VariantCoverage {
             variant_name: "BinOp::Sub",
             status: CoverageStatus::Covered {
-                modules: vec!["overflow"],
-                vc_kinds: vec!["ArithmeticOverflow"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
+                vc_kinds: vec!["ArithmeticOverflow", "FloatOverflowToInfinity"],
             },
         },
         VariantCoverage {
             variant_name: "BinOp::Mul",
             status: CoverageStatus::Covered {
-                modules: vec!["overflow"],
-                vc_kinds: vec!["ArithmeticOverflow"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
+                vc_kinds: vec!["ArithmeticOverflow", "FloatOverflowToInfinity"],
             },
         },
         VariantCoverage {
             variant_name: "BinOp::Div",
             status: CoverageStatus::Covered {
-                modules: vec!["divzero"],
-                vc_kinds: vec!["DivisionByZero", "ArithmeticOverflow (signed INT_MIN / -1)"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
+                vc_kinds: vec![
+                    "DivisionByZero",
+                    "ArithmeticOverflow (signed INT_MIN / -1)",
+                    "FloatOverflowToInfinity (float division magnitude)",
+                ],
             },
         },
         VariantCoverage {
             variant_name: "BinOp::Rem",
             status: CoverageStatus::Covered {
-                modules: vec!["divzero"],
-                vc_kinds: vec!["RemainderByZero", "ArithmeticOverflow (signed INT_MIN % -1)"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
+                vc_kinds: vec![
+                    "RemainderByZero (integer remainder)",
+                    "ArithmeticOverflow (signed INT_MIN % -1)",
+                ],
             },
         },
         VariantCoverage {
@@ -510,14 +664,14 @@ fn analyze_binop_coverage() -> Vec<VariantCoverage> {
         VariantCoverage {
             variant_name: "BinOp::Shl",
             status: CoverageStatus::Covered {
-                modules: vec!["shifts"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
                 vc_kinds: vec!["ShiftOverflow"],
             },
         },
         VariantCoverage {
             variant_name: "BinOp::Shr",
             status: CoverageStatus::Covered {
-                modules: vec!["shifts"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
                 vc_kinds: vec!["ShiftOverflow"],
             },
         },
@@ -546,16 +700,18 @@ fn analyze_unop_coverage() -> Vec<VariantCoverage> {
         VariantCoverage {
             variant_name: "UnOp::Neg",
             status: CoverageStatus::Covered {
-                modules: vec!["negation"],
+                modules: vec!["generate::safety", "generate::checked_vcs"],
                 vc_kinds: vec!["NegationOverflow (signed INT_MIN)"],
             },
         },
         VariantCoverage {
             variant_name: "UnOp::PtrMetadata",
-            status: CoverageStatus::FormulaOnly {
-                module: "chc",
-                reason: "Fat pointer metadata extraction -- produces unconstrained \
-                         usize, modeled as identity pass-through",
+            status: CoverageStatus::Covered {
+                modules: vec!["generate::unsupported", "generate::slice_conversion", "guards"],
+                vc_kinds: vec![
+                    "slice/str/array length via slice_len_formula",
+                    "UnsupportedMir for unmodelable raw-pointer or dynamic metadata provenance",
+                ],
             },
         },
     ]
@@ -580,43 +736,71 @@ pub fn coverage_report() -> CoverageReport {
 mod tests {
     use super::*;
 
+    fn exactly_one<'a>(rows: &'a [VariantCoverage], name: &str) -> &'a VariantCoverage {
+        let matches = rows.iter().filter(|entry| entry.variant_name == name).collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "{name} must have exactly one coverage row");
+        matches[0]
+    }
+
     #[test]
     fn test_coverage_report_generation() {
         let report = coverage_report();
 
-        // Verify we enumerate all known variants
+        // These counts come from wildcard-free matches in trust-types, the
+        // source crate that owns the enums. A newly added variant fails that
+        // crate's build until its source census is updated, then fails this
+        // report until it gains a handling row.
         assert_eq!(
             report.rvalue_coverage.len(),
-            12,
-            "Rvalue has 12 variants: Use, BinaryOp, CheckedBinaryOp, UnaryOp, \
-             Ref, Cast, Aggregate, Discriminant, Len, Repeat, AddressOf, CopyForDeref"
+            trust_types::RVALUE_VARIANT_NAMES.len(),
+            "Rvalue report must match the source-owned exhaustive census"
         );
         assert_eq!(
             report.terminator_coverage.len(),
-            8,
-            "Terminator has 8 variants: Goto, SwitchInt, Return, Call, Assert, Drop, Opaque, Unreachable"
+            trust_types::TERMINATOR_VARIANT_NAMES.len(),
+            "Terminator report must match the source-owned exhaustive census"
         );
         assert_eq!(
             report.binop_coverage.len(),
-            17,
-            "BinOp has 17 variants: Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, \
-             Gt, Ge, BitAnd, BitOr, BitXor, Shl, Shr, Cmp"
+            trust_types::BINOP_VARIANT_NAMES.len(),
+            "BinOp report must match the source-owned exhaustive census"
         );
-        assert_eq!(report.unop_coverage.len(), 3, "UnOp has 3 variants: Not, Neg, PtrMetadata");
+        assert_eq!(
+            report.unop_coverage.len(),
+            trust_types::UNOP_VARIANT_NAMES.len(),
+            "UnOp report must match the source-owned exhaustive census"
+        );
+    }
+
+    #[test]
+    fn test_variant_name_inventory_is_exact() {
+        let report = coverage_report();
+        let names = |rows: &[VariantCoverage]| {
+            rows.iter().map(|entry| entry.variant_name).collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(&report.rvalue_coverage), trust_types::RVALUE_VARIANT_NAMES,);
+        assert_eq!(names(&report.terminator_coverage), trust_types::TERMINATOR_VARIANT_NAMES,);
+        assert_eq!(names(&report.binop_coverage), trust_types::BINOP_VARIANT_NAMES,);
+        assert_eq!(names(&report.unop_coverage), trust_types::UNOP_VARIANT_NAMES,);
     }
 
     #[test]
     fn test_rvalue_coverage_counts() {
         let report = coverage_report();
 
-        // Covered (have safety VCs): BinaryOp, CheckedBinaryOp, UnaryOp,
-        // Cast, Aggregate, Discriminant, AddressOf = 7
-        assert_eq!(report.rvalue_covered_count(), 7, "7 Rvalue variants should have VC generation");
+        // Explicit/direct or fail-closed VC vc_kinds: every variant except Len
+        // and Repeat = 13. PtrOffset and Unsupported are deliberately
+        // fail-closed; Use/Ref/CopyForDeref emit projection-safety rows when
+        // their places carry projections.
+        assert_eq!(report.rvalue_covered_count(), 13, "13 Rvalue variants should have VC handling");
 
-        // Formula-only (safe, no VCs needed): Use, Ref, Len, Repeat,
-        // CopyForDeref = 5
-        let formula_only = report.rvalue_formula_count() - report.rvalue_covered_count();
-        assert_eq!(formula_only, 5, "5 Rvalue variants should be formula-only (safe)");
+        // Modeled without any direct VC path: Len and Repeat = 2.
+        let modeled_no_direct_vc = report.rvalue_handled_count() - report.rvalue_covered_count();
+        assert_eq!(
+            modeled_no_direct_vc, 2,
+            "2 Rvalue variants should be modeled without a direct VC"
+        );
 
         assert_eq!(report.rvalue_gap_count(), 0, "no Rvalue variants should be gaps");
     }
@@ -625,15 +809,86 @@ mod tests {
     fn test_terminator_coverage_counts() {
         let report = coverage_report();
 
-        // Covered: SwitchInt, Return, Call, Assert, Opaque, Unreachable = 6
+        // Direct/fail-closed VC paths: Return, Call, TailCall, Assert, Opaque,
+        // Unreachable = 6. Goto, SwitchInt, Drop, and Resume have explicit CFG
+        // semantics without a direct VC.
         assert_eq!(
             report.terminator_covered_count(),
             6,
             "6 Terminator variants should have VC generation"
         );
 
-        // No gaps -- Goto and Drop are formula-only (safe)
+        // No gaps: every remaining terminator has explicit CFG semantics.
         assert_eq!(report.terminator_gap_count(), 0, "no Terminator gaps");
+    }
+
+    #[test]
+    fn test_terminator_tail_call_is_exactly_covered() {
+        let report = coverage_report();
+        let tail_call = exactly_one(&report.terminator_coverage, "Terminator::TailCall");
+        assert_eq!(
+            &tail_call.status,
+            &CoverageStatus::Covered {
+                modules: vec![
+                    "trust_types::model::with_tail_calls_expanded",
+                    "generate::callsite",
+                    "generate::contract_vcs",
+                    "termination",
+                    "interprocedural",
+                ],
+                vc_kinds: vec![
+                    "Precondition (callee's #[requires])",
+                    "Postcondition (call result returned to caller)",
+                    "Direct-self recursion decreases",
+                ],
+            },
+            "TailCall coverage must retain the exact handling-path and direct-VC inventory"
+        );
+    }
+
+    #[test]
+    fn test_newly_enumerated_variant_rows_are_exact() {
+        let report = coverage_report();
+
+        assert_eq!(
+            &exactly_one(&report.rvalue_coverage, "Rvalue::UncheckedBinaryOp").status,
+            &CoverageStatus::Covered {
+                modules: vec![
+                    "validate_function",
+                    "generate::safety",
+                    "generate::unsupported",
+                    "generate::slice_conversion",
+                ],
+                vc_kinds: vec![
+                    "MalformedTrustIr for non-Add/Sub/Mul or invalid integer carriers",
+                    "UncheckedArithmeticOverflow (unchecked Add/Sub/Mul; UB on overflow, no runtime guard)",
+                    "UnsupportedMir for an explicit unsupported operand",
+                ],
+            }
+        );
+        assert_eq!(
+            &exactly_one(&report.rvalue_coverage, "Rvalue::PtrOffset").status,
+            &CoverageStatus::Covered {
+                modules: vec!["generate::unsupported", "generate::slice_conversion"],
+                vc_kinds: vec!["UnsupportedMir (pointer-offset bounds unresolved; fail-closed)",],
+            }
+        );
+        assert_eq!(
+            &exactly_one(&report.rvalue_coverage, "Rvalue::Unsupported").status,
+            &CoverageStatus::Covered {
+                modules: vec!["generate::unsupported", "generate::slice_conversion", "chc"],
+                vc_kinds: vec![
+                    "UnsupportedMir (preserved kind/detail/operands; sealed ThreadLocalRef thin-address exception)",
+                ],
+            }
+        );
+        assert_eq!(
+            &exactly_one(&report.terminator_coverage, "Terminator::Resume").status,
+            &CoverageStatus::FormulaOnly {
+                module: "generate::path_defs",
+                reason: "UnwindResume is a terminal re-raise with no in-CFG successor or direct safety assertion; cleanup Drop sites are handled separately",
+            }
+        );
     }
 
     #[test]
@@ -643,7 +898,7 @@ mod tests {
         // Covered (have overflow/safety VCs): Add, Sub, Mul, Div, Rem, Shl, Shr = 7
         assert_eq!(report.binop_covered_count(), 7, "7 BinOp variants should have safety VCs");
 
-        // No gaps -- comparisons and bitwise ops are formula-only (safe)
+        // No gaps -- comparisons and bitwise ops have value semantics without direct VCs.
         assert_eq!(
             report.binop_gap_count(),
             0,
@@ -662,22 +917,22 @@ mod tests {
     #[test]
     fn test_coverage_status_predicates() {
         let covered = CoverageStatus::Covered {
-            modules: vec!["overflow"],
+            modules: vec!["generate::safety"],
             vc_kinds: vec!["ArithmeticOverflow"],
         };
         assert!(covered.has_vc_generation());
-        assert!(covered.has_formula());
+        assert!(covered.is_handled());
         assert!(!covered.is_gap());
 
-        let formula_only = CoverageStatus::FormulaOnly { module: "chc", reason: "safe" };
-        assert!(!formula_only.has_vc_generation());
-        assert!(formula_only.has_formula());
-        assert!(!formula_only.is_gap());
+        let modeled = CoverageStatus::FormulaOnly { module: "chc", reason: "safe" };
+        assert!(!modeled.has_vc_generation());
+        assert!(modeled.is_handled());
+        assert!(!modeled.is_gap());
 
         let not_covered =
             CoverageStatus::NotCovered { gap_description: "needs work", priority: "high" };
         assert!(!not_covered.has_vc_generation());
-        assert!(!not_covered.has_formula());
+        assert!(!not_covered.is_handled());
         assert!(not_covered.is_gap());
     }
 
@@ -685,16 +940,16 @@ mod tests {
     fn test_total_counts() {
         let report = coverage_report();
 
-        // Total = 12 + 8 + 17 + 3 = 40
-        assert_eq!(report.total_variant_count(), 40);
+        // Total = 15 + 10 + 17 + 3 = 45
+        assert_eq!(report.total_variant_count(), 45);
 
         assert_eq!(report.total_gap_count(), 0);
 
-        // Every variant except gaps should have formula coverage
+        // Every variant except gaps must have semantic or explicit fail-closed handling.
         assert_eq!(
-            report.total_formula_count(),
+            report.total_handled_count(),
             report.total_variant_count() - report.total_gap_count(),
-            "all non-gap variants should have formula coverage"
+            "all non-gap variants should have explicit handling"
         );
     }
 
@@ -703,8 +958,9 @@ mod tests {
         let report = coverage_report();
         let display = format!("{report}");
 
-        assert!(display.contains("MIR-to-Formula Coverage Report"), "display should have header");
+        assert!(display.contains("MIR Handling Coverage Report"), "display should have header");
         assert!(display.contains("Rvalue:"), "display should list Rvalue stats");
+        assert!(display.contains("UnOp:"), "display should list UnOp stats");
         assert!(display.contains("No gaps identified."), "display should show gap-free coverage");
     }
 
@@ -713,17 +969,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_rvalue_use_is_formula_only() {
+    fn test_rvalue_use_has_projection_safety_coverage() {
         let report = coverage_report();
         let entry = report
             .rvalue_coverage
             .iter()
             .find(|v| v.variant_name == "Rvalue::Use")
             .expect("Rvalue::Use should be in report");
-        assert!(
-            matches!(entry.status, CoverageStatus::FormulaOnly { .. }),
-            "Rvalue::Use should be formula-only"
-        );
+        let CoverageStatus::Covered { modules, vc_kinds } = &entry.status else {
+            panic!("Rvalue::Use must retain projection-safety handling")
+        };
+        assert!(modules.contains(&"rvalue_safety"));
+        assert!(vc_kinds.iter().any(|effect| effect.contains("IndexOutOfBounds")));
     }
 
     #[test]
@@ -747,7 +1004,18 @@ mod tests {
             .expect("Rvalue::Cast should be in report");
         assert!(
             entry.status.has_vc_generation(),
-            "Rvalue::Cast should have VC generation (cast overflow)"
+            "Rvalue::Cast must explicitly fail closed when its representation is unmodeled"
+        );
+        let CoverageStatus::Covered { vc_kinds, .. } = &entry.status else {
+            unreachable!("the preceding assertion establishes Covered")
+        };
+        assert!(
+            vc_kinds.iter().all(|kind| !kind.contains("CastOverflow")),
+            "defined Rust casts must not be mislabeled as CastOverflow"
+        );
+        assert!(
+            vc_kinds.iter().any(|kind| kind.contains("UnsupportedMir")),
+            "unmodeled cast representation/provenance must remain fail-closed"
         );
     }
 
@@ -760,6 +1028,22 @@ mod tests {
             .find(|v| v.variant_name == "Rvalue::AddressOf")
             .expect("Rvalue::AddressOf should be in report");
         assert!(entry.status.has_vc_generation(), "Rvalue::AddressOf should have VC generation");
+    }
+
+    #[test]
+    fn test_ptr_metadata_records_modeled_and_fail_closed_paths() {
+        let report = coverage_report();
+        let entry = report
+            .unop_coverage
+            .iter()
+            .find(|v| v.variant_name == "UnOp::PtrMetadata")
+            .expect("UnOp::PtrMetadata should be in report");
+        let CoverageStatus::Covered { modules, vc_kinds } = &entry.status else {
+            panic!("PtrMetadata must record both modeled and fail-closed handling")
+        };
+        assert!(modules.contains(&"generate::unsupported"));
+        assert!(vc_kinds.iter().any(|kind| kind.contains("slice_len_formula")));
+        assert!(vc_kinds.iter().any(|kind| kind.contains("UnsupportedMir")));
     }
 
     #[test]
@@ -801,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn test_binop_comparisons_are_formula_only() {
+    fn test_binop_comparisons_are_modeled_without_direct_vc() {
         let report = coverage_report();
         for name in ["BinOp::Eq", "BinOp::Ne", "BinOp::Lt", "BinOp::Le", "BinOp::Gt", "BinOp::Ge"] {
             let entry = report
@@ -811,13 +1095,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} should be in report"));
             assert!(
                 matches!(entry.status, CoverageStatus::FormulaOnly { .. }),
-                "{name} should be formula-only (comparisons are safe)"
+                "{name} should be modeled without a direct VC (comparisons are safe)"
             );
         }
     }
 
     #[test]
-    fn test_binop_bitwise_are_formula_only() {
+    fn test_binop_bitwise_are_modeled_without_direct_vc() {
         let report = coverage_report();
         for name in ["BinOp::BitAnd", "BinOp::BitOr", "BinOp::BitXor"] {
             let entry = report
@@ -827,13 +1111,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} should be in report"));
             assert!(
                 matches!(entry.status, CoverageStatus::FormulaOnly { .. }),
-                "{name} should be formula-only (bitwise ops are safe)"
+                "{name} should be modeled without a direct VC (bitwise ops are safe)"
             );
         }
     }
 
     #[test]
-    fn test_binop_cmp_is_formula_only() {
+    fn test_binop_cmp_is_modeled_without_direct_vc() {
         let report = coverage_report();
         let entry = report
             .binop_coverage
@@ -842,7 +1126,7 @@ mod tests {
             .expect("BinOp::Cmp should be in report");
         assert!(
             matches!(entry.status, CoverageStatus::FormulaOnly { .. }),
-            "BinOp::Cmp should be formula-only (three-way comparison is safe)"
+            "BinOp::Cmp should be modeled without a direct VC (three-way comparison is safe)"
         );
     }
 
@@ -861,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unop_not_is_formula_only() {
+    fn test_unop_not_is_modeled_without_direct_vc() {
         let report = coverage_report();
         let entry = report
             .unop_coverage
@@ -870,21 +1154,7 @@ mod tests {
             .expect("UnOp::Not should be in report");
         assert!(
             matches!(entry.status, CoverageStatus::FormulaOnly { .. }),
-            "UnOp::Not should be formula-only"
-        );
-    }
-
-    #[test]
-    fn test_unop_ptrmetadata_is_formula_only() {
-        let report = coverage_report();
-        let entry = report
-            .unop_coverage
-            .iter()
-            .find(|v| v.variant_name == "UnOp::PtrMetadata")
-            .expect("UnOp::PtrMetadata should be in report");
-        assert!(
-            matches!(entry.status, CoverageStatus::FormulaOnly { .. }),
-            "UnOp::PtrMetadata should be formula-only"
+            "UnOp::Not should be modeled without a direct VC"
         );
     }
 }

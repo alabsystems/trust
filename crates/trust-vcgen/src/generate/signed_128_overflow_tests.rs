@@ -1,8 +1,7 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
-    Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, UnOp, VcKind, VerifiableBody,
-    VerifiableFunction,
+    Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, UnOp, UnwindEdge, VcKind,
+    VerifiableBody, VerifiableFunction,
 };
 
 use super::{
@@ -68,9 +67,7 @@ impl Bv {
 fn eval_bv(f: &Formula, env: &dyn Fn(&str) -> u128) -> Bv {
     match f {
         Formula::BitVec { value, width } => Bv::new(*value as u128, false, *width),
-        Formula::Var(name, trust_types::Sort::BitVec(w)) => {
-            Bv::new(env(name.as_str()), false, *w)
-        }
+        Formula::Var(name, trust_types::Sort::BitVec(w)) => Bv::new(env(name.as_str()), false, *w),
         Formula::BvAdd(a, b, w) => {
             let va = eval_bv(a, env);
             let vb = eval_bv(b, env);
@@ -91,8 +88,7 @@ fn eval_bv(f: &Formula, env: &dyn Fn(&str) -> u128) -> Bv {
             let vb = eval_bv(b, env);
             // SMT bvshl: shift by >= width yields 0. `vb.lo >= 128` also avoids
             // the u128 `<<` overflow (shift amount must be < 128 to be in range).
-            let shifted =
-                if vb.lo >= u128::from(*w) || vb.lo >= 128 { 0 } else { va.lo << vb.lo };
+            let shifted = if vb.lo >= u128::from(*w) || vb.lo >= 128 { 0 } else { va.lo << vb.lo };
             Bv::new(shifted, false, *w)
         }
         Formula::BvSignExt(a, extra) => {
@@ -372,10 +368,8 @@ fn i128_sub_overflow_is_modeled_not_unsupported() {
 
     // The signed-128 path emits the BV `w+1`-bit sign-extension overflow check;
     // operands are bare locals → fresh BV vars `__trust_ovf_bv_{role}_{base}`.
-    let a_bv =
-        format!("__trust_ovf_bv_lhs_{}", crate::place_to_var_name(&func, &Place::local(1)));
-    let b_bv =
-        format!("__trust_ovf_bv_rhs_{}", crate::place_to_var_name(&func, &Place::local(2)));
+    let a_bv = format!("__trust_ovf_bv_lhs_{}", crate::place_to_var_name(&func, &Place::local(1)));
+    let b_bv = format!("__trust_ovf_bv_rhs_{}", crate::place_to_var_name(&func, &Place::local(2)));
 
     // ADVERSARIAL: `i128::MAX - (-1)` is a genuine overflow (true result =
     // i128::MAX + 1 > i128::MAX). The violation formula MUST be satisfiable here,
@@ -463,13 +457,11 @@ fn i128_negation_overflow_is_modeled_and_exact() {
 
     // The signed-128 neg path emits the BV failure `x == INT_MIN`; the operand is
     // a bare local → fresh BV var `__trust_ovf_bv_neg_{base}`.
-    let x_bv =
-        format!("__trust_ovf_bv_neg_{}", crate::place_to_var_name(&func, &Place::local(1)));
+    let x_bv = format!("__trust_ovf_bv_neg_{}", crate::place_to_var_name(&func, &Place::local(1)));
 
     // ADVERSARIAL: `-(i128::MIN)` genuinely overflows. The violation formula
     // (`x == i128::MIN`) must be SAT (refutable).
-    let overflow_env =
-        |name: &str| -> u128 { if name == x_bv { i128::MIN as u128 } else { 0 } };
+    let overflow_env = |name: &str| -> u128 { if name == x_bv { i128::MIN as u128 } else { 0 } };
     assert!(
         eval_bv_bool(&neg.formula, &overflow_env),
         "REAL i128 negation overflow (-(i128::MIN)) must satisfy the violation \
@@ -597,8 +589,7 @@ fn u128_add_overflow_still_refutable() {
     );
     // lhs `a` is a bare local → BV var `__trust_ovf_bv_lhs_a`; rhs is the
     // constant `1` (a `BitVec` literal, no var). `i128::MAX + 1` overflows.
-    let a_bv =
-        format!("__trust_ovf_bv_lhs_{}", crate::place_to_var_name(&func, &Place::local(1)));
+    let a_bv = format!("__trust_ovf_bv_lhs_{}", crate::place_to_var_name(&func, &Place::local(1)));
     let env = |name: &str| -> u128 { if name == a_bv { i128::MAX as u128 } else { 0 } };
     assert!(
         eval_bv_bool(&vc.formula, &env),
@@ -1328,8 +1319,19 @@ fn i128_mul_both_const_pinned_proves_no_overflow() {
 #[test]
 fn i128_mul_unbounded_box_is_not_suppressed_by_the_assert_gate() {
     let overflow = i128_mul_precond_fn(0, i128::MAX, 0, 2);
+    let Terminator::Assert { target, cond, expected, .. } = &overflow.body.blocks[0].terminator
+    else {
+        unreachable!("fixture ends in its overflow assert")
+    };
     assert!(
-        !v2_overflow_assert_provably_cannot_fire(&overflow, &overflow.body.blocks[0], BinOp::Mul),
+        !v2_overflow_assert_provably_cannot_fire(
+            &overflow,
+            &overflow.body.blocks[0],
+            *target,
+            BinOp::Mul,
+            cond,
+            *expected,
+        ),
         "a box whose corner (i128::MAX * 2) overflows must NOT be suppressed"
     );
     let vcs = generate_v2_safety_vcs(&overflow);
@@ -1481,4 +1483,519 @@ fn signed_mul_corners_fit_boundary_exactness() {
     assert!(!v2_signed_mul_corners_fit((0, i128::MAX), (0, 2)), "corner MAX*2 overflows");
     // An inconsistent (empty) box is conservatively NOT provable.
     assert!(!v2_signed_mul_corners_fit((5, 3), (1, 1)), "empty box (lo > hi) not proved");
+}
+
+// ---------------------------------------------------------------------------
+// The CheckedSub-SOURCED shift amount: `-(1i128 << (width - 1))`.
+//
+// WHY THESE EXIST (measured 2026-08-27). `signed_min_neg_shifted_is_provable_unsat`
+// above uses a PLAIN `Sub` for the amount (`_6 = width - 1`), which is NOT the MIR
+// rustc actually builds with overflow checks on. The real shape, dumped from
+// `trustc -Ztrust-dump=mir:` on `trust_semantics::signed_min`, routes the amount
+// through a CHECKED sub and its tuple:
+//
+//     bb4:  _7 = CheckedSub(width, 1u32);   assert(!_7.1, Overflow(Sub)) -> bb5
+//     bb5:  _6 = Use(Move(_7.0));           assert(_6 < 128, Overflow(Shl)) -> bb6
+//     bb6:  _5 = Shl(1i128, Move(_6));      assert(!(_5 == i128::MIN), OverflowNeg) -> bb7
+//     bb7:  _0 = Neg(Move(_5))
+//
+// So the amount reaching `Shl` is a BARE local (`_6`), not a projection — the
+// `.0` field read is its own `Use` statement. `v2_collect_bv_shl_blockdef`'s
+// `projections.is_empty()` gate therefore does NOT decline this shape, and
+// `v2_amount_sub_source_at_use`'s `Projection::Field(0)` arm threads the
+// `width <= 127` path guard through the CheckedSub to bound the amount at
+// `< 127`, not merely at the shift assert's `< 128`.
+//
+// That one-integer difference is the whole proof: `1 << 127` IS `i128::MIN`, so
+// a `< 128` bound leaves the negation-overflow violation SATISFIABLE while a
+// `< 127` bound makes it UNSAT.
+//
+// The pair below is a DISCRIMINATING control. Both halves carry the CheckedSub
+// tuple; they differ in exactly one thing — whether the `width <= 127` guard
+// dominates the shift. The unguarded half is a REAL panic, RUNTIME-CONFIRMED
+// rather than argued: `-(1i128 << (width - 1))` with `width = 128` (so shift
+// amount 127) aborts with `attempt to negate with overflow`, exit 101. So the
+// negative half's SAT witness `amt = 127` is the true overflowing execution,
+// not an artifact of a weak encoding — which is what makes the pair separate a
+// working block-def from a broken one instead of failing on both sides.
+
+/// The dumped `trust_semantics::signed_min` body, verbatim (locals and blocks as
+/// `-Ztrust-dump=mir:` wrote them for `-(1i128 << (width - 1))` guarded by
+/// `width != 128 && width >= 1 && width <= 127`).
+fn checked_sub_amount_guarded_fixture() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "signed_min".to_string(),
+        def_path: "test::signed_min".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i128(), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("width".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: None },
+                LocalDecl { index: 3, ty: Ty::Bool, name: None },
+                LocalDecl { index: 4, ty: Ty::Bool, name: None },
+                LocalDecl { index: 5, ty: Ty::i128(), name: None },
+                LocalDecl { index: 6, ty: Ty::u32(), name: None },
+                LocalDecl { index: 7, ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]), name: None },
+                LocalDecl { index: 8, ty: Ty::Bool, name: None },
+                LocalDecl { index: 9, ty: Ty::Bool, name: None },
+            ],
+            blocks: vec![
+                // bb0: `width == 128`?  false -> bb2, true -> bb1
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign(
+                        2,
+                        Rvalue::BinaryOp(
+                            BinOp::Eq,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(128, 32)),
+                        ),
+                    )],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(2)),
+                        targets: vec![(0, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb1: `width == 128` arm — returns i128::MIN directly.
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![assign(
+                        0,
+                        Rvalue::Use(Operand::Constant(ConstValue::Int(i128::MIN))),
+                    )],
+                    terminator: Terminator::Goto(BlockId(9)),
+                },
+                // bb2: `width >= 1`?  false -> bb8, true -> bb3
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(
+                        3,
+                        Rvalue::BinaryOp(
+                            BinOp::Ge,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(1, 32)),
+                        ),
+                    )],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(3)),
+                        targets: vec![(0, BlockId(8))],
+                        otherwise: BlockId(3),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb3: `width <= 127`?  false -> bb8, true -> bb4.  THE GUARD.
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![assign(
+                        4,
+                        Rvalue::BinaryOp(
+                            BinOp::Le,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(127, 32)),
+                        ),
+                    )],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(4)),
+                        targets: vec![(0, BlockId(8))],
+                        otherwise: BlockId(4),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb4: the CHECKED `width - 1` into the tuple `_7`.
+                BasicBlock {
+                    id: BlockId(4),
+                    stmts: vec![assign(
+                        7,
+                        Rvalue::CheckedBinaryOp(
+                            BinOp::Sub,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(1, 32)),
+                        ),
+                    )],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place {
+                            local: 7,
+                            projections: vec![Projection::Field(1)],
+                        }),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Sub),
+                        target: BlockId(5),
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb5: `_6 = _7.0` (its OWN statement — this is why the Shl's
+                // amount operand is a bare local), then the shift-amount assert.
+                BasicBlock {
+                    id: BlockId(5),
+                    stmts: vec![
+                        assign(
+                            6,
+                            Rvalue::Use(Operand::Move(Place {
+                                local: 7,
+                                projections: vec![Projection::Field(0)],
+                            })),
+                        ),
+                        assign(
+                            8,
+                            Rvalue::BinaryOp(
+                                BinOp::Lt,
+                                Operand::Copy(Place::local(6)),
+                                Operand::Constant(ConstValue::Uint(128, 32)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place::local(8)),
+                        expected: true,
+                        msg: AssertMessage::Overflow(BinOp::Shl),
+                        target: BlockId(6),
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb6: the shift, then the negation-overflow assert.
+                BasicBlock {
+                    id: BlockId(6),
+                    stmts: vec![
+                        assign(
+                            5,
+                            Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Constant(ConstValue::Int(1)),
+                                Operand::Move(Place::local(6)),
+                            ),
+                        ),
+                        assign(
+                            9,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(5)),
+                                Operand::Constant(ConstValue::Int(i128::MIN)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place::local(9)),
+                        expected: false,
+                        msg: AssertMessage::OverflowNeg,
+                        target: BlockId(7),
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(7),
+                    stmts: vec![assign(
+                        0,
+                        Rvalue::UnaryOp(UnOp::Neg, Operand::Move(Place::local(5))),
+                    )],
+                    terminator: Terminator::Goto(BlockId(9)),
+                },
+                BasicBlock {
+                    id: BlockId(8),
+                    stmts: vec![assign(
+                        0,
+                        Rvalue::Use(Operand::Constant(ConstValue::Int(i128::MIN))),
+                    )],
+                    terminator: Terminator::Goto(BlockId(9)),
+                },
+                BasicBlock { id: BlockId(9), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// The NEGATIVE control: the dumped body of `fn derived(width: u32) -> i128 {
+/// -(1i128 << (width - 1)) }` — the SAME CheckedSub-sourced amount with NO
+/// dominating `width <= 127` guard. `derived(128)` really panics.
+fn checked_sub_amount_unguarded_fixture() -> VerifiableFunction {
+    VerifiableFunction {
+        name: "derived".to_string(),
+        def_path: "test::derived".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::i128(), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("width".into()) },
+                LocalDecl { index: 2, ty: Ty::i128(), name: None },
+                LocalDecl { index: 3, ty: Ty::u32(), name: None },
+                LocalDecl { index: 4, ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]), name: None },
+                LocalDecl { index: 5, ty: Ty::Bool, name: None },
+                LocalDecl { index: 6, ty: Ty::Bool, name: None },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign(
+                        4,
+                        Rvalue::CheckedBinaryOp(
+                            BinOp::Sub,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(ConstValue::Uint(1, 32)),
+                        ),
+                    )],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place {
+                            local: 4,
+                            projections: vec![Projection::Field(1)],
+                        }),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Sub),
+                        target: BlockId(1),
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        assign(
+                            3,
+                            Rvalue::Use(Operand::Move(Place {
+                                local: 4,
+                                projections: vec![Projection::Field(0)],
+                            })),
+                        ),
+                        assign(
+                            5,
+                            Rvalue::BinaryOp(
+                                BinOp::Lt,
+                                Operand::Copy(Place::local(3)),
+                                Operand::Constant(ConstValue::Uint(128, 32)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place::local(5)),
+                        expected: true,
+                        msg: AssertMessage::Overflow(BinOp::Shl),
+                        target: BlockId(2),
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![
+                        assign(
+                            2,
+                            Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Constant(ConstValue::Int(1)),
+                                Operand::Move(Place::local(3)),
+                            ),
+                        ),
+                        assign(
+                            6,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Constant(ConstValue::Int(i128::MIN)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Continue,
+                        cond: Operand::Move(Place::local(6)),
+                        expected: false,
+                        msg: AssertMessage::OverflowNeg,
+                        target: BlockId(3),
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![assign(
+                        0,
+                        Rvalue::UnaryOp(UnOp::Neg, Operand::Move(Place::local(2))),
+                    )],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::i128(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// Build the hardened `OverflowNeg` BV formula for a fixture, and return it with
+/// the name of the shift-amount BV variable it bound (if any).
+fn hardened_neg_formula(func: &VerifiableFunction) -> (Formula, Option<String>) {
+    let block = func
+        .body
+        .blocks
+        .iter()
+        .find(|b| {
+            matches!(&b.terminator, Terminator::Assert { msg: AssertMessage::OverflowNeg, .. })
+        })
+        .expect("fixture must carry an OverflowNeg assert");
+    let Terminator::Assert { cond, expected, msg, target, .. } = &block.terminator else {
+        unreachable!()
+    };
+    let formula =
+        super::v2_hardened_signed_bv_overflow_formula(func, block, msg, cond, *expected, *target)
+            .expect("the hardened signed-128 neg lane must build a BV formula for this shape");
+    let mut amt = None;
+    collect_amt_var(&formula, &mut amt);
+    (formula, amt)
+}
+
+fn collect_amt_var(f: &Formula, out: &mut Option<String>) {
+    match f {
+        Formula::Var(name, _) if name.starts_with("__trust_ovf_bv_amt_") => {
+            *out = Some(name.to_string());
+        }
+        Formula::And(cs) | Formula::Or(cs) => cs.iter().for_each(|c| collect_amt_var(c, out)),
+        Formula::Not(c) => collect_amt_var(c, out),
+        Formula::Eq(a, b)
+        | Formula::BvULt(a, b, _)
+        | Formula::BvShl(a, b, _)
+        | Formula::Lt(a, b)
+        | Formula::Le(a, b) => {
+            collect_amt_var(a, out);
+            collect_amt_var(b, out);
+        }
+        _ => {}
+    }
+}
+
+/// The strict upper bound the formula puts on the shift amount, i.e. the `K` in
+/// `bvult(amt, K)`. `None` when no bound was emitted at all.
+fn amt_strict_upper_bound(f: &Formula) -> Option<i128> {
+    match f {
+        Formula::BvULt(a, b, _) => match (&**a, &**b) {
+            (Formula::Var(name, _), Formula::BitVec { value, .. })
+                if name.starts_with("__trust_ovf_bv_amt_") =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        },
+        Formula::And(cs) | Formula::Or(cs) => cs.iter().find_map(amt_strict_upper_bound),
+        _ => None,
+    }
+}
+
+/// Is the BV violation satisfiable for SOME shift amount in `0..=255`? Returns
+/// the witnessing amount. The only free variables are the amount and the shifted
+/// result, and the result is pinned by the block-def equality, so enumerating the
+/// amount is an EXACT decision procedure for this formula shape.
+fn neg_violation_witness(formula: &Formula, amt_var: &str) -> Option<u128> {
+    let bv_name =
+        neg_result_var(formula).expect("the block-def must name a __trust_ovf_bv_neg_ var");
+    (0u128..=255).find(|amt| {
+        // `_neg == bvshl(1, amt)` is a definition: evaluate it to feed the
+        // result var, so the enumeration covers only the genuinely free amount.
+        let shifted: u128 = if *amt >= 128 { 0 } else { 1u128 << amt };
+        let env = |name: &str| -> u128 {
+            if name == amt_var {
+                *amt
+            } else if name == bv_name {
+                shifted
+            } else {
+                0
+            }
+        };
+        eval_bv_bool(formula, &env)
+    })
+}
+
+fn neg_result_var(f: &Formula) -> Option<String> {
+    match f {
+        Formula::Var(name, _) if name.starts_with("__trust_ovf_bv_neg_") => Some(name.to_string()),
+        Formula::And(cs) | Formula::Or(cs) => cs.iter().find_map(neg_result_var),
+        Formula::Not(c) => neg_result_var(c),
+        Formula::Eq(a, b) | Formula::BvULt(a, b, _) | Formula::BvShl(a, b, _) => {
+            neg_result_var(a).or_else(|| neg_result_var(b))
+        }
+        _ => None,
+    }
+}
+
+/// GUARDED half, (a) BINDING: the CheckedSub-sourced amount MUST bind a BV
+/// variable. A FREE `__trust_ovf_bv_amt_*` twin is the false-refutation surface
+/// this lane exists to close, and its absence is invisible in the verdict — the
+/// row just reports `unknown`.
+#[test]
+fn checked_sub_sourced_shift_amount_binds_a_bv_variable() {
+    let func = checked_sub_amount_guarded_fixture();
+    let (formula, amt) = hardened_neg_formula(&func);
+    assert!(
+        amt.is_some(),
+        "the CheckedSub-sourced amount must bind a `__trust_ovf_bv_amt_*` variable; \
+         formula: {formula:?}"
+    );
+}
+
+/// GUARDED half, (b) TIGHTNESS: the dominating `width <= 127` guard must thread
+/// through the CheckedSub tuple, bounding the amount at `< 127` — NOT at the
+/// shift assert's own `< 128`. The one-integer difference is the whole proof.
+#[test]
+fn checked_sub_sourced_shift_amount_bound_is_tight() {
+    let func = checked_sub_amount_guarded_fixture();
+    let (formula, _) = hardened_neg_formula(&func);
+    assert_eq!(
+        amt_strict_upper_bound(&formula),
+        Some(127),
+        "the `width <= 127` guard must thread through the CheckedSub tuple to bound the \
+         amount at `< 127`; a `< 128` bound admits `1 << 127 == i128::MIN`. \
+         formula: {formula:?}"
+    );
+}
+
+/// GUARDED half, (c) UNSAT: with the tight bound the violation has no model, so
+/// the obligation is genuinely discharged rather than merely unrefuted.
+#[test]
+fn checked_sub_sourced_shift_amount_violation_is_unsat() {
+    let func = checked_sub_amount_guarded_fixture();
+    let (formula, amt) = hardened_neg_formula(&func);
+    let amt = amt.expect("binding is pinned by its own test above");
+    assert_eq!(
+        neg_violation_witness(&formula, &amt),
+        None,
+        "guarded `-(1i128 << (width - 1))` cannot overflow, so the BV violation must be \
+         UNSAT for every shift amount. formula: {formula:?}"
+    );
+}
+
+/// NEGATIVE control. Delete ONLY the `width <= 127` guard and the very same
+/// encoding must stay refutable, with the witness being the amount the real
+/// program reaches (`width = 128` -> `amt = 127`, `-(1i128 << 127)` panics).
+#[test]
+fn unguarded_checked_sub_sourced_shift_amount_stays_refutable() {
+    let func = checked_sub_amount_unguarded_fixture();
+    let (formula, amt) = hardened_neg_formula(&func);
+    let amt = amt.expect("the amount must bind here too — the two halves differ only in the guard");
+    assert_eq!(
+        amt_strict_upper_bound(&formula),
+        Some(128),
+        "with no `width <= 127` guard the only dominating bound is the shift assert's \
+         `< 128`. formula: {formula:?}"
+    );
+    assert_eq!(
+        neg_violation_witness(&formula, &amt),
+        Some(127),
+        "unguarded `-(1i128 << (width - 1))` DOES overflow at `width = 128`, so the \
+         violation must be SAT at exactly amount 127 — the real panicking execution, \
+         not an encoding artifact. formula: {formula:?}"
+    );
 }

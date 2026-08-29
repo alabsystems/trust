@@ -1,9 +1,8 @@
-use trust_types::UnwindEdge;
 use std::path::PathBuf;
 
 use trust_types::{
     AggregateKind, CallableDefPathHash, CallableKind, ClosureCallKind, Operand, Place, Sort,
-    SourceSpan, VcKind, VerificationResult,
+    SourceSpan, UnOp, UnwindEdge, VcKind, VerificationResult,
 };
 
 use super::*;
@@ -186,6 +185,160 @@ fn public_vcgen_rejects_invalid_argument_and_reference_indices() {
     assert_malformed_body_fails_closed(&invalid_target);
 }
 
+#[test]
+fn assert_refutation_declines_a_guard_whose_value_depends_on_an_opaque_call() {
+    // Reduced from real MIR for:
+    // `value = iter.sum(); assert_eq!(value, 10)`.  The assert macro compares
+    // values loaded through shared references.  Proof-facing guard lowering is
+    // allowed to weaken an unmodeled Boolean comparison to `true`; a SAT-based
+    // refutation must instead retain the raw Boolean, discover that its value
+    // ultimately depends on the opaque call destination, and decline.
+    let span = SourceSpan::default();
+    let function = VerifiableFunction {
+        name: "checked".into(),
+        def_path: "test::checked".into(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: Ty::Bool, name: Some("gate".into()) },
+                LocalDecl { index: 2, ty: Ty::u64(), name: Some("value".into()) },
+                LocalDecl { index: 3, ty: Ty::u64(), name: Some("opaque_sum".into()) },
+                LocalDecl { index: 4, ty: Ty::u64(), name: Some("ten".into()) },
+                LocalDecl {
+                    index: 5,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::u64()) },
+                    name: Some("left_ref".into()),
+                },
+                LocalDecl {
+                    index: 6,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::u64()) },
+                    name: Some("right_ref".into()),
+                },
+                LocalDecl { index: 7, ty: Ty::u64(), name: Some("left".into()) },
+                LocalDecl { index: 8, ty: Ty::u64(), name: Some("right".into()) },
+                LocalDecl { index: 9, ty: Ty::Bool, name: Some("equal".into()) },
+                LocalDecl { index: 10, ty: Ty::Never, name: None },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(1)),
+                        targets: vec![(0, BlockId(4))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: span.clone(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: "test::opaque_sum".into(),
+                        args: vec![],
+                        dest: Place::local(3),
+                        target: Some(BlockId(2)),
+                        span: span.clone(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: UnwindEdge::Continue,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::Use(Operand::Move(Place::local(3))),
+                            span: span.clone(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(10, 64))),
+                            span: span.clone(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(5),
+                            rvalue: Rvalue::Ref { mutable: false, place: Place::local(2) },
+                            span: span.clone(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(6),
+                            rvalue: Rvalue::Ref { mutable: false, place: Place::local(4) },
+                            span: span.clone(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(7),
+                            rvalue: Rvalue::Use(Operand::Copy(Place {
+                                local: 5,
+                                projections: vec![Projection::Deref],
+                            })),
+                            span: span.clone(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(8),
+                            rvalue: Rvalue::Use(Operand::Copy(Place {
+                                local: 6,
+                                projections: vec![Projection::Deref],
+                            })),
+                            span: span.clone(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(9),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Move(Place::local(7)),
+                                Operand::Move(Place::local(8)),
+                            ),
+                            span: span.clone(),
+                        },
+                    ],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(9)),
+                        targets: vec![(0, BlockId(3))],
+                        otherwise: BlockId(4),
+                        exhaustive_enum_unreachable: false,
+                        span: span.clone(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: "core::panicking::assert_failed::<u64, u64>".into(),
+                        args: vec![],
+                        dest: Place::local(10),
+                        target: None,
+                        span: span.clone(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: UnwindEdge::Continue,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    assert!(
+        generate_full_assert_refutation_vcs(&function).is_empty(),
+        "an opaque call destination has no producer-fidelity witness and must not yield a refutation VC"
+    );
+}
+
 /// The modeled `copy_nonoverlapping` STATEMENT is admitted (allow-listed) by
 /// `validate_statement_references`, so a copy-bearing body reaches the VC lane
 /// where the sep engine mints its bounds/overlap rows. The 810baa6c4c revert
@@ -214,10 +367,7 @@ fn public_vcgen_admits_copy_nonoverlapping_statement_and_validates_its_operands(
         unreachable!()
     };
     *dst = Operand::Copy(Place::local(99));
-    assert!(matches!(
-        validate_function(&func),
-        Err(VcgenError::InvalidLocal { index: 99, .. })
-    ));
+    assert!(matches!(validate_function(&func), Err(VcgenError::InvalidLocal { index: 99, .. })));
     assert_malformed_body_fails_closed(&func);
 }
 
@@ -247,15 +397,14 @@ fn test_operand_to_formula_preserves_symbolic_operand() {
 }
 
 #[test]
-fn test_generate_vcs_consumes_trust_symbolic_formula_payload() {
-    let symbolic_payload =
-        Formula::var_owned("trust_symbolic.formula".to_string(), Sort::BitVec(64));
-    let symbolic_divisor = Formula::BvAdd(
-        Box::new(symbolic_payload.clone()),
-        Box::new(Formula::BitVec { value: 1, width: 64 }),
-        64,
-    );
-    let func = VerifiableFunction {
+fn test_binary_admission_rejects_symbolic_payload_without_a_rust_type_identity() {
+    // An exact-width `Sort::BitVec(w)` payload whose `w` equals the audited
+    // destination width IS admitted (the value spaces coincide bit-for-bit;
+    // see `tests/synthetic_mir.rs::test_symbolic_divisor_formula_preserved_in_division_vc`).
+    // What must stay rejected is a payload with NO Rust type identity: a
+    // mathematical, widthless `Sort::Int` formula, and a bit-vector whose
+    // width does not match the validated destination.
+    let build = |symbolic_divisor: Formula| VerifiableFunction {
         name: "symbolic_payload_divisor".to_string(),
         def_path: "test::symbolic_payload_divisor".to_string(),
         span: SourceSpan::default(),
@@ -272,7 +421,7 @@ fn test_generate_vcs_consumes_trust_symbolic_formula_payload() {
                     rvalue: Rvalue::BinaryOp(
                         BinOp::Div,
                         Operand::Copy(Place::local(1)),
-                        Operand::Symbolic(symbolic_divisor.clone()),
+                        Operand::Symbolic(symbolic_divisor),
                     ),
                     span: SourceSpan::binary_address(0x4000),
                 }],
@@ -288,22 +437,33 @@ fn test_generate_vcs_consumes_trust_symbolic_formula_payload() {
         spec: Default::default(),
     };
 
-    let div_vc = generate_vcs(&func)
-        .into_iter()
-        .find(|vc| matches!(vc.kind, VcKind::DivisionByZero))
-        .expect("symbolic divisor should emit a DivisionByZero VC");
-    let expected_formula =
-        Formula::Eq(Box::new(symbolic_divisor), Box::new(Formula::BitVec { value: 0, width: 64 }));
+    let int_payload = Formula::var_owned("trust_symbolic.formula".to_string(), Sort::Int);
+    let int_divisor = Formula::Add(Box::new(int_payload.clone()), Box::new(Formula::Int(1)));
+    let narrow_payload = Formula::var_owned("trust_symbolic.formula".to_string(), Sort::BitVec(32));
+    let narrow_divisor = Formula::BvAdd(
+        Box::new(narrow_payload.clone()),
+        Box::new(Formula::BitVec { value: 1, width: 32 }),
+        32,
+    );
+    for (case, symbolic_divisor, symbolic_payload) in [
+        ("widthless mathematical Sort::Int", int_divisor, int_payload),
+        ("width-mismatched Sort::BitVec(32) against u64", narrow_divisor, narrow_payload),
+    ] {
+        let func = build(symbolic_divisor.clone());
+        assert!(
+            matches!(
+                validate_function(&func),
+                Err(VcgenError::MalformedMir { detail, .. })
+                    if detail.contains("BinaryOp(Div)")
+            ),
+            "{case}: a formula sort does not authenticate Rust's fixed width and signedness"
+        );
+        assert_malformed_body_fails_closed(&func);
 
-    assert_eq!(
-        div_vc.formula, expected_formula,
-        "trust_symbolic.formula payloads must be consumed structurally, not lowered to Undef"
-    );
-    assert!(
-        formula_contains(&div_vc.formula, &|formula| formula == &symbolic_payload),
-        "proof consumers must still see the preserved trust_symbolic.formula payload: {:?}",
-        div_vc.formula
-    );
+        // The payload remains intact in its metadata consumer record; this
+        // admission refusal is specific to proof-bearing Rust arithmetic.
+        assert!(formula_contains(&symbolic_divisor, &|formula| formula == &symbolic_payload));
+    }
 }
 
 #[test]
@@ -1010,32 +1170,18 @@ fn unsupported_checked_op_function(op: BinOp) -> VerifiableFunction {
 }
 
 #[test]
-fn test_unsupported_checked_binary_op_fails_closed() {
-    // Checked shifts are modeled as `ShiftOverflow` VCs. Keep this fail-closed
-    // test on a checked op whose overflow semantics are intentionally unsupported.
+fn test_non_with_overflow_checked_binary_op_is_malformed_and_fails_closed() {
     let func = unsupported_checked_op_function(BinOp::BitAnd);
-    let vcs = generate_vcs(&func);
-    let unsupported = vcs
-        .iter()
-        .find(|vc| {
-            matches!(
-                &vc.kind,
-                VcKind::UnsupportedMir { kind, detail }
-                    if kind == "Rvalue::CheckedBinaryOp" && detail.contains("checked BitAnd")
-            )
-        })
-        .expect("unsupported checked op overflow semantics must emit UnsupportedMir VC");
-    assert_eq!(unsupported.formula, Formula::Bool(true));
-
-    let (solver_vcs, preclassified) = generate_vcs_with_discharge(&func);
     assert!(
-        solver_vcs.iter().all(|vc| !matches!(vc.kind, VcKind::UnsupportedMir { .. })),
-        "UnsupportedMir checked-op VCs must be preclassified before solver dispatch"
+        matches!(
+            validate_function(&func),
+            Err(VcgenError::MalformedMir { detail, .. })
+                if detail.contains("CheckedBinaryOp(BitAnd)")
+                    && detail.contains("only Add, Sub, and Mul")
+        ),
+        "rustc's checked tuple carrier exists only for Add/Sub/Mul WithOverflow"
     );
-    assert!(preclassified.iter().any(|(vc, result)| {
-        matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::CheckedBinaryOp")
-            && matches!(result, VerificationResult::Unknown { reason, .. } if reason.contains("unsupported MIR"))
-    }));
+    assert_malformed_body_fails_closed(&func);
 }
 
 #[test]
@@ -1299,9 +1445,9 @@ fn test_thread_local_ref_rvalue_uses_sealed_address_model() {
     let (solver_vcs, preclassified) = generate_vcs_with_discharge(&func);
     assert!(
         solver_vcs.iter().all(|vc| !matches!(vc.kind, VcKind::UnsupportedMir { .. }))
-            && preclassified.iter().all(|(vc, _)| {
-                !matches!(vc.kind, VcKind::UnsupportedMir { .. })
-            }),
+            && preclassified
+                .iter()
+                .all(|(vc, _)| { !matches!(vc.kind, VcKind::UnsupportedMir { .. }) }),
         "ThreadLocalRef must not reappear as a preclassified unsupported row: solver={solver_vcs:#?}, preclassified={preclassified:#?}"
     );
 
@@ -1316,9 +1462,7 @@ fn test_thread_local_ref_rvalue_uses_sealed_address_model() {
     );
 
     let mut marker_with_operand = func.clone();
-    let Statement::Assign { rvalue, .. } =
-        &mut marker_with_operand.body.blocks[0].stmts[0]
-    else {
+    let Statement::Assign { rvalue, .. } = &mut marker_with_operand.body.blocks[0].stmts[0] else {
         panic!("ThreadLocalRef fixture assignment disappeared");
     };
     let Rvalue::Unsupported { operands, .. } = rvalue else {
@@ -1581,12 +1725,16 @@ fn test_project_ty_slice_subslice_preserves_slice_metadata_shape() {
 }
 
 fn tagged_adt_with_field(field_name: &str, field_ty: Ty) -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Tagged".to_string(),
         fields: vec![(field_name.to_string(), field_ty), ("payload".to_string(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn set_discriminant_function(name: &str, local_ty: Ty, variant_index: usize) -> VerifiableFunction {
@@ -1675,12 +1823,16 @@ fn generated_discriminant_definition_cannot_alias_source_scalar() {
 fn test_set_discriminant_without_explicit_tag_fails_closed() {
     let func = set_discriminant_function(
         "untagged_set_discriminant",
-        Ty::Adt { adt_kind: None, layout: None, 
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Untagged".to_string(),
             fields: vec![("payload".to_string(), Ty::i32())],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+        },
         1,
     );
 
@@ -2976,12 +3128,7 @@ fn test_place_to_var_name_resolves_unique_explicit_indices_in_sparse_reordered_t
     // still need collision-safe, deterministic names.
     let mut func = midpoint_function();
     func.body.locals.swap(1, 2);
-    func.body
-        .locals
-        .iter_mut()
-        .find(|decl| decl.index == 2)
-        .expect("local 2")
-        .index = 7;
+    func.body.locals.iter_mut().find(|decl| decl.index == 2).expect("local 2").index = 7;
 
     assert_eq!(place_to_var_name(&func, &Place::local(1)), "a");
     assert_eq!(place_to_var_name(&func, &Place::local(7)), "b");
@@ -3323,12 +3470,16 @@ fn match_exhaustive_function() -> VerifiableFunction {
                 LocalDecl { index: 0, ty: Ty::u32(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, 
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "Status".into(),
                         fields: vec![("discriminant".into(), Ty::u32())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("status".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::u32(), name: Some("x".into()) },
@@ -3428,13 +3579,18 @@ fn test_match_div_vc_has_variant_guard() {
 
 /// Helper: build a function with a single BinOp on two variable operands.
 fn make_binop_func(op: BinOp, ty: Ty) -> VerifiableFunction {
+    let result_ty = match op {
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ty::Bool,
+        BinOp::Cmp => Ty::adt("core::cmp::Ordering", vec![]),
+        _ => ty.clone(),
+    };
     VerifiableFunction {
         name: format!("arith_{op:?}"),
         def_path: format!("test::arith_{op:?}"),
         span: SourceSpan::default(),
         body: VerifiableBody {
             locals: vec![
-                LocalDecl { index: 0, ty: ty.clone(), name: None },
+                LocalDecl { index: 0, ty: result_ty.clone(), name: None },
                 LocalDecl { index: 1, ty: ty.clone(), name: Some("a".into()) },
                 LocalDecl { index: 2, ty: ty.clone(), name: Some("b".into()) },
             ],
@@ -3452,6 +3608,294 @@ fn make_binop_func(op: BinOp, ty: Ty) -> VerifiableFunction {
                 terminator: Terminator::Return,
             }],
             arg_count: 2,
+            return_ty: result_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn binary_assignment_admission_accepts_each_audited_rust_carrier_family() {
+    for (op, ty) in [
+        (BinOp::Add, Ty::u32()),
+        (BinOp::Sub, Ty::i16()),
+        (BinOp::Mul, Ty::f32_ty()),
+        (BinOp::Div, Ty::f64_ty()),
+        (BinOp::Rem, Ty::u128()),
+    ] {
+        let func = make_binop_func(op, ty);
+        assert!(validate_function(&func).is_ok(), "{op:?} must admit its exact carrier");
+    }
+
+    for op in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
+        let func = make_binop_func(op, Ty::Bool);
+        assert!(validate_function(&func).is_ok(), "Boolean {op:?} is a logical operation");
+    }
+
+    let mut mixed_width_shift = make_binop_func(BinOp::Shl, Ty::u32());
+    mixed_width_shift.body.locals[2].ty = Ty::u8();
+    assert!(
+        validate_function(&mixed_width_shift).is_ok(),
+        "Rust permits an independently typed integer shift amount"
+    );
+
+    // rustc spells `x << 3` as `Shl(copy _1, const 3_i32)` and trust-mir-extract
+    // lowers every signed literal to widthless `ConstValue::Int`. The amount's
+    // concrete value is fully established, the destination supplies the
+    // arithmetic identity, and the shift-amount bound obligation is emitted
+    // independently by the safety lane — so the live carrier must be admitted.
+    let mut widthless_shift_amount = make_binop_func(BinOp::Shl, Ty::u32());
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+        &mut widthless_shift_amount.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *rhs = Operand::Constant(ConstValue::Int(3));
+    assert!(
+        validate_function(&widthless_shift_amount).is_ok(),
+        "the live widthless-literal shift amount carrier must be admitted"
+    );
+
+    // rustc emits `Eq(const 2_i32, const 0_i32)` on the constant-divisor
+    // `n % 2` path. Two exactly-established literal values compare identically
+    // at every width where both are representable, and the Bool destination
+    // carries no width identity a wrong binding could violate.
+    let mut literal_comparison = make_binop_func(BinOp::Eq, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut literal_comparison.body.blocks[0].stmts[0] else {
+        unreachable!()
+    };
+    *rvalue = Rvalue::BinaryOp(
+        BinOp::Eq,
+        Operand::Constant(ConstValue::Int(2)),
+        Operand::Constant(ConstValue::Int(0)),
+    );
+    assert!(
+        validate_function(&literal_comparison).is_ok(),
+        "the live literal-literal comparison carrier must be admitted"
+    );
+
+    // Constant-first spellings must authenticate symmetrically with their
+    // mirrored place-first twins: `5usize == x` and `'a' == c`.
+    let mut const_first_usize = make_binop_func(BinOp::Eq, Ty::usize());
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, lhs, _), .. } =
+        &mut const_first_usize.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *lhs = Operand::Constant(ConstValue::Uint(5, 64));
+    assert!(
+        validate_function(&const_first_usize).is_ok(),
+        "a constant-first usize comparison must admit like its mirrored spelling"
+    );
+
+    let mut const_first_char = make_binop_func(BinOp::Eq, Ty::Char);
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, lhs, _), .. } =
+        &mut const_first_char.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *lhs = Operand::Constant(ConstValue::Uint(u128::from(u32::from('a')), 32));
+    assert!(
+        validate_function(&const_first_char).is_ok(),
+        "a constant-first char comparison must admit like its mirrored spelling"
+    );
+
+    // The post-cast thin-pointer identity comparison the extraction emits:
+    // both RESOLVED types are thin raw pointers, so `==` is address equality —
+    // independent of pointee type and of mutability.
+    for rhs_ty in [
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) },
+        Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) },
+    ] {
+        let mut thin_pointer_eq =
+            make_binop_func(BinOp::Eq, Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) });
+        thin_pointer_eq.body.locals[2].ty = rhs_ty.clone();
+        assert!(
+            validate_function(&thin_pointer_eq).is_ok(),
+            "thin-pointer address Eq must admit a {rhs_ty:?} partner"
+        );
+    }
+
+    for ty in [
+        Ty::Bool,
+        Ty::Char,
+        Ty::i64(),
+        Ty::f64_ty(),
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) },
+    ] {
+        let func = make_binop_func(BinOp::Eq, ty.clone());
+        assert!(validate_function(&func).is_ok(), "Eq must admit exact {ty:?} operands");
+    }
+
+    let cmp = make_binop_func(BinOp::Cmp, Ty::i32());
+    assert!(validate_function(&cmp).is_ok(), "the public Cmp carrier is structurally faithful");
+    let cmp_vcs = try_generate_vcs(&cmp).expect("valid Cmp reaches fail-closed generation");
+    assert!(cmp_vcs.iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, detail }
+            if kind == "Rvalue::BinaryOp(Cmp)"
+                && detail.contains("Ordering discriminant tags")
+    )));
+
+    let mut explicit_unsupported = make_binop_func(BinOp::Add, Ty::u32());
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+        &mut explicit_unsupported.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *rhs = Operand::Unsupported {
+        kind: "test::unsupported_u32".into(),
+        detail: "the producer could not retain this operand".into(),
+    };
+    assert!(validate_function(&explicit_unsupported).is_ok());
+    assert!(try_generate_vcs(&explicit_unsupported).unwrap().iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "test::unsupported_u32"
+    )));
+}
+
+#[test]
+fn binary_assignment_admission_rejects_every_unauthenticated_type_shape() {
+    fn assert_binary_malformed(func: &VerifiableFunction, op: BinOp) {
+        assert!(
+            matches!(
+                validate_function(func),
+                Err(VcgenError::MalformedMir { detail, .. })
+                    if detail.contains(&format!("BinaryOp({op:?})"))
+            ),
+            "unauthenticated {op:?} carrier unexpectedly validated"
+        );
+        assert_malformed_body_fails_closed(func);
+    }
+
+    let mut wrong_destination = make_binop_func(BinOp::Add, Ty::u32());
+    wrong_destination.body.locals[0].ty = Ty::u8();
+    wrong_destination.body.return_ty = Ty::u8();
+    assert_binary_malformed(&wrong_destination, BinOp::Add);
+
+    let mut mismatched_operand = make_binop_func(BinOp::Add, Ty::u32());
+    mismatched_operand.body.locals[2].ty = Ty::u8();
+    assert_binary_malformed(&mismatched_operand, BinOp::Add);
+
+    assert_binary_malformed(&make_binop_func(BinOp::Add, Ty::Bool), BinOp::Add);
+    assert_binary_malformed(&make_binop_func(BinOp::Add, Ty::Float { width: 16 }), BinOp::Add);
+
+    let mut wrong_comparison_result = make_binop_func(BinOp::Eq, Ty::u32());
+    wrong_comparison_result.body.locals[0].ty = Ty::u32();
+    wrong_comparison_result.body.return_ty = Ty::u32();
+    assert_binary_malformed(&wrong_comparison_result, BinOp::Eq);
+
+    let reference_ty = Ty::Ref { mutable: false, inner: Box::new(Ty::u8()) };
+    assert_binary_malformed(&make_binop_func(BinOp::Eq, reference_ty), BinOp::Eq);
+
+    // Literal-literal comparisons are now admitted (both values are exactly
+    // established — see the accepts test), so the adversarial ambiguity cases
+    // are the ones a widthless literal must NOT rescue: an identity-less
+    // opaque occurrence, and a non-integer constant partner.
+    let mut ambiguous_literals = make_binop_func(BinOp::Eq, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut ambiguous_literals.body.blocks[0].stmts[0] else {
+        unreachable!()
+    };
+    *rvalue = Rvalue::BinaryOp(
+        BinOp::Eq,
+        Operand::Constant(ConstValue::Int(1)),
+        Operand::Constant(ConstValue::OpaqueScalar { width: 8, signed: true }),
+    );
+    assert_binary_malformed(&ambiguous_literals, BinOp::Eq);
+
+    let mut literal_bool_mix = make_binop_func(BinOp::Eq, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut literal_bool_mix.body.blocks[0].stmts[0] else {
+        unreachable!()
+    };
+    *rvalue = Rvalue::BinaryOp(
+        BinOp::Eq,
+        Operand::Constant(ConstValue::Int(1)),
+        Operand::Constant(ConstValue::Bool(true)),
+    );
+    assert_binary_malformed(&literal_bool_mix, BinOp::Eq);
+
+    // A widthless literal amount is now admitted on an INTEGER-destination
+    // shift (see the accepts test); it must never rescue a non-integer
+    // destination, whose arithmetic identity remains unestablished.
+    let mut widthless_shift = make_binop_func(BinOp::Shl, Ty::Bool);
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+        &mut widthless_shift.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *rhs = Operand::Constant(ConstValue::Int(1));
+    assert_binary_malformed(&widthless_shift, BinOp::Shl);
+
+    let mut wrong_cmp_result = make_binop_func(BinOp::Cmp, Ty::i32());
+    wrong_cmp_result.body.locals[0].ty = Ty::Bool;
+    wrong_cmp_result.body.return_ty = Ty::Bool;
+    assert_binary_malformed(&wrong_cmp_result, BinOp::Cmp);
+    assert_binary_malformed(&make_binop_func(BinOp::Cmp, Ty::f32_ty()), BinOp::Cmp);
+
+    // Thin-pointer Eq/Ne is address comparison and admits pointee/mutability
+    // differences (see the accepts test). What must STAY rejected: a
+    // metadata-bearing partner (fat `*const [u8]` equality also compares its
+    // length, which an address-only formula would drop) and any ORDERING over
+    // mixed pointer spellings (no audited carrier establishes it).
+    let mut pointer_mismatch =
+        make_binop_func(BinOp::Eq, Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) });
+    pointer_mismatch.body.locals[2].ty =
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    assert_binary_malformed(&pointer_mismatch, BinOp::Eq);
+
+    let mut pointer_order_mismatch =
+        make_binop_func(BinOp::Lt, Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) });
+    pointer_order_mismatch.body.locals[2].ty =
+        Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) };
+    assert_binary_malformed(&pointer_order_mismatch, BinOp::Lt);
+
+    let mut narrow_signed = make_binop_func(BinOp::Add, Ty::i8());
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+        &mut narrow_signed.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *rhs = Operand::Constant(ConstValue::Int(128));
+    assert_binary_malformed(&narrow_signed, BinOp::Add);
+
+    let mut wrong_width_unsigned = make_binop_func(BinOp::Add, Ty::u8());
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+        &mut wrong_width_unsigned.body.blocks[0].stmts[0]
+    else {
+        unreachable!()
+    };
+    *rhs = Operand::Constant(ConstValue::Uint(1, 16));
+    assert_binary_malformed(&wrong_width_unsigned, BinOp::Add);
+}
+
+/// Build the exact live MIR carrier produced for rustc's
+/// `AddUnchecked`/`SubUnchecked`/`MulUnchecked` operations.
+fn make_unchecked_binop_func(op: BinOp, lhs: Operand) -> VerifiableFunction {
+    let ty = Ty::u32();
+    VerifiableFunction {
+        name: format!("unchecked_{op:?}"),
+        def_path: format!("test::unchecked_{op:?}"),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: ty.clone(), name: None },
+                LocalDecl { index: 1, ty: ty.clone(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: ty.clone(), name: Some("b".into()) },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::UncheckedBinaryOp(op, lhs, Operand::Copy(Place::local(2))),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 2,
             return_ty: ty,
             datatype_defs: Default::default(),
         },
@@ -3460,6 +3904,1519 @@ fn make_binop_func(op: BinOp, ty: Ty) -> VerifiableFunction {
         postconditions: vec![],
         spec: Default::default(),
     }
+}
+
+fn set_unchecked_scalar_types(func: &mut VerifiableFunction, dest: Ty, lhs: Ty, rhs: Ty) {
+    func.body.return_ty = dest.clone();
+    func.body.locals[0].ty = dest;
+    func.body.locals[1].ty = lhs;
+    func.body.locals[2].ty = rhs;
+}
+
+#[test]
+fn unchecked_add_sub_mul_are_admitted_and_reach_exact_overflow_vcs() {
+    for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+        let func = make_unchecked_binop_func(op, Operand::Copy(Place::local(1)));
+        assert!(
+            validate_function(&func).is_ok(),
+            "the live {op:?}Unchecked carrier must pass structural admission"
+        );
+
+        let vcs = try_generate_vcs(&func).expect("admitted unchecked arithmetic must generate VCs");
+        let matching: Vec<_> = vcs
+            .iter()
+            .filter(|vc| {
+                matches!(
+                    vc.kind,
+                    VcKind::UncheckedArithmeticOverflow { op: emitted, .. } if emitted == op
+                )
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{op:?}Unchecked must reach exactly one matching ArithmeticOverflow row: {vcs:#?}"
+        );
+        assert!(
+            !matches!(&matching[0].formula, Formula::Bool(_)),
+            "the unchecked overflow row must carry a real operand-dependent formula"
+        );
+        assert!(
+            matching[0].obligation.is_some(),
+            "the unchecked overflow row must retain its authenticated arithmetic seed"
+        );
+        let VcKind::UncheckedArithmeticOverflow { operand_tys, .. } = &matching[0].kind else {
+            unreachable!("matching filtered this exact kind")
+        };
+        assert_eq!(operand_tys, &(Ty::u32(), Ty::u32()));
+        assert!(
+            vcs.iter().all(|vc| !matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+            )),
+            "a live {op:?}Unchecked carrier must not collapse to MalformedTrustIr: {vcs:#?}"
+        );
+    }
+}
+
+fn make_checked_binop_func(op: BinOp, value_ty: Ty) -> VerifiableFunction {
+    let mut func = make_binop_func(op, value_ty.clone());
+    let tuple_ty = Ty::Tuple(vec![value_ty, Ty::Bool]);
+    func.body.locals[0].ty = tuple_ty.clone();
+    func.body.return_ty = tuple_ty;
+    let Statement::Assign { rvalue, .. } = &mut func.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    let (lhs, rhs) = match rvalue {
+        Rvalue::BinaryOp(_, lhs, rhs) => (lhs.clone(), rhs.clone()),
+        _ => unreachable!(),
+    };
+    *rvalue = Rvalue::CheckedBinaryOp(op, lhs, rhs);
+    func
+}
+
+#[test]
+fn checked_binary_op_admission_is_exactly_the_integer_with_overflow_tuple() {
+    for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+        let func = make_checked_binop_func(op, Ty::u32());
+        assert!(validate_function(&func).is_ok(), "{op:?} WithOverflow must be admitted");
+    }
+
+    for op in [
+        BinOp::Div,
+        BinOp::Rem,
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+        BinOp::BitAnd,
+        BinOp::BitOr,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+        BinOp::Cmp,
+    ] {
+        let func = make_checked_binop_func(op, Ty::u32());
+        assert!(
+            matches!(
+                validate_function(&func),
+                Err(VcgenError::MalformedMir { detail, .. })
+                    if detail.contains("not an admitted WithOverflow operation")
+            ),
+            "forged CheckedBinaryOp({op:?}) must fail structural admission"
+        );
+        assert_malformed_body_fails_closed(&func);
+    }
+
+    let float = make_checked_binop_func(BinOp::Add, Ty::Float { width: 32 });
+    assert_malformed_body_fails_closed(&float);
+
+    let mut wrong_dest = make_checked_binop_func(BinOp::Add, Ty::u32());
+    wrong_dest.body.locals[0].ty = Ty::u32();
+    wrong_dest.body.return_ty = Ty::u32();
+    assert_malformed_body_fails_closed(&wrong_dest);
+
+    let mut mismatch = make_checked_binop_func(BinOp::Add, Ty::u32());
+    mismatch.body.locals[2].ty = Ty::u64();
+    assert_malformed_body_fails_closed(&mismatch);
+
+    let mut projected_destination = make_checked_binop_func(BinOp::Add, Ty::u32());
+    let Statement::Assign { place, .. } = &mut projected_destination.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    place.projections.push(Projection::Field(0));
+    assert!(matches!(
+        validate_function(&projected_destination),
+        Err(VcgenError::MalformedMir { detail, .. }) if detail.contains("whole tuple local")
+    ));
+    assert_malformed_body_fails_closed(&projected_destination);
+
+    // Real overflow-checked MIR reads projection-bearing places — rustc spells
+    // `t.0 + t.1` as `AddWithOverflow(copy (_1.0), copy (_1.1))` and `a[i] + b`
+    // with an indexed read — so a projected operand whose RESOLVED type matches
+    // the established tuple payload is admitted like the plain-BinaryOp lane.
+    // (The UB-bearing UncheckedBinaryOp lane keeps its whole-local restriction;
+    // see `unchecked_binary_op_rejects_projected_operand_reads_at_admission`.)
+    let mut projected_operand = make_checked_binop_func(BinOp::Add, Ty::u32());
+    projected_operand.body.locals[1].ty = Ty::Array { elem: Box::new(Ty::u32()), len: 4 };
+    projected_operand.body.locals.push(LocalDecl {
+        index: 3,
+        ty: Ty::usize(),
+        name: Some("index".into()),
+    });
+    let Statement::Assign { rvalue, .. } = &mut projected_operand.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    let Rvalue::CheckedBinaryOp(_, lhs, _) = rvalue else {
+        unreachable!();
+    };
+    *lhs = Operand::Copy(Place { local: 1, projections: vec![Projection::Index(3)] });
+    assert!(
+        validate_function(&projected_operand).is_ok(),
+        "the live indexed checked-add carrier must pass structural admission"
+    );
+    assert!(
+        try_generate_vcs(&projected_operand)
+            .expect("the admitted projected carrier must generate VCs")
+            .iter()
+            .all(|vc| !matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+            )),
+        "a live projected checked carrier must not collapse to MalformedTrustIr"
+    );
+
+    let mut tuple_field_operands = make_checked_binop_func(BinOp::Add, Ty::u32());
+    tuple_field_operands.body.locals[1].ty = Ty::Tuple(vec![Ty::u32(), Ty::u32()]);
+    let Statement::Assign { rvalue, .. } = &mut tuple_field_operands.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::CheckedBinaryOp(
+        BinOp::Add,
+        Operand::Copy(Place { local: 1, projections: vec![Projection::Field(0)] }),
+        Operand::Copy(Place { local: 1, projections: vec![Projection::Field(1)] }),
+    );
+    assert!(
+        validate_function(&tuple_field_operands).is_ok(),
+        "rustc's exact `AddWithOverflow(copy (_1.0), copy (_1.1))` shape must be admitted"
+    );
+
+    // The type audit is what remains load-bearing: a projection RESOLVING to
+    // the wrong payload type still rejects.
+    let mut mistyped_projection = make_checked_binop_func(BinOp::Add, Ty::u32());
+    mistyped_projection.body.locals[1].ty = Ty::Tuple(vec![Ty::u32(), Ty::Bool]);
+    let Statement::Assign { rvalue, .. } = &mut mistyped_projection.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    let Rvalue::CheckedBinaryOp(_, lhs, _) = rvalue else {
+        unreachable!();
+    };
+    *lhs = Operand::Copy(Place { local: 1, projections: vec![Projection::Field(1)] });
+    assert!(matches!(
+        validate_function(&mistyped_projection),
+        Err(VcgenError::MalformedMir { detail, .. })
+            if detail.contains("tuple payload's supported fixed-width integer type")
+    ));
+    assert_malformed_body_fails_closed(&mistyped_projection);
+}
+
+/// Build `fn f(p: <operand_ty>) { let _2: <dest_ty> = PtrMetadata(<operand>); }`.
+fn ptr_metadata_assign_func(operand_ty: Ty, dest_ty: Ty, operand: Operand) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "ptr_metadata_assign".to_string(),
+        def_path: "test::ptr_metadata_assign".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: operand_ty, name: Some("p".into()) },
+                LocalDecl { index: 2, ty: dest_ty, name: Some("meta".into()) },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(2),
+                    rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, operand),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn ptr_metadata_unmodeled_shapes_fail_closed_at_row_level_not_function_level() {
+    // A GVN-propagated pointer-shaped CONSTANT (`PtrMetadata(const "abc")`)
+    // carries no resolvable type: it is a faithful rustc carrier whose metadata
+    // is simply not modeled, so it must classify Unsupported (one visible
+    // row-level fail-closed obligation), never Invalid (whole-function
+    // MalformedTrustIr collapse).
+    let const_str = ptr_metadata_assign_func(
+        Ty::u32(), // unused local; the operand is the constant itself
+        Ty::usize(),
+        Operand::Constant(ConstValue::Str { bytes: b"abc".to_vec() }),
+    );
+    assert_eq!(
+        ptr_metadata_model(
+            &const_str,
+            &Operand::Constant(ConstValue::Str { bytes: b"abc".to_vec() })
+        ),
+        PtrMetadataModel::Unsupported,
+    );
+    assert!(validate_function(&const_str).is_ok());
+    let vcs = try_generate_vcs(&const_str).expect("row-level fail-closed shape must generate");
+    assert!(
+        vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::UnaryOp(PtrMetadata)"
+        )),
+        "an unmodeled constant metadata read must stay a visible row: {vcs:#?}"
+    );
+    assert!(
+        vcs.iter().all(|vc| !matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+        )),
+        "an unmodeled constant metadata read must not collapse the function: {vcs:#?}"
+    );
+
+    // A THIN pointer's metadata is `()`. When the extraction writes it into a
+    // non-`()` destination, the metadata lane is not the faithfully typed rustc
+    // shape: it must stay a row-level fail-closed obligation, not a
+    // whole-function collapse — and with a faithful `()` destination the unit
+    // model remains authoritative (no spurious row).
+    let thin_ty = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u32()) };
+    let thin_to_usize =
+        ptr_metadata_assign_func(thin_ty.clone(), Ty::usize(), Operand::Copy(Place::local(1)));
+    assert_eq!(
+        ptr_metadata_model(&thin_to_usize, &Operand::Copy(Place::local(1))),
+        PtrMetadataModel::Unsupported,
+    );
+    assert!(validate_function(&thin_to_usize).is_ok());
+    assert!(
+        try_generate_vcs(&thin_to_usize)
+            .expect("row-level fail-closed shape must generate")
+            .iter()
+            .any(|vc| matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, .. } if kind == "Rvalue::UnaryOp(PtrMetadata)"
+            )),
+        "thin metadata written to a non-unit destination must stay a visible row"
+    );
+
+    let thin_to_unit = ptr_metadata_assign_func(thin_ty, Ty::Unit, Operand::Copy(Place::local(1)));
+    assert_eq!(
+        ptr_metadata_model(&thin_to_unit, &Operand::Copy(Place::local(1))),
+        PtrMetadataModel::Unit,
+    );
+    assert!(validate_function(&thin_to_unit).is_ok());
+
+    // A resolved NON-pointer operand stays genuinely malformed: hard rejection.
+    let non_pointer =
+        ptr_metadata_assign_func(Ty::u32(), Ty::usize(), Operand::Copy(Place::local(1)));
+    assert_eq!(
+        ptr_metadata_model(&non_pointer, &Operand::Copy(Place::local(1))),
+        PtrMetadataModel::Invalid,
+    );
+    assert!(matches!(
+        validate_function(&non_pointer),
+        Err(VcgenError::MalformedMir { detail, .. }) if detail.contains("pointer operand")
+    ));
+    assert_malformed_body_fails_closed(&non_pointer);
+}
+
+#[test]
+fn checked_overflow_assert_uses_the_operation_snapshot_not_a_later_operand_write() {
+    let mut func = make_checked_binop_func(BinOp::Add, Ty::u32());
+    func.name = "checked_snapshot".into();
+    func.def_path = "test::checked_snapshot".into();
+    let checked_span = SourceSpan::binary_address(0x5100);
+    let assert_span = SourceSpan::binary_address(0x5200);
+    let Statement::Assign { span, .. } = &mut func.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *span = checked_span;
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(1),
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(123_456_789, 32))),
+        span: SourceSpan::binary_address(0x5101),
+    });
+    func.body.blocks[0].terminator = Terminator::Assert {
+        unwind: UnwindEdge::Unreachable,
+        cond: Operand::Copy(Place::field(0, 1)),
+        expected: false,
+        msg: AssertMessage::Overflow(BinOp::Add),
+        target: BlockId(1),
+        span: assert_span.clone(),
+    };
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(1),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
+
+    let vcs = try_generate_vcs(&func).expect("the non-SSA public body remains structurally valid");
+    let assert_vc = vcs
+        .iter()
+        .find(|vc| {
+            vc.location == assert_span
+                && matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Add, .. })
+        })
+        .unwrap_or_else(|| panic!("the checked Assert must retain its exact row: {vcs:#?}"));
+    let smt = assert_vc.formula.to_smtlib();
+    assert!(
+        !smt.contains("123456789"),
+        "a post-operation write must not rewrite the checked operation snapshot: {smt}"
+    );
+}
+
+fn forged_target_overflow_assert(op: BinOp) -> VerifiableFunction {
+    let assert_span = SourceSpan::binary_address(0x5300 + op as u64);
+    VerifiableFunction {
+        name: format!("forged_target_{op:?}"),
+        def_path: format!("test::forged_target_{op:?}"),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                LocalDecl { index: 1, ty: Ty::Bool, name: Some("guard".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("value".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(1),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Unreachable,
+                        cond: Operand::Copy(Place::local(1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(op),
+                        target: BlockId(1),
+                        span: assert_span,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::BinaryOp(
+                            op,
+                            Operand::Constant(ConstValue::Uint(1, 32)),
+                            Operand::Constant(ConstValue::Uint(1, 32)),
+                        ),
+                        span: SourceSpan::binary_address(0x5400 + op as u64),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn target_operation_never_substitutes_for_a_caller_controlled_assert_condition() {
+    for op in [BinOp::Add, BinOp::Div, BinOp::Rem, BinOp::Shl, BinOp::Shr] {
+        let func = forged_target_overflow_assert(op);
+        let assert_span = SourceSpan::binary_address(0x5300 + op as u64);
+        let vcs = try_generate_vcs(&func).expect("the synthetic assertion is valid public TrustIR");
+        let exact = vcs
+            .iter()
+            .find(|vc| {
+                vc.location == assert_span
+                    && matches!(vc.kind, VcKind::ArithmeticOverflow { op: emitted, .. } if emitted == op)
+            })
+            .unwrap_or_else(|| panic!("Overflow({op:?}) must remain visible: {vcs:#?}"));
+        assert!(
+            exact.formula.to_smtlib().contains("guard"),
+            "Overflow({op:?}) must prove the runtime condition, not the unrelated safe target op: {}",
+            exact.formula.to_smtlib()
+        );
+    }
+}
+
+#[test]
+fn inverse_bounds_assert_proves_its_actual_condition_not_the_usual_success_edge() {
+    let assert_span = SourceSpan::binary_address(0x5500);
+    let func = VerifiableFunction {
+        name: "inverse_bounds".into(),
+        def_path: "test::inverse_bounds".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                LocalDecl { index: 1, ty: Ty::usize(), name: Some("index".into()) },
+                LocalDecl { index: 2, ty: Ty::usize(), name: Some("length".into()) },
+                LocalDecl { index: 3, ty: Ty::Bool, name: Some("in_bounds".into()) },
+                LocalDecl {
+                    index: 4,
+                    ty: Ty::Array { elem: Box::new(Ty::u8()), len: 4 },
+                    name: Some("array".into()),
+                },
+                LocalDecl { index: 5, ty: Ty::u8(), name: Some("element".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Lt,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Unreachable,
+                        cond: Operand::Copy(Place::local(3)),
+                        expected: false,
+                        msg: AssertMessage::BoundsCheck,
+                        target: BlockId(1),
+                        span: assert_span.clone(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(5),
+                        rvalue: Rvalue::Use(Operand::Copy(Place {
+                            local: 4,
+                            projections: vec![Projection::Index(1)],
+                        })),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let vcs = try_generate_vcs(&func).expect("inverse BoundsCheck remains valid public TrustIR");
+    let exact = vcs
+        .iter()
+        .find(|vc| vc.location == assert_span && matches!(vc.kind, VcKind::IndexOutOfBounds))
+        .unwrap_or_else(|| panic!("inverse bounds assertion must remain visible: {vcs:#?}"));
+    let smt = exact.formula.to_smtlib();
+    assert!(
+        smt.contains("in_bounds"),
+        "expected=false must retain the actual Lt condition rather than substituting Ge: {smt}"
+    );
+}
+
+#[test]
+fn bounds_assert_never_rewrites_the_condition_operands_after_the_comparison() {
+    let func = {
+        // Reuse the exact target shape that lets the bounds lane infer the
+        // IndexOutOfBounds kind, then make the normal rustc assertion shape.
+        let assert_span = SourceSpan::binary_address(0x5510);
+        VerifiableFunction {
+            name: "stale_bounds_condition".into(),
+            def_path: "test::stale_bounds_condition".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                    LocalDecl { index: 1, ty: Ty::usize(), name: Some("index".into()) },
+                    LocalDecl { index: 2, ty: Ty::usize(), name: Some("length".into()) },
+                    LocalDecl { index: 3, ty: Ty::Bool, name: Some("in_bounds".into()) },
+                    LocalDecl {
+                        index: 4,
+                        ty: Ty::Array { elem: Box::new(Ty::u8()), len: 4 },
+                        name: Some("array".into()),
+                    },
+                    LocalDecl { index: 5, ty: Ty::u8(), name: Some("element".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![
+                            Statement::Assign {
+                                place: Place::local(3),
+                                rvalue: Rvalue::BinaryOp(
+                                    BinOp::Lt,
+                                    Operand::Copy(Place::local(1)),
+                                    Operand::Copy(Place::local(2)),
+                                ),
+                                span: SourceSpan::default(),
+                            },
+                            // The bool above snapshots the old out-of-bounds
+                            // index. Rewriting the local cannot rewrite that bool.
+                            Statement::Assign {
+                                place: Place::local(1),
+                                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+                                span: SourceSpan::default(),
+                            },
+                        ],
+                        terminator: Terminator::Assert {
+                            unwind: UnwindEdge::Unreachable,
+                            cond: Operand::Copy(Place::local(3)),
+                            expected: true,
+                            msg: AssertMessage::BoundsCheck,
+                            target: BlockId(1),
+                            span: assert_span,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(5),
+                            rvalue: Rvalue::Use(Operand::Copy(Place {
+                                local: 4,
+                                projections: vec![Projection::Index(1)],
+                            })),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    };
+    let assert_span = SourceSpan::binary_address(0x5510);
+    let vcs = try_generate_vcs(&func).expect("the non-SSA public body remains structurally valid");
+    let exact = vcs
+        .iter()
+        .find(|vc| vc.location == assert_span && matches!(vc.kind, VcKind::IndexOutOfBounds))
+        .unwrap_or_else(|| panic!("the stale bounds assertion must remain visible: {vcs:#?}"));
+    assert!(
+        exact.formula.to_smtlib().contains("in_bounds"),
+        "the stale comparison must fall back to the snapshotted boolean, not the rewritten index: {}",
+        exact.formula.to_smtlib()
+    );
+}
+
+#[test]
+fn bounds_assert_snapshot_survives_a_later_write_through_mutable_alias() {
+    use trust_router::{InProcessAyBackend, VerificationBackend};
+
+    let assert_span = SourceSpan::binary_address(0x5511);
+    let mut_ref_usize = Ty::Ref { mutable: true, inner: Box::new(Ty::usize()) };
+    let func = VerifiableFunction {
+        name: "aliased_stale_bounds_condition".into(),
+        def_path: "test::aliased_stale_bounds_condition".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                LocalDecl { index: 1, ty: Ty::usize(), name: Some("index".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: Some("in_bounds".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::Array { elem: Box::new(Ty::u8()), len: 4 },
+                    name: Some("array".into()),
+                },
+                LocalDecl { index: 4, ty: Ty::u8(), name: Some("element".into()) },
+                LocalDecl { index: 5, ty: mut_ref_usize, name: Some("index_ref".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Lt,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(1, 64)),
+                            ),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(5),
+                            rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
+                            span: SourceSpan::default(),
+                        },
+                        // The comparison snapshotted the old `index`; this
+                        // canonical alias write changes only its later value.
+                        Statement::Assign {
+                            place: Place { local: 5, projections: vec![Projection::Deref] },
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Unreachable,
+                        cond: Operand::Copy(Place::local(2)),
+                        expected: true,
+                        msg: AssertMessage::BoundsCheck,
+                        target: BlockId(1),
+                        span: assert_span.clone(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(4),
+                        rvalue: Rvalue::Use(Operand::Copy(Place {
+                            local: 3,
+                            projections: vec![Projection::Index(1)],
+                        })),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let vcs = try_generate_vcs(&func).expect("the alias-write fixture is valid public TrustIR");
+    let exact = vcs
+        .iter()
+        .find(|vc| vc.location == assert_span && matches!(vc.kind, VcKind::IndexOutOfBounds))
+        .unwrap_or_else(|| panic!("the stale bounds assertion must remain visible: {vcs:#?}"));
+    assert!(
+        exact.formula.to_smtlib().contains("in_bounds"),
+        "the VC must retain the snapshotted Bool instead of the terminal index: {}",
+        exact.formula.to_smtlib()
+    );
+    let backend = InProcessAyBackend::new();
+    assert!(backend.can_handle(exact));
+    assert!(
+        matches!(backend.verify(exact), VerificationResult::Failed { .. }),
+        "an input whose old index is out of bounds must refute the assertion even though the alias later writes zero"
+    );
+}
+
+#[test]
+fn division_static_truth_fold_refuses_a_later_mutable_alias_write() {
+    use trust_router::{InProcessAyBackend, VerificationBackend};
+
+    let assert_span = SourceSpan::binary_address(0x5512);
+    let func = VerifiableFunction {
+        name: "aliased_static_division_condition".into(),
+        def_path: "test::aliased_static_division_condition".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                LocalDecl { index: 1, ty: Ty::Bool, name: Some("is_zero".into()) },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(Ty::Bool) },
+                    name: Some("is_zero_ref".into()),
+                },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(1),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Constant(ConstValue::Uint(2, 32)),
+                                Operand::Constant(ConstValue::Uint(0, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place { local: 2, projections: vec![Projection::Deref] },
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Unreachable,
+                        cond: Operand::Copy(Place::local(1)),
+                        expected: false,
+                        msg: AssertMessage::DivisionByZero,
+                        target: BlockId(1),
+                        span: assert_span.clone(),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let vcs = try_generate_vcs(&func).expect("the mutable-alias fixture is valid public TrustIR");
+    let exact = vcs
+        .iter()
+        .find(|vc| vc.location == assert_span && matches!(vc.kind, VcKind::DivisionByZero))
+        .unwrap_or_else(|| panic!("the stale shared fold must retain the assertion: {vcs:#?}"));
+    let backend = InProcessAyBackend::new();
+    assert!(backend.can_handle(exact));
+    assert!(
+        matches!(backend.verify(exact), VerificationResult::Failed { .. }),
+        "the alias changes the snapshotted condition to the failure value, so the retained row must refute"
+    );
+}
+
+#[test]
+fn checked_overflow_flag_alias_write_cannot_reuse_the_old_safe_operation() {
+    use trust_router::{InProcessAyBackend, VerificationBackend};
+
+    let assert_span = SourceSpan::binary_address(0x5513);
+    let tuple_ty = Ty::Tuple(vec![Ty::i128(), Ty::Bool]);
+    let func = VerifiableFunction {
+        name: "aliased_checked_overflow_flag".into(),
+        def_path: "test::aliased_checked_overflow_flag".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                LocalDecl { index: 1, ty: tuple_ty, name: Some("checked".into()) },
+                LocalDecl {
+                    index: 2,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(Ty::Bool) },
+                    name: Some("flag_ref".into()),
+                },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(1),
+                            rvalue: Rvalue::CheckedBinaryOp(
+                                BinOp::Add,
+                                Operand::Constant(ConstValue::Int(0)),
+                                Operand::Constant(ConstValue::Int(0)),
+                            ),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::Ref { mutable: true, place: Place::field(1, 1) },
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place { local: 2, projections: vec![Projection::Deref] },
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Unreachable,
+                        cond: Operand::Copy(Place::field(1, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(1),
+                        span: assert_span.clone(),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let vcs =
+        try_generate_vcs(&func).expect("the checked-flag alias fixture is valid public TrustIR");
+    let exact = vcs
+        .iter()
+        .find(|vc| vc.location == assert_span)
+        .unwrap_or_else(|| panic!("the forged overflow assertion must fail closed: {vcs:#?}"));
+    assert!(
+        matches!(
+            exact.kind,
+            VcKind::UnsupportedMir { .. } | VcKind::ArithmeticOverflow { op: BinOp::Add, .. }
+        ),
+        "the retained row must be the exact assertion or an explicit proof gap: {:?}",
+        exact.kind
+    );
+    let backend = InProcessAyBackend::new();
+    assert!(backend.can_handle(exact));
+    assert!(
+        matches!(backend.verify(exact), VerificationResult::Failed { .. }),
+        "forcing the checked flag true must never reuse the old zero-plus-zero proof"
+    );
+
+    let hardened = crate::hardened::generate_hardened_vcs_for_profile(&func);
+    let boundary = hardened
+        .iter()
+        .find(|vc| {
+            vc.location == assert_span
+                && matches!(
+                    vc.kind,
+                    VcKind::HardenedBoundary {
+                        category: trust_types::HardenedVcCategory::PanicBoundary,
+                        ..
+                    }
+                )
+        })
+        .unwrap_or_else(|| panic!("the hardened panic boundary must remain: {hardened:#?}"));
+    assert!(backend.can_handle(boundary));
+    assert!(
+        matches!(backend.verify(boundary), VerificationResult::Failed { .. }),
+        "the hardened lane must also refuse the stale checked-operation specialization"
+    );
+}
+
+#[test]
+fn negation_assert_never_rewrites_the_condition_operand_after_the_comparison() {
+    let assert_span = SourceSpan::binary_address(0x5520);
+    let func = VerifiableFunction {
+        name: "stale_neg_condition".into(),
+        def_path: "test::stale_neg_condition".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                LocalDecl { index: 1, ty: Ty::i128(), name: Some("value".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: Some("is_min".into()) },
+                LocalDecl { index: 3, ty: Ty::i128(), name: Some("negated".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Int(i128::MIN)),
+                            ),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(1),
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(0))),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        unwind: UnwindEdge::Unreachable,
+                        cond: Operand::Copy(Place::local(2)),
+                        expected: false,
+                        msg: AssertMessage::OverflowNeg,
+                        target: BlockId(1),
+                        span: assert_span,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::UnaryOp(UnOp::Neg, Operand::Copy(Place::local(1))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let vcs = try_generate_vcs(&func).expect("the non-SSA public body remains structurally valid");
+    assert!(
+        vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+            if kind.contains("RecognizedSafetyAssertProofGap(OverflowNeg)"))),
+        "a stale negation comparison must fail closed instead of proving the rewritten operand: {vcs:#?}"
+    );
+}
+
+#[test]
+fn public_coroutine_sentinel_messages_never_erase_a_panicking_assert() {
+    for msg in [
+        AssertMessage::ResumedAfterReturn,
+        AssertMessage::ResumedAfterPanic,
+        AssertMessage::ResumedAfterDrop,
+    ] {
+        let mut func = forged_target_overflow_assert(BinOp::Add);
+        func.body.blocks[0].terminator = Terminator::Assert {
+            unwind: UnwindEdge::Unreachable,
+            cond: Operand::Copy(Place::local(1)),
+            expected: false,
+            msg: msg.clone(),
+            target: BlockId(1),
+            span: SourceSpan::binary_address(0x5600),
+        };
+        let vcs = try_generate_vcs(&func).expect("public sentinel fixture must validate");
+        assert!(
+            vcs.iter().any(|vc| {
+                matches!(&vc.kind, VcKind::Assertion { message }
+                if message.contains("public coroutine protocol assert"))
+                    && vc.formula.to_smtlib().contains("guard")
+            }),
+            "{msg:?} must preserve the exact always-panicking assertion: {vcs:#?}"
+        );
+    }
+}
+
+#[test]
+fn signed_remainder_by_minus_one_keeps_its_min_overflow_row() {
+    for ty in [Ty::i8(), Ty::i64()] {
+        let mut func = make_binop_func(BinOp::Rem, ty.clone());
+        let Statement::Assign { rvalue, .. } = &mut func.body.blocks[0].stmts[0] else {
+            unreachable!();
+        };
+        *rvalue = Rvalue::BinaryOp(
+            BinOp::Rem,
+            Operand::Copy(Place::local(1)),
+            Operand::Constant(ConstValue::Int(-1)),
+        );
+        let vcs = try_generate_vcs(&func).expect("signed remainder carrier must validate");
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::ArithmeticOverflow { op: BinOp::Rem, operand_tys }
+                    if operand_tys.0 == ty && operand_tys.1.is_signed()
+            )),
+            "MIN % -1 overflow must remain explicit for {ty:?}: {vcs:#?}"
+        );
+        assert!(
+            vcs.iter().all(|vc| !matches!(vc.kind, VcKind::RemainderByZero)),
+            "a known -1 divisor needs no zero row"
+        );
+    }
+}
+
+#[test]
+fn predecessor_checked_guard_never_suppresses_successor_unchecked_overflow() {
+    let mut func = make_unchecked_binop_func(BinOp::Mul, Operand::Copy(Place::local(1)));
+    func.name = "checked_then_unchecked".into();
+    func.def_path = "test::checked_then_unchecked".into();
+    func.body.locals.push(LocalDecl { index: 3, ty: Ty::Bool, name: Some("guard".into()) });
+    let unchecked = func.body.blocks.remove(0);
+    func.body.blocks = vec![
+        BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(false))),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Assert {
+                unwind: UnwindEdge::Unreachable,
+                cond: Operand::Copy(Place::local(3)),
+                expected: false,
+                msg: AssertMessage::Overflow(BinOp::Shl),
+                target: BlockId(1),
+                span: SourceSpan::default(),
+            },
+        },
+        BasicBlock { id: BlockId(1), ..unchecked },
+    ];
+
+    assert!(
+        crate::generate::v2_overflow_guard_targets(&func).contains(&BlockId(1)),
+        "the predecessor must exercise a safety-assert kind that records bb1 as an overflow-guard target"
+    );
+    let vcs = try_generate_vcs(&func).expect("the checked-to-unchecked body must validate");
+    let unchecked_mul = vcs
+        .iter()
+        .filter(|vc| matches!(vc.kind, VcKind::UncheckedArithmeticOverflow { op: BinOp::Mul, .. }))
+        .count();
+    assert_eq!(
+        unchecked_mul, 1,
+        "a predecessor's checked-overflow success edge cannot guard an unrelated unchecked op: {vcs:#?}"
+    );
+}
+
+#[test]
+fn predecessor_checked_guard_never_suppresses_successor_plain_overflow() {
+    let mut func = make_unchecked_binop_func(BinOp::Mul, Operand::Copy(Place::local(1)));
+    func.name = "checked_then_plain".into();
+    func.def_path = "test::checked_then_plain".into();
+    func.body.locals.push(LocalDecl { index: 3, ty: Ty::Bool, name: Some("guard".into()) });
+    let mut plain = func.body.blocks.remove(0);
+    let Statement::Assign { rvalue, .. } = &mut plain.stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::BinaryOp(
+        BinOp::Mul,
+        Operand::Copy(Place::local(1)),
+        Operand::Copy(Place::local(2)),
+    );
+    func.body.blocks = vec![
+        BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(false))),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Assert {
+                unwind: UnwindEdge::Unreachable,
+                cond: Operand::Copy(Place::local(3)),
+                expected: false,
+                msg: AssertMessage::Overflow(BinOp::Shl),
+                target: BlockId(1),
+                span: SourceSpan::default(),
+            },
+        },
+        BasicBlock { id: BlockId(1), ..plain },
+    ];
+
+    assert!(crate::generate::v2_overflow_guard_targets(&func).contains(&BlockId(1)));
+    let vcs = try_generate_vcs(&func).expect("the checked-to-plain body must validate");
+    assert_eq!(
+        vcs.iter()
+            .filter(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. }))
+            .count(),
+        1,
+        "an unrelated predecessor assert cannot suppress an ordinary Mul row: {vcs:#?}"
+    );
+}
+
+#[test]
+fn unchecked_binary_op_rejects_non_integer_mismatched_and_ambiguous_types() {
+    let raw = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+    let cases = [
+        ("float", Ty::Float { width: 32 }, Ty::Float { width: 32 }, Ty::Float { width: 32 }),
+        ("bool", Ty::Bool, Ty::Bool, Ty::Bool),
+        ("pointer", raw.clone(), raw.clone(), raw),
+        ("width mismatch", Ty::u8(), Ty::u8(), Ty::u32()),
+        ("signedness mismatch", Ty::u8(), Ty::i8(), Ty::u8()),
+        (
+            "non-Rust width",
+            Ty::Int { width: 7, signed: false },
+            Ty::Int { width: 7, signed: false },
+            Ty::Int { width: 7, signed: false },
+        ),
+    ];
+
+    for (label, dest, lhs, rhs) in cases {
+        let mut func = make_unchecked_binop_func(BinOp::Add, Operand::Copy(Place::local(1)));
+        set_unchecked_scalar_types(&mut func, dest, lhs, rhs);
+        assert!(
+            matches!(
+                validate_function(&func),
+                Err(VcgenError::MalformedMir { detail, .. })
+                    if detail.contains("UncheckedBinaryOp")
+                        && detail.contains("fixed-width integer")
+            ),
+            "{label} must fail the unchecked carrier's integer-type admission"
+        );
+        assert_malformed_body_fails_closed(&func);
+    }
+
+    let mut symbolic = make_unchecked_binop_func(BinOp::Add, Operand::Symbolic(Formula::Int(1)));
+    set_unchecked_scalar_types(&mut symbolic, Ty::i64(), Ty::i64(), Ty::i64());
+    assert!(
+        matches!(
+            validate_function(&symbolic),
+            Err(VcgenError::MalformedMir { detail, .. })
+                if detail.contains("UncheckedBinaryOp lhs")
+        ),
+        "a formula sort is not a serialized Rust signed-width identity"
+    );
+    assert_malformed_body_fails_closed(&symbolic);
+}
+
+#[test]
+fn unchecked_binary_op_binds_constants_to_the_destination_integer_type() {
+    let cases = [
+        (
+            "signed i8 bounds",
+            Ty::i8(),
+            Operand::Constant(ConstValue::Int(-128)),
+            Operand::Constant(ConstValue::Int(127)),
+        ),
+        (
+            "unsigned u8 bounds",
+            Ty::u8(),
+            Operand::Constant(ConstValue::Uint(255, 8)),
+            Operand::Constant(ConstValue::Uint(0, 8)),
+        ),
+    ];
+
+    for (label, ty, lhs, rhs) in cases {
+        let mut func = make_unchecked_binop_func(BinOp::Add, lhs.clone());
+        set_unchecked_scalar_types(&mut func, ty.clone(), ty.clone(), ty.clone());
+        let Statement::Assign { rvalue, .. } = &mut func.body.blocks[0].stmts[0] else {
+            unreachable!();
+        };
+        *rvalue = Rvalue::UncheckedBinaryOp(BinOp::Add, lhs, rhs);
+
+        validate_function(&func).unwrap_or_else(|err| panic!("{label} must validate: {err}"));
+        let vcs = try_generate_vcs(&func).expect("valid narrow constants must generate VCs");
+        // Trust: the UB-bearing spelling has its OWN kind (2026-08-24). This test
+        // drives `Rvalue::UncheckedBinaryOp`, and `UncheckedBinaryOp` modelling gave
+        // that form `VcKind::UncheckedArithmeticOverflow` rather than the plain
+        // `ArithmeticOverflow` it used to share. The property under test — that the
+        // row's `operand_tys` come from the DESTINATION integer type and that the
+        // arithmetic seed survives — is unchanged; only the kind it lives under moved.
+        let exact = vcs
+            .iter()
+            .find(|vc| {
+                matches!(vc.kind, VcKind::UncheckedArithmeticOverflow { op: BinOp::Add, .. })
+            })
+            .unwrap_or_else(|| panic!("{label} must retain its overflow row: {vcs:#?}"));
+        let VcKind::UncheckedArithmeticOverflow { operand_tys, .. } = &exact.kind else {
+            unreachable!();
+        };
+        assert_eq!(operand_tys, &(ty.clone(), ty), "{label} must use destination width");
+        assert!(exact.obligation.is_some(), "{label} must retain its arithmetic seed");
+    }
+
+    for (label, ty, constant) in [
+        ("signed high", Ty::i8(), ConstValue::Int(128)),
+        ("signed low", Ty::i8(), ConstValue::Int(-129)),
+        ("unsigned encoded width", Ty::u8(), ConstValue::Uint(255, 16)),
+        ("unsigned out of range", Ty::u8(), ConstValue::Uint(256, 8)),
+    ] {
+        let mut func = make_unchecked_binop_func(BinOp::Add, Operand::Constant(constant));
+        set_unchecked_scalar_types(&mut func, ty.clone(), ty.clone(), ty);
+        assert!(
+            matches!(
+                validate_function(&func),
+                Err(VcgenError::MalformedMir { detail, .. })
+                    if detail.contains("UncheckedBinaryOp lhs")
+            ),
+            "{label} must fail constant/type admission"
+        );
+        assert_malformed_body_fails_closed(&func);
+    }
+}
+
+#[test]
+fn unchecked_i128_mul_fail_closed_row_names_its_actual_carrier() {
+    let mut func = make_unchecked_binop_func(BinOp::Mul, Operand::Copy(Place::local(1)));
+    set_unchecked_scalar_types(&mut func, Ty::i128(), Ty::i128(), Ty::i128());
+    let vcs = try_generate_vcs(&func).expect("validated i128 unchecked Mul must generate");
+    assert!(
+        vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == "Rvalue::UncheckedBinaryOp"
+                    && detail.contains("signed 128-bit Mul overflow is nonlinear")
+        )),
+        "the nonlinear unchecked Mul must fail closed under its own carrier identity: {vcs:#?}"
+    );
+}
+
+#[test]
+fn unchecked_binary_op_rejects_every_non_arithmetic_spelling_before_generation() {
+    for op in [
+        BinOp::Div,
+        BinOp::Rem,
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+        BinOp::BitAnd,
+        BinOp::BitOr,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+        BinOp::Cmp,
+    ] {
+        let func = make_unchecked_binop_func(op, Operand::Copy(Place::local(1)));
+        assert!(
+            matches!(
+                validate_function(&func),
+                Err(VcgenError::MalformedMir { detail, .. })
+                    if detail.contains(&format!("UncheckedBinaryOp({op:?})"))
+                        && detail.contains("only Add, Sub, and Mul")
+            ),
+            "a forged UncheckedBinaryOp({op:?}) must fail structural admission"
+        );
+        assert_malformed_body_fails_closed(&func);
+    }
+}
+
+#[test]
+fn unchecked_binary_op_traverses_unsupported_operands_fail_closed() {
+    let func = make_unchecked_binop_func(
+        BinOp::Add,
+        Operand::Unsupported {
+            kind: "Operand::UncheckedArithmeticOpaque".into(),
+            detail: "unchecked arithmetic operand has no modeled value".into(),
+        },
+    );
+    assert!(
+        validate_function(&func).is_ok(),
+        "an explicit unsupported operand is a valid fail-closed carrier, not malformed MIR"
+    );
+
+    let vcs = try_generate_vcs(&func).expect("the admitted carrier must reach VC generation");
+    assert!(
+        vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == "Operand::UncheckedArithmeticOpaque"
+                    && detail.contains("unchecked arithmetic operand has no modeled value")
+        )),
+        "the unsupported operand inside UncheckedBinaryOp must remain visible: {vcs:#?}"
+    );
+    assert!(
+        vcs.iter().all(|vc| !matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+        )),
+        "unsupported operands use their exact marker rather than collapsing the body: {vcs:#?}"
+    );
+
+    let (solver_vcs, preclassified) = generate_vcs_with_discharge(&func);
+    assert!(
+        solver_vcs.iter().all(|vc| !matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+        "unsupported operands must never reach solver dispatch"
+    );
+    assert!(preclassified.iter().any(|(vc, result)| {
+        matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, .. }
+                if kind == "Operand::UncheckedArithmeticOpaque"
+        ) && matches!(result, VerificationResult::Unknown { .. })
+    }));
+}
+
+#[test]
+fn unchecked_binary_op_rejects_projected_operand_reads_at_admission() {
+    let projected = Place { local: 1, projections: vec![Projection::Index(3)] };
+    let mut func = make_unchecked_binop_func(BinOp::Add, Operand::Copy(projected));
+    func.body.locals[1].ty = Ty::Array { elem: Box::new(Ty::u32()), len: 4 };
+    func.body.locals.push(LocalDecl { index: 3, ty: Ty::usize(), name: Some("index".into()) });
+
+    assert!(
+        matches!(
+            validate_function(&func),
+            Err(VcgenError::MalformedMir { detail, .. })
+                if detail.contains("UncheckedBinaryOp lhs")
+        ),
+        "a newly admitted unchecked carrier is deliberately restricted to whole-local reads"
+    );
+    assert_malformed_body_fails_closed(&func);
+}
+
+#[test]
+fn identityless_opaque_arithmetic_never_acquires_an_overflow_proof() {
+    let opaque = Operand::Constant(ConstValue::OpaqueScalar { width: 8, signed: true });
+
+    let mut plain = make_binop_func(BinOp::Sub, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut plain.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::BinaryOp(BinOp::Sub, opaque.clone(), opaque.clone());
+    let vcs = try_generate_vcs(&plain).expect("plain opaque arithmetic is structurally valid");
+    assert!(
+        vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == "IntegerArithmeticOpaqueScalar"
+                    && detail.contains("cannot distinguish identity-less OpaqueScalar")
+        )),
+        "identity-less operands must produce an explicit fail-closed row: {vcs:#?}"
+    );
+    assert!(
+        vcs.iter().all(|vc| !matches!(vc.kind, VcKind::ArithmeticOverflow { .. })),
+        "aliasing the two opaque occurrences must never manufacture an overflow proof row"
+    );
+    let (solver_vcs, preclassified) = generate_vcs_with_discharge(&plain);
+    assert!(solver_vcs.is_empty());
+    assert!(preclassified.iter().any(|(vc, result)| {
+        matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, .. } if kind == "IntegerArithmeticOpaqueScalar"
+        ) && matches!(result, VerificationResult::Unknown { .. })
+    }));
+
+    let mut unchecked = make_unchecked_binop_func(BinOp::Sub, opaque.clone());
+    set_unchecked_scalar_types(&mut unchecked, Ty::i8(), Ty::i8(), Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut unchecked.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::UncheckedBinaryOp(BinOp::Sub, opaque.clone(), opaque);
+    assert!(
+        matches!(
+            validate_function(&unchecked),
+            Err(VcgenError::MalformedMir { detail, .. })
+                if detail.contains("UncheckedBinaryOp lhs")
+        ),
+        "unchecked arithmetic rejects identity-less operands before formula construction"
+    );
+    assert_malformed_body_fails_closed(&unchecked);
+}
+
+#[test]
+fn identityless_opaque_scalar_fails_closed_at_every_public_operand_boundary() {
+    let opaque = Operand::Constant(ConstValue::OpaqueScalar { width: 8, signed: true });
+
+    for op in [BinOp::Div, BinOp::Rem] {
+        let result_ty = if op == BinOp::Eq { Ty::Bool } else { Ty::i8() };
+        let mut func = make_binop_func(op, Ty::i8());
+        func.body.locals[0].ty = result_ty.clone();
+        func.body.return_ty = result_ty;
+        let Statement::Assign { rvalue, .. } = &mut func.body.blocks[0].stmts[0] else {
+            unreachable!();
+        };
+        *rvalue = Rvalue::BinaryOp(op, opaque.clone(), opaque.clone());
+        let vcs =
+            try_generate_vcs(&func).expect("opaque public operands remain structurally valid");
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, detail }
+                    if kind == "ConstValue::OpaqueScalar"
+                        && detail.contains("identity-less opaque")
+            )),
+            "{op:?} must retain the common identity-less-operand refusal: {vcs:#?}"
+        );
+        let (_, preclassified) = generate_vcs_with_discharge(&func);
+        assert!(preclassified.iter().any(|(vc, result)| {
+            matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, .. } if kind == "ConstValue::OpaqueScalar"
+            ) && matches!(result, VerificationResult::Unknown { .. })
+        }));
+    }
+
+    // Comparisons can establish their input type from one typed operand.  The
+    // other, identity-less occurrence is then admitted only to reach the
+    // common explicit UnsupportedMir refusal.
+    let mut compared = make_binop_func(BinOp::Eq, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut compared.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(1)), opaque.clone());
+    assert!(try_generate_vcs(&compared).unwrap().iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "ConstValue::OpaqueScalar"
+    )));
+
+    // Shift RHS types are independent of the destination and therefore must
+    // self-authenticate. An opaque constant cannot supply that Rust type.
+    let mut shifted = make_binop_func(BinOp::Shl, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut shifted.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::BinaryOp(BinOp::Shl, Operand::Copy(Place::local(1)), opaque.clone());
+    assert!(matches!(
+        validate_function(&shifted),
+        Err(VcgenError::MalformedMir { detail, .. }) if detail.contains("BinaryOp(Shl)")
+    ));
+    assert_malformed_body_fails_closed(&shifted);
+
+    let mut unary = make_binop_func(BinOp::Add, Ty::i8());
+    let Statement::Assign { rvalue, .. } = &mut unary.body.blocks[0].stmts[0] else {
+        unreachable!();
+    };
+    *rvalue = Rvalue::UnaryOp(UnOp::Neg, opaque.clone());
+    assert!(try_generate_vcs(&unary).unwrap().iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "ConstValue::OpaqueScalar"
+    )));
+
+    let mut switched = make_binop_func(BinOp::Add, Ty::i8());
+    switched.body.blocks.push(BasicBlock {
+        id: BlockId(1),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
+    switched.body.blocks[0].terminator = Terminator::SwitchInt {
+        discr: opaque.clone(),
+        targets: vec![(0, BlockId(1))],
+        otherwise: BlockId(1),
+        exhaustive_enum_unreachable: false,
+        span: SourceSpan::default(),
+    };
+    assert!(try_generate_vcs(&switched).unwrap().iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "ConstValue::OpaqueScalar"
+    )));
+
+    let mut called = make_binop_func(BinOp::Add, Ty::i8());
+    called.body.blocks.push(BasicBlock {
+        id: BlockId(1),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
+    called.body.blocks[0].terminator = Terminator::Call {
+        func: "test::opaque_consumer".into(),
+        args: vec![opaque],
+        dest: Place::local(0),
+        target: Some(BlockId(1)),
+        span: SourceSpan::default(),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        unwind: UnwindEdge::Unreachable,
+    };
+    assert!(try_generate_vcs(&called).unwrap().iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "ConstValue::OpaqueScalar"
+    )));
+}
+
+#[test]
+fn unwind_resume_is_a_modeled_sink_not_an_unreachable_assertion() {
+    let mut func = VerifiableFunction {
+        name: "resume_sink".into(),
+        def_path: "test::resume_sink".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Resume,
+            }],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let resume_vcs = try_generate_vcs(&func).expect("UnwindResume is valid modeled Trust MIR");
+    assert!(
+        resume_vcs
+            .iter()
+            .all(|vc| !matches!(vc.kind, VcKind::Unreachable | VcKind::UnsupportedMir { .. })),
+        "a re-raise sink must add neither an unreachable assertion nor an unsupported row: {resume_vcs:#?}"
+    );
+
+    func.body.blocks[0].terminator = Terminator::Unreachable;
+    let unreachable_vcs =
+        try_generate_vcs(&func).expect("the Unreachable mutation is also structurally valid");
+    assert_eq!(
+        unreachable_vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Unreachable)).count(),
+        1,
+        "the exact Unreachable mutation must mint one reachability obligation: {unreachable_vcs:#?}"
+    );
 }
 
 // The canonical pipeline emits direct safety VCs for operations callers still
@@ -3516,6 +5473,19 @@ fn test_vc_coverage_rem_no_remzero_vc() {
     assert!(
         vcs.iter().any(|vc| matches!(vc.kind, VcKind::RemainderByZero)),
         "Rem(_, var) must emit RemainderByZero VC"
+    );
+}
+
+#[test]
+fn float_remainder_by_zero_is_defined_and_emits_no_integer_panic_row() {
+    let func = make_binop_func(BinOp::Rem, Ty::Float { width: 32 });
+    let vcs = generate_vcs(&func);
+    assert!(
+        vcs.iter().all(|vc| !matches!(
+            vc.kind,
+            VcKind::RemainderByZero | VcKind::ArithmeticOverflow { op: BinOp::Rem, .. }
+        )),
+        "IEEE float remainder by zero produces NaN rather than a Rust integer panic: {vcs:#?}"
     );
 }
 
@@ -4200,6 +6170,7 @@ fn test_float_overflow_safe_path_generates_guarded_obligation() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -4234,6 +6205,7 @@ fn test_float_overflow_safe_path_generates_guarded_obligation() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -4422,6 +6394,7 @@ fn test_float_overflow_join_does_not_use_first_path_guard_shortcut() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -4456,6 +6429,7 @@ fn test_float_overflow_join_does_not_use_first_path_guard_shortcut() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -4567,6 +6541,7 @@ fn test_begin_panic_call_generates_guarded_assertion_vc() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::rt::begin_panic::<&str>".to_string(),
                         args: vec![],
@@ -4664,6 +6639,7 @@ fn contract_panic_fixture(def_path: &str, msg: Option<&str>) -> VerifiableFuncti
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::panicking::panic_fmt".to_string(),
                         args,
@@ -4695,58 +6671,95 @@ fn contract_panic_fixture(def_path: &str, msg: Option<&str>) -> VerifiableFuncti
 }
 
 #[test]
+fn stdlib_subject_crate_names_match_the_span_exemption_roots() {
+    for name in [
+        "core",
+        "alloc",
+        "std",
+        "proc_macro",
+        "test",
+        "panic_abort",
+        "panic_unwind",
+        "std_detect",
+        "unwind",
+    ] {
+        assert!(is_stdlib_crate_name(name), "missing stdlib subject root: {name}");
+    }
+    for name in ["", "mycrate", "core2", "testing", "compiler_builtins"] {
+        assert!(!is_stdlib_crate_name(name), "non-stdlib crate classified as subject: {name}");
+    }
+}
+
+#[test]
 fn nested_query_forcing_restores_false_caller_after_true_callee() {
     let caller = VcgenContext::for_function("test::caller");
-    let callee =
-        VcgenContext::for_function("test::callee").with_single_writer(true).with_backing(true);
+    let callee = VcgenContext::for_function("test::callee")
+        .with_single_writer(true)
+        .with_backing(true)
+        .with_stdlib_subject_memory_safety(true);
 
     with_vcgen_context(&caller, || {
         assert!(!single_writer_hint_for("test::caller"));
         assert!(!backing_hint_for("test::caller"));
+        assert!(!verify_stdlib_subject_memory_safety_for("test::caller"));
         with_vcgen_context(&callee, || {
             assert!(single_writer_hint_for("test::callee"));
             assert!(backing_hint_for("test::callee"));
+            assert!(verify_stdlib_subject_memory_safety_for("test::callee"));
             assert!(!single_writer_hint_for("test::caller"));
             assert!(!backing_hint_for("test::caller"));
+            assert!(!verify_stdlib_subject_memory_safety_for("test::caller"));
         });
         assert!(!single_writer_hint_for("test::caller"));
         assert!(!backing_hint_for("test::caller"));
+        assert!(!verify_stdlib_subject_memory_safety_for("test::caller"));
     });
 
     assert!(!single_writer_hint_for("test::caller"));
     assert!(!backing_hint_for("test::caller"));
+    assert!(!verify_stdlib_subject_memory_safety_for("test::caller"));
 }
 
 #[test]
 fn nested_query_forcing_restores_true_caller_after_false_callee() {
-    let caller =
-        VcgenContext::for_function("test::caller").with_single_writer(true).with_backing(true);
+    let caller = VcgenContext::for_function("test::caller")
+        .with_single_writer(true)
+        .with_backing(true)
+        .with_stdlib_subject_memory_safety(true);
     let callee = VcgenContext::for_function("test::callee");
 
     with_vcgen_context(&caller, || {
         assert!(single_writer_hint_for("test::caller"));
         assert!(backing_hint_for("test::caller"));
+        assert!(verify_stdlib_subject_memory_safety_for("test::caller"));
         with_vcgen_context(&callee, || {
             assert!(!single_writer_hint_for("test::callee"));
             assert!(!backing_hint_for("test::callee"));
+            assert!(!verify_stdlib_subject_memory_safety_for("test::callee"));
             assert!(!single_writer_hint_for("test::caller"));
             assert!(!backing_hint_for("test::caller"));
+            assert!(!verify_stdlib_subject_memory_safety_for("test::caller"));
         });
         assert!(single_writer_hint_for("test::caller"));
         assert!(backing_hint_for("test::caller"));
+        assert!(verify_stdlib_subject_memory_safety_for("test::caller"));
     });
 }
 
 #[test]
-fn vcgen_context_rejects_single_writer_and_backing_owner_mismatch() {
-    let context =
-        VcgenContext::for_function("test::owner").with_single_writer(true).with_backing(true);
+fn vcgen_context_rejects_function_policy_owner_mismatch() {
+    let context = VcgenContext::for_function("test::owner")
+        .with_single_writer(true)
+        .with_backing(true)
+        .with_stdlib_subject_memory_safety(true);
 
     with_vcgen_context(&context, || {
         assert!(single_writer_hint_for("test::owner"));
         assert!(backing_hint_for("test::owner"));
+        assert!(verify_stdlib_subject_memory_safety_for("test::owner"));
         assert!(!single_writer_hint_for("test::different_function"));
         assert!(!backing_hint_for("test::different_function"));
+        assert!(!verify_stdlib_subject_memory_safety_for("test::different_function"));
     });
 }
 
@@ -4781,6 +6794,7 @@ fn vcgen_context_restores_after_unwind() {
     let context = VcgenContext::for_function("test::panics")
         .with_single_writer(true)
         .with_backing(true)
+        .with_stdlib_subject_memory_safety(true)
         .with_contract_panic_annotations(vec!["payload".into()]);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         with_vcgen_context(&context, || panic!("synthetic nested query panic"));
@@ -4788,6 +6802,7 @@ fn vcgen_context_restores_after_unwind() {
     assert!(result.is_err());
     assert!(!single_writer_hint_for("test::panics"));
     assert!(!backing_hint_for("test::panics"));
+    assert!(!verify_stdlib_subject_memory_safety_for("test::panics"));
     assert!(contract_panic_annotations_for("test::panics").is_empty());
 }
 
@@ -5150,6 +7165,7 @@ fn contract_panic_inlined_panic_fmt_arguments_from_str_counts_as_used_and_stamps
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::fmt::Arguments::<'a>::from_str".to_string(),
                         args: vec![Operand::Constant(ConstValue::Str {
@@ -5167,6 +7183,7 @@ fn contract_panic_inlined_panic_fmt_arguments_from_str_counts_as_used_and_stamps
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::rt::panic_fmt".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -5280,6 +7297,7 @@ fn contract_panic_formatted_fixture(def_path: &str, template: &[u8]) -> Verifiab
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::fmt::Arguments::<'_>::new::<10, 1>".to_string(),
                         args: vec![Operand::Move(Place::local(5)), Operand::Copy(Place::local(6))],
@@ -5295,6 +7313,7 @@ fn contract_panic_formatted_fixture(def_path: &str, template: &[u8]) -> Verifiab
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::panicking::panic_fmt".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -5466,6 +7485,7 @@ fn float_clamp_weighted_sum_fixture(
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: clamp_callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1)), lo, hi],
@@ -5669,6 +7689,7 @@ fn test_unreachable_display_call_generates_guarded_unreachable_vc() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::panicking::unreachable_display::<&str>".to_string(),
                         args: vec![],
@@ -5908,6 +7929,28 @@ fn partial_enum_match_unreachable_vc_stays_sat_without_full_coverage() {
     );
 }
 
+#[test]
+fn forged_exhaustive_enum_hint_never_erases_a_reachable_unreachable_vc() {
+    let mut func = enum_discriminant_match_function(&[0], &[0, 1, 2]);
+    let Terminator::SwitchInt { exhaustive_enum_unreachable, .. } =
+        &mut func.body.blocks[0].terminator
+    else {
+        unreachable!("fixture begins with a SwitchInt")
+    };
+    *exhaustive_enum_unreachable = true;
+
+    let vcs = generate_vcs(&func);
+    let unreach = vcs
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::Unreachable))
+        .expect("caller-constructible exhaustive hint cannot suppress the public Unreachable row");
+    assert!(
+        discriminant_vc_is_sat(&unreach.formula),
+        "uncovered valid tags keep the forged-hint default reachable: {:?}",
+        unreach.formula
+    );
+}
+
 /// Models a *nested* enum match (`match o { Some(Ok(x)) ... }` over
 /// `Option<Result<_, _>>`): an outer `SwitchInt` on `_3` whose `Some` arm leads
 /// to an inner `SwitchInt` on `_2`, with BOTH `otherwise` edges flowing to one
@@ -6078,7 +8121,9 @@ fn nested_enum_match_partial_inner_uses_inner_tag_set_not_outer() {
 
 #[test]
 fn test_cmp_binop_produces_no_arithmetic_vcs() {
-    // #361: BinOp::Cmp (three-way comparison) is always safe — no VCs.
+    // Three-way comparison is panic-free, but proof-producing value semantics
+    // remain fail-closed until the destination Ordering's exact discriminant
+    // tags are bound (Less is not uniformly encoded as -1).
     let func = make_binop_func(BinOp::Cmp, Ty::i32());
     let vcs = generate_vcs(&func);
     let arith_vcs: Vec<_> = vcs
@@ -6098,6 +8143,11 @@ fn test_cmp_binop_produces_no_arithmetic_vcs() {
         arith_vcs.is_empty(),
         "BinOp::Cmp should not generate any arithmetic VCs, got {}",
         arith_vcs.len()
+    );
+    assert!(
+        vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+        if kind == "Rvalue::BinaryOp(Cmp)")),
+        "Cmp must retain an explicit fail-closed Ordering-tag row: {vcs:#?}"
     );
 }
 
@@ -6200,6 +8250,7 @@ fn atomic_load_release_function() -> VerifiableFunction {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::intrinsics::atomic_load_release".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -6276,6 +8327,7 @@ fn test_atomic_legality_legal_load_no_vc() {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::intrinsics::atomic_load_acquire".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -6647,6 +8699,7 @@ fn test_atomic_legality_fence_relaxed_generates_vc() {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::intrinsics::atomic_fence_relaxed".to_string(),
                     args: vec![],
@@ -7019,18 +9072,26 @@ fn place_ty_resolves_nested_enum_variant_payload() {
     // inner payload of `Option<Option<u32>>` resolves to the tag's Int and a
     // discriminant read on it false-fails as InvalidDiscriminant (nested_opt).
     let tag = || Ty::Int { width: 64, signed: true };
-    let inner_opt = Ty::Adt { adt_kind: None, layout: None, 
+    let inner_opt = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Option".into(),
         fields: vec![("__tag".into(), tag()), ("__v1_0".into(), Ty::u32())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let outer_opt = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let outer_opt = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Option".into(),
         fields: vec![("__tag".into(), tag()), ("__v1_0".into(), inner_opt.clone())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
@@ -7078,22 +9139,31 @@ fn operand_ty_cow_is_byte_identical_to_operand_ty() {
     // family's case) the cow walk BORROWS the multi-MB declared root, while `operand_ty`
     // deep-clones it; the RESOLVED type must be byte-identical either way. This locks in
     // that VC-IDENTICAL property (a regression here would change a verdict).
-    let fat = Ty::Adt { adt_kind: None, layout: None, 
+    let fat = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Expr".into(),
         fields: vec![
             (
                 "kind".into(),
-                Ty::Adt { adt_kind: None, layout: None, 
+                Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
                     variants: Vec::new(),
                     name: "ExprKind".into(),
                     fields: vec![("x".into(), Ty::u32())],
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                },
             ),
             ("flag".into(), Ty::Bool),
         ],
-        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, };
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::Unit, name: None },
@@ -7137,7 +9207,9 @@ fn deref_of_reborrowed_payload_converges_to_referent_name() {
     // the guard reads `*_9` while the arithmetic reads `*_3`. Both alias the same
     // payload `((*o) as Some).0`; the deref names must converge on that referent
     // or the guard cannot constrain the overflow VC (a Goal-1 false-fail).
-    let opt = Ty::Adt { adt_kind: None, layout: None, 
+    let opt = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Option".into(),
         fields: vec![
@@ -7145,7 +9217,9 @@ fn deref_of_reborrowed_payload_converges_to_referent_name() {
             ("__v1_0".into(), Ty::u32()),
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let opt_ref = Ty::Ref { mutable: false, inner: Box::new(opt) };
     let payload = Place {
         local: 1,
@@ -7235,12 +9309,16 @@ fn deref_of_reassigned_reference_is_not_canonicalized() {
 fn place_ty_struct_field_without_downcast_stays_flat() {
     // regression guard: a struct field access has no Downcast, so
     // `Field(i)` must keep its flat lookup into the struct's fields.
-    let s = Ty::Adt { adt_kind: None, layout: None, 
+    let s = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "S".into(),
         fields: vec![("x".into(), Ty::u32()), ("y".into(), Ty::Bool)],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
@@ -7450,12 +9528,16 @@ fn deref_shared_struct_field_array_const_index_converges() {
     // two reads must converge on `b*.0[0;min=4]`. Field-in-prefix is the second case
     // the pos==1-only Shape B missed.
     let arr = Ty::Array { elem: Box::new(Ty::u32()), len: 4 };
-    let buf = Ty::Adt { adt_kind: None, layout: None, 
+    let buf = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Buf".to_string(),
         fields: vec![("data".to_string(), arr)],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let bref = Ty::Ref { mutable: false, inner: Box::new(buf) };
     let func = single_block_func(
         vec![
@@ -7720,6 +9802,7 @@ fn array_theory_local_none_for_index_reassigned_via_call_dest() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "reidx".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -7768,6 +9851,7 @@ fn array_theory_local_none_for_whole_array_call_reseat() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "fresh".to_string(),
                         args: vec![],
@@ -7885,6 +9969,7 @@ fn v2_widening_bv_source_declines_call_and_binop_reassign() {
         Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],
@@ -8289,6 +10374,7 @@ fn loop_backedge_call_dest_havocs_preloop_fact() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "next_i".to_string(),
                         args: vec![],
@@ -8390,6 +10476,7 @@ fn call_arg_mut_ref_havocs_pointee_fact() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "mutate".to_string(),
                         args: vec![Operand::Move(Place::local(2))],

@@ -1,5 +1,8 @@
 fn monitored_loop(mut n: u32) -> u32 {
-    while n > 0 invariant n <= 4 decreases n {
+    while n > 0
+        invariant n <= 4
+        decreases n
+    {
         n -= 1;
     }
     n

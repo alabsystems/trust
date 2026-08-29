@@ -104,6 +104,63 @@ impl<'de> Deserialize<'de> for HardenedVcCategory {
     }
 }
 
+/// The compile-time check settings that decide whether the GENERATED program
+/// still carries a dynamic guard for an obligation.
+///
+/// [`VcKind::has_runtime_fallback`] used to take a lone `overflow_checks: bool`.
+/// That signature structurally CANNOT answer for the unchecked-UB family
+/// (`slice::get_unchecked`, `unchecked_{add,sub,mul}`): the guard those keep is
+/// `assert_unsafe_precondition!`, which `library/core/src/ub_checks.rs` gates on
+/// `intrinsics::ub_checks()` — i.e. on `Session::ub_checks()`
+/// (rustc_session/src/session.rs), NOT on `-C overflow-checks`.
+///
+/// MEASURED, stage2 `trustc 1.99.0-dev (d6a53e72a)`, `--emit=llvm-ir -C
+/// opt-level=0`, function `<usize as SliceIndex<[u32]>>::get_unchecked` and
+/// `u32::unchecked_add`:
+///
+/// | flags | `xs[i]` | `a + b` | `get_unchecked(i)` | `unchecked_add(a,b)` |
+/// | --- | --- | --- | --- | --- |
+/// | `-Coverflow-checks=off -Cdebug-assertions=off` | `panic_bounds_check` | none | **none** | **none** (`add nuw`) |
+/// | `-Coverflow-checks=on  -Cdebug-assertions=on`  | `panic_bounds_check` | `panic_const_add_overflow` | `precondition_check` | `precondition_check` |
+/// | `-Coverflow-checks=off -Zub-checks=yes`        | `panic_bounds_check` | none | `precondition_check` | `precondition_check` |
+///
+/// The third row is the decisive one: with `overflow_checks` OFF the unchecked
+/// family still has its guard, and `a + b` does not. The two knobs are
+/// independent, and the unchecked family answers the OTHER one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RuntimeCheckEnv {
+    /// `-C overflow-checks` (`Session::overflow_checks()`). Gates the
+    /// `Assert(Overflow*)` terminator rustc inserts on CHECKED arithmetic.
+    pub overflow_checks: bool,
+    /// `Session::ub_checks()` (rustc_session/src/session.rs:894-896; defaults to
+    /// `-C debug-assertions`, overridable with `-Z ub-checks`). Gates every
+    /// `assert_unsafe_precondition!` in `core`, which is the ONLY guard the
+    /// unchecked-UB family ever has.
+    pub ub_checks: bool,
+}
+
+impl RuntimeCheckEnv {
+    /// The full check environment.
+    #[must_use]
+    pub const fn new(overflow_checks: bool, ub_checks: bool) -> Self {
+        Self { overflow_checks, ub_checks }
+    }
+
+    /// FAIL-CLOSED adapter for a caller that knows only `overflow_checks`.
+    ///
+    /// `ub_checks` is assumed OFF — the release configuration, in which every
+    /// `assert_unsafe_precondition!` is compiled out. A caller that cannot
+    /// establish the real value must not be able to mint the positive claim, so
+    /// the unknown knob resolves to "no guard", never to "guard present".
+    /// Threading the real `Session::ub_checks()` can only ADD fallbacks, never
+    /// remove one, so no consumer of this adapter can be made less safe by a
+    /// later migration to [`RuntimeCheckEnv::new`].
+    #[must_use]
+    pub const fn overflow_checks_only(overflow_checks: bool) -> Self {
+        Self { overflow_checks, ub_checks: false }
+    }
+}
+
 /// What kind of property a VC checks.
 ///
 /// Each variant maps to a specific safety or functional property. The
@@ -137,12 +194,106 @@ pub enum VcKind {
         operand_ty: Ty,
         shift_ty: Ty,
     },
+    /// `unchecked_{add,sub,mul}` — the SAME out-of-range obligation as
+    /// [`VcKind::ArithmeticOverflow`], minted from the UB-on-overflow intrinsics
+    /// instead of a checked `BinaryOp`.
+    ///
+    /// It is a SEPARATE variant for exactly one reason: the two answer
+    /// [`VcKind::has_runtime_fallback`] from DIFFERENT knobs.
+    /// `AddUnchecked`/`SubUnchecked`/`MulUnchecked` lower to LLVM `add nsw/nuw`
+    /// (rustc_codegen_ssa/src/mir/rvalue.rs) — no `Assert`, no branch, nothing
+    /// gated on `overflow_checks` at ANY value — so answering `overflow_checks`
+    /// (as the shared `ArithmeticOverflow` variant does, correctly, for `a + b`
+    /// and `pow`) was a positive safety claim minted from a program with no
+    /// guard in it. The only guard these ever have is the `ub_checks`-gated
+    /// `assert_unsafe_precondition!` in `library/core/src/num/uint_macros.rs`.
+    ///
+    /// Fields mirror `ArithmeticOverflow` so the shared arithmetic machinery
+    /// (type-range conjoins, structural cross-check, interval discharge) can
+    /// treat the two identically wherever the runtime-guard question is not
+    /// being asked.
+    UncheckedArithmeticOverflow {
+        op: BinOp,
+        operand_tys: (Ty, Ty),
+    },
     DivisionByZero,
     RemainderByZero,
     IndexOutOfBounds,
     SliceBoundsCheck,
+    /// `slice::get_unchecked` / `get_unchecked_mut` — the index must be `< len`,
+    /// with NO language-inserted bounds check.
+    ///
+    /// Distinct from [`VcKind::IndexOutOfBounds`], which covers SAFE indexing
+    /// (`xs[i]`) and legitimately keeps its `panic_bounds_check` in every
+    /// profile. Minting this family as `IndexOutOfBounds` made it inherit that
+    /// unconditional `true`, so the sole obligation on an unchecked index — the
+    /// separation-engine `index >= len` row, which is also the reason the
+    /// always-refuting `[unsafe] missing SAFETY comment` lint is suppressed for
+    /// that block — self-reported as monitored while the emitted code held a
+    /// bare `getelementptr`.
+    UncheckedIndexBounds {
+        /// The unchecked accessor (e.g. `core::slice::<impl [T]>::get_unchecked`).
+        callee: String,
+        /// Human-readable statement of the obligation.
+        detail: String,
+    },
     Assertion {
         message: String,
+    },
+    /// An authored `#[invariant(...)]` / `#[trust::invariant(...)]` clause.
+    ///
+    /// A SPECIFICATION obligation, exactly like its two sibling clauses
+    /// (`Requires -> Precondition`, `Ensures -> Postcondition`), and it must
+    /// answer [`VcKind::has_runtime_fallback`] the way they do: `false`. Routing
+    /// it onto [`VcKind::Assertion`] borrowed that variant's `true`, which is
+    /// earned by a rustc-inserted `Assert` terminator / `assert!` panic call —
+    /// something an invariant attribute never produces. The attribute is
+    /// span-only and is never lowered (trust-mir-extract reads it off
+    /// `tcx.hir_attrs` for its span and snippet); MEASURED on stage2, a
+    /// `#[trust::invariant(x > 0)] fn inv_fn(x: i32) -> i32 { x }` emits LLVM IR
+    /// byte-identical to the unannotated function — `start: ret i32 %x`.
+    ///
+    /// # NOTHING IN PRODUCTION CONSTRUCTS THIS VARIANT, AND NOTHING SHOULD
+    ///
+    /// It is retained so the reporting, display and exhaustiveness paths keep
+    /// their arms, and as the record of a fixed defect. Both former mint sites
+    /// (`trust_vcgen::contracts::check_contracts_with_loop_invariant_feedback`
+    /// and `trust_vcgen::spec_parser::generate_spec_vcs`) now emit the
+    /// non-refutable `UnsupportedMir`/`SpecUnverifiable` row instead.
+    ///
+    /// The reason is that this variant was only ever paired with
+    /// `formula: Not(predicate)` and NOTHING ELSE — no path condition, no
+    /// pre-state, no binding of the clause's free names to program locals,
+    /// because an item-position attribute names no program point to bind them
+    /// at. The solver was therefore asked `is ¬P unsatisfiable`, i.e. `is P
+    /// VALID`, which is a question about the predicate's text rather than about
+    /// the program. MEASURED on the sealed toolchain `trust-e26541e3`, over
+    /// `fn f(x: u32) -> u32 { x / 2 }`:
+    ///
+    /// | clause | outcome | solver |
+    /// |---|---|---|
+    /// | `invariant(1 == 1)` | **proved** | `clean-kernel-certified` |
+    /// | `invariant(x == x)` | **proved** | `clean-kernel-certified` |
+    /// | `invariant(x >= 0)` | unknown | — |
+    /// | `invariant(true)` | unknown | — |
+    /// | `invariant(false)` | unknown | — |
+    ///
+    /// The PROVED set is exactly the set of predicates that constrain nothing,
+    /// and because [`VcKind::proof_level`] puts this variant at
+    /// [`ProofLevel::L1Functional`] and [`VcKind::kind_str`] labels it
+    /// `"invariant"`, each such row is a kernel-certified CONTRACT-KIND proof —
+    /// the kind a verification ratchet reports as headline progress. A
+    /// one-line `#[trust::invariant(1 == 1)]` could therefore manufacture a
+    /// "first invariant proof" that means nothing.
+    ///
+    /// If a genuinely situated invariant is ever added, it must carry its
+    /// program point and its state binding, and it must be a new variant whose
+    /// formula is not merely `Not(predicate)`. The loop machinery already does
+    /// this correctly via `ContractKind::LoopInvariant`, which is a different
+    /// clause kind with a real MIR loop header.
+    ContractInvariant {
+        /// The clause source text.
+        expression: String,
     },
     Precondition {
         callee: String,
@@ -457,6 +608,189 @@ impl VcKind {
     /// `format!("FullVerification::{kind:?}")` from the verifier-API obligation
     /// kind in `trust_verify.rs::legacy_unsupported_kind_detail`).
     pub const FULL_VERIFICATION_KIND_PREFIX: &'static str = "FullVerification::";
+    /// Message prefix the separation engine (trust-vcgen `sep_engine.rs`, the
+    /// ONLY producer) stamps on every unsafe-operation obligation it mints as a
+    /// [`VcKind::Assertion`]. Rust inserts no check for any of them, so
+    /// [`VcKind::has_runtime_fallback_in`] declines the whole family.
+    pub const SEP_UNSAFE_ASSERTION_PREFIX: &'static str = "[unsafe:sep:";
+
+    /// Why a kernel-checked UNSAT of this kind's violation formula is NOT a
+    /// proof about the program — or `None` when it is.
+    ///
+    /// # The question this answers
+    ///
+    /// `trust_certify::certify_vc` mints a zero-trust `CleanCic` certificate on
+    /// a kernel-checked UNSAT of `vc.formula`, and two compiler routes turn that
+    /// certificate into a `Proved { solver: "clean-kernel-certified" }` row:
+    /// `promote_kernel_certifiable` and the bridge certify-fallback (both in
+    /// `rustc_mir_transform::trust_verify`). Neither inspects `vc.kind`. Their
+    /// shared soundness argument is written in the fallback's comment:
+    ///
+    /// > a genuinely-violable obligation has a SAT violation, so it stays
+    /// > undecided (never a false Proved).
+    ///
+    /// That argument is valid **only if `vc.formula` faithfully encodes "this
+    /// obligation is violated"** — i.e. only if it conjoins the program state
+    /// reaching the obligation's program point with the negated predicate. When
+    /// it does, UNSAT means no reachable state violates the obligation, which is
+    /// a statement about the program. When it does not, UNSAT means only that
+    /// the predicate's negation is unsatisfiable — that the predicate is VALID —
+    /// which is a statement about the predicate's TEXT.
+    ///
+    /// A row that means "P is valid" is provable exactly when P constrains
+    /// nothing, so the provable set of such a kind is exactly the TAUTOLOGIES.
+    /// The kernel is not at fault in that case and the certificate is not
+    /// forged: the kernel is asked a true question and answers it truthfully.
+    /// The defect is that the question is not about the program.
+    ///
+    /// # Measured
+    ///
+    /// On the sealed toolchain `trust-e26541e3`, via the `register_tool`
+    /// surface, over `pub fn f(x: u32) -> u32 { x / 2 }`:
+    ///
+    /// ```text
+    ///   #[trust::invariant(1 == 1)] -> proved, solver=clean-kernel-certified
+    ///   #[trust::invariant(x == x)] -> proved, solver=clean-kernel-certified
+    ///   #[trust::invariant(x >= 0)] -> unknown   (true of EVERY u32)
+    ///   #[trust::invariant(true)]   -> unknown
+    ///   #[trust::invariant(false)]  -> unknown
+    /// ```
+    ///
+    /// The provable set is exactly the tautologies, and the proved rows carry
+    /// `kind: "invariant"` at `ProofLevel::L1Functional` — the rows a ratchet
+    /// counts as `proved_by_kind.invariant` and `kernel_certified`. The same
+    /// battery over `ensures` on the same body proves `result <= x` and
+    /// `result == 7` (on a body returning `7`) while refusing `result > x` and
+    /// `result == 7` (on `x / 2`), so that kind's formula IS body-aware and is
+    /// admitted here unchanged.
+    ///
+    /// # Why this is a total match
+    ///
+    /// The refusal is deliberately expressed as an exhaustive match rather than
+    /// a refuse-list plus a catch-all. `VcKind` is `#[non_exhaustive]` only to
+    /// DOWNSTREAM crates; in this crate a new variant makes this match fail to
+    /// compile, which forces whoever adds a kind to state whether its formula
+    /// binds its free names to program state before the kernel may certify it.
+    /// That compile error is the point of this function.
+    #[must_use]
+    pub fn kernel_authority_refusal(&self) -> Option<&'static str> {
+        match self {
+            // ---- REFUSED -------------------------------------------------
+            //
+            // An item-position `#[invariant(..)]` names NO program point, so
+            // there is nothing to bind its free names at. `trust-mir-extract`
+            // reads the attribute off `tcx.hir_attrs` for its span and snippet
+            // and never lowers it, and vcgen mints `formula: Not(parsed)` with
+            // nothing else — no path condition, no pre-state. UNSAT of that is
+            // validity of the clause text. See the measured table above.
+            //
+            // This is NOT the loop machinery: a `while <cond> invariant <p>`
+            // clause is `ContractKind::LoopInvariant` and lowers to the
+            // `LoopInvariant{Initiation,Consecution,Sufficiency}` kinds below,
+            // which carry a `header_block` and conjoin the loop's state. Those
+            // stay admitted, and the initiation shape certifies exactly as it
+            // did before this gate existed.
+            VcKind::ContractInvariant { .. } => Some(
+                "item-position `invariant` names no program point, so its violation formula is \
+                 the bare negated clause with none of its free names bound to program state; a \
+                 kernel-checked UNSAT of it proves only that the clause text is a tautology",
+            ),
+            // Same defect, same shape: vcgen mints `formula: Not(parsed)` over
+            // the refinement predicate with the refined variable unbound to any
+            // program value, so UNSAT is validity of the predicate text rather
+            // than a fact about the refined place.
+            VcKind::TypeRefinementViolation { .. } => Some(
+                "a type-refinement row's violation formula is the bare negated predicate with \
+                 the refined variable unbound to any program value; a kernel-checked UNSAT of \
+                 it proves only that the predicate text is a tautology",
+            ),
+
+            // ---- ADMITTED ------------------------------------------------
+            //
+            // Language-safety obligations. vcgen builds each of these from MIR
+            // with the reaching path condition conjoined, so UNSAT of the
+            // violation formula is exactly "no reachable state violates it".
+            VcKind::ArithmeticOverflow { .. }
+            | VcKind::ShiftOverflow { .. }
+            | VcKind::UncheckedArithmeticOverflow { .. }
+            | VcKind::DivisionByZero
+            | VcKind::RemainderByZero
+            | VcKind::IndexOutOfBounds
+            | VcKind::SliceBoundsCheck
+            | VcKind::UncheckedIndexBounds { .. }
+            | VcKind::Assertion { .. }
+            | VcKind::CastOverflow { .. }
+            | VcKind::NegationOverflow { .. }
+            | VcKind::Unreachable
+            | VcKind::FloatDivisionByZero
+            | VcKind::FloatOverflowToInfinity { .. }
+            | VcKind::InvalidDiscriminant { .. }
+            | VcKind::AggregateArrayLengthMismatch { .. }
+            | VcKind::UnsafeOperation { .. }
+            | VcKind::SavedReturnAddressOverwrite { .. }
+            | VcKind::FormatStringViolation { .. }
+            | VcKind::TaintedIndirectBranch { .. } => None,
+
+            // Contract kinds whose formula IS body-aware.
+            //
+            // `Postcondition` is replaced by the per-`Return` body-aware rows in
+            // `generate_v2_contract_vcs_impl` before dispatch, and the measured
+            // battery above confirms it refuses predicates false of the body.
+            // `Precondition` at a CALL SITE carries the caller's actual
+            // arguments; the def-site `#[requires]` row never reaches a solver
+            // as a proof request at all (it is transported as
+            // `assumption:requires`), so admitting the kind does not admit it.
+            VcKind::Postcondition | VcKind::Precondition { .. } => None,
+
+            // Loop-clause obligations. Each carries a `header_block` program
+            // point and conjoins the loop state with the negated invariant, so
+            // UNSAT is a fact about the loop.
+            VcKind::LoopInvariantInitiation { .. }
+            | VcKind::LoopInvariantConsecution { .. }
+            | VcKind::LoopInvariantSufficiency { .. } => None,
+
+            // Memory, aliasing, concurrency and boundary obligations: all minted
+            // from MIR/analysis facts with their reaching conditions.
+            VcKind::UseAfterFree { .. }
+            | VcKind::DoubleFree { .. }
+            | VcKind::AliasingViolation { .. }
+            | VcKind::LifetimeViolation { .. }
+            | VcKind::SendViolation
+            | VcKind::SyncViolation
+            | VcKind::DataRace { .. }
+            | VcKind::InsufficientOrdering { .. }
+            | VcKind::Deadlock
+            | VcKind::UnboundedAllocation { .. }
+            | VcKind::CopyBoundsViolation { .. }
+            | VcKind::ExternallyMutableAllocationBounds { .. }
+            | VcKind::FfiBoundaryViolation { .. }
+            | VcKind::BinaryAbiContradiction { .. }
+            | VcKind::BinaryCopySinkLengthViolation { .. }
+            | VcKind::HardenedBoundary { .. }
+            | VcKind::FrameConditionViolation { .. } => None,
+
+            // Model/domain obligations. These are not certified through this
+            // route today (their backends own them), but their formulas are
+            // built from the extracted model rather than from clause text, so
+            // the gate does not refuse them.
+            VcKind::DeadState { .. }
+            | VcKind::Temporal { .. }
+            | VcKind::Liveness { .. }
+            | VcKind::Fairness { .. }
+            | VcKind::TaintViolation { .. }
+            | VcKind::RefinementViolation { .. }
+            | VcKind::ResilienceViolation { .. }
+            | VcKind::ProtocolViolation { .. }
+            | VcKind::NonTermination { .. }
+            | VcKind::TranslationValidation { .. }
+            | VcKind::FunctionalCorrectness { .. } => None,
+
+            // A preserved-but-unmodelled MIR sentinel. It is deliberately
+            // non-refutable wherever it is minted, so it cannot reach UNSAT; the
+            // gate leaves it exactly as it was.
+            VcKind::UnsupportedMir { .. } => None,
+        }
+    }
 
     /// Hardened obligation category for typed rows and legacy
     /// `FunctionalCorrectness { property: "hardened::<category>" }` rows.
@@ -524,13 +858,27 @@ impl VcKind {
                 BinOp::Shr => "shift:right",
                 _ => "shift",
             },
+            // Deliberately NOT the `overflow:*` tags. Same-span twin subsumption
+            // keys on this token, and an `unchecked_add` has no `mir_assert`
+            // twin to be subsumed BY — sharing the tag would let a PROVED
+            // checked-add sibling discharge it across ops.
+            VcKind::UncheckedArithmeticOverflow { op, .. } => match op {
+                BinOp::Add => "unchecked_overflow:add",
+                BinOp::Sub => "unchecked_overflow:sub",
+                BinOp::Mul => "unchecked_overflow:mul",
+                _ => "unchecked_overflow",
+            },
             VcKind::DivisionByZero => "divzero",
             VcKind::RemainderByZero => "remzero",
             VcKind::FloatDivisionByZero => "float_division_by_zero",
             VcKind::FloatOverflowToInfinity { .. } => "float_overflow_to_infinity",
             VcKind::IndexOutOfBounds => "bounds",
             VcKind::SliceBoundsCheck => "slice",
+            // Distinct from `bounds` for the same twin-subsumption reason: an
+            // unchecked index has no `panic_bounds_check` twin.
+            VcKind::UncheckedIndexBounds { .. } => "unchecked_bounds",
             VcKind::Assertion { .. } => "assert",
+            VcKind::ContractInvariant { .. } => "invariant",
             VcKind::Precondition { .. } => "precond",
             VcKind::Postcondition => "postcond",
             VcKind::Unreachable => "unreach",
@@ -579,6 +927,13 @@ impl VcKind {
             VcKind::ArithmeticOverflow { op, .. } => {
                 format!("arithmetic overflow ({op:?})")
             }
+            // Prefixed, so it can never collide with the `ArithmeticSafety`
+            // detail prefixes `recovered_full_lane_vc_tag` anchors on — a
+            // round-tripped unchecked row must not recover as `overflow:add`
+            // and thereby re-acquire the `overflow_checks` answer.
+            VcKind::UncheckedArithmeticOverflow { op, .. } => {
+                format!("unchecked arithmetic overflow ({op:?})")
+            }
             VcKind::ShiftOverflow { op, .. } => {
                 format!("shift overflow ({op:?})")
             }
@@ -586,7 +941,11 @@ impl VcKind {
             VcKind::RemainderByZero => "remainder by zero".to_string(),
             VcKind::IndexOutOfBounds => "index out of bounds".to_string(),
             VcKind::SliceBoundsCheck => "slice bounds check".to_string(),
+            VcKind::UncheckedIndexBounds { callee, detail } => {
+                format!("unchecked index bounds in `{callee}`: {detail}")
+            }
             VcKind::Assertion { message } => format!("assertion: {message}"),
+            VcKind::ContractInvariant { expression } => format!("invariant: {expression}"),
             VcKind::Precondition { callee } => format!("precondition of `{callee}`"),
             VcKind::Postcondition => "postcondition".to_string(),
             VcKind::CastOverflow { from_ty, to_ty } => {
@@ -737,11 +1096,16 @@ impl VcKind {
     pub fn proof_level(&self) -> ProofLevel {
         match self {
             VcKind::ArithmeticOverflow { .. }
+            // Same L0 safety property as its checked sibling — overflowing an
+            // `unchecked_*` is UB, which is strictly worse than a panic.
+            | VcKind::UncheckedArithmeticOverflow { .. }
             | VcKind::ShiftOverflow { .. }
             | VcKind::DivisionByZero
             | VcKind::RemainderByZero
             | VcKind::IndexOutOfBounds
             | VcKind::SliceBoundsCheck
+            // An out-of-bounds unchecked index is UB, not a panic: L0.
+            | VcKind::UncheckedIndexBounds { .. }
             | VcKind::Assertion { .. }
             | VcKind::CastOverflow { .. }
             | VcKind::NegationOverflow { .. }
@@ -763,7 +1127,11 @@ impl VcKind {
             | VcKind::ExternallyMutableAllocationBounds { .. }
             // Unbounded allocation is an availability/DoS safety hazard (L0).
             | VcKind::UnboundedAllocation { .. } => ProofLevel::L0Safety,
-            VcKind::Precondition { .. } | VcKind::Postcondition => ProofLevel::L1Functional,
+            // An authored invariant is a contract clause, exactly like its
+            // `Requires`/`Ensures` siblings: L1, not L0 safety.
+            VcKind::Precondition { .. }
+            | VcKind::Postcondition
+            | VcKind::ContractInvariant { .. } => ProofLevel::L1Functional,
             VcKind::DeadState { .. }
             | VcKind::Deadlock
             | VcKind::Temporal { .. }
@@ -928,19 +1296,88 @@ impl VcKind {
         Some(tag)
     }
 
-    /// Returns whether Rust has a corresponding runtime check for this VC kind.
+    /// Returns whether the generated program provably RETAINS a runtime check
+    /// for this VC kind — i.e. whether an unproved obligation of this kind is
+    /// still dynamically guarded.
+    ///
+    /// CONTRACT: `true` is a POSITIVE SAFETY CLAIM, and every consumer reads it
+    /// that way. `classify_runtime_disposition` (result.rs) uses it to downgrade
+    /// an `Unknown`/`Timeout` row to `RuntimeChecked` under
+    /// `RuntimeCheckPolicy::Auto`, which reads to the user as "covered"; the
+    /// residual-gap scan in `trust_verify.rs` uses it to decide a gap is
+    /// tolerable. So `true` must mean the monitor DEMONSTRABLY exists for every
+    /// obligation this arm can be reached by. Answer `false` whenever the kind
+    /// cannot decide that — an over-reported `Unknown` is a lost recovery, an
+    /// under-reported one is a false safety claim, and only the latter is UB.
+    ///
+    /// `VcKind::Unreachable` is therefore `false`, despite three of its four
+    /// mint sites being panic-backed. It is a UNIT variant carrying no
+    /// provenance, and `v2_build_terminator_vc`
+    /// (trust-vcgen/src/generate/overflow_vc.rs) mints it from four physically
+    /// different terminators: a bare `Terminator::Unreachable`, which
+    /// rustc_codegen_ssa lowers straight to `llvm.unreachable` with NO check
+    /// emitted (`rustc_codegen_ssa/src/mir/block.rs`), plus three
+    /// `Terminator::Call` panic shapes that do keep one. The two shapes are
+    /// indistinguishable downstream, so this arm cannot tell them apart and
+    /// fails closed for all of them.
+    ///
+    /// FAIL-CLOSED ADAPTER. This spelling knows only `overflow_checks`, so it
+    /// answers as if `ub_checks` were OFF — see
+    /// [`RuntimeCheckEnv::overflow_checks_only`]. Every kind whose guard is
+    /// `ub_checks`-gated (`get_unchecked`, `unchecked_{add,sub,mul}`) therefore
+    /// answers `false` here regardless of the real session setting. That is the
+    /// safe direction: threading the real `Session::ub_checks()` through
+    /// [`VcKind::has_runtime_fallback_in`] can only ADD fallbacks.
     #[must_use]
     pub fn has_runtime_fallback(&self, overflow_checks: bool) -> bool {
+        self.has_runtime_fallback_in(RuntimeCheckEnv::overflow_checks_only(overflow_checks))
+    }
+
+    /// [`VcKind::has_runtime_fallback`] against the FULL check environment.
+    ///
+    /// Read the contract on `has_runtime_fallback` first — it applies verbatim.
+    /// This is the spelling that can answer for the unchecked-UB family, whose
+    /// guard is gated on `ub_checks` and not on `overflow_checks`; see
+    /// [`RuntimeCheckEnv`] for the measured table.
+    #[must_use]
+    pub fn has_runtime_fallback_in(&self, env: RuntimeCheckEnv) -> bool {
         match self {
             VcKind::ArithmeticOverflow { .. }
             | VcKind::ShiftOverflow { .. }
-            | VcKind::NegationOverflow { .. } => overflow_checks,
+            | VcKind::NegationOverflow { .. } => env.overflow_checks,
+            // `unchecked_{add,sub,mul}` lower to `add nsw`/`nuw` with NO branch;
+            // `get_unchecked` lowers to a bare `getelementptr`. Neither is gated
+            // on `overflow_checks` at any value — the sole guard either can have
+            // is the `ub_checks`-gated `assert_unsafe_precondition!`, which is
+            // compiled out of every release build.
+            VcKind::UncheckedArithmeticOverflow { .. }
+            | VcKind::UncheckedIndexBounds { .. } => env.ub_checks,
+            // Trust: the separation engine mints its unsafe-operation
+            // obligations as `Assertion`s tagged `[unsafe:sep:<op>]`
+            // (trust-vcgen/src/sep_engine.rs — the ONLY producer of this
+            // prefix): double-free, `Vec::set_len` past capacity, `ptr::offset`
+            // out of its allocation, `NonZero::new_unchecked(0)`,
+            // `from_utf8_unchecked` on non-UTF-8, `assume_init` on uninit
+            // memory, `alloc` returning null. Rust inserts NO check for ANY of
+            // them; they are obligations precisely BECAUSE the language does not
+            // watch them. Falling into the `Assertion => true` arm below — which
+            // is earned by a rustc-inserted `Assert` terminator or an `assert!`
+            // panic call — reported the whole separation-engine unsafe output as
+            // monitored. It also contradicted the typed spellings of the very
+            // same properties: `VcKind::DoubleFree`, `VcKind::UnsafeOperation`
+            // and `VcKind::HardenedBoundary { UnsafeOperation }` all answer
+            // `false`, and `hardened_category()` already classifies these rows as
+            // `UnsafeOperation`. Anchored at the start, matching the mint format.
+            VcKind::Assertion { message }
+                if message.starts_with(Self::SEP_UNSAFE_ASSERTION_PREFIX) =>
+            {
+                false
+            }
             VcKind::DivisionByZero
             | VcKind::RemainderByZero
             | VcKind::IndexOutOfBounds
             | VcKind::SliceBoundsCheck
-            | VcKind::Assertion { .. }
-            | VcKind::Unreachable => true,
+            | VcKind::Assertion { .. } => true,
             // Effective-kind runtime fallback: a native full-lane round-trip
             // row (`FullVerification::<ApiKind>`) is an obligation whose
             // underlying operation KEEPS its physical runtime check — checks
@@ -959,17 +1396,46 @@ impl VcKind {
                         "overflow:add" | "overflow:sub" | "overflow:mul" | "overflow:div"
                         | "overflow:rem" | "overflow" | "shift:left" | "shift:right" | "shift"
                         | "negation",
-                    ) => overflow_checks,
+                    ) => env.overflow_checks,
                     // DivisionByZero / RemainderByZero / IndexOutOfBounds /
-                    // SliceBoundsCheck / Assertion / Unreachable arms.
-                    Some("divzero" | "remzero" | "bounds" | "slice" | "assert" | "unreach") => true,
-                    // Every other recovered family (cast/precond/postcond/
-                    // float/temporal/…) answers `false` per its own arm, and an
-                    // unrecovered detail stays fail-closed `false`.
+                    // SliceBoundsCheck arms.
+                    Some("divzero" | "remzero" | "bounds" | "slice") => true,
+                    // The `assert` tag must answer EXACTLY what the direct
+                    // `Assertion` arm answers, INCLUDING its `[unsafe:sep:`
+                    // decline — otherwise a round-trip launders a
+                    // separation-engine unsafe obligation back into a fallback
+                    // that arm refused. `recovered_full_lane_vc_tag` produces
+                    // `assert` only from a `detail` starting `"assertion: "`,
+                    // which is `VcKind::Assertion`'s own `description()`, so
+                    // stripping that prefix recovers the original message.
+                    // (Today `vc_obligation_kind` routes these rows through the
+                    // hardened namespace instead, so this arm is belt-and-braces
+                    // — it is here so the two stay in lock-step if that routing
+                    // changes, exactly as the `unreach` note below requires.)
+                    Some("assert") => !detail
+                        .strip_prefix("assertion: ")
+                        .unwrap_or(detail.as_str())
+                        .starts_with(Self::SEP_UNSAFE_ASSERTION_PREFIX),
+                    // Every other recovered family (`unreach`/cast/precond/
+                    // postcond/float/temporal/…) answers `false` per its own arm,
+                    // and an unrecovered detail stays fail-closed `false`.
+                    // `unreach` belongs here and NOT above: it must answer
+                    // exactly what the `VcKind::Unreachable` arm answers, or a
+                    // round-tripped `FullVerification::Assertion` row would
+                    // re-acquire a fallback that arm declined.
                     _ => false,
                 }
             }
-            VcKind::CastOverflow { .. }
+            // Bare `Terminator::Unreachable` compiles to `llvm.unreachable` with
+            // no trap emitted, and the unit variant cannot distinguish that mint
+            // from the panic-backed ones — fail closed. See the doc comment.
+            VcKind::Unreachable
+            | VcKind::CastOverflow { .. }
+            // An authored invariant is a specification clause with no lowered
+            // code behind it: `#[trust::invariant(..)]` is span-only (MEASURED —
+            // byte-identical LLVM IR to the unannotated function), so it answers
+            // `false` in lock-step with its `Requires`/`Ensures` siblings.
+            | VcKind::ContractInvariant { .. }
             | VcKind::Precondition { .. }
             | VcKind::Postcondition
             | VcKind::ResilienceViolation { .. }
@@ -1465,12 +1931,14 @@ mod tests {
                 true,
                 true,
             ),
-            // Unreach → whatever the Unreachable arm answers (true).
+            // Unreach → whatever the Unreachable arm answers (false). The
+            // recovered tag stays `unreach` for display; only the fallback
+            // answer moved, and it must move in lock-step with the direct arm.
             (
                 "FullVerification::Assertion",
                 "unreachable code reached; contract_id=contract:trust-mc-typed-chc-public:8031b9",
-                true,
-                true,
+                false,
+                false,
             ),
             // Recovered families whose own arms answer false stay false.
             ("FullVerification::ArithmeticSafety", "cast overflow (U64 -> U32)", false, false),
@@ -1514,11 +1982,286 @@ mod tests {
         }
     }
 
+    // ── Runtime-fallback fail-opens: the unchecked-UB family, the
+    //    separation-engine unsafe assertions, and the authored invariant ──
+
+    fn unchecked_add_kind() -> VcKind {
+        VcKind::UncheckedArithmeticOverflow {
+            op: BinOp::Add,
+            operand_tys: (Ty::u32(), Ty::u32()),
+        }
+    }
+
+    fn unchecked_index_kind() -> VcKind {
+        VcKind::UncheckedIndexBounds {
+            callee: "core::slice::<impl [u32]>::get_unchecked".into(),
+            detail: "unchecked index must be < the container length".into(),
+        }
+    }
+
+    /// THE decisive lock. The unchecked-UB family answers `ub_checks`, and
+    /// nothing else.
+    ///
+    /// MEASURED, stage2 `trustc 1.99.0-dev (d6a53e72a)`, `--emit=llvm-ir -C
+    /// opt-level=0`: with `-Coverflow-checks=off -Cdebug-assertions=off`,
+    /// `u32::unchecked_add` is a lone `add nuw` and
+    /// `<usize as SliceIndex<[u32]>>::get_unchecked` is a lone `getelementptr`;
+    /// with `-Coverflow-checks=off -Zub-checks=yes` BOTH gain a
+    /// `precondition_check` call, while `a + b` gains nothing.
+    ///
+    /// MUTATIONS THIS CATCHES, and why no other path neutralises them:
+    /// * arm → `env.overflow_checks` (the pre-split behaviour, i.e. folding these
+    ///   back onto `ArithmeticOverflow` / `IndexOutOfBounds`): the
+    ///   `(overflow_checks: true, ub_checks: false)` row — the RELEASE
+    ///   configuration — flips to `true` and fails. That row is the whole bug.
+    /// * arm → `true`: both `ub_checks: false` rows fail.
+    /// * arm → `false`: both `ub_checks: true` rows fail, so the fix cannot be
+    ///   "widened to a blanket decline" without this test noticing.
+    /// The `has_runtime_fallback_in` match is exhaustive over `VcKind` and these
+    /// two variants appear in exactly one arm, so no earlier or later arm can
+    /// intercept them; the guarded `Assertion` arm above cannot match a
+    /// non-`Assertion` variant.
+    #[test]
+    fn unchecked_ub_family_answers_ub_checks_never_overflow_checks() {
+        for kind in [unchecked_add_kind(), unchecked_index_kind()] {
+            // (overflow_checks, ub_checks) -> expected
+            let cases = [
+                ((false, false), false),
+                // RELEASE with overflow checks on: the guard is still gone.
+                ((true, false), false),
+                // The knob that actually controls the guard, with the other OFF.
+                ((false, true), true),
+                ((true, true), true),
+            ];
+            for ((oc, ub), expected) in cases {
+                assert_eq!(
+                    kind.has_runtime_fallback_in(RuntimeCheckEnv::new(oc, ub)),
+                    expected,
+                    "{kind:?} at overflow_checks={oc} ub_checks={ub}"
+                );
+            }
+            // Both are UB, not a panic: L0, exactly like the checked siblings.
+            assert_eq!(kind.proof_level(), ProofLevel::L0Safety);
+        }
+    }
+
+    /// ANTI-OVER-FIX lock. A blanket `false` on `IndexOutOfBounds` /
+    /// `ArithmeticOverflow` would "fix" the unchecked family by fail-closing
+    /// every ordinary `xs[i]` and `a + b` in the tree — a release gate, not a
+    /// fix. These rows are MEASURED to keep their guards: `xs[i]` emits
+    /// `panic_bounds_check` under all three probed configurations, and `a + b`
+    /// emits `panic_const_add_overflow` exactly when `-Coverflow-checks=on`.
+    ///
+    /// Mutation caught: changing either arm to `false` (or to `env.ub_checks`)
+    /// fails here. Nothing else asserts the POSITIVE direction for these kinds
+    /// across a `ub_checks: false` environment, which is where a careless
+    /// "everything unchecked is unmonitored" edit would land.
+    #[test]
+    fn checked_indexing_and_arithmetic_keep_their_own_guards() {
+        for env in [
+            RuntimeCheckEnv::new(false, false),
+            RuntimeCheckEnv::new(true, false),
+            RuntimeCheckEnv::new(false, true),
+            RuntimeCheckEnv::new(true, true),
+        ] {
+            assert!(
+                VcKind::IndexOutOfBounds.has_runtime_fallback_in(env),
+                "safe `xs[i]` keeps `panic_bounds_check` under {env:?}"
+            );
+            assert!(VcKind::SliceBoundsCheck.has_runtime_fallback_in(env));
+            assert!(VcKind::DivisionByZero.has_runtime_fallback_in(env));
+            let add =
+                VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (Ty::i32(), Ty::i32()) };
+            assert_eq!(
+                add.has_runtime_fallback_in(env),
+                env.overflow_checks,
+                "checked `a + b` tracks overflow_checks and NOT ub_checks, under {env:?}"
+            );
+        }
+    }
+
+    /// The `overflow_checks`-only adapter must resolve the knob it cannot see to
+    /// "no guard", for every kind.
+    ///
+    /// Mutation caught: flipping `RuntimeCheckEnv::overflow_checks_only` to
+    /// `ub_checks: true` makes the two `assert!(!…)` rows fail. That mutation is
+    /// otherwise invisible — every existing caller passes a bool, and the
+    /// unchecked family is the only thing that reads the field.
+    #[test]
+    fn overflow_checks_only_adapter_resolves_ub_checks_to_off() {
+        assert_eq!(
+            RuntimeCheckEnv::overflow_checks_only(true),
+            RuntimeCheckEnv::new(true, false)
+        );
+        for kind in [unchecked_add_kind(), unchecked_index_kind()] {
+            assert!(!kind.has_runtime_fallback(true), "{kind:?}");
+            assert!(!kind.has_runtime_fallback(false), "{kind:?}");
+        }
+        // The adapter is exactly `has_runtime_fallback_in` with ub_checks off.
+        for oc in [false, true] {
+            for kind in [
+                unchecked_add_kind(),
+                unchecked_index_kind(),
+                VcKind::IndexOutOfBounds,
+                VcKind::ArithmeticOverflow { op: BinOp::Mul, operand_tys: (Ty::u32(), Ty::u32()) },
+                VcKind::ContractInvariant { expression: "x > 0".into() },
+            ] {
+                assert_eq!(
+                    kind.has_runtime_fallback(oc),
+                    kind.has_runtime_fallback_in(RuntimeCheckEnv::new(oc, false)),
+                    "{kind:?} at overflow_checks={oc}"
+                );
+            }
+        }
+    }
+
+    /// An authored `#[invariant(..)]` has no code behind it in ANY configuration.
+    ///
+    /// MEASURED, stage2: `#[trust::invariant(x > 0)] fn inv_fn(x: i32) -> i32 { x }`
+    /// emits `start: ret i32 %x` — byte-identical to the unannotated function.
+    ///
+    /// Mutation caught: routing the clause back onto `VcKind::Assertion` (the
+    /// pre-fix mint in `contracts.rs` / `spec_parser.rs`) makes every row here
+    /// answer `true`. The vcgen-side twins of this lock live next to those two
+    /// mint sites, so the mutation is caught at the kind AND at both producers.
+    #[test]
+    fn contract_invariant_never_claims_a_runtime_fallback() {
+        let kind = VcKind::ContractInvariant { expression: "x > 0".into() };
+        for env in [
+            RuntimeCheckEnv::new(false, false),
+            RuntimeCheckEnv::new(true, false),
+            RuntimeCheckEnv::new(false, true),
+            RuntimeCheckEnv::new(true, true),
+        ] {
+            assert!(!kind.has_runtime_fallback_in(env), "{env:?}");
+            // Its two sibling clauses answer identically — that symmetry is the
+            // whole point of moving it off `Assertion`.
+            assert!(!VcKind::Postcondition.has_runtime_fallback_in(env));
+            assert!(!VcKind::Precondition { callee: "f".into() }.has_runtime_fallback_in(env));
+        }
+        assert_eq!(kind.proof_level(), ProofLevel::L1Functional);
+        assert_eq!(kind.description(), "invariant: x > 0");
+        assert_eq!(kind.transport_tag(), "invariant");
+    }
+
+    /// The separation engine's `[unsafe:sep:*]` assertions name operations Rust
+    /// does not watch (double-free, `set_len` past capacity, `ptr::offset` out of
+    /// its allocation, `assume_init` on uninit memory). They must not inherit the
+    /// `Assertion` arm's `true`, which is earned by a rustc-inserted `Assert`
+    /// terminator.
+    ///
+    /// Mutation caught, in BOTH directions:
+    /// * deleting the guarded arm (so these fall through to `Assertion => true`)
+    ///   fails the first loop;
+    /// * widening the decline to all `Assertion`s fails the second loop, which
+    ///   pins an ordinary `assert!` — including one whose message merely
+    ///   MENTIONS the marker rather than leading with it, since the guard is
+    ///   anchored with `starts_with`.
+    #[test]
+    fn separation_engine_unsafe_assertions_have_no_runtime_fallback() {
+        let unmonitored = [
+            "[unsafe:sep:free] double-free of `p` (prov#1) in f",
+            "[unsafe:sep:set_len] new length must not exceed capacity in f",
+            "[unsafe:sep:offset] pointer offset out of bounds for `p` in f",
+            "[unsafe:sep:assume_init] the value must be fully initialized in f",
+        ];
+        for message in unmonitored {
+            let kind = VcKind::Assertion { message: message.to_string() };
+            for env in [RuntimeCheckEnv::new(true, true), RuntimeCheckEnv::new(false, false)] {
+                assert!(!kind.has_runtime_fallback_in(env), "{message:?} under {env:?}");
+            }
+            // It already classifies as a hardened unsafe row; the typed
+            // spellings of the same properties (`DoubleFree`, `UnsafeOperation`,
+            // `HardenedBoundary { UnsafeOperation }`) all answer `false` too, so
+            // this arm restores agreement rather than inventing a new rule.
+            assert_eq!(kind.hardened_category(), Some(HardenedVcCategory::UnsafeOperation));
+        }
+        assert!(!VcKind::DoubleFree.has_runtime_fallback(true));
+        assert!(!VcKind::UnsafeOperation { desc: "raw deref".into() }.has_runtime_fallback(true));
+
+        // A genuine rustc `Assert` terminator / `assert!` panic call keeps its
+        // fallback — the decline is anchored, not blanket.
+        for message in [
+            "panic call: std::rt::panic_fmt",
+            "invariant holds",
+            "checked that [unsafe:sep:free] cannot happen here",
+        ] {
+            let kind = VcKind::Assertion { message: message.to_string() };
+            assert!(kind.has_runtime_fallback(true), "{message:?}");
+            assert!(kind.has_runtime_fallback(false), "{message:?}");
+        }
+    }
+
+    /// LAUNDERING GUARD. A full-lane round-trip must not hand an unchecked or
+    /// sep-unsafe row back a fallback its direct arm declined.
+    ///
+    /// `recovered_full_lane_vc_tag` recovers a tag by matching `detail` — which
+    /// is the original `VcKind::description()` — against per-family prefixes.
+    /// Mutation caught: renaming `UncheckedArithmeticOverflow`'s description to
+    /// anything starting `"arithmetic overflow ("` makes the first block recover
+    /// `overflow:add` and answer `env.overflow_checks`, resurrecting HOLE B for
+    /// every round-tripped row. Likewise `"index out of bounds…"` for HOLE A.
+    /// The third block pins the `assert` arm's mirrored `[unsafe:sep:` decline.
+    #[test]
+    fn full_lane_round_trip_cannot_launder_an_unmonitored_row() {
+        // Descriptions are anchored so they can never match a checked family's
+        // prefix set.
+        let unchecked_add_detail = unchecked_add_kind().description();
+        assert_eq!(unchecked_add_detail, "unchecked arithmetic overflow (Add)");
+        assert_eq!(
+            VcKind::recovered_full_lane_vc_tag(
+                "FullVerification::ArithmeticSafety",
+                &unchecked_add_detail
+            ),
+            None,
+        );
+
+        let unchecked_index_detail = unchecked_index_kind().description();
+        assert!(unchecked_index_detail.starts_with("unchecked index bounds in "));
+        assert_eq!(
+            VcKind::recovered_full_lane_vc_tag(
+                "FullVerification::BoundsCheck",
+                &unchecked_index_detail
+            ),
+            None,
+        );
+
+        for detail in [&unchecked_add_detail, &unchecked_index_detail] {
+            for family in ["FullVerification::ArithmeticSafety", "FullVerification::BoundsCheck"] {
+                let row = full_lane(family, detail);
+                assert!(
+                    !row.has_runtime_fallback_in(RuntimeCheckEnv::new(true, true)),
+                    "family={family} detail={detail}"
+                );
+            }
+        }
+
+        // A round-tripped `[unsafe:sep:` assertion answers exactly what the
+        // direct arm answers.
+        let sep_row = full_lane(
+            "FullVerification::Assertion",
+            "assertion: [unsafe:sep:free] double-free of `p` in f; contract_id=contract:x",
+        );
+        assert_eq!(
+            VcKind::recovered_full_lane_vc_tag(
+                "FullVerification::Assertion",
+                "assertion: [unsafe:sep:free] double-free of `p` in f; contract_id=contract:x",
+            ),
+            Some("assert"),
+            "the DISPLAY tag is unchanged — only the fallback answer moved",
+        );
+        assert!(!sep_row.has_runtime_fallback_in(RuntimeCheckEnv::new(true, true)));
+
+        // An ordinary round-tripped assertion still gets its fallback.
+        let plain = full_lane("FullVerification::Assertion", "assertion: panic call: core::panic");
+        assert!(plain.has_runtime_fallback(false));
+    }
+
     #[test]
     fn non_unsupported_mir_runtime_fallback_arms_are_stable() {
         // The effective-kind derivation touches ONLY `UnsupportedMir`; every
         // other family keeps its existing answer.
-        let cases: [(VcKind, bool, bool); 8] = [
+        let cases: [(VcKind, bool, bool); 11] = [
             (
                 VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (Ty::i32(), Ty::i32()) },
                 true,
@@ -1529,8 +2272,18 @@ mod tests {
             (VcKind::IndexOutOfBounds, true, true),
             (VcKind::SliceBoundsCheck, true, true),
             (VcKind::Assertion { message: "invariant holds".into() }, true, true),
-            (VcKind::Unreachable, true, true),
+            // `Unreachable` has NO fallback: its bare-`Terminator::Unreachable`
+            // mint emits no runtime trap and the unit variant cannot prove which
+            // mint a given row came from.
+            (VcKind::Unreachable, false, false),
             (VcKind::CastOverflow { from_ty: Ty::i32(), to_ty: Ty::u32() }, false, false),
+            // The unchecked-UB family is invariant in `overflow_checks` — the
+            // knob this bool-only spelling carries is simply not the one that
+            // controls their guard, and the adapter pins the other knob OFF.
+            (unchecked_add_kind(), false, false),
+            (unchecked_index_kind(), false, false),
+            // A span-only attribute has no guard under any knob.
+            (VcKind::ContractInvariant { expression: "x > 0".into() }, false, false),
         ];
 
         for (vc_kind, with_oc, without_oc) in cases {

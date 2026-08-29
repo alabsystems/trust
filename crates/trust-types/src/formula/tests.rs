@@ -91,7 +91,9 @@ fn test_vc_kind_runtime_fallback_matrix() {
         (VcKind::Postcondition, false, false),
         (VcKind::CastOverflow { from_ty: Ty::i32(), to_ty: Ty::u32() }, false, false),
         (VcKind::NegationOverflow { ty: Ty::i32() }, true, false),
-        (VcKind::Unreachable, true, true),
+        // No fallback: bare `Terminator::Unreachable` emits no trap, and the
+        // unit variant cannot prove a row came from a panic-backed mint.
+        (VcKind::Unreachable, false, false),
         (VcKind::DeadState { state: "idle".into() }, false, false),
         (VcKind::Deadlock, false, false),
         (VcKind::Temporal { property: "always ready".into(), machine: None }, false, false),
@@ -126,6 +128,101 @@ fn test_vc_kind_runtime_fallback_matrix() {
         assert_eq!(vc_kind.has_runtime_fallback(true), with_overflow_checks);
         assert_eq!(vc_kind.has_runtime_fallback(false), without_overflow_checks);
     }
+}
+
+/// TRIPWIRE for the `VcKind::Unreachable` fallback answer, in BOTH of the two
+/// physically different arms that can produce it.
+///
+/// `has_runtime_fallback` returning `true` is a POSITIVE SAFETY CLAIM (its own
+/// doc comment says so, and `classify_runtime_disposition` turns it into a
+/// user-visible `RuntimeChecked` row). `Unreachable` cannot make that claim: it
+/// is a UNIT variant carrying no provenance, and `v2_build_terminator_vc` mints
+/// it both from a bare `Terminator::Unreachable` — which `rustc_codegen_ssa`
+/// lowers to `llvm.unreachable` with NO check emitted — and from three
+/// `Terminator::Call` panic shapes that do keep one. Nothing downstream can
+/// tell the two apart, so the answer is `false` for all of them.
+///
+/// # Why FOUR assertions and not one comparison
+///
+/// The claim is spelled twice, in two arms that share no code:
+///
+/// 1. the direct `VcKind::Unreachable` arm;
+/// 2. the `VcKind::UnsupportedMir` recovery arm, which recovers a full-lane
+///    round-trip row's effective kind by TAG and answers per that tag.
+///
+/// Asserting `direct == recovered` would be satisfied by BOTH being wrong and
+/// so cannot fail for either mutation below. They are therefore asserted
+/// SEPARATELY, and each names the mutation it exists to catch. The third
+/// assertion stops assertion 2 from passing vacuously, and the fourth stops the
+/// whole test from passing against a dead function.
+#[test]
+fn unreachable_has_no_runtime_fallback_in_either_spelling() {
+    // MUTATION 1 — the direct arm. Moving `VcKind::Unreachable` back into the
+    // `DivisionByZero | … | Assertion { .. } => true` list turns this red, and
+    // touches nothing assertion 2 reads.
+    for overflow_checks in [true, false] {
+        assert!(
+            !VcKind::Unreachable.has_runtime_fallback(overflow_checks),
+            "`VcKind::Unreachable` claimed a runtime fallback \
+             (overflow_checks={overflow_checks}). A bare `Terminator::Unreachable` emits \
+             no trap, and the unit variant cannot prove a given row came from one of the \
+             panic-backed mints — so `true` here is a false safety claim, and reaching \
+             the block is UB"
+        );
+    }
+
+    // MUTATION 2 — the `UnsupportedMir` recovery arm, a physically different
+    // code path. Re-adding `"unreach"` to that arm's
+    // `Some("divzero" | "remzero" | "bounds" | "slice" | "assert") => true`
+    // list turns this red WITHOUT touching the arm mutation 1 guards; a
+    // round-tripped row would then re-acquire the fallback the direct arm
+    // declined.
+    let round_tripped = VcKind::UnsupportedMir {
+        kind: "FullVerification::Assertion".into(),
+        detail: "unreachable code reached; contract_id=contract:trust-mc-typed-chc-public:8031b9"
+            .into(),
+    };
+    for overflow_checks in [true, false] {
+        assert!(
+            !round_tripped.has_runtime_fallback(overflow_checks),
+            "a round-tripped `FullVerification::Assertion` / `unreachable code reached` \
+             row re-acquired the fallback the `VcKind::Unreachable` arm declines \
+             (overflow_checks={overflow_checks})"
+        );
+    }
+
+    // NOT-VACUOUS PIN for mutation 2. If the detail text ever stops mapping,
+    // the row falls to the fail-closed `_ => false` default and the two
+    // assertions above answer `false` for the WRONG reason — green while
+    // guarding nothing. This pins that the fixture row really does reach the
+    // `unreach` arm, so the two answers above come from the arm under test.
+    assert_eq!(
+        VcKind::recovered_full_lane_vc_tag(
+            "FullVerification::Assertion",
+            "unreachable code reached; contract_id=contract:trust-mc-typed-chc-public:8031b9",
+        ),
+        Some("unreach"),
+        "the fixture row no longer recovers as `unreach`, so the assertions above are \
+         answering `false` from the unmapped default instead of from the arm they exist \
+         to guard — re-derive this test against the current tag table"
+    );
+
+    // INSTRUMENT CONTROL: the SAME recovery path can still answer `true`, so a
+    // blanket `has_runtime_fallback -> false` regression cannot leave this test
+    // green. `assert` is `unreach`'s own sibling inside the
+    // `FullVerification::Assertion` family, so this exercises the identical
+    // recovery route with the opposite expected answer.
+    let assert_sibling = VcKind::UnsupportedMir {
+        kind: "FullVerification::Assertion".into(),
+        detail: "assertion: panic call: std::rt::panic_fmt".into(),
+    };
+    assert!(
+        assert_sibling.has_runtime_fallback(true)
+            && assert_sibling.has_runtime_fallback(false),
+        "the `assert` sibling of the same recovered family must still answer `true` — \
+         otherwise the `false` assertions above are measuring a function that answers \
+         `false` for everything"
+    );
 }
 
 // Trust: Liveness and fairness tests.

@@ -1782,6 +1782,7 @@ mod tests {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
                 }],

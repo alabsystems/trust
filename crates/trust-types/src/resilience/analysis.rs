@@ -3,11 +3,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::{BinOp, Rvalue, SourceSpan, Statement, Terminator, VerifiableFunction};
-
 use super::external_patterns::extract_failure_model;
 use super::helpers::{assert_msg_description, classify_error_handling, detect_panic_call};
 use super::types::*;
+use crate::{BinOp, Rvalue, SourceSpan, Statement, Terminator, VerifiableFunction};
 
 /// Resilience analyzer: inspects a `VerifiableFunction` and produces a `ResilienceReport`.
 pub struct ResilienceAnalysis;
@@ -65,7 +64,8 @@ impl ResilienceAnalysis {
                         kind,
                     });
                 }
-                Terminator::Call { func: call_func, span, .. } => {
+                Terminator::Call { func: call_func, span, .. }
+                | Terminator::TailCall { func: call_func, span, .. } => {
                     if let Some(kind) = detect_panic_call(call_func) {
                         paths.push(PanicPath {
                             block: block.id,

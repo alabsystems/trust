@@ -142,6 +142,11 @@ CANONICAL_FIXTURES = {
         "ir-carries-both-languages",
         "trustc",
     ),
+    "lane-e-ir-spine/e2_rust_calls_clean_in_ir.rs": (
+        "E-ir-spine",
+        "ir-links-clean-origin",
+        "trustc",
+    ),
 }
 
 DIRECTIVE_RE = re.compile(r"^//@\s*(battery-[a-z-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
@@ -365,6 +370,7 @@ def validate_fixture_directives(path: Path, text: str) -> tuple[str, str, str]:
         "battery-flags",
         "battery-ir-lean-marker",
         "battery-ir-rust-marker",
+        "battery-ir-clean-def",
         "battery-lane",
         "battery-tool",
     }
@@ -588,7 +594,7 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
         ] + flags
 
         ir_dir = None
-        if expect == "ir-carries-both-languages":
+        if expect in ("ir-carries-both-languages", "ir-links-clean-origin"):
             ir_dir = Path(td) / "irdump"
             ir_dir.mkdir(parents=True, exist_ok=True)
             cmd += [f"-Ztrust-dump=ir:{ir_dir}"]
@@ -645,6 +651,15 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
                 rec["ir_artifact_count"] = len(rec["ir_module_artifacts"])
                 rec["ir_artifacts"] = names[:50]
                 rec["_ir_blob"] = "\n".join(blobs)
+                # IR-5 (e2): the linkage verdict reads the coverage sidecar
+                # STRUCTURED — never the marker blob (the sidecar is excluded
+                # from the blob above, deliberately, and stays excluded).
+                if expect == "ir-links-clean-origin":
+                    for f in sorted(ir_dir.rglob("*.coverage.json")):
+                        rec["_coverage_json"] = f.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        break
         except subprocess.TimeoutExpired:
             rec["exit_code"] = None
             rec["stdout"] = ""
@@ -704,6 +719,62 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
         else:
             rec["verdict"] = "frontier-malformed"
             rec["battery_ok"] = False
+
+    elif expect == "ir-links-clean-origin":
+        # IR-5 linkage: the Clean def must be RECORDED (a clean_origin.emitted
+        # row) and the Rust caller's call edge must be RE-POINTED at it (a
+        # linked row with edges_repointed >= 1, and `call @func.<id>` in the
+        # canonical text). Recording without linkage is the honest pre-IR-5
+        # verdict `ir-clean-declared-only` — a measurement, not a battery error
+        # class of its own invention (the e1 `ir-rust-only` discipline).
+        clean_def = d.get("battery-ir-clean-def", "")
+        blob = rec.pop("_ir_blob", "")
+        coverage_text = rec.pop("_coverage_json", "")
+        rec["ir_artifact_count"] = rec.get("ir_artifact_count", 0)
+        if not compiled:
+            rec["verdict"] = "ir-compile-failed"
+            rec["failure_kind"] = classify_failure(stderr)
+            rec["battery_ok"] = False
+        elif rec["ir_artifact_count"] == 0:
+            rec["verdict"] = "ir-no-artifact"
+            rec["battery_ok"] = False
+        else:
+            recorded_func_id = None
+            linked = False
+            try:
+                coverage = json.loads(coverage_text) if coverage_text else {}
+                clean_origin = coverage.get("clean_origin", {})
+                if clean_origin.get("recorded") is True:
+                    for row in clean_origin.get("emitted", []):
+                        if clean_def and clean_def in str(row.get("def_path", "")):
+                            recorded_func_id = row.get("func_id")
+                            break
+                if recorded_func_id is not None:
+                    for row in clean_origin.get("linked", []):
+                        if (
+                            row.get("target_func_id") == recorded_func_id
+                            and row.get("edges_repointed", 0) >= 1
+                        ):
+                            linked = True
+                            break
+            except (ValueError, TypeError):
+                pass
+            call_spelling = (
+                f"call @func.{recorded_func_id}(" if recorded_func_id is not None else None
+            )
+            call_in_text = bool(call_spelling) and call_spelling in blob
+            rec["clean_recorded_func_id"] = recorded_func_id
+            rec["clean_linked"] = linked
+            rec["clean_call_in_text"] = call_in_text
+            if recorded_func_id is None:
+                rec["verdict"] = "ir-no-clean-row"
+                rec["battery_ok"] = False
+            elif linked and call_in_text:
+                rec["verdict"] = "ir-links-clean-origin"
+                rec["battery_ok"] = True
+            else:
+                rec["verdict"] = "ir-clean-declared-only"
+                rec["battery_ok"] = False
 
     elif expect == "ir-carries-both-languages":
         rust_marker = d.get("battery-ir-rust-marker")
@@ -907,7 +978,12 @@ def main() -> int:
     # rows must satisfy their per-file directive.
     permitted_target_verdicts = {
         "D-legacy": {"tippy-fires-but-no-lean", "tippy-emits-lean"},
-        "E-ir-spine": {"ir-rust-only", "ir-carries-both-languages"},
+        "E-ir-spine": {
+            "ir-rust-only",
+            "ir-carries-both-languages",
+            "ir-clean-declared-only",
+            "ir-links-clean-origin",
+        },
     }
     blocking = []
     for rec in results:

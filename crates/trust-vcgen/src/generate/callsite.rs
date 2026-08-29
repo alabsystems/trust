@@ -58,10 +58,23 @@ pub fn generate_callsite_precondition_vcs(
 
     let mut vcs = Vec::new();
     for block in &func.body.blocks {
-        let Terminator::Call { func: callee_name, args, span, .. } = &block.terminator else {
-            continue;
+        let (callee_name, args, span) = match &block.terminator {
+            Terminator::Call { func, args, span, .. }
+            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+            _ => continue,
         };
         let Some(summary) = summaries.get(callee_name) else {
+            // Trust (I5 L0 lane — the fail-OPEN this arm used to be): a
+            // `None` here is not always "the callee has no contract". When the
+            // L0 definitional subset REFUSED a summary because it declares
+            // preconditions, the name is absent from the DB but the call site
+            // still owes the guard — and emitting nothing reported a caller
+            // that VIOLATES that precondition as CLEAN. Mint the fail-closed
+            // row instead. Ordinary absences are unaffected: only
+            // `definitional_precondition_free_subset` ever records a name.
+            if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+                vcs.push(crate::modular::l0_withheld_summary_vc(func, callee_name, span, count));
+            }
             if precond_debug {
                 eprintln!(
                     "[PRECOND_DEBUG/prod] fn={} block={} callee={callee_name} NO-SUMMARY (keys: {:?})",
@@ -330,10 +343,23 @@ pub fn generate_callsite_precondition_vcs_attributed(
 
     let mut out = Vec::new();
     for block in &func.body.blocks {
-        let Terminator::Call { func: callee_name, args, span, .. } = &block.terminator else {
-            continue;
+        let (callee_name, args, span) = match &block.terminator {
+            Terminator::Call { func, args, span, .. }
+            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+            _ => continue,
         };
         let Some(summary) = summaries.get(callee_name) else {
+            // Kept IDENTICAL to the non-attributed producer's arm (see there
+            // for why a `None` is not always "no contract"). The attributed
+            // shape carries the same always-true `not_p`/hypotheses pair the
+            // sibling `SummaryArityMismatch` refusal below uses.
+            if let Some(count) = summaries.l0_withheld_precondition_count(callee_name) {
+                out.push((
+                    crate::modular::l0_withheld_summary_vc(func, callee_name, span, count),
+                    Formula::Bool(true),
+                    Vec::new(),
+                ));
+            }
             if precond_debug {
                 eprintln!(
                     "[PRECOND_DEBUG] fn={} block={} callee={callee_name} NO-SUMMARY (keys: {:?})",
@@ -789,6 +815,16 @@ pub(crate) fn callee_postcondition_is_injectable(
         && dest.projections.is_empty()
         && summary.param_names.len() == arg_count
         && is_single_static_assignment(func, dest.local)
+        // Trust (postcondition composition, slice 2): a PRECONDITIONED summary
+        // is injectable only when its clauses can ride under their own guard —
+        // `summary_postconditions_ride_with_their_guard` is the shared ADMIT/EMIT
+        // predicate, and `rebind_callee_postconditions` returns EMPTY on exactly
+        // the same condition. A precondition-free summary is unaffected (the
+        // disjunct short-circuits), and a preconditioned summary WITHOUT the
+        // guard bit keeps its pre-existing behaviour on the lanes that reach it.
+        && (summary.preconditions.is_empty()
+            || !summary.postconditions_guarded_by_own_preconditions()
+            || summary_postconditions_ride_with_their_guard(summary))
         // At least one postcondition must be fully rebindable, else nothing is
         // injected (and `assumptions_injected` would over-count).
         //
@@ -828,6 +864,67 @@ pub(super) fn postcondition_rebindable(post: &Formula, param_names: &[String]) -
     post.free_variables().iter().all(|v| v == "_0" || param_names.iter().any(|p| p == v))
 }
 
+/// True iff every FREE variable of `pre` is one of the callee's FORMALS.
+///
+/// The sibling of [`postcondition_rebindable`] for the precondition ANTECEDENT,
+/// and deliberately STRICTER by one symbol: `_0` is excluded. A precondition is
+/// a statement about the callee's ENTRY state; rebinding `_0` would bind it to
+/// the caller's destination — the value the call has just PRODUCED — turning the
+/// guard into a condition on the result. That antecedent could then be
+/// discharged by facts about the post-state and release the postcondition on a
+/// call that was never in contract.
+pub(super) fn precondition_rebindable(pre: &Formula, param_names: &[String]) -> bool {
+    pre.free_variables().iter().all(|v| param_names.iter().any(|p| p == v))
+}
+
+/// Trust (postcondition composition, slice 2): whether `summary`'s
+/// postconditions may be assumed at a call site UNDER THEIR OWN PRECONDITIONS —
+/// i.e. whether the guard this summary's clauses are conditional on can actually
+/// be BUILT at a call site.
+///
+/// This is the single predicate the ADMIT and EMIT sides share:
+///   * ADMIT — [`crate::modular::SummaryDatabase::definitional_precondition_free_subset`]
+///     lets a preconditioned summary into the L0 database only when this holds,
+///     and [`callee_postcondition_is_injectable`] gates on it too;
+///   * EMIT — [`rebind_callee_postconditions`] produces the guarded implication
+///     when this holds and produces NOTHING when it does not.
+///
+/// They are one function rather than two spellings on purpose. The failure mode
+/// of a divergence is not a missing fact, it is an UNGUARDED preconditioned
+/// clause reaching a caller — the exact false PROVE this lane exists to avoid.
+///
+/// # Why each conjunct
+///
+///  * **The authority bit.** `postconditions_guarded_by_own_preconditions` is
+///    the producer's assertion that `preconditions` is the callee's COMPLETE
+///    authored `requires` set and that what it proved was the implication. A
+///    preconditioned DEFINITIONAL summary does not carry it and keeps its
+///    pre-existing withheld treatment exactly.
+///  * **Every precondition must be expressible, ALL OR NOTHING.** Dropping one
+///    conjunct of the antecedent yields `pre1 -> post` where the callee only
+///    proved `pre1 AND pre2 -> post`. That is a STRONGER claim than the contract
+///    supports, not a weaker one, so a partial guard is unsound in the ordinary
+///    "dropping a hypothesis is safe" direction's OPPOSITE. Hence `all`, and
+///    hence a single refusal kills the whole injection rather than the clause.
+///  * **No unmodeled machine arithmetic in the guard.** The antecedent is read
+///    over mathematical `Int`. If that reading is satisfiable where the callee's
+///    fixed-width `requires` is false, the implication would fire outside the
+///    contract. Same filter the postcondition side applies, in the direction
+///    that matters for an antecedent.
+///
+/// A callee with NO preconditions is not this lane's business and answers
+/// `false` here — its clause needs no guard and rides the ordinary path.
+pub(crate) fn summary_postconditions_ride_with_their_guard(
+    summary: &crate::modular::FunctionSummary,
+) -> bool {
+    !summary.preconditions.is_empty()
+        && summary.postconditions_guarded_by_own_preconditions()
+        && summary.preconditions.iter().all(|pre| {
+            !contracts::formula_uses_unmodeled_machine_arithmetic(pre)
+                && precondition_rebindable(pre, &summary.param_names)
+        })
+}
+
 pub(crate) fn rebind_callee_postconditions(
     func: &VerifiableFunction,
     args: &[Operand],
@@ -843,6 +940,62 @@ pub(crate) fn rebind_callee_postconditions(
     // Map the callee return symbol `_0` to the caller's destination place.
     let dest_name = place_to_var_name(func, dest);
     let dest_sort = crate::place_sort(func, dest).unwrap_or(Sort::Int);
+
+    // Trust (postcondition composition, slice 2): THE GUARD.
+    //
+    // What a preconditioned callee proved is `requires -> ensures`, so that is
+    // what is assumed here — the instantiated antecedent conjoined into the
+    // clause, not stripped off it. The caller obtains the postcondition exactly
+    // where its own path context entails the antecedent at THIS call site, and
+    // obtains nothing where it does not; there is no reliance on the separately
+    // emitted `VcKind::Precondition` row, which is `L1Functional` and does not
+    // survive an `L0Safety` level filter.
+    //
+    // Built from `replacements` BEFORE `_0` joins them, so the callee result
+    // symbol can never be substituted into a guard: an antecedent that could
+    // mention the value the call PRODUCED would be a condition on the
+    // post-state masquerading as an entry condition (`precondition_rebindable`
+    // rejects `_0` outright; this ordering means even a future widening there
+    // cannot bind it by accident).
+    //
+    // EMIT refuses on exactly the ADMIT predicate — an all-or-nothing
+    // `Vec::new()`, never a partially-guarded clause. A summary with no
+    // preconditions, or a preconditioned one without the guard bit, is
+    // untouched and rides the pre-existing path.
+    let guard: Option<Formula> = if summary.preconditions.is_empty()
+        || !summary.postconditions_guarded_by_own_preconditions()
+    {
+        None
+    } else {
+        if !summary_postconditions_ride_with_their_guard(summary)
+            || summary.param_names.len() != args.len()
+        {
+            return Vec::new();
+        }
+        let mut conjuncts: Vec<Formula> = summary
+            .preconditions
+            .iter()
+            .map(|pre| substitute_summary_params(pre, &replacements))
+            .collect();
+        let antecedent =
+            if conjuncts.len() == 1 { conjuncts.remove(0) } else { Formula::And(conjuncts) };
+        // The whole implication is about to be handed to
+        // `version_terminator_dest_fact`, which forces EVERY occurrence of the
+        // dest's base name to the POST-call token `s{b}_t`. In the consequent
+        // that is exactly right — it is what pins the fact to the value this
+        // call defined. In the ANTECEDENT it would be a silent time shift: an
+        // entry condition re-read against the post-state, dischargeable by
+        // facts the call itself established. Refuse instead. (Reaching this
+        // needs an actual naming the dest local, which the summary's
+        // single-static-assignment gate already makes hard to build; a
+        // fail-closed refusal costs a fact, an unnoticed time shift costs the
+        // soundness argument.)
+        if antecedent.free_variables().iter().any(|v| *v == dest_name) {
+            return Vec::new();
+        }
+        Some(antecedent)
+    };
+
     replacements.push(("_0".to_string(), Formula::var(&dest_name, dest_sort)));
 
     summary
@@ -863,6 +1016,13 @@ pub(crate) fn rebind_callee_postconditions(
         // captures a same-named caller local and can false-PROVE.
         .filter(|post| postcondition_rebindable(post, &summary.param_names))
         .map(|post| substitute_summary_params(post, &replacements))
+        // Slice 2: the clause leaves as the implication the callee proved.
+        .map(|post| match &guard {
+            Some(antecedent) => {
+                Formula::Implies(Box::new(antecedent.clone()), Box::new(post))
+            }
+            None => post,
+        })
         .collect()
 }
 

@@ -287,7 +287,7 @@ def _validate_installed_receipt(document: Mapping[str, Any]) -> None:
     )
     if doctor.get("ready") is not True or doctor.get("daily_driver_ready") is not True:
         raise ReceiptError("receipt doctor/daily-driver status is not ready")
-    if set(doctor.get("required_verifier_suites") or []) != {"trust-mc", "trust-wp", "trust-vc"}:
+    if set(doctor.get("required_verifier_suites") or []) != {"trust-mc", "trust-vc"}:
         raise ReceiptError("receipt doctor verifier-suite set is incomplete")
     doctor_report = doctor.get("report")
     if not isinstance(doctor_report, dict):

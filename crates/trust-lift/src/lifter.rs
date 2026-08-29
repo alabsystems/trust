@@ -3,12 +3,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::{FxHashMap, FxHashSet};
-
 use trust_disasm::aarch64::Aarch64Decoder;
 use trust_disasm::arch::Decoder;
 use trust_disasm::operand::Register;
 use trust_disasm::x86_64::X86_64Decoder;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{Ty, VerifiableBody};
 
 use crate::boundary::{FunctionBoundary, find_function_at};
@@ -1138,7 +1137,12 @@ mod tests {
             candidates
                 .iter()
                 .map(|candidate| {
-                    (candidate.abi_index, candidate.var_name.as_str(), candidate.reg_name.as_str(), candidate.local_index)
+                    (
+                        candidate.abi_index,
+                        candidate.var_name.as_str(),
+                        candidate.reg_name.as_str(),
+                        candidate.local_index,
+                    )
                 })
                 .collect::<Vec<_>>(),
             vec![(0, "X7", "RDI", 8), (1, "X6", "RSI", 7)],

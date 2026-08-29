@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::fmt::Write;
 use std::mem;
 
@@ -71,6 +72,11 @@ fn clean_decl_kind_and_name(decl: &clean_parser::SurfaceDecl) -> (CleanDeclKind,
         D::Section { name, .. } => opt_named(CleanDeclKind::Section, name),
         D::UniverseDecl { .. } => anon(CleanDeclKind::UniverseDecl),
         D::Variable { .. } => anon(CleanDeclKind::Variable),
+        // `include x y …` / `omit x y …` name section variables that already
+        // exist; they introduce no name of their own, so they classify anon
+        // exactly as `variable`/`open` do.
+        D::IncludeVars { .. } => anon(CleanDeclKind::IncludeVars),
+        D::OmitVars { .. } => anon(CleanDeclKind::OmitVars),
         D::Open { .. } => anon(CleanDeclKind::Open),
         D::Export { .. } => anon(CleanDeclKind::Export),
         D::DerivingInstance { .. } => anon(CleanDeclKind::DerivingInstance),

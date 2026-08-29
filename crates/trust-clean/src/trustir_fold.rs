@@ -1090,10 +1090,19 @@ pub fn sem_structural_fold_shape_of_with_bodies(
     // once. Rung B: DISTINCT variants may share one arm BLOCK (`A | B =>` — the
     // walk is per-variant, so variant-specific reads still fail per-walk).
     let mut arm_of_variant: Vec<Option<BlockId>> = vec![None; variants.len()];
+    // The MIR arm label is a RAW two's-complement bit pattern at the
+    // discriminant temp's width; `VariantDef::discriminant` is the DECODED tag
+    // (extraction boundary). Decode the label under the temp's own declared
+    // type so the two are compared in the same encoding — the pair used to be
+    // raw-vs-raw, which agreed only by accident and only while the tags were
+    // raw. An undecodable label declines the whole shape (fail closed).
+    let Some(discr_ty) = body.locals.iter().find(|l| l.index == d).map(|l| l.ty.clone()) else {
+        return Err(FoldDecline::NonDiscriminantSwitch);
+    };
     for (tag_u, blk) in targets {
-        let Ok(tag) = i128::try_from(*tag_u) else {
+        let Some(tag) = discr_ty.decode_switch_label(*tag_u) else {
             return Err(FoldDecline::UnmappedSwitchTarget(format!(
-                "switch tag {tag_u} exceeds the modeled i128 range"
+                "switch tag {tag_u} is not decodable at the discriminant's type"
             )));
         };
         let matching: Vec<usize> = variants
@@ -2022,10 +2031,7 @@ fn resolve_operand(
                     // unasserted pair's `.0` WRAPS and declines by name.
                     Some(AbsVal::CheckedPairAsserted(e)) => Ok(AbsVal::Int(e.clone())),
                     Some(AbsVal::CheckedPair(_)) => Err(FoldDecline::UnsupportedArmStatement(
-                        format!(
-                            "field 0 of UNASSERTED checked pair _{} — the wrap trap",
-                            p.local
-                        ),
+                        format!("field 0 of UNASSERTED checked pair _{} — the wrap trap", p.local),
                     )),
                     _ => Err(FoldDecline::UnsupportedArmStatement(format!(
                         "field projection of unmodeled local _{}",

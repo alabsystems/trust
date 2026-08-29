@@ -40,10 +40,8 @@ fn array_read_fn(index_def: Option<u128>) -> VerifiableFunction {
     let index_local = if index_def.is_some() { 4 } else { 2 };
     let mut bb0_stmts = Vec::new();
     if let Some(k) = index_def {
-        bb0_stmts.push(assign(
-            Place::local(4),
-            Rvalue::Use(Operand::Constant(ConstValue::Uint(k, 64))),
-        ));
+        bb0_stmts
+            .push(assign(Place::local(4), Rvalue::Use(Operand::Constant(ConstValue::Uint(k, 64)))));
     }
     bb0_stmts.push(assign(Place::local(5), Rvalue::Len(Place::local(1))));
     bb0_stmts.push(assign(
@@ -92,10 +90,7 @@ fn array_read_fn(index_def: Option<u128>) -> VerifiableFunction {
                 },
                 BasicBlock {
                     id: BlockId(1),
-                    stmts: vec![assign(
-                        Place::local(0),
-                        Rvalue::Use(Operand::Copy(read_place)),
-                    )],
+                    stmts: vec![assign(Place::local(0), Rvalue::Use(Operand::Copy(read_place)))],
                     terminator: Terminator::Return,
                 },
             ],
@@ -241,6 +236,7 @@ fn call_written_index_local_keeps_the_bounds_vc() {
             terminator: Terminator::Call {
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: "test::pick".to_string(),
                 args: vec![],
@@ -251,9 +247,5 @@ fn call_written_index_local_keeps_the_bounds_vc() {
             },
         },
     );
-    assert_eq!(
-        bounds_kind_count(&func),
-        1,
-        "a call-written index local must KEEP its bounds VC"
-    );
+    assert_eq!(bounds_kind_count(&func), 1, "a call-written index local must KEEP its bounds VC");
 }

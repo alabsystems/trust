@@ -43,7 +43,12 @@ pub(super) fn signed_result_expr(op: SignedOp, a_ref: &Expr, b_ref: &Expr) -> Ex
 ///
 /// This is the term Lemma 5 claims is def-eq to `s<op>_overflows_iW a b`. BOTH
 /// disjuncts are live (signed arithmetic underflows AND overflows).
-pub(super) fn reflected_signed_out_of_range(op: SignedOp, a_ref: &Expr, b_ref: &Expr, w: SWidth) -> Expr {
+pub(super) fn reflected_signed_out_of_range(
+    op: SignedOp,
+    a_ref: &Expr,
+    b_ref: &Expr,
+    w: SWidth,
+) -> Expr {
     let result = signed_result_expr(op, a_ref, b_ref);
     // Lt(result, MIN) ↦ Int.lt result MIN   (Lt grounds in order)
     let underflow = Expr::apps(cst("Int.lt"), [result.clone(), signed_min_expr(w)]);
@@ -66,7 +71,11 @@ pub(super) fn reflected_signed_out_of_range(op: SignedOp, a_ref: &Expr, b_ref: &
 /// is built from the prelude's reducible `Or`/`Int.lt`/`Int.add`/`Int.sub`/
 /// `Int.ofNat`/`Int.negSucc` DEFINITIONS, so the decl's transitive axiom closure is
 /// `⊆ {propext, Quot.sound, Classical.choice}`.
-pub(super) fn register_signed_overflows(env: &mut Environment, op: SignedOp, w: SWidth) -> Result<(), String> {
+pub(super) fn register_signed_overflows(
+    env: &mut Environment,
+    op: SignedOp,
+    w: SWidth,
+) -> Result<(), String> {
     let name = Name::from_string(&signed_overflows_name(op, w));
     if env.get_const(&name).is_some() {
         return Ok(());
@@ -100,7 +109,11 @@ pub(super) fn register_signed_overflows(env: &mut Environment, op: SignedOp, w: 
 /// the two operand Ints. `claimed_rhs = Some` REPLACES the spec on the RHS — used by
 /// the fail-closed tests to assert a WRONG threshold / width / dropped-disjunct /
 /// direction does NOT prove.
-pub(super) fn signed_overflow_adequacy_statement(op: SignedOp, w: SWidth, claimed_rhs: Option<&Expr>) -> Expr {
+pub(super) fn signed_overflow_adequacy_statement(
+    op: SignedOp,
+    w: SWidth,
+    claimed_rhs: Option<&Expr>,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     // Inside `∀(a:Int).∀(b:Int), …` : b = bvar(0), a = bvar(1).
     let a_ref = Expr::bvar(1);
@@ -409,7 +422,10 @@ pub fn check_neg_overflow_adequacy(w: SWidth) -> AdequacyVerdict {
 
 /// Internal: `claimed_rhs = Some(e)` overrides the spec (the fail-closed path — a wrong
 /// threshold / width / relation must make the reflexivity proof fail to type-check).
-pub(super) fn check_neg_overflow_adequacy_inner(w: SWidth, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_neg_overflow_adequacy_inner(
+    w: SWidth,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let mut env = match mirsem_safety_env() {
         Ok(e) => e,
         Err(e) => return AdequacyVerdict::KernelRejected(e),
@@ -918,7 +934,10 @@ pub fn check_usub_underflow_adequacy(w: UWidth) -> AdequacyVerdict {
 /// Internal: `claimed_rhs = Some(e)` overrides the spec (the fail-closed path — a
 /// wrong direction / comparator / threshold must make the reflexivity proof fail to
 /// type-check).
-pub(super) fn check_usub_underflow_adequacy_inner(w: UWidth, claimed_rhs: Option<&Expr>) -> AdequacyVerdict {
+pub(super) fn check_usub_underflow_adequacy_inner(
+    w: UWidth,
+    claimed_rhs: Option<&Expr>,
+) -> AdequacyVerdict {
     let mut env = match mirsem_safety_env() {
         Ok(e) => e,
         Err(e) => return AdequacyVerdict::KernelRejected(e),

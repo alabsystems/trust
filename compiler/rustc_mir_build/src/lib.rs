@@ -16,10 +16,11 @@ pub mod thir;
 // Trust (typeck-moonshot P1, Phase 3): the CHECKED witness-replay hook body.
 mod trust_replay;
 
+use std::path::PathBuf;
+
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_session::Session;
-use std::path::PathBuf;
 
 pub fn provide(providers: &mut Providers) {
     providers.queries.check_match = thir::pattern::check_match;
@@ -89,11 +90,29 @@ pub fn trust_ir_install_artifact_publication(
 // temporal annotations are a frontend contract violation and fail compilation even without a
 // dump. The finalizer also returns a typed direct-obligation capability marker; today it is
 // structural/parity-only and grants no proof authority or native-request capability.
-pub fn trust_ir_crate_finalize(tcx: TyCtxt<'_>) {
+/// Trust (wall A, instance-flip probe): re-exported for rustc_interface's
+/// post-codegen seam, mirroring [`trust_ir_crate_finalize`] — this crate already
+/// links trust-thir-lower, so no new crate edge. A no-op unless
+/// `-Ztrust-instance-flip-probe` is set (see
+/// `trust_thir_lower::instance_probe` for what it measures).
+pub fn trust_instance_probe_finalize(tcx: TyCtxt<'_>) {
+    trust_thir_lower::instance_probe::finalize_probe(tcx);
+}
+
+// Trust (IR-1, docs/design/2026-08-27-two-language-direct-to-trust-ir.md §3):
+// `clean_origin` is the Clean-origin trust-ir collection from
+// `rustc_mir_transform::clean_origin_ir` — threaded through here because this
+// crate cannot depend on rustc_mir_transform; `rustc_interface` (which depends
+// on both) performs the hand-off. `None` = verification off, the collection
+// deliberately did not run.
+pub fn trust_ir_crate_finalize(
+    tcx: TyCtxt<'_>,
+    clean_origin: Option<Vec<trust_thir_lower::clean_origin_join::CleanOriginIrOutcome>>,
+) {
     // rustc_interface prepared and invalidated the explicit artifact identity
     // before input I/O. The finalizer consumes that transaction (or prepares it
     // as a custom-driver fallback) before it forces/replays `mir_built`.
-    let summary = trust_thir_lower::crate_module::finalize_and_dump(tcx);
+    let summary = trust_thir_lower::crate_module::finalize_and_dump(tcx, clean_origin);
     if !summary.errors.is_empty() {
         tcx.dcx().fatal(format!(
             "trust-ir-lower semantic finalization failed: {}",

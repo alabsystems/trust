@@ -42,10 +42,9 @@ pub use host::{
     NamespaceBinding, NamespaceDescriptor, ParsedModule, ReExportName, ResolveExportResult,
     StarExport,
 };
-pub use record::{ModuleId, Status};
-
 use indexmap::IndexMap;
 use record::CyclicModuleRecord;
+pub use record::{ModuleId, Status};
 
 /// The result of `dynamic_import`: the imported module plus the promise its
 /// evaluation settles. The host, from the reactor job that ran the dynamic
@@ -199,10 +198,9 @@ impl<H: Host> ModuleGraph<H> {
     pub fn resolve_export(&self, id: ModuleId, name: &str) -> ResolveExportResult<H::Key> {
         let mut resolve_set = Vec::new();
         match self.resolve_export_inner(id, name, &mut resolve_set) {
-            InnerResolve::Resolved { module, binding } => ResolveExportResult::Resolved {
-                module: self.rec(module).key.clone(),
-                binding,
-            },
+            InnerResolve::Resolved { module, binding } => {
+                ResolveExportResult::Resolved { module: self.rec(module).key.clone(), binding }
+            }
             InnerResolve::Ambiguous => ResolveExportResult::Ambiguous,
             InnerResolve::NotFound => ResolveExportResult::NotFound,
         }
@@ -235,7 +233,10 @@ impl<H: Host> ModuleGraph<H> {
                 let dep = self.imported(id, &e.module_request);
                 match &e.import_name {
                     ReExportName::All => {
-                        return InnerResolve::Resolved { module: dep, binding: BindingName::Namespace };
+                        return InnerResolve::Resolved {
+                            module: dep,
+                            binding: BindingName::Namespace,
+                        };
                     }
                     ReExportName::Named(import_name) => {
                         let import_name = import_name.clone();
@@ -669,10 +670,7 @@ impl<H: Host> ModuleGraph<H> {
     /// runs its pre-await portion now and arranges, via the reactor, to call
     /// `async_module_execution_fulfilled` / `_rejected` when the await settles.
     fn execute_async_module(&mut self, host: &mut H, id: ModuleId) {
-        debug_assert!(matches!(
-            self.rec(id).status,
-            Status::Evaluating | Status::EvaluatingAsync
-        ));
+        debug_assert!(matches!(self.rec(id).status, Status::Evaluating | Status::EvaluatingAsync));
         debug_assert!(self.rec(id).has_tla);
         let key = self.rec(id).key.clone();
         host.start_async_module(&key);

@@ -19,34 +19,29 @@ pub(crate) mod portfolio;
 mod tests;
 
 // --- Re-exports: types ---
-pub use types::{
-    ChangeKind, ComposabilityResult, ComposedProof, CompositionError, CompositionNodeStatus,
-    FunctionStrength, Property,
-};
-
 // --- Re-exports: checkers ---
 pub use checkers::{
     check_composability, compose_proofs, strengthening_check, transitive_closure, weakening,
 };
 #[allow(unused_imports)]
 pub(crate) use checkers::{check_composability_semantic, negate_formula_json, strength_rank};
-
-// --- Re-exports: modular ---
-pub use modular::{modular_composition, modular_composition_with_deps};
-
 // --- Re-exports: dag ---
 pub use dag::{
     CompositionNode, CompositionVerification, IncrementalComposition, ProofComposition,
     verify_composition,
 };
-
 // --- Re-exports: manifest ---
 pub use manifest::{
     CompositionManifest, FunctionSpec, ManifestEntry, ManifestError, generate_manifest,
 };
-
+// --- Re-exports: modular ---
+pub use modular::{modular_composition, modular_composition_with_deps};
 // --- Re-exports: portfolio ---
 pub use portfolio::{
     CertificateComponent, ComposedCertificate, CompositionMethod, compose_certificates,
     make_component,
+};
+pub use types::{
+    ChangeKind, ComposabilityResult, ComposedProof, CompositionError, CompositionNodeStatus,
+    FunctionStrength, Property,
 };

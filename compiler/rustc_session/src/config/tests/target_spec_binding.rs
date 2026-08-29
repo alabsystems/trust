@@ -1,6 +1,4 @@
-use super::{
-    TargetTuple, evidence_inert_target_llvm_args_error, trust_target_spec_binding_error,
-};
+use super::{TargetTuple, evidence_inert_target_llvm_args_error, trust_target_spec_binding_error};
 
 fn json_target(contents: &str) -> TargetTuple {
     TargetTuple::TargetJson {

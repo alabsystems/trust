@@ -1,16 +1,17 @@
-# trust-wp: trustc integration boundary for trust-wp deductive verifier
+# trust-wp: standalone compatibility boundary for the trust-wp deductive verifier
 #
-# Exposes trust-wp's deductive verification as a library API callable from trust's
-# verification pass. The target contract architecture is
-# designs/2026-04-25-trust-contracts-first-class-target.md.
+# Exposes explicit standalone diagnostic and historical inspection APIs. It is
+# not called by Trust's compiler/full-verifier pass. The historical architecture
+# is documented in designs/2026-04-25-trust-contracts-first-class-target.md.
 #
-# Defines transitional standalone types (ContractSet, trust-wpResult,
-# LoopInvariant) and a trust-wpBackend trait. The CliBackend is a compatibility
-# bridge only; target trustc builds must pass TyCtxt + DefId + TrustContractBundle
-# to trust-wp in-process.
+# Retains transitional standalone types (ContractSet, TrustWpResult,
+# LoopInvariant), a TrustWpBackend trait, and historical wire inspectors. The
+# CliBackend is standalone diagnostic compatibility only. TrustWP advertises no
+# compiler/full-verifier proof kind and grants no publication authority.
 #
-# Default builds do not depend on trust-wp-core; trust-build enables the native
-# trust-wp bridge explicitly.
+# Default builds do not depend on trust-wp-core. `trust-build` compiles
+# historical native inspection/conformance support; it does not restore a
+# routed verifier capability.
 #
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -27,9 +28,9 @@ build = "build.rs"
 workspace = true
 
 [features]
-# trust #790: trust-build enables compilation against the trustc compiler tree.
-# Target behavior: verify_with_contracts accepts TyCtxt + DefId +
-# TrustContractBundle directly in-process. Subprocess mode is compatibility only.
+# trust #790: `trust-build` compiles historical native inspection/conformance
+# support against the first-party TrustWP crates. The public verifier remains
+# zero-capability and cannot authorize a verdict in either feature mode.
 trust-build = ["dep:trust-wp-core", "dep:trust-wp-ay", "dep:trust-ir"]
 
 [dependencies]

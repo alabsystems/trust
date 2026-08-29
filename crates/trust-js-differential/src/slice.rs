@@ -28,8 +28,8 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::frontmatter::parse_frontmatter;
-use crate::model::{ExternalSliceManifest, SliceManifest, SLICE_SCHEMA};
-use crate::util::{contains_subslice, today_utc, Finding};
+use crate::model::{ExternalSliceManifest, SLICE_SCHEMA, SliceManifest};
+use crate::util::{Finding, contains_subslice, today_utc};
 
 pub const INCLUDE_PREFIXES: [&str; 2] = ["test/language/", "test/built-ins/"];
 pub const EXCLUDE_PREFIXES: [&str; 4] =
@@ -194,9 +194,8 @@ pub struct SliceContext {
 
 pub fn load_slice_context(corpus: &Path) -> anyhow::Result<SliceContext> {
     let features_path = corpus.join("features.txt");
-    let text = std::fs::read_to_string(&features_path).map_err(|e| {
-        anyhow::anyhow!("S0 rule 7 needs {}: {e}", features_path.display())
-    })?;
+    let text = std::fs::read_to_string(&features_path)
+        .map_err(|e| anyhow::anyhow!("S0 rule 7 needs {}: {e}", features_path.display()))?;
     let mut proposal_features = std::collections::BTreeSet::new();
     let mut in_proposed = false;
     for line in text.lines() {
@@ -305,11 +304,7 @@ fn content_selected(
     if fm.flags.iter().any(|f| kind.exclude_flags().contains(&f.as_str())) {
         return Ok(false);
     }
-    if fm
-        .features
-        .iter()
-        .any(|f| EXCLUDE_FEATURES.contains(&f.as_str()) || f.contains("Intl"))
-    {
+    if fm.features.iter().any(|f| EXCLUDE_FEATURES.contains(&f.as_str()) || f.contains("Intl")) {
         return Ok(false);
     }
     if fm.features.iter().any(|f| ctx.proposal_features.contains(f)) {
@@ -412,7 +407,11 @@ pub fn build_manifest(corpus_revision: &str, derived: &DerivedSlice) -> SliceMan
 /// generalized to `kind`. The [rules] table always mirrors the canonical
 /// selection constants for `kind`, so a re-derivation checks against it. Used
 /// to (re)generate S-async.toml and by `slice-derive --slice-kind async --out`.
-pub fn build_external_manifest(kind: SliceKind, corpus_revision: &str, derived: &DerivedSlice) -> String {
+pub fn build_external_manifest(
+    kind: SliceKind,
+    corpus_revision: &str,
+    derived: &DerivedSlice,
+) -> String {
     fn arr(items: &[&str]) -> String {
         let inner = items.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
         format!("[{inner}]")
@@ -622,8 +621,9 @@ pub fn verify_derived(loaded: &LoadedSlice, derived: &DerivedSlice) -> Vec<Findi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
+    use super::*;
 
     fn write(root: &Path, rel: &str, content: &str) {
         let p = root.join(rel);
@@ -751,11 +751,7 @@ mod tests {
         // IN: raw-flag test stays in.
         write(root, "test/language/raw.js", "/*---\nflags: [raw]\n---*/\nx;");
         // OUT rule 7: proposal-stage feature (from the fixture features.txt).
-        write(
-            root,
-            "test/built-ins/proposal.js",
-            "/*---\nfeatures: [TestProposalFeat]\n---*/\nx;",
-        );
+        write(root, "test/built-ins/proposal.js", "/*---\nfeatures: [TestProposalFeat]\n---*/\nx;");
         // OUT rule 8: pulls a $262.-dependent harness include.
         write(
             root,
@@ -763,11 +759,7 @@ mod tests {
             "/*---\nincludes: [poison.js]\n---*/\nx;",
         );
         // IN: a clean include is fine.
-        write(
-            root,
-            "test/built-ins/clean-include.js",
-            "/*---\nincludes: [assert.js]\n---*/\nx;",
-        );
+        write(root, "test/built-ins/clean-include.js", "/*---\nincludes: [assert.js]\n---*/\nx;");
 
         let derived = derive_s0(root).unwrap();
         assert_eq!(
@@ -905,20 +897,29 @@ list_sha256 = "{}"
         // OUT rule 5: async but uses $262.
         write(root, "test/built-ins/realm.js", "/*---\nflags: [async]\n---*/\n$262.evalScript();");
         // OUT rule 6: async but Intl / listed feature.
-        write(root, "test/built-ins/sab.js", "/*---\nflags: [async]\nfeatures: [SharedArrayBuffer]\n---*/\nx;");
+        write(
+            root,
+            "test/built-ins/sab.js",
+            "/*---\nflags: [async]\nfeatures: [SharedArrayBuffer]\n---*/\nx;",
+        );
         // OUT rule 7: async but proposal-stage feature.
-        write(root, "test/built-ins/prop.js", "/*---\nflags: [async]\nfeatures: [TestProposalFeat]\n---*/\nx;");
+        write(
+            root,
+            "test/built-ins/prop.js",
+            "/*---\nflags: [async]\nfeatures: [TestProposalFeat]\n---*/\nx;",
+        );
         // OUT rule 8: async but pulls a $262.-poisoned include.
-        write(root, "test/built-ins/pi.js", "/*---\nflags: [async]\nincludes: [poison.js]\n---*/\nx;");
+        write(
+            root,
+            "test/built-ins/pi.js",
+            "/*---\nflags: [async]\nincludes: [poison.js]\n---*/\nx;",
+        );
         // OUT rule 2/3: excluded prefix + fixture.
         write(root, "test/intl402/i.js", "/*---\nflags: [async]\n---*/\nx;");
         write(root, "test/language/thing_FIXTURE.js", "/*---\nflags: [async]\n---*/\nx;");
 
         let derived = derive(root, SliceKind::SAsync).unwrap();
-        assert_eq!(
-            derived.paths,
-            ["test/built-ins/Promise/p.js", "test/language/await/a.js"]
-        );
+        assert_eq!(derived.paths, ["test/built-ins/Promise/p.js", "test/language/await/a.js"]);
         assert_eq!(derived.list_sha256, list_sha256(&derived.paths));
 
         // The same corpus under S0 selects the complement: the sync test only.

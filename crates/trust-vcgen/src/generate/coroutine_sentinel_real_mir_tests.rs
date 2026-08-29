@@ -94,12 +94,12 @@ fn real_body_mints_one_marker_candidate_per_sentinel() {
         .iter()
         .filter(|block| {
             matches!(&block.terminator, Terminator::Assert { msg, .. }
-                if matches!(
-                    msg,
-                    AssertMessage::ResumedAfterReturn
-                        | AssertMessage::ResumedAfterPanic
-                        | AssertMessage::ResumedAfterDrop
-                ))
+            if matches!(
+                msg,
+                AssertMessage::ResumedAfterReturn
+                    | AssertMessage::ResumedAfterPanic
+                    | AssertMessage::ResumedAfterDrop
+            ))
         })
         .count();
     assert_eq!(sinks, 1, "the real zero-await body carries one ResumedAfter* sink");

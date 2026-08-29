@@ -146,7 +146,8 @@ fn eval_expr(e: &TsExpr, env: &Env) -> Option<i128> {
             if args.len() != callee.params.len() {
                 return None;
             }
-            let argvals: Vec<i128> = args.iter().map(|a| eval_expr(a, env)).collect::<Option<_>>()?;
+            let argvals: Vec<i128> =
+                args.iter().map(|a| eval_expr(a, env)).collect::<Option<_>>()?;
             let mut sub = Env {
                 scalars: callee
                     .params

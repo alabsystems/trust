@@ -212,6 +212,25 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // got here (`deduce_param_attrs`). That means we can *not* apply arbitrary further MIR
     // transforms as that may invalidate those deduced facts!
 
+    // Trust (wall A): the per-INSTANCE trust-ir flip. For a GENERIC body whose THIR->trust-ir
+    // lowering was proven equivalent to the built MIR at the `mir_built` hook, and whose derived
+    // body ALSO agrees with rustc's own instantiation of its own MIR at THESE args, consume MIR
+    // re-derived from the trust-ir Module as the codegen root. This is the seam the `optimized_mir`
+    // flip cannot reach: there is no single concrete ABI at the `LocalDefId` seam for a generic
+    // body, and here there is exactly one.
+    //
+    // Placement mirrors the `ergonomic_clones` branch below, which already swaps a fully
+    // instantiated whole-`Body` root through `tcx.arena.alloc`. The deduced-facts caveat above is
+    // honoured by the provider, which re-runs `deduce_param_attrs` on the derived body and refuses
+    // any disagreement; it likewise refuses any body that references an item mono collection never
+    // scheduled. Fail-closed everywhere: `None` keeps rustc's own body.
+    if let ty::InstanceKind::Item(def_id) = instance.def
+        && def_id.is_local()
+        && let Some(flipped) = tcx.trust_instance_flip_body((def_id, instance.args))
+    {
+        mir = flipped;
+    }
+
     let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
     debug!("fn_abi: {:?}", fn_abi);
 

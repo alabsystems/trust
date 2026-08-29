@@ -89,30 +89,28 @@ pub enum MethodKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassElement {
-    Method {
-        is_static: bool,
-        kind: MethodKind,
-        key: PropKey,
-        func: Func,
-    },
-    Field {
-        is_static: bool,
-        key: PropKey,
-        init: Option<Expr>,
-    },
+    Method { is_static: bool, kind: MethodKind, key: PropKey, func: Func },
+    Field { is_static: bool, key: PropKey, init: Option<Expr> },
     StaticBlock(Vec<Stmt>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjProp {
     /// `key: value` (`was_proto`: non-computed `__proto__` in this form).
-    KeyValue { key: PropKey, value: Expr },
+    KeyValue {
+        key: PropKey,
+        value: Expr,
+    },
     /// Shorthand `{ a }`.
     Shorthand(String),
     /// Cover-only `{ a = expr }` — legal solely when the literal is reparsed
     /// as a pattern; the parser tracks the pending error.
     CoverInit(String, Box<Expr>),
-    Method { kind: MethodKind, key: PropKey, func: Func },
+    Method {
+        kind: MethodKind,
+        key: PropKey,
+        func: Func,
+    },
     Spread(Expr),
 }
 
@@ -292,15 +290,9 @@ pub struct ExportEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportDecl {
     /// `export * from 'mod'` (alias `None`) / `export * as x from 'mod'`.
-    Star {
-        alias: Option<ModuleExportName>,
-        source: String,
-    },
+    Star { alias: Option<ModuleExportName>, source: String },
     /// `export { … }` with an optional `from 'mod'` re-export clause.
-    Named {
-        specs: Vec<ExportEntry>,
-        source: Option<String>,
-    },
+    Named { specs: Vec<ExportEntry>, source: Option<String> },
     /// `export VariableStatement | Declaration` (the wrapped declaration).
     Decl(Box<Stmt>),
     /// `export default HoistableDeclaration | ClassDeclaration |

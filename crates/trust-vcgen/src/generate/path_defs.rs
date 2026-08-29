@@ -76,16 +76,48 @@ pub(crate) fn formula_survives_redefs(f: &Formula, redefined: &FxHashSet<String>
 /// from the mention test — mirroring `Formula::free_variables_inner`'s
 /// `!bound.contains(name)` binder handling exactly (the overlap test only ever runs
 /// on genuinely-free names).
-pub(super) fn formula_mentions_redef(f: &Formula, redefined: &FxHashSet<String>, bound: &[&str]) -> bool {
+pub(super) fn formula_mentions_redef(
+    f: &Formula,
+    redefined: &FxHashSet<String>,
+    bound: &[&str],
+) -> bool {
     match f {
+        // Trust #soundness (2026-08-25): a redefinition of `p` also kills the DERIVED
+        // `p__slice_len`. `place_names_overlap` alone cannot see that — `_` is not a
+        // projection separator, so `place_names_overlap("p__slice_len", "p")` is FALSE
+        // — and `write_covers_derived_slice_len` is the predicate that closes exactly
+        // that gap everywhere else in this file.
+        //
+        // MEASURED, the shape that exposed it (`/tmp/r6/r6.rs`, extracted MIR):
+        //     bb0[3]: _6 = AddressOf(_2.Deref)   // p = &raw const *sa
+        //             -> ties `_6__slice_len == _2__slice_len` (len 3)
+        //     bb1[1]: _6 = Use(Move(_7))         // p = &raw const *sb (len 1)
+        //     bb3[1]: _11 = PtrMetadata(Copy(_6))
+        // The reassignment is an `Rvalue::Use`, and `push_borrow_slice_len` is called
+        // ONLY from the `Ref`/`AddressOf` arms — never `Use` — so bb1 emits a def named
+        // `_6` and NO `_6__slice_len` def. Without the bridge the bb0 tie was not killed
+        // on that path, survived the join, and discharged `2 < _2__slice_len` = `2 < 3`:
+        // a `proved`, kernel-certified bounds row on a program that panics with
+        // "index out of bounds: the len is 1 but the index is 2".
+        //
+        // KILLING is the correct direction, and PROPAGATING through `Use` would be
+        // wrong: emitting a fresh tie there would put `== sa__slice_len` and
+        // `== sb__slice_len` on the SAME join variable — a contradiction, i.e. a
+        // vacuous proof of everything. Dropping the fact can only turn a PROVE into a
+        // FAIL, never the reverse.
         Formula::Var(name, _) => {
             !bound.contains(&name.as_str())
-                && redefined.iter().any(|n| place_names_overlap(name, n))
+                && redefined.iter().any(|n| {
+                    place_names_overlap(name, n) || write_covers_derived_slice_len(n, name)
+                })
         }
         // SymVar carries a `Symbol`; resolve to its `&str` for the same name check.
         Formula::SymVar(sym, _) => {
             let name = sym.as_str();
-            !bound.contains(&name) && redefined.iter().any(|n| place_names_overlap(name, n))
+            !bound.contains(&name)
+                && redefined.iter().any(|n| {
+                    place_names_overlap(name, n) || write_covers_derived_slice_len(n, name)
+                })
         }
         // Quantifiers extend the bound set with their binding names; only the body
         // is a sub-formula (the bindings are not). Matches `children()` + the
@@ -179,7 +211,10 @@ pub(crate) fn terminator_def_names(
                 _ => false,
             }) && !func_has_pointer_laundering(func);
             if args_cannot_reach_locals {
-                return vec![place_to_var_name(func, dest)];
+                let dest_name = place_to_var_name(func, dest);
+                let mut names = vec![dest_name.clone()];
+                push_derived_slice_len(&mut names, &dest_name);
+                return names;
             }
             // The callee may write its destination AND mutate any local whose
             // mutable reference escapes into it (`f(&mut x)` / `f(&raw mut x)`).
@@ -191,7 +226,7 @@ pub(crate) fn terminator_def_names(
             // points-to (disjoint `&mut` args) is a further completeness
             // refinement. Shared-ref interior mutability
             // is a separate, narrower residual.
-            let mut names = mutably_borrowed_local_names(func);
+            let mut names = mutably_borrowed_havoc_names(func);
             // Trust #soundness (round-12/13): also havoc every local whose type
             // TRANSITIVELY contains a mutable reference / raw pointer — a `&mut`/
             // `*mut` PARAMETER, a pointer RETURNED from a call, or one NESTED in an
@@ -233,7 +268,12 @@ pub(crate) fn terminator_def_names(
             // vacuously discharged a real overflow/assert on the post-call `s.0`
             // (a false-PROVE). Killing the dest name is monotone-sound (drops a
             // hypothesis: PROVE -> FAIL only, never the reverse).
-            names.push(place_to_var_name(func, dest));
+            let dest_name = place_to_var_name(func, dest);
+            names.push(dest_name.clone());
+            // Trust (P0 false proof — STALE LENGTH TIE): the callee writes a whole
+            // new value into `dest`, so a slice-typed `dest` gets new length
+            // metadata. See `extend_with_derived_slice_len`.
+            push_derived_slice_len(&mut names, &dest_name);
             names
         }
         // Trust #soundness (callee-write false-accept sweep): DROP GLUE RUNS
@@ -247,7 +287,7 @@ pub(crate) fn terminator_def_names(
         // mut-pointer-carrying local, the dropped place itself, and its
         // deref-extension (the pointee spelling a `Box`/ref drop mutates).
         Terminator::Drop { place, .. } => {
-            let mut names = mutably_borrowed_local_names(func);
+            let mut names = mutably_borrowed_havoc_names(func);
             names.extend(mutable_pointer_local_names(func));
             names.push(place_to_var_name(func, place));
             let mut dp = place.clone();
@@ -260,12 +300,39 @@ pub(crate) fn terminator_def_names(
         // arbitrary code — same conservative havoc as a Call (minus a dest,
         // which Opaque does not model). Dropping facts is monotone-sound.
         Terminator::Opaque { .. } => {
-            let mut names = mutably_borrowed_local_names(func);
+            let mut names = mutably_borrowed_havoc_names(func);
             names.extend(mutable_pointer_local_names(func));
             names
         }
         _ => Vec::new(),
     }
+}
+
+/// [`mutably_borrowed_local_names`] plus, for each root, the DERIVED slice-length
+/// name that reseating it invalidates.
+///
+/// Trust (P0 false proof — STALE LENGTH TIE). Code that receives `&mut s` may store
+/// a whole new fat pointer into `s`, not merely write through the old one, which
+/// changes `s__slice_len`. That derived name is not reached by `place_names_overlap`
+/// from the base name (`_` is not a projection separator), so an array→slice tie
+/// minted earlier in the function survived the call and certified-PROVED an
+/// out-of-bounds index (`q6_mut_reseat` in `tests/array_unsize_slice_len.rs`).
+///
+/// All three arbitrary-code terminators (`Call`, `Drop`, `Opaque`) share this one
+/// helper so the reseat channel cannot be closed on one and left open on another.
+/// `refine_call_havoc_names` drops only names EQUAL to a replaceable root's base
+/// name, so the derived names survive the refinement unchanged.
+///
+/// Scoped to the EXPLICITLY `&mut`-borrowed roots — `mutable_pointer_local_names`
+/// is deliberately NOT extended, for the reason [`extend_with_derived_slice_len`]
+/// documents.
+fn mutably_borrowed_havoc_names(func: &VerifiableFunction) -> Vec<String> {
+    let mut names = mutably_borrowed_local_names(func);
+    for i in 0..names.len() {
+        let base = names[i].clone();
+        push_derived_slice_len(&mut names, &base);
+    }
+    names
 }
 
 /// True if `ty` TRANSITIVELY contains a mutable reference or ANY raw pointer
@@ -364,6 +431,30 @@ pub(crate) fn mutably_borrowed_local_names(func: &VerifiableFunction) -> Vec<Str
 /// can mutate any `&mut` pointee) — so any fact about a possible referent is
 /// dropped. Monotone-sound: dropping a hypothesis can only turn a PROVE into a
 /// FAIL, never the reverse. Empty unless such a store exists.
+///
+/// Trust (P0 false proof — STALE LENGTH TIE through the DEREF-STORE channel). The
+/// `&mut`-borrowed roots carry their DERIVED slice-length names here for the same
+/// reason they do at a `Call` ([`mutably_borrowed_havoc_names`]): a store through a
+/// pointer whose POINTEE IS THE SLICE REFERENCE ITSELF (`p: &mut &[T]`, `*p = t`)
+/// RESEATS it and changes its length, which the base name alone does not reach
+/// (`_` is not a projection separator). Without this the array→slice tie minted
+/// before the store stayed live and certified-PROVED an out-of-bounds index on
+/// bodies that panic at runtime — measured on the reborrow-reseat, int-to-ptr
+/// reseat, struct-carried-pointer reseat, field-reseat and reseat-in-loop shapes.
+///
+/// A store through a pointer to an ELEMENT (`e: &mut T`, `*e = x`) preserves the
+/// length, and havocing there is the false REFUTATION
+/// `write_covers_derived_slice_len` exists to prevent. The two are separated here
+/// by the SCOPE of the extension, not by the store's pointee type: only the
+/// EXPLICITLY `&mut`-borrowed roots are extended, and a slice reference cannot be
+/// reseated through a pointer that was never derived from `&mut`/`&raw mut` of
+/// that place. `mutable_pointer_local_names` stays unextended — those entries are
+/// base locals whose own length metadata lives one projection down
+/// (`p*__slice_len`, already an overlap of `p`), so extending them would only havoc
+/// a `&mut [T]` local's live tie at every element store through an unrelated
+/// opaque pointer. Measured: the element-store controls (`&mut T` through a
+/// two-branch borrow, `v[i] = x`, a `&mut` element write in a loop, a raw-pointer
+/// element store) all keep their proofs under this scoping.
 pub(super) fn deref_store_havoc_names(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
@@ -381,7 +472,7 @@ pub(super) fn deref_store_havoc_names(
     if !has_opaque_deref_store {
         return Vec::new();
     }
-    let mut names = mutably_borrowed_local_names(func);
+    let mut names = mutably_borrowed_havoc_names(func);
     names.extend(mutable_pointer_local_names(func));
     names
 }
@@ -404,8 +495,9 @@ pub(super) fn deref_store_havoc_names(
 /// Dropping a fact only ever removes a hypothesis, so it can introduce a
 /// false-FAIL but never a false-PROVE.
 pub(super) fn extend_killing_redefs(defs: &mut Vec<Formula>, new_defs: Vec<Formula>) {
-    let redefined: FxHashSet<String> =
+    let mut redefined: FxHashSet<String> =
         new_defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    extend_with_derived_slice_len(&mut redefined);
     if !redefined.is_empty() {
         defs.retain(|f| formula_survives_redefs(f, &redefined));
     }
@@ -434,6 +526,7 @@ pub(super) fn v2_live_path_defs(
     block_defs.extend(extract_set_discriminant_definitions(func, block));
     let mut redefined: FxHashSet<String> =
         block_defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    extend_with_derived_slice_len(&mut redefined);
     redefined.extend(deref_store_havoc_names(func, block));
     if redefined.is_empty() {
         return entry_defs.to_vec();
@@ -482,6 +575,7 @@ pub(crate) fn block_written_names(
     defs.extend(extract_set_discriminant_definitions(func, block));
     let mut names: FxHashSet<String> =
         defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    extend_with_derived_slice_len(&mut names);
     names.extend(block_deref_store_havoc_names(func, block));
     names.extend(terminator_def_names(func, block));
     names
@@ -756,6 +850,7 @@ pub(crate) fn writes_until(
     defs.extend(extract_set_discriminant_definitions_until(func, block, stmt_idx));
     let mut names: FxHashSet<String> =
         defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    extend_with_derived_slice_len(&mut names);
     // Opaque deref-store havoc: if any opaque `*p = v` appears in stmts[..stmt_idx],
     // its referent-havoc is in effect from that point. `deref_store_havoc_names` is
     // block-level; gate it on a prefix occurrence so it does not leak BACKWARD to
@@ -1029,12 +1124,63 @@ pub(super) fn stmt_writes_name(
 /// write of `dst__slice_len` — a phantom write there would re-version
 /// later reads away from the live tie and reintroduce the disconnect.
 pub(super) fn write_covers_derived_slice_len(dest: &str, name: &str) -> bool {
-    name.strip_suffix("__slice_len").is_some_and(|base| {
+    name.strip_suffix(SLICE_LEN_SUFFIX).is_some_and(|base| {
         base == dest
             || (base.len() > dest.len()
                 && base.starts_with(dest)
                 && matches!(base.as_bytes()[dest.len()], b'.' | b'[' | b'*'))
     })
+}
+
+/// Suffix `guards::push_borrow_slice_len` / `push_unsize_slice_len` /
+/// `crate::slice_len_formula` append to a place name to spell its slice-length
+/// metadata symbol.
+pub(crate) const SLICE_LEN_SUFFIX: &str = "__slice_len";
+
+/// GEN-SET form of [`write_covers_derived_slice_len`], for the analyses that hold
+/// a set of written NAMES and test it with [`place_names_overlap`] rather than
+/// asking the predicate per (dest, name) pair.
+///
+/// Trust (P0 false proof — STALE LENGTH TIE, 2026-08-25). `write_covers_derived_slice_len`
+/// is applied at STATEMENT granularity (`stmt_writes_name`, `block_def_establish_stmt`),
+/// but every gen-set here is built from `formula_def_name` over
+/// `extract_block_definitions`. A block whose only write to a slice local is an
+/// `Rvalue::Use` — `s = <call dest>`, `s = t` — contributes the def `Eq(Var("s"), ..)`
+/// and hence the name `s`, never `s__slice_len`; a BORROW or an array→slice CAST
+/// contributes `Eq(Var("s__slice_len"), N)` and so mints the name by itself. The
+/// non-cast reassignment therefore left `s__slice_len` ungen'd, the cast block's
+/// token stayed the only one reaching the join, and `s__slice_len#<cast> == N` was
+/// conjoined onto a path where `s` had been reseated to a different length —
+/// certified-PROVED bodies that fault at runtime (measured on `q1_call_dest`,
+/// `q2_slice_to_slice`, `q3_loop`, `q4_merge`, `q6_mut_reseat`, `q7_after_len_read`,
+/// `q9_store_call`; see `tests/array_unsize_slice_len.rs`).
+///
+/// Only the `base == dest` branch of the predicate needs a new NAME: the
+/// projection-descendant branch is already answered by `place_names_overlap`,
+/// because `{dest}.0__slice_len` starts with `dest` followed by the `.` separator.
+///
+/// Apply to the DIRECT-WRITE channel only — statement/terminator destinations and
+/// the explicitly `&mut`-borrowed roots a callee can RESEAT. NOT to
+/// `mutable_pointer_local_names`, whose entries are base locals reached at every
+/// call in the function and whose own length metadata lives one projection down
+/// (`p*__slice_len`, already an overlap of `p`): extending those would havoc a
+/// `&mut [T]` parameter's live tie at every call, which is the false REFUTATION
+/// `write_covers_derived_slice_len` exists to prevent.
+pub(crate) fn extend_with_derived_slice_len(names: &mut FxHashSet<String>) {
+    let derived: Vec<String> = names
+        .iter()
+        .filter(|n| !n.ends_with(SLICE_LEN_SUFFIX))
+        .map(|n| format!("{n}{SLICE_LEN_SUFFIX}"))
+        .collect();
+    names.extend(derived);
+}
+
+/// [`extend_with_derived_slice_len`] for the `Vec`-shaped havoc/def name lists.
+pub(crate) fn push_derived_slice_len(names: &mut Vec<String>, dest: &str) {
+    if dest.ends_with(SLICE_LEN_SUFFIX) {
+        return;
+    }
+    names.push(format!("{dest}{SLICE_LEN_SUFFIX}"));
 }
 
 // =========================================================================
@@ -1195,7 +1341,10 @@ pub(crate) fn flip_token_distinctness_violations(func: &VerifiableFunction) -> u
 /// of the statement-granular kill): a name whose reaching-def version at block
 /// entry is non-entry.
 #[cfg(test)]
-pub(super) fn block_entry_may_reassigned(func: &VerifiableFunction, block: BlockId) -> FxHashSet<String> {
+pub(super) fn block_entry_may_reassigned(
+    func: &VerifiableFunction,
+    block: BlockId,
+) -> FxHashSet<String> {
     let entry_only = std::collections::BTreeSet::from([ENTRY_VERSION_SENTINEL.to_string()]);
     block_entry_versions(func)
         .get(&block)
@@ -1218,6 +1367,7 @@ pub(crate) fn v2_may_reassigned_per_block(
         block_defs.extend(extract_set_discriminant_definitions(func, block));
         let mut stmt: FxHashSet<String> =
             block_defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+        extend_with_derived_slice_len(&mut stmt);
         stmt.extend(deref_store_havoc_names(func, block));
         let term: FxHashSet<String> = terminator_def_names(func, block).into_iter().collect();
         gen_stmt.push(stmt);
@@ -1338,16 +1488,156 @@ pub(crate) fn conjoin_preconditions_versioned_recorded(
     // place names a different variable than the renamed body and cannot constrain
     // it — the kill's drop, by name-disjointness. Verdict-equivalence proven by
     // `flip_matches_kill_stmt`.
-    let vc = Vc::versioned(version_rename_at(&formula, &sv, func, block, terminal), block);
+    let renamed = version_rename_at(&formula, &sv, func, block, terminal);
+    // Read the ties off the SHIPPED spelling, and conjoin them in the SAME bucket as
+    // the preconditions — the bucket whose bare place names ARE the entry value.
+    // Emitted into the path-def fact stream instead, they would be stamped by this
+    // very rename into `pre == post`, the forbidden re-unification.
+    let ties = entry_sentinel_ties(func, &sv, block, terminal, &renamed);
+    let vc = Vc::versioned(renamed, block);
     // Defense in depth for callers that invoke a lower-level generator without
     // passing through `generate_vcs_impl`'s sanitized function view.
-    let kept: Vec<Formula> = preconditions
+    let mut kept: Vec<Formula> = preconditions
         .iter()
         .filter(|pre| !contracts::formula_uses_unmodeled_machine_arithmetic_in_function(func, pre))
         .cloned()
         .collect();
+    // Ties ride the SAME vector so `ob_record_conjoin` mirrors them and obligation
+    // reconstruction still reproduces `And([facts.., renamed_body])` exactly.
+    kept.extend(ties);
     let facts: Vec<Fact> = kept.iter().cloned().map(Fact::entry).collect();
     (conjoin(&facts, vc), kept)
+}
+
+/// Tie each ENTRY-SENTINEL read the in-place-update pin left behind (`n#e`) to the
+/// BARE name that denotes the same value in this conjoin bucket: `Eq(n#e, n)`.
+///
+/// `stamp_entry_valued_recurrent_read` is the only site in the crate that mints `#e`
+/// as a NAME SUFFIX, and it mints one only where the read rendered bare, i.e. where
+/// `version_token_at` said the value is the function-ENTRY one. A bare place name
+/// conjoined HERE is the entry value too (the `Fact::entry` contract). So the tie is
+/// an identity between two spellings of one value, not a new hypothesis: it cannot
+/// exclude a real execution, and it restores the precondition/type-range connection
+/// that a free `#e` costs.
+///
+/// It is NOT cosmetic. MEASURED on a safe `#[requires(n < 30)] n /= 3; … a[n]` whose
+/// use sits past a diamond join: the semantic-guard BFS weakens the establish-
+/// versioned sibling `n#s0_0 == n / 3` away, the pinned `n#s0_0 == n#e / 3` is the
+/// only carrier, `n#e` occurs once, and the bounds row is FALSELY REFUTED
+/// (`n#e = 300`).
+///
+/// The COLLISION check below and [`entry_sentinel_tie_is_sound`] enumerate every way
+/// a tie could be a FALSE equation; each is refused rather than reasoned about.
+/// `tests/entry_sentinel_tie_guards.rs` plants the violations and watches them fail.
+fn entry_sentinel_ties(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    block: BlockId,
+    terminal: usize,
+    renamed: &Formula,
+) -> Vec<Formula> {
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut ties: Vec<Formula> = Vec::new();
+    renamed.visit(&mut |node| {
+        let Formula::Var(name, sort) = node else { return };
+        // EXACT token match: a MIXED join renders `n#e_s1_t` — a partially-entry
+        // read, whose tie would be a false cross-path equality.
+        let Some((base, tok)) = name.split_once('#') else { return };
+        if tok != ENTRY_VERSION_SENTINEL || !seen.insert(name.clone()) {
+            return;
+        }
+        // COLLISION, the pin's own backstop repeated at this second minting site.
+        // `validate_function` does not reserve `#` and `place_to_var_name` permits
+        // it, so a caller-built IR may hold a local literally named `n#e`; tying it
+        // to `n` would assert a relationship the program does not have.
+        if func.body.locals.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
+            return;
+        }
+        if !entry_sentinel_tie_is_sound(func, sv, block, terminal, base) {
+            return;
+        }
+        ties.push(Formula::Eq(
+            Box::new(Formula::Var(name.clone(), sort.clone())),
+            Box::new(Formula::Var(base.to_string(), sort.clone())),
+        ));
+    });
+    ties
+}
+
+/// May `Eq(base#e, base)` be asserted at `(block, terminal)`? Three clauses, each
+/// closing one way the equation could be FALSE rather than merely uninformative.
+///
+///  * MINT SIDE. `version_token_at` also returns `None` at a block whose
+///    entry-version map is EMPTY — every block with no `v2_terminator_targets`
+///    in-edge, i.e. every cleanup block, because that successor function omits
+///    unwind edges while `v2_path_def_fixpoint` transports facts across them. An
+///    `#e` minted there names that block's local value, not the entry value. We
+///    cannot tell at the consumer WHICH block minted it, so refuse unless NO block
+///    of the function could have minted a spurious one.
+///  * CONSUMER SIDE. Tie only where this consumer VERSIONS the base, so the pinned
+///    def's subject has been stamped `base#tok` and cannot coincide with the tie's
+///    bare side. Where the subject renders bare the tie would re-mint `n == n / 3` —
+///    n pinned to 0, the original false proof, split across two conjuncts where
+///    `self_referential_definition` cannot see it.
+///    DEAD under the MINT-SIDE clause above — deleting it alone leaves the WHOLE
+///    suite green (re-measured 2026-08-28: 3977 passed, 0 failed) and no fixture
+///    isolates it.
+///    Recorded as the argument rather than as a suspicion, in the order a future
+///    edit breaks it:
+///      1. `v2_terminator_targets` ⊆ the fixpoint's enqueue set on EVERY
+///         `Terminator` variant — they differ only by the unwind edges the
+///         fixpoint adds. Guarded by `entry_sentinel_tie_subsumption_tests`.
+///      2. the token `{e}` is seeded only at bb0 and any gen replaces it, so a
+///         consumer whose set is exactly `{e}` has no v2-ancestor writing `base`.
+///      3. `base#e` has ONE mint site — `stamp_entry_valued_recurrent_read`, via
+///         `pin_in_place_update_reads` inside this fixpoint's own gen-set
+///         construction — and it stamps only a def SUBJECT, so only a block the
+///         entry-version dataflow counts as a base-WRITER can gen one.
+///    A `base#e` fact must therefore cross a v2 in-edge of the consumer; by (1)
+///    the fixpoint explores that edge and intersects its outflow in, and by (2)+(3)
+///    that predecessor gens none — so the intersection removes it. An unwind edge
+///    can still DELIVER the def, but the mandatory v2 in-edge removes it again, and
+///    a consumer with NO v2 in-edge is exactly what the MINT-SIDE clause refuses.
+///    Corroboration, not proof: 57 real-MIR fixtures (2 mint `#e`, 0 carry a
+///    bare-subject pinned def) and 6 hand-built shapes incl. all three
+///    unwind-bearing terminators; the three unwind shapes are the negative
+///    controls in `entry_sentinel_tie_subsumption_tests`.
+///    Kept because dropping a refusal is never the safer direction. What is TESTED
+///    is the IMPLICATION that makes it dead (the `debug_assert!` below) — not the
+///    clause, which must not be cited as an independently falsified guarantee.
+///  * COLLAPSE. If the base's version tokens all normalize back to the bare name,
+///    the tie degenerates to the tautology `x == x`, which the recurrence scanners
+///    report as an offending self-referential definition. Nothing is lost: both
+///    sides of the tie collapse together, so the connection exists anyway.
+fn entry_sentinel_tie_is_sound(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    block: BlockId,
+    terminal: usize,
+    base: &str,
+) -> bool {
+    if !func.body.blocks.iter().all(|b| sv.entry_map_covers(b.id, base)) {
+        return false;
+    }
+    // "mint-side passed ⇒ consumer-side passes" — the implication that makes the
+    // next clause dead. INERT IN RELEASE: it gates nothing, the `return false`
+    // below is what fails closed. Its only job is to make a silent reachability
+    // change loud in dev/test, because a live consumer-side clause means one of
+    // the three doc-comment steps above stopped holding.
+    debug_assert!(
+        sv.version_token_at(func, block, terminal, base).is_some(),
+        "`{}`: mint-side passed yet `{base}` still renders BARE at {block:?}/{terminal} — \
+         the consumer-side clause is LIVE again; re-derive its argument before \
+         trusting this refusal",
+        func.name
+    );
+    if sv.version_token_at(func, block, terminal, base).is_none() {
+        return false;
+    }
+    let base_local = (0..func.body.locals.len()).find(|&l| {
+        crate::place_to_var_name(func, &Place { local: l, projections: Vec::new() }) == base
+    });
+    !base_local.is_some_and(|l| discharge::local_versions_collapse_to_bare(func, l))
 }
 
 // DELETED (S2c item 3): `conjoin_live_preconditions` — the precondition KILL
@@ -1358,6 +1648,119 @@ pub(crate) fn conjoin_preconditions_versioned_recorded(
 // kill's drop, by name-disjointness. Verdict-equivalence proven by
 // `flip_matches_kill_stmt` (statement-granular, 125 functions, 0 disagreements)
 // and validated by the full trust-vcgen suite passing with the flip live.
+/// Pin the READS of an IN-PLACE UPDATE (`x = f(x)`) to their pre-write values.
+///
+/// `extract_block_definitions` renders a def bare, which is correct only while the
+/// subject and its reads denote the same value. For an in-place update they do NOT:
+/// the lhs `x` is the value AFTER the write, every rhs `x` the value BEFORE it. Bare,
+/// they are ONE symbol, and the consuming block's terminal rename stamps both with
+/// that block's single live token — minting the recurrence `x#t == f(x#t)`. That is
+/// never a statement about the program: it is a tautology (`x == x`) or, for any real
+/// update, unsatisfiable/over-constraining (`remain == remain / 10_000` pins `remain`
+/// to 0), and one such hypothesis vacuously discharges EVERY obligation it reaches.
+/// Measured on `sr_countdown_full[u32;N=10;exact]` — genuinely safe code — where bb3's
+/// `remain /= 10_000` flowed bare into the `buf[offset + 1/2/3]` blocks and collapsed
+/// to `Eq(remain#s3_6, Div(remain#s3_6, 10000))`.
+///
+/// So rename the reads at the establishing statement's read-point `k` (their values
+/// just BEFORE the write), then put the SUBJECT BACK TO BARE. Leaving the subject bare
+/// is what keeps this a pure narrowing rather than a re-wiring:
+///   * the consumer's terminal rename still stamps it, so the def connects to the body
+///     exactly as it does today (facts are renamed TOGETHER with the body, the
+///     connection property the pre-rename conjoin position exists to provide); and
+///   * every kill keyed on the def's name — `extend_killing_redefs`/`formula_def_name`
+///     here, `v2_live_path_defs` at the consumer — still sees the bare subject and
+///     fires unchanged. (`place_names_overlap` cannot match `x#tok` against a bare
+///     gen-set name, so versioning the subject would silently render those kills
+///     inert; the S2c rule is to add versioning WITHOUT retiring a kill.)
+///
+/// Only the rhs reads move, and only for a def that reads its own subject. Every other
+/// def passes through byte-identical.
+fn pin_in_place_update_reads(
+    sv: &StmtVersionCtx,
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    def: Formula,
+) -> Formula {
+    let Some(subj) = block_def_subject(&def) else { return def };
+    // Array term defs (`arr$L$vN`) carry their own version scheme.
+    if subj.starts_with("arr$") {
+        return def;
+    }
+    // FLOAT defs wrap the subject in `FpFromBits`, which `block_def_subject`
+    // unwraps (block_defs.rs:695) but the KILLS' own extractor does not
+    // (`formula_def_name`, and `writes_until` at :787). The bare-subject
+    // invariant this repair rests on therefore does NOT hold for them, so pass
+    // them through byte-identical rather than reason about a kill that was never
+    // watching the subject. (Found by adversarial review, 2026-08-27.)
+    if matches!(&def, Formula::Eq(l, _) if matches!(&**l, Formula::FpFromBits { .. })) {
+        return def;
+    }
+    // The `#e` symbol must be FRESH. `validate_function` does not reserve `#` in
+    // local names (lib.rs:492) and `place_to_var_name` permits it (lib.rs:5310),
+    // so a caller-constructed `VerifiableFunction` may already hold a local
+    // literally named `n#e`. Minting it would then ALIAS a real local and assert
+    // a relationship the program does not have — a false proof, not merely a
+    // weakening, because `version_rename_at` treats any `#` name as already
+    // versioned (:1102) and the collision survives. Fail closed: no repair.
+    let entry_symbol = format!("{subj}#{ENTRY_VERSION_SENTINEL}");
+    if func.body.locals.iter().any(|l| l.name.as_deref() == Some(entry_symbol.as_str())) {
+        return def;
+    }
+    let Formula::Eq(_, rhs) = &def else { return def };
+    // Only an in-place update needs this: the rhs must READ the subject.
+    if !rhs.free_variables().iter().any(|v| v.split('#').next().unwrap_or(v) == subj) {
+        return def;
+    }
+    // A deref subject `x*` is established by the borrow `x = &..` of its base.
+    let base = subj.strip_suffix('*').unwrap_or(&subj);
+    let Some(k) = block_def_establish_stmt(func, block, base, block.stmts.len()) else {
+        return def;
+    };
+    let read_versioned = version_rename_at(&def, sv, func, block.id, k);
+    let read_versioned = stamp_entry_valued_recurrent_read(read_versioned, &subj);
+    rebind_block_def_subject(read_versioned, &subj, None)
+}
+
+/// Give a recurrent read that renders BARE the explicit entry token (`n#e`).
+///
+/// `version_token_at` returns `None` — i.e. the bare name — when the value read is
+/// the function-ENTRY one, deliberately, so never-havoced parameter reads stay
+/// byte-identical across lanes. For an in-place update in the FIRST block that
+/// writes the place, that lands the read right back where it started: `n /= 3` at
+/// bb1[0] renames its read at point 0, gets `None` (bb1's entry value of `n` IS the
+/// parameter), and ships `Eq(n, Div(n, 3))` — whereupon the consumer, whose entry
+/// token for `n` is `s1_0`, stamps BOTH occurrences and re-mints
+/// `Eq(n#s1_0, Div(n#s1_0, 3))`. Pinning the read at its establish point is
+/// therefore only half the fix; MEASURED on
+/// `fn f(mut n: u32, a: &[u8; 10]) -> u8 { n /= 3; if n < 10 { a[n as usize] } else { 0 } }`
+/// (safe), where it demotes 1 of 1 obligations — fixture
+/// `tests/data/entry_block_in_place_update.json`.
+///
+/// `e` is the designated entry sentinel (`ENTRY_VERSION_SENTINEL`), so the read now
+/// names the pre-write value and only that. It is WEAKER than the bare read: bare,
+/// it would have unified with any other entry-valued read of the subject; `#e`
+/// unifies with nothing else. That cost is confined to the update's own subject —
+/// every OTHER read in the def keeps its bare entry spelling and stays connected —
+/// and it buys nothing away, because every block this def flows to is dominated by
+/// the write and so reads the subject POST-write anyway.
+fn stamp_entry_valued_recurrent_read(def: Formula, subj: &str) -> Formula {
+    let stamp = |f: &Formula| {
+        f.clone().map(&mut |node| match node {
+            Formula::Var(name, sort) if name == subj => {
+                Formula::Var(format!("{name}#{ENTRY_VERSION_SENTINEL}"), sort)
+            }
+            other => other,
+        })
+    };
+    // Read side only: the subject is rebound to BARE immediately after this, and it
+    // is the consumer's rename of that bare subject that connects the def to the body.
+    match def {
+        Formula::Eq(l, r) => Formula::Eq(l, Box::new(stamp(&r))),
+        other => other,
+    }
+}
+
 /// Monotone dataflow fixpoint over path-definition facts. `result[b]` converges to
 /// the INTERSECTION of every incoming path's accumulated defs — i.e. the facts that
 /// hold on *every* execution reaching `b`. Intersection is sound: a fact retained here
@@ -1385,6 +1788,7 @@ pub(super) fn v2_path_def_fixpoint(
 ) -> FxHashMap<BlockId, Vec<Formula>> {
     use std::collections::VecDeque;
 
+    let sv = StmtVersionCtx::build(func);
     let n = func.body.blocks.len();
     let mut result: FxHashMap<BlockId, Vec<Formula>> = FxHashMap::default();
     let mut queue: VecDeque<(BlockId, Vec<Formula>)> = VecDeque::from([(BlockId(0), Vec::new())]);
@@ -1431,7 +1835,41 @@ pub(super) fn v2_path_def_fixpoint(
         if let Some(seeded) = seed.get(&block_id) {
             extend_killing_redefs(&mut next_defs, seeded.clone());
         }
-        extend_killing_redefs(&mut next_defs, guards::extract_block_definitions(func, block));
+        // Trust (P0 false proof — the OPAQUE DEREF STORE never reached the
+        // OUTFLOW). `v2_live_path_defs` drops a block's ENTRY facts that an opaque
+        // `*p = v` in that block invalidates, so VCs INSIDE the storing block are
+        // sound; this fixpoint applied only the statement-def and terminator kills,
+        // so those same facts flowed on to the SUCCESSORS untouched. `block_written_names`
+        // (which mints the version tokens) DOES include the deref-store havoc, so the
+        // stale fact was renamed to the post-store token by `version_rename_at` and
+        // unified with the live read.
+        //
+        // The straight-line shape hid it — rustc puts the two-branch `&mut` join, the
+        // store and the use in ONE block, where the entry kill already applies. Put the
+        // use in a LATER block and the fact leaks: `let p = if c { &mut x } else { &mut y };
+        // while i < n { *p = 4_000_000_000; i += 1 } x + x` is kernel-certified PROVED
+        // while it panics at runtime (`a_scalar_reseat_in_a_loop_still_refutes` in `tests/opaque_deref_store_reseat.rs`).
+        //
+        // Kills incoming + seeded entry facts only; the block's OWN statement defs are
+        // added after and stay. Monotone-sound: dropping a hypothesis turns PROVE into
+        // FAIL, never the reverse.
+        let store_havoc = deref_store_havoc_names(func, block);
+        if !store_havoc.is_empty() {
+            let store_set: FxHashSet<String> = store_havoc.into_iter().collect();
+            next_defs.retain(|f| formula_survives_redefs(f, &store_set));
+        }
+        // Reads of an in-place update are pinned to their pre-write values BEFORE the
+        // defs cross a block boundary; the subject stays bare, so the kill computed
+        // inside `extend_killing_redefs` is byte-identical to the unversioned form.
+        // Orthogonal to the deref-store havoc kill above: that DROPS incoming facts a
+        // `*p = v` invalidates, this NARROWS the block's own defs. Both are monotone.
+        extend_killing_redefs(
+            &mut next_defs,
+            guards::extract_block_definitions(func, block)
+                .into_iter()
+                .map(|d| pin_in_place_update_reads(&sv, func, block, d))
+                .collect(),
+        );
         extend_killing_redefs(&mut next_defs, extract_set_discriminant_definitions(func, block));
         // loop-backedge: a value the block's TERMINATOR reassigns (a direct
         // `Call { dest: i }` to a user var) is invisible to the statement-based
@@ -1607,7 +2045,9 @@ pub(crate) fn v2_conjoin_path_guards_for_hardened(
     }
 }
 
-pub(super) fn v2_build_path_definition_map(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn v2_build_path_definition_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     // Pass 1: converge the pure path-definition intersection (no seed). `base[b]`
     // holds the facts true on EVERY path reaching `b`.
     let base = v2_path_def_fixpoint(func, &FxHashMap::default());

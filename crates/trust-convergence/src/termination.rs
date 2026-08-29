@@ -730,8 +730,11 @@ impl RankingAnalyzer {
             })
         } else if attempt < n.saturating_mul(3) {
             // Strategy 3: Polynomial (quadratic) combination.
-            let idx =
-                (attempt.saturating_sub(if self.config.use_lexicographic && n > 1 { n.saturating_mul(2) } else { n })) % n;
+            let idx = (attempt.saturating_sub(if self.config.use_lexicographic && n > 1 {
+                n.saturating_mul(2)
+            } else {
+                n
+            })) % n;
             let (var, _delta) = decreasing_vars[idx.min(n - 1)];
             Some(RankingFunction {
                 name: format!("rank_poly_{var}"),

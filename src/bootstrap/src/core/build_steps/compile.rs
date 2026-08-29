@@ -337,11 +337,7 @@ impl Step for Std {
             // `Formatter::write_str` (1 call) stayed an absent callee, so no impl of
             // `Debug` or `Display` could verify. An inlining heuristic must not decide
             // what a VERIFYING compiler is able to prove.
-            if trust_std_encode_mir_enabled(std::env::var_os(TRUST_STD_ENCODE_MIR_ENV).as_deref())
-                .unwrap_or_else(|message| panic!("{message}"))
-            {
-                cargo.rustflag("-Zalways-encode-mir");
-            }
+            apply_trust_std_encode_mir(&mut cargo);
             cargo
         };
 
@@ -619,6 +615,42 @@ fn compiler_rt_for_profiler(builder: &Builder<'_>) -> PathBuf {
 
 /// Configure cargo to compile the standard library, adding appropriate env vars
 /// and such.
+/// Trust: apply `-Zalways-encode-mir` to a `Mode::Std` cargo, under its gate.
+///
+/// EXTRACTED BECAUSE THE TWO STD LANES MUST NOT DRIFT. `compile::Std::run` and
+/// `test::Crate::run` both configure a `Mode::Std` cargo with `std_cargo`, and
+/// both write into the SAME target directory (`cargo.rs`'s `CARGO_TARGET_DIR` is
+/// `stage_out(compiler, mode)`, which has no `Kind` term). When only the build
+/// lane added this flag, cargo forked `core` into two units — because rustflags
+/// are hashed into cargo's `unit_id` (the `-Cextra-filename` and the
+/// `build/<pkg>/<hash>/` directory) but deliberately NOT into `c_metadata` (the
+/// `-Cmetadata`).
+///
+/// Two `core` rlibs with the same `-Cmetadata` and different content collide:
+/// `StableCrateId` is `hash(crate name, -Cmetadata, is_exe, cfg_version)`
+/// (`rustc_span/src/def_id.rs`), and `extra_filename` is not an input. That is
+/// exactly the failure `library/std_detect` hit — its `#[cfg(test)] extern crate
+/// std;` has no cargo edge to supply `std` (std_detect is a DEPENDENCY of std),
+/// so `std` resolved through the sysroot, which was linked against the BUILD
+/// lane's `core`, while `--extern core` handed the test target the TEST lane's.
+/// "found crates (`core` and `core`) with colliding StableCrateId values",
+/// followed by a bogus-looking `E0463: can't find crate for `std``.
+///
+/// Upstream does not hit this: it adds `-Zalways-encode-mir` only on the
+/// `is_for_mir_opt_tests` path, which uses a different sysroot, so its two lanes
+/// never share a directory while disagreeing about a flag.
+///
+/// Call this from EVERY `Mode::Std` cargo. A future flag that applies to one
+/// lane only re-creates this bug, and the symptom will again look like anything
+/// but a missing rustflag.
+pub fn apply_trust_std_encode_mir(cargo: &mut Cargo) {
+    if trust_std_encode_mir_enabled(std::env::var_os(TRUST_STD_ENCODE_MIR_ENV).as_deref())
+        .unwrap_or_else(|message| panic!("{message}"))
+    {
+        cargo.rustflag("-Zalways-encode-mir");
+    }
+}
+
 pub fn std_cargo(
     builder: &Builder<'_>,
     target: TargetSelection,
@@ -2071,12 +2103,9 @@ fn restore_user_facing_tools(builder: &Builder<'_>, compiler: Compiler, sysroot:
     // Trust: no stock `rust-analyzer-proc-macro-srv` alias. Purge it even when
     // the canonical server was not recopied, and detect dangling symlinks as
     // real forbidden path entries rather than relying on `Path::exists`.
-    let stock_proc_macro_srv = sysroot
-        .join("libexec")
-        .join(exe("rust-analyzer-proc-macro-srv", compiler.host));
-    t!(crate::core::build_steps::tool::remove_retired_proc_macro_srv_alias(
-        &stock_proc_macro_srv
-    ));
+    let stock_proc_macro_srv =
+        sysroot.join("libexec").join(exe("rust-analyzer-proc-macro-srv", compiler.host));
+    t!(crate::core::build_steps::tool::remove_retired_proc_macro_srv_alias(&stock_proc_macro_srv));
 }
 
 fn restore_local_compiler_aliases(builder: &Builder<'_>, compiler: Compiler, sysroot: &Path) {

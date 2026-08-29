@@ -13,13 +13,14 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
-use crate::value::{
-    units_from_str, Builtin, CollIterKind, CollKey, CollectionData, NativeErrorKind, ObjId,
-    ObjKind, Object, Prop, Value,
-};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use crate::interp::{Abrupt, ERes, Interp};
+use crate::value::{
+    Builtin, CollIterKind, CollKey, CollectionData, NativeErrorKind, ObjId, ObjKind, Object, Prop,
+    Value, units_from_str,
+};
 
 /// CanonicalizeKeyedCollectionKey (24.5.1): -0𝔽 → +0𝔽; every other value
 /// unchanged. Applied to the STORED key so iteration reads back +0.
@@ -249,34 +250,14 @@ impl Interp {
 
     /// CreateMapIterator (24.1.5.1) / CreateSetIterator (24.2.5.1): a fresh
     /// iterator sharing `this`'s store. RequireInternalSlot on the receiver.
-    fn make_coll_iterator(
-        &mut self,
-        this: &Value,
-        kind: CollIterKind,
-        is_set: bool,
-    ) -> ERes {
-        let store = if is_set {
-            self.set_store(this)?
-        } else {
-            self.map_store(this)?
-        };
-        let proto = if is_set {
-            self.intr.set_iterator_proto
-        } else {
-            self.intr.map_iterator_proto
-        };
+    fn make_coll_iterator(&mut self, this: &Value, kind: CollIterKind, is_set: bool) -> ERes {
+        let store = if is_set { self.set_store(this)? } else { self.map_store(this)? };
+        let proto =
+            if is_set { self.intr.set_iterator_proto } else { self.intr.map_iterator_proto };
         let okind = if is_set {
-            ObjKind::SetIterator {
-                target: Some(store),
-                index: 0,
-                kind,
-            }
+            ObjKind::SetIterator { target: Some(store), index: 0, kind }
         } else {
-            ObjKind::MapIterator {
-                target: Some(store),
-                index: 0,
-                kind,
-            }
+            ObjKind::MapIterator { target: Some(store), index: 0, kind }
         };
         let oid = self.alloc(Object::new(okind, Some(proto)));
         Ok(Value::Obj(oid))
@@ -292,16 +273,12 @@ impl Interp {
         let oid = *oid;
         // Read the iterator's slots; the variant must match the prototype.
         let (store, mut index, kind) = match &self.obj(oid).kind {
-            ObjKind::MapIterator {
-                target,
-                index,
-                kind,
-            } if !is_set => (target.clone(), *index, *kind),
-            ObjKind::SetIterator {
-                target,
-                index,
-                kind,
-            } if is_set => (target.clone(), *index, *kind),
+            ObjKind::MapIterator { target, index, kind } if !is_set => {
+                (target.clone(), *index, *kind)
+            }
+            ObjKind::SetIterator { target, index, kind } if is_set => {
+                (target.clone(), *index, *kind)
+            }
             _ => return Err(self.throw_native(NativeErrorKind::TypeError)),
         };
         let Some(store) = store else {
@@ -310,11 +287,7 @@ impl Interp {
         loop {
             let slot = {
                 let d = store.borrow();
-                if index >= d.entries.len() {
-                    None
-                } else {
-                    Some(d.entries[index].clone())
-                }
+                if index >= d.entries.len() { None } else { Some(d.entries[index].clone()) }
             };
             match slot {
                 // Past the end: mark exhausted ([[Map]]/[[Set]] ← empty).
@@ -333,12 +306,8 @@ impl Interp {
                         CollIterKind::Value => v,
                         CollIterKind::Entry => {
                             let arr = self.new_array(2);
-                            self.obj_mut(arr)
-                                .props
-                                .insert(units_from_str("0"), Prop::data(k));
-                            self.obj_mut(arr)
-                                .props
-                                .insert(units_from_str("1"), Prop::data(v));
+                            self.obj_mut(arr).props.insert(units_from_str("0"), Prop::data(k));
+                            self.obj_mut(arr).props.insert(units_from_str("1"), Prop::data(v));
                             self.set_array_length_raw(arr, 2.0);
                             Value::Obj(arr)
                         }
@@ -371,11 +340,7 @@ impl Interp {
     /// live iteration over the store; the callback is `(value, key, coll)` for
     /// a Map and `(value, value, coll)` for a Set.
     fn coll_for_each(&mut self, this: &Value, args: &[Value], is_set: bool) -> ERes {
-        let store = if is_set {
-            self.set_store(this)?
-        } else {
-            self.map_store(this)?
-        };
+        let store = if is_set { self.set_store(this)? } else { self.map_store(this)? };
         let cb = args.first().cloned().unwrap_or(Value::Undefined);
         let cb_fn = match &cb {
             Value::Obj(o) if self.obj(*o).is_callable() => *o,
@@ -467,25 +432,13 @@ impl Interp {
                 if !is_new {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
-                self.collection_construct(
-                    self.intr.map_proto,
-                    ObjKind::Map,
-                    arg(0),
-                    "set",
-                    true,
-                )
+                self.collection_construct(self.intr.map_proto, ObjKind::Map, arg(0), "set", true)
             }
             Builtin::SetCtor => {
                 if !is_new {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
-                self.collection_construct(
-                    self.intr.set_proto,
-                    ObjKind::Set,
-                    arg(0),
-                    "add",
-                    false,
-                )
+                self.collection_construct(self.intr.set_proto, ObjKind::Set, arg(0), "add", false)
             }
             Builtin::WeakMapCtor => {
                 if !is_new {
@@ -511,9 +464,9 @@ impl Interp {
                     false,
                 )
             }
-            Builtin::MapGroupBy => Err(Abrupt::Fatal(
-                "Map.groupBy (grouping proposal, out of slice)".to_string(),
-            )),
+            Builtin::MapGroupBy => {
+                Err(Abrupt::Fatal("Map.groupBy (grouping proposal, out of slice)".to_string()))
+            }
             Builtin::SetProtoCombinator => Err(Abrupt::Fatal(
                 "Set-methods combinator (union/intersection/... out of slice)".to_string(),
             )),

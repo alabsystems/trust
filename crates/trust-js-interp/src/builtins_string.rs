@@ -7,19 +7,21 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 use std::rc::Rc;
+
 use trust_js_value::{
-    to_integer_or_infinity, to_length_u64, to_uint32, units_from_str, ErrKind, JsValue, NativeFn,
-    PropKey, SymId, Units, WkSym,
+    ErrKind, JsValue, NativeFn, PropKey, SymId, Units, WkSym, to_integer_or_infinity,
+    to_length_u64, to_uint32, units_from_str,
 };
+
+use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 
 /// ECMA-262 WhiteSpace ∪ LineTerminator, over code units.
 fn is_ws_unit(c: u16) -> bool {
     matches!(
         c,
-        0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028
-            | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+        0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000
+            ..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
     )
 }
 
@@ -189,11 +191,8 @@ impl Interp {
                 let s = self.this_str(&this)?;
                 let search = self.to_string_units(&arg(0))?;
                 let num_pos = self.to_number(&arg(1))?;
-                let pos = if num_pos.is_nan() {
-                    f64::INFINITY
-                } else {
-                    to_integer_or_infinity(num_pos)
-                };
+                let pos =
+                    if num_pos.is_nan() { f64::INFINITY } else { to_integer_or_infinity(num_pos) };
                 let start = self.clamp_pos(pos, s.len());
                 if search.len() > s.len() {
                     return Ok(JsValue::Num(-1.0));
@@ -302,11 +301,7 @@ impl Interp {
                     .iter()
                     .map(|&c| {
                         let b = c as u8;
-                        let m = if upper {
-                            b.to_ascii_uppercase()
-                        } else {
-                            b.to_ascii_lowercase()
-                        };
+                        let m = if upper { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() };
                         u16::from(m)
                     })
                     .collect();
@@ -492,7 +487,11 @@ impl Interp {
         if !separator.is_nullish() {
             let key = PropKey::Sym(SymId::WellKnown(WkSym::Split));
             if let Some(splitter) = self.get_method(separator, &key)? {
-                return self.call_value(&splitter, separator.clone(), vec![this.clone(), limit.clone()]);
+                return self.call_value(
+                    &splitter,
+                    separator.clone(),
+                    vec![this.clone(), limit.clone()],
+                );
             }
         }
         let s = self.to_string_units(this)?;
@@ -602,12 +601,10 @@ impl Interp {
         }
         let s = self.to_string_units(this)?;
         let search = self.to_string_units(search_value)?;
-        let functional = matches!(replace_value, JsValue::Obj(o) if self.heap.obj(*o).is_callable());
-        let template: Option<Units> = if functional {
-            None
-        } else {
-            Some(self.to_string_units(replace_value)?)
-        };
+        let functional =
+            matches!(replace_value, JsValue::Obj(o) if self.heap.obj(*o).is_callable());
+        let template: Option<Units> =
+            if functional { None } else { Some(self.to_string_units(replace_value)?) };
         // Match positions.
         let mut positions: Vec<usize> = Vec::new();
         if all {

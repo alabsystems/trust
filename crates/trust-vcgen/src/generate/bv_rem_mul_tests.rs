@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue,
-    SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+    Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::generate_vcs;
@@ -106,7 +105,8 @@ fn count_bv_bounds(f: &Formula) -> usize {
     match f {
         Formula::And(fs) | Formula::Or(fs) => fs.iter().map(count_bv_bounds).sum(),
         Formula::BvULt(l, r, _) | Formula::BvULe(l, r, _) => {
-            let mentions = |g: &Formula| matches!(g, Formula::Var(n, _) if n.starts_with("__trust_ovf_bv_"));
+            let mentions =
+                |g: &Formula| matches!(g, Formula::Var(n, _) if n.starts_with("__trust_ovf_bv_"));
             usize::from(mentions(l) && matches!(r.as_ref(), Formula::BitVec { .. }))
         }
         Formula::Not(inner) => count_bv_bounds(inner),
@@ -167,24 +167,20 @@ fn zero_divisor_rem_adds_no_bound() {
 #[test]
 fn unsigned_var_var_mul_vc_carries_authenticated_record() {
     use trust_types::ObligationWrapper;
-    for (l, r, label) in
-        [(None, None, "unguarded"), (Some(100u128), Some(50u128), "rem-clamped")]
-    {
+    for (l, r, label) in [(None, None, "unguarded"), (Some(100u128), Some(50u128), "rem-clamped")] {
         let func = mod_mul_func(l, r);
         let vcs = generate_vcs(&func);
         let vc = vcs
             .iter()
             .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. }))
             .expect("the checked mul emits an overflow VC");
-        let rec = vc.obligation.as_ref().unwrap_or_else(|| {
-            panic!("{label}: the umul VC must carry a record")
-        });
+        let rec = vc
+            .obligation
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: the umul VC must carry a record"));
         // The body is the Or-range core over a Mul term, at the operand width.
-        let Formula::Or(disjuncts) = &rec.body else {
-            panic!("{label}: body must be the Or core")
-        };
-        let [Formula::Lt(under_t, min_f), Formula::Gt(over_t, max_f)] = disjuncts.as_slice()
-        else {
+        let Formula::Or(disjuncts) = &rec.body else { panic!("{label}: body must be the Or core") };
+        let [Formula::Lt(under_t, min_f), Formula::Gt(over_t, max_f)] = disjuncts.as_slice() else {
             panic!("{label}: body must be [Lt, Gt]")
         };
         assert!(matches!(&**under_t, Formula::Mul(..)), "{label}: operator is Mul");

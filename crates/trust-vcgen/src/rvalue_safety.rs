@@ -178,13 +178,17 @@ pub(crate) fn place_needs_bounds_check(place: &trust_types::Place) -> bool {
     })
 }
 
-pub(crate) fn is_direct_projection_load(rvalue: &Rvalue) -> bool {
+/// The place a direct-projection LOAD reads through, when that place carries a
+/// bounds-relevant projection — the exact place whose index rows the
+/// exact-binding native-assert suppression must cover before the rvalue walk
+/// may be skipped. `None` for every other rvalue shape.
+pub(crate) fn direct_projection_load_place(rvalue: &Rvalue) -> Option<&trust_types::Place> {
     match rvalue {
         Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
         | Rvalue::Ref { place, .. }
         | Rvalue::AddressOf(_, place)
-        | Rvalue::CopyForDeref(place) => place_needs_bounds_check(place),
-        _ => false,
+        | Rvalue::CopyForDeref(place) => place_needs_bounds_check(place).then_some(place),
+        _ => None,
     }
 }
 
@@ -400,7 +404,7 @@ pub(crate) fn collection_len_formula(
     }
 }
 
-fn slice_metadata_place(
+pub(crate) fn slice_metadata_place(
     func: &VerifiableFunction,
     collection: &trust_types::Place,
 ) -> trust_types::Place {
@@ -495,12 +499,16 @@ mod tests {
                     LocalDecl { index: 0, ty: Ty::u32(), name: None },
                     LocalDecl {
                         index: 1,
-                        ty: Ty::Adt { adt_kind: None, layout: None, 
+                        ty: Ty::Adt {
+                            adt_kind: None,
+                            layout: None,
                             name: "MyEnum".into(),
                             fields: vec![("discriminant".into(), Ty::u32())],
                             variants: Vec::new(),
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                        },
                         name: Some("e".into()),
                     },
                     LocalDecl { index: 2, ty: Ty::u32(), name: Some("d".into()) },

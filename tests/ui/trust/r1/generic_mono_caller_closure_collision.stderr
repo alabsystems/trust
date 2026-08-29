@@ -1,0 +1,33 @@
+TRUST_R1_TRACE: init: incomplete=0 address_taken=0 callers_keys=6 recursive=0 hidden=0
+TRUST_R1_TRACE: V::<N>::inner: GENERIC per-mono harvest — 1 distinct mono(s), 1 site(s)
+TRUST_R1_TRACE: V::<N>::inner: mono [N/#0] proposed P = Lt(Var("i", Int), Int(4))
+TRUST_R1_TRACE: V::<N>::inner: ADMITTED GENERIC FLIP over 1 mono(s) at 41:8
+TRUST_R1_TRACE: stored flip key='t::V::<N>::inner' kind='index out of bounds' loc=41:8 file=Some("generic_mono_caller_closure_collision.rs")
+TRUST_R1_TRACE: t::mid: GENERIC per-mono harvest — 1 distinct mono(s), 1 site(s)
+TRUST_R1_TRACE: t::mid: mono [4_usize] has no Failed VC (0 obligation(s)) — reject to stay sound
+TRUST_R1_TRACE: mid: GENERIC per-mono harvest — 1 distinct mono(s), 1 site(s)
+TRUST_R1_TRACE: mid: mono [3_usize] has no Failed VC (0 obligation(s)) — reject to stay sound
+TRUST_R1_TRACE: h: no Failed VC among 0 obligation(s)
+TRUST_R1_TRACE: g: no Failed VC among 0 obligation(s)
+TRUST_R1_TRACE: main: not Total (is_public=true address_taken=false scan_incomplete=0)
+TRUST_R1_TRACE: init: generic-mono covered=1 caller-closure=3
+TRUST_R1_TRACE: apply_r1_flips: def_path='t::V::<N>::inner' has 1 flip(s); 1 result VC(s):
+TRUST_R1_TRACE:   result kind='index out of bounds' loc=41:8 file=Some("generic_mono_caller_closure_collision.rs") proved=false
+TRUST_R1_TRACE:     native key kind='index out of bounds' loc=41:8 file=Some("generic_mono_caller_closure_collision.rs")
+TRUST_R1_TRACE:   FLIP kind='index out of bounds' loc=41:8 file=Some("generic_mono_caller_closure_collision.rs")
+
+=== Trust Verification Report (t) ===
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/generic_mono_caller_closure_collision.rs:40:5
+   |
+LL | /     fn inner(a: &[u8; 4], i: usize) -> u8 {
+LL | |         a[i]
+LL | |     }
+   | |_____^
+
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::t::mid'; stored keys=["t::V::<N>::inner"]
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::mid'; stored keys=["t::V::<N>::inner"]
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::h'; stored keys=["t::V::<N>::inner"]
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::g'; stored keys=["t::V::<N>::inner"]
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::main'; stored keys=["t::V::<N>::inner"]

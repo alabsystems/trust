@@ -80,6 +80,9 @@ use trust_vcgen::mutual_recursive_datatype_functional::mutual_recursive_datatype
 
 // ── The extracted mutual ring (loaded literal extractor output) ───────────────
 
+const FUEL_DEF_PATH: &str = "clean_kernel::level::Level";
+const PAYLOAD_DEF_PATH: &str = "clean_kernel::expr::kind::ExprKind";
+
 /// The TRUE postcondition `m fuel e = e`.
 fn identity_post(e_sort: &Sort) -> Formula {
     Formula::Eq(
@@ -116,23 +119,49 @@ fn ring(
 
     // Sanity: the artifact really is the extracted mutual shape this lane
     // expects (the full pin is the extract-side drift gate).
-    let fm = &functions["fm"];
-    let Ty::Datatype { name, variants } = &fm.body.return_ty else {
-        panic!("ring members return the modeled payload, got {:?}", fm.body.return_ty);
+    let e_sort = {
+        let fm = &functions["fm"];
+        // Authenticated artifacts use markers everywhere and carry their full
+        // definitions in `datatype_defs`; validate and consume that table.
+        let Ty::Datatype { name: marker_name, variants: marker_variants } = &fm.body.return_ty
+        else {
+            panic!("ring return must carry a datatype marker, got {:?}", fm.body.return_ty);
+        };
+        assert_eq!(marker_name, PAYLOAD_DEF_PATH);
+        assert!(marker_variants.is_empty(), "the authenticated root is a bare marker");
+        let payload = fm.body.resolved_datatype(&fm.body.return_ty);
+        let Ty::Datatype { name, variants } = payload.as_ref() else {
+            panic!("ring members return the modeled payload, got {:?}", fm.body.return_ty);
+        };
+        assert_eq!(name, PAYLOAD_DEF_PATH);
+        assert_eq!(
+            variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
+            vec![("A", 0), ("B", 1)],
+        );
+        let fuel_param_ty = &fm.body.locals.iter().find(|d| d.index == 1).expect("param _1").ty;
+        let Ty::Ref { inner: fuel_dt, .. } = fuel_param_ty else {
+            panic!("fuel param must be a reference, got {fuel_param_ty:?}");
+        };
+        assert!(
+            matches!(fuel_dt.as_ref(), Ty::Datatype { name, variants } if name == FUEL_DEF_PATH && variants.is_empty()),
+            "authenticated fuel position must carry the canonical bare marker, got {fuel_dt:?}"
+        );
+        let fuel = fm.body.resolved_datatype(fuel_dt);
+        let Ty::Datatype { name: fuel_name, variants: fuel_variants } = fuel.as_ref() else {
+            panic!("fuel param must reference a datatype, got {fuel_dt:?}");
+        };
+        assert_eq!(fuel_name, FUEL_DEF_PATH);
+        assert_eq!(
+            fuel_variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
+            vec![("Zero", 0), ("Succ", 1)],
+        );
+        Sort::from_ty(payload.as_ref())
     };
-    assert_eq!(name, "expr::kind::ExprKind");
-    assert_eq!(
-        variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
-        vec![("A", 0), ("B", 1)],
-    );
-    let e_sort = Sort::from_ty(&fm.body.return_ty);
 
     let mut out = Vec::new();
-    for (name, post) in [
-        ("fm", post_fm(&e_sort)),
-        ("gm", post_gm(&e_sort)),
-        ("hm", post_hm(&e_sort)),
-    ] {
+    for (name, post) in
+        [("fm", post_fm(&e_sort)), ("gm", post_gm(&e_sort)), ("hm", post_hm(&e_sort))]
+    {
         let mut f = functions.remove(name).expect("ring member");
         assert!(
             f.postconditions.is_empty(),
@@ -162,8 +191,8 @@ fn mutual_ring_identity_end_to_end() {
         })
         .collect();
     assert_eq!(
-        props,
-        vec![
+        props[..12],
+        [
             "mutual_recursive_datatype_functional_base::fm::A",
             "mutual_recursive_datatype_functional_base::fm::B",
             "mutual_recursive_datatype_functional_case::fm::A[calls=]",
@@ -176,10 +205,15 @@ fn mutual_ring_identity_end_to_end() {
             "mutual_recursive_datatype_functional_base::hm::B",
             "mutual_recursive_datatype_functional_case::hm::A[calls=]",
             "mutual_recursive_datatype_functional_case::hm::B[calls=fm]",
-            "mutual_recursive_datatype_functional_conclusion[mutual-induction:\
-             fuel=level::Level:Zero|Succ;data=expr::kind::ExprKind;\
-             members=fm,gm,hm;bases=6;cases=6]",
         ],
+    );
+    assert_eq!(
+        props[12],
+        format!(
+            "mutual_recursive_datatype_functional_conclusion[mutual-induction:\
+             fuel={FUEL_DEF_PATH}:Zero|Succ;data={PAYLOAD_DEF_PATH};\
+             members=fm,gm,hm;bases=6;cases=6]"
+        ),
         "bundle: {vcs:#?}"
     );
 

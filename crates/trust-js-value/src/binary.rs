@@ -49,11 +49,7 @@ pub fn to_uint8_clamp(n: f64) -> u8 {
         return fi;
     }
     // Exact tie: round to even.
-    if fi % 2 == 1 {
-        fi + 1
-    } else {
-        fi
-    }
+    if fi % 2 == 1 { fi + 1 } else { fi }
 }
 
 /// IEEE-754 binary16 encode with round-to-nearest, ties-to-even. NaN
@@ -126,11 +122,7 @@ pub fn f16_bits_to_f64(bits: u16) -> f64 {
     let mag = if exp == 0 {
         mant * 2f64.powi(-24)
     } else if exp == 0x1f {
-        if mant == 0.0 {
-            f64::INFINITY
-        } else {
-            f64::NAN
-        }
+        if mant == 0.0 { f64::INFINITY } else { f64::NAN }
     } else {
         (1.0 + mant / 1024.0) * 2f64.powi(exp - 15)
     };

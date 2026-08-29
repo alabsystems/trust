@@ -127,6 +127,31 @@ class Report:
                     label = "fix:" if i == 0 else "    "
                     print(f"         {self._c(label, '1;36')} {cmd}")
 
+        # A finding whose `check` is not in `checks_run` was never rendered by the
+        # loop above, yet it still counts below -- which produced the worst
+        # possible gate output: "N blocking ... DO NOT START A BUILD" with no FAIL
+        # line anywhere and a REMEDIATION PLAN whose commands belong to an item
+        # the operator cannot see. That is indistinguishable from a broken gate,
+        # and it is what got this preflight overridden with TRUST_SKIP_PREFLIGHT=1
+        # on a day its demand was CORRECT (the first-party/clean gitlink was stale
+        # and trust's own rustc_parse would not compile without the bump).
+        # Render them rather than counting them silently.
+        rendered = set(checks_run)
+        orphans = [f for f in self.findings if f.check not in rendered]
+        if orphans:
+            title = "--- FINDINGS OUTSIDE THE CHECKS THAT RAN "
+            print(f"\n{self._c(title + '-' * max(0, 78 - len(title)), '1')}")
+            print("         these were recorded by a check that is not in this run's")
+            print("         check list; they still COUNT below, so they are shown here")
+            print("         instead of vanishing.")
+            for f in sorted(orphans, key=lambda f: _ORDER[f.severity]):
+                print(f"  {self.tag(f.severity)} [{f.check}] {f.title}")
+                for d in f.detail:
+                    print(f"         {d}")
+                for i, cmd in enumerate(f.fix):
+                    label = "fix:" if i == 0 else "    "
+                    print(f"         {self._c(label, '1;36')} {cmd}")
+
         fails = [f for f in self.findings if f.severity == FAIL]
         warns = [f for f in self.findings if f.severity == WARN]
 
@@ -853,6 +878,134 @@ def check_submodules(root: Path, rep: Report) -> None:
     if not (drifted or uninit or conflicted):
         n = len([ln for ln in out.splitlines() if ln.strip()])
         rep.add(INFO, check, f"all {n} submodules match their pinned gitlink SHA")
+
+
+def check_pin_regression(root: Path, rep: Report) -> None:
+    """Refuse a SILENT BACKWARD move of a `first-party/*` pin.
+
+    `check_submodules` catches WORKTREE drift — the checkout differing from the
+    recorded gitlink. It cannot catch the case where the RECORDED PIN ITSELF moved
+    backward and the worktree faithfully matches it: everything reports OK while
+    the tree no longer builds.
+
+    That case is neither hypothetical nor rare. A submodule gitlink has no textual
+    content, so a merge picks a side and reports NO CONFLICT, while the consumer
+    source merges forward cleanly — the two drift apart silently. On 2026-08-25/26
+    this reverted `first-party/clean` from `0b3b94e5b3` to `99e2128ef2` FOUR times
+    across successive merges. Each time `rustc_parse` still referenced
+    `SurfaceDecl::IncludeVars`/`OmitVars`, which exist only at the newer pin, so
+    the tree failed with three E0599s in the PARSER — nowhere near the change under
+    test — after a full 90-minute build had already been spent.
+
+    `scripts/check_pin_regression.sh` was written for exactly this and was on no
+    path that runs. It is now.
+    """
+    check = "pin_regression"
+    script = root / "scripts" / "check_pin_regression.sh"
+    if not script.is_file():
+        return
+    try:
+        proc = subprocess.run(
+            ["bash", str(script)],
+            cwd=root, capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return  # never let the guard itself block a build
+    if proc.returncode == 0:
+        return
+    detail = (proc.stdout or "").strip().splitlines()
+    rep.add(
+        FAIL,
+        check,
+        "a first-party pin moves BACKWARD in this range - the tree may not build, "
+        "and a merge reports no conflict for a gitlink",
+        detail[:12],
+        [
+            "# inspect which pin regressed:",
+            "./scripts/check_pin_regression.sh",
+            "# then restore it, e.g.:",
+            "git -C first-party/<sub> checkout <intended-sha> && git add first-party/<sub>",
+        ],
+    )
+
+
+def check_pin_behind_history(root: Path, rep: Report) -> None:
+    """Refuse a pin that is STRICTLY OLDER than one this repo already recorded.
+
+    This is the half `check_pin_regression` cannot see. That guard judges
+    `origin/main..HEAD`, so it catches a regression a branch INTRODUCES and is
+    blind to one it INHERITS — and on 2026-08-26 `origin/main` itself carried the
+    stale `first-party/clean` gitlink, so nothing fired while the tree did not
+    build.
+
+    The question here is history-relative rather than branch-relative: for each
+    submodule, did some earlier superproject commit record a pin that the CURRENT
+    pin is a strict ancestor of? If so the pin moved backward at some point and
+    was never repaired, no matter who did it or on which branch.
+
+    Ancestry, not recency, is the test — a legitimate pin move to a sibling branch
+    is not an ancestor of what it replaced, so it is not flagged. Only a strict
+    walk-backward is.
+    """
+    check = "pin_behind_history"
+    try:
+        paths = subprocess.run(
+            ["git", "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+            cwd=root, capture_output=True, text=True, timeout=30,
+        ).stdout.split()
+    except Exception:
+        return
+    subs = [p for p in paths if p.startswith("first-party/")]
+
+    def pin_at(rev: str, path: str) -> str:
+        try:
+            out = subprocess.run(
+                ["git", "ls-tree", rev, "--", path],
+                cwd=root, capture_output=True, text=True, timeout=30,
+            ).stdout.split()
+            return out[2] if len(out) >= 3 and out[0] == "160000" else ""
+        except Exception:
+            return ""
+
+    for path in subs:
+        cur = pin_at("HEAD", path)
+        if not cur or not (root / path / ".git").exists():
+            continue
+        try:
+            revs = subprocess.run(
+                ["git", "log", "-40", "--format=%H", "--", path],
+                cwd=root, capture_output=True, text=True, timeout=30,
+            ).stdout.split()
+        except Exception:
+            continue
+        seen: set[str] = set()
+        for rev in revs:
+            old = pin_at(rev, path)
+            if not old or old == cur or old in seen:
+                continue
+            seen.add(old)
+            try:
+                anc = subprocess.run(
+                    ["git", "-C", path, "merge-base", "--is-ancestor", cur, old],
+                    cwd=root, capture_output=True, timeout=30,
+                )
+            except Exception:
+                continue
+            if anc.returncode == 0:
+                rep.add(
+                    FAIL,
+                    check,
+                    f"{path} pin {cur[:10]} is a STRICT ANCESTOR of {old[:10]}, "
+                    f"which this repo recorded earlier - the pin walked BACKWARD",
+                    [
+                        f"current : {cur}",
+                        f"earlier : {old}  (recorded by {rev[:10]})",
+                        "a gitlink has no textual content, so a merge picks a side and",
+                        "reports NO CONFLICT while the consumer source merges forward",
+                    ],
+                    [f"git -C {path} checkout {old[:12]} && git add {path}"],
+                )
+                break
 
 
 def check_bootstrap_submodule_policy(root: Path, cfg: dict, rep: Report) -> None:
@@ -2240,9 +2393,33 @@ def check_concurrent_build(root: Path, rep: Report, for_build: bool) -> None:
             continue
         # Must look like bootstrap AND be this checkout's bootstrap. Matching
         # loosely here caught an unrelated shell snapshot on the first run.
-        looks_like_bootstrap = re.search(
-            r"(/x\.py|/bootstrap\.py|build/bootstrap/[^/]+/bootstrap)(\s|$)", cmd
+        #
+        # 2026-08-28: it caught a second one, and the ancestor walk above cannot
+        # help. Searching the WHOLE command line cannot tell a process that IS a
+        # build from one that merely QUOTES the invocation -- `zsh -c '... x.py
+        # build ...'` and `daemonize.py -- ... x.py build ...` both contain the
+        # pattern and the root path. The ancestor exclusion misses them whenever
+        # the launcher is not an ancestor, which is exactly what a fork+setsid
+        # daemonizer produces: the daemon reparents to PID 1, so its launching
+        # shell is a SIBLING, still alive, still carrying the text. A stale
+        # launcher then blocks every future build with "ALREADY RUNNING" while
+        # `pgrep -x bootstrap` shows nothing.
+        #
+        # Anchor on argv[0] -- the thing actually executing -- instead of on the
+        # line. A real build is `.../bootstrap`, `.../x.py`, or a Python
+        # interpreter whose argv[1] is x.py/bootstrap.py. It is never a shell,
+        # and never a wrapper that happens to mention them.
+        argv = cmd.split()
+        argv0 = argv[0] if argv else ""
+        argv1 = argv[1] if len(argv) > 1 else ""
+        exe_is_bootstrap = re.search(
+            r"(x\.py|bootstrap\.py|build/bootstrap/[^/]+/bootstrap)$", argv0
         )
+        exe_is_python_running_bootstrap = bool(
+            re.search(r"/(python[0-9.]*|Python)$", argv0)
+            and re.search(r"(x\.py|bootstrap\.py)$", argv1)
+        )
+        looks_like_bootstrap = exe_is_bootstrap or exe_is_python_running_bootstrap
         subcmd = re.search(r"\b(build|check|test|dist|install|doc)\b", cmd)
         if looks_like_bootstrap and str(root) in cmd and subcmd:
             hits.append(f"pid {pid}: {cmd[:120]}")
@@ -2469,6 +2646,8 @@ def main() -> int:
         checks_run.append("1. SUBMODULE DRIFT")
         check_submodules(root, rep)
         check_bootstrap_submodule_policy(root, cfg, rep)
+        check_pin_regression(root, rep)
+        check_pin_behind_history(root, rep)
 
     workspaces: list[Path] = []
     if "lockfiles" in only:

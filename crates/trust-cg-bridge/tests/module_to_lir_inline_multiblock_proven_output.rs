@@ -55,12 +55,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::Module;
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Source the REAL bridge Module from two trust-types VerifiableFunctions:
@@ -152,16 +149,15 @@ fn make_bridge_cab_module() -> Module {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         func: "add".to_string(),
-                        args: vec![
-                            Operand::Copy(Place::local(1)),
-                            Operand::Copy(Place::local(2)),
-                        ],
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
                         span: SourceSpan::default(),
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
-                        is_unsafe_sig: false, is_foreign: false,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -208,8 +204,8 @@ fn emit_cab_text(module: &Module) -> (Vec<u8>, u64) {
 /// `add` (the inlining baseline).
 fn emit_fn_text(module: &Module, idx: usize) -> (Vec<u8>, u64) {
     let f = &module.functions[idx];
-    let lir = lower_trust_ir_function_to_lir(module, f)
-        .expect("lower_trust_ir_function_to_lir failed");
+    let lir =
+        lower_trust_ir_function_to_lir(module, f).expect("lower_trust_ir_function_to_lir failed");
     let triple = host_triple();
     let backend = TrustCgCodegenBackend::new_for_triple(TrustCgTargetArch::host(), triple);
     let obj = backend.emit_object(&[lir]).expect("emit_object failed");
@@ -808,8 +804,8 @@ fn negative_control_cab_vs_a_plus_b_plus_1_is_sat() {
     let (code, base) = emit_cab_text(&module);
     assert!(!code.is_empty(), "emitted __text is empty");
 
-    let (machine_out, precondition) = symbolic_machine_output(&code, base)
-        .expect("path-merge of the inlined cab bytes failed");
+    let (machine_out, precondition) =
+        symbolic_machine_output(&code, base).expect("path-merge of the inlined cab bytes failed");
 
     let wrong = add_plus_one_spec();
     let proven = discharge_equal_under(&precondition, &machine_out, &wrong);

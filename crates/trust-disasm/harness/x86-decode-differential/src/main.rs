@@ -244,12 +244,7 @@ fn main() {
     println!("  mismatched  : {}", counts.mismatched);
     println!(
         "  unchecked   : {}",
-        counts
-            .unchecked
-            .iter()
-            .map(|(k, v)| format!("{k:?}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        counts.unchecked.iter().map(|(k, v)| format!("{k:?}={v}")).collect::<Vec<_>>().join(", ")
     );
     if !counts.families.is_empty() {
         println!(

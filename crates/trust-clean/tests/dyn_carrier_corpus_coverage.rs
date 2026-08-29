@@ -134,7 +134,8 @@ const STALE_FIXTURE_WAIVERS: &[StaleFixtureWaiver] = &[
 
 /// CAUSE A — applies to every row. The dump predates `Ty::Dynamic::principal_key`.
 /// RETIREMENT: re-dump with a post-`8b9626a7de` `trustc` (task #199).
-const CAUSE_A: &str = "dump predates `principal_key` (8b9626a7de); consumed fail-closed by fd824f53df";
+const CAUSE_A: &str =
+    "dump predates `principal_key` (8b9626a7de); consumed fail-closed by fd824f53df";
 
 /// CAUSE B — a SECOND, independent gap, measured 2026-08-19 and not previously
 /// recorded anywhere: `clean_ground::dyn_principal_keys_in` traverses only
@@ -151,8 +152,7 @@ const CAUSE_A: &str = "dump predates `principal_key` (8b9626a7de); consumed fail
 /// its own soundness review — every new arm is a new carrier the kernel must accept).
 /// The `reachable_if_keyed` pin below makes any such widening show up as a required
 /// re-pin, so progress is measured rather than asserted.
-const CAUSE_B: &str =
-    "`dyn_principal_keys_in` never traverses to these nodes (no FnPtr/Closure/Datatype \
+const CAUSE_B: &str = "`dyn_principal_keys_in` never traverses to these nodes (no FnPtr/Closure/Datatype \
      arm, depth cap 8), so a re-dump alone cannot restore them";
 
 /// All rows share one expiry: enough runway for a re-dump, not so much that the
@@ -165,7 +165,13 @@ const fn w(
     reachable_if_keyed: usize,
     files_with_dyn: usize,
 ) -> StaleFixtureWaiver {
-    StaleFixtureWaiver { corpus, demanded, reachable_if_keyed, files_with_dyn, expires: WAIVER_EXPIRY }
+    StaleFixtureWaiver {
+        corpus,
+        demanded,
+        reachable_if_keyed,
+        files_with_dyn,
+        expires: WAIVER_EXPIRY,
+    }
 }
 
 /// RATCHET. The waived (unmodelled) demand may only ever SHRINK. Raising this number
@@ -472,14 +478,25 @@ fn trait_object_carrier_coverage_over_committed_corpus() {
     for (name, c) in &census {
         let waiver = STALE_FIXTURE_WAIVERS.iter().find(|w| w.corpus == name.as_str());
         let Some(waiver) = waiver else {
-            failures.push(format!(
-                "UNWAIVED COVERAGE COLLAPSE in corpus `{name}`: {} of {} `Ty::Dynamic` nodes \
-                 model no carrier and there is no waiver row. Either the corpus is newly \
-                 stale (fix the dumps) or a consumer regressed (fix the consumer). Adding a \
-                 row is a decision, not a workaround.",
-                c.demanded - c.minted,
-                c.demanded,
-            ));
+            // A waiver is owed only for demand the corpus does NOT model. A corpus that
+            // mints a carrier for every `Ty::Dynamic` node it has is the state this gate
+            // exists to reach, so it needs no row — and the message below would have read
+            // "0 of N nodes model no carrier", which refutes itself.
+            //
+            // `decline-handling-2026-08-25` is the first such corpus in the tree
+            // (present 1 / keyed 1 / minted 1: its dumps postdate `principal_key`), and it
+            // tripped this arm. The RATCHET below is what holds the total: it counts
+            // `td - tm`, which a fully-modelling corpus leaves unchanged.
+            if c.minted < c.demanded {
+                failures.push(format!(
+                    "UNWAIVED COVERAGE COLLAPSE in corpus `{name}`: {} of {} `Ty::Dynamic` \
+                     nodes model no carrier and there is no waiver row. Either the corpus is \
+                     newly stale (fix the dumps) or a consumer regressed (fix the consumer). \
+                     Adding a row is a decision, not a workaround.",
+                    c.demanded - c.minted,
+                    c.demanded,
+                ));
+            }
             continue;
         };
 

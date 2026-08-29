@@ -80,7 +80,17 @@ pub fn parse_spec_expr_result(input: &str) -> Result<Formula, SpecParseError> {
     let mut parser = Parser::new(tokens);
     let formula = parser.parse_implies()?;
 
-    if parser.is_eof() { Ok(formula) } else { Err(SpecParseError::TrailingTokens) }
+    if parser.is_eof() {
+        return Ok(formula);
+    }
+    // Name the construct instead of reporting a bare "trailing tokens". An `as`
+    // cast is the measured case: `u32::MAX` alone parses, so the generic message
+    // pointed at the wrong place entirely. Still a refusal — see
+    // `SpecParseError::UnsupportedCast` for why this parser cannot decide casts.
+    if parser.peek() == Some(&Token::Ident("as".to_string())) {
+        return Err(SpecParseError::UnsupportedCast { clause: input.trim().to_string() });
+    }
+    Err(SpecParseError::TrailingTokens)
 }
 
 /// Reject alternate decimal spellings before tokenization erases them.
@@ -1892,6 +1902,46 @@ mod tests {
 
         let err = parse_spec_expr_result("   ").unwrap_err();
         assert!(matches!(err, SpecParseError::Empty));
+    }
+
+    /// D3. An `as` cast is still REFUSED — this parser cannot decide whether a
+    /// cast preserves its operand's value, because it has neither the operand's
+    /// type nor the target pointer width — but the refusal must NAME the cast.
+    ///
+    /// The measured complaint: `requires idx <= u32::MAX as usize` reported only
+    /// "trailing tokens after expression" while `u32::MAX` alone was accepted,
+    /// so the message pointed away from the construct that was refused.
+    #[test]
+    fn cast_refusal_names_the_cast_instead_of_reporting_trailing_tokens() {
+        let err = parse_spec_expr_result("idx <= u32::MAX as usize").unwrap_err();
+        match &err {
+            SpecParseError::UnsupportedCast { clause } => {
+                assert_eq!(clause, "idx <= u32::MAX as usize");
+            }
+            other => panic!("expected UnsupportedCast, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("`as` casts are not supported"), "{message}");
+        assert!(message.contains("truncating"), "must say WHY it refuses: {message}");
+
+        // The bare constant still parses, which is exactly why the old generic
+        // message was misleading.
+        assert!(parse_spec_expr_result("idx <= u32::MAX").is_ok());
+
+        // The FIRST-CLASS clause lane has its own parser (`spec_attrs`), and it
+        // is the lane ay's native `requires` actually goes through. It must
+        // give the same named refusal, not the generic one.
+        let native = crate::parse_spec_attr("requires", "idx <= u32::MAX as usize").unwrap_err();
+        assert!(
+            matches!(&native, SpecParseError::UnsupportedCast { clause } if clause == "idx <= u32::MAX as usize"),
+            "first-class clause lane must name the cast too, got {native:?}"
+        );
+
+        // A genuine trailing-token error is still reported as one.
+        assert!(matches!(
+            parse_spec_expr_result("x 1").unwrap_err(),
+            SpecParseError::TrailingTokens
+        ));
     }
 
     #[test]

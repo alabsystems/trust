@@ -7,9 +7,5 @@
 // model that tracked "some guard exists" rather than "this index's guard exists"
 // would falsely prove the unguarded `s[j]` access.
 pub fn conj_guard_two_index(s: &[u32], i: usize, j: usize) -> u32 {
-    if i < s.len() {
-        s[i].wrapping_add(s[j])
-    } else {
-        0
-    }
+    if i < s.len() { s[i].wrapping_add(s[j]) } else { 0 }
 }

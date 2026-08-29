@@ -330,8 +330,9 @@ pub fn recheck_lift_instantiate_swap(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_ir::ProofEvidence;
+
+    use super::*;
 
     /// THE MILESTONE + the consumer-side fail-closed gates, exercised on a single
     /// minted certificate (each spec rebuild is heavy, so they share one mint):

@@ -36,9 +36,33 @@ pub struct CertSigningKey {
 
 impl CertSigningKey {
     /// Generate a new random signing key at the given trust level.
+    ///
+    /// # Where the entropy comes from, and why this is not `SigningKey::generate`
+    ///
+    /// The seed is drawn by [`trust_rand::secret_seed_32`] — Trust-owned, OS
+    /// entropy, zero third-party dependencies — and expanded by
+    /// [`SigningKey::from_bytes`]. It is deliberately *not* written as
+    /// `SigningKey::generate(&mut rng)`: that constructor's bound is
+    /// `rand_core::CryptoRngCore`, a third-party trait, so keeping it would
+    /// hold the whole `rand`/`rand_core` closure in the shipping graph for one
+    /// 32-byte draw. `trust-ed25519` therefore omits `generate` entirely.
+    ///
+    /// The two spellings are **equal**, not merely similar, and that is
+    /// established by test rather than by reading the incumbent's source:
+    /// `crates/trust-rand/tests/ed25519_equivalence.rs` feeds a deterministic
+    /// RNG emitting a fixed 32 bytes to `SigningKey::generate` and asserts the
+    /// secret key, verifying key and signature are byte-identical to
+    /// `SigningKey::from_bytes` on the same bytes. That test fails loudly if a
+    /// future incumbent ever puts a KDF, a rejection loop, or a clamping step
+    /// between the RNG and `from_bytes`.
+    ///
+    /// # Panics
+    ///
+    /// If the OS entropy source cannot supply 32 bytes, or supplies a
+    /// degenerate all-zero draw. Both are fail-closed: a key is never minted
+    /// from entropy that was not delivered.
     pub fn generate(trust_level: TrustLevel) -> Self {
-        let mut rng = rand::thread_rng();
-        let key = SigningKey::generate(&mut rng);
+        let key = SigningKey::from_bytes(&trust_rand::secret_seed_32());
         CertSigningKey { key, trust_level }
     }
 

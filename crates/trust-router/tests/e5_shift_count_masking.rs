@@ -37,7 +37,10 @@ fn shift_loop(op: BinOp, count: i128) -> VerifiableFunction {
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Gt,
                             Operand::Copy(Place::local(1)),
-                            Operand::Constant(ConstValue::Int(0)),
+                            // Extractor-faithful spelling: rustc emits `const 0_u8`
+                            // for a u8 comparison, and the admission audit binds
+                            // unsigned constants by their carried width.
+                            Operand::Constant(ConstValue::Uint(0, 8)),
                         ),
                         span: SourceSpan::default(),
                     }],

@@ -115,11 +115,7 @@ pub fn e16_if_nested_cond(a: u32, b: u32, c: u32) -> u32 {
 
 #[inline(never)]
 pub fn e17_if_arms_are_ifs(a: u32, b: u32, c: u32) -> u32 {
-    if a == b {
-        if b == c { a } else { b }
-    } else {
-        if a == c { c } else { a }
-    }
+    if a == b { if b == c { a } else { b } } else { if a == c { c } else { a } }
 }
 
 #[inline(never)]

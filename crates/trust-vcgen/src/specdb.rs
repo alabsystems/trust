@@ -228,6 +228,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "parse".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -243,6 +244,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "sqrt".to_string(),
                             args: vec![Operand::Copy(Place::local(2))],
@@ -388,6 +390,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "parse".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],

@@ -45,9 +45,8 @@
 //!    24 GB host from OOM-panicking.
 //!
 //! 4. **Full-verifier three-suite sample** (`three_suite_sample`): a same-run
-//!    typed fail-closed manifest with accepted trust-mc/trust-wp evidence and
-//!    rejected trust-vc evidence pending actual Lean kernel replay, plus its
-//!    paired missing-suite negative row. The shared validator lives in
+//!    typed fail-closed MC/VC/TY ownership manifest whose proof-free rows are
+//!    all rejected, plus its paired missing-active-suite negative row. The shared validator lives in
 //!    `pipeline_v2.rs` so these two modes cannot drift back to different proof
 //!    claims.
 //!

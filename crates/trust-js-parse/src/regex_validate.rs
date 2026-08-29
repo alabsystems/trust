@@ -19,7 +19,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::lexer::{is_id_continue, is_id_start, Fail};
+use crate::lexer::{Fail, is_id_continue, is_id_start};
 use crate::unicode_props::{P_KNOWN_INVALID, P_VALID_U, P_VALID_V_ONLY};
 
 pub fn validate_regex(pattern: &str, flags: &str) -> Result<(), Fail> {
@@ -234,9 +234,7 @@ impl PatParser {
                 } else if self.unicode {
                     Err(Fail::early("lone '{' in unicode-mode regex"))
                 } else {
-                    Err(Fail::unsupported(
-                        "regex: literal '{' (annexB ExtendedPatternCharacter)",
-                    ))
+                    Err(Fail::unsupported("regex: literal '{' (annexB ExtendedPatternCharacter)"))
                 }
             }
             _ => {
@@ -373,18 +371,14 @@ impl PatParser {
                 if self.unicode {
                     Err(Fail::early("lone ']' in unicode-mode regex"))
                 } else {
-                    Err(Fail::unsupported(
-                        "regex: literal ']' (annexB ExtendedPatternCharacter)",
-                    ))
+                    Err(Fail::unsupported("regex: literal ']' (annexB ExtendedPatternCharacter)"))
                 }
             }
             '}' => {
                 if self.unicode {
                     Err(Fail::early("lone '}' in unicode-mode regex"))
                 } else {
-                    Err(Fail::unsupported(
-                        "regex: literal '}' (annexB ExtendedPatternCharacter)",
-                    ))
+                    Err(Fail::unsupported("regex: literal '}' (annexB ExtendedPatternCharacter)"))
                 }
             }
             '\\' => {
@@ -433,9 +427,7 @@ impl PatParser {
         }
         for c in &add {
             if remove.contains(c) {
-                return Err(Fail::early(
-                    "flag both added and removed in regex modifier group",
-                ));
+                return Err(Fail::early("flag both added and removed in regex modifier group"));
             }
         }
         Ok(())
@@ -506,18 +498,12 @@ impl PatParser {
             if self.vmode && !negated {
                 return Ok(());
             }
-            return Err(Fail::early(
-                "string property escape invalid here (negated or non-v mode)",
-            ));
+            return Err(Fail::early("string property escape invalid here (negated or non-v mode)"));
         }
         if P_KNOWN_INVALID.binary_search(&name.as_str()).is_ok() {
-            return Err(Fail::early(format!(
-                "unknown unicode property '{name}' in regex"
-            )));
+            return Err(Fail::early(format!("unknown unicode property '{name}' in regex")));
         }
-        Err(Fail::unsupported(format!(
-            "regex: unicode property '{name}' not in the modeled table"
-        )))
+        Err(Fail::unsupported(format!("regex: unicode property '{name}' not in the modeled table")))
     }
 
     fn atom_escape(&mut self) -> Result<(), Fail> {
@@ -606,7 +592,19 @@ impl PatParser {
     fn identity_escape(&mut self, c: char) -> Result<(), Fail> {
         let syntax = matches!(
             c,
-            '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+            '^' | '$'
+                | '\\'
+                | '.'
+                | '*'
+                | '+'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
                 | '/'
         );
         if syntax {
@@ -616,8 +614,21 @@ impl PatParser {
         if self.vmode
             && matches!(
                 c,
-                '!' | '#' | '%' | '&' | ',' | '-' | ':' | ';' | '<' | '=' | '>' | '@' | '`'
-                    | '~' | '"' | '\''
+                '!' | '#'
+                    | '%'
+                    | '&'
+                    | ','
+                    | '-'
+                    | ':'
+                    | ';'
+                    | '<'
+                    | '='
+                    | '>'
+                    | '@'
+                    | '`'
+                    | '~'
+                    | '"'
+                    | '\''
             )
         {
             self.pos += 1;
@@ -755,8 +766,24 @@ impl PatParser {
     fn v_double_punct(c: char) -> bool {
         matches!(
             c,
-            '&' | '!' | '#' | '$' | '%' | '*' | '+' | ',' | '.' | ':' | ';' | '<' | '=' | '>'
-                | '?' | '@' | '^' | '`' | '~'
+            '&' | '!'
+                | '#'
+                | '$'
+                | '%'
+                | '*'
+                | '+'
+                | ','
+                | '.'
+                | ':'
+                | ';'
+                | '<'
+                | '='
+                | '>'
+                | '?'
+                | '@'
+                | '^'
+                | '`'
+                | '~'
         )
     }
 
@@ -773,9 +800,9 @@ impl PatParser {
                 Ok(ClassAtom::Escape)
             }
             Some('\\') => self.class_atom(),
-            Some(c) if Self::v_reserved_punct(c) => Err(Fail::early(
-                "reserved punctuator must be escaped in v-mode class",
-            )),
+            Some(c) if Self::v_reserved_punct(c) => {
+                Err(Fail::early("reserved punctuator must be escaped in v-mode class"))
+            }
             Some(c) if Self::v_double_punct(c) && self.peek_at(1) == Some(c) => {
                 Err(Fail::early("doubled punctuator in v-mode class"))
             }
@@ -800,17 +827,13 @@ impl PatParser {
                 Some('}') => {
                     self.pos += 1;
                     if cur_len != 1 && self.in_negated_class {
-                        return Err(Fail::early(
-                            "string disjunction in negated v-mode class",
-                        ));
+                        return Err(Fail::early("string disjunction in negated v-mode class"));
                     }
                     return Ok(());
                 }
                 Some('|') => {
                     if cur_len != 1 && self.in_negated_class {
-                        return Err(Fail::early(
-                            "string disjunction in negated v-mode class",
-                        ));
+                        return Err(Fail::early("string disjunction in negated v-mode class"));
                     }
                     cur_len = 0;
                     self.pos += 1;
@@ -820,20 +843,22 @@ impl PatParser {
                     // escapes (\d, \p{...}, …) are not.
                     if matches!(
                         self.peek_at(1),
-                        Some('d') | Some('D') | Some('s') | Some('S') | Some('w') | Some('W')
-                            | Some('p') | Some('P')
+                        Some('d')
+                            | Some('D')
+                            | Some('s')
+                            | Some('S')
+                            | Some('w')
+                            | Some('W')
+                            | Some('p')
+                            | Some('P')
                     ) {
-                        return Err(Fail::early(
-                            "class escape inside \\q string in v-mode class",
-                        ));
+                        return Err(Fail::early("class escape inside \\q string in v-mode class"));
                     }
                     let _ = self.class_atom()?;
                     cur_len += 1;
                 }
                 Some(c) if Self::v_reserved_punct(c) => {
-                    return Err(Fail::early(
-                        "reserved punctuator must be escaped in v-mode class",
-                    ))
+                    return Err(Fail::early("reserved punctuator must be escaped in v-mode class"));
                 }
                 Some(_) => {
                     self.pos += 1;
@@ -865,11 +890,7 @@ impl PatParser {
                     match mode {
                         None if count == 1 => mode = Some("&&"),
                         Some("&&") => {}
-                        _ => {
-                            return Err(Fail::early(
-                                "mixed set operators in v-mode class",
-                            ))
-                        }
+                        _ => return Err(Fail::early("mixed set operators in v-mode class")),
                     }
                     self.pos += 2;
                     let _ = self.v_operand()?;
@@ -879,11 +900,7 @@ impl PatParser {
                     match mode {
                         None if count == 1 => mode = Some("--"),
                         Some("--") => {}
-                        _ => {
-                            return Err(Fail::early(
-                                "mixed set operators in v-mode class",
-                            ))
-                        }
+                        _ => return Err(Fail::early("mixed set operators in v-mode class")),
                     }
                     self.pos += 2;
                     let _ = self.v_operand()?;
@@ -914,15 +931,13 @@ impl PatParser {
                         match (&atom, &hi) {
                             (ClassAtom::Char(a), ClassAtom::Char(b)) => {
                                 if a > b {
-                                    return Err(Fail::early(
-                                        "regex class range out of order",
-                                    ));
+                                    return Err(Fail::early("regex class range out of order"));
                                 }
                             }
                             _ => {
                                 return Err(Fail::early(
                                     "non-character range bound in v-mode class",
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1037,8 +1052,20 @@ impl PatParser {
             _ => {
                 let syntax = matches!(
                     e,
-                    '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
-                        | '|' | '/'
+                    '^' | '$'
+                        | '\\'
+                        | '.'
+                        | '*'
+                        | '+'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '|'
+                        | '/'
                 );
                 if syntax {
                     self.pos += 1;
@@ -1047,8 +1074,21 @@ impl PatParser {
                 if self.vmode
                     && matches!(
                         e,
-                        '!' | '#' | '%' | '&' | ',' | '-' | ':' | ';' | '<' | '=' | '>' | '@'
-                            | '`' | '~' | '"' | '\''
+                        '!' | '#'
+                            | '%'
+                            | '&'
+                            | ','
+                            | '-'
+                            | ':'
+                            | ';'
+                            | '<'
+                            | '='
+                            | '>'
+                            | '@'
+                            | '`'
+                            | '~'
+                            | '"'
+                            | '\''
                     )
                 {
                     self.pos += 1;

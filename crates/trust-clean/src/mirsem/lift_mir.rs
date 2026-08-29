@@ -781,10 +781,7 @@ pub(crate) fn sem_field_read_operand(
         // `Field(Field(Var idx, f1), f2)` — `SemOperand::Field` is recursive by
         // construction; `idx_elem` composes; NO value claim is asserted (the
         // same "stable token keyed on (base, path)" reading as one hop).
-        projs
-            if projs.len() >= 2
-                && projs.iter().all(|p| matches!(p, Projection::Field(_))) =>
-        {
+        projs if projs.len() >= 2 && projs.iter().all(|p| matches!(p, Projection::Field(_))) => {
             let idx = param_index(p.local)?;
             // The type chase, hop by hop.
             let mut cur_ty = &body.locals.get(p.local)?.ty;
@@ -805,8 +802,8 @@ pub(crate) fn sem_field_read_operand(
                 let last = n + 1 == projs.len();
                 if fields.len() != 1 {
                     return None; // EVERY hop base must be the single payload (a
-                                 // 1-ZST-carrying transparent struct declines —
-                                 // the dump cannot compute ZST-ness; fail closed).
+                    // 1-ZST-carrying transparent struct declines —
+                    // the dump cannot compute ZST-ness; fail closed).
                 }
                 let (_, fty) = fields.get(*fld)?;
                 if last && !matches!(fty, Ty::Int { .. } | Ty::Bool) {
@@ -1620,14 +1617,7 @@ pub(super) fn sem_rvalue_of_mir_at_depth(
                 // the 0/1 embed of a Bool value. Resolve at this exact use site so a
                 // later or non-dominating temp definition cannot supply the cast.
                 .or_else(|| {
-                    resolve_bool_cast_embed_rvalue(
-                        body,
-                        op,
-                        dest_ty,
-                        param_index,
-                        depth,
-                        use_site,
-                    )
+                    resolve_bool_cast_embed_rvalue(body, op, dest_ty, param_index, depth, use_site)
                 })
         }
         _ => None,

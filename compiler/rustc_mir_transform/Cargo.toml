@@ -8,6 +8,17 @@ edition = "2024"
 
 [dependencies]
 # tidy-alphabetical-start
+clean-kernel = { workspace = true }
+# Trust (kernel-tv): the producing denotation map; the independent re-check is
+# trust-ir-build's clean_backend_tv mirror, driven via validate_module.
+clean-reflect = { workspace = true }
+# Trust (totality campaign): the GENERAL Clean -> trust-ir compiler for the
+# general recording lane (every computational island def, not only the 13
+# planned shapes). Feature trust-ir-backend comes from the workspace entry.
+clean-compiler = { workspace = true }
+# Trust (totality campaign): in-tree re-check of the general lane's mint-time
+# TV certificates (the clean_backend_tv mirror) before the strip.
+trust-ir-build = { workspace = true }
 either = "1"
 itertools = "0.15"
 libc = "0.2"
@@ -33,6 +44,11 @@ smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
 tracing = "0.1"
 trust-cache = { workspace = true }
 trust-certify = { workspace = true }
+# Trust (I5): the gate's admitted statement is at the CARRIER type, and the
+# emitter's local types are the carrier decision rather than a convenience
+# mapping. Named directly so `clean_origin_mir.rs` cannot silently acquire a
+# second, looser type mapping through a re-export.
+trust-clean-carrier = { workspace = true }
 # Trust (I5): the Clean-origin CALL lane's two decisions. This crate is a
 # DEPENDENCY of `rustc_mir_transform`, not a provider installer above
 # `rustc_interface` — §7's "installs the provider overrides" is not
@@ -42,12 +58,9 @@ trust-certify = { workspace = true }
 # functions, which is strictly better: both call sites are inside the crate that
 # owns MIR construction, so there is no override to audit.
 trust-clean-origin = { workspace = true }
-# Trust (I5): the gate's admitted statement is at the CARRIER type, and the
-# emitter's local types are the carrier decision rather than a convenience
-# mapping. Named directly so `clean_origin_mir.rs` cannot silently acquire a
-# second, looser type mapping through a re-export.
-trust-clean-carrier = { workspace = true }
-clean-kernel = { workspace = true }
+# Trust: the Clean -> TrustIR producer. Consumes the SAME sealed CleanOriginPlan
+# `clean_origin_mir` emits MIR from, so the two languages meet in TrustIR.
+trust-clean-ir = { workspace = true }
 trust-ir = { workspace = true, features = ["serde"] }
 trust-ir-bridge = { workspace = true, features = ["compiler-context"] }
 trust-mir-extract = { workspace = true }

@@ -123,6 +123,23 @@ fn main() {
     cmd.args(&args);
     cmd.env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
+    // Trust: the same additional sysroot paths the rustc shim adds
+    // (`bin/rustc.rs`), because a DOCTEST is a rustdoc invocation and needs them
+    // for exactly the same reason.
+    //
+    // Trust keeps staged sysroots pruned of rustc_private artifacts (upstream
+    // #108767 parity), so a rustc_private tool must be handed the coherent
+    // `rustc-private-tool` sysroot dirs. 681f6f5c0b9 did that for the
+    // `CrateRustdoc` test rebuild — but only the RUSTC side reads the variable,
+    // so `-p rustdoc --doc` still resolved `extern crate rustc_*` against
+    // partially-pruned leftovers and died with the same E0463/E0460 cascade the
+    // commit was written to fix ("can't find crate for `rustc_abi`", …).
+    if let Ok(dirs) = env::var("RUSTC_ADDITIONAL_SYSROOT_PATHS") {
+        for dir in dirs.split(',') {
+            cmd.arg(format!("-L{dir}"));
+        }
+    }
+
     // Force all crates compiled by this compiler to (a) be unstable and (b)
     // allow the `rustc_private` feature to link to other unstable crates
     // also in the sysroot.

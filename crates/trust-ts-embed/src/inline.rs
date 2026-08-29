@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 
+use trust_types::BinOp;
+
 use crate::core::{TsExpr, TsFunction, TsStmt};
 use crate::escape::{FragmentEscape, UnsupportedTsConstruct};
-use trust_types::BinOp;
 
 /// Maximum call-inlining depth. Bounds BOUNDED recursion (a recursive call whose
 /// argument is constant-folded down to its base case resolves within the limit);
@@ -19,7 +20,10 @@ const MAX_INLINE_DEPTH: u32 = 64;
 /// Inline every call in `entry` against the module's `funcs`, returning a call-free
 /// `TsFunction`. Fails closed on unknown callees, arity mismatches, callees that are
 /// not single-return-expression helpers, or recursion deeper than [`MAX_INLINE_DEPTH`].
-pub fn inline_calls(entry: &TsFunction, funcs: &[TsFunction]) -> Result<TsFunction, FragmentEscape> {
+pub fn inline_calls(
+    entry: &TsFunction,
+    funcs: &[TsFunction],
+) -> Result<TsFunction, FragmentEscape> {
     let table: HashMap<&str, &TsFunction> = funcs.iter().map(|f| (f.name.as_str(), f)).collect();
     let body = entry
         .body
@@ -39,7 +43,9 @@ fn inline_stmt(
         TsStmt::Assign { var, value } => {
             TsStmt::Assign { var: var.clone(), value: inline_expr(value, table, sym, depth)? }
         }
-        TsStmt::Return { value } => TsStmt::Return { value: inline_expr(value, table, sym, depth)? },
+        TsStmt::Return { value } => {
+            TsStmt::Return { value: inline_expr(value, table, sym, depth)? }
+        }
         TsStmt::ForRange { var, count, body } => TsStmt::ForRange {
             var: var.clone(),
             count: *count,
@@ -104,12 +110,8 @@ fn inline_expr(
                 .iter()
                 .map(|a| inline_expr(a, table, sym, depth))
                 .collect::<Result<Vec<_>, _>>()?;
-            let pmap: HashMap<&str, TsExpr> = callee
-                .params
-                .iter()
-                .map(|p| p.name.as_str())
-                .zip(inlined_args)
-                .collect();
+            let pmap: HashMap<&str, TsExpr> =
+                callee.params.iter().map(|p| p.name.as_str()).zip(inlined_args).collect();
             // Substitute, then CONSTANT-FOLD: for a recursive call with a constant-
             // bounded argument, the base-case guard folds and prunes the recursive
             // branch, so the recursion terminates within the depth bound.
@@ -213,16 +215,12 @@ fn subst(e: &TsExpr, pmap: &HashMap<&str, TsExpr>) -> TsExpr {
             else_e: Box::new(subst(else_e, pmap)),
             ty: *ty,
         },
-        TsExpr::Field { obj, field, elem_width } => TsExpr::Field {
-            obj: rename_base(obj),
-            field: field.clone(),
-            elem_width: *elem_width,
-        },
-        TsExpr::Index { base, elem_width, index } => TsExpr::Index {
-            base: rename_base(base),
-            elem_width: *elem_width,
-            index: *index,
-        },
+        TsExpr::Field { obj, field, elem_width } => {
+            TsExpr::Field { obj: rename_base(obj), field: field.clone(), elem_width: *elem_width }
+        }
+        TsExpr::Index { base, elem_width, index } => {
+            TsExpr::Index { base: rename_base(base), elem_width: *elem_width, index: *index }
+        }
         TsExpr::IndexVar { base, elem_width, index_var } => TsExpr::IndexVar {
             base: rename_base(base),
             elem_width: *elem_width,

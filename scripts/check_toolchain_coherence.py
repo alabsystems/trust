@@ -190,10 +190,19 @@ def check_stage0_bin_surface(root: Path) -> list[str]:
     forbidden_bins = authorities.get("STAGE0_FORBIDDEN_BINS", set())
     forbidden_libexec = authorities.get("STAGE0_FORBIDDEN_LIBEXEC_BINS", set())
 
-    # Complete stage2 roots may expose the two canonical optional Miri tools;
-    # every inherited/retired spelling stays forbidden. Keep the Rust release
-    # detector and shell front doors on exactly that derived inventory.
-    stage2_forbidden_bins = forbidden_bins - {"trust-miri", "targo-miri"}
+    # Complete stage2 roots may expose the two canonical optional Miri tools,
+    # and they deliberately ship `rustdoc` as a same-surface alias of `trustdoc`
+    # (76d408e1cd: cargo spawns a binary named `rustdoc` for its doctest phase
+    # and rustup's proxy refuses a linked toolchain without it, so
+    # tool.rs:1676 rustdoc_sysroot_bins installs both names at every stage >= 1
+    # and dist packages both). Its identity is enforced as an ALIAS -- the same
+    # byte-identity check that admits `rustc` and `cargo` -- not by absence, so
+    # a stock rustdoc still cannot pass as Trust surface. Every other
+    # inherited/retired spelling stays forbidden, and a stage0 SEED still
+    # forbids `rustdoc` outright, which is why the carve-out is derived here
+    # rather than removed from the authority. Keep the Rust release detector and
+    # shell front doors on exactly that derived inventory.
+    stage2_forbidden_bins = forbidden_bins - {"trust-miri", "targo-miri", "rustdoc"}
     stage2_forbidden_mirrors = (
         (
             "scripts/lib/trust_toolchain_surface.sh:TRUST_TOOLCHAIN_FORBIDDEN_PUBLIC_BINS",

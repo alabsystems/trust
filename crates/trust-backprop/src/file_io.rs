@@ -10,12 +10,13 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use trust_strengthen::Proposal;
 use trust_types::fx::FxHashMap;
 
 use crate::proposal_converter::{ConvertError, convert_proposal};
 use crate::rewriter::{RewriteEngine, RewriteError};
 use crate::{RewritePlan, SourceRewrite};
-use trust_strengthen::Proposal;
 
 /// Errors from file-level rewrite operations.
 #[derive(Debug, thiserror::Error)]

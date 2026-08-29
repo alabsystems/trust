@@ -46,10 +46,7 @@ impl IntoChurchList for Vec<Term> {
 
 impl<T: IntoChurchNum> IntoChurchList for Vec<T> {
     fn into_church(self) -> Term {
-        self.into_iter()
-            .map(|t| t.into_church())
-            .collect::<Vec<Term>>()
-            .into_church()
+        self.into_iter().map(|t| t.into_church()).collect::<Vec<Term>>().into_church()
     }
 }
 
@@ -67,10 +64,7 @@ impl IntoScottList for Vec<Term> {
 
 impl<T: IntoScottNum> IntoScottList for Vec<T> {
     fn into_scott(self) -> Term {
-        self.into_iter()
-            .map(|t| t.into_scott())
-            .collect::<Vec<Term>>()
-            .into_scott()
+        self.into_iter().map(|t| t.into_scott()).collect::<Vec<Term>>().into_scott()
     }
 }
 
@@ -79,15 +73,8 @@ impl IntoParigotList for Vec<Term> {
         let mut ret = abs!(2, Var(2));
 
         for t in self.into_iter().rev() {
-            ret = abs!(
-                2,
-                app!(
-                    Var(1),
-                    t,
-                    ret.clone(),
-                    ret.unabs().and_then(|r| r.unabs()).unwrap()
-                )
-            );
+            ret =
+                abs!(2, app!(Var(1), t, ret.clone(), ret.unabs().and_then(|r| r.unabs()).unwrap()));
         }
 
         ret
@@ -96,9 +83,6 @@ impl IntoParigotList for Vec<Term> {
 
 impl<T: IntoParigotNum> IntoParigotList for Vec<T> {
     fn into_parigot(self) -> Term {
-        self.into_iter()
-            .map(|t| t.into_parigot())
-            .collect::<Vec<Term>>()
-            .into_parigot()
+        self.into_iter().map(|t| t.into_parigot()).collect::<Vec<Term>>().into_parigot()
     }
 }

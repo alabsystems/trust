@@ -45,7 +45,6 @@ mod windows;
 
 pub use mode::UnixMode;
 pub use process::{BoundedWait, kill_process_group, spawn_in_own_process_group, wait_bounded};
-
 #[cfg(unix)]
 pub use unix::{
     DirFd, FileIdentity, create_file_at, identity_at, metadata_at, open_file_at,

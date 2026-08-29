@@ -7,10 +7,8 @@ fn const_param_equality_is_unknown_never_definitely_unequal() {
     // v2_const_eq_truth over a ConstParam must return None (verify BOTH
     // branches), NEVER Some(false) — else an equal `N == N` prunes the taken
     // branch and drops its safety obligations (a false PROVE).
-    let n =
-        ConstValue::ConstParam { index: 1, name: "N".to_string(), width: 64, signed: false };
-    let m =
-        ConstValue::ConstParam { index: 0, name: "M".to_string(), width: 64, signed: false };
+    let n = ConstValue::ConstParam { index: 1, name: "N".to_string(), width: 64, signed: false };
+    let m = ConstValue::ConstParam { index: 0, name: "M".to_string(), width: 64, signed: false };
     assert_eq!(v2_const_eq_truth(&n, &n), None, "N == N must be UNKNOWN, not Some(true/false)");
     assert_eq!(v2_const_eq_truth(&n, &m), None, "N == M must be UNKNOWN");
     assert_eq!(

@@ -7,9 +7,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_types::BinarySegmentPermissions;
+
 use crate::detect::{BinaryFormat, detect_format};
 use crate::error::ParseError;
-use trust_types::BinarySegmentPermissions;
 
 /// Target architecture detected from binary headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

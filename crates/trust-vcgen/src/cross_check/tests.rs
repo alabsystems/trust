@@ -3,12 +3,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::UnwindEdge;
 use trust_types::fx::FxHashSet;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place,
-    ProofLevel, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,
-    VerifiableFunction, VerificationCondition,
+    ProofLevel, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind,
+    VerifiableBody, VerifiableFunction, VerificationCondition,
 };
 
 use super::comparison::{VcCategory, categorize_vc, compare_vc_sets};
@@ -20,7 +19,13 @@ fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Ver
         name: name.to_string(),
         def_path: format!("test::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 0, return_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 0,
+            return_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -995,35 +1000,22 @@ fn test_full_cross_check_shift_overflow() {
 }
 
 #[test]
-fn test_full_cross_check_checked_shift_overflow() {
+fn test_checked_shift_tuple_spelling_is_rejected_at_the_public_boundary() {
     let func = checked_shift_function();
-    let result = full_cross_check(&func);
-
     assert!(
-        result
-            .primary_vc_kinds
-            .iter()
-            .any(|k| matches!(k, VcKind::ShiftOverflow { op: BinOp::Shl, .. })),
-        "primary should classify checked Shl overflow as ShiftOverflow"
+        matches!(
+            crate::validate_function(&func),
+            Err(crate::VcgenError::MalformedMir { detail, .. })
+                if detail.contains("CheckedBinaryOp(Shl)")
+        ),
+        "rustc spells checked shifts as a shift plus an Assert, not a WithOverflow tuple"
     );
-    assert!(
-        result
-            .reference_vc_kinds
-            .iter()
-            .any(|k| matches!(k, VcKind::ShiftOverflow { op: BinOp::Shl, .. })),
-        "reference should classify checked Shl overflow as ShiftOverflow"
-    );
-    assert!(
-        !result
-            .reference_vc_kinds
-            .iter()
-            .any(|k| matches!(k, VcKind::ArithmeticOverflow { op: BinOp::Shl, .. })),
-        "reference must not classify checked Shl overflow as ArithmeticOverflow"
-    );
-    assert!(
-        matches!(result.verdict, CrossCheckVerdict::Agree),
-        "checked shift mismatch: {result:?}"
-    );
+    let vcs = crate::generate_vcs(&func);
+    assert_eq!(vcs.len(), 1);
+    assert!(matches!(
+        &vcs[0].kind,
+        VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr"
+    ));
 }
 
 #[test]

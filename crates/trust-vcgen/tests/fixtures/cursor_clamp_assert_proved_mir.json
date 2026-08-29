@@ -2,7 +2,7 @@
   "name": "cursor_clamp_assert",
   "def_path": "cursor_clamp_assert::cursor_clamp_assert",
   "span": {
-    "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+    "file": "fixtures/cursor_clamp_assert.rs",
     "line_start": 4,
     "col_start": 0,
     "line_end": 8,
@@ -129,7 +129,7 @@
                 ]
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 5,
                 "col_start": 21,
                 "line_end": 5,
@@ -155,7 +155,7 @@
             "otherwise": 1,
             "exhaustive_enum_unreachable": false,
             "span": {
-              "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+              "file": "fixtures/cursor_clamp_assert.rs",
               "line_start": 5,
               "col_start": 21,
               "line_end": 5,
@@ -182,7 +182,7 @@
                 }
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 5,
                 "col_start": 35,
                 "line_end": 5,
@@ -224,7 +224,7 @@
                 ]
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 5,
                 "col_start": 49,
                 "line_end": 5,
@@ -250,7 +250,7 @@
             "otherwise": 3,
             "exhaustive_enum_unreachable": false,
             "span": {
-              "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+              "file": "fixtures/cursor_clamp_assert.rs",
               "line_start": 5,
               "col_start": 49,
               "line_end": 5,
@@ -288,7 +288,7 @@
                 ]
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 5,
                 "col_start": 61,
                 "line_end": 5,
@@ -315,7 +315,7 @@
             },
             "target": 4,
             "span": {
-              "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+              "file": "fixtures/cursor_clamp_assert.rs",
               "line_start": 5,
               "col_start": 61,
               "line_end": 5,
@@ -346,7 +346,7 @@
                 }
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 5,
                 "col_start": 61,
                 "line_end": 5,
@@ -379,7 +379,7 @@
                 }
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 5,
                 "col_start": 80,
                 "line_end": 5,
@@ -421,7 +421,7 @@
                 ]
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 6,
                 "col_start": 12,
                 "line_end": 6,
@@ -447,7 +447,7 @@
             "otherwise": 9,
             "exhaustive_enum_unreachable": false,
             "span": {
-              "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+              "file": "fixtures/cursor_clamp_assert.rs",
               "line_start": 6,
               "col_start": 12,
               "line_end": 6,
@@ -474,7 +474,7 @@
                 }
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 6,
                 "col_start": 26,
                 "line_end": 6,
@@ -506,7 +506,7 @@
                 ]
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 6,
                 "col_start": 26,
                 "line_end": 6,
@@ -532,7 +532,7 @@
             "otherwise": 9,
             "exhaustive_enum_unreachable": false,
             "span": {
-              "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+              "file": "fixtures/cursor_clamp_assert.rs",
               "line_start": 6,
               "col_start": 26,
               "line_end": 6,
@@ -610,7 +610,7 @@
             },
             "target": null,
             "span": {
-              "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+              "file": "fixtures/cursor_clamp_assert.rs",
               "line_start": 6,
               "col_start": 4,
               "line_end": 6,
@@ -640,7 +640,7 @@
                 }
               },
               "span": {
-                "file": "tests/trust-falsification/proved/cursor_clamp_assert.rs",
+                "file": "fixtures/cursor_clamp_assert.rs",
                 "line_start": 7,
                 "col_start": 4,
                 "line_end": 7,

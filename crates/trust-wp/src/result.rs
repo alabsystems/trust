@@ -62,7 +62,10 @@ impl TrustWpResult {
         matches!(self.verdict, Verdict::Unknown { .. })
     }
 
-    /// Convert to a `trust_types::VerificationResult` for the router.
+    /// Convert to the legacy shared result shape for standalone diagnostics.
+    ///
+    /// The compiler/full verifier does not call this compatibility conversion,
+    /// and the returned value is not publication authority.
     #[must_use]
     pub fn to_verification_result(&self) -> trust_types::VerificationResult {
         match &self.verdict {

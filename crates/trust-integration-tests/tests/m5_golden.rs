@@ -425,10 +425,8 @@ fn test_m5_strengthen_overflow_proposal_quality() {
         total_with_assumptions: 0,
     };
 
-    let output = trust_strengthen::run(
-        &crate_results,
-        &trust_strengthen::StrengthenConfig::default(),
-    );
+    let output =
+        trust_strengthen::run(&crate_results, &trust_strengthen::StrengthenConfig::default());
 
     // Proposals should include a precondition about overflow
     let has_precondition = output

@@ -5,11 +5,12 @@
 //! input — yet it lands `runtime-checked` on the BV path, where `certify_vc` has
 //! no BV-mul reconstruction family and therefore cannot mint exact authority.
 
-use super::{v2_build_overflow_vc_for_operands, v2_widening_bv_source};
 use trust_types::{
     BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
     Terminator, Ty, VerifiableBody, VerifiableFunction,
 };
+
+use super::{v2_build_overflow_vc_for_operands, v2_widening_bv_source};
 
 /// `fn f(a: u8, b: u8) -> u16 { (a as u16) * (b as u16) }`
 ///

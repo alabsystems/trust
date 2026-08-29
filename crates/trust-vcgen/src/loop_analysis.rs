@@ -303,7 +303,7 @@ fn block_successors(term: &Terminator) -> Vec<BlockId> {
             succs.push(*otherwise);
             succs
         }
-        Terminator::Return | Terminator::Unreachable => vec![],
+        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => vec![],
         Terminator::Call { target, .. } => target.iter().copied().collect(),
         Terminator::Assert { target, .. } => vec![*target],
         Terminator::Drop { target, .. } => vec![*target],

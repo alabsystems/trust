@@ -29,7 +29,6 @@
 #![allow(internal_features)]
 #![warn(rustdoc::unescaped_backticks)]
 #![warn(unreachable_pub)]
-
 // Blessed env_mutation (2026-07-20): pre-existing code that predates the
 // toolchain's deny-by-default ENV_MUTATION lint. Mutates process-global env
 // under local save/restore, an RAII guard, or single-threaded harness/CLI

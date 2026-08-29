@@ -390,7 +390,11 @@ fn snapshot_executable(path: &Path, prefix: &str) -> io::Result<ExecutableSnapsh
         let snapshot_path = root.path().join("executable");
         atomic_write_private(&snapshot_path, &bytes)?;
         std::fs::set_permissions(&snapshot_path, std::fs::Permissions::from_mode(0o700))?;
-        Ok(ExecutableSnapshot { _root: root, path: snapshot_path, sha256: trust_types::digest::stable_sha256_hex(&bytes) })
+        Ok(ExecutableSnapshot {
+            _root: root,
+            path: snapshot_path,
+            sha256: trust_types::digest::stable_sha256_hex(&bytes),
+        })
     }
 
     #[cfg(not(unix))]

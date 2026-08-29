@@ -25,7 +25,7 @@
 
 use clean_kernel::{BinderInfo, Expr, Name};
 use trust_clean_carrier::{
-    carrier_for, carrier_signature_for, CarrierRefused, CleanType, SignaturePosition,
+    CarrierRefused, CleanType, SignaturePosition, carrier_for, carrier_signature_for,
 };
 use trust_symbols::{CarrierEvidence, CarrierWitness};
 use trust_types::Ty;
@@ -130,10 +130,7 @@ fn an_int_result_refuses_the_whole_signature_and_names_the_result() {
 #[test]
 fn no_partial_credit_the_good_arguments_do_not_rescue_the_bad_one() {
     // Three of the four positions are exact. That earns nothing.
-    let ty = Expr::arrow(
-        c("UInt64"),
-        Expr::arrow(c("Bool"), Expr::arrow(c("Int"), c("UInt32"))),
-    );
+    let ty = Expr::arrow(c("UInt64"), Expr::arrow(c("Bool"), Expr::arrow(c("Int"), c("UInt32"))));
     let err = carrier_signature_for(&ty).expect_err("one uncarried component sinks the signature");
     let CarrierRefused::SignatureComponent { position, .. } = &err else {
         panic!("expected a positional refusal, got {err:?}");

@@ -242,7 +242,9 @@ fn ffi_malloc_call_buggy() -> VerifiableFunction {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        is_unsafe_sig: false,
+                        is_foreign: false,
                         func: "libc::malloc".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -250,6 +252,7 @@ fn ffi_malloc_call_buggy() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -281,7 +284,9 @@ fn safe_call_no_ffi() -> VerifiableFunction {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        is_unsafe_sig: false,
+                        is_foreign: false,
                         func: "std::vec::Vec::push".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -289,6 +294,7 @@ fn safe_call_no_ffi() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },

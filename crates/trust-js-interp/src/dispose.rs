@@ -24,9 +24,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, Compl, ERes, Interp};
 use std::rc::Rc;
+
 use trust_js_value::{ErrKind, JsObject, JsValue, ObjId, ObjKind, PropKey, Property};
+
+use crate::interp::{Abrupt, Compl, ERes, Interp};
 
 /// One entry of a `[[DisposableResourceStack]]`, sync-dispose hint only.
 #[derive(Clone)]
@@ -66,10 +68,9 @@ impl Interp {
                 let key = PropKey::Sym(self.intr.dispose_sym);
                 // GetMethod: TypeError if @@dispose is present but not callable.
                 match self.get_method(value, &key)? {
-                    Some(method) => Ok(Some(DisposableResource::Method {
-                        value: value.clone(),
-                        method,
-                    })),
+                    Some(method) => {
+                        Ok(Some(DisposableResource::Method { value: value.clone(), method }))
+                    }
                     // @@dispose absent/undefined → CreateDisposableResource TypeError.
                     None => Err(self.throw_type_error()),
                 }
@@ -140,10 +141,10 @@ impl Interp {
     fn make_suppressed_error(&mut self, error: JsValue, suppressed: JsValue) -> ERes {
         let proto = self.intr.suppressed_error_proto;
         let oid = self.make_native_error_with_proto(ErrKind::Error, false, proto)?;
-        self.heap.obj_mut(oid).props.insert(
-            PropKey::from_str("error"),
-            Property::with_attrs(error, true, false, true),
-        );
+        self.heap
+            .obj_mut(oid)
+            .props
+            .insert(PropKey::from_str("error"), Property::with_attrs(error, true, false, true));
         self.heap.obj_mut(oid).props.insert(
             PropKey::from_str("suppressed"),
             Property::with_attrs(suppressed, true, false, true),
@@ -175,10 +176,10 @@ impl Interp {
                 Property::with_attrs(JsValue::Str(Rc::new(msg)), true, false, true),
             );
         }
-        self.heap.obj_mut(oid).props.insert(
-            PropKey::from_str("error"),
-            Property::with_attrs(arg(0), true, false, true),
-        );
+        self.heap
+            .obj_mut(oid)
+            .props
+            .insert(PropKey::from_str("error"), Property::with_attrs(arg(0), true, false, true));
         self.heap.obj_mut(oid).props.insert(
             PropKey::from_str("suppressed"),
             Property::with_attrs(arg(1), true, false, true),
@@ -196,13 +197,8 @@ impl Interp {
         };
         let proto = self.get_prototype_from_constructor(ntv, self.intr.disposable_stack_proto)?;
         let oid = self.alloc_obj(JsObject::new(ObjKind::Plain, Some(proto)))?;
-        self.disposable_stack_state.insert(
-            oid,
-            DisposableStackData {
-                disposed: false,
-                resources: Vec::new(),
-            },
-        );
+        self.disposable_stack_state
+            .insert(oid, DisposableStackData { disposed: false, resources: Vec::new() });
         Ok(JsValue::Obj(oid))
     }
 
@@ -230,11 +226,7 @@ impl Interp {
             return Err(self.throw_native(ErrKind::Reference));
         }
         if let Some(res) = self.create_sync_disposable_resource(&value)? {
-            self.disposable_stack_state
-                .get_mut(&oid)
-                .expect("brand checked")
-                .resources
-                .push(res);
+            self.disposable_stack_state.get_mut(&oid).expect("brand checked").resources.push(res);
         }
         Ok(value)
     }
@@ -252,10 +244,7 @@ impl Interp {
             .get_mut(&oid)
             .expect("brand checked")
             .resources
-            .push(DisposableResource::Adopt {
-                value: value.clone(),
-                on_dispose,
-            });
+            .push(DisposableResource::Adopt { value: value.clone(), on_dispose });
         Ok(value)
     }
 
@@ -272,10 +261,7 @@ impl Interp {
             .get_mut(&oid)
             .expect("brand checked")
             .resources
-            .push(DisposableResource::Method {
-                value: JsValue::Undefined,
-                method: on_dispose,
-            });
+            .push(DisposableResource::Method { value: JsValue::Undefined, method: on_dispose });
         Ok(JsValue::Undefined)
     }
 
@@ -289,23 +275,11 @@ impl Interp {
         let proto = self.intr.disposable_stack_proto;
         let new_oid = self.alloc_obj(JsObject::new(ObjKind::Plain, Some(proto)))?;
         let resources = std::mem::take(
-            &mut self
-                .disposable_stack_state
-                .get_mut(&oid)
-                .expect("brand checked")
-                .resources,
-        );
-        self.disposable_stack_state.insert(
-            new_oid,
-            DisposableStackData {
-                disposed: false,
-                resources,
-            },
+            &mut self.disposable_stack_state.get_mut(&oid).expect("brand checked").resources,
         );
         self.disposable_stack_state
-            .get_mut(&oid)
-            .expect("brand checked")
-            .disposed = true;
+            .insert(new_oid, DisposableStackData { disposed: false, resources });
+        self.disposable_stack_state.get_mut(&oid).expect("brand checked").disposed = true;
         Ok(JsValue::Obj(new_oid))
     }
 
@@ -316,10 +290,7 @@ impl Interp {
         if self.disposable_stack_state[&oid].disposed {
             return Ok(JsValue::Undefined);
         }
-        let entry = self
-            .disposable_stack_state
-            .get_mut(&oid)
-            .expect("brand checked");
+        let entry = self.disposable_stack_state.get_mut(&oid).expect("brand checked");
         entry.disposed = true;
         let resources = std::mem::take(&mut entry.resources);
         self.dispose_resources(resources, Ok(Some(JsValue::Undefined)))?;

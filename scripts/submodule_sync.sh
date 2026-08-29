@@ -687,8 +687,17 @@ builds_running() {
   # this machine — sibling repos build constantly — and a guard that fires every
   # time is a guard everyone learns to `--force` past. A process counts if its cwd
   # is inside the superproject or its command line names it.
+  #
+  # `pgrep -x bootstrap` is a SEPARATE probe, not another alternative in the -f
+  # pattern, and it is not optional: the python `x.py` wrapper can exit while its
+  # bootstrap child keeps compiling (observed 2026-08-01, attempt 8), and matching
+  # on `x.py` alone then sees nothing while the tree is being written. Matching the
+  # executable NAME also assumes nothing about argument order — `bootstrap build`
+  # as a -f pattern never matches, because `x.py --stage 1 build` produces
+  # `.../bootstrap --stage 1 build` and the two words are not adjacent.
   local cands pid_csv by_cmd by_cwd
-  cands="$(pgrep -f 'x\.py|[/ ]cargo |[/ ]rustc |[/ ]targo ' 2>/dev/null | head -40)"
+  cands="$( { pgrep -f 'x\.py|[/ ]cargo |[/ ]rustc |[/ ]targo ' 2>/dev/null
+              pgrep -x bootstrap 2>/dev/null; } | sort -un | head -40)"
   [ -n "$cands" ] || return 0
 
   if ! command -v lsof >/dev/null 2>&1; then

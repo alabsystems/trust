@@ -205,8 +205,10 @@ mod tests {
         }
         match bounds_obligation() {
             Discharge::Unmodeled(r) => assert_eq!(r.what(), "Vec receiver len not modeled"),
-            Discharge::Modeled(_) => panic!("`?` produced a modeled value from an unmodeled input \
-                                             — the false-proof idiom is back"),
+            Discharge::Modeled(_) => panic!(
+                "`?` produced a modeled value from an unmodeled input \
+                                             — the false-proof idiom is back"
+            ),
         }
     }
 

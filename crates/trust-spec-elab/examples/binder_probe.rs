@@ -30,15 +30,10 @@ fn main() {
         .collect();
     let outcomes =
         trust_spec_elab::probe_untyped_binder_typings(quantifier, binder, body, &var_types);
-    let successes: Vec<&str> =
-        outcomes.iter().filter(|(_, ok)| *ok).map(|(ty, _)| *ty).collect();
-    let unique = if successes.len() == 1 {
-        format!("\"{}\"", successes[0])
-    } else {
-        "null".to_string()
-    };
-    let pairs: Vec<String> =
-        outcomes.iter().map(|(ty, ok)| format!("\"{ty}\":{ok}")).collect();
+    let successes: Vec<&str> = outcomes.iter().filter(|(_, ok)| *ok).map(|(ty, _)| *ty).collect();
+    let unique =
+        if successes.len() == 1 { format!("\"{}\"", successes[0]) } else { "null".to_string() };
+    let pairs: Vec<String> = outcomes.iter().map(|(ty, ok)| format!("\"{ty}\":{ok}")).collect();
     println!(
         "{{\"binder\":\"{binder}\",\"outcomes\":{{{}}},\"unique\":{unique}}}",
         pairs.join(",")

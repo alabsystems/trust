@@ -15,12 +15,12 @@ use std::time::SystemTime;
 
 use thiserror::Error;
 use trust_types::fx::FxHashMap;
-use trust_types::{BlockId, VerifiableFunction, VerificationCondition};
-
-use crate::cross_check::{CrossCheckResult, full_cross_check};
 use trust_types::translation_validation::{
     CheckKind, SimulationRelation, TranslationValidationError,
 };
+use trust_types::{BlockId, VerifiableFunction, VerificationCondition};
+
+use crate::cross_check::{CrossCheckResult, full_cross_check};
 
 // ---------------------------------------------------------------------------
 // Certification levels

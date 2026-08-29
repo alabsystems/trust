@@ -150,7 +150,10 @@ pub(super) fn for_each_element_fixed_array_bound(
 /// element type and length WITHOUT any signedness/width judgement — callers apply their
 /// own (unsigned `fixed_array_elem_bound`, or the signed-aware reduction range). Only a
 /// fixed-size array (static `LEN`) qualifies; a slice or other shape yields None.
-pub(super) fn for_each_array_elem_ty(func: &VerifiableFunction, x_local: usize) -> Option<(Ty, u64)> {
+pub(super) fn for_each_array_elem_ty(
+    func: &VerifiableFunction,
+    x_local: usize,
+) -> Option<(Ty, u64)> {
     for_each_array_source(func, x_local).map(|(elem, len, _)| (elem, len))
 }
 
@@ -227,7 +230,10 @@ pub(super) fn index_local_of_place(place: &Place) -> Option<usize> {
 /// non-monotonic counter is NOT a `Range::next` payload and yields None — it could revisit
 /// an in-bounds index unboundedly, which would make the bound false. A slice/dynamic end,
 /// a signed/non-integer element, or a non-constant bound also yield None.
-pub(super) fn index_range_reduction_bound(func: &VerifiableFunction, x_local: usize) -> Option<(i128, i128)> {
+pub(super) fn index_range_reduction_bound(
+    func: &VerifiableFunction,
+    x_local: usize,
+) -> Option<(i128, i128)> {
     const FUEL: u32 = 16;
     // x = a[i] : a load of an Index place (possibly behind a Deref for `&[ELEM; N]`).
     let idx_local = match crate::unique_whole_local_def(func, x_local)? {
@@ -272,7 +278,16 @@ pub(super) fn index_range_reduction_bound(func: &VerifiableFunction, x_local: us
 /// merely obligation-contained (hunt-4 defense-in-depth). A shared borrow `&acc` cannot
 /// mutate and its cast to `*mut` is rejected by the `invalid_reference_casting` deny, so it
 /// need not be withheld (keeps the bound for legitimate read-only borrows of `acc`).
-pub(super) fn accumulator_init_const(func: &VerifiableFunction, acc: usize, ck_dest: usize) -> Option<i128> {
+///
+/// This is the RAW recognizer: it counts only definitions `body.blocks` carries, so a
+/// PARAMETER accumulator's implicit entry definition is NOT charged here. Every lane that
+/// ASSERTS the derived bound must call [`accumulator_bound_init_const`] instead; this one
+/// is for the BMC refutation lane, which only needs a value `acc` can hold at loop entry.
+pub(super) fn accumulator_init_const(
+    func: &VerifiableFunction,
+    acc: usize,
+    ck_dest: usize,
+) -> Option<i128> {
     let mut init: Option<i128> = None;
     let mut saw_self_add = false;
     let mut def_count = 0usize;
@@ -316,6 +331,58 @@ pub(super) fn accumulator_init_const(func: &VerifiableFunction, acc: usize, ck_d
         }
     }
     if def_count == 2 && saw_self_add { init } else { None }
+}
+
+/// [`accumulator_init_const`] for the BOUND lanes — the same recognition PLUS the
+/// accumulator's implicit ENTRY definition when `acc` is a PARAMETER.
+///
+/// A parameter is defined at entry, implicitly, and `body.blocks` never carries that
+/// definition, so the statement scan in `accumulator_init_const` cannot see it. A by-value
+/// `mut t: u64` parameter with a CONDITIONAL const init and a self-add therefore scores
+/// `def_count == 2` and is admitted, while `t` actually holds THREE values: the caller's
+/// argument, the `t = 0` store, and the self-add result. On the path that skips the store
+/// the caller's value survives into the loop, so the emitted fact `acc <= C + K*M` is FALSE
+/// — its path condition goes UNSAT and every obligation on it discharges AND kernel-certifies.
+///
+/// MEASURED on the toolchain built from `1d457f875e` (whose `loop_bounds.rs` is
+/// byte-identical to `442cb527e7`'s), `-Ztrust-policy=certify`:
+///
+/// ```text
+/// pub fn u64_acc_param(mut t: u64, a: &[u8;64], c: bool) -> u64 {
+///     if c { t = 0; } for &x in a { t += x as u64; } t }
+///
+/// note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out,
+///       0 runtime-checked out of 2 obligation(s)
+///     = note: of which 2 kernel-certified by the clean CIC kernel
+///
+/// TRUST_ACC[u64_acc_param] acc=1 K=64 per_max=255 init=0 -> bound t <= 16320
+/// TRUST_ACC[u64_acc]       acc=2 K=64 per_max=255 init=0 -> bound t <= 16320
+/// ```
+///
+/// `u64_acc_param` has `arg_count == 3`, so its accumulator `_1` IS a parameter and
+/// `t <= 16320` is false — a stock-rustc oracle (`-C overflow-checks=on`, at `-O` and
+/// without) panics on 5 of 48 inputs sweeping `t` x array-fill x `c`. The control `u64_acc`
+/// has `arg_count == 1`, so its `_2` is an ordinary local, the same bound is TRUE, and it
+/// still proves. That difference is the whole discriminator.
+///
+/// WHY A WRAPPER rather than a tightening of `accumulator_init_const` itself: the two
+/// consumers need opposite things. A BOUND lane ASSERTS `acc <= C + K*M` on every reaching
+/// path, so an unaccounted entry value makes it unsound. The BMC lane
+/// (`bmc_reduction::recognize_bounded_reduction`) REFUTES — it exhibits one input on which
+/// the obligation fails — and `init` there is a value the accumulator demonstrably CAN hold
+/// at loop entry, which stays true for a parameter. Tightening the shared recognizer would
+/// have cost that lane refutations it is entitled to; the raw recognizer is therefore left
+/// exactly as it was, and only the three bound sites move to this wrapper.
+pub(super) fn accumulator_bound_init_const(
+    func: &VerifiableFunction,
+    acc: usize,
+    ck_dest: usize,
+) -> Option<i128> {
+    // Locals `1..=arg_count` are the parameters (local 0 is the return place).
+    if acc > 0 && acc <= func.body.arg_count {
+        return None;
+    }
+    accumulator_init_const(func, acc, ck_dest)
 }
 
 /// The trip count `K` of the single loop, traced from a reduction ELEMENT local (the
@@ -609,7 +676,10 @@ pub(super) fn signed_addend_per_iteration_range(
 /// `(start, end)` of the exclusive `Range` a for-loop variable iterates, when both are constants.
 /// The loop var `v` is the Some-payload of `Range::next` (`v = (next() as Some).0`); trace it to
 /// the originating range aggregate and read its constant bounds. None for a non-range / non-const.
-pub(super) fn loop_var_const_range(func: &VerifiableFunction, local: usize) -> Option<(i128, i128)> {
+pub(super) fn loop_var_const_range(
+    func: &VerifiableFunction,
+    local: usize,
+) -> Option<(i128, i128)> {
     const FUEL: u32 = 16;
     let opt_local = match crate::unique_whole_local_def(func, local)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
@@ -625,7 +695,10 @@ pub(super) fn loop_var_const_range(func: &VerifiableFunction, local: usize) -> O
 
 /// The local of a `dst = Use(Copy(tuple.0))` extraction of `tuple_local`'s field 0 — the index
 /// `_20` in `_20 = _23.0` for a checked-op result `_23`. None if no such single extraction.
-pub(super) fn checked_result_field0_consumer(func: &VerifiableFunction, tuple_local: usize) -> Option<usize> {
+pub(super) fn checked_result_field0_consumer(
+    func: &VerifiableFunction,
+    tuple_local: usize,
+) -> Option<usize> {
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             if let Statement::Assign {
@@ -644,6 +717,40 @@ pub(super) fn checked_result_field0_consumer(func: &VerifiableFunction, tuple_lo
     None
 }
 
+/// The field-0 consumer of a checked result, but only when its bare symbol has
+/// one stable meaning throughout the body.
+///
+/// `build_flattened_index_facts` emits a GLOBAL fact over that bare symbol. A
+/// mere extraction site is not enough to license such a fact: a merged local
+/// can also be assigned an unconstrained value, and a parameter has an implicit
+/// entry value in addition to its visible body writes. In either case, applying
+/// the checked-result bound to the bare name constrains the other value and can
+/// false-prove a bounds check. The shared, parameter-aware SSA-collapse gate is
+/// the exact authority boundary for this use.
+pub(super) fn stable_checked_result_field0_consumer(
+    func: &VerifiableFunction,
+    tuple_local: usize,
+) -> Option<usize> {
+    let local = checked_result_field0_consumer(func, tuple_local)?;
+    local_versions_collapse_to_bare(func, local).then_some(local)
+}
+
+pub(super) fn append_stable_flattened_index_bound(
+    func: &VerifiableFunction,
+    tuple_local: usize,
+    bound: i128,
+    facts: &mut Vec<Formula>,
+) {
+    let Some(idx_local) = stable_checked_result_field0_consumer(func, tuple_local) else {
+        return;
+    };
+    let idx_name = crate::place_to_var_name(func, &Place { local: idx_local, projections: vec![] });
+    facts.push(Formula::Le(
+        Box::new(Formula::Var(idx_name, Sort::Int)),
+        Box::new(Formula::Int(bound)),
+    ));
+}
+
 /// Global facts for a FLATTENED 2D index `g[y*W + x]` over nested const-range loops
 /// (`for y in 0..H { for x in 0..W' { g[y*W + x] } }`). The MIR is a checked-op chain:
 /// `_22 = CheckedMul(y, W); _21 = _22.0; _23 = CheckedAdd(_21, x); _20 = _23.0; g[_20]`. With
@@ -654,9 +761,12 @@ pub(super) fn checked_result_field0_consumer(func: &VerifiableFunction, tuple_lo
 /// `[overflow:mul]` on `y*W` is handled separately by the BV operand-bound render.)
 ///
 /// SOUNDNESS: both bounds are TRUE — `W` is a const, `H`/`W'` are the const range ends, and the
-/// loop-var trace (`loop_var_const_range`) yields the EXACT exclusive-range bounds. SELF-LIMITING:
+/// loop-var trace (`loop_var_const_range`) yields the EXACT exclusive-range bounds, and the index
+/// consumer passes `local_versions_collapse_to_bare`, so the global bare-name fact cannot leak onto
+/// a merged definition or a parameter's distinct entry value. SELF-LIMITING:
 /// an out-of-range grid (`(H-1)*W+(W'-1) ≥ g.len()`) leaves compatible bounds and stays
-/// runtime-checked; a non-const dimension / non-loop-var operand yields no fact.
+/// runtime-checked; a non-const dimension / non-loop-var operand or unstable consumer yields no
+/// index fact.
 pub(super) fn build_flattened_index_facts(func: &VerifiableFunction) -> Vec<Formula> {
     let mut facts = Vec::new();
     for block in &func.body.blocks {
@@ -707,21 +817,16 @@ pub(super) fn build_flattened_index_facts(func: &VerifiableFunction) -> Vec<Form
             ) else {
                 continue;
             };
-            let Some(idx_local) = checked_result_field0_consumer(func, add_tuple.local) else {
-                continue;
-            };
             let mul_name =
                 crate::place_to_var_name(func, &Place { local: mul_p.local, projections: vec![] });
-            let idx_name =
-                crate::place_to_var_name(func, &Place { local: idx_local, projections: vec![] });
             facts.push(Formula::Le(
                 Box::new(Formula::Var(mul_name, Sort::Int)),
                 Box::new(Formula::Int(mul_bound)),
             ));
-            facts.push(Formula::Le(
-                Box::new(Formula::Var(idx_name, Sort::Int)),
-                Box::new(Formula::Int(idx_bound)),
-            ));
+            // The mul result remains independently bounded even when the final
+            // checked-add consumer is merged. Only the INDEX fact requires the
+            // consumer's global bare-name license.
+            append_stable_flattened_index_bound(func, add_tuple.local, idx_bound, &mut facts);
         }
     }
     facts
@@ -786,7 +891,8 @@ pub(super) fn build_accumulator_bound_facts(func: &VerifiableFunction) -> Vec<Fo
             if let Operand::Copy(rp) | Operand::Move(rp) = rhs
                 && rp.projections.is_empty()
                 && let Some((smin, smax)) = signed_addend_per_iteration_range(func, rp.local)
-                && let Some(init_c) = accumulator_init_const(func, acc, ck_dest.local)
+                && let Some(init_c) =
+                    accumulator_bound_init_const(func, acc, ck_dest.local)
                 && let (Some(lo), Some(hi)) = (
                     k.checked_mul(smin).and_then(|nm| init_c.checked_add(nm)),
                     k.checked_mul(smax).and_then(|nm| init_c.checked_add(nm)),
@@ -828,7 +934,10 @@ pub(super) fn build_accumulator_bound_facts(func: &VerifiableFunction) -> Vec<Fo
                 }
                 _ => continue,
             };
-            let Some(init_c) = accumulator_init_const(func, acc, ck_dest.local) else { continue };
+            let Some(init_c) = accumulator_bound_init_const(func, acc, ck_dest.local)
+            else {
+                continue;
+            };
             let Some(bound) = k.checked_mul(per_max).and_then(|nm| init_c.checked_add(nm)) else {
                 continue;
             };
@@ -889,7 +998,11 @@ pub(super) fn build_accumulator_bound_facts(func: &VerifiableFunction) -> Vec<Fo
 }
 
 /// Trace an operand to its root whole-local through `Copy`/`Move` and `Use` copies.
-pub(super) fn operand_root_local(func: &VerifiableFunction, op: &Operand, fuel: u32) -> Option<usize> {
+pub(super) fn operand_root_local(
+    func: &VerifiableFunction,
+    op: &Operand,
+    fuel: u32,
+) -> Option<usize> {
     if fuel == 0 {
         return None;
     }
@@ -907,7 +1020,10 @@ pub(super) fn operand_root_local(func: &VerifiableFunction, op: &Operand, fuel: 
 
 /// The successor a boolean `SwitchInt` takes when the discriminant is TRUE (value
 /// 1) — for `_g = Lt(lo, hi)` this is the `lo < hi` (loop-body) edge.
-pub(super) fn bool_switch_true_target(targets: &[(u128, BlockId)], otherwise: BlockId) -> Option<BlockId> {
+pub(super) fn bool_switch_true_target(
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+) -> Option<BlockId> {
     if let Some((_, t)) = targets.iter().find(|(v, _)| *v == 1) {
         return Some(*t);
     }
@@ -967,7 +1083,9 @@ pub(super) fn reachable_avoiding(
 /// re-entering the loop header, AND not reachable at all from a `lo`-write block's
 /// successors (so no path delivers a post-increment `lo`). At such blocks `lo`
 /// equals its guard value on every path, so `lo < s.len()` is SOUND.
-pub(super) fn build_converging_pointer_facts(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn build_converging_pointer_facts(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     const FUEL: u32 = 16;
     let mut map: FxHashMap<BlockId, Vec<Formula>> = FxHashMap::default();
     let downward = downward_induction_vars(func);

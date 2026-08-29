@@ -8,4 +8,6 @@
 // runtime checks. Default mode must report it fully proved (0 runtime-checked).
 #[core::contracts::requires(x < 100)]
 #[core::contracts::ensures(move |ret: &u32| *ret > x)]
-pub fn contract_inc(x: u32) -> u32 { x + 1 }
+pub fn contract_inc(x: u32) -> u32 {
+    x + 1
+}

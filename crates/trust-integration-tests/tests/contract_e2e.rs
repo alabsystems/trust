@@ -136,17 +136,89 @@ fn test_pipeline_postcondition_vc() {
 }
 
 #[test]
-fn test_pipeline_loop_invariant_generates_three_vcs() {
-    let func = make_contract_function(
-        "loop_inv_fn",
-        vec![Contract {
+fn test_pipeline_loop_invariant_generates_the_e4_pair() {
+    // Trust: this test used to build a function with a SINGLE block whose
+    // terminator is `Return` -- no back edge, no loop at all -- attach a
+    // `LoopInvariant` contract naming `bb0` as its header, and demand three VCs
+    // back. It also named `sum`, which `single_arg_locals()` never declared.
+    // Production now fail-closes on both, and says so:
+    //
+    //   "loop invariant `sum >= 0` references an unsupported or ambiguous MIR value"
+    //   "e45.transition.no-natural-loop: ... has no complete exact transition model at bb0"
+    //
+    // Both refusals are right. An initiation VC for a value the body does not
+    // contain, or for a loop that does not exist, verifies a claim about
+    // nothing. So the fixture is now a REAL loop: bb1 is a genuine header with a
+    // back edge from bb2, and the invariant names `i`, a local that exists.
+    //
+    // The count dropped from three to TWO deliberately. `generate_vcs` emits the
+    // E4 pair -- initiation and consecution. `VcKind::LoopInvariantSufficiency`
+    // is constructed NOWHERE in production: every occurrence in the tree is a
+    // test building one by hand or a match arm in serialization/reporting. The
+    // old assertion demanded a VC kind the vcgen pipeline has never produced,
+    // and it only ever passed because the whole loop lane was refusing and the
+    // assertions were unreachable behind the first failure.
+    let func = VerifiableFunction {
+        name: "loop_inv_fn".to_string(),
+        def_path: "test::loop_inv_fn".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".into()) },
+                LocalDecl { index: 1, ty: Ty::Bool, name: Some("keep".into()) },
+                LocalDecl { index: 2, ty: Ty::usize(), name: Some("i".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 64))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                // The loop header: `keep` decides another iteration.
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(1)),
+                        targets: vec![(1, BlockId(2))],
+                        otherwise: BlockId(3),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                // The body, and the back edge that makes bb1 a natural header.
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place::local(2)),
+                            Operand::Constant(ConstValue::Uint(1, 64)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![Contract {
             kind: ContractKind::LoopInvariant,
             span: SourceSpan::default(),
-            body: "bb0: sum >= 0".to_string(),
+            body: "bb1: i >= 0".to_string(),
         }],
-        single_arg_locals(),
-        1,
-    );
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: FunctionSpec::default(),
+    };
 
     let vcs = trust_vcgen::generate_vcs(&func);
 
@@ -158,31 +230,30 @@ fn test_pipeline_loop_invariant_generates_three_vcs() {
         .iter()
         .filter(|vc| matches!(&vc.kind, VcKind::LoopInvariantConsecution { .. }))
         .collect();
-    let suff_vcs: Vec<_> = vcs
-        .iter()
-        .filter(|vc| matches!(&vc.kind, VcKind::LoopInvariantSufficiency { .. }))
-        .collect();
 
     assert_eq!(
         init_vcs.len(),
         1,
-        "LoopInvariant contract must produce exactly 1 LoopInvariantInitiation VC"
+        "a real loop with a groundable invariant must produce exactly 1 \
+         LoopInvariantInitiation VC. Recorded rows: {:#?}",
+        vcs.iter().map(|vc| format!("{:?}", vc.kind)).collect::<Vec<_>>(),
     );
     assert_eq!(
         consec_vcs.len(),
         1,
-        "LoopInvariant contract must produce exactly 1 LoopInvariantConsecution VC"
+        "a real loop with a groundable invariant must produce exactly 1 \
+         LoopInvariantConsecution VC. Recorded rows: {:#?}",
+        vcs.iter().map(|vc| format!("{:?}", vc.kind)).collect::<Vec<_>>(),
     );
-    assert_eq!(
-        suff_vcs.len(),
-        1,
-        "LoopInvariant contract must produce exactly 1 LoopInvariantSufficiency VC"
+    assert!(
+        !vcs.iter().any(|vc| matches!(vc.kind, VcKind::UnsupportedMir { .. })),
+        "the supported loop lane must not degrade: {vcs:#?}",
     );
 
-    // Check that the invariant string and header_block are preserved.
+    // The invariant string and header block survive into the VC.
     if let VcKind::LoopInvariantInitiation { invariant, header_block } = &init_vcs[0].kind {
-        assert_eq!(invariant, "sum >= 0");
-        assert_eq!(*header_block, 0);
+        assert_eq!(invariant, "i >= 0");
+        assert_eq!(*header_block, 1);
     }
 }
 

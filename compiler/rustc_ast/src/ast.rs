@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 //! The Rust abstract syntax tree module.
 //!
 //! This module contains common structures forming the language AST.
@@ -1797,6 +1798,11 @@ pub enum ExprKind {
     /// `'label: for await? pat in iter { block }`
     ///
     /// This is desugared to a combination of `loop` and `match` expressions.
+    ///
+    /// Trust: `for` has NO first-class clause field, deliberately. See
+    /// [`super::super::Parser::reject_trust_for_loop_contract`] for the
+    /// measured reason and `ExprKind::While` / `ExprKind::Loop` for the
+    /// surfaces that do carry one.
     ForLoop {
         pat: Box<Pat>,
         iter: Box<Expr>,
@@ -1807,7 +1813,12 @@ pub enum ExprKind {
     /// Conditionless loop (can be exited with `break`, `continue`, or `return`).
     ///
     /// `'label: loop { block }`
-    Loop(Box<Block>, Option<Label>, Span),
+    ///
+    /// Trust: the fourth field carries first-class loop clauses
+    /// (`loop invariant P decreases e { block }`, two-language design E4/E5)
+    /// — grammar positions vanilla Rust rejects, so `None` for all vanilla
+    /// programs.
+    Loop(Box<Block>, Option<Label>, Span, Option<Box<LoopContract>>),
     /// A `match` block.
     Match(Box<Expr>, ThinVec<Arm>, MatchKind),
     /// A closure (e.g., `move |a, b, c| a + b + c`).
@@ -3928,7 +3939,6 @@ pub struct FnContract {
     pub clause_order: ThinVec<FnContractClauseMarker>,
 }
 
-
 #[cfg(test)]
 mod tests;
 
@@ -4140,6 +4150,12 @@ pub enum CleanDeclKind {
     Section,
     UniverseDecl,
     Variable,
+    /// `include x y …` — force section variables into the signatures of the
+    /// declarations that follow, whether or not they mention them.
+    IncludeVars,
+    /// `omit x y …` — cancel a preceding `include`, restoring Lean's
+    /// mention-based inclusion for those names.
+    OmitVars,
     Open,
     Export,
     DerivingInstance,
@@ -4184,6 +4200,8 @@ impl CleanDeclKind {
             CleanDeclKind::Section => "section",
             CleanDeclKind::UniverseDecl => "universe",
             CleanDeclKind::Variable => "variable",
+            CleanDeclKind::IncludeVars => "include",
+            CleanDeclKind::OmitVars => "omit",
             CleanDeclKind::Open => "open",
             CleanDeclKind::Export => "export",
             CleanDeclKind::DerivingInstance => "deriving instance",
@@ -4693,6 +4711,13 @@ mod size_asserts {
     static_assert_size!(AttrKind, 16);
     static_assert_size!(Attribute, 32);
     static_assert_size!(Block, 32);
+    // Trust: unchanged from upstream. `ExprKind::While` and `ExprKind::Loop`
+    // carry a first-class loop contract for free -- both stay at or below the
+    // width of `ExprKind::ForLoop`, whose 37-byte payload is the widest
+    // variant. Giving `ForLoop` a contract field too would cost +8 bytes here
+    // (72 -> 80, 40 -> 48) because it has only 3 spare padding bytes; that
+    // cost was measured and then declined along with the `for` clause
+    // position itself. See `Parser::reject_trust_for_loop_contract`.
     static_assert_size!(Expr, 72);
     static_assert_size!(ExprKind, 40);
     static_assert_size!(Fn, 192);

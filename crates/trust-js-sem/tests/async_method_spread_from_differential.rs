@@ -13,11 +13,12 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
-use trust_js_trace::{explain_divergence, extract_trace, traces_equal, ObservableTrace};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
+use trust_js_trace::{ObservableTrace, explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
 // CARGO_MANIFEST_DIR so it works in any checkout; override with
@@ -32,7 +33,9 @@ fn node_bin() -> Option<String> {
 }
 
 fn corpus_root() -> PathBuf {
-    PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string()))
+    PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string()),
+    )
 }
 
 fn driver_path() -> PathBuf {
@@ -139,14 +142,8 @@ const MINIS: &[(&str, &str)] = &[
     ("spread_string", "console.log([...'abc']);"),
     ("spread_string_astral", "console.log([...'a\\u{1f600}b'].length);"),
     ("spread_set", "console.log([...new Set([1,1,2,3,3])]);"),
-    (
-        "spread_map",
-        "var m = new Map([['a',1],['b',2]]); console.log([...m]);",
-    ),
-    (
-        "spread_generator",
-        "function* g() { yield 1; yield 2; yield 3; } console.log([...g()]);",
-    ),
+    ("spread_map", "var m = new Map([['a',1],['b',2]]); console.log([...m]);"),
+    ("spread_generator", "function* g() { yield 1; yield 2; yield 3; } console.log([...g()]);"),
     (
         "spread_iteration_order",
         "var log = []; var it = { [Symbol.iterator]() { var i = 0; return { next() { log.push('n' + i); return i < 3 ? {value: i++, done: false} : {value: undefined, done: true}; } }; } }; \
@@ -162,30 +159,18 @@ const MINIS: &[(&str, &str)] = &[
          var a = [...it]; console.log(a, closed);",
     ),
     // ---- call / new spread ---------------------------------------------
-    (
-        "call_spread_basic",
-        "function f(a,b,c){ return a+b+c; } console.log(f(...[1,2,3]));",
-    ),
+    ("call_spread_basic", "function f(a,b,c){ return a+b+c; } console.log(f(...[1,2,3]));"),
     (
         "call_spread_mixed",
         "function f(){ return Array.prototype.slice.call(arguments); } console.log(f(1, ...[2,3], 4, ...[5]));",
     ),
-    (
-        "call_spread_string",
-        "function f(){ return arguments.length; } console.log(f(...'hello'));",
-    ),
+    ("call_spread_string", "function f(){ return arguments.length; } console.log(f(...'hello'));"),
     (
         "call_spread_this",
         "var o = { v: 5, f(x, y) { return this.v + x + y; } }; console.log(o.f(...[10, 20]));",
     ),
-    (
-        "new_spread",
-        "function P(a,b){ this.s = a + b; } console.log(new P(...[3,4]).s);",
-    ),
-    (
-        "call_spread_set",
-        "console.log(Math.max(...new Set([3,1,4,1,5,9,2,6])));",
-    ),
+    ("new_spread", "function P(a,b){ this.s = a + b; } console.log(new P(...[3,4]).s);"),
+    ("call_spread_set", "console.log(Math.max(...new Set([3,1,4,1,5,9,2,6])));"),
     ("call_spread_trailing_comma", "function f(a,b){return a+b;} console.log(f(...[2,3],));"),
     (
         "call_spread_order",
@@ -196,30 +181,12 @@ const MINIS: &[(&str, &str)] = &[
     ("from_array", "console.log(Array.from([1,2,3]));"),
     ("from_string", "console.log(Array.from('abc'));"),
     ("from_set", "console.log(Array.from(new Set([1,2,2,3])));"),
-    (
-        "from_map",
-        "console.log(Array.from(new Map([['x',1]])));",
-    ),
-    (
-        "from_generator",
-        "function* g(){ yield 10; yield 20; } console.log(Array.from(g()));",
-    ),
-    (
-        "from_arraylike",
-        "console.log(Array.from({ length: 3, 0: 'a', 1: 'b', 2: 'c' }));",
-    ),
-    (
-        "from_arraylike_holes",
-        "console.log(Array.from({ length: 3, 0: 'a', 2: 'c' }));",
-    ),
-    (
-        "from_mapfn",
-        "console.log(Array.from([1,2,3], x => x * x));",
-    ),
-    (
-        "from_mapfn_index",
-        "console.log(Array.from(['a','b','c'], (x, i) => x + i));",
-    ),
+    ("from_map", "console.log(Array.from(new Map([['x',1]])));"),
+    ("from_generator", "function* g(){ yield 10; yield 20; } console.log(Array.from(g()));"),
+    ("from_arraylike", "console.log(Array.from({ length: 3, 0: 'a', 1: 'b', 2: 'c' }));"),
+    ("from_arraylike_holes", "console.log(Array.from({ length: 3, 0: 'a', 2: 'c' }));"),
+    ("from_mapfn", "console.log(Array.from([1,2,3], x => x * x));"),
+    ("from_mapfn_index", "console.log(Array.from(['a','b','c'], (x, i) => x + i));"),
     (
         "from_mapfn_thisarg",
         "var ctx = { mul: 3 }; console.log(Array.from([1,2,3], function(x){ return x * this.mul; }, ctx));",
@@ -232,10 +199,7 @@ const MINIS: &[(&str, &str)] = &[
         "from_empty",
         "console.log(Array.from([]).length, Array.from('').length, Array.from({length:0}).length);",
     ),
-    (
-        "from_number_not_iterable",
-        "console.log(Array.from(5).length, Array.from(true).length);",
-    ),
+    ("from_number_not_iterable", "console.log(Array.from(5).length, Array.from(true).length);"),
     (
         "from_undefined_throws",
         "try { Array.from(undefined); console.log('no'); } catch(e){ console.log(e.name); }",
@@ -249,10 +213,7 @@ const MINIS: &[(&str, &str)] = &[
         "var closed=false; var it={ [Symbol.iterator](){ var i=0; return { next(){ return i<3?{value:i++,done:false}:{done:true}; }, return(){ closed=true; return {}; } }; } }; \
          try { Array.from(it, x => { if (x===1) throw new RangeError('stop'); return x; }); } catch(e){ console.log(e.name, closed); }",
     ),
-    (
-        "from_length_prop",
-        "console.log(Array.from({length:2, 0:'p', 1:'q'}).length);",
-    ),
+    ("from_length_prop", "console.log(Array.from({length:2, 0:'p', 1:'q'}).length);"),
     // ---- Array.of ------------------------------------------------------
     ("of_basic", "console.log(Array.of(1,2,3));"),
     ("of_single_number", "console.log(Array.of(7).length, Array.of(7)[0]);"),
@@ -260,18 +221,9 @@ const MINIS: &[(&str, &str)] = &[
     ("of_holes_semantics", "console.log(Array.of(undefined, undefined).length);"),
     ("of_mixed", "console.log(Array.of(1, 'a', true, null));"),
     // ---- Array.from/of with a detached (non-constructor) receiver ------
-    (
-        "from_detached_receiver",
-        "var f = Array.from; console.log(f([1,2,3]));",
-    ),
-    (
-        "of_detached_receiver",
-        "var of = Array.of; console.log(of(1,2,3));",
-    ),
-    (
-        "from_call_null",
-        "console.log(Array.from.call(null, [9,8,7]));",
-    ),
+    ("from_detached_receiver", "var f = Array.from; console.log(f([1,2,3]));"),
+    ("of_detached_receiver", "var of = Array.of; console.log(of(1,2,3));"),
+    ("from_call_null", "console.log(Array.from.call(null, [9,8,7]));"),
     // ---- TypedArray.from / of ------------------------------------------
     ("ta_from_array", "console.log(Array.from(Int8Array.from([1,2,3])));"),
     ("ta_from_iterable", "console.log(Array.from(Uint8Array.from(new Set([10,20,30]))));"),
@@ -280,7 +232,10 @@ const MINIS: &[(&str, &str)] = &[
     // A mapFn over an ARRAY-LIKE (non-iterator) source is incremental in both
     // sem and V8 → exact. (The iterable-path mapFn corner is engine-divergent
     // and sound-refused; see the refusal pins below.)
-    ("ta_from_mapfn", "console.log(Array.from(Int16Array.from({length:3, 0:1, 1:2, 2:3}, x => x * 10)));"),
+    (
+        "ta_from_mapfn",
+        "console.log(Array.from(Int16Array.from({length:3, 0:1, 1:2, 2:3}, x => x * 10)));",
+    ),
     ("ta_from_arraylike", "console.log(Array.from(Uint8Array.from({length: 2, 0: 5, 1: 6})));"),
     ("ta_of_basic", "console.log(Array.from(Int32Array.of(4,5,6)));"),
     ("ta_of_empty", "console.log(Int8Array.of().length);"),
@@ -293,7 +248,10 @@ const MINIS: &[(&str, &str)] = &[
         "ta_from_bigint_mismatch",
         "try { BigInt64Array.from([1,2,3]); console.log('no'); } catch(e){ console.log(e.name); }",
     ),
-    ("ta_from_bigint_ok", "console.log(Array.from(BigInt64Array.from([1n,2n,3n]), x => Number(x)));"),
+    (
+        "ta_from_bigint_ok",
+        "console.log(Array.from(BigInt64Array.from([1n,2n,3n]), x => Number(x)));",
+    ),
     // TypedArrayCreate step-3: a custom constructor returning a SMALLER
     // instance than requested throws TypeError (before any element set).
     (
@@ -338,10 +296,7 @@ const MINIS: &[(&str, &str)] = &[
          console.log(Array.from(Uint8Array.from.call(ctor, [7, 8])));",
     ),
     // ---- interactions --------------------------------------------------
-    (
-        "from_then_spread",
-        "console.log([...Array.from(new Set([1,2,3]))]);",
-    ),
+    ("from_then_spread", "console.log([...Array.from(new Set([1,2,3]))]);"),
     (
         "async_method_spread_args",
         "var o = { async m(...xs){ return xs.reduce((a,b)=>a+b,0); } }; o.m(...[1,2,3,4]).then(v=>console.log(v));",
@@ -462,11 +417,8 @@ fn sem_only_totality_scan_body() {
                 continue;
             }
             let raw = fm.flags.iter().any(|f| f == "raw");
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".to_string(), "sta.js".to_string()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".to_string(), "sta.js".to_string()] };
             include_names.extend(fm.includes.iter().cloned());
             let mut include_srcs: Vec<String> = Vec::new();
             let mut missing = false;
@@ -659,7 +611,9 @@ fn corpus_sweep_vs_node() {
 #[allow(clippy::too_many_lines)]
 fn corpus_sweep_body() {
     let Some(node) = node_bin() else {
-        eprintln!("SKIP corpus_sweep_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS)");
+        eprintln!(
+            "SKIP corpus_sweep_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS)"
+        );
         return;
     };
     let corpus = corpus_root();
@@ -697,11 +651,8 @@ fn corpus_sweep_body() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".to_string(), "sta.js".to_string()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".to_string(), "sta.js".to_string()] };
             include_names.extend(fm.includes.iter().cloned());
             if fm.flags.iter().any(|f| f == "async")
                 && !include_names.iter().any(|n| n == "doneprintHandle.js")
@@ -822,9 +773,5 @@ fn corpus_sweep_body() {
 }
 
 fn mode_str(strict: bool) -> &'static str {
-    if strict {
-        "strict"
-    } else {
-        "bare"
-    }
+    if strict { "strict" } else { "bare" }
 }

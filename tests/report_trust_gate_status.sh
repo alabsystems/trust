@@ -49,7 +49,7 @@ LEGACY_COMPAT_GATES=(
 EVIDENCE_CLASSES=(
     "no-verification compatibility|trust-compat,launch|Stage2 no-verification compatibility and linked/local launch smoke; no proof claim."
     "strict Tier-0 proof|trust-extra|Strict verifier corpus evidence with proof-grade rows; runtime_checked, unknown, and no-verification rows do not satisfy this claim."
-    "native proof engines|native-contracts-pipeline-v2|Native TrustIr/trust-mc/trust-wp/trust-vc evidence must be same-row proof evidence, not text-only transport markers."
+    "native proof engines|native-contracts-pipeline-v2|Native TrustIr/trust-mc/trust-vc/TY evidence must be same-row proof evidence, not text-only transport markers."
     "hardened proof|-|Hardened model-backed proof is unclaimed until model assumptions and proof-backed hardened rows are present; inventory-only findings do not satisfy this claim."
     "trust-codegen|trust-extra|trust-codegen requires enforce-mode parity and translation-validation evidence, not report-mode exceptions."
     "dependency integrity|public-distribution|Owned dependency release readiness, public source, checksums, and distribution-root integrity evidence."

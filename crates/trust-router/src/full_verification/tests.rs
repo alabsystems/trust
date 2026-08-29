@@ -24,8 +24,6 @@ use trust_verifier_api::{
     TrustContractBundle, TrustObligation, ValidatedVerificationRequest, VerificationEngine,
     VerificationRunResult, VerificationRunStatus, VerifierExecutionContext, VerifierResourceLimits,
 };
-#[cfg(not(feature = "trust-build"))]
-use trust_wp::TrustWpVerificationEngine;
 
 use super::*;
 
@@ -73,6 +71,13 @@ fn bundle_with_obligation(
         metadata: Vec::new(),
     });
     bundle
+}
+
+fn plain_obligation(kind: ObligationKind, obligation_id: &str) -> TrustObligation {
+    bundle_with_obligation(kind, obligation_id, None, None)
+        .obligations
+        .pop()
+        .expect("single-obligation fixture")
 }
 
 fn canonicalize_fixture_json(value: &mut serde_json::Value) {
@@ -455,8 +460,8 @@ fn direct_trust_vc_receipt_rejects_byte_identical_cross_dispatch_transplant() {
         route_only_policy(),
     );
     let bundle = direct_trust_vc_bundle("memory.direct.cross-dispatch");
-    // Reuse the exact same public context so both independent executions
-    // intentionally publish byte-identical result envelopes.
+    // Reuse the exact same public inputs so both result envelopes are equal
+    // after normalizing observational timing and their evidence rows are exact.
     let context = VerifierExecutionContext::new("direct-trust-vc-cross-dispatch");
     let first = engine.verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
         &bundle,
@@ -464,26 +469,51 @@ fn direct_trust_vc_receipt_rejects_byte_identical_cross_dispatch_transplant() {
         None,
         &context,
     );
-    // The public batch diagnostic includes measured elapsed milliseconds. Run
-    // a few independent calls until that diagnostic also matches, so this
-    // regression genuinely exercises byte-identical public carriers rather
-    // than obtaining rejection from an incidental timing difference.
-    let second = (0..64)
-        .find_map(|_| {
-            let candidate = engine
-                .verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
-                    &bundle,
-                    &bundle.obligations,
-                    None,
-                    &context,
-                );
-            (candidate.result() == first.result()).then_some(candidate)
-        })
-        .expect("fixture must produce a byte-identical independent public run");
+    let second = engine.verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
+        &bundle,
+        &bundle.obligations,
+        None,
+        &context,
+    );
     let (first_run, mut first_live_receipts) = first.into_parts();
     let (second_run, second_live_receipts) = second.into_parts();
     let mut first_receipts = first_live_receipts.take_direct_trust_vc_receipts();
-    assert_eq!(first_run, second_run, "fixture must exercise equal public bytes");
+
+    // The public batch diagnostic deliberately reports measured elapsed
+    // milliseconds. Normalize only that observational field at this test seam
+    // so host timing cannot decide whether the authority test runs. The exact
+    // evidence rows below remain untouched and must still serialize to
+    // byte-identical public carriers.
+    let normalize_batch_elapsed = |run: &VerificationRunResult| {
+        let mut normalized = run.clone();
+        let mut normalized_count = 0;
+        for diagnostic in &mut normalized.diagnostics {
+            let Some((prefix, measured)) = diagnostic.split_once(" elapsed_ms=") else {
+                continue;
+            };
+            if !prefix.starts_with("full-verification engine batch:") {
+                continue;
+            }
+            let (elapsed_ms, suffix) = measured
+                .split_once(" worker_threads=")
+                .expect("batch diagnostic retains its worker-thread field");
+            elapsed_ms.parse::<u128>().expect("batch elapsed value is an integer");
+            *diagnostic = format!("{prefix} elapsed_ms=<normalized> worker_threads={suffix}");
+            normalized_count += 1;
+        }
+        assert_eq!(normalized_count, 1, "one batch timing diagnostic is normalized");
+        normalized
+    };
+    assert_eq!(
+        normalize_batch_elapsed(&first_run),
+        normalize_batch_elapsed(&second_run),
+        "independent public runs differ only in observational batch timing",
+    );
+    assert_eq!(
+        serde_json::to_vec(&first_run.evidence[0]).expect("first public carrier serializes"),
+        serde_json::to_vec(&second_run.evidence[0]).expect("second public carrier serializes"),
+        "the authority-bearing public carriers must be byte-identical",
+    );
     let receipt = first_receipts
         .remove("memory.direct.cross-dispatch")
         .expect("first live dispatch must retain its receipt");
@@ -497,7 +527,15 @@ fn direct_trust_vc_receipt_rejects_byte_identical_cross_dispatch_transplant() {
         second_live_receipts
             .authorizes_direct_trust_vc_receipt(&receipt, obligation, &second_run.evidence[0],)
             .is_err(),
-        "byte-identical public runs must retain distinct private dispatch identities",
+        "byte-identical public evidence carriers retain distinct private dispatch identities",
+    );
+    let mut mutated_second_row = second_run.evidence[0].clone();
+    mutated_second_row.evidence_id.push_str(":mutation-control");
+    assert!(
+        first_live_receipts
+            .authorizes_direct_trust_vc_receipt(&receipt, obligation, &mutated_second_row,)
+            .is_err(),
+        "a mutated second-dispatch row must remain unauthorized",
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "configured spoof must not run");
 }
@@ -852,24 +890,14 @@ fn required_native_engines_fail_closed_without_typed_proof_input() {
     assert_eq!(result.summary.unsupported, 1);
     assert!(!result.is_fully_proved());
     assert!(!result.evidence[0].diagnostics.is_empty());
-    #[cfg(all(not(feature = "trust-build"), not(feature = "trust-vc-native")))]
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("requires native trust-wp, trust-vc, trust-mc, and TY engines")
-            && diagnostic.contains("missing: trust-wp, trust-vc")
+    assert!(result.evidence[0].diagnostics.iter().all(|diagnostic| {
+        !diagnostic.contains("missing: trust-wp")
+            && !diagnostic.contains("requires native trust-wp")
     }));
-    #[cfg(all(not(feature = "trust-build"), feature = "trust-vc-native"))]
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("requires native trust-wp, trust-vc, trust-mc, and TY engines")
-            && diagnostic.ends_with("missing: trust-wp")
-    }));
-    #[cfg(feature = "trust-build")]
-    assert!(
-        result.evidence[0].diagnostics.iter().any(|diagnostic| diagnostic.contains("trust-wp"))
-    );
 
     let structured = result.full_verification_obligation_evidence();
     assert_eq!(structured.len(), 1);
-    assert_eq!(structured[0].primary_suite.as_deref(), Some("trust-wp"));
+    assert_eq!(structured[0].primary_suite.as_deref(), Some("trust-mc"));
     assert!(!structured[0].has_accepted_proof());
     assert_eq!(structured[0].decisions[0].status, EvidenceStatus::Unsupported);
     assert_eq!(structured[0].decisions[0].diagnostics, result.evidence[0].diagnostics);
@@ -1105,7 +1133,11 @@ fn required_native_trust_mc_engine_owns_hardened_custom_obligations() {
 fn required_native_engines_route_primary_obligation_families_fail_closed() {
     let engine = FullVerificationEngine::with_required_native_engines();
     for (kind, expected_suite) in [
-        (ObligationKind::Precondition, "trust-wp"),
+        (ObligationKind::Precondition, "trust-mc"),
+        (ObligationKind::Postcondition, "trust-mc"),
+        (ObligationKind::LoopInvariant, "trust-mc"),
+        (ObligationKind::Termination, "trust-mc"),
+        (ObligationKind::Refinement, "trust-vc"),
         (ObligationKind::MemorySafety, "trust-vc"),
         (ObligationKind::Ownership, "trust-vc"),
         (ObligationKind::Assertion, "trust-mc"),
@@ -1156,12 +1188,8 @@ fn unbounded_allocation_namespace_routes_to_trust_vc_fail_closed() {
             name: name.to_string(),
         };
         let obligation_id = format!("obligation-unbounded-alloc-{name}");
-        let bundle = bundle_with_obligation(
-            kind,
-            &obligation_id,
-            None,
-            Some(ProofStrength::deductive()),
-        );
+        let bundle =
+            bundle_with_obligation(kind, &obligation_id, None, Some(ProofStrength::deductive()));
         assert!(engine.supports(&bundle.obligations[0]).is_supported());
 
         let result =
@@ -1209,8 +1237,7 @@ fn mir_memory_transport_kind_tables_agree() {
             None,
             Some(ProofStrength::deductive()),
         );
-        let result =
-            engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-agreement"));
+        let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-agreement"));
         let structured = result.full_verification_obligation_evidence();
         assert_eq!(structured[0].primary_suite.as_deref(), Some("trust-vc"), "{kind:?}");
         // Adapter ownership predicate.
@@ -1225,15 +1252,35 @@ fn mir_memory_transport_kind_tables_agree() {
     }
 }
 
+#[test]
+fn refinement_routes_only_to_trust_vc_contract_frame_transport() {
+    let kind = ObligationKind::Refinement;
+    let route =
+        super::routing::obligation_route_for_kind(&kind).expect("refinement has a v6/D3 route");
+    assert_eq!(route.primary.name(), "trust-vc");
+    assert!(trust_vc_bridge::is_trust_vc_owned_obligation_kind(&kind));
+    assert!(trust_vc_bridge::requires_trust_vc_contract_frame(&kind));
+    assert!(!trust_vc_bridge::requires_trust_vc_ownership_context(&kind));
+    // The producer/consumer kind mapping is `trust-build`-gated in the
+    // bridge (enabled from this crate via `trust-vc-native`, like every
+    // other native-mapping assertion in this file); a default-features
+    // build cannot reference it at all.
+    #[cfg(feature = "trust-vc-native")]
+    assert_eq!(
+        trust_vc_bridge::trust_vc_native_trust_ir_kind_for_public_obligation(&kind),
+        Some(trust_ir::ObligationKind::RefinementType)
+    );
+    assert!(!trust_wp::is_trust_wp_owned_obligation_kind(&kind));
+}
+
 // Trust (P1.2 precedent, extended to preconditions and E4/E5): a body-aware VC
 // carrying the accepted typed formula envelope must be DISPATCHED to trust-mc for
 // Postcondition (the `#[ensures]` VC), Precondition (the call-site
 // `#[requires]` VC), LoopInvariant (E4 initiation/consecution), and Termination
 // (E5 non-negative/strict-decrease). This route is both the engine dispatch and the
 // expected-suite the native-TrustIr evidence validation compares against the
-// compiler's recorded trust-mc proof unit. Payload-less kinds keep their
-// per-kind routes (pinned by
-// `required_native_engines_route_primary_obligation_families_fail_closed`).
+// compiler's recorded trust-mc proof unit. Payload-less kinds are TrustMC-owned
+// too and fail closed there when no body formula exists.
 #[test]
 fn payload_carrying_body_aware_contract_vcs_route_to_trust_mc() {
     let engine = FullVerificationEngine::with_required_native_engines();
@@ -1273,7 +1320,7 @@ fn payload_carrying_body_aware_contract_vcs_route_to_trust_mc() {
 }
 
 #[test]
-fn payloadless_e4_e5_claims_remain_trust_wp_owned() {
+fn payloadless_e4_e5_claims_are_trust_mc_owned_and_fail_closed() {
     let engine = FullVerificationEngine::with_required_native_engines();
     for kind in [ObligationKind::LoopInvariant, ObligationKind::Termination] {
         let obligation_id = format!("obligation-claim-route-{kind:?}");
@@ -1286,15 +1333,15 @@ fn payloadless_e4_e5_claims_remain_trust_wp_owned() {
         let structured = result.full_verification_obligation_evidence();
         assert_eq!(
             structured[0].primary_suite.as_deref(),
-            Some("trust-wp"),
-            "payload-less {:?} claim must not acquire trust-mc authority",
+            Some("trust-mc"),
+            "payload-less {:?} claim stays TrustMC-owned and must fail closed there",
             bundle.obligations[0].kind,
         );
     }
 }
 
 #[test]
-fn partial_or_forged_e4_e5_formula_envelopes_remain_trust_wp_owned() {
+fn partial_or_forged_e4_e5_formula_envelopes_do_not_change_trust_mc_ownership() {
     let engine = FullVerificationEngine::with_required_native_engines();
     for kind in [ObligationKind::LoopInvariant, ObligationKind::Termination] {
         let obligation_id = format!("obligation-forged-payload-route-{kind:?}");
@@ -1315,7 +1362,7 @@ fn partial_or_forged_e4_e5_formula_envelopes_remain_trust_wp_owned() {
         let structured = result.full_verification_obligation_evidence();
         assert_eq!(
             structured[0].primary_suite.as_deref(),
-            Some("trust-wp"),
+            Some("trust-mc"),
             "partial {:?} formula metadata must not change ownership",
             bundle.obligations[0].kind,
         );
@@ -1360,101 +1407,69 @@ fn malformed_typed_e4_e5_predicates_do_not_change_dispatch_ownership() {
         let structured = result.full_verification_obligation_evidence();
         assert_eq!(
             structured[0].primary_suite.as_deref(),
-            Some("trust-wp"),
+            Some("trust-mc"),
             "malformed {:?} formula metadata must not change ownership",
             bundle.obligations[0].kind,
         );
     }
 }
 
-#[cfg(not(feature = "trust-build"))]
 #[test]
-fn full_verifier_keeps_typed_trust_wp_lowering_fail_closed_without_aggregate_gate() {
-    // Isolate the optional trust-wp adapter's own fail-closed behavior from
-    // the composite all-required-engine availability gate.
-    let engine = FullVerificationEngine::new(
-        vec![Box::new(TrustWpVerificationEngine::new())],
-        route_only_policy(),
-    );
+fn historical_trust_wp_metadata_cannot_revive_retired_ownership() {
+    let engine = FullVerificationEngine::with_required_native_engines();
     let bundle = bundle_with_typed_trust_wp_postcondition();
+
     let result =
-        engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-trust-wp-native"));
+        engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-retired-trust-wp"));
 
-    assert_eq!(result.status, VerificationRunStatus::Inconclusive);
-    assert_eq!(result.summary.requested_obligations, 1);
+    assert_eq!(result.status, VerificationRunStatus::Inconclusive, "{result:#?}");
     assert_eq!(result.summary.proved, 0);
     assert_eq!(result.summary.unsupported, 1);
-    assert!(!result.is_fully_proved());
     assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
     assert!(result.evidence[0].proof_strength.is_none());
     assert!(result.evidence[0].artifacts.is_empty());
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("local typed TrustWpPureExprV1 replay")
-            && diagnostic.contains("trust_wp.verify-bundle.aggregate-native-replay-gate.v1")
-    }));
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("primary owner trust-wp")
-            && diagnostic.contains("produced rejected evidence")
-    }));
+    let structured = result.full_verification_obligation_evidence();
+    assert_eq!(structured[0].primary_suite.as_deref(), Some("trust-mc"));
+    assert!(!structured[0].has_accepted_proof());
+}
+
+#[test]
+fn historical_trust_wp_native_request_round_trips_without_reviving_a_route() {
+    let live = native_trust_ir_mc_bundle();
+    assert!(
+        live.requests
+            .iter()
+            .all(|request| { !matches!(request, NativeVerificationRequest::TrustWp(_)) })
+    );
+
+    let historical = historical_native_trust_wp_bundle();
+    assert_eq!(
+        historical
+            .requests
+            .iter()
+            .filter(|request| matches!(request, NativeVerificationRequest::TrustWp(_)))
+            .count(),
+        1,
+        "the compatibility fixture must contain one genuine historical TrustWP wire row",
+    );
+    let encoded = serde_json::to_value(&historical).expect("historical bundle serializes");
+    let decoded: NativeVerificationBundle =
+        serde_json::from_value(encoded).expect("historical TrustWP wire remains readable");
+    decoded.validate().expect("historical bundle remains structurally valid");
+
+    let post = bundle_with_typed_trust_wp_postcondition();
+    let route = super::routing::obligation_route(&post.obligations[0])
+        .expect("postcondition remains routable");
+    assert_eq!(route.primary.name(), "trust-mc");
+    assert!(!trust_wp::is_trust_wp_owned_obligation_kind(&post.obligations[0].kind));
 }
 
 #[cfg(feature = "trust-build")]
 #[test]
-fn full_verifier_accepts_typed_trust_wp_lowering_with_aggregate_gate() {
+fn historical_native_trust_wp_bundle_cannot_authorize_a_public_postcondition() {
     let engine = FullVerificationEngine::with_required_native_engines();
     let bundle = bundle_with_typed_trust_wp_postcondition();
-    let mut native_bundle = native_trust_ir_mc_wp_bundle();
-    bind_native_obligation_to_public_claim(
-        &mut native_bundle,
-        trust_ir::ProofId::new(2),
-        &bundle,
-        0,
-    );
-    for key in TRUST_TRUST_WP_NATIVE_REPLAY_REQUIRED_METADATA_KEYS {
-        assert!(
-            !bundle.obligations[0].metadata.iter().any(|entry| entry.key == key),
-            "trust-wp native metadata key `{key}` must be generated from the native bundle, not pre-attached public metadata"
-        );
-    }
-    let result = engine.verify_bundle_with_native_trust_ir_bundle(
-        &bundle,
-        &native_bundle,
-        &VerifierExecutionContext::new("run-trust-wp-native"),
-    );
-
-    assert_eq!(result.status, VerificationRunStatus::Proved, "{result:#?}");
-    assert_eq!(result.summary.requested_obligations, 1);
-    assert_eq!(result.summary.proved, 1);
-    assert_eq!(result.summary.unsupported, 0);
-    assert!(result.is_fully_proved());
-    assert_eq!(result.evidence[0].status, EvidenceStatus::Proved);
-    assert!(result.evidence[0].proof_strength.is_some());
-    assert!(result.evidence[0].satisfies_proof_artifact_policy());
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("NativeTrustWpBundleVerifier aggregate VerifyBundleResult")
-    }));
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("typed TrustIr native request identity accepted")
-            && diagnostic.contains("suite=trust-wp")
-            && diagnostic.contains("request_id=2")
-            && diagnostic.contains("proof_obligation_id=2")
-    }));
-    assert!(result.full_verification_obligation_evidence()[0].has_accepted_proof());
-}
-
-#[cfg(feature = "trust-build")]
-#[test]
-fn full_verifier_rejects_native_trust_wp_claim_for_different_public_predicate() {
-    let engine = FullVerificationEngine::with_required_native_engines();
-    let mut bundle = bundle_with_typed_trust_wp_postcondition();
-    bundle.contracts[0].predicate = ContractPredicate::CanonicalJson {
-        schema: "TrustWpPureExprV1".to_string(),
-        value: serde_json::json!({
-            "kind": "bool",
-            "value": false,
-        }),
-    };
-    let mut native_bundle = native_trust_ir_mc_wp_bundle();
+    let mut native_bundle = historical_native_trust_wp_bundle();
     bind_native_obligation_to_public_claim(
         &mut native_bundle,
         trust_ir::ProofId::new(2),
@@ -1465,7 +1480,7 @@ fn full_verifier_rejects_native_trust_wp_claim_for_different_public_predicate() 
     let result = engine.verify_bundle_with_native_trust_ir_bundle(
         &bundle,
         &native_bundle,
-        &VerifierExecutionContext::new("run-trust-wp-native-public-claim-substitution"),
+        &VerifierExecutionContext::new("run-retired-native-trust-wp"),
     );
 
     assert_eq!(result.status, VerificationRunStatus::Inconclusive, "{result:#?}");
@@ -1474,92 +1489,9 @@ fn full_verifier_rejects_native_trust_wp_claim_for_different_public_predicate() 
     assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
     assert!(result.evidence[0].proof_strength.is_none());
     assert!(result.evidence[0].artifacts.is_empty());
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("public/native claim semantic mismatch")
-            && diagnostic.contains("public=sha256:")
-            && diagnostic.contains("native=sha256:")
-    }));
-    assert!(!result.full_verification_obligation_evidence()[0].has_accepted_proof());
-}
-
-#[cfg(feature = "trust-build")]
-#[test]
-fn full_verifier_rejects_trust_wp_metadata_only_when_native_request_is_missing() {
-    let engine = FullVerificationEngine::with_required_native_engines();
-    let mut bundle = bundle_with_typed_trust_wp_postcondition();
-    let mut original_native_bundle = native_trust_ir_mc_wp_bundle();
-    bind_native_obligation_to_public_claim(
-        &mut original_native_bundle,
-        trust_ir::ProofId::new(2),
-        &bundle,
-        0,
-    );
-    let mut native_bundle_without_trust_wp = original_native_bundle.clone();
-    native_bundle_without_trust_wp
-        .requests
-        .retain(|request| request.verifier_suite() != trust_ir::NativeVerifierSuite::TrustWp);
-    attach_trust_wp_native_replay_metadata(
-        &mut bundle,
-        &original_native_bundle,
-        0,
-        trust_ir::ProofId::new(2),
-    );
-
-    let result = engine.verify_bundle_with_native_trust_ir_bundle(
-        &bundle,
-        &native_bundle_without_trust_wp,
-        &VerifierExecutionContext::new("run-trust-wp-metadata-only"),
-    );
-
-    assert_eq!(result.status, VerificationRunStatus::Inconclusive, "{result:#?}");
-    assert_eq!(result.summary.proved, 0);
-    assert_eq!(result.summary.unsupported, 1);
-    assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
-    assert!(result.evidence[0].proof_strength.is_none());
-    assert!(result.evidence[0].artifacts.is_empty());
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("trust-wp native TrustIr bundle evidence rejected")
-            && (diagnostic.contains("missing matching trust_wp native TrustIr request")
-                || diagnostic.contains("NativeVerificationBundle validation failed"))
-    }));
-}
-
-#[cfg(feature = "trust-build")]
-#[test]
-fn full_verifier_rejects_trust_wp_mismatched_native_request_identity() {
-    let engine = FullVerificationEngine::with_required_native_engines();
-    let mut bundle = bundle_with_typed_trust_wp_postcondition();
-    let mut native_bundle = native_trust_ir_mc_wp_bundle();
-    bind_native_obligation_to_public_claim(
-        &mut native_bundle,
-        trust_ir::ProofId::new(2),
-        &bundle,
-        0,
-    );
-    let request_id = bundle.obligations[0]
-        .metadata
-        .iter_mut()
-        .find(|entry| entry.key == TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY)
-        .expect("test obligation has TrustIr request metadata");
-    request_id.value = "99".to_string();
-
-    let result = engine.verify_bundle_with_native_trust_ir_bundle(
-        &bundle,
-        &native_bundle,
-        &VerifierExecutionContext::new("run-trust-wp-mismatch"),
-    );
-
-    assert_eq!(result.status, VerificationRunStatus::Inconclusive, "{result:#?}");
-    assert_eq!(result.summary.proved, 0);
-    assert_eq!(result.summary.unsupported, 1);
-    assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
-    assert!(result.evidence[0].proof_strength.is_none());
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("native request metadata `99`")
-            && diagnostic
-                .contains("canonical obligation id `trust_ir-native-trust-wp-request-2-proof-2`")
-            && diagnostic.contains("request `2`")
-    }));
+    let structured = result.full_verification_obligation_evidence();
+    assert_eq!(structured[0].primary_suite.as_deref(), Some("trust-mc"));
+    assert!(!structured[0].has_accepted_proof());
 }
 
 #[cfg(feature = "trust-build")]
@@ -1644,10 +1576,10 @@ fn full_verifier_rejects_invalid_public_bundle_before_engine_dispatch() {
 fn full_verifier_rejects_id_preserving_obligation_substitution_before_dispatch() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::proving(
-            "trust-wp",
-            EngineKind::Deductive,
+            "trust-mc",
+            EngineKind::Reachability,
             ObligationKind::Postcondition,
-            ProofStrength::deductive(),
+            ProofStrength { reasoning: ReasoningKind::Chc, assurance: AssuranceLevel::SmtBacked },
         ))],
         route_only_policy(),
     );
@@ -1842,10 +1774,10 @@ fn full_verifier_reports_refuted_native_ty_temporal_model() {
 fn bounded_required_strength_is_rejected_in_full_mode() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::proving(
-            "trust-wp",
-            EngineKind::Deductive,
+            "trust-mc",
+            EngineKind::Reachability,
             ObligationKind::Postcondition,
-            ProofStrength::deductive(),
+            ProofStrength { reasoning: ReasoningKind::Chc, assurance: AssuranceLevel::SmtBacked },
         ))],
         route_only_policy(),
     );
@@ -2242,11 +2174,11 @@ fn rebind_native_bundle_module_digest(bundle: &mut NativeVerificationBundle) {
     }
 }
 
-/// Admission-valid native fixture for router tests that do not exercise proof
-/// authority. Request zero deliberately reserves the former TrustVc position
-/// with a pending TrustMc obligation, so the long-standing TrustMc/TrustWp
-/// request identities (1 and 2) remain stable without forging a TrustVc proof.
-fn native_trust_ir_mc_wp_bundle() -> NativeVerificationBundle {
+/// Admission-valid live-planner fixture for router tests that do not exercise
+/// proof authority. The third obligation retains historical TrustWP-shaped
+/// formula and source metadata, but current ownership deliberately emits only
+/// TrustMc requests for all three rows.
+fn native_trust_ir_mc_bundle() -> NativeVerificationBundle {
     let mut module = trust_ir::Module::new("router_native_trust_ir_bundle");
     let source_file = module.intern_file("router_native_fixture.rs");
     let function_id = trust_ir::FuncId::new(0);
@@ -2307,7 +2239,7 @@ fn native_trust_ir_mc_wp_bundle() -> NativeVerificationBundle {
             trust_ir::ProofId::new(2),
             trust_ir::ObligationKind::Postcondition,
             trust_ir::ProofStatus::Pending,
-            "trust-wp postcondition request",
+            "postcondition carrying historical TrustWP-shaped metadata",
         )
         .with_formula(router_native_obligation_source_formula(
             "trust_ir-native-trust-wp-request-2-proof-2",
@@ -2338,12 +2270,51 @@ fn native_trust_ir_mc_wp_bundle() -> NativeVerificationBundle {
     );
     replace_router_native_replay_formula(
         &mut bundle,
-        trust_ir::NativeVerifierSuite::TrustWp,
+        trust_ir::NativeVerifierSuite::TrustMc,
         trust_ir::ProofId::new(2),
         trust_wp_true_replay_formula(),
     );
     rebind_native_bundle_module_digest(&mut bundle);
-    bundle.validate().expect("native TrustMc/TrustWp fixture remains valid after replay formulas");
+    bundle.validate().expect("native TrustMc fixture remains valid after replay formulas");
+    bundle
+}
+
+/// Materialize one structurally valid historical TrustWP request without using
+/// the current native-request planner. This keeps wire compatibility testable
+/// while making the planner's zero-TrustWP invariant anti-vacuous.
+fn historical_native_trust_wp_bundle() -> NativeVerificationBundle {
+    let mut bundle = native_trust_ir_mc_bundle();
+    let request_index = bundle
+        .requests
+        .iter()
+        .position(|request| request.obligations() == [trust_ir::ProofId::new(2)])
+        .expect("historical source row has one current TrustMc request");
+    let NativeVerificationRequest::TrustMc(active) = bundle.requests.remove(request_index) else {
+        panic!("the current planner must own the historical postcondition in TrustMc");
+    };
+    let historical = trust_ir::TrustWpNativeRequest {
+        id: active.id,
+        mode: trust_ir::TrustWpVerificationMode::WeakestPrecondition,
+        function: active.function,
+        obligations: active.obligations,
+        lineage_roots: active.lineage_roots,
+        options: trust_ir::TrustWpRequestOptions::default(),
+        diagnostics: active.diagnostics,
+        provenance: trust_ir::NativeRequestProvenance::trust_wp(trust_ir::NativeToolIdentity::new(
+            "trust_wp",
+        ))
+        .with_solver(trust_ir::NativeToolIdentity::new("ay"))
+        .with_replay(
+            trust_ir::ProofReplayIdentity::new(
+                "trust-wp-core.native-pure-replay",
+                "historical compatibility fixture",
+            )
+            .with_transcript_digest(native_trust_ir_digest(0xB2)),
+        )
+        .with_replay_context(active.provenance.replay_context),
+    };
+    bundle.requests.insert(request_index, NativeVerificationRequest::TrustWp(historical));
+    bundle.validate().expect("historical TrustWP wire fixture remains structurally valid");
     bundle
 }
 
@@ -2461,7 +2432,7 @@ fn kernel_certified_postcondition_fixture() -> (TrustContractBundle, NativeVerif
         .expect("typed public postcondition has a canonical semantic digest");
     let public_semantic_digest = proof_digest_from_canonical_sha256(&public_semantic_digest);
 
-    let mut module = trust_ir::Module::new("router_kernel_certified_three_suite_bundle");
+    let mut module = trust_ir::Module::new("router_kernel_certified_trust_vc_trust_mc_bundle");
     let source_file = module.intern_file("router_kernel_fixture.rs");
     let function_id = trust_ir::FuncId::new(0);
     let func_ty = module.add_func_type(trust_ir::FuncTy {
@@ -2516,13 +2487,13 @@ fn kernel_certified_postcondition_fixture() -> (TrustContractBundle, NativeVerif
             trust_ir::ProofId::new(2),
             trust_ir::ObligationKind::Postcondition,
             trust_ir::ProofStatus::Pending,
-            "independent trust-wp request",
+            "independent trust-mc postcondition request",
         )
         .with_formula(trust_wp_true_replay_formula())
         .with_function(function_id)
         .with_source(router_native_obligation_source_identity(
             trust_ir::ProofId::new(2),
-            "trust_ir-native-trust-wp-request-2-proof-2",
+            "trust_ir-native-trust-mc-request-2-proof-2",
             source_file,
             22,
             native_trust_ir_digest(0xB2),
@@ -2537,7 +2508,7 @@ fn kernel_certified_postcondition_fixture() -> (TrustContractBundle, NativeVerif
 
     let native_bundle =
         native_verification_bundle_from_module(module, native_trust_ir_digest(0xA2), function_id)
-            .expect("kernel-certified three-suite native bundle builds");
+            .expect("kernel-certified TrustVc/TrustMc native bundle builds");
     public_bundle.obligations[0].metadata.extend(trust_vc_native_import_metadata(
         &native_bundle,
         0,
@@ -2565,7 +2536,7 @@ fn kernel_certified_trust_vc_full_engine() -> FullVerificationEngine {
 
 #[cfg(feature = "trust-build")]
 #[test]
-fn kernel_certified_postcondition_is_credited_only_through_typed_trust_vc_import() {
+fn kernel_certified_postcondition_does_not_override_trust_mc_ownership() {
     let (bundle, native_bundle) = kernel_certified_postcondition_fixture();
     let result = kernel_certified_trust_vc_full_engine().verify_bundle_with_native_trust_ir_bundle(
         &bundle,
@@ -2573,22 +2544,15 @@ fn kernel_certified_postcondition_is_credited_only_through_typed_trust_vc_import
         &VerifierExecutionContext::new("run-kernel-certified-postcondition"),
     );
 
-    assert_eq!(result.status, VerificationRunStatus::Proved, "{result:#?}");
+    assert_eq!(result.status, VerificationRunStatus::Inconclusive, "{result:#?}");
     assert_eq!(result.summary.requested_obligations, 1, "{result:#?}");
-    assert_eq!(result.summary.proved, 1, "{result:#?}");
+    assert_eq!(result.summary.proved, 0, "{result:#?}");
+    assert!(result.evidence[0].proof_strength.is_none());
+    assert!(result.evidence[0].artifacts.is_empty());
     assert_eq!(
-        result.evidence[0].proof_strength,
-        Some(ProofStrength::certified(ReasoningKind::Deductive)),
-        "a contract-frame certificate is deductive, not ownership analysis"
+        result.full_verification_obligation_evidence()[0].primary_suite.as_deref(),
+        Some("trust-mc")
     );
-    assert!(result.evidence[0].artifacts.iter().any(|artifact| {
-        artifact.kind == EvidenceArtifactKind::ProofCertificate
-            && artifact.uri.starts_with(TRUST_VC_NATIVE_TRUST_IR_PROOF_CERTIFICATE_URI_PREFIX)
-            && artifact.materialization.is_some()
-    }));
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("native trust_vc TrustIr proof certificate import accepted")
-    }));
 }
 
 #[cfg(feature = "trust-build")]
@@ -2608,21 +2572,12 @@ fn kernel_certified_metadata_without_native_bundle_never_earns_proof_credit() {
             .iter()
             .all(|artifact| { artifact.kind != EvidenceArtifactKind::ProofCertificate })
     );
-    assert!(
-        result.evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("exact typed TrustContractBundle request")
-                || diagnostic.contains("did not produce proved evidence")
-                || diagnostic.contains(
-                    "did not carry an exact compiler-deferred direct TrustVC receipt input",
-                )
-        }),
-        "{result:#?}"
-    );
+    assert!(!result.evidence[0].diagnostics.is_empty(), "{result:#?}");
 }
 
 #[cfg(feature = "trust-build")]
 #[test]
-fn kernel_certified_contract_routing_requires_exact_unique_suite_declaration() {
+fn producer_suite_metadata_cannot_override_v6_contract_ownership() {
     let (bundle, _) = kernel_certified_postcondition_fixture();
     let obligation = &bundle.obligations[0];
     assert_eq!(
@@ -2630,7 +2585,7 @@ fn kernel_certified_contract_routing_requires_exact_unique_suite_declaration() {
             .expect("postcondition has a route")
             .primary
             .name(),
-        "trust-vc"
+        "trust-mc"
     );
 
     for replacement in [None, Some("trust-wp"), Some(" trust-vc ")] {
@@ -2649,8 +2604,8 @@ fn kernel_certified_contract_routing_requires_exact_unique_suite_declaration() {
                 .expect("postcondition has a route")
                 .primary
                 .name(),
-            "trust-wp",
-            "missing, mismatched, or non-canonical suite declarations retain the default owner"
+            "trust-mc",
+            "producer suite metadata never changes the v6 owner"
         );
     }
 
@@ -2664,8 +2619,8 @@ fn kernel_certified_contract_routing_requires_exact_unique_suite_declaration() {
             .expect("postcondition has a route")
             .primary
             .name(),
-        "trust-wp",
-        "even agreeing duplicate declarations are ambiguous"
+        "trust-mc",
+        "even agreeing duplicate declarations cannot change ownership"
     );
 }
 
@@ -2723,16 +2678,13 @@ fn kernel_certified_public_formula_substitution_rejects_native_certificate() {
             .iter()
             .all(|artifact| artifact.kind != EvidenceArtifactKind::ProofCertificate)
     );
-    assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("public typed contract formula differs")
-            || diagnostic.contains("semantic")
-    }));
+    assert!(!result.evidence[0].diagnostics.is_empty());
 }
 
 /// Adversarial variant used only to prove that router admission fails before
 /// child evidence can launder an opaque TrustVc certificate into authority.
 fn native_trust_ir_unreplayed_trust_vc_bundle() -> NativeVerificationBundle {
-    let mut bundle = native_trust_ir_mc_wp_bundle();
+    let mut bundle = native_trust_ir_mc_bundle();
     let proof = trust_ir::ProofId::new(0);
     let obligation = bundle
         .module
@@ -3063,30 +3015,6 @@ fn add_trust_mc_public_typed_chc_binding_metadata(
     ]);
 }
 
-#[cfg(feature = "trust-build")]
-fn attach_trust_wp_native_replay_metadata(
-    bundle: &mut TrustContractBundle,
-    native_bundle: &NativeVerificationBundle,
-    obligation_index: usize,
-    proof_obligation_id: trust_ir::ProofId,
-) {
-    let request = native_bundle
-        .requests
-        .iter()
-        .find(|request| {
-            request.verifier_suite() == trust_ir::NativeVerifierSuite::TrustWp
-                && request.obligations().contains(&proof_obligation_id)
-        })
-        .expect("native bundle contains requested trust_wp obligation");
-    let metadata = trust_wp_native_replay_metadata_entries_for_request(
-        native_bundle,
-        request,
-        proof_obligation_id,
-    )
-    .expect("trust-wp native replay metadata is built through controlled trust_wp API");
-    bundle.obligations[obligation_index].metadata.extend(metadata);
-}
-
 fn native_trust_ir_obligation(
     suite: &str,
     request_id: u32,
@@ -3207,7 +3135,8 @@ struct ProvedFailedConflictEngine {
 
 impl ProvedFailedConflictEngine {
     fn new() -> Self {
-        let mut manifest = EngineManifest::new("trust-wp", "conflict-test", EngineKind::Deductive);
+        let mut manifest =
+            EngineManifest::new("trust-mc", "conflict-test", EngineKind::Reachability);
         manifest.capabilities.push(EngineCapability {
             obligation_kind: ObligationKind::Postcondition,
             support: SupportLevel::Preferred,
@@ -3245,9 +3174,12 @@ impl VerificationEngine for ProvedFailedConflictEngine {
                     engine: self.manifest.clone(),
                     status: EvidenceStatus::Proved,
                     decline: None,
-                    proof_strength: Some(ProofStrength::deductive()),
+                    proof_strength: Some(ProofStrength {
+                        reasoning: ReasoningKind::Chc,
+                        assurance: AssuranceLevel::SmtBacked,
+                    }),
                     artifacts: exact_fixture_artifacts_for_engine(
-                        "trust-wp",
+                        "trust-mc",
                         obligation,
                         "proved-failed-conflict",
                     ),
@@ -3344,7 +3276,7 @@ impl VerificationEngine for BatchCountingEngine {
         obligations
             .iter()
             .map(|obligation| ObligationEvidence {
-                evidence_id: format!("trust-wp:batch:{}", obligation.obligation_id),
+                evidence_id: format!("ty:batch:{}", obligation.obligation_id),
                 obligation_id: obligation.obligation_id.clone(),
                 engine: self.manifest.clone(),
                 status: EvidenceStatus::Proved,
@@ -3587,28 +3519,25 @@ fn full_verifier_preserves_requested_evidence_order_across_primary_batches() {
                 calls.clone(),
             )),
             Box::new(RecordingEngine::new(
-                "trust-wp",
-                EngineKind::Deductive,
-                ObligationKind::Postcondition,
-                ProofStrength::deductive(),
+                "ty",
+                EngineKind::Temporal,
+                ObligationKind::Liveness,
+                ProofStrength {
+                    reasoning: ReasoningKind::TemporalModelCheck,
+                    assurance: AssuranceLevel::Sound,
+                },
                 calls.clone(),
             )),
         ],
         route_only_policy(),
     );
-    let native_bundle = native_trust_ir_mc_wp_bundle();
+    let native_bundle = native_trust_ir_mc_bundle();
     let mut bundle = TrustContractBundle::empty(
         "bundle-native-batch-order",
         BundleSubject::Function { crate_name: "demo".to_string(), path: "demo::f".to_string() },
     );
     bundle.obligations = vec![
-        native_trust_ir_obligation(
-            "trust-wp",
-            2,
-            2,
-            ObligationKind::Postcondition,
-            Some(ProofStrength::deductive()),
-        ),
+        plain_obligation(ObligationKind::Liveness, "obligation-liveness"),
         native_trust_ir_obligation(
             "trust-mc",
             1,
@@ -3630,15 +3559,12 @@ fn full_verifier_preserves_requested_evidence_order_across_primary_batches() {
     assert_eq!(result.status, VerificationRunStatus::Proved);
     let mut called_engines = calls.lock().expect("calls lock").clone();
     called_engines.sort();
-    assert_eq!(called_engines, vec!["trust-mc".to_string(), "trust-wp".to_string()]);
+    assert_eq!(called_engines, vec!["trust-mc".to_string(), "ty".to_string()]);
     let evidence_ids =
         result.evidence.iter().map(|item| item.obligation_id.as_str()).collect::<Vec<_>>();
     assert_eq!(
         evidence_ids,
-        vec![
-            "trust_ir-native-trust-wp-request-2-proof-2",
-            "trust_ir-native-trust-mc-request-1-proof-1"
-        ]
+        vec!["obligation-liveness", "trust_ir-native-trust-mc-request-1-proof-1"]
     );
 }
 
@@ -3649,10 +3575,13 @@ fn full_verifier_runs_independent_primary_batches_in_parallel_when_worker_thread
     let engine = FullVerificationEngine::new(
         vec![
             Box::new(SlowRecordingEngine::new(
-                "trust-wp",
-                EngineKind::Deductive,
-                ObligationKind::Postcondition,
-                ProofStrength::deductive(),
+                "ty",
+                EngineKind::Temporal,
+                ObligationKind::Liveness,
+                ProofStrength {
+                    reasoning: ReasoningKind::TemporalModelCheck,
+                    assurance: AssuranceLevel::Sound,
+                },
                 active_calls.clone(),
                 max_active_calls.clone(),
             )),
@@ -3670,19 +3599,13 @@ fn full_verifier_runs_independent_primary_batches_in_parallel_when_worker_thread
         ],
         route_only_policy(),
     );
-    let native_bundle = native_trust_ir_mc_wp_bundle();
+    let native_bundle = native_trust_ir_mc_bundle();
     let mut bundle = TrustContractBundle::empty(
         "bundle-native-parallel-batches",
         BundleSubject::Function { crate_name: "demo".to_string(), path: "demo::f".to_string() },
     );
     bundle.obligations = vec![
-        native_trust_ir_obligation(
-            "trust-wp",
-            2,
-            2,
-            ObligationKind::Postcondition,
-            Some(ProofStrength::deductive()),
-        ),
+        plain_obligation(ObligationKind::Liveness, "obligation-liveness"),
         native_trust_ir_obligation(
             "trust-mc",
             1,
@@ -3710,10 +3633,7 @@ fn full_verifier_runs_independent_primary_batches_in_parallel_when_worker_thread
         result.evidence.iter().map(|item| item.obligation_id.as_str()).collect::<Vec<_>>();
     assert_eq!(
         evidence_ids,
-        vec![
-            "trust_ir-native-trust-wp-request-2-proof-2",
-            "trust_ir-native-trust-mc-request-1-proof-1"
-        ]
+        vec!["obligation-liveness", "trust_ir-native-trust-mc-request-1-proof-1"]
     );
     let batch_diagnostics = result
         .diagnostics
@@ -3744,10 +3664,13 @@ fn full_verifier_runs_independent_primary_batches_serially_when_worker_threads_i
     let engine = FullVerificationEngine::new(
         vec![
             Box::new(SlowRecordingEngine::new(
-                "trust-wp",
-                EngineKind::Deductive,
-                ObligationKind::Postcondition,
-                ProofStrength::deductive(),
+                "ty",
+                EngineKind::Temporal,
+                ObligationKind::Liveness,
+                ProofStrength {
+                    reasoning: ReasoningKind::TemporalModelCheck,
+                    assurance: AssuranceLevel::Sound,
+                },
                 active_calls.clone(),
                 max_active_calls.clone(),
             )),
@@ -3765,19 +3688,13 @@ fn full_verifier_runs_independent_primary_batches_serially_when_worker_threads_i
         ],
         route_only_policy(),
     );
-    let native_bundle = native_trust_ir_mc_wp_bundle();
+    let native_bundle = native_trust_ir_mc_bundle();
     let mut bundle = TrustContractBundle::empty(
         "bundle-native-serial-batches",
         BundleSubject::Function { crate_name: "demo".to_string(), path: "demo::f".to_string() },
     );
     bundle.obligations = vec![
-        native_trust_ir_obligation(
-            "trust-wp",
-            2,
-            2,
-            ObligationKind::Postcondition,
-            Some(ProofStrength::deductive()),
-        ),
+        plain_obligation(ObligationKind::Liveness, "obligation-liveness"),
         native_trust_ir_obligation(
             "trust-mc",
             1,
@@ -3884,24 +3801,24 @@ fn full_verifier_rejects_child_proof_when_trust_vc_authority_was_not_replayed() 
 fn full_verifier_accepts_publication_grade_child_evidence() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::proving(
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
-            ProofStrength { reasoning: ReasoningKind::Deductive, assurance: AssuranceLevel::Sound },
+            "trust-mc",
+            EngineKind::Reachability,
+            ObligationKind::ArithmeticSafety,
+            ProofStrength { reasoning: ReasoningKind::Pdr, assurance: AssuranceLevel::SmtBacked },
         ))],
         route_only_policy(),
     );
-    let native_bundle = native_trust_ir_mc_wp_bundle();
+    let native_bundle = native_trust_ir_mc_bundle();
     let mut bundle = TrustContractBundle::empty(
-        "bundle-native-trust-wp-publication-grade",
+        "bundle-native-trust-mc-publication-grade",
         BundleSubject::Function { crate_name: "demo".to_string(), path: "demo::f".to_string() },
     );
     bundle.obligations = vec![native_trust_ir_obligation(
-        "trust-wp",
-        2,
-        2,
-        ObligationKind::Postcondition,
-        Some(ProofStrength::deductive()),
+        "trust-mc",
+        1,
+        1,
+        ObligationKind::ArithmeticSafety,
+        Some(ProofStrength { reasoning: ReasoningKind::Pdr, assurance: AssuranceLevel::SmtBacked }),
     )];
     let result = engine.verify_bundle_with_native_trust_ir_bundle(
         &bundle,
@@ -3916,7 +3833,7 @@ fn full_verifier_accepts_publication_grade_child_evidence() {
         result.evidence[0]
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.contains("primary owner trust-wp"))
+            .any(|diagnostic| diagnostic.contains("primary owner trust-mc"))
     );
 }
 
@@ -3924,20 +3841,23 @@ fn full_verifier_accepts_publication_grade_child_evidence() {
 fn proof_grade_without_replay_check_metadata_fails_full_mode() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::new(
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
+            "ty",
+            EngineKind::Temporal,
+            ObligationKind::Liveness,
             SupportLevel::Preferred,
             UnitEvidenceMode::Evidence {
                 status: EvidenceStatus::Proved,
-                proof_strength: Some(ProofStrength::deductive()),
+                proof_strength: Some(ProofStrength {
+                    reasoning: ReasoningKind::TemporalModelCheck,
+                    assurance: AssuranceLevel::Sound,
+                }),
                 artifacts: Vec::new(),
                 diagnostics: Vec::new(),
             },
         ))],
         route_only_policy(),
     );
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle = bundle_with_obligation(ObligationKind::Liveness, "obligation-live", None, None);
     let result =
         engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-no-proof-artifacts"));
 
@@ -3959,12 +3879,6 @@ fn primary_native_route_proved_evidence_requires_native_bundle_without_identity_
             EngineKind::Reachability,
             ObligationKind::ArithmeticSafety,
             ProofStrength { reasoning: ReasoningKind::Chc, assurance: AssuranceLevel::SmtBacked },
-        ),
-        (
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
-            ProofStrength::deductive(),
         ),
         (
             "trust-vc",
@@ -4037,44 +3951,27 @@ fn primary_native_route_proved_evidence_requires_native_bundle_without_identity_
 }
 
 #[test]
-fn native_trust_ir_bundle_identity_is_preserved_for_trust_mc_and_trust_wp() {
-    let native_bundle = native_trust_ir_mc_wp_bundle();
+fn native_trust_ir_bundle_identity_is_preserved_for_active_trust_mc() {
+    let native_bundle = native_trust_ir_mc_bundle();
     let engine = FullVerificationEngine::new(
-        vec![
-            Box::new(UnitEngine::new(
-                "trust-mc",
-                EngineKind::Reachability,
-                ObligationKind::ArithmeticSafety,
-                SupportLevel::Preferred,
-                UnitEvidenceMode::Evidence {
-                    status: EvidenceStatus::Proved,
-                    proof_strength: Some(ProofStrength {
-                        reasoning: ReasoningKind::Pdr,
-                        assurance: AssuranceLevel::SmtBacked,
-                    }),
-                    artifacts: vec![
-                        solver_transcript_artifact("trust-mc-native-transcript"),
-                        proof_check_artifact("trust-mc-native-proof-check"),
-                    ],
-                    diagnostics: Vec::new(),
-                },
-            )),
-            Box::new(UnitEngine::new(
-                "trust-wp",
-                EngineKind::Deductive,
-                ObligationKind::Postcondition,
-                SupportLevel::Preferred,
-                UnitEvidenceMode::Evidence {
-                    status: EvidenceStatus::Proved,
-                    proof_strength: Some(ProofStrength::deductive()),
-                    artifacts: vec![
-                        solver_transcript_artifact("trust-wp-native-transcript"),
-                        proof_check_artifact("trust-wp-proof-check"),
-                    ],
-                    diagnostics: Vec::new(),
-                },
-            )),
-        ],
+        vec![Box::new(UnitEngine::new(
+            "trust-mc",
+            EngineKind::Reachability,
+            ObligationKind::ArithmeticSafety,
+            SupportLevel::Preferred,
+            UnitEvidenceMode::Evidence {
+                status: EvidenceStatus::Proved,
+                proof_strength: Some(ProofStrength {
+                    reasoning: ReasoningKind::Pdr,
+                    assurance: AssuranceLevel::SmtBacked,
+                }),
+                artifacts: vec![
+                    solver_transcript_artifact("trust-mc-native-transcript"),
+                    proof_check_artifact("trust-mc-native-proof-check"),
+                ],
+                diagnostics: Vec::new(),
+            },
+        ))],
         route_only_policy(),
     );
     let mut bundle = TrustContractBundle::empty(
@@ -4084,28 +3981,20 @@ fn native_trust_ir_bundle_identity_is_preserved_for_trust_mc_and_trust_wp() {
             path: "demo::checked_transfer".to_string(),
         },
     );
-    bundle.obligations = vec![
-        native_trust_ir_obligation("trust-mc", 1, 1, ObligationKind::ArithmeticSafety, None),
-        native_trust_ir_obligation(
-            "trust-wp",
-            2,
-            2,
-            ObligationKind::Postcondition,
-            Some(ProofStrength::deductive()),
-        ),
-    ];
+    bundle.obligations =
+        vec![native_trust_ir_obligation("trust-mc", 1, 1, ObligationKind::ArithmeticSafety, None)];
 
     let result = engine.verify_bundle_with_native_trust_ir_bundle(
         &bundle,
         &native_bundle,
-        &VerifierExecutionContext::new("run-native-trust-ir-mc-wp"),
+        &VerifierExecutionContext::new("run-native-trust-ir-mc"),
     );
 
     assert_eq!(result.status, VerificationRunStatus::Proved);
-    assert_eq!(result.summary.proved, 2);
+    assert_eq!(result.summary.proved, 1);
     assert_eq!(result.summary.missing_proof_artifacts, 0);
 
-    for (suite, request_id, proof_id) in [("trust-mc", 1, 1), ("trust-wp", 2, 2)] {
+    for (suite, request_id, proof_id) in [("trust-mc", 1, 1)] {
         let obligation_id =
             format!("trust_ir-native-{suite}-request-{request_id}-proof-{proof_id}");
         let evidence = result
@@ -4135,7 +4024,7 @@ fn native_trust_ir_bundle_identity_is_preserved_for_trust_mc_and_trust_wp() {
     }
 
     let manifest = result.to_manifest();
-    assert_eq!(manifest.accepted_evidence.len(), 2);
+    assert_eq!(manifest.accepted_evidence.len(), 1);
     assert!(manifest.rejected_evidence.is_empty());
     assert!(manifest.artifacts.iter().any(|artifact| {
         artifact.uri.starts_with("trust_ir-native://verification-bundle/")
@@ -4148,7 +4037,7 @@ fn native_trust_ir_bundle_identity_is_preserved_for_trust_mc_and_trust_wp() {
     }));
 
     let structured = result.full_verification_obligation_evidence();
-    assert_eq!(structured.len(), 2);
+    assert_eq!(structured.len(), 1);
     for item in &structured {
         assert!(item.has_accepted_proof(), "missing accepted proof for {}", item.obligation_id);
         assert!(
@@ -4169,26 +4058,30 @@ fn native_trust_ir_bundle_identity_is_preserved_for_trust_mc_and_trust_wp() {
 
 #[test]
 fn native_trust_ir_mode_rejects_proved_evidence_without_native_obligation_identity() {
-    let native_bundle = native_trust_ir_mc_wp_bundle();
+    let native_bundle = native_trust_ir_mc_bundle();
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::new(
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
+            "trust-mc",
+            EngineKind::Reachability,
+            ObligationKind::ArithmeticSafety,
             SupportLevel::Preferred,
             UnitEvidenceMode::Evidence {
                 status: EvidenceStatus::Proved,
-                proof_strength: Some(ProofStrength::deductive()),
+                proof_strength: Some(ProofStrength {
+                    reasoning: ReasoningKind::Pdr,
+                    assurance: AssuranceLevel::SmtBacked,
+                }),
                 artifacts: vec![
-                    solver_transcript_artifact("trust-wp-transcript"),
-                    proof_check_artifact("trust-wp-proof-check"),
+                    solver_transcript_artifact("trust-mc-transcript"),
+                    proof_check_artifact("trust-mc-proof-check"),
                 ],
                 diagnostics: Vec::new(),
             },
         ))],
         route_only_policy(),
     );
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle =
+        bundle_with_obligation(ObligationKind::ArithmeticSafety, "obligation-overflow", None, None);
 
     let result = engine.verify_bundle_with_native_trust_ir_bundle(
         &bundle,
@@ -4215,7 +4108,7 @@ fn native_trust_ir_mode_rejects_proved_evidence_without_native_obligation_identi
     let structured = result.full_verification_obligation_evidence();
     let native_trust_ir =
         structured[0].native_trust_ir.as_ref().expect("native TrustIr evidence view");
-    assert_eq!(native_trust_ir.expected_suite, "trust-wp");
+    assert_eq!(native_trust_ir.expected_suite, "trust-mc");
     assert!(!native_trust_ir.has_matching_artifacts());
     assert!(native_trust_ir.identity_error.as_ref().is_some_and(|error| {
         error.contains("missing TrustIr native proof-obligation identity")
@@ -4228,7 +4121,7 @@ fn native_trust_ir_mode_rejects_proved_evidence_without_native_obligation_identi
                 expected_suite,
                 identity_error: Some(_),
                 ..
-            } if obligation_id == "obligation-ensures" && expected_suite == "trust-wp"
+            } if obligation_id == "obligation-overflow" && expected_suite == "trust-mc"
         )
     }));
 }
@@ -4237,25 +4130,29 @@ fn native_trust_ir_mode_rejects_proved_evidence_without_native_obligation_identi
 fn proved_evidence_with_native_trust_ir_identity_requires_native_bundle() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::new(
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
+            "trust-mc",
+            EngineKind::Reachability,
+            ObligationKind::ArithmeticSafety,
             SupportLevel::Preferred,
             UnitEvidenceMode::Evidence {
                 status: EvidenceStatus::Proved,
-                proof_strength: Some(ProofStrength::deductive()),
+                proof_strength: Some(ProofStrength {
+                    reasoning: ReasoningKind::Pdr,
+                    assurance: AssuranceLevel::SmtBacked,
+                }),
                 artifacts: vec![
-                    solver_transcript_artifact("trust-wp-transcript"),
-                    proof_check_artifact("trust-wp-proof-check"),
+                    solver_transcript_artifact("trust-mc-transcript"),
+                    proof_check_artifact("trust-mc-proof-check"),
                 ],
                 diagnostics: Vec::new(),
             },
         ))],
         route_only_policy(),
     );
-    let mut bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let mut bundle =
+        bundle_with_obligation(ObligationKind::ArithmeticSafety, "obligation-overflow", None, None);
     bundle.obligations[0] =
-        native_trust_ir_obligation("trust-wp", 2, 2, ObligationKind::Postcondition, None);
+        native_trust_ir_obligation("trust-mc", 1, 1, ObligationKind::ArithmeticSafety, None);
 
     let result = engine.verify_bundle(
         &bundle,
@@ -4274,9 +4171,9 @@ fn proved_evidence_with_native_trust_ir_identity_requires_native_bundle() {
     let structured = result.full_verification_obligation_evidence();
     let native_trust_ir =
         structured[0].native_trust_ir.as_ref().expect("native TrustIr evidence view");
-    assert_eq!(native_trust_ir.expected_suite, "trust-wp");
-    assert_eq!(native_trust_ir.request_id, Some(2));
-    assert_eq!(native_trust_ir.proof_obligation_id, Some(2));
+    assert_eq!(native_trust_ir.expected_suite, "trust-mc");
+    assert_eq!(native_trust_ir.request_id, Some(1));
+    assert_eq!(native_trust_ir.proof_obligation_id, Some(1));
     assert!(!native_trust_ir.has_matching_artifacts());
     assert!(structured[0].blockers.iter().any(|blocker| {
         matches!(
@@ -4284,40 +4181,44 @@ fn proved_evidence_with_native_trust_ir_identity_requires_native_bundle() {
             FullVerificationEvidenceBlocker::NativeTrustIrArtifactMismatch {
                 obligation_id,
                 expected_suite,
-                request_id: Some(2),
-                proof_obligation_id: Some(2),
+                request_id: Some(1),
+                proof_obligation_id: Some(1),
                 ..
-            } if obligation_id == "trust_ir-native-trust-wp-request-2-proof-2"
-                && expected_suite == "trust-wp"
+            } if obligation_id == "trust_ir-native-trust-mc-request-1-proof-1"
+                && expected_suite == "trust-mc"
         )
     }));
 }
 
 #[test]
 fn native_trust_ir_mode_rejects_proved_evidence_when_bundle_validation_fails() {
-    let mut native_bundle = native_trust_ir_mc_wp_bundle();
+    let mut native_bundle = native_trust_ir_mc_bundle();
     native_bundle.requests.clear();
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::new(
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
+            "trust-mc",
+            EngineKind::Reachability,
+            ObligationKind::ArithmeticSafety,
             SupportLevel::Preferred,
             UnitEvidenceMode::Evidence {
                 status: EvidenceStatus::Proved,
-                proof_strength: Some(ProofStrength::deductive()),
+                proof_strength: Some(ProofStrength {
+                    reasoning: ReasoningKind::Pdr,
+                    assurance: AssuranceLevel::SmtBacked,
+                }),
                 artifacts: vec![
-                    solver_transcript_artifact("trust-wp-transcript"),
-                    proof_check_artifact("trust-wp-proof-check"),
+                    solver_transcript_artifact("trust-mc-transcript"),
+                    proof_check_artifact("trust-mc-proof-check"),
                 ],
                 diagnostics: Vec::new(),
             },
         ))],
         route_only_policy(),
     );
-    let mut bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let mut bundle =
+        bundle_with_obligation(ObligationKind::ArithmeticSafety, "obligation-overflow", None, None);
     bundle.obligations[0] =
-        native_trust_ir_obligation("trust-wp", 2, 2, ObligationKind::Postcondition, None);
+        native_trust_ir_obligation("trust-mc", 1, 1, ObligationKind::ArithmeticSafety, None);
 
     let result = engine.verify_bundle_with_native_trust_ir_bundle(
         &bundle,
@@ -4377,26 +4278,17 @@ fn trust_mc_solver_transcript_without_replay_check_is_rejected() {
 }
 
 #[test]
-fn trust_wp_and_trust_vc_require_suite_native_replay_check_artifacts() {
-    for (run_id, engine_name, engine_kind, obligation_kind, proof_strength) in [
-        (
-            "run-trust-wp-transcript-only",
-            "trust-wp",
-            EngineKind::Deductive,
-            ObligationKind::Postcondition,
-            ProofStrength::deductive(),
-        ),
-        (
-            "run-trust-vc-transcript-only",
-            "trust-vc",
-            EngineKind::Deductive,
-            ObligationKind::MemorySafety,
-            ProofStrength {
-                reasoning: ReasoningKind::OwnershipAnalysis,
-                assurance: AssuranceLevel::Sound,
-            },
-        ),
-    ] {
+fn trust_vc_requires_suite_native_replay_check_artifacts() {
+    for (run_id, engine_name, engine_kind, obligation_kind, proof_strength) in [(
+        "run-trust-vc-transcript-only",
+        "trust-vc",
+        EngineKind::Deductive,
+        ObligationKind::MemorySafety,
+        ProofStrength {
+            reasoning: ReasoningKind::OwnershipAnalysis,
+            assurance: AssuranceLevel::Sound,
+        },
+    )] {
         let engine = FullVerificationEngine::new(
             vec![Box::new(UnitEngine::new(
                 engine_name,
@@ -4643,23 +4535,23 @@ fn unchecked_and_runtime_evidence_remain_rejected_in_full_mode() {
         (
             "run-unchecked",
             ProofStrength {
-                reasoning: ReasoningKind::Deductive,
+                reasoning: ReasoningKind::TemporalModelCheck,
                 assurance: AssuranceLevel::Unchecked,
             },
         ),
         (
             "run-runtime",
             ProofStrength {
-                reasoning: ReasoningKind::RuntimeMonitoring,
+                reasoning: ReasoningKind::TemporalModelCheck,
                 assurance: AssuranceLevel::RuntimeObserved,
             },
         ),
     ] {
         let engine = FullVerificationEngine::new(
             vec![Box::new(UnitEngine::new(
-                "trust-wp",
-                EngineKind::Deductive,
-                ObligationKind::Postcondition,
+                "ty",
+                EngineKind::Temporal,
+                ObligationKind::Liveness,
                 SupportLevel::Preferred,
                 UnitEvidenceMode::Evidence {
                     status: EvidenceStatus::Proved,
@@ -4670,7 +4562,8 @@ fn unchecked_and_runtime_evidence_remain_rejected_in_full_mode() {
             ))],
             route_only_policy(),
         );
-        let bundle = bundle_with_postcondition(None);
+        let bundle =
+            bundle_with_obligation(ObligationKind::Liveness, "obligation-live", None, None);
         let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new(run_id));
 
         assert_eq!(result.status, trust_verifier_api::VerificationRunStatus::Inconclusive);
@@ -4690,7 +4583,7 @@ fn secondary_engine_cannot_replace_missing_primary_owner() {
         ))],
         route_only_policy(),
     );
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle = bundle_with_postcondition(None);
     let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-4"));
 
     assert_eq!(result.status, trust_verifier_api::VerificationRunStatus::Inconclusive);
@@ -4701,7 +4594,7 @@ fn secondary_engine_cannot_replace_missing_primary_owner() {
         result.evidence[0]
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.contains("primary owner trust-wp is required"))
+            .any(|diagnostic| diagnostic.contains("primary owner trust-mc is required"))
     );
 }
 
@@ -4710,8 +4603,8 @@ fn missing_primary_evidence_fails_without_skipping_obligation() {
     let engine = FullVerificationEngine::new(
         vec![
             Box::new(UnitEngine::new(
-                "trust-wp",
-                EngineKind::Deductive,
+                "trust-mc",
+                EngineKind::Reachability,
                 ObligationKind::Postcondition,
                 SupportLevel::Preferred,
                 UnitEvidenceMode::Empty,
@@ -4725,7 +4618,7 @@ fn missing_primary_evidence_fails_without_skipping_obligation() {
         ],
         route_only_policy(),
     );
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle = bundle_with_postcondition(None);
     let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-5"));
 
     assert_eq!(result.status, trust_verifier_api::VerificationRunStatus::Inconclusive);
@@ -4895,15 +4788,15 @@ fn manifest_accounts_for_primary_routed_accepted_rejected_and_skipped_obligation
 fn unsupported_primary_engine_blocks_full_verification() {
     let engine = FullVerificationEngine::new(
         vec![Box::new(UnitEngine::new(
-            "trust-wp",
-            EngineKind::Deductive,
+            "trust-mc",
+            EngineKind::Reachability,
             ObligationKind::Postcondition,
             SupportLevel::Unsupported { reason: "native lowering missing".to_string() },
             UnitEvidenceMode::Empty,
         ))],
         route_only_policy(),
     );
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle = bundle_with_postcondition(None);
     let support = engine.supports(&bundle.obligations[0]);
     let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-7"));
 
@@ -4917,7 +4810,7 @@ fn unsupported_primary_engine_blocks_full_verification() {
         result.evidence[0]
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.contains("primary owner trust-wp@0.1.0 rejected"))
+            .any(|diagnostic| diagnostic.contains("primary owner trust-mc@0.1.0 rejected"))
     );
 }
 
@@ -4936,21 +4829,27 @@ fn duplicate_primary_engine_registration_is_ambiguous_and_fails_closed() {
     let engine = FullVerificationEngine::new(
         vec![
             Box::new(UnitEngine::proving(
-                "trust-wp",
-                EngineKind::Deductive,
+                "trust-mc",
+                EngineKind::Reachability,
                 ObligationKind::Postcondition,
-                ProofStrength::deductive(),
+                ProofStrength {
+                    reasoning: ReasoningKind::Chc,
+                    assurance: AssuranceLevel::SmtBacked,
+                },
             )),
             Box::new(UnitEngine::proving(
-                "trust-wp",
-                EngineKind::Deductive,
+                "trust-mc",
+                EngineKind::Reachability,
                 ObligationKind::Postcondition,
-                ProofStrength::deductive(),
+                ProofStrength {
+                    reasoning: ReasoningKind::Chc,
+                    assurance: AssuranceLevel::SmtBacked,
+                },
             )),
         ],
         route_only_policy(),
     );
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle = bundle_with_postcondition(None);
 
     let support = engine.supports(&bundle.obligations[0]);
     let result = engine.verify_bundle(&bundle, &VerifierExecutionContext::new("run-duplicate"));
@@ -4958,26 +4857,26 @@ fn duplicate_primary_engine_registration_is_ambiguous_and_fails_closed() {
     assert!(matches!(
         support,
         SupportLevel::Unsupported { reason }
-            if reason.contains("ambiguous duplicate primary engines: trust-wp")
+            if reason.contains("ambiguous duplicate primary engines: trust-mc")
     ));
     assert_eq!(result.status, VerificationRunStatus::Inconclusive);
     assert_eq!(result.summary.proved, 0);
     assert!(result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("ambiguous duplicate primary engines: trust-wp")
+        diagnostic.contains("ambiguous duplicate primary engines: trust-mc")
     }));
 }
 
 #[test]
 fn invalid_primary_manifest_is_rejected_before_dispatch() {
     let mut invalid = UnitEngine::proving(
-        "trust-wp",
-        EngineKind::Deductive,
+        "trust-mc",
+        EngineKind::Reachability,
         ObligationKind::Postcondition,
-        ProofStrength::deductive(),
+        ProofStrength { reasoning: ReasoningKind::Chc, assurance: AssuranceLevel::SmtBacked },
     );
     invalid.manifest.api_version = "forged-future-api".to_string();
     let engine = FullVerificationEngine::new(vec![Box::new(invalid)], route_only_policy());
-    let bundle = bundle_with_postcondition(Some(ProofStrength::deductive()));
+    let bundle = bundle_with_postcondition(None);
 
     let support = engine.supports(&bundle.obligations[0]);
     let result =
@@ -5174,8 +5073,7 @@ fn concurrency_obligations_are_unroutable_until_their_formula_is_real() {
     }
 
     for name in ["data_race", "insufficient_ordering"] {
-        let obligation =
-            custom(trust_verifier_api::TRUST_VC_OBLIGATION_NAMESPACE, name);
+        let obligation = custom(trust_verifier_api::TRUST_VC_OBLIGATION_NAMESPACE, name);
 
         assert!(
             super::routing::obligation_route(&obligation).is_none(),

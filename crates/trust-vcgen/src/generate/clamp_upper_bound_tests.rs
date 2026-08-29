@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, Sort,
-    SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::{
@@ -14,8 +13,7 @@ use super::{
 /// widening). `build_cast_lower_bound_facts` must emit `Ge(_3, 1)` keyed on the cast
 /// dest `_3`. `narrowing` toggles a value-CHANGING cast (u32->u8) which must be rejected.
 fn max_then_cast(c: i128, narrowing: bool) -> VerifiableFunction {
-    let (src_ty, dst_ty) =
-        if narrowing { (Ty::u32(), Ty::u8()) } else { (Ty::u32(), Ty::u64()) };
+    let (src_ty, dst_ty) = if narrowing { (Ty::u32(), Ty::u8()) } else { (Ty::u32(), Ty::u64()) };
     VerifiableFunction {
         name: "assign_partition".into(),
         def_path: "assign_partition".into(),
@@ -35,6 +33,7 @@ fn max_then_cast(c: i128, narrowing: bool) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "<u32 as core::cmp::Ord>::max".into(),
                         args: vec![
@@ -74,10 +73,9 @@ fn max_const_carries_lower_bound_across_widening() {
     let facts = build_cast_lower_bound_facts(&func);
     assert_eq!(
         facts,
-        vec![Formula::Ge(
-            Box::new(Formula::Var("n".into(), Sort::Int)),
-            Box::new(Formula::Int(1)),
-        )],
+        vec![
+            Formula::Ge(Box::new(Formula::Var("n".into(), Sort::Int)), Box::new(Formula::Int(1)),)
+        ],
         "max(p,1) as u64 must yield (cast)>=1; got {facts:?}"
     );
 }
@@ -120,6 +118,7 @@ fn max_const_lower_bound_dropped_when_source_reassigned() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "<u64 as core::cmp::Ord>::max".into(),
                         args: vec![
@@ -188,6 +187,7 @@ fn clamp_then_cast(lo: i128, hi: i128) -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "<i32 as core::cmp::Ord>::clamp".into(),
                         args: vec![

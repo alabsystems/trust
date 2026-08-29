@@ -161,8 +161,13 @@ fn run_walkthrough_bin(
 ) -> WalkthroughExecution {
     let manifest_directory =
         manifest_dir(manifest_path).expect("validated manifest path has a parent");
+    // The recorded command IS the evidence a reader reruns, so it must be the
+    // command this function actually spawns — including the explicit
+    // `--unverified` lane 333042c50a added. A bare `targo build` refuses rather
+    // than create an implicitly unverified artifact, so a transcript that
+    // omitted the lane was not reproducible.
     let command = format!(
-        "{} build --message-format=json --manifest-path {} --bin {}",
+        "{} --unverified build --message-format=json --manifest-path {} --bin {}",
         targo.display(),
         manifest_path.display(),
         bin.name

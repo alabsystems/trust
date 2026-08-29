@@ -134,11 +134,7 @@ fn main() {
     // The initial state satisfies the invariant. This control can fail only
     // if the same authenticated header is checked after a completed
     // iteration, rather than just on the entry edge.
-    compile_test(
-        &trustc,
-        "loop_invariant_backedge_fail.rs",
-        "loop-invariant-backedge-fail",
-    );
+    compile_test(&trustc, "loop_invariant_backedge_fail.rs", "loop-invariant-backedge-fail");
     run_fail(&bin_name("loop-invariant-backedge-fail"))
         .assert_stderr_contains("kernel-certified Trust monitor failed");
 
@@ -149,18 +145,10 @@ fn main() {
     // A two-latch loop needs independent checks on its explicit-continue and
     // fallthrough backedges. Each control makes only the named edge violate
     // descent, so neither edge can pass merely because the other is covered.
-    compile_test(
-        &trustc,
-        "loop_continue_latch_fail.rs",
-        "loop-continue-latch-fail",
-    );
+    compile_test(&trustc, "loop_continue_latch_fail.rs", "loop-continue-latch-fail");
     run_fail(&bin_name("loop-continue-latch-fail"))
         .assert_stderr_contains("kernel-certified Trust monitor failed");
-    compile_test(
-        &trustc,
-        "loop_fallthrough_latch_fail.rs",
-        "loop-fallthrough-latch-fail",
-    );
+    compile_test(&trustc, "loop_fallthrough_latch_fail.rs", "loop-fallthrough-latch-fail");
     run_fail(&bin_name("loop-fallthrough-latch-fail"))
         .assert_stderr_contains("kernel-certified Trust monitor failed");
 
@@ -172,11 +160,7 @@ fn main() {
     // The positive above would also pass if the inner loop received no instrumentation at all.
     // Keep the outer loop valid and stall only the supported inner loop's E5 measure: a crash is
     // therefore a non-vacuous witness that the inner authenticated header has its own monitor.
-    compile_test(
-        &trustc,
-        "loop_nested_inner_decrease_fail.rs",
-        "loop-nested-inner-decrease-fail",
-    );
+    compile_test(&trustc, "loop_nested_inner_decrease_fail.rs", "loop-nested-inner-decrease-fail");
     run_fail(&bin_name("loop-nested-inner-decrease-fail"))
         .assert_stderr_contains("kernel-certified Trust monitor failed");
 

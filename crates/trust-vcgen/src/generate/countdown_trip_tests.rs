@@ -280,10 +280,9 @@ fn b0_expect_const_global_facts_pin_both_destinations() {
     // The GLOBAL value lane (`build_expect_const_facts`): `_9 == 999` and
     // `scale == 10000` — the loop-body remzero/divzero discharge channel
     // (the versioned call-dest lane cannot cross the loop-head join).
-    let func: VerifiableFunction = serde_json::from_str(include_str!(
-        "../../tests/fixtures/countdown_fmt_u32_macro_mir.json"
-    ))
-    .unwrap();
+    let func: VerifiableFunction =
+        serde_json::from_str(include_str!("../../tests/fixtures/countdown_fmt_u32_macro_mir.json"))
+            .unwrap();
     let facts: Vec<String> =
         build_expect_const_facts(&func).iter().map(|f| format!("{f:?}")).collect();
     assert_eq!(facts.len(), 2, "{facts:?}");
@@ -302,9 +301,6 @@ fn b0_unfitting_const_pins_nothing() {
     // `999.try_into().expect(..)` into u8 FAILS the width-exact range check:
     // the expect genuinely panics if reached — no value fact, no suppression.
     let func = load(include_str!("../../tests/fixtures/countdown_b0_u8_overflow_mir.json"));
-    assert!(
-        expect_infallible_const_map(&func).is_empty(),
-        "999 must not be modeled as fitting u8"
-    );
+    assert!(expect_infallible_const_map(&func).is_empty(), "999 must not be modeled as fitting u8");
     assert!(fact_strings(&func).is_empty(), "{:?}", fact_strings(&func));
 }

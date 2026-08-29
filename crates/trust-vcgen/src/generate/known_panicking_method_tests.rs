@@ -1,9 +1,8 @@
-use trust_types::UnwindEdge;
-use trust_types::LocalDecl;
+use trust_types::{LocalDecl, UnwindEdge};
 
 use super::{
-    AggregateKind, BinOp, ConstValue, Operand, Place, Rvalue, SourceSpan, Statement,
-    Terminator, Ty, VerifiableFunction, is_known_panicking_method, range_aggregate_const_len,
+    AggregateKind, BinOp, ConstValue, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+    Ty, VerifiableFunction, is_known_panicking_method, range_aggregate_const_len,
     range_bound_affine, slice_arg_static_len,
 };
 
@@ -72,6 +71,7 @@ fn slice_receiver_fn(callee: &str) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -156,6 +156,7 @@ fn int_receiver_fn(callee: &str) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -229,6 +230,7 @@ fn receiver_only_fn(callee: &str) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -327,12 +329,16 @@ fn const_diff_range_fn(
         },
         LocalDecl {
             index: 5,
-            ty: Ty::Adt { adt_kind: None, layout: None, 
+            ty: Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 variants: Vec::new(),
                 name: "core::ops::Range".into(),
                 fields: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             name: Some("_5".into()),
         },
     ];
@@ -371,6 +377,7 @@ fn const_diff_range_fn(
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -427,14 +434,8 @@ fn const_difference_range_recovers_static_length() {
         "slice_arg_static_len must recover 8 via the index-call's const-diff range"
     );
     // Affine recovery of the two bounds: both share base _2; offsets 0 and 8.
-    assert_eq!(
-        range_bound_affine(&func, &Operand::Copy(Place::local(2)), 8),
-        Some((Some(2), 0))
-    );
-    assert_eq!(
-        range_bound_affine(&func, &Operand::Move(Place::local(6)), 8),
-        Some((Some(2), 8))
-    );
+    assert_eq!(range_bound_affine(&func, &Operand::Copy(Place::local(2)), 8), Some((Some(2), 0)));
+    assert_eq!(range_bound_affine(&func, &Operand::Move(Place::local(6)), 8), Some((Some(2), 8)));
 }
 
 #[test]
@@ -457,12 +458,16 @@ fn off_plus_8_to_off_plus_16_recovers_length_8() {
         },
         LocalDecl {
             index: 5,
-            ty: Ty::Adt { adt_kind: None, layout: None, 
+            ty: Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 variants: Vec::new(),
                 name: "core::ops::Range".into(),
                 fields: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             name: Some("_5".into()),
         },
         LocalDecl { index: 6, ty: Ty::usize(), name: Some("start".into()) },
@@ -522,6 +527,7 @@ fn off_plus_8_to_off_plus_16_recovers_length_8() {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],

@@ -98,7 +98,7 @@ pub fn n10_isize_ge(a: isize, b: isize) -> bool {
 
 #[inline(never)]
 pub fn n11_sized_ctor(i: isize, u: usize) -> Sized2 {
-    Sized2 { i: i, u: u }
+    Sized2 { i, u }
 }
 
 #[inline(never)]
@@ -172,7 +172,7 @@ pub fn n24_char_cmp_const(a: char) -> bool {
 
 #[inline(never)]
 pub fn n25_ch_ctor(c: char, b: bool) -> Ch {
-    Ch { c: c, b: b }
+    Ch { c, b }
 }
 
 #[inline(never)]

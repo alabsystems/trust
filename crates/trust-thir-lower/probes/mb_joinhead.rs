@@ -54,11 +54,7 @@ pub fn join_is_head(a: u32, b: u32, c: u32) -> u32 {
 //     outer join (a reconvergence two levels up).
 #[inline(never)]
 pub fn arm_is_head_shared_join(a: u32, b: u32) -> u32 {
-    if a == 0 {
-        if b == 0 { 1 } else { 2 }
-    } else {
-        3
-    }
+    if a == 0 { if b == 0 { 1 } else { 2 } } else { 3 }
 }
 
 // (c) The condition is the result of a nested if-expression compared to a constant,

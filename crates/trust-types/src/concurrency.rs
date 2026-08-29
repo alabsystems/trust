@@ -9,11 +9,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::{FxHashMap, FxHashSet};
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fx::{FxHashMap, FxHashSet};
 use crate::{BlockId, SourceSpan};
 
 /// A concurrency primitive detected in MIR.
@@ -732,15 +732,20 @@ pub fn detect_thread_spawns(func: &crate::VerifiableFunction) -> Vec<ThreadSpawn
     let mut sites = Vec::new();
 
     for block in &func.body.blocks {
-        if let crate::Terminator::Call { func: func_name, args, dest, span, .. } = &block.terminator
-            && is_thread_spawn(func_name)
-        {
+        let (func_name, args, dest_local, span) = match &block.terminator {
+            crate::Terminator::Call { func, args, dest, span, .. } => {
+                (func, args, dest.local, span)
+            }
+            crate::Terminator::TailCall { func, args, span, .. } => (func, args, 0, span),
+            _ => continue,
+        };
+        if is_thread_spawn(func_name) {
             let spawn_target = resolve_spawn_target(args);
             sites.push(ThreadSpawnSite {
                 caller_function: func.def_path.clone(),
                 block: block.id,
                 spawn_target,
-                join_handle_local: Some(dest.local),
+                join_handle_local: Some(dest_local),
                 span: span.clone(),
             });
         }
@@ -754,9 +759,12 @@ pub fn detect_thread_joins(func: &crate::VerifiableFunction) -> Vec<JoinSite> {
     let mut sites = Vec::new();
 
     for block in &func.body.blocks {
-        if let crate::Terminator::Call { func: func_name, args, span, .. } = &block.terminator
-            && is_thread_join(func_name)
-        {
+        let (func_name, args, span) = match &block.terminator {
+            crate::Terminator::Call { func, args, span, .. }
+            | crate::Terminator::TailCall { func, args, span, .. } => (func, args, span),
+            _ => continue,
+        };
+        if is_thread_join(func_name) {
             // The first argument to JoinHandle::join is the handle itself.
             let handle_local = args
                 .first()
@@ -831,13 +839,16 @@ pub fn extract_concurrency_model(func: &crate::VerifiableFunction) -> Concurrenc
     let mut resource_counter: FxHashMap<ConcurrencyPrimitive, usize> = FxHashMap::default();
 
     for block in &func.body.blocks {
-        if let crate::Terminator::Call { func: func_name, dest, span, .. } = &block.terminator
-            && let Some((primitive, operation)) = match_concurrency_call(func_name)
-        {
+        let (func_name, dest_local, span) = match &block.terminator {
+            crate::Terminator::Call { func, dest, span, .. } => (func, dest.local, span),
+            crate::Terminator::TailCall { func, span, .. } => (func, 0, span),
+            _ => continue,
+        };
+        if let Some((primitive, operation)) = match_concurrency_call(func_name) {
             // Generate a resource ID from the destination place and primitive type.
             // For channel create operations, use the dest local as the resource.
             // For lock/send/recv, use the first arg (the self receiver) local.
-            let resource_key = format!("{:?}_{}", primitive, dest.local);
+            let resource_key = format!("{:?}_{}", primitive, dest_local);
 
             let count = resource_counter.entry(primitive).or_insert(0);
             let resource_id = ResourceId(resource_key.clone());
@@ -1307,7 +1318,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(0),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "std::sync::Mutex::<Account>::lock".into(),
                             args: vec![Operand::Copy(Place::local(1))],
                             dest: Place::local(2),
@@ -1326,7 +1341,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(1),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "std::sync::Mutex::<Account>::lock".into(),
                             args: vec![Operand::Copy(Place::local(1))],
                             dest: Place::local(3),
@@ -1345,7 +1364,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(2),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "std::sync::mpsc::Sender::<TransferEvent>::send".into(),
                             args: vec![Operand::Copy(Place::local(4))],
                             dest: Place::local(0),
@@ -1463,7 +1486,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(0),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "tokio::sync::Mutex::<State>::lock".into(),
                             args: vec![],
                             dest: Place::local(1),
@@ -1476,7 +1503,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(1),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "tokio::task::spawn".into(),
                             args: vec![],
                             dest: Place::local(2),
@@ -1489,7 +1520,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(2),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "tokio::sync::Semaphore::acquire".into(),
                             args: vec![],
                             dest: Place::local(3),
@@ -1568,7 +1603,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(0),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "std::thread::spawn::<closure>".into(),
                             args: vec![Operand::Move(Place::local(1))],
                             dest: Place::local(2),
@@ -1622,7 +1661,11 @@ mod tests {
                     BasicBlock {
                         id: BlockId(0),
                         stmts: vec![],
-                        terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            is_foreign: false,
                             func: "std::thread::JoinHandle::<()>::join".into(),
                             args: vec![Operand::Move(Place::local(1))],
                             dest: Place::local(2),

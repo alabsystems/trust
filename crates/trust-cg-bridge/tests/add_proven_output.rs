@@ -106,12 +106,10 @@ fn emit_text(func: &VerifiableFunction) -> (Vec<u8>, u64) {
 
 /// Extract the `__text` section bytes + vmaddr from a 64-bit Mach-O object.
 fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let rd_u32 = |o: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?))
-    };
-    let rd_u64 = |o: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?))
-    };
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
+    let rd_u64 =
+        |o: usize| -> Option<u64> { Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?)) };
     if rd_u32(0)? != 0xfeed_facf {
         return None;
     }
@@ -212,9 +210,9 @@ fn sort_width(sort: &Sort) -> u32 {
 fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
     match f {
         Formula::Var(name, sort) => solver.bv_var(name, sort_width(sort)),
-        Formula::BitVec { value, width } => solver
-            .try_bv_const_bigint(&BigInt::from(*value), *width)
-            .expect("bv const"),
+        Formula::BitVec { value, width } => {
+            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
+        }
         Formula::BvAdd(a, b, _) => {
             let a = formula_to_term(solver, a);
             let b = formula_to_term(solver, b);

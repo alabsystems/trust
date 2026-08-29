@@ -288,10 +288,9 @@ pub fn make_strategy(kind: SearchStrategyKind) -> Box<dyn SearchStrategy> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::path::PathConstraint;
     use crate::state::SymbolicState;
-
-    use super::*;
 
     fn make_fork(next_block: usize) -> ExecutionFork {
         ExecutionFork { state: SymbolicState::new(), path: PathConstraint::new(), next_block }

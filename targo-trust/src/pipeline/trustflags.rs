@@ -355,9 +355,10 @@ mod tests {
 
     #[test]
     fn duplicate_options_are_last_wins_across_equivalent_spellings() {
-        let parsed =
-            TrustFlags::parse_plain("-Ztrust-verify-level=0 -Ztrust-policy=advisory -Z trust_verify_level=2")
-                .expect("duplicates resolve last-wins");
+        let parsed = TrustFlags::parse_plain(
+            "-Ztrust-verify-level=0 -Ztrust-policy=advisory -Z trust_verify_level=2",
+        )
+        .expect("duplicates resolve last-wins");
         assert_eq!(parsed.options(), ["trust-policy=advisory", "trust_verify_level=2"]);
     }
 
@@ -394,9 +395,12 @@ mod tests {
 
     #[test]
     fn unsupported_trust_options_list_the_supported_policy_surface() {
-        for flag in
-            ["-Ztrust-dump=mir-only:/tmp/d", "-Ztrust-verify=off", "-Ztrust-verify=off", "-Ztrust-ir-flip"]
-        {
+        for flag in [
+            "-Ztrust-dump=mir-only:/tmp/d",
+            "-Ztrust-verify=off",
+            "-Ztrust-verify=off",
+            "-Ztrust-ir-flip",
+        ] {
             let error = TrustFlags::parse_plain(flag)
                 .expect_err("non-policy trust options must fail closed");
             assert!(error.contains("not a supported TRUSTFLAGS policy option"), "{flag}: {error}");

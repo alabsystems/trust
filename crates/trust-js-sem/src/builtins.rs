@@ -7,24 +7,21 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{strict_eq, Abrupt, ERes, Interp};
-use crate::number::js_number_to_string;
-use crate::value::{
-    array_index_of, units_eq_ascii, units_from_str, units_to_lossy, Builtin, DateOp, EnvFrame,
-    FnImpl, MathOp, NativeErrorKind, ObjId, ObjKind, Object, Prop, PropDesc, PropVal, PropertyKey,
-    StrOp, SymData, SymId, Units, Value,
-};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
 use trust_js_trace::HostEvent;
 
-const OBJECT_PROTO_DANGER: &[&str] = &[
-    "__proto__",
-    "__defineGetter__",
-    "__defineSetter__",
-    "__lookupGetter__",
-    "__lookupSetter__",
-];
+use crate::interp::{Abrupt, ERes, Interp, strict_eq};
+use crate::number::js_number_to_string;
+use crate::value::{
+    Builtin, DateOp, EnvFrame, FnImpl, MathOp, NativeErrorKind, ObjId, ObjKind, Object, Prop,
+    PropDesc, PropVal, PropertyKey, StrOp, SymData, SymId, Units, Value, array_index_of,
+    units_eq_ascii, units_from_str, units_to_lossy,
+};
+
+const OBJECT_PROTO_DANGER: &[&str] =
+    &["__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"];
 
 const FUNCTION_PROTO_DANGER: &[&str] = &["toString", "caller", "arguments"];
 
@@ -32,29 +29,79 @@ const FUNCTION_PROTO_DANGER: &[&str] = &["toString", "caller", "arguments"];
 /// (verified against Node 24; a miss on one of these can never fall through
 /// to Object.prototype).
 const STRING_PROTO_DANGER: &[&str] = &[
-    "anchor", "at", "big", "blink", "bold", "codePointAt", "concat", "endsWith", "fixed",
-    "fontcolor", "fontsize", "includes", "isWellFormed", "italics", "link", "localeCompare",
-    "normalize", "padEnd", "padStart", "repeat",
-    "small", "startsWith", "strike", "sub", "substr", "sup", "toLocaleLowerCase",
-    "toLocaleUpperCase", "toWellFormed", "trimEnd", "trimLeft", "trimRight", "trimStart",
+    "anchor",
+    "at",
+    "big",
+    "blink",
+    "bold",
+    "codePointAt",
+    "concat",
+    "endsWith",
+    "fixed",
+    "fontcolor",
+    "fontsize",
+    "includes",
+    "isWellFormed",
+    "italics",
+    "link",
+    "localeCompare",
+    "normalize",
+    "padEnd",
+    "padStart",
+    "repeat",
+    "small",
+    "startsWith",
+    "strike",
+    "sub",
+    "substr",
+    "sup",
+    "toLocaleLowerCase",
+    "toLocaleUpperCase",
+    "toWellFormed",
+    "trimEnd",
+    "trimLeft",
+    "trimRight",
+    "trimStart",
 ];
 
 /// Real own properties of Number.prototype the model does not carry.
-const NUMBER_PROTO_DANGER: &[&str] =
-    &["toExponential", "toFixed", "toLocaleString", "toPrecision"];
+const NUMBER_PROTO_DANGER: &[&str] = &["toExponential", "toFixed", "toLocaleString", "toPrecision"];
 
 /// Real own properties of %IteratorPrototype% (Iterator Helpers, Node 24) the
 /// model does not carry; a miss on one can never fall through to
 /// Object.prototype. `constructor` is %Iterator%, likewise unmodeled.
 const ITERATOR_PROTO_DANGER: &[&str] = &[
-    "constructor", "drop", "every", "filter", "find", "flatMap", "forEach", "map", "reduce",
-    "some", "take", "toArray",
+    "constructor",
+    "drop",
+    "every",
+    "filter",
+    "find",
+    "flatMap",
+    "forEach",
+    "map",
+    "reduce",
+    "some",
+    "take",
+    "toArray",
 ];
 
 const ARRAY_PROTO_DANGER: &[&str] = &[
-    "at", "concat", "copyWithin", "fill", "findLast", "findLastIndex", "flat",
-    "flatMap", "reverse", "sort", "splice", "toLocaleString", "toReversed", "toSorted",
-    "toSpliced", "with",
+    "at",
+    "concat",
+    "copyWithin",
+    "fill",
+    "findLast",
+    "findLastIndex",
+    "flat",
+    "flatMap",
+    "reverse",
+    "sort",
+    "splice",
+    "toLocaleString",
+    "toReversed",
+    "toSorted",
+    "toSpliced",
+    "with",
 ];
 
 /// Real own properties of %RegExp.prototype% the model does not carry: `compile`
@@ -501,10 +548,7 @@ impl Realm<'_> {
     /// A builtin function object: own `length` then `name` (spec creation
     /// order via CreateBuiltinFunction).
     fn mk_fn(&mut self, fproto: ObjId, name: &str, len: f64, b: Builtin) -> ObjId {
-        let f = self.alloc(Object::new(
-            ObjKind::Function(FnImpl::Builtin(b)),
-            Some(fproto),
-        ));
+        let f = self.alloc(Object::new(ObjKind::Function(FnImpl::Builtin(b)), Some(fproto)));
         self.put(f, "length", Prop::with_attrs(Value::Num(len), false, false, true));
         self.put(f, "name", Prop::with_attrs(Value::str_from(name), false, false, true));
         f
@@ -693,16 +737,8 @@ pub fn create_interp() -> Interp {
         ("setPrototypeOf", 2.0, Builtin::ObjectSetPrototypeOf),
         ("defineProperty", 3.0, Builtin::ObjectDefineProperty),
         ("defineProperties", 2.0, Builtin::ObjectDefineProperties),
-        (
-            "getOwnPropertyDescriptor",
-            2.0,
-            Builtin::ObjectGetOwnPropertyDescriptor,
-        ),
-        (
-            "getOwnPropertyDescriptors",
-            1.0,
-            Builtin::ObjectGetOwnPropertyDescriptors,
-        ),
+        ("getOwnPropertyDescriptor", 2.0, Builtin::ObjectGetOwnPropertyDescriptor),
+        ("getOwnPropertyDescriptors", 1.0, Builtin::ObjectGetOwnPropertyDescriptors),
         ("getOwnPropertyNames", 1.0, Builtin::ObjectGetOwnPropertyNames),
         ("getOwnPropertySymbols", 1.0, Builtin::ObjectGetOwnPropertySymbols),
         ("keys", 1.0, Builtin::ObjectKeys),
@@ -716,13 +752,8 @@ pub fn create_interp() -> Interp {
         let m = r.mk_fn(function_proto, name, len, b);
         r.put(object_ctor, name, attrs_method(Value::Obj(m)));
     }
-    let error_ctor = mk_ctor(
-        &mut r,
-        "Error",
-        1.0,
-        Builtin::ErrorCtor(NativeErrorKind::Error),
-        error_proto,
-    );
+    let error_ctor =
+        mk_ctor(&mut r, "Error", 1.0, Builtin::ErrorCtor(NativeErrorKind::Error), error_proto);
     let type_error_ctor = mk_ctor(
         &mut r,
         "TypeError",
@@ -879,11 +910,7 @@ pub fn create_interp() -> Interp {
     let generator_function_proto = r.alloc(Object::new(ObjKind::Plain, Some(function_proto)));
     let generator_function =
         r.mk_fn(function_ctor, "GeneratorFunction", 1.0, Builtin::GeneratorFunctionCtor);
-    r.put(
-        generator_function,
-        "prototype",
-        attrs_frozen(Value::Obj(generator_function_proto)),
-    );
+    r.put(generator_function, "prototype", attrs_frozen(Value::Obj(generator_function_proto)));
     r.put(
         generator_function_proto,
         "constructor",
@@ -964,11 +991,7 @@ pub fn create_interp() -> Interp {
     r.put(symbol_proto, "valueOf", attrs_method(Value::Obj(m)));
     // `description` is an accessor (get only).
     let dget = r.mk_fn(function_proto, "get description", 0.0, Builtin::SymbolProtoDescriptionGet);
-    r.put(
-        symbol_proto,
-        "description",
-        Prop::accessor(Some(dget), None, false, true),
-    );
+    r.put(symbol_proto, "description", Prop::accessor(Some(dget), None, false, true));
     // Symbol.prototype[@@toPrimitive] — name "[Symbol.toPrimitive]",
     // {writable:false, enumerable:false, configurable:true}.
     let tp = r.mk_fn(function_proto, "[Symbol.toPrimitive]", 1.0, Builtin::SymbolProtoToPrimitive);
@@ -1034,12 +1057,8 @@ pub fn create_interp() -> Interp {
     r.put(bigint_ctor, "asUintN", attrs_method(Value::Obj(m)));
 
     // %Function.prototype%[@@hasInstance] (the default OrdinaryHasInstance).
-    let function_proto_has_instance = r.mk_fn(
-        function_proto,
-        "[Symbol.hasInstance]",
-        1.0,
-        Builtin::FunctionProtoHasInstance,
-    );
+    let function_proto_has_instance =
+        r.mk_fn(function_proto, "[Symbol.hasInstance]", 1.0, Builtin::FunctionProtoHasInstance);
     r.it[function_proto_has_instance.0 as usize].extensible = true;
     r.put_sym(
         function_proto,
@@ -1047,15 +1066,16 @@ pub fn create_interp() -> Interp {
         Prop::with_attrs(Value::Obj(function_proto_has_instance), false, false, false),
     );
     // %Array.prototype%[@@iterator] = %Array.prototype.values%.
-    let values_fn = match &r.it[array_proto.0 as usize].props.get(&units_from_str("values")).expect("values").val {
+    let values_fn = match &r.it[array_proto.0 as usize]
+        .props
+        .get(&units_from_str("values"))
+        .expect("values")
+        .val
+    {
         PropVal::Data { value: Value::Obj(v), .. } => *v,
         _ => unreachable!("array values is a data method"),
     };
-    r.put_sym(
-        array_proto,
-        wk_syms[WK_ITERATOR],
-        attrs_method(Value::Obj(values_fn)),
-    );
+    r.put_sym(array_proto, wk_syms[WK_ITERATOR], attrs_method(Value::Obj(values_fn)));
 
     // %IteratorPrototype%[@@iterator] (27.1.2.1): the shared self-return method
     // (name "[Symbol.iterator]", length 0, {writable, non-enumerable,
@@ -1063,12 +1083,9 @@ pub fn create_interp() -> Interp {
     // GetIterator protocol on an iterator returns the iterator itself. (Its
     // sibling @@toStringTag is an Iterator-Helpers accessor — S0-EXCLUDED, kept
     // declared-owned/unmodeled so a read refuses rather than guess.)
-    let iter_self = r.mk_fn(function_proto, "[Symbol.iterator]", 0.0, Builtin::IteratorProtoIterator);
-    r.put_sym(
-        iterator_proto,
-        wk_syms[WK_ITERATOR],
-        attrs_method(Value::Obj(iter_self)),
-    );
+    let iter_self =
+        r.mk_fn(function_proto, "[Symbol.iterator]", 0.0, Builtin::IteratorProtoIterator);
+    r.put_sym(iterator_proto, wk_syms[WK_ITERATOR], attrs_method(Value::Obj(iter_self)));
     // %ArrayIteratorPrototype%[@@toStringTag] = "Array Iterator".
     r.put_sym(
         array_iterator_proto,
@@ -1083,11 +1100,7 @@ pub fn create_interp() -> Interp {
     );
     // String.prototype[@@iterator] (22.1.3.35): a String Iterator by code point.
     let str_iter = r.mk_fn(function_proto, "[Symbol.iterator]", 0.0, Builtin::StringProtoIterator);
-    r.put_sym(
-        string_proto,
-        wk_syms[WK_ITERATOR],
-        attrs_method(Value::Obj(str_iter)),
-    );
+    r.put_sym(string_proto, wk_syms[WK_ITERATOR], attrs_method(Value::Obj(str_iter)));
 
     // ---- Date (21.4) -----------------------------------------------------
     let date_proto = r.alloc(Object::new(ObjKind::Plain, Some(object_proto)));
@@ -1132,7 +1145,12 @@ pub fn create_interp() -> Interp {
         let m = r.mk_fn(function_proto, name, len, Builtin::DateMethod(op));
         r.put(date_proto, name, attrs_method(Value::Obj(m)));
     }
-    let tp = r.mk_fn(function_proto, "[Symbol.toPrimitive]", 1.0, Builtin::DateMethod(DateOp::ToPrimitive));
+    let tp = r.mk_fn(
+        function_proto,
+        "[Symbol.toPrimitive]",
+        1.0,
+        Builtin::DateMethod(DateOp::ToPrimitive),
+    );
     r.put_sym(
         date_proto,
         wk_syms[WK_TO_PRIMITIVE],
@@ -1145,11 +1163,7 @@ pub fn create_interp() -> Interp {
     // oracle head, so the reference semantics mirror the wrapper exactly (own
     // key order [length, name, prototype, now, parse, UTC]).
     let date_ctor = r.mk_fn(function_proto, "Date", 0.0, Builtin::DateCtor);
-    r.put(
-        date_ctor,
-        "prototype",
-        Prop::with_attrs(Value::Obj(date_proto), true, false, false),
-    );
+    r.put(date_ctor, "prototype", Prop::with_attrs(Value::Obj(date_proto), true, false, false));
     r.put(date_proto, "constructor", attrs_method(Value::Obj(date_ctor)));
     let m = r.mk_fn(function_proto, "now", 0.0, Builtin::DateNow);
     r.put(date_ctor, "now", Prop::data(Value::Obj(m)));
@@ -1183,17 +1197,9 @@ pub fn create_interp() -> Interp {
         ("unicode", RegExpFlag::Unicode),
         ("unicodeSets", RegExpFlag::UnicodeSets),
     ] {
-        let getter = r.mk_fn(
-            function_proto,
-            &format!("get {name}"),
-            0.0,
-            Builtin::RegExpFlagGet(flag),
-        );
-        r.put(
-            regexp_proto,
-            name,
-            Prop::accessor(Some(getter), None, false, true),
-        );
+        let getter =
+            r.mk_fn(function_proto, &format!("get {name}"), 0.0, Builtin::RegExpFlagGet(flag));
+        r.put(regexp_proto, name, Prop::accessor(Some(getter), None, false, true));
     }
     // @@-protocols on %RegExp.prototype%.
     for (sym_idx, sym_name, len, op) in [
@@ -1211,12 +1217,8 @@ pub fn create_interp() -> Interp {
     r.put(regexp_ctor, "prototype", attrs_frozen(Value::Obj(regexp_proto)));
     r.put(regexp_proto, "constructor", attrs_method(Value::Obj(regexp_ctor)));
     // get RegExp[@@species] — returns the receiver.
-    let species_get = r.mk_fn(
-        function_proto,
-        "get [Symbol.species]",
-        0.0,
-        Builtin::RegExpSpeciesGet,
-    );
+    let species_get =
+        r.mk_fn(function_proto, "get [Symbol.species]", 0.0, Builtin::RegExpSpeciesGet);
     r.put_sym(
         regexp_ctor,
         wk_syms[WK_SPECIES],
@@ -1316,8 +1318,13 @@ pub fn create_interp() -> Interp {
     getter(&mut r, typed_array_proto, "byteLength", Builtin::TypedArrayByteLengthGet);
     getter(&mut r, typed_array_proto, "byteOffset", Builtin::TypedArrayByteOffsetGet);
     getter(&mut r, typed_array_proto, "length", Builtin::TypedArrayLengthGet);
-    let tg = r.mk_fn(function_proto, "get [Symbol.toStringTag]", 0.0, Builtin::TypedArrayToStringTagGet);
-    r.put_sym(typed_array_proto, wk_syms[WK_TO_STRING_TAG], Prop::accessor(Some(tg), None, false, true));
+    let tg =
+        r.mk_fn(function_proto, "get [Symbol.toStringTag]", 0.0, Builtin::TypedArrayToStringTagGet);
+    r.put_sym(
+        typed_array_proto,
+        wk_syms[WK_TO_STRING_TAG],
+        Prop::accessor(Some(tg), None, false, true),
+    );
     use crate::value::TAMethod;
     let mut ta_values_fn = None;
     for (name, len, tm) in [
@@ -1641,10 +1648,11 @@ pub fn create_interp() -> Interp {
     }
     // The concrete typed-array constructor globals (Int8Array..BigUint64Array).
     for (_, ctor, _) in &typed_arrays {
-        let name = match &r.it[ctor.0 as usize].props.get(&units_from_str("name")).expect("name").val {
-            PropVal::Data { value: Value::Str(s), .. } => units_to_lossy(s),
-            _ => unreachable!("ctor name is a data string"),
-        };
+        let name =
+            match &r.it[ctor.0 as usize].props.get(&units_from_str("name")).expect("name").val {
+                PropVal::Data { value: Value::Str(s), .. } => units_to_lossy(s),
+                _ => unreachable!("ctor name is a data string"),
+            };
         r.put(global, &name, attrs_method(Value::Obj(*ctor)));
     }
 
@@ -1714,11 +1722,7 @@ pub fn create_interp() -> Interp {
         (weakset_ctor, &[] as &'static [&'static str]),
     ]
     .into_iter()
-    .chain(
-        typed_arrays
-            .iter()
-            .map(|(_, c, _)| (*c, &[] as &'static [&'static str])),
-    )
+    .chain(typed_arrays.iter().map(|(_, c, _)| (*c, &[] as &'static [&'static str])))
     .collect();
 
     let intr = Intrinsics {
@@ -1829,11 +1833,7 @@ impl Interp {
         for a in args.iter().take(n.saturating_sub(1)) {
             param_parts.push(self.to_string_units(a)?);
         }
-        let body_units = if n == 0 {
-            Vec::new()
-        } else {
-            self.to_string_units(&args[n - 1])?
-        };
+        let body_units = if n == 0 { Vec::new() } else { self.to_string_units(&args[n - 1])? };
         // Join parameter texts with U+002C, decode each fragment strictly
         // (a lone surrogate in assembled source is out of slice).
         let decode = |u: &Units| -> Result<String, Abrupt> {
@@ -1857,7 +1857,7 @@ impl Interp {
         let prog = match crate::parser::parse_program(&src) {
             Ok(p) => p,
             Err(crate::parser::ParseFail::EarlySyntaxError(_)) => {
-                return Err(self.throw_native(NativeErrorKind::SyntaxError))
+                return Err(self.throw_native(NativeErrorKind::SyntaxError));
             }
             Err(e) => return Err(Abrupt::Fatal(format!("Function() body parse: {e}"))),
         };
@@ -1991,9 +1991,7 @@ impl Interp {
             Builtin::RegExpFlagGet(flag) => return self.regexp_flag_get(flag, &this),
             // get RegExp[@@species] (22.2.5.2): returns the receiver.
             Builtin::RegExpSpeciesGet => return Ok(this),
-            Builtin::RegExpStringIteratorNext => {
-                return self.regexp_string_iterator_next(&this)
-            }
+            Builtin::RegExpStringIteratorNext => return self.regexp_string_iterator_next(&this),
             _ => {}
         }
         match b {
@@ -3375,10 +3373,9 @@ impl Interp {
             }),
             proto,
         ));
-        self.obj_mut(f).props.insert(
-            units_from_str("length"),
-            Prop::with_attrs(Value::Num(l), false, false, true),
-        );
+        self.obj_mut(f)
+            .props
+            .insert(units_from_str("length"), Prop::with_attrs(Value::Num(l), false, false, true));
         self.obj_mut(f).props.insert(
             units_from_str("name"),
             Prop::with_attrs(Value::str_from(&format!("bound {base_name}")), false, false, true),
@@ -3454,61 +3451,59 @@ impl Interp {
                 self.define_properties_from(o, &arg(1))?;
                 Ok(arg(0))
             }
-            Builtin::ObjectGetOwnPropertyDescriptor => {
-                match arg(0) {
-                    Value::Undefined | Value::Null => {
-                        Err(self.throw_native(NativeErrorKind::TypeError))
-                    }
-                    Value::Obj(o) if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) => {
-                        let key = self.to_property_key(&arg(1))?;
-                        match self.mop_get_own_property(o, &key)? {
-                            Some(p) => self.from_property_descriptor(&p),
-                            None => Ok(Value::Undefined),
-                        }
-                    }
-                    Value::Obj(o) => match self.to_property_key(&arg(1))? {
-                        PropertyKey::Str(key) => match self.own_prop_resolved(o, &key) {
-                            Some(p) => self.from_property_descriptor(&p),
-                            None => {
-                                let name = units_to_lossy(&key);
-                                if let Some(gap) = self.own_miss_gap(o, &name) {
-                                    return Err(Abrupt::Fatal(format!(
-                                        "getOwnPropertyDescriptor: {gap}"
-                                    )));
-                                }
-                                Ok(Value::Undefined)
-                            }
-                        },
-                        PropertyKey::Sym(s) => match self.obj(o).sym_props.get(&s).cloned() {
-                            Some(p) => self.from_property_descriptor(&p),
-                            None => {
-                                if let Some(gap) = self.sym_miss_danger(o, s) {
-                                    return Err(Abrupt::Fatal(format!(
-                                        "getOwnPropertyDescriptor: {gap}"
-                                    )));
-                                }
-                                Ok(Value::Undefined)
-                            }
-                        },
-                    },
-                    Value::Str(s) => match self.to_property_key(&arg(1))? {
-                        PropertyKey::Str(key) => match string_own_prop(&s, &key) {
-                            Some(p) => self.from_property_descriptor(&p),
-                            None => Ok(Value::Undefined),
-                        },
-                        PropertyKey::Sym(_) => Ok(Value::Undefined),
-                    },
-                    _ => {
-                        self.to_property_key(&arg(1))?;
-                        Ok(Value::Undefined)
+            Builtin::ObjectGetOwnPropertyDescriptor => match arg(0) {
+                Value::Undefined | Value::Null => {
+                    Err(self.throw_native(NativeErrorKind::TypeError))
+                }
+                Value::Obj(o) if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) => {
+                    let key = self.to_property_key(&arg(1))?;
+                    match self.mop_get_own_property(o, &key)? {
+                        Some(p) => self.from_property_descriptor(&p),
+                        None => Ok(Value::Undefined),
                     }
                 }
-            }
+                Value::Obj(o) => match self.to_property_key(&arg(1))? {
+                    PropertyKey::Str(key) => match self.own_prop_resolved(o, &key) {
+                        Some(p) => self.from_property_descriptor(&p),
+                        None => {
+                            let name = units_to_lossy(&key);
+                            if let Some(gap) = self.own_miss_gap(o, &name) {
+                                return Err(Abrupt::Fatal(format!(
+                                    "getOwnPropertyDescriptor: {gap}"
+                                )));
+                            }
+                            Ok(Value::Undefined)
+                        }
+                    },
+                    PropertyKey::Sym(s) => match self.obj(o).sym_props.get(&s).cloned() {
+                        Some(p) => self.from_property_descriptor(&p),
+                        None => {
+                            if let Some(gap) = self.sym_miss_danger(o, s) {
+                                return Err(Abrupt::Fatal(format!(
+                                    "getOwnPropertyDescriptor: {gap}"
+                                )));
+                            }
+                            Ok(Value::Undefined)
+                        }
+                    },
+                },
+                Value::Str(s) => match self.to_property_key(&arg(1))? {
+                    PropertyKey::Str(key) => match string_own_prop(&s, &key) {
+                        Some(p) => self.from_property_descriptor(&p),
+                        None => Ok(Value::Undefined),
+                    },
+                    PropertyKey::Sym(_) => Ok(Value::Undefined),
+                },
+                _ => {
+                    self.to_property_key(&arg(1))?;
+                    Ok(Value::Undefined)
+                }
+            },
             Builtin::ObjectGetOwnPropertyDescriptors => {
                 let out = self.alloc(Object::new(ObjKind::Plain, Some(self.intr.object_proto)));
                 match arg(0) {
                     Value::Undefined | Value::Null => {
-                        return Err(self.throw_native(NativeErrorKind::TypeError))
+                        return Err(self.throw_native(NativeErrorKind::TypeError));
                     }
                     Value::Obj(o) if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) => {
                         for k in self.mop_own_keys(o)? {
@@ -3527,9 +3522,9 @@ impl Interp {
                         }
                     }
                     Value::Obj(o) => {
-                        let keys = self
-                            .own_keys_exact(o)
-                            .map_err(|e| Abrupt::Fatal(format!("getOwnPropertyDescriptors: {e}")))?;
+                        let keys = self.own_keys_exact(o).map_err(|e| {
+                            Abrupt::Fatal(format!("getOwnPropertyDescriptors: {e}"))
+                        })?;
                         if !self.sym_surface_complete(o) {
                             return Err(Abrupt::Fatal(
                                 "getOwnPropertyDescriptors over an object with unmodeled symbol surface"
@@ -3569,7 +3564,7 @@ impl Interp {
             Builtin::ObjectGetOwnPropertyNames => {
                 let keys: Vec<Units> = match arg(0) {
                     Value::Undefined | Value::Null => {
-                        return Err(self.throw_native(NativeErrorKind::TypeError))
+                        return Err(self.throw_native(NativeErrorKind::TypeError));
                     }
                     Value::Obj(o) if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) => self
                         .mop_own_keys(o)?
@@ -3590,7 +3585,7 @@ impl Interp {
             Builtin::ObjectKeys => {
                 let keys: Vec<Units> = match arg(0) {
                     Value::Undefined | Value::Null => {
-                        return Err(self.throw_native(NativeErrorKind::TypeError))
+                        return Err(self.throw_native(NativeErrorKind::TypeError));
                     }
                     Value::Obj(o) if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) => {
                         self.proxy_enumerable_string_keys(o)?
@@ -3598,9 +3593,7 @@ impl Interp {
                     Value::Obj(o) => self
                         .enumerable_own_keys_sound(o)
                         .map_err(|e| Abrupt::Fatal(format!("Object.keys: {e}")))?,
-                    Value::Str(s) => (0..s.len())
-                        .map(|i| units_from_str(&i.to_string()))
-                        .collect(),
+                    Value::Str(s) => (0..s.len()).map(|i| units_from_str(&i.to_string())).collect(),
                     _ => Vec::new(),
                 };
                 Ok(self.array_of_strings(keys))
@@ -3633,10 +3626,7 @@ impl Interp {
                             ..PropDesc::default()
                         }
                     } else {
-                        PropDesc {
-                            configurable: Some(false),
-                            ..PropDesc::default()
-                        }
+                        PropDesc { configurable: Some(false), ..PropDesc::default() }
                     }
                 };
                 // SetIntegrityLevel (7.3.15) locks every own key of
@@ -3808,10 +3798,9 @@ impl Interp {
         let a = self.new_array(keys.len());
         let n = keys.len();
         for (i, k) in keys.into_iter().enumerate() {
-            self.obj_mut(a).props.insert(
-                units_from_str(&i.to_string()),
-                Prop::data(Value::Str(Rc::new(k))),
-            );
+            self.obj_mut(a)
+                .props
+                .insert(units_from_str(&i.to_string()), Prop::data(Value::Str(Rc::new(k))));
         }
         #[allow(clippy::cast_precision_loss)]
         self.set_array_length_raw(a, n as f64);
@@ -3828,11 +3817,8 @@ impl Interp {
                 for a in args {
                     coerced.push(self.to_number(a)?);
                 }
-                let mut acc = if matches!(op, MathOp::Max) {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                };
+                let mut acc =
+                    if matches!(op, MathOp::Max) { f64::NEG_INFINITY } else { f64::INFINITY };
                 let mut nan = false;
                 for n in coerced {
                     if n.is_nan() {
@@ -3993,12 +3979,7 @@ impl Interp {
                         }
                     }
                     if let Some(r) = self.get_method_symbol(&search, self.intr.wk(WK_REPLACE))? {
-                        return self.call_function(
-                            r,
-                            search,
-                            vec![this.clone(), arg(1)],
-                            false,
-                        );
+                        return self.call_function(r, search, vec![this.clone(), arg(1)], false);
                     }
                 }
             }
@@ -4042,11 +4023,7 @@ impl Interp {
             StrOp::LastIndexOf => {
                 let search = self.to_string_units(&arg(0))?;
                 let num_pos = self.to_number(&arg(1))?;
-                let pos = if num_pos.is_nan() {
-                    i64::MAX / 4
-                } else {
-                    to_integer_i64(num_pos)
-                };
+                let pos = if num_pos.is_nan() { i64::MAX / 4 } else { to_integer_i64(num_pos) };
                 let start = pos.clamp(0, ilen);
                 let slen = search.len();
                 if slen > len {
@@ -4074,18 +4051,10 @@ impl Interp {
                 };
                 let rel = |n: i64| -> usize {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    if n < 0 {
-                        ((ilen + n).max(0)) as usize
-                    } else {
-                        n.min(ilen) as usize
-                    }
+                    if n < 0 { ((ilen + n).max(0)) as usize } else { n.min(ilen) as usize }
                 };
                 let (a, b) = (rel(from), rel(to));
-                Ok(Value::Str(Rc::new(if a < b {
-                    s[a..b].to_vec()
-                } else {
-                    Vec::new()
-                })))
+                Ok(Value::Str(Rc::new(if a < b { s[a..b].to_vec() } else { Vec::new() })))
             }
             StrOp::Substring => {
                 let a = to_integer_i64(self.to_number(&arg(0))?).clamp(0, ilen);
@@ -4128,8 +4097,8 @@ impl Interp {
                 let is_ws = |c: u16| {
                     matches!(
                         c,
-                        0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20 | 0xa0 | 0xfeff | 0x1680
-                            | 0x2000..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000
+                        0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20 | 0xa0 | 0xfeff | 0x1680 | 0x2000
+                            ..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000
                     )
                 };
                 let start = s.iter().position(|&c| !is_ws(c)).unwrap_or(len);
@@ -4172,11 +4141,7 @@ impl Interp {
             u64::from(crate::props::to_uint32(self.to_number(limit)?))
         };
         let sep_is_undefined = matches!(sep, Value::Undefined);
-        let r = if sep_is_undefined {
-            Vec::new()
-        } else {
-            self.to_string_units(sep)?
-        };
+        let r = if sep_is_undefined { Vec::new() } else { self.to_string_units(sep)? };
         let mut parts: Vec<Units> = Vec::new();
         if lim == 0 {
             return Ok(self.array_of_strings(parts));
@@ -4223,11 +4188,7 @@ impl Interp {
     fn str_replace(&mut self, s: &[u16], search: &Value, replace: &Value) -> ERes {
         let search_str = self.to_string_units(search)?;
         let functional = matches!(replace, Value::Obj(f) if self.obj(*f).is_callable());
-        let replace_str = if functional {
-            Vec::new()
-        } else {
-            self.to_string_units(replace)?
-        };
+        let replace_str = if functional { Vec::new() } else { self.to_string_units(replace)? };
         let Some(pos) = string_index_of(s, &search_str, 0) else {
             return Ok(Value::Str(Rc::new(s.to_vec())));
         };
@@ -4301,11 +4262,7 @@ impl Interp {
     fn str_replace_all(&mut self, s: &[u16], search: &Value, replace: &Value) -> ERes {
         let search_str = self.to_string_units(search)?;
         let functional = matches!(replace, Value::Obj(f) if self.obj(*f).is_callable());
-        let replace_str = if functional {
-            Vec::new()
-        } else {
-            self.to_string_units(replace)?
-        };
+        let replace_str = if functional { Vec::new() } else { self.to_string_units(replace)? };
         let search_len = search_str.len();
         let advance = search_len.max(1);
         let mut positions: Vec<usize> = Vec::new();
@@ -4446,11 +4403,7 @@ impl Interp {
                         return Ok(if want_value { v } else { Value::Num(k as f64) });
                     }
                 }
-                Ok(if want_value {
-                    Value::Undefined
-                } else {
-                    Value::Num(-1.0)
-                })
+                Ok(if want_value { Value::Undefined } else { Value::Num(-1.0) })
             }
             Builtin::ArrayProtoReduce | Builtin::ArrayProtoReduceRight => {
                 let fwd = matches!(b, Builtin::ArrayProtoReduce);
@@ -4458,7 +4411,11 @@ impl Interp {
                 if len == 0 && !has_init {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
-                let mut k: i64 = if fwd { 0 } else { i64::try_from(len).expect("ToLength bounded by 2^53-1") - 1 };
+                let mut k: i64 = if fwd {
+                    0
+                } else {
+                    i64::try_from(len).expect("ToLength bounded by 2^53-1") - 1
+                };
                 let step = if fwd { 1 } else { -1 };
                 let in_range = |k: i64| {
                     if fwd {
@@ -4525,10 +4482,7 @@ impl Interp {
             self.obj_mut(oid).props.insert(
                 units_from_str(&i.to_string()),
                 Prop {
-                    val: PropVal::Data {
-                        value: Value::Str(Rc::new(vec![u])),
-                        writable: false,
-                    },
+                    val: PropVal::Data { value: Value::Str(Rc::new(vec![u])), writable: false },
                     enumerable: true,
                     configurable: false,
                     synthetic: false,
@@ -4611,11 +4565,7 @@ impl Interp {
         kind: crate::value::ArrayIterKind,
     ) -> ObjId {
         self.alloc(Object::new(
-            ObjKind::ArrayIterator {
-                target: Some(target),
-                index: 0,
-                kind,
-            },
+            ObjKind::ArrayIterator { target: Some(target), index: 0, kind },
             Some(self.intr.array_iterator_proto),
         ))
     }
@@ -4627,11 +4577,7 @@ impl Interp {
     pub(crate) fn array_iterator_step(&mut self, oid: ObjId) -> Result<(Value, bool), Abrupt> {
         use crate::value::ArrayIterKind;
         let (target, index, kind) = match self.obj(oid).kind {
-            ObjKind::ArrayIterator {
-                target,
-                index,
-                kind,
-            } => (target, index, kind),
+            ObjKind::ArrayIterator { target, index, kind } => (target, index, kind),
             _ => return Err(Abrupt::Fatal("array_iterator_step on non-iterator".to_string())),
         };
         let Some(target) = target else {
@@ -4662,9 +4608,7 @@ impl Interp {
                 self.obj_mut(arr)
                     .props
                     .insert(units_from_str("0"), Prop::data(Value::Num(idx_num)));
-                self.obj_mut(arr)
-                    .props
-                    .insert(units_from_str("1"), Prop::data(el));
+                self.obj_mut(arr).props.insert(units_from_str("1"), Prop::data(el));
                 self.set_array_length_raw(arr, 2.0);
                 Value::Obj(arr)
             }
@@ -4676,10 +4620,7 @@ impl Interp {
     /// immutable snapshot of `s` with next code-unit index 0.
     pub(crate) fn create_string_iterator(&mut self, s: Rc<Units>) -> ObjId {
         self.alloc(Object::new(
-            ObjKind::StringIterator {
-                string: Some(s),
-                index: 0,
-            },
+            ObjKind::StringIterator { string: Some(s), index: 0 },
             Some(self.intr.string_iterator_proto),
         ))
     }
@@ -4728,9 +4669,7 @@ impl Interp {
     fn array_like_receiver(&mut self, this: &Value) -> Result<ObjId, Abrupt> {
         match this {
             Value::Obj(oid) => Ok(*oid),
-            Value::Undefined | Value::Null => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Value::Undefined | Value::Null => Err(self.throw_native(NativeErrorKind::TypeError)),
             prim => self.to_object_wrapper(prim),
         }
     }
@@ -4855,10 +4794,7 @@ fn string_own_prop(s: &[u16], key: &Units) -> Option<Prop> {
     let i = array_index_of(key)? as usize;
     if i < s.len() {
         Some(Prop {
-            val: PropVal::Data {
-                value: Value::Str(Rc::new(vec![s[i]])),
-                writable: false,
-            },
+            val: PropVal::Data { value: Value::Str(Rc::new(vec![s[i]])), writable: false },
             enumerable: true,
             configurable: false,
             synthetic: false,
@@ -4870,9 +4806,7 @@ fn string_own_prop(s: &[u16], key: &Units) -> Option<Prop> {
 
 /// The string exotic's own keys: indices ascending, then "length".
 fn string_own_keys(s: &[u16]) -> Vec<Units> {
-    let mut keys: Vec<Units> = (0..s.len())
-        .map(|i| units_from_str(&i.to_string()))
-        .collect();
+    let mut keys: Vec<Units> = (0..s.len()).map(|i| units_from_str(&i.to_string())).collect();
     keys.push(units_from_str("length"));
     keys
 }
@@ -4915,11 +4849,7 @@ fn math_round(n: f64) -> f64 {
     }
     let f = n.floor();
     let frac = n - f; // exact for |n| in the fractional range
-    if frac >= 0.5 {
-        f + 1.0
-    } else {
-        f
-    }
+    if frac >= 0.5 { f + 1.0 } else { f }
 }
 
 /// Number::exponentiate where the spec pins the result exactly: the special-
@@ -4988,11 +4918,7 @@ pub(crate) fn math_pow_exact(base: f64, exp: f64) -> Option<f64> {
         if !p.is_finite() {
             return None;
         }
-        if a.mul_add(b, -p) == 0.0 {
-            Some(p)
-        } else {
-            None
-        }
+        if a.mul_add(b, -p) == 0.0 { Some(p) } else { None }
     };
     let mut result = 1.0f64;
     let mut acc = base;
@@ -5014,17 +4940,9 @@ pub(crate) fn math_pow_exact(base: f64, exp: f64) -> Option<f64> {
     let bits = result.abs().to_bits();
     let mantissa = bits & ((1u64 << 52) - 1);
     let exponent = bits >> 52;
-    let pow2 = if exponent == 0 {
-        mantissa.count_ones() == 1
-    } else {
-        mantissa == 0
-    };
+    let pow2 = if exponent == 0 { mantissa.count_ones() == 1 } else { mantissa == 0 };
     let recip = 1.0 / result;
-    if pow2 && recip.is_finite() && recip * result == 1.0 {
-        Some(recip)
-    } else {
-        None
-    }
+    if pow2 && recip.is_finite() && recip * result == 1.0 { Some(recip) } else { None }
 }
 
 impl Interp {
@@ -5091,31 +5009,29 @@ fn object_to_string_tag(it: &Interp, this: &Value) -> Result<String, Abrupt> {
     // is equivalent — a user override on Boolean/Number/String/Symbol/BigInt
     // .prototype (data String) wins; otherwise the builtin tag stands.
     let primitive_tag = |proto: ObjId, builtin: &str| -> Result<String, Abrupt> {
-        Ok(it
-            .resolve_string_tag_data(proto)?
-            .unwrap_or_else(|| builtin.to_string()))
+        Ok(it.resolve_string_tag_data(proto)?.unwrap_or_else(|| builtin.to_string()))
     };
     let tag = match this {
         Value::Undefined => "Undefined",
         Value::Null => "Null",
         Value::Bool(_) => {
-            return Ok(format!("[object {}]", primitive_tag(it.intr.boolean_proto, "Boolean")?))
+            return Ok(format!("[object {}]", primitive_tag(it.intr.boolean_proto, "Boolean")?));
         }
         Value::Num(_) => {
-            return Ok(format!("[object {}]", primitive_tag(it.intr.number_proto, "Number")?))
+            return Ok(format!("[object {}]", primitive_tag(it.intr.number_proto, "Number")?));
         }
         // BigInt/Symbol wrappers have NO [[XData]] builtin-tag branch (steps
         // 5-14), so their builtinTag is "Object". The "[object BigInt]" /
         // "[object Symbol]" forms come ONLY from the intrinsic @@toStringTag
         // data string; a non-string override falls back to "Object".
         Value::BigInt(_) => {
-            return Ok(format!("[object {}]", primitive_tag(it.intr.bigint_proto, "Object")?))
+            return Ok(format!("[object {}]", primitive_tag(it.intr.bigint_proto, "Object")?));
         }
         Value::Str(_) => {
-            return Ok(format!("[object {}]", primitive_tag(it.intr.string_proto, "String")?))
+            return Ok(format!("[object {}]", primitive_tag(it.intr.string_proto, "String")?));
         }
         Value::Sym(_) => {
-            return Ok(format!("[object {}]", primitive_tag(it.intr.symbol_proto, "Object")?))
+            return Ok(format!("[object {}]", primitive_tag(it.intr.symbol_proto, "Object")?));
         }
         Value::Obj(oid) => {
             // ArrayBuffer/DataView/typed arrays carry a modeled @@toStringTag
@@ -5394,10 +5310,7 @@ mod tests {
         assert_eq!(math_pow_exact(3.0, 5.0), Some(243.0));
         assert_eq!(math_pow_exact(f64::NAN, 0.0), Some(1.0));
         assert_eq!(math_pow_exact(0.0, -1.0), Some(f64::INFINITY));
-        assert_eq!(
-            math_pow_exact(-0.0, -1.0),
-            Some(f64::NEG_INFINITY)
-        );
+        assert_eq!(math_pow_exact(-0.0, -1.0), Some(f64::NEG_INFINITY));
         assert!(math_pow_exact(-2.0, 0.5).is_some_and(f64::is_nan));
         // 3^40 > 2^53: not exactly representable → refuse.
         assert_eq!(math_pow_exact(3.0, 40.0), None);

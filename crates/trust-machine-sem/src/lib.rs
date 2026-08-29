@@ -56,7 +56,6 @@ pub(crate) mod state;
 pub(crate) mod x86_64;
 
 pub use aarch64::Aarch64Semantics;
-pub use x86_64::X86_64Semantics;
 // Trust: #564 — re-export condition_to_formula for semantic_lift branch wiring.
 pub use aarch64::condition_to_formula;
 pub use concrete::{ConcreteError, ConcreteFlags, ConcreteState, eval_condition};
@@ -67,6 +66,7 @@ pub use effect::{
 pub use error::SemError;
 pub use semantics::Semantics;
 pub use state::{Flags, MachineState};
+pub use x86_64::X86_64Semantics;
 
 #[cfg(test)]
 mod tests;

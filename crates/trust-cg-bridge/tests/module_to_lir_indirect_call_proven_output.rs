@@ -59,14 +59,13 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::{lower_trust_ir_function_to_lir, lower_trust_ir_function_to_lir_real_calls};
 use trust_disasm::{Instruction as DisasmInst, Opcode, Operand, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, Effect, Flags, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, GlobalId, ValueId};
 use trust_ir::{Block, Constant, Function as IrFunction, Global, Linkage, Module};
+use trust_machine_sem::{Aarch64Semantics, Effect, Flags, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build the KNOWN-target indirect-call module: ci(a,b) = (&ir_addf)(a,b).
@@ -114,13 +113,11 @@ fn make_indirect_module() -> Module {
 
     // --- caller: ci(a, b) = (let f = &ir_addf; f(a, b))  (FuncId 0) ---
     let mut caller = IrFunction::new(FuncId::new(0), "ir_ci", FuncTyId::new(0), BlockId::new(0));
-    let (a, b, fptr, called) =
-        (ValueId::new(0), ValueId::new(1), ValueId::new(2), ValueId::new(3));
+    let (a, b, fptr, called) = (ValueId::new(0), ValueId::new(1), ValueId::new(2), ValueId::new(3));
     let mut cb = Block::new(BlockId::new(0));
     cb.params.push((a, Ty::I32));
     cb.params.push((b, Ty::I32));
-    cb.body
-        .push(InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(fptr));
+    cb.body.push(InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(fptr));
     cb.body.push(
         InstrNode::new(Inst::CallIndirect {
             callee: fptr,
@@ -407,9 +404,7 @@ fn substitute_var(f: &Formula, name: &str, replacement: &Formula) -> Formula {
     match f {
         Formula::Var(n, _) if n == name => replacement.clone(),
         leaf @ (Formula::Var(..) | Formula::SymVar(..)) => leaf.clone(),
-        other => {
-            other.clone().map_children(&mut |child| substitute_var(&child, name, replacement))
-        }
+        other => other.clone().map_children(&mut |child| substitute_var(&child, name, replacement)),
     }
 }
 
@@ -444,8 +439,9 @@ fn composed_indirect_output(
             break;
         }
 
-        let effects =
-            sem.effects(&state, &insn).unwrap_or_else(|e| panic!("effects failed at {pc:#x}: {e:?}"));
+        let effects = sem
+            .effects(&state, &insn)
+            .unwrap_or_else(|e| panic!("effects failed at {pc:#x}: {e:?}"));
         let is_call = effects.iter().any(|e| matches!(e, Effect::Call { .. }));
 
         // ---- Symbol-address materialization tracer (ADRP + ADD). ----
@@ -532,7 +528,12 @@ fn composed_indirect_output(
 
         // ---- BLR: compose the KNOWN target, or FAIL CLOSED. ----
         if is_call {
-            assert_eq!(insn.opcode, Opcode::Blr, "the real call must be a BLR (indirect), got {:?}", insn.opcode);
+            assert_eq!(
+                insn.opcode,
+                Opcode::Blr,
+                "the real call must be a BLR (indirect), got {:?}",
+                insn.opcode
+            );
             let target_reg = dst_gpr_index(&insn).expect("BLR has a GPR target operand");
             let sym = sym_reg.get(&target_reg).unwrap_or_else(|| {
                 panic!(
@@ -888,13 +889,11 @@ fn open_target_indirect_call_via_non_function_global_fails_closed() {
     });
 
     let mut caller = IrFunction::new(FuncId::new(0), "ir_open", FuncTyId::new(0), BlockId::new(0));
-    let (a, b, fptr, called) =
-        (ValueId::new(0), ValueId::new(1), ValueId::new(2), ValueId::new(3));
+    let (a, b, fptr, called) = (ValueId::new(0), ValueId::new(1), ValueId::new(2), ValueId::new(3));
     let mut cb = Block::new(BlockId::new(0));
     cb.params.push((a, Ty::I32));
     cb.params.push((b, Ty::I32));
-    cb.body
-        .push(InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(fptr));
+    cb.body.push(InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(fptr));
     cb.body.push(
         InstrNode::new(Inst::CallIndirect {
             callee: fptr,
@@ -980,20 +979,16 @@ fn impure_known_target_indirect_call_fails_closed_at_lowering() {
     // composability gate. We pass (a, a-cast-to-ptr-shaped) args of matching arity;
     // the gate rejects the callee BEFORE arg validation because it is impure.
     let mut caller = IrFunction::new(FuncId::new(0), "ir_ci2", FuncTyId::new(0), BlockId::new(0));
-    let (a, b, fptr, pv, called) = (
-        ValueId::new(0),
-        ValueId::new(1),
-        ValueId::new(2),
-        ValueId::new(3),
-        ValueId::new(4),
-    );
+    let (a, b, fptr, pv, called) =
+        (ValueId::new(0), ValueId::new(1), ValueId::new(2), ValueId::new(3), ValueId::new(4));
     let mut cb = Block::new(BlockId::new(0));
     cb.params.push((a, Ty::I32));
     cb.params.push((b, Ty::I32));
-    cb.body
-        .push(InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(fptr));
+    cb.body.push(InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(fptr));
     // A second GlobalAddr just to supply a ptr-typed second arg (arity match).
-    cb.body.push(InstrNode::new(Inst::UnOp { op: UnOp::Neg, ty: Ty::I32, operand: b }).with_result(pv));
+    cb.body.push(
+        InstrNode::new(Inst::UnOp { op: UnOp::Neg, ty: Ty::I32, operand: b }).with_result(pv),
+    );
     cb.body.push(
         InstrNode::new(Inst::CallIndirect {
             callee: fptr,
@@ -1075,7 +1070,9 @@ fn make_open_indirect_module() -> Module {
         .with_result(called),
     );
     // Return the CONSTANT 7 — independent of the (havoced) call.
-    cb.body.push(InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(7) }).with_result(seven));
+    cb.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(7) }).with_result(seven),
+    );
     cb.body.push(InstrNode::new(Inst::Return { values: vec![seven] }));
     caller.blocks.push(cb);
     module.functions.push(caller);

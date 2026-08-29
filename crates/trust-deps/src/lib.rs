@@ -3,8 +3,6 @@
 //! This crate keeps dependency snapshot accounting in Rust so the public
 //! workflow does not accrete one-off Python scripts.
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,6 +10,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const LOCK_SCHEMA: &str = "trust.engines.lock.v2";
 /// Where sibling engine repos are expected to be cloned. Override with

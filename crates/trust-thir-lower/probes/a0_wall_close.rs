@@ -28,13 +28,22 @@
 use std::sync::Arc;
 
 // ---- D: Arc payload, TOTAL match (no `expect`), static fallback (no panic arm).
-pub enum LevelD { Zero, Succ(ArcD), Max(ArcD, ArcD), IMax(ArcD, ArcD), Param(u32) }
+pub enum LevelD {
+    Zero,
+    Succ(ArcD),
+    Max(ArcD, ArcD),
+    IMax(ArcD, ArcD),
+    Param(u32),
+}
 pub struct ArcD(Option<Arc<LevelD>>);
 static ZERO_D: LevelD = LevelD::Zero;
 impl std::ops::Deref for ArcD {
     type Target = LevelD;
     fn deref(&self) -> &LevelD {
-        match &self.0 { Some(a) => &**a, None => &ZERO_D }
+        match &self.0 {
+            Some(a) => &**a,
+            None => &ZERO_D,
+        }
     }
 }
 impl LevelD {
@@ -50,13 +59,22 @@ impl LevelD {
 
 // ---- B: BOX payload, TOTAL match, static fallback. `Box` is the ONE type whose deref
 // is a MIR builtin projection rather than a call.
-pub enum LevelB { Zero, Succ(BoxB), Max(BoxB, BoxB), IMax(BoxB, BoxB), Param(u32) }
+pub enum LevelB {
+    Zero,
+    Succ(BoxB),
+    Max(BoxB, BoxB),
+    IMax(BoxB, BoxB),
+    Param(u32),
+}
 pub struct BoxB(Option<Box<LevelB>>);
 static ZERO_B: LevelB = LevelB::Zero;
 impl std::ops::Deref for BoxB {
     type Target = LevelB;
     fn deref(&self) -> &LevelB {
-        match &self.0 { Some(b) => &**b, None => &ZERO_B }
+        match &self.0 {
+            Some(b) => &**b,
+            None => &ZERO_B,
+        }
     }
 }
 impl LevelB {
@@ -71,11 +89,19 @@ impl LevelB {
 }
 
 // ---- C: BOX payload, NOT optional — the smallest possible edge.
-pub enum LevelC { Zero, Succ(BoxC), Max(BoxC, BoxC), IMax(BoxC, BoxC), Param(u32) }
+pub enum LevelC {
+    Zero,
+    Succ(BoxC),
+    Max(BoxC, BoxC),
+    IMax(BoxC, BoxC),
+    Param(u32),
+}
 pub struct BoxC(Box<LevelC>);
 impl std::ops::Deref for BoxC {
     type Target = LevelC;
-    fn deref(&self) -> &LevelC { &*self.0 }
+    fn deref(&self) -> &LevelC {
+        &*self.0
+    }
 }
 impl LevelC {
     pub fn is_zero_c(&self) -> bool {
@@ -90,7 +116,13 @@ impl LevelC {
 
 // ---- E: Box payload, and NO Deref impl at all — the recursion spells the projection
 // itself, so there is not even a `deref` frame in the closure.
-pub enum LevelE { Zero, Succ(Box<LevelE>), Max(Box<LevelE>, Box<LevelE>), IMax(Box<LevelE>, Box<LevelE>), Param(u32) }
+pub enum LevelE {
+    Zero,
+    Succ(Box<LevelE>),
+    Max(Box<LevelE>, Box<LevelE>),
+    IMax(Box<LevelE>, Box<LevelE>),
+    Param(u32),
+}
 impl LevelE {
     pub fn is_zero_e(&self) -> bool {
         match self {

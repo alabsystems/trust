@@ -1,5 +1,4 @@
-use trust_types::UnwindEdge;
-use trust_types::{Formula, Sort};
+use trust_types::{Formula, Sort, UnwindEdge};
 
 use super::substitute_summary_params;
 
@@ -7,10 +6,7 @@ use super::substitute_summary_params;
 fn pre_forall_x_lt_i() -> Formula {
     Formula::forall(
         &[("i", Sort::Int)],
-        Formula::Lt(
-            Box::new(Formula::var("x", Sort::Int)),
-            Box::new(Formula::var("i", Sort::Int)),
-        ),
+        Formula::Lt(Box::new(Formula::var("x", Sort::Int)), Box::new(Formula::var("i", Sort::Int))),
     )
 }
 
@@ -128,8 +124,8 @@ fn write_covers_derived_slice_len_semantics() {
 #[test]
 fn mut_pointer_param_pointee_havoced_at_call() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
-        VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty, VerifiableBody,
+        VerifiableFunction,
     };
     // fn f(r: &mut u32) { g(r) } — `r` is a &mut PARAMETER (no syntactic
     // `&mut x` statement), so mutably_borrowed_local_names misses it. The
@@ -155,6 +151,7 @@ fn mut_pointer_param_pointee_havoced_at_call() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "g".into(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -191,22 +188,30 @@ fn ty_contains_mut_pointer_recurses_aggregates() {
     let rawmut = || Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) };
     assert!(c(&mref()));
     assert!(c(&rawmut()));
-    assert!(c(&Ty::Adt { adt_kind: None, layout: None, 
+    assert!(c(&Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "W".into(),
         fields: vec![("p".into(), mref())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }));
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }));
     assert!(c(&Ty::Tuple(vec![Ty::u32(), rawmut()])));
     assert!(c(&Ty::Array { elem: Box::new(mref()), len: 4 }));
     // No mutable pointer anywhere -> false.
     assert!(!c(&Ty::u32()));
-    assert!(!c(&Ty::Adt { adt_kind: None, layout: None, 
+    assert!(!c(&Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "P".into(),
         fields: vec![("v".into(), Ty::u32())],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }));
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }));
     // A shared `&` is NOT recursed into (cannot drive a mutation).
     assert!(!c(&Ty::Ref { mutable: false, inner: Box::new(mref()) }));
 }
@@ -214,19 +219,23 @@ fn ty_contains_mut_pointer_recurses_aggregates() {
 #[test]
 fn mut_pointer_nested_in_aggregate_havoced_at_call() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
-        VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty, VerifiableBody,
+        VerifiableFunction,
     };
     // fn f(s: Wrapper { p: &mut u32 }) { g(s) } — the &mut is NESTED in a
     // non-reference Adt local: no syntactic `&mut x` statement and the local's
     // top-level type is not a pointer. The Call must still havoc `s` (whose
     // prefix-overlap kills the nested pointee fact `s.0*`). Round-13 fix.
-    let wrapper = Ty::Adt { adt_kind: None, layout: None, 
+    let wrapper = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Wrapper".into(),
         fields: vec![("p".into(), Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) })],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "f".into(),
         def_path: "f".into(),
@@ -243,6 +252,7 @@ fn mut_pointer_nested_in_aggregate_havoced_at_call() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "g".into(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -274,8 +284,7 @@ fn mut_pointer_nested_in_aggregate_havoced_at_call() {
 #[test]
 fn int_op_type_recovers_width_from_nonconst_operand() {
     use trust_types::{
-        ConstValue, LocalDecl, Operand, Place, SourceSpan, Ty, VerifiableBody,
-        VerifiableFunction,
+        ConstValue, LocalDecl, Operand, Place, SourceSpan, Ty, VerifiableBody, VerifiableFunction,
     };
     // `100i8 + x` (x: i8): a SIGNED constant loses its width at extraction
     // (operand_ty fabricates i64), so the overflow bound must be recovered from
@@ -402,6 +411,7 @@ fn foreign_flagged_call_fails_closed_even_without_name_marker() {
                         atomic: None,
                         is_foreign,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -421,6 +431,36 @@ fn foreign_flagged_call_fails_closed_even_without_name_marker() {
         vcs.iter().any(|vc| matches!(&vc.kind, VcKind::FfiBoundaryViolation { .. })
             && vc.formula == Formula::Bool(true)),
         "foreign-flagged call must emit a fail-closed FFI obligation; got {vcs:?}"
+    );
+    let mut tail = build(true);
+    let Terminator::Call {
+        func,
+        args,
+        span,
+        atomic,
+        is_foreign,
+        is_unsafe_sig,
+        callee_identity,
+        ..
+    } = tail.body.blocks[0].terminator.clone()
+    else {
+        unreachable!();
+    };
+    tail.body.blocks[0].terminator = Terminator::TailCall {
+        func,
+        args,
+        span,
+        atomic,
+        is_foreign,
+        is_unsafe_sig,
+        callee_identity,
+    };
+    tail.body.blocks.truncate(1);
+    let tail_vcs = super::generate_vcs(&tail);
+    assert!(
+        tail_vcs.iter().any(|vc| matches!(&vc.kind, VcKind::FfiBoundaryViolation { .. })
+            && vc.formula == Formula::Bool(true)),
+        "foreign-flagged TailCall must emit the same fail-closed FFI obligation; got {tail_vcs:?}"
     );
     // Control: without the flag, the unrecognized name is NOT detected as
     // FFI by name alone — this is precisely the gap the flag closes.

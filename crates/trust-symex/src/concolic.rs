@@ -335,7 +335,7 @@ fn validate_terminator(
             "unsupported concolic drop terminator: {}",
             place_to_name(place)
         ))),
-        Terminator::Call { .. } | Terminator::Opaque { .. } => Err(
+        Terminator::Call { .. } | Terminator::TailCall { .. } | Terminator::Opaque { .. } => Err(
             SymexError::UnsupportedOperation(format!("unsupported concolic terminator: {term:?}")),
         ),
         other => Err(SymexError::UnsupportedOperation(format!(
@@ -1050,10 +1050,9 @@ fn build_path_constraints(formula: &Formula, inputs: &BTreeMap<String, i128>) ->
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         BasicBlock, BinOp, BlockId, ConstValue, Operand, Place, Rvalue, Sort, SourceSpan,
-        Statement, Terminator, VcKind,
+        Statement, Terminator, UnwindEdge, VcKind,
     };
 
     use super::*;
@@ -1373,13 +1372,17 @@ mod tests {
         let blocks = vec![BasicBlock {
             id: BlockId(0),
             stmts: vec![],
-            terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+            terminator: Terminator::Call {
+                unwind: UnwindEdge::Unreachable,
+                is_unsafe_sig: false,
+                is_foreign: false,
                 func: "opaque_call".into(),
                 args: vec![],
                 dest: Place::local(1),
                 target: Some(BlockId(1)),
                 span: span(),
                 atomic: None,
+                callee_identity: None,
             },
         }];
         let config = ConcolicConfig::default();

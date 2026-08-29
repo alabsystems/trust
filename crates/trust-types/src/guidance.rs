@@ -408,7 +408,11 @@ mod tests {
     fn extended_l0_kinds_have_actionable_guidance() {
         use crate::Ty;
         let cases: Vec<VcKind> = vec![
-            VcKind::ShiftOverflow { op: crate::BinOp::Shl, operand_ty: Ty::u32(), shift_ty: Ty::u32() },
+            VcKind::ShiftOverflow {
+                op: crate::BinOp::Shl,
+                operand_ty: Ty::u32(),
+                shift_ty: Ty::u32(),
+            },
             VcKind::CastOverflow { from_ty: Ty::u64(), to_ty: Ty::u8() },
             VcKind::NegationOverflow { ty: Ty::i32() },
             VcKind::UseAfterFree,
@@ -426,23 +430,18 @@ mod tests {
 
     #[test]
     fn termination_guidance_uses_native_function_and_loop_clauses() {
-        let loop_guidance = VcKind::NonTermination {
-            context: "loop".into(),
-            measure: "n".into(),
-        }
-        .agentic_guidance()
-        .unwrap();
+        let loop_guidance = VcKind::NonTermination { context: "loop".into(), measure: "n".into() }
+            .agentic_guidance()
+            .unwrap();
         assert!(
             loop_guidance.suggested_fixes[0].change.contains("loop-local `decreases <measure>`")
         );
         assert!(!loop_guidance.suggested_fixes[0].change.contains("#[decreases"));
 
-        let recursion_guidance = VcKind::NonTermination {
-            context: "recursion".into(),
-            measure: "n".into(),
-        }
-        .agentic_guidance()
-        .unwrap();
+        let recursion_guidance =
+            VcKind::NonTermination { context: "recursion".into(), measure: "n".into() }
+                .agentic_guidance()
+                .unwrap();
         assert!(
             recursion_guidance.suggested_fixes[0]
                 .change

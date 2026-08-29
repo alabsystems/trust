@@ -65,11 +65,8 @@ fn dot_like(preconditions: Vec<Formula>, reassign_self: bool) -> VerifiableFunct
             Rvalue::Use(Operand::Constant(ConstValue::Float(1e300))),
         ));
     }
-    let local = |index: usize, name: &str| LocalDecl {
-        index,
-        ty: Ty::f64_ty(),
-        name: Some(name.into()),
-    };
+    let local =
+        |index: usize, name: &str| LocalDecl { index, ty: Ty::f64_ty(), name: Some(name.into()) };
     VerifiableFunction {
         name: "dot".into(),
         def_path: "Vec3::dot".into(),
@@ -146,8 +143,7 @@ fn bare_param_field_direct_copy_operand_is_bounded() {
     // (no temp) — float_exp_bound must still reach contract_exp_bound.
     let func = dot_like(two_sided(), false);
     assert!(
-        float_exp_bound(&func, &Operand::Copy(Place::field(1, 0)), FLOAT_EXP_BOUND_FUEL)
-            .is_some()
+        float_exp_bound(&func, &Operand::Copy(Place::field(1, 0)), FLOAT_EXP_BOUND_FUEL).is_some()
     );
 }
 
@@ -351,8 +347,7 @@ fn field_projected_precond_with_nonplace_actual_becomes_free_not_captured() {
     // NOT be left spelled `o.0` (which could be captured by a caller's own
     // `o.0`). It becomes a disjoint fresh free var so the caller obligation
     // fails closed.
-    let precond =
-        Formula::Le(Box::new(Formula::Var("o.0".into(), f64s())), Box::new(fp(1.0e30)));
+    let precond = Formula::Le(Box::new(Formula::Var("o.0".into(), f64s())), Box::new(fp(1.0e30)));
     let replacements = vec![("o".to_string(), Formula::Int(5))];
     let out = substitute_summary_params(&precond, &replacements);
     let Formula::Le(a, _) = &out else { panic!("expected Le, got {out:?}") };
@@ -368,8 +363,7 @@ fn field_projected_precond_with_nonplace_actual_becomes_free_not_captured() {
 fn non_formal_field_var_is_left_unchanged() {
     // A field var whose base is NOT a substituted formal is untouched (existing
     // behavior): `k.0` with only `self`/`o` in the map stays `k.0`.
-    let precond =
-        Formula::Le(Box::new(Formula::Var("k.0".into(), f64s())), Box::new(fp(1.0e30)));
+    let precond = Formula::Le(Box::new(Formula::Var("k.0".into(), f64s())), Box::new(fp(1.0e30)));
     let replacements = vec![("self".to_string(), Formula::Var("a".into(), Sort::Int))];
     let out = substitute_summary_params(&precond, &replacements);
     assert_eq!(out, precond);

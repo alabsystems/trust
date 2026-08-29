@@ -1001,3 +1001,133 @@ replace = """
 """
 expected_replacements = 1
 allow_missing = false
+
+# 2026-08-23: the `--emit trust-ir` help line. Trust added a first-class
+# `TrustIr` variant to the shared `define_output_types!` table
+# (compiler/rustc_session/src/config.rs). `EMIT_HELP` (config.rs, UNMODIFIED
+# upstream) mechanically renders one `*  <shorthand> - <default_filename>` row
+# per variant, so the extra help line is a consequence of the variant, not a
+# separate edit to any diagnostic.
+#
+# WHY THIS IS ACCEPTED RATHER THAN HIDDEN. trust-ir is the canonical universal
+# IR (docs/DESIGN_PHILOSOPHY.md#5), so `--emit trust-ir` is meant to be a
+# first-class, discoverable user-facing artifact of Trust's own compiler. This
+# is Trust advertising its own artifact menu in its own `--emit` listing; it
+# changes no program's compilation. Suppressing the row was considered and
+# REJECTED because it yields an incoherent CLI: `OutputType::shorthands_display`
+# still names `trust-ir` in the "unknown emission type ... expected one of"
+# error (measured 2026-08-23: `--emit=bogus` lists `trust-ir`), so `--emit`
+# would recommend a type its own help refuses to list. Undiscoverable-but-
+# recommended is worse than one extra help line. Same shape as
+# `trust.divergence.check-cfg-trustverify-well-known-names`.
+#
+# THREE files carry this one divergence. Only the ui .stderr surfaced in the
+# 2026-08-23 run because the run-make suite was not reached; the two
+# rustc-help expectations fail identically the moment it is. They are ledgered
+# together so the same divergence does not resurface as a "new" failure.
+#
+# OPEN, DELIBERATELY NOT DECIDED HERE (needs owner): `--emit trust-ir` is
+# currently UNGATED, i.e. visible and usable without `-Zunstable-options`,
+# unlike `thin-link-bitcode` which is gated in `parse_output_types` yet still
+# listed in this same help text. Gating it would NOT remove the help row and so
+# does not change these three patches either way, but it is a real surface-
+# stability question for a `channel="trust"` compiler.
+
+[[patches]]
+id = "trust.divergence.emit-help-trust-ir-ui"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust's first-class `--emit trust-ir` output type (trust-ir is the canonical universal IR, docs/DESIGN_PHILOSOPHY.md#5) appears in the upstream-unmodified EMIT_HELP listing, which renders one row per OutputType variant. CLI/diagnostic surface only: no program compiles differently. Hiding the row was rejected because shorthands_display still recommends `trust-ir` in the unknown-emission-type error."
+issue = "local:docs/DESIGN_PHILOSOPHY.md#5-trust-ir-is-the-canonical-universal-ir"
+reviewed_on = "2026-08-23"
+expires_on = "2026-11-23"
+path = "tests/ui/compile-flags/invalid/emit-output-types-without-args.stderr"
+kind = "string-replace"
+find = '''
+                               * thin-link-bitcode - CRATE_NAME.indexing.o
+'''
+replace = '''
+                               * thin-link-bitcode - CRATE_NAME.indexing.o
+                               * trust-ir - CRATE_NAME.trust-ir.bin
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.emit-help-trust-ir-rustc-help"
+status = "active"
+owner = "@trust-compiler"
+reason = "Companion to trust.divergence.emit-help-trust-ir-ui: the same EMIT_HELP row appears in `rustc --help` output. Not yet observed failing only because the 2026-08-23 domination run did not reach the run-make suite."
+issue = "local:docs/DESIGN_PHILOSOPHY.md#5-trust-ir-is-the-canonical-universal-ir"
+reviewed_on = "2026-08-23"
+expires_on = "2026-11-23"
+path = "tests/run-make/rustc-help/help.stdout"
+kind = "string-replace"
+find = '''
+                        * thin-link-bitcode - CRATE_NAME.indexing.o
+'''
+replace = '''
+                        * thin-link-bitcode - CRATE_NAME.indexing.o
+                        * trust-ir - CRATE_NAME.trust-ir.bin
+'''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.emit-help-trust-ir-rustc-help-v"
+status = "active"
+owner = "@trust-compiler"
+reason = "Companion to trust.divergence.emit-help-trust-ir-ui: the same EMIT_HELP row appears in `rustc --help -v` output. Not yet observed failing only because the 2026-08-23 domination run did not reach the run-make suite."
+issue = "local:docs/DESIGN_PHILOSOPHY.md#5-trust-ir-is-the-canonical-universal-ir"
+reviewed_on = "2026-08-23"
+expires_on = "2026-11-23"
+path = "tests/run-make/rustc-help/help-v.stdout"
+kind = "string-replace"
+find = '''
+                        * thin-link-bitcode - CRATE_NAME.indexing.o
+'''
+replace = '''
+                        * thin-link-bitcode - CRATE_NAME.indexing.o
+                        * trust-ir - CRATE_NAME.trust-ir.bin
+'''
+expected_replacements = 1
+allow_missing = false
+
+# ---------------------------------------------------------------------------
+# DELETE ROWS — upstream paths Trust retires on purpose.
+#
+# Added 2026-08-23 with the `kind = "delete"` patch kind. Before it existed the
+# manifest could not express a deletion, and the `ported-overlay-not-applied`
+# validation row was a raw set difference (`upstream_path_set - current_paths`)
+# that consulted no ledger. Two decisions this project had already made and
+# documented in `divergence-audit.toml` — a file NO CODE READS — therefore
+# surfaced as a gate failure whose only offered remedy was `--apply`, which
+# would have reverted them: its write phase copies every upstream path
+# unconditionally.
+#
+# An active row here does two things: it removes the path from the imported
+# overlay so `--apply` cannot resurrect the test, and it accounts for the path
+# in the coverage check. A row that is `status = "inactive"` or expired stops
+# doing both, so a stale waiver cannot hold a coverage claim open.
+
+[[patches]]
+id = "trust.deleted.crashes.135122.no-ice"
+kind = "delete"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust emits ordinary diagnostics (E0046/E0207/E0191/E0277) where upstream ICEs (rust-lang/rust#135122), so the `//@ known-bug` crashes entry cannot pass and is not supposed to. Retired through the upstream-sanctioned de-ICE process in e7aaf758723 and replaced by tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs, which asserts the non-ICE diagnostics. Its waiver test-exc.crashes.135122.no-ice was RETIRED 2026-07-23 precisely because the subject no longer exists — re-creating the file would re-open a failing test with no active exception."
+issue = "local:tests/upstream-rust/divergence-audit.toml#upstream.accepted.crashes.135122.no-ice"
+reviewed_on = "2026-08-23"
+expires_on = "2026-11-23"
+path = "tests/crashes/135122.rs"
+
+[[patches]]
+id = "trust.deleted.dist.cranelift-backend"
+kind = "delete"
+status = "active"
+owner = "@trust-release"
+reason = "The test body is `//@ compile-flags: -Z codegen-backend=cranelift`, and Trust has no cranelift backend: `rustc_codegen_cranelift` and `src/gcc` were removed wholesale in d711cf76b19 (the W1-06/W2-07 fork-cleanup wave, which also dropped the `## tests/ui/dist` section from tests/ui/README.md). A dist test for a backend that does not exist cannot pass and should not be resurrected. This deletion was NOT ledgered anywhere under tests/upstream-rust/ until now — it was carried only by the commit that made it, which is why the coverage check could not account for it."
+issue = "local:d711cf76b19"
+reviewed_on = "2026-08-23"
+expires_on = "2026-11-23"
+path = "tests/ui/dist/cranelift-x86_64-unknown-linux-gnu-dist.rs"

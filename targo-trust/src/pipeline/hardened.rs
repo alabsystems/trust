@@ -168,10 +168,8 @@ fn verification_result_is_coroutine_resume_contract_row(
         && result.reason.as_deref()
             == Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON)
         && result.counterexample.is_none()
-        && trust_types::assumption::parse_coroutine_resume_contract_row_description(
-            &result.message,
-        )
-        .is_some()
+        && trust_types::assumption::parse_coroutine_resume_contract_row_description(&result.message)
+            .is_some()
 }
 
 pub(crate) fn partition_outcome_counts(
@@ -464,11 +462,7 @@ pub(crate) fn evaluate_verification_gate(
             } else if counts.failed > 0 {
                 GateDecision::Fail
             } else if counts.total == 0
-                || counts.unknown
-                    + counts.assumed
-                    + counts.mandated
-                    + counts.contract_panics
-                    > 0
+                || counts.unknown + counts.assumed + counts.mandated + counts.contract_panics > 0
             {
                 // NOTE `runtime_checked` is deliberately NOT in this sum any
                 // more; see the `Strict` doc comment. It remains in the
@@ -621,6 +615,10 @@ pub(super) fn hardened_proof_gate_failure_for_results(
         cached: 0,
         total: counts.total,
         results: results.to_vec(),
+        // Trust (#220): this is an internal gate PROBE over an already-published
+        // vector, never rendered to a terminal — there is no publication pass
+        // here whose boundary could be reported, so it is honestly unmeasured.
+        publication_boundary: None,
         zero_obligation_functions: zero_obligation_functions.to_vec(),
         compiler_diagnostics: compiler_diagnostics.to_vec(),
         duration_ms: 0,

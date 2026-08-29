@@ -7,10 +7,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::FxHashMap;
-
-use trust_types::{Formula, Sort as FormulaSort};
 use ay::{BitVecSort, Logic, Solver, Sort as AYSort, Term};
+use trust_types::fx::FxHashMap;
+use trust_types::{Formula, Sort as FormulaSort};
 
 use crate::cfg::LiftedFunction;
 use crate::error::LiftError;
@@ -600,11 +599,12 @@ impl<'s> EncodingEnv<'s> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::{
         BasicBlock, BinOp, BlockId, Formula, LocalDecl, Operand, Place, Rvalue,
         Sort as FormulaSort, SourceSpan, Statement, Ty, VerifiableBody,
     };
+
+    use super::*;
 
     /// Helper: build a minimal LiftedFunction with a single-block body.
     fn make_lifted(body: VerifiableBody) -> LiftedFunction {

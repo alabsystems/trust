@@ -8,4 +8,6 @@ fn pong(a: &[u32; 8], n: usize, i: usize) -> u32 {
     let y = a[i];
     if n > 0 { ping(a, n - 1, i + 1) } else { y }
 }
-pub fn go() -> u32 { ping(&[0u32; 8], 5, 0) }
+pub fn go() -> u32 {
+    ping(&[0u32; 8], 5, 0)
+}

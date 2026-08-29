@@ -68,12 +68,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::Module;
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Source the REAL bridge Module from a trust-types VerifiableFunction whose body
@@ -184,7 +181,13 @@ fn make_bridge_divrem_module(signed: bool, rem: bool) -> Module {
         name: if rem { "rm".to_string() } else { "dv".to_string() },
         def_path: "divrem::dv".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 2, return_ty: ity, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 2,
+            return_ty: ity,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -694,8 +697,8 @@ fn divrem_lir_shape_carries_guarded_divide() {
     ];
     for &(signed, rem, is_div, want_brif) in cases {
         let module = make_bridge_divrem_module(signed, rem);
-        let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
-            .expect("div/rem lowers");
+        let lir =
+            lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("div/rem lowers");
         assert!(lir.stack_slots.is_empty(), "div/rem must materialize NO memory");
         let mut divs = 0;
         let mut brif = 0;

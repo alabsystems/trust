@@ -94,7 +94,9 @@ rule = "print_request_docs_help"
         target_triple: None,
         host: None,
         host_triple: None,
-        test_exception_validation_date: None,
+        // Pinned inside the fixture patches' reviewed_on..expires_on window
+        // (2026-05-07..2026-08-05) so the test does not rot with the wall clock.
+        test_exception_validation_date: Some("2026-08-01".to_string()),
         upstream_revision: qualified_revision(&current),
         upstream_remote: "missing-upstream.invalid".to_string(),
         out_dir: PathBuf::from("reports/smoke"),
@@ -672,7 +674,9 @@ fn full_proof_uses_supplied_test_exceptions_for_failed_artifacts() {
         target_triple: None,
         host: None,
         host_triple: None,
-        test_exception_validation_date: None,
+        // Pinned inside the fixture exception's reviewed_on..expires_on window
+        // (2026-04-29..2026-07-28) so the test does not rot with the wall clock.
+        test_exception_validation_date: Some("2026-07-01".to_string()),
         upstream_revision: qualified_revision(&upstream),
         upstream_remote: "missing-upstream.invalid".to_string(),
         out_dir: PathBuf::from("reports/proof-test-exceptions"),

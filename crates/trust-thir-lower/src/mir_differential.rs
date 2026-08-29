@@ -1135,6 +1135,9 @@ pub(crate) fn canonical_cfg_roles(body: &VerifiableBody) -> CanonResult<Canonica
                 .collect::<Vec<_>>(),
             Terminator::Assert { target, .. } => vec![target.0],
             Terminator::Return | Terminator::Unreachable => Vec::new(),
+            Terminator::TailCall { .. } => {
+                return Err("TailCall outside MIR differential fragment".to_string());
+            }
             Terminator::Goto(_) => {
                 return Err("goto block treated as canonical".to_string());
             }
@@ -1612,6 +1615,9 @@ fn canonicalize_with_norms(
             }
             Terminator::Assert { target, .. } => vec![thread(target.0)?],
             Terminator::Return | Terminator::Unreachable => vec![],
+            Terminator::TailCall { .. } => {
+                return Err("TailCall outside MIR differential fragment".to_string());
+            }
             Terminator::Goto(_) => return Err("goto block treated as canonical".to_string()),
             // Trust (wave-6): a direct call's single canonical successor is its return
             // target (the extraction already dropped the unwind edge and this comparator's
@@ -2175,6 +2181,9 @@ fn eval_with_header_envs(
             }
             Terminator::Return => {
                 return Err("return block reached the merge walk (return-split broken)".to_string());
+            }
+            Terminator::TailCall { .. } => {
+                return Err("TailCall outside MIR differential fragment".to_string());
             }
             // Trust (B10): render the memory suffix at the unreachable SINK too — closes the
             // store-then-unreachable invisibility (dead path, but symmetric and free).
@@ -3313,6 +3322,7 @@ fn local_ever_written(body: &VerifiableBody, local: usize) -> bool {
             _ => false,
         }) || match &bb.terminator {
             Terminator::Call { dest, .. } => dest.local == local,
+            Terminator::TailCall { .. } => local == 0,
             _ => false,
         }
     })
@@ -3610,6 +3620,9 @@ fn canon_markers(body: &VerifiableBody) -> CanonResult<Vec<String>> {
             }
             Terminator::Assert { target, .. } => vec![target.0],
             Terminator::Return | Terminator::Unreachable => vec![],
+            Terminator::TailCall { .. } => {
+                return Err("TailCall outside MIR differential fragment".to_string());
+            }
             // Trust (wave-6): a direct call's fine-walk successor is its return target
             // (extraction already dropped the unwind edge; the raw call channel verified
             // the built unwind's benign lone-resume shape, which is marker-free — and the
@@ -4272,6 +4285,7 @@ mod session_state_tests {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         unwind: UnwindEdge::Unreachable,
                     },
                 },

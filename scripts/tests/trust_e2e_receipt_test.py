@@ -112,7 +112,7 @@ class AtomicReceiptTests(unittest.TestCase):
                 "report": doctor_report,
                 "ready": True,
                 "daily_driver_ready": True,
-                "required_verifier_suites": ["trust-mc", "trust-wp", "trust-vc"],
+                "required_verifier_suites": ["trust-mc", "trust-vc"],
             },
             "serde_fixture": {
                 "tree_manifest_sha256": digest,

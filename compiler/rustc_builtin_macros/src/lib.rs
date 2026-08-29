@@ -155,4 +155,16 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
     register(sym::trust_contracts_requires, trust_requires);
     let trust_ensures = SyntaxExtensionKind::Attr(Arc::new(contracts::ExpandTrustEnsures));
     register(sym::trust_contracts_ensures, trust_ensures);
+    // Trust (D4): `trust::decreases` has no upstream `core::contracts`
+    // counterpart and no second lane to drift into — it desugars to the native
+    // `decreases e` clause spelling itself, so the attribute and first-class
+    // surfaces are one implementation by construction.
+    let trust_decreases = SyntaxExtensionKind::Attr(Arc::new(contracts::ExpandTrustDecreases));
+    register(sym::trust_contracts_decreases, trust_decreases);
+    // Trust: `trust::invariant` maps onto a REFUSAL, not a lowering. Without an
+    // entry here the trust-spec passthrough proc macro runs and the annotation
+    // is erased with no diagnostic. See `contracts::ExpandTrustInvariant` for
+    // the measured reason this must not be routed to a VC instead.
+    let trust_invariant = SyntaxExtensionKind::Attr(Arc::new(contracts::ExpandTrustInvariant));
+    register(sym::trust_contracts_invariant, trust_invariant);
 }

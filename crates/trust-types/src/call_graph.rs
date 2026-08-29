@@ -98,7 +98,10 @@ pub fn canonical_trait_method(def_path: &str) -> Option<(String, String, String,
             if !trait_with_args.ends_with('>') {
                 return None;
             }
-            (trait_with_args[..ti].trim(), trait_with_args[ti + 1..trait_with_args.len() - 1].trim())
+            (
+                trait_with_args[..ti].trim(),
+                trait_with_args[ti + 1..trait_with_args.len() - 1].trim(),
+            )
         }
         None => (trait_with_args, ""),
     };
@@ -191,11 +194,7 @@ impl<'a> CalleeResolver<'a> {
         }
     }
 
-    fn record_canonical(
-        &mut self,
-        key: (String, String, String, String),
-        def_path: &'a str,
-    ) {
+    fn record_canonical(&mut self, key: (String, String, String, String), def_path: &'a str) {
         match self.canonical.get_mut(&key) {
             None => {
                 self.canonical.insert(key, Resolution::Unique(def_path));

@@ -35,18 +35,18 @@ mod error;
 mod host;
 mod types;
 
-pub use error::ReactorError;
-pub use host::{Completion, Host, RejectionEvent, ThenLookup};
-pub use types::{Capability, PromiseId, PromiseStatus, TimerId};
-
-use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
+
+pub use error::ReactorError;
+pub use host::{Completion, Host, RejectionEvent, ThenLookup};
+use indexmap::IndexMap;
 use types::{
     AggState, Handler, Internal, Job, PromiseRecord, PromiseState, ReactionRecord, TimerEntry,
     TimerKey,
 };
+pub use types::{Capability, PromiseId, PromiseStatus, TimerId};
 
 /// The deterministic event loop. Generic over the host value type `V` and host
 /// callback handle `F`; all engine operations that need a JS interpreter are
@@ -177,10 +177,7 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
     /// reason). Empty once every rejection has been handled.
     #[must_use]
     pub fn unhandled_rejections(&self) -> Vec<(PromiseId, V)> {
-        self.outstanding
-            .iter()
-            .map(|(id, r)| (*id, r.clone()))
-            .collect()
+        self.outstanding.iter().map(|(id, r)| (*id, r.clone())).collect()
     }
 
     // -- queueing ----------------------------------------------------------
@@ -272,7 +269,12 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
 
     /// The promise reject function: `reject(reason)` with the already-resolved
     /// guard (RejectPromise, no thenable check).
-    pub fn reject<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, cap: &Capability, reason: V) {
+    pub fn reject<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        cap: &Capability,
+        reason: V,
+    ) {
         if !cap.claim() {
             return;
         }
@@ -301,7 +303,12 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
 
     /// RejectPromise: settle `pid` rejected, enqueue its reject reactions, and —
     /// if the promise was never handled — raise the unhandled-rejection signal.
-    fn reject_promise<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, pid: PromiseId, reason: V) {
+    fn reject_promise<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        pid: PromiseId,
+        reason: V,
+    ) {
         let (reactions, handled) = {
             let p = &mut self.promises[pid];
             if !matches!(p.state, PromiseState::Pending) {
@@ -320,10 +327,7 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
         }
         if !handled {
             self.outstanding.insert(pid, reason.clone());
-            host.on_rejection(RejectionEvent::Rejected {
-                promise: pid,
-                reason,
-            });
+            host.on_rejection(RejectionEvent::Rejected { promise: pid, reason });
         }
     }
 
@@ -375,30 +379,17 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
             p.handled = true;
             match &p.state {
                 PromiseState::Pending => {
-                    p.fulfill_reactions.push(ReactionRecord {
-                        handler: fulfill_handler,
-                        cap: cap.clone(),
-                    });
-                    p.reject_reactions.push(ReactionRecord {
-                        handler: reject_handler,
-                        cap,
-                    });
+                    p.fulfill_reactions
+                        .push(ReactionRecord { handler: fulfill_handler, cap: cap.clone() });
+                    p.reject_reactions.push(ReactionRecord { handler: reject_handler, cap });
                     return;
                 }
                 PromiseState::Fulfilled(v) => {
-                    job = Job::Reaction {
-                        handler: fulfill_handler,
-                        arg: v.clone(),
-                        cap,
-                    };
+                    job = Job::Reaction { handler: fulfill_handler, arg: v.clone(), cap };
                 }
                 PromiseState::Rejected(e) => {
                     emit_handled = !already_handled;
-                    job = Job::Reaction {
-                        handler: reject_handler,
-                        arg: e.clone(),
-                        cap,
-                    };
+                    job = Job::Reaction { handler: reject_handler, arg: e.clone(), cap };
                 }
             }
         }
@@ -413,7 +404,11 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
 
     /// `Promise.resolve(value)`: return `value` if it is already one of this
     /// reactor's promises, else a new promise resolved with `value`.
-    pub fn promise_resolve<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, value: V) -> PromiseId {
+    pub fn promise_resolve<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        value: V,
+    ) -> PromiseId {
         if let Some(pid) = host.promise_of(&value) {
             return pid;
         }
@@ -424,7 +419,11 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
 
     /// `Promise.reject(reason)`: a new promise rejected with `reason` (initially
     /// unhandled).
-    pub fn promise_reject<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, reason: V) -> PromiseId {
+    pub fn promise_reject<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        reason: V,
+    ) -> PromiseId {
         let (p, cap) = self.new_promise();
         self.reject(host, &cap, reason);
         p
@@ -436,7 +435,11 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
     /// values, or reject with the first rejection. The consumer supplies the
     /// already-iterated element values; the reactor coerces each with
     /// `promise_resolve` and orchestrates the aggregation.
-    pub fn promise_all<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, elements: Vec<V>) -> PromiseId {
+    pub fn promise_all<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        elements: Vec<V>,
+    ) -> PromiseId {
         let (result, cap) = self.new_promise();
         let n = elements.len();
         if n == 0 {
@@ -455,10 +458,7 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
             self.perform_then(
                 host,
                 ep,
-                Handler::Internal(Internal::AllFulfill {
-                    state: state.clone(),
-                    index,
-                }),
+                Handler::Internal(Internal::AllFulfill { state: state.clone(), index }),
                 Handler::Internal(Internal::RejectMain { cap: cap.clone() }),
                 None,
             );
@@ -491,14 +491,8 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
             self.perform_then(
                 host,
                 ep,
-                Handler::Internal(Internal::SettledFulfill {
-                    state: state.clone(),
-                    index,
-                }),
-                Handler::Internal(Internal::SettledReject {
-                    state: state.clone(),
-                    index,
-                }),
+                Handler::Internal(Internal::SettledFulfill { state: state.clone(), index }),
+                Handler::Internal(Internal::SettledReject { state: state.clone(), index }),
                 None,
             );
         }
@@ -507,7 +501,11 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
 
     /// `Promise.race(elements)` — settle with the first element to settle
     /// (fulfill or reject). Empty input stays forever pending, per spec.
-    pub fn promise_race<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, elements: Vec<V>) -> PromiseId {
+    pub fn promise_race<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        elements: Vec<V>,
+    ) -> PromiseId {
         let (result, cap) = self.new_promise();
         for v in elements {
             let ep = self.promise_resolve(host, v);
@@ -525,7 +523,11 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
     /// `Promise.any(elements)` — fulfill with the first element to fulfill; if
     /// all reject, reject with an AggregateError of the ordered reasons. Empty
     /// input rejects with an AggregateError immediately, per spec.
-    pub fn promise_any<H: Host<Value = V, Fn = F>>(&mut self, host: &mut H, elements: Vec<V>) -> PromiseId {
+    pub fn promise_any<H: Host<Value = V, Fn = F>>(
+        &mut self,
+        host: &mut H,
+        elements: Vec<V>,
+    ) -> PromiseId {
         let (result, cap) = self.new_promise();
         let n = elements.len();
         if n == 0 {
@@ -545,10 +547,7 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
                 host,
                 ep,
                 Handler::Internal(Internal::ResolveMain { cap: cap.clone() }),
-                Handler::Internal(Internal::AnyReject {
-                    state: state.clone(),
-                    index,
-                }),
+                Handler::Internal(Internal::AnyReject { state: state.clone(), index }),
                 None,
             );
         }
@@ -581,11 +580,7 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
                 self.id_to_key.insert(entry.id, nk);
                 self.timers.insert(
                     nk,
-                    TimerEntry {
-                        id: entry.id,
-                        f: entry.f.clone(),
-                        interval: Some(period),
-                    },
+                    TimerEntry { id: entry.id, f: entry.f.clone(), interval: Some(period) },
                 );
             }
             self.charge()?;
@@ -610,11 +605,7 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
         match job {
             Job::HostMicrotask(f) => host.run_callback(self, &f),
             Job::Reaction { handler, arg, cap } => self.run_reaction(host, handler, arg, cap),
-            Job::ResolveThenable {
-                promise,
-                thenable,
-                then,
-            } => {
+            Job::ResolveThenable { promise, thenable, then } => {
                 let cap = self.resolving_functions(promise);
                 match host.call_then(self, &then, &thenable, cap.clone(), cap.clone()) {
                     Completion::Normal(_) => {}
@@ -697,7 +688,11 @@ impl<V: Clone, F: Clone> Reactor<V, F> {
 /// return them with the aggregate capability. `None` while more are pending or
 /// if the aggregate already settled. The RefCell borrow is released before the
 /// caller touches the host, so no borrow is held across a host call.
-fn collect<V>(state: &Rc<RefCell<AggState<V>>>, index: usize, item: V) -> Option<(Vec<V>, Capability)> {
+fn collect<V>(
+    state: &Rc<RefCell<AggState<V>>>,
+    index: usize,
+    item: V,
+) -> Option<(Vec<V>, Capability)> {
     let mut s = state.borrow_mut();
     if s.settled {
         return None;

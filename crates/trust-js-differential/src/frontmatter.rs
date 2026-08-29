@@ -34,7 +34,9 @@ impl Frontmatter {
 
 fn strip_quotes(s: &str) -> &str {
     let b = s.as_bytes();
-    if b.len() >= 2 && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\'')) {
+    if b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+    {
         &s[1..s.len() - 1]
     } else {
         s
@@ -47,7 +49,12 @@ fn is_indented(line: &str) -> bool {
 
 /// Parse a flow (`[a, b]`, possibly spanning lines) or block (`- item`) list
 /// value. Returns the items and the index of the first unconsumed line.
-fn parse_list(lines: &[String], i: usize, rest: &str, key: &str) -> Result<(Vec<String>, usize), String> {
+fn parse_list(
+    lines: &[String],
+    i: usize,
+    rest: &str,
+    key: &str,
+) -> Result<(Vec<String>, usize), String> {
     if rest.starts_with('[') {
         let mut acc = rest.to_string();
         let mut j = i;
@@ -226,7 +233,8 @@ mod tests {
 
     #[test]
     fn multiline_flow_list() {
-        let src = "/*---\nfeatures: [Symbol.iterator,\n  Symbol.asyncIterator]\nflags: [module]\n---*/\n";
+        let src =
+            "/*---\nfeatures: [Symbol.iterator,\n  Symbol.asyncIterator]\nflags: [module]\n---*/\n";
         let fm = parse_frontmatter(src).unwrap();
         assert_eq!(fm.features, ["Symbol.iterator", "Symbol.asyncIterator"]);
         assert_eq!(fm.flags, ["module"]);

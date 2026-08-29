@@ -359,10 +359,7 @@ fn native_artifact_envelope_bytes<T: Serialize>(
 }
 
 fn sha256_artifact_hash(bytes: &[u8]) -> ArtifactHash {
-    ArtifactHash {
-        algorithm: "sha256".to_string(),
-        value: trust_types::stable_sha256_hex(bytes),
-    }
+    ArtifactHash { algorithm: "sha256".to_string(), value: trust_types::stable_sha256_hex(bytes) }
 }
 
 impl NativeTrustIrObligationIdentity {
@@ -476,11 +473,12 @@ pub(crate) fn native_trust_ir_artifact_match(
 
 #[cfg(test)]
 mod tests {
+    use trust_verifier_api::{MetadataEntry, ObligationKind, SourceLocation};
+
     use super::*;
     use crate::full_verification::routing::{
         ObligationRoute, PrimaryEngine, ProofFamily, RequiredAssurance,
     };
-    use trust_verifier_api::{MetadataEntry, ObligationKind, SourceLocation};
 
     fn artifact(kind: EvidenceArtifactKind, uri: &str) -> EvidenceArtifact {
         EvidenceArtifact {

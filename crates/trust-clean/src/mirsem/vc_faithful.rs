@@ -353,9 +353,7 @@ fn mir_assert_condition_core(
 /// the twin's recognized set is a SUBSET of the emitter's and the disagreement direction
 /// is over-rejection (a lost certificate), never over-acceptance (a subject the emitter
 /// never used).
-fn negation_subjects(
-    func: &trust_types::VerifiableFunction,
-) -> Vec<(String, trust_types::Ty)> {
+fn negation_subjects(func: &trust_types::VerifiableFunction) -> Vec<(String, trust_types::Ty)> {
     use trust_types::{Operand, Rvalue, Statement, Terminator, UnOp};
     fn is_signed_abs_call(callee: &str) -> bool {
         callee.trim().rsplit("::").next() == Some("abs")
@@ -496,12 +494,10 @@ fn formula_agrees_modulo_versions(a: &trust_types::Formula, b: &trust_types::For
     use trust_types::Formula as F;
     match (a, b) {
         (F::Var(x, sx), F::Var(y, sy)) => {
-            sx == sy
-                && x.as_str().split('#').next() == y.as_str().split('#').next()
+            sx == sy && x.as_str().split('#').next() == y.as_str().split('#').next()
         }
         (F::And(u), F::And(v)) | (F::Or(u), F::Or(v)) => {
-            u.len() == v.len()
-                && u.iter().zip(v).all(|(x, y)| formula_agrees_modulo_versions(x, y))
+            u.len() == v.len() && u.iter().zip(v).all(|(x, y)| formula_agrees_modulo_versions(x, y))
         }
         (F::Not(x), F::Not(y)) | (F::Neg(x), F::Neg(y)) => formula_agrees_modulo_versions(x, y),
         (F::Implies(x1, x2), F::Implies(y1, y2))
@@ -570,9 +566,7 @@ fn assert_bound_or_body_core_with<'a>(
 /// never soundness). Byte-identical to the producer-validated replay (28/28
 /// reconstructions over the committed `trust-vcgen` fixtures) and to the trust-ir twin
 /// `trustir_safety::reconstruct_obligation`.
-pub(super) fn reconstruct_obligation(
-    rec: &trust_types::ObligationRecord,
-) -> trust_types::Formula {
+pub(super) fn reconstruct_obligation(rec: &trust_types::ObligationRecord) -> trust_types::Formula {
     use trust_types::{Formula as F, ObligationWrapper as W, PathGuardTerm as P};
     let mut cur = rec.body.clone();
     for w in &rec.wrappers {
@@ -641,10 +635,7 @@ fn authenticated_record(
 /// shared across every path-guard disjunct: one check over the record's facts covers every
 /// occurrence the peel's universal used to quantify over, and it is read off the
 /// authenticated record rather than off a guessed sibling list.
-fn record_pins_nonneg(
-    rec: &trust_types::ObligationRecord,
-    term: &trust_types::Formula,
-) -> bool {
+fn record_pins_nonneg(rec: &trust_types::ObligationRecord, term: &trust_types::Formula) -> bool {
     rec.wrappers.iter().any(|w| match w {
         trust_types::ObligationWrapper::ConjoinFactsLast { facts } => {
             has_nonneg_range_sibling(facts, term)
@@ -658,7 +649,11 @@ fn record_pins_nonneg(
 /// over the SAME de-Bruijn refs). This is the bridge check: it certifies the term the
 /// reflection pipeline ACTUALLY grounds equals the pinned machine-semantics condition,
 /// not a hand-built shape. Returns `true` ONLY on a real modulo-3 kernel def-eq.
-pub(super) fn live_ground_def_eq_spec(cg: &CoreGround<'_>, spec: &Expr, binder_count: usize) -> bool {
+pub(super) fn live_ground_def_eq_spec(
+    cg: &CoreGround<'_>,
+    spec: &Expr,
+    binder_count: usize,
+) -> bool {
     let Ok(mut env) = mirsem_safety_env() else {
         return false;
     };
@@ -1033,9 +1028,7 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             // only `b = 0 ∨ z > 5`. The assert route is untouched — it resolves the bare
             // `Var(_c)` body against the MIR's own binding, which is a position, not a
             // search.
-            let is_core = |f: &F| {
-                matches!(f, F::Eq(a, b) if formula_var_name(a).is_some() && matches!(&**b, F::Int(0)))
-            };
+            let is_core = |f: &F| matches!(f, F::Eq(a, b) if formula_var_name(a).is_some() && matches!(&**b, F::Int(0)));
             // Trust: AUTHENTICATED OBLIGATION (2026-07-31, vertical slice ARM 1). Read the
             // emitter's RECORDED obligation body instead of guessing it out of the wrapped
             // formula. `Authenticated` ⇒ `reconstruct_obligation == vc.formula`, so the
@@ -1564,7 +1557,8 @@ pub(super) fn safety_vc_is_faithful_formula_aware(
             // legacy fallback when nothing is recorded, and a recorded-but-unfaithful claim
             // fails closed. The subject/width are additionally cross-checked below.
             let rec = authenticated_record(vc)?;
-            let (leaf, route) = assert_bound_or_body_core_with(func, &vc.formula, &rec.body, &is_core)?;
+            let (leaf, route) =
+                assert_bound_or_body_core_with(func, &vc.formula, &rec.body, &is_core)?;
             let F::Eq(x_f, min_f) = leaf else { return None };
             if formula_var_name(x_f).is_none() {
                 return None;
@@ -1748,6 +1742,108 @@ pub(super) fn is_safety_vc_kind(kind: &trust_types::VcKind) -> bool {
 #[must_use]
 pub fn is_safety_vc_kind_pub(kind: &trust_types::VcKind) -> bool {
     is_safety_vc_kind(kind)
+}
+
+/// Whether a `VcKind` records a **DECLINED** obligation: the emitter met a construct it
+/// does not model and said so, instead of proving or refuting it.
+///
+/// A verifier has THREE outcomes — proved, refuted, DECLINED — and a declined row is a
+/// REASON TO REFUSE, never an absence. It is deliberately NOT a member of
+/// [`is_safety_vc_kind`]: a decline is a coverage gap, not a runtime-UB check, and the
+/// modeled-lemma taxonomy (`safety_vc_kind_is_modeled`) has nothing to say about it.
+/// Consumers must therefore ask for it EXPLICITLY — which is what
+/// [`function_emits_declined_vc`] is for.
+///
+/// Every other tier already fail-closes on this row before any formula reaches a
+/// decision procedure: `trust_vcgen::abstract_interp::try_discharge_vc` returns
+/// `Undetermined`, `trust_router::backend_trait::unsupported_mir_unknown` returns
+/// `Unknown` before dispatch, `trust_router::Router::backend_plan` returns an empty
+/// plan, and targo-trust demotes a favorable outcome on such a row. trust-clean was the
+/// outlier.
+pub(super) fn is_declined_vc_kind(kind: &trust_types::VcKind) -> bool {
+    matches!(kind, trust_types::VcKind::UnsupportedMir { .. })
+}
+
+/// Public accessor for [`is_declined_vc_kind`].
+#[must_use]
+pub fn is_declined_vc_kind_pub(kind: &trust_types::VcKind) -> bool {
+    is_declined_vc_kind(kind)
+}
+
+/// Whether `func`'s REAL emitter run raises AT LEAST ONE declined obligation
+/// ([`is_declined_vc_kind`]), discharged or not — the RAW census predicate.
+///
+/// KIND-LEVEL, never formula-level. The declined row's formula is a placeholder, so
+/// refuting it proves nothing about the body — that is the exact confusion that let a
+/// `Bool(false)` placeholder "discharge".
+///
+/// Gates want [`function_has_open_declined_vc`], not this: this one also answers `true`
+/// for the one declined kind trust-clean provably discharges elsewhere.
+#[must_use]
+pub fn function_emits_declined_vc(func: &trust_types::VerifiableFunction) -> bool {
+    trust_vcgen::generate_vcs(func).iter().any(|vc| is_declined_vc_kind(&vc.kind))
+}
+
+/// The ONE declined kind that is a HAND-OFF rather than a coverage gap.
+///
+/// `trust_vcgen` raises `UnsupportedMir { kind: "Rvalue::PtrOffset" }` for every
+/// `Rvalue::PtrOffset` and states at the emission site why (`trust-vcgen`'s
+/// `generate/slice_conversion.rs`): the offset's "faithful in-bounds obligation is the
+/// intrinsic lane's `ptr_offset_bounds_vc` (`0 <= index && index <= len`), which lives
+/// over the reflected `(base slice, index)` `PtrModel` in **trust-clean**, NOT here".
+/// The receiving end of that hand-off is [`crate::prove::function_ptr_offsets_all_discharged`],
+/// which proves exactly that formula for EVERY `Rvalue::PtrOffset` statement in the
+/// body and whose own doc calls the row "the obligation swap". Both ends of the
+/// hand-off, and both prose statements of it, predate this module.
+const PTR_OFFSET_DECLINE_KIND: &str = "Rvalue::PtrOffset";
+
+/// Whether `func` carries a declined obligation that NOTHING discharges — the predicate
+/// the FAITHFULNESS gates ask.
+///
+/// A declined row is a REASON TO REFUSE unless some other lane discharges the exact
+/// obligation it stands for. Today exactly one lane does, so this differs from
+/// [`function_emits_declined_vc`] on exactly one kind:
+///
+/// * `Rvalue::PtrOffset` — discharged by [`crate::prove::function_ptr_offsets_all_discharged`]
+///   (see [`PTR_OFFSET_DECLINE_KIND`]). A body whose ONLY declines are offset rows and
+///   whose offsets ALL discharge has no open obligation, so refusing it would refuse
+///   more than soundness requires: it would take down the ptr-spine (`memchr`
+///   `One::count`), record (`into_iter` / `Iter::new`) and W2 iterator lanes, each of
+///   which conjoins that discharge already — `prove::diagnose_fully_faithful_gate`'s
+///   production verdict is literally `(via_ir || via_mirsem) && function_ptr_offsets_all_discharged`.
+/// * EVERY OTHER declined kind ⇒ `true`. No compensating lane is claimed for it, so it
+///   stays open. In particular `SliceBoundsCheck`, `Call::*::panic-freedom-unverified`,
+///   `map-index-key-presence` and `Rvalue::BinaryOp(Cmp)` are NOT compensated.
+///
+/// The compensation is checked by KIND and only after the whole row set has been
+/// scanned, so a body mixing an offset row with any other decline still refuses.
+///
+/// SCOPE — this predicate is NOT the certification-tier gate. The offset lane closes
+/// the OFFSET's in-bounds obligation, which is the whole claim a faithfulness verdict
+/// makes about that statement; it is NOT the whole-body panic-freedom claim
+/// `whole_program::{ensures_certified_modulo_3, certify_function_in_graph}` mint, and
+/// crediting it there certified a body the runtime oracle panics on 24/24
+/// (`decline_gate_tests::ptr_offset_decline_earns_no_certification_tier`). Those two
+/// gates therefore refuse EVERY declined kind and ask
+/// [`is_declined_vc_kind`] directly over their own row set.
+#[must_use]
+pub fn function_has_open_declined_vc(func: &trust_types::VerifiableFunction) -> bool {
+    let mut saw_ptr_offset = false;
+    for vc in trust_vcgen::generate_vcs(func) {
+        match &vc.kind {
+            trust_types::VcKind::UnsupportedMir { kind, .. }
+                if kind == PTR_OFFSET_DECLINE_KIND =>
+            {
+                saw_ptr_offset = true;
+            }
+            k if is_declined_vc_kind(k) => return true,
+            _ => {}
+        }
+    }
+    // The hand-off is only honored when its receiving lane actually closes: an
+    // unresolved or out-of-range offset (`Some(false)` / `None` there) leaves the row
+    // exactly as open as any other decline.
+    saw_ptr_offset && !crate::prove::function_ptr_offsets_all_discharged(func)
 }
 
 /// If an `ArithmeticOverflow` VC is the UNSIGNED-ADD case of a MODELED width Lemma 2
@@ -1985,6 +2081,15 @@ pub fn function_safety_vcs_faithful(
     let mut div_cert: Option<SafetyVcCertificate> = None;
     let mut rem_cert: Option<SafetyVcCertificate> = None;
     let mut shift_certs: Vec<SafetyVcCertificate> = Vec::new();
+    // DECLINE IS NOT ABSENCE: a declined row is outside `is_safety_vc_kind`, so the
+    // `continue` below would skip it and let the function mint a certificate covering
+    // only the rows the emitter DID model. Fail closed — but on the OPEN declines only
+    // ([`function_has_open_declined_vc`]), so a body whose sole decline is a
+    // `Rvalue::PtrOffset` row that `prove::function_ptr_offsets_all_discharged` closes
+    // keeps its certificates. Checked once, up front, over the whole row set.
+    if function_has_open_declined_vc(func) {
+        return None;
+    }
     for vc in &vcs {
         if !is_safety_vc_kind(&vc.kind) {
             continue; // a postcondition / contract / non-safety property — not our concern

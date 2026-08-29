@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/guards.rs: Guard condition extraction and VC assumption threading
 //
 // Converts GuardCondition (from MIR control flow) into Formula assumptions.
@@ -29,7 +30,7 @@ use trust_types::{AssertMessage, LocalDecl, Place, SourceSpan, VerifiableBody};
 use crate::range::{type_max_formula, type_min_formula};
 use crate::{
     ArrayReadCtx, ArrayVersionCtx, operand_to_formula, operand_to_formula_with_array_ctx,
-    operand_ty, slice_len_formula, u128_to_formula,
+    operand_ty, slice_len_formula, unsigned_value_to_formula,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,8 +161,25 @@ pub(crate) fn guard_to_formula(func: &VerifiableFunction, guard: &GuardCondition
             if matches!(crate::operand_ty_cow(func, discr).as_deref(), Some(Ty::Bool)) {
                 if *value == 0 { Formula::Not(Box::new(discr_f)) } else { discr_f }
             } else {
-                let value_f = u128_to_formula(*value);
-                Formula::Eq(Box::new(discr_f), Box::new(value_f))
+                // The raw MIR label is a two's-complement BIT PATTERN at the
+                // scrutinee's width; decode it under that type
+                // (`crate::switch_label_to_formula`). Reading it as a magnitude
+                // put `n == 4294967295` on an `i32` `-1` arm — UNSAT against
+                // `n`'s own range fact, so the arm's path condition was VACUOUS
+                // and every obligation under it discharged (the
+                // `match n { -1 => x + 1, _ => 0 }` FALSE PROOF, and every
+                // `match a.cmp(&b)`'s `Ordering::Less` arm with it).
+                //
+                // A label this cannot decode contributes NO conjunct. This is
+                // an assumption lane: a weaker path condition means fewer
+                // premises, which can only lose proofs, never manufacture one.
+                match crate::operand_ty_cow(func, discr)
+                    .as_deref()
+                    .and_then(|ty| crate::switch_label_to_formula(ty, *value))
+                {
+                    Some(value_f) => Formula::Eq(Box::new(discr_f), Box::new(value_f)),
+                    None => Formula::Bool(true),
+                }
             }
         }
         GuardCondition::SwitchIntOtherwise { discr, excluded_values } => {
@@ -188,23 +206,53 @@ pub(crate) fn guard_to_formula(func: &VerifiableFunction, guard: &GuardCondition
             if excluded_values.is_empty() {
                 return Formula::Bool(true);
             }
-            let not_eqs: Vec<Formula> = excluded_values
+            // Same typed decode as the match arm above. An undecodable label
+            // simply drops out of the conjunction: `otherwise` then excludes one
+            // value fewer, which WEAKENS the path condition (fails closed) —
+            // whereas the raw spelling asserted `n != 4294967295`, a tautology
+            // on an `i32`, silently losing the real `n != -1` exclusion anyway.
+            let discr_ty = crate::operand_ty_cow(func, discr);
+            let mut not_eqs: Vec<Formula> = excluded_values
                 .iter()
-                .map(|v| {
-                    Formula::Not(Box::new(Formula::Eq(
+                .filter_map(|v| {
+                    let value_f = crate::switch_label_to_formula(discr_ty.as_deref()?, *v)?;
+                    Some(Formula::Not(Box::new(Formula::Eq(
                         Box::new(discr_f.clone()),
-                        Box::new(u128_to_formula(*v)),
-                    )))
+                        Box::new(value_f),
+                    ))))
                 })
                 .collect();
-            if not_eqs.len() == 1 {
-                // SAFETY: len == 1 guarantees .next() returns Some.
-                not_eqs
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
-            } else {
-                Formula::And(not_eqs)
+            // THE EMPTY CASE IS NOW REACHABLE, and it is a semantic answer
+            // rather than a defensive one. Before the typed decode it could not
+            // happen — the `excluded_values.is_empty()` early return above
+            // covered it and the old `map` never dropped an element — so the
+            // `None` arm below was pure defence. With `filter_map`, EVERY label
+            // can fail to decode, and the answer is "excludes nothing": the
+            // weakest path condition, which fails closed. Spelled as the literal
+            // it means. `And([])` denotes the same thing (`formula_to_smtlib`
+            // renders it `true`, `chc_fold_bool_expr`'s empty value is `true`),
+            // but a reachable answer should say what it is —
+            // `test_guard_switch_int_otherwise_u128_above_i128_max` pins this
+            // spelling, and it is what the `SwitchIntMatch` arm above returns
+            // for the same undecodable input.
+            if not_eqs.is_empty() {
+                return Formula::Bool(true);
+            }
+            // Let `pop` DECIDE the shape rather than testing `len` and then
+            // asserting "therefore Some" — that second step is what used to
+            // need a panic on a production path in the TCB. Semantics are
+            // unchanged: exactly one conjunct folds to itself, 2+ go through
+            // `And`.
+            match not_eqs.pop() {
+                Some(only) if not_eqs.is_empty() => only,
+                Some(last) => {
+                    not_eqs.push(last);
+                    Formula::And(not_eqs)
+                }
+                // Unreachable: the `is_empty` return above already answered it.
+                // Kept as the non-panicking identity, never a `panic!` — that is
+                // the whole point of deciding the shape with `pop`.
+                None => Formula::And(Vec::new()),
             }
         }
         GuardCondition::AssertHolds { cond, expected } => {
@@ -229,6 +277,87 @@ pub(crate) fn guard_to_formula(func: &VerifiableFunction, guard: &GuardCondition
             }
         }
         _ => Formula::Bool(true), /* unknown guard condition: do not hide bad states */
+    }
+}
+
+/// Lower one CFG guard without any proof-direction weakening.
+///
+/// [`guard_to_formula`] is intentionally allowed to replace an unmodeled guard
+/// by `true`: callers use the result as a hypothesis, so dropping a hypothesis
+/// can only lose a proof.  A refutation lane has the opposite obligation.  SAT
+/// after such a replacement need not describe an executable path, so this
+/// companion returns `None` whenever the complete guard cannot be represented.
+/// It also avoids the one-way predicate summaries in [`bool_switch_semantics`]
+/// and keeps a Boolean discriminant as its raw value; the refutation producer
+/// must subsequently pin that value to an exact definition or decline.
+pub(crate) fn guard_to_refutation_formula(
+    func: &VerifiableFunction,
+    guard: &GuardCondition,
+) -> Option<Formula> {
+    // The public renderer deliberately maps future/unsupported operands to a
+    // fresh symbol so proof-facing callers lose facts instead of panicking.
+    // That is still too weak for SAT-as-witness: a model for the fresh symbol
+    // need not be a value the source operand can take.  Reuse the checked CHC
+    // boundary so every accepted operand has an exact carrier.
+    let raw_operand =
+        |operand: &Operand| crate::chc::operand_to_formula_checked(func, operand).ok();
+    match guard {
+        GuardCondition::SwitchIntMatch { discr, value } => {
+            let discr_ty = crate::operand_ty_cow(func, discr)?;
+            if matches!(discr_ty.as_ref(), Ty::Bool) {
+                let discr_f = raw_operand(discr)?;
+                return Some(match *value {
+                    0 => Formula::Not(Box::new(discr_f)),
+                    1 => discr_f,
+                    // A Boolean can never carry any other switch label.  This
+                    // is an exact unreachable edge, not an omitted condition.
+                    _ => Formula::Bool(false),
+                });
+            }
+            let value_f = crate::switch_label_to_formula(discr_ty.as_ref(), *value)?;
+            Some(Formula::Eq(Box::new(raw_operand(discr)?), Box::new(value_f)))
+        }
+        GuardCondition::SwitchIntOtherwise { discr, excluded_values } => {
+            let discr_ty = crate::operand_ty_cow(func, discr)?;
+            if matches!(discr_ty.as_ref(), Ty::Bool) {
+                let excludes_false = excluded_values.contains(&0);
+                let excludes_true = excluded_values.contains(&1);
+                let discr_f = raw_operand(discr)?;
+                return Some(match (excludes_false, excludes_true) {
+                    (false, false) => Formula::Bool(true),
+                    (true, false) => discr_f,
+                    (false, true) => Formula::Not(Box::new(discr_f)),
+                    (true, true) => Formula::Bool(false),
+                });
+            }
+            let discr_f = raw_operand(discr)?;
+            let exclusions = excluded_values
+                .iter()
+                .map(|value| {
+                    let value_f = crate::switch_label_to_formula(discr_ty.as_ref(), *value)?;
+                    Some(Formula::Not(Box::new(Formula::Eq(
+                        Box::new(discr_f.clone()),
+                        Box::new(value_f),
+                    ))))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(match exclusions.len() {
+                0 => Formula::Bool(true),
+                1 => exclusions.into_iter().next().expect("length checked"),
+                _ => Formula::And(exclusions),
+            })
+        }
+        GuardCondition::AssertHolds { cond, expected } => {
+            let cond_f = raw_operand(cond)?;
+            Some(if *expected { cond_f } else { Formula::Not(Box::new(cond_f)) })
+        }
+        GuardCondition::AssertFails { cond, expected, .. } => {
+            let cond_f = raw_operand(cond)?;
+            Some(if *expected { Formula::Not(Box::new(cond_f)) } else { cond_f })
+        }
+        // `GuardCondition` is non-exhaustive.  A future condition has no exact
+        // refutation semantics until this match is deliberately widened.
+        _ => None,
     }
 }
 
@@ -481,7 +610,10 @@ fn same_block_inlined_operand_formula(
         }
         return match rvalue {
             Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner) => {
-                crate::slice_len_formula(func, inner)
+                match crate::ptr_metadata_model(func, inner) {
+                    crate::PtrMetadataModel::Length(formula) => Some(formula),
+                    _ => None,
+                }
             }
             // Trust (Imp3): a `slice.len()` in a guard can lower to `Rvalue::Len(place)`
             // (the array/slice `len` rvalue) rather than `PtrMetadata`. Inline it to the
@@ -708,7 +840,8 @@ fn ascii_predicate_bound(func: &VerifiableFunction, discr: &Operand) -> Option<F
 
 /// True when `local`'s symbolic value is NOT stable — it is REASSIGNED (a parameter with any store
 /// to it, or a non-parameter with 2+ stores; counting WHOLE-local AND projected/field stores
-/// `t.0 = ..`, plus Call-terminator dests) or mutably borrowed (`Ref{mutable:true}`/`AddressOf`).
+/// `t.0 = ..`, `SetDiscriminant`/`Deinit`, plus Call-terminator dests) or mutably borrowed
+/// (`Ref{mutable:true}`/`AddressOf`).
 /// A guard-narrowing fact (e.g. `is_ascii` => x<=127, or about a field `t.0<=127`) is STALE in any
 /// region where the value was reassigned, so it must not be emitted (hunt-8 + hunt-9 P0 fix). Field
 /// stores are counted on the BASE local — conservative (a write to ANY field disqualifies the whole
@@ -718,15 +851,28 @@ pub(crate) fn value_local_is_unstable(func: &VerifiableFunction, local: usize) -
     let mut assigns = 0u32;
     for block in &func.body.blocks {
         for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt {
-                if let Rvalue::Ref { mutable: true, place: bp } | Rvalue::AddressOf(_, bp) = rvalue
-                    && bp.local == local
-                {
-                    return true;
+            match stmt {
+                Statement::Assign { place, rvalue, .. } => {
+                    if let Rvalue::Ref { mutable: true, place: bp } | Rvalue::AddressOf(_, bp) =
+                        rvalue
+                        && bp.local == local
+                    {
+                        return true;
+                    }
+                    if place.local == local {
+                        assigns += 1;
+                    }
                 }
-                if place.local == local {
+                // Modeled value writes that carry no Assign rvalue still stale
+                // every fact rooted at the place. Count the base conservatively;
+                // a Deref-first write only over-invalidates a pointer-local fact,
+                // which is the safe direction for this staleness gate.
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
+                    if place.local == local =>
+                {
                     assigns += 1;
                 }
+                _ => {}
             }
         }
         // Trust (P0 call-arg &mut staleness): a `&mut local` / `&raw mut local`
@@ -900,12 +1046,17 @@ pub(crate) fn guards_to_assumption(
     if guards.is_empty() {
         return Formula::Bool(true);
     }
-    let formulas: Vec<Formula> = guards.iter().map(|g| guard_to_formula(func, g)).collect();
-    if formulas.len() == 1 {
-        // SAFETY: len == 1 guarantees .next() returns Some.
-        formulas.into_iter().next().unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
-    } else {
-        Formula::And(formulas)
+    let mut formulas: Vec<Formula> = guards.iter().map(|g| guard_to_formula(func, g)).collect();
+    // `pop` decides the shape; no "len == 1 implies Some" panic step. The
+    // empty case is unreachable via the early return above, and folds to
+    // `And(vec![])` = `true` rather than aborting the verifier.
+    match formulas.pop() {
+        Some(only) if formulas.is_empty() => only,
+        Some(last) => {
+            formulas.push(last);
+            Formula::And(formulas)
+        }
+        None => Formula::And(Vec::new()),
     }
 }
 
@@ -1161,6 +1312,79 @@ pub(crate) fn extract_assert_passed_semantics(
         facts.push(range);
     }
     facts
+}
+
+/// The CANONICAL out-of-range **violation** for the block's asserted checked
+/// binary op: `result < min ∨ result > max`.
+///
+/// This is the De Morgan dual of [`extract_assert_passed_semantics`]'s leading
+/// `in_range` conjunct, and — this is the whole point — it is the term the rest
+/// of the system already agrees on:
+///
+/// * `generate::overflow_vc` emits exactly this shape as its `out_of_range` core
+///   for the per-statement `[arithmetic_overflow_*]` row, and
+/// * `trust_semantics::noOverflow_violation_formula` — the trust-types
+///   reflection of the Clean kernel's `noOverflow` definition — is pinned
+///   STRUCTURALLY equal to it by
+///   `range.rs::semantics_violation_formula_is_the_emitted_out_of_range_term`.
+///
+/// WHY THIS EXISTS (measured 2026-08-27, ledger #221/#222). The `unix_hardened`
+/// panic-boundary twin used to hand-roll its violation as
+/// `Formula::Not(Box::new(in_range))` — a NEGATED CONJUNCTION. That is the same
+/// proposition (z3 4.x reports both UNSAT on `blocked.rs`, and both SAT with the
+/// same witness on the guard-widened mutant), but it is a DIFFERENT SYNTAX, and
+/// `trust_certify::certify_disjunctive_contradiction` builds its kernel proof by
+/// case-splitting a `Formula::Or` found in the normalized conjunct pool. A
+/// negated conjunction never reaches that recognizer, so the interval solver's
+/// `Proved` was dropped by the authority gate with
+/// `"Proved label lacked exact kernel/native proof authority"` — and every crate
+/// containing a guarded integer add failed the strict lane on a row nothing
+/// refuted.
+///
+/// The fix is on THIS side, not the certifier's: the recognizer stays exactly as
+/// narrow as it is, and the twin is handed the same spelling as its primary.
+/// Emitting the canonical dual is not a widening — `¬(min ≤ r ∧ r ≤ max)` and
+/// `r < min ∨ r > max` are interderivable over a total order, so the violation's
+/// satisfying set is unchanged and a genuinely-overflowing op still refutes
+/// (pinned end to end by `blocked_overflows.rs` in
+/// `scripts/trust_strict_pass_frontier.sh` and by
+/// `crates/trust-certify/tests/hardened_overflow_twin_certification.rs`'s
+/// `a_genuinely_overflowing_twin_certifies_nothing_before_or_after_de_morgan`).
+///
+/// Returns `None` on exactly the blocks where `extract_assert_passed_semantics`
+/// returns empty — the biconditional is pinned by
+/// `out_of_range_violation_is_the_de_morgan_dual_of_in_range`.
+pub(crate) fn checked_binop_out_of_range_violation(
+    func: &VerifiableFunction,
+    block: &BasicBlock,
+) -> Option<Formula> {
+    let (_tuple_local, op, lhs, rhs, value_ty) = exact_asserted_checked_binary_op(func, block)?;
+    let lhs_f = operand_to_formula(func, lhs);
+    let rhs_f = operand_to_formula(func, rhs);
+    let width = value_ty.int_width()?;
+    let signed = value_ty.is_signed();
+
+    // Byte-identical to `extract_assert_passed_semantics`'s `result`.
+    let result = match op {
+        BinOp::Add => Formula::Add(Box::new(lhs_f), Box::new(rhs_f)),
+        BinOp::Sub => Formula::Sub(Box::new(lhs_f), Box::new(rhs_f)),
+        BinOp::Mul => Formula::Mul(Box::new(lhs_f), Box::new(rhs_f)),
+        _ => return None,
+    };
+
+    let min_f = type_min_formula(width, signed);
+    let max_f = type_max_formula(width, signed);
+    // NOTE: this deliberately keeps BOTH disjuncts, including for unsigned
+    // `Sub`, where `generate::overflow_vc` drops the tautologically-false
+    // `result > max` half to keep the `u64::MAX` literal out of ay's i64 domain.
+    // That refinement needs the operand ranges to justify it and would make this
+    // a semantic change rather than a re-spelling; it is a separate, separately
+    // measurable improvement and must not be smuggled in here. The negated
+    // conjunction this replaces carried the same `max` literal already.
+    Some(Formula::Or(vec![
+        Formula::Lt(Box::new(result.clone()), Box::new(min_f)),
+        Formula::Gt(Box::new(result), Box::new(max_f)),
+    ]))
 }
 
 /// If `operand` is `Copy/Move(_n)` where `_n` is defined by a value-preserving
@@ -1455,6 +1679,93 @@ fn push_borrow_slice_len(
     }
 }
 
+/// The element type and CONSTANT length of an array-shaped operand type:
+/// `&[T; N]` / `&mut [T; N]` / `*const [T; N]` / `*mut [T; N]` / `[T; N]` all give
+/// `(T, N)`. A const-generic length gives the same per-param symbol
+/// `slice_len_formula` uses for `[T; N]`, so a guard written against `N`
+/// discharges an index whose bound came through a coercion.
+///
+/// `None` for every non-array shape — in particular for a source that is ALREADY
+/// a slice, whose length is a free variable and therefore carries no static fact.
+fn array_pointee_len(ty: &Ty) -> Option<(&Ty, Formula)> {
+    let pointee = match ty {
+        Ty::Ref { inner, .. } => inner.as_ref(),
+        Ty::RawPtr { pointee, .. } => pointee.as_ref(),
+        other => other,
+    };
+    match pointee {
+        Ty::Array { elem, len } => Some((elem.as_ref(), Formula::Int(i128::from(*len)))),
+        Ty::SymArray { elem, len_sym } => {
+            Some((elem.as_ref(), crate::sym_array_len_formula(len_sym)))
+        }
+        _ => None,
+    }
+}
+
+/// The element type of a slice-pointer target: `&[T]` / `&mut [T]` /
+/// `*const [T]` / `*mut [T]` / `[T]` all give `T`. `None` otherwise — notably for
+/// `str` (whose metadata is a BYTE length, not an element count) and for
+/// `dyn Trait` (whose metadata is a vtable).
+fn slice_pointee_elem(ty: &Ty) -> Option<&Ty> {
+    let pointee = match ty {
+        Ty::Ref { inner, .. } => inner.as_ref(),
+        Ty::RawPtr { pointee, .. } => pointee.as_ref(),
+        other => other,
+    };
+    match pointee {
+        Ty::Slice { elem } => Some(elem.as_ref()),
+        _ => None,
+    }
+}
+
+/// Emit `{dest}__slice_len == N` for an array→slice UNSIZE coercion
+/// `dest = src as &[T]`, where `src: &[T; N]`.
+///
+/// MIR spells `&[T; N] -> &[T]` as
+/// `_d = copy _s as &[T] (PointerCoercion(Unsize, Implicit))`, and
+/// `trust-mir-extract`'s slice-unsize arm lowers it to `Rvalue::Cast(op, <the
+/// slice-ref target>)`. TrustIR's `Rvalue::Cast` does not carry the `CastKind`, so
+/// the coercion is recognised here by its TYPES instead. `slice_len_formula` maps
+/// the DEST — a slice reference — to the FREE var `{dest}__slice_len`, which
+/// discards the `N` that was part of the SOURCE's type. This is the tie for the
+/// coercion that [`push_borrow_slice_len`] is for a borrow, and it exists for the
+/// same reason its doc names: without it the length read is a fresh unconstrained
+/// var, so `a.len() - 1` on a `&[u8; 8]` refutes with `len = 0`, and the free
+/// length reaches every obligation kind that consumes it (bounds, div/rem-by-zero,
+/// add/sub/mul overflow).
+///
+/// SOUND: the coercion sets the result's length metadata to exactly the source
+/// array's `N`, so the equality holds on every execution and conjoining it removes
+/// no real model. A genuine out-of-bounds `a[i]` still refutes, because what is
+/// unconstrained there is `i`, not the length.
+///
+/// FAIL-CLOSED on shape. `Rvalue::Cast` is the SAME TrustIR variant used for
+/// `PtrToPtr` and int-to-int casts, so the tie is gated on both ends:
+/// the source pointee must be an array ([`array_pointee_len`], which declines a
+/// source that is already a slice) and the target pointee must be a slice of the
+/// SAME element type ([`slice_pointee_elem`]). An element-type change such as
+/// `*const [u32] -> *const [u8]` — where the preserved metadata counts a different
+/// unit — therefore never reaches the tie.
+fn push_unsize_slice_len(
+    func: &VerifiableFunction,
+    dest_name: &str,
+    source: &Operand,
+    to_ty: &Ty,
+    defs: &mut Vec<Formula>,
+    seen_dests: &mut FxHashSet<String>,
+) {
+    let Some(target_elem) = slice_pointee_elem(to_ty) else { return };
+    let Some(source_ty) = crate::operand_ty(func, source) else { return };
+    let Some((source_elem, len)) = array_pointee_len(&source_ty) else { return };
+    if source_elem != target_elem {
+        return;
+    }
+    let name = format!("{dest_name}__slice_len");
+    if seen_dests.insert(name.clone()) {
+        defs.push(Formula::Eq(Box::new(Formula::var_owned(name, Sort::Int)), Box::new(len)));
+    }
+}
+
 pub(crate) fn extract_block_definitions(
     func: &VerifiableFunction,
     block: &BasicBlock,
@@ -1596,11 +1907,33 @@ fn extract_block_definitions_until_impl(
                 operand_to_formula_with_array_ctx(func, operand, Some(&read_ctx))
             }
             Rvalue::BinaryOp(op, lhs, rhs) => {
+                // The shift's own result type, recovered from the DESTINATION when the
+                // shifted value is a width-less signed constant. Everything below —
+                // the result range AND the `dest == lhs << rhs` equality — reads this
+                // one type, so the range can never be stated at a width the definition
+                // does not use.
+                let lhs_ty = shift_result_ty_from_dest(func, place, op, lhs)
+                    .map(std::borrow::Cow::Owned)
+                    .or_else(|| crate::operand_ty_cow(func, lhs));
                 // an unsigned right-shift by a constant tightens its result
                 // below the type max; push that bound BEFORE the `dest == lhs >> rhs`
                 // equality (mirroring #52) so it survives the operand-clobber dedup, and
                 // so `(x >> k) + …` proves even when `x` is an unconstrained payload.
-                if let Some(range) = shift_result_range(func, op, lhs, rhs, &dest_name) {
+                // The shift AMOUNT is rendered through the same operand path as the
+                // `dest == lhs << rhs` equality below, so `variable_shl_result_range`'s
+                // antecedent names the identical symbol; a differently-rendered symbol
+                // would leave the implication permanently unfireable instead of wrong.
+                if matches!(op, BinOp::Shl | BinOp::Shr)
+                    && let Some(range) = shift_result_range(
+                        func,
+                        lhs_ty.as_deref(),
+                        op,
+                        lhs,
+                        rhs,
+                        &dest_name,
+                        operand_to_formula_with_array_ctx(func, rhs, Some(&read_ctx)),
+                    )
+                {
                     defs.push(range);
                 }
                 // ...and an unsigned floor-division is additionally bounded by its own
@@ -1621,7 +1954,6 @@ fn extract_block_definitions_until_impl(
                 {
                     defs.push(rel);
                 }
-                let lhs_ty = crate::operand_ty_cow(func, lhs);
                 if lhs_ty.as_deref().is_some_and(|ty| matches!(ty, Ty::Bool)) {
                     let l = operand_to_formula_with_array_ctx(func, lhs, Some(&read_ctx));
                     let r = operand_to_formula_with_array_ctx(func, rhs, Some(&read_ctx));
@@ -1686,11 +2018,62 @@ fn extract_block_definitions_until_impl(
                     {
                         continue;
                     }
-                    // Trust #integrity: fail closed — skip the def
-                    // (a dropped hypothesis), never panic mid-verification.
-                    match crate::chc::try_binop_to_formula(*op, l, r, width, signed) {
-                        Ok(formula) => formula,
-                        Err(_) => continue,
+                    // Trust (2026-08-20, bare-BinaryOp wrapping — the -O /
+                    // overflow-checks-off form): rustc MIR defines the PLAIN
+                    // integer `Add`/`Sub`/`Mul` as WRAPPING mod 2^w.
+                    // Overflow-CHECKED user arithmetic arrives as the separate
+                    // `CheckedBinaryOp` + overflow-`Assert` pair (skipped
+                    // above — its success-path value equation is edge-sensitive
+                    // and owned by the path-definition map), and UB-on-overflow
+                    // arithmetic as `UncheckedBinaryOp` (unmatched here — no
+                    // def). The extractor preserves the three forms distinctly
+                    // (`trust-mir-extract convert_supported_binop`), so a bare
+                    // `Rvalue::BinaryOp` IS the wrapping case by construction
+                    // and no session overflow-checks bit exists or is needed:
+                    // with checks ON the bare form arises only from wrapping
+                    // intrinsics (e.g. `wrapping_add` inlined at -O), with
+                    // checks OFF from all user arithmetic — both wrap.
+                    //
+                    // The old model here was `try_binop_to_formula`'s UNBOUNDED
+                    // `dest == a + b`, FALSE of every execution that wraps:
+                    // conjoined as a hypothesis it excluded exactly the wrap
+                    // traces, and in the `-full` assert-refutation lane (where
+                    // UNSAT of the panic-path formula is consumed as PROVED)
+                    // it false-PROVED `assert!(a + b >= a)`-shaped asserts
+                    // that panic at runtime — see `wrapping_binop_defs_tests::
+                    // wrapping_add_ge_lhs_false_prove_control` for the measured
+                    // instance. Encode the EXACT modular semantics instead, via
+                    // the SAME shared constructor the authenticated
+                    // wrapping-call model uses (`wrapping_binop_modular_ite` —
+                    // one spelling, so the call form and the dissolved -O form
+                    // can never encode differently in one query), pushing the
+                    // operands' type-range tautologies FIRST (true of every
+                    // execution; they keep a refute-direction model from
+                    // picking an out-of-range operand — and the pre-Eq order is
+                    // the same clobber-dedup rationale as `shift_result_range`).
+                    // `Mul` and width>64 have no encoding in this lane: DROP
+                    // the def (fail-closed — an ungrounded value can only
+                    // demote a row toward runtime-checked, never mis-decide
+                    // it), exactly the call form's `WrappingMul => None`
+                    // boundary. An Add/Sub/Mul whose operand width is UNKNOWN
+                    // is likewise dropped, never modeled unbounded.
+                    if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                        let Some(width) = width else { continue };
+                        let Some(wrap) =
+                            crate::generate::wrapping_binop_modular_ite(*op, &l, &r, width, signed)
+                        else {
+                            continue;
+                        };
+                        defs.push(crate::range::input_range_constraint(&l, width, signed));
+                        defs.push(crate::range::input_range_constraint(&r, width, signed));
+                        wrap
+                    } else {
+                        // Trust #integrity: fail closed — skip the def
+                        // (a dropped hypothesis), never panic mid-verification.
+                        match crate::chc::try_binop_to_formula(*op, l, r, width, signed) {
+                            Ok(formula) => formula,
+                            Err(_) => continue,
+                        }
                     }
                 }
             }
@@ -1711,9 +2094,11 @@ fn extract_block_definitions_until_impl(
                 Formula::Not(Box::new(operand_to_formula_with_array_ctx(func, op, Some(&read_ctx))))
             }
             Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, op) => {
-                match slice_len_formula(func, op) {
-                    Some(formula) => formula,
-                    None => continue,
+                match crate::ptr_metadata_model(func, op) {
+                    crate::PtrMetadataModel::Length(formula) => formula,
+                    crate::PtrMetadataModel::Unit
+                    | crate::PtrMetadataModel::Unsupported
+                    | crate::PtrMetadataModel::Invalid => continue,
                 }
             }
             // Trust: `_N = Len(s)` ties the length temp `_N` to the slice's
@@ -1748,6 +2133,11 @@ fn extract_block_definitions_until_impl(
                 if let Some(range) = narrowing_cast_result_range(func, op, to_ty, &dest_name) {
                     defs.push(range);
                 }
+                // An array→slice unsize coercion keeps the source array's STATIC
+                // length; tie it, or the coerced slice's length is a free var.
+                // Pushed BEFORE the `dest == source` equality for the same
+                // clobber-dedup ordering reason as the two ranges above.
+                push_unsize_slice_len(func, &dest_name, op, to_ty, &mut defs, &mut seen_dests);
                 match cast_definition_formula(func, place, op, to_ty) {
                     Some(formula) => formula,
                     None => continue,
@@ -1935,7 +2325,17 @@ fn conservative_snapshot_writes(
             Statement::Assign { place, .. }
             | Statement::SetDiscriminant { place, .. }
             | Statement::Deinit { place } => {
-                writes.insert(crate::place_to_var_name(func, place));
+                let dest = crate::place_to_var_name(func, place);
+                // Trust (P0 false proof — STALE LENGTH TIE): a write to the whole
+                // place also invalidates its derived `{dest}__slice_len` metadata
+                // name, which no `place_names_overlap` of `dest` reaches. Same
+                // extension `generate::extend_with_derived_slice_len` applies to
+                // the gen-sets; this loop's dests exist because definition
+                // extraction declines some rvalues, so they never pass through it.
+                if !dest.ends_with(crate::generate::SLICE_LEN_SUFFIX) {
+                    writes.insert(format!("{dest}{}", crate::generate::SLICE_LEN_SUFFIX));
+                }
+                writes.insert(dest);
             }
             Statement::StorageLive(_)
             | Statement::StorageDead(_)
@@ -2335,10 +2735,14 @@ fn single_switch_branch_merge_definitions(
                 };
                 guards.push(guard);
             }
-            let guard = match guards.len() {
-                0 => return Vec::new(),
-                1 => guards.pop().unwrap_or_else(|| unreachable!("one exact switch guard")),
-                _ => Formula::Or(guards),
+            // `pop` decides the shape; no "len == 1 implies Some" panic step.
+            let guard = match guards.pop() {
+                None => return Vec::new(),
+                Some(only) if guards.is_empty() => only,
+                Some(last) => {
+                    guards.push(last);
+                    Formula::Or(guards)
+                }
             };
             acc = Formula::Ite(Box::new(guard), Box::new(per_arm[idx].clone()), Box::new(acc));
         }
@@ -2842,12 +3246,7 @@ fn bool_definition_is_switch_block_local(
         Rvalue::BinaryOp(BinOp::BitAnd | BinOp::BitOr, lhs, rhs) => {
             [lhs, rhs].into_iter().all(|operand| match operand {
                 Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
-                    bool_definition_is_switch_block_local(
-                        func,
-                        switch_block,
-                        place.local,
-                        fuel - 1,
-                    )
+                    bool_definition_is_switch_block_local(func, switch_block, place.local, fuel - 1)
                 }
                 // A constant or projected leaf is not resolved through the bool
                 // resolver, so it cannot carry a cross-block comparison.
@@ -3152,14 +3551,27 @@ fn split_on_first_conjoined_or(formula: &Formula) -> Option<Vec<Formula>> {
     }
 }
 
-/// Exact raw route guard for one `SwitchInt` table value.
+/// Exact route guard for one `SwitchInt` table value.
 ///
 /// Do not call [`guard_to_formula`] here: it is an assumption-strengthening API
 /// and deliberately returns one-way facts for some boolean predicates. An Ite
-/// selector requires equality with the raw discriminator value. Signed MIR
-/// targets need sign-extension before comparison; this narrow merge lane
-/// currently fails closed on signed discriminators rather than risk interpreting
-/// (for example) i8 `-1`'s raw `0xff` as mathematical `255`.
+/// selector requires an EXACT equality with the arm's constant.
+///
+/// SIGNED discriminators are now modeled, through the shared typed decode
+/// [`crate::switch_label_to_formula`]. They previously had no arm at all, and
+/// the caller ([`single_switch_branch_merge_definitions`]) abandons the ENTIRE
+/// branch merge when any table value fails to resolve — so every `match` on
+/// `Option` / `Result` / `Ordering` / a no-`repr` enum (rustc types those
+/// discriminant temps `i8`/`i64`, always SIGNED) silently lost its arm constants
+/// and false-FAILed obligations the arm constant was what made safe. Shipping
+/// that arm WITHOUT the decode would have been worse than the gap: the merge
+/// would then resolve targets at the raw value, so an `Ite` selector would carry
+/// `d == 255` where the arm means `d == -1`.
+///
+/// Exact in both directions: the decode is a bijection on the labels it accepts,
+/// and it returns `None` (fail closed — the whole merge is abandoned) for a
+/// malformed label, a non-scalar `char`, or a type whose width it cannot
+/// establish.
 fn exact_switch_value_guard(
     func: &VerifiableFunction,
     discr: &Operand,
@@ -3167,22 +3579,16 @@ fn exact_switch_value_guard(
 ) -> Option<Formula> {
     let ty = crate::operand_ty_cow(func, discr)?;
     let raw = operand_to_formula(func, discr);
-    match ty.as_ref() {
-        Ty::Bool if value <= 1 => Some(if value == 0 { Formula::Not(Box::new(raw)) } else { raw }),
-        Ty::Int { width, signed: false } if *width > 0 && *width <= 128 => {
-            if *width < 128 && value >= (1u128 << *width) {
-                return None;
-            }
-            Some(Formula::Eq(Box::new(raw), Box::new(u128_to_formula(value))))
-        }
-        Ty::PtrSizedInt { signed: false } if value <= u64::MAX as u128 => {
-            Some(Formula::Eq(Box::new(raw), Box::new(u128_to_formula(value))))
-        }
-        Ty::Char if value <= char::MAX as u128 && !(0xD800..=0xDFFF).contains(&(value as u32)) => {
-            Some(Formula::Eq(Box::new(raw), Box::new(u128_to_formula(value))))
-        }
-        _ => None,
+    if matches!(ty.as_ref(), Ty::Bool) {
+        // A bool switch is a POLARITY, not an equality: `Eq(raw, 0/1)` would mix
+        // the Bool and Int sorts. Anything but 0/1 is a malformed bool label.
+        return match value {
+            0 => Some(Formula::Not(Box::new(raw))),
+            1 => Some(raw),
+            _ => None,
+        };
     }
+    Some(Formula::Eq(Box::new(raw), Box::new(crate::switch_label_to_formula(ty.as_ref(), value)?)))
 }
 
 /// Predecessor lists for every block, covering both guarded
@@ -4575,6 +4981,16 @@ fn cast_definition_formula(
     // `[T; len > max_disc]` false-FAILs (proved/enumdf_i8_nonneg). SOUND: a negative-disc
     // enum (where `e as usize` reinterprets the sign bit) has `min_disc < 0`, declines
     // here, and the def is dropped — never a false equality, never a false-PROVE.
+    //
+    // GATE-NONNEG DEPENDS ON THE DECODED TAG. `VariantDef::discriminant` is the TRUE
+    // signed tag (decoded at the extraction boundary, `trust_mir_extract::ty_convert`'s
+    // `decode_discr_tag`). While it was the RAW `Discr::val` bit pattern this gate could
+    // NEVER decline: a sub-128-bit raw pattern is never negative, so `#[repr(i8)] A = -1`
+    // presented as `min_disc == 2` (over `{255, 2}`) and passed. It did no harm only
+    // because the tag FACTS were raw too — the OOB witness `_3 = 255` stayed reachable —
+    // an accidental cancellation, not a gate. With the tags decoded the gate does what
+    // this comment always claimed: `{-1, 2}` has `min_disc == -1` and declines, and
+    // `t[e as usize]` / `t[a.cmp(&b) as usize]` refute on a real witness.
     if let (Some(from_w), Ty::Int { width: to_w, .. }) = (from_ty.int_width(), to_ty)
         && *to_w >= from_w
         && let Operand::Copy(p) | Operand::Move(p) = op
@@ -4589,7 +5005,61 @@ fn cast_definition_formula(
         return Some(operand_to_formula(func, op));
     }
 
+    // Trust: a NON-NARROWING signed->unsigned `as` cast (`i32 as u64`, `i32 as u32`,
+    // `isize as usize`) — the exact two's-complement value relation.
+    //
+    // Every other helper on this path declines this cast, each for its own sound
+    // reason: `is_modeled_identity_cast` refuses (a negative source does not survive
+    // as identity), `widening_cast_result_range` refuses (`*ss && !ds`), and
+    // `narrowing_cast_result_range` refuses a strict widening (`*dw > *sw`). The
+    // CONJUNCTION of those declines emitted NOTHING relating the destination to the
+    // source, leaving it constrained only by its own type range — so a dominating
+    // `if x < 0 || x >= 16 { return 0; }` guard bounds the SOURCE while the solver is
+    // still free to pick any `usize` for the RESULT, and `a[x as usize]` refutes on a
+    // model no execution can produce.
+    //
+    // Rust's `as` here sign-extends to the destination width and reinterprets, so the
+    // result is the source's residue mod `2^to_w`. For `to_w >= from_w` the source
+    // range `[-2^(from_w-1), 2^(from_w-1)-1]` sits strictly inside `(-2^to_w, 2^to_w)`,
+    // so the residue takes exactly two forms and the relation is the total function
+    //   `dest == if src >= 0 { src } else { src + 2^to_w }`
+    // — a value-level identity of this statement for EVERY input, not a claim about
+    // any guard. `value_facts::truncate_nonneg_tag_as_int` constant-folds the same
+    // `as` semantics for the enum-discriminant tag sets.
+    //
+    // GATED on `to_w >= from_w`. A NARROWING signed->unsigned cast (`i32 as u8`) is a
+    // truncation whose residue needs many representatives, and either branch above
+    // would be FALSE for a source outside `[0, 2^to_w)`: conjoined with the
+    // destination's own `[0, 2^to_w-1]` range (which `narrowing_cast_result_range`
+    // does emit) the hypotheses would be CONTRADICTORY for exactly those sources, and
+    // a contradiction proves everything — including the out-of-bounds
+    // `a[(x as u8) as usize]`. Narrowing therefore keeps its target-range-only
+    // treatment. `to_w == 128` is likewise declined: `2^128` is not representable as a
+    // `Formula::Int`/`UInt` literal, and a wrong modulus is worse than none.
+    if let (Ty::Int { width: from_w, signed: true }, Ty::Int { width: to_w, signed: false }) =
+        (&from_ty, to_ty)
+        && *to_w >= *from_w
+        && let Some(modulus) = power_of_two_i128(*to_w)
+    {
+        let src = operand_to_formula(func, op);
+        // Caller wraps this in `Eq(Var(dest), value)`.
+        return Some(Formula::Ite(
+            Box::new(Formula::Ge(Box::new(src.clone()), Box::new(Formula::Int(0)))),
+            Box::new(src.clone()),
+            Box::new(Formula::Add(Box::new(src), Box::new(Formula::Int(modulus)))),
+        ));
+    }
+
     None
+}
+
+/// `2^exp` as an `i128`, or `None` when it does not fit.
+///
+/// `1i128 << 127` evaluates to `i128::MIN`, not `2^127`, so the shift has to be
+/// range-checked rather than trusted; a caller that needs a modulus DECLINES on
+/// `None` instead of asserting a wrong one.
+fn power_of_two_i128(exp: u32) -> Option<i128> {
+    (exp < 127).then(|| 1i128 << exp)
 }
 
 fn callable_reification_formula(
@@ -4726,10 +5196,14 @@ fn narrowing_cast_result_range(
 /// gated tightly:
 ///   * `Shr` only — `Shl` can overflow, so its result has no tautological sub-type-max bound;
 ///   * unsigned operand only — a signed `>>` sign-extends, a different (still-bounded but
-///     two-sided) range we do not model here;
-///   * constant shift only — a variable shift's tightest sound upper bound is just the type
+///     two-sided) range we do not model here (since corrected: the signed `Shr` arm of
+///     `shift_result_range` now emits that two-sided range — see `soundness-signed-shift`);
+///   * constant shift only — an UNCONDITIONAL bound on a variable shift is just the type
 ///     max (`k` could be 0), which is useless; and `k >= w` is a checked shift-overflow
 ///     (the op may panic and never produce a value), so we must not pre-bound it.
+///     `variable_shl_result_range` reaches the variable-amount case a different way — as an
+///     IMPLICATION whose antecedent bounds `k` — which is why it escapes this argument
+///     rather than contradicting it.
 /// The largest value the shift's LHS can hold, when that is structurally bounded BELOW the
 /// shift type's max: a widening cast `(x as W)` of an UNSIGNED `ELEM` is `<= MAX(ELEM)`
 /// (`2^width(ELEM) - 1`), and a non-negative integer constant bounds itself. None when the LHS
@@ -4823,12 +5297,208 @@ fn unsigned_floor_div_le_lhs(
     Some(Formula::Le(Box::new(dest), Box::new(lhs_formula)))
 }
 
+/// The true result type of a SHIFT whose shifted value is a **width-less signed
+/// constant**, recovered from the assignment DESTINATION.
+///
+/// `ConstValue::Int` carries no width, so `operand_ty` must infer one from the
+/// value: it returns `i64` for anything that fits `i64` (`lib.rs`, and the widening
+/// to 128 there only fires for values OUTSIDE `i64`). For `1i128 << k` that
+/// fabricates width **64**, and the shift definition
+/// `extract_block_definitions` then emits is `bv2int_signed(bvshl(int2bv(1,64),
+/// int2bv(k,64), 64))` — which is FALSE of the real program the moment `k >= 63`
+/// (Rust computes `1i128 << 63 == 2^63`; the 64-bit model says `-2^63`). A false
+/// hypothesis is a latent vacuity, and it is also what pins the companion
+/// `variable_shl_result_range` to a useless `k <= 62` window when the program's own
+/// guard gives `k <= 126`.
+///
+/// The destination of `dst = Shl(lhs, rhs)` has EXACTLY the shift's result type,
+/// which in Rust is the shifted value's type — so this is the exact width, not an
+/// estimate in either direction. Same recovery, and the same soundness argument, as
+/// `generate::checked_vcs::v2_shift_dest_width` (round-19), which already applies it
+/// to the `ShiftOverflow` VC; this brings the block DEFINITION into agreement with
+/// it.
+///
+/// Deliberately narrow: it fires ONLY for `ConstValue::Int`, the one operand form
+/// whose width is fabricated. Every other shifted value (a local, a
+/// width-carrying `ConstValue::Uint`, an `OpaqueScalar`) already reports its real
+/// type, and overriding that with the destination's would be a change of meaning
+/// rather than a repair.
+fn shift_result_ty_from_dest(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+    op: &BinOp,
+    lhs: &Operand,
+) -> Option<Ty> {
+    if !matches!(op, BinOp::Shl | BinOp::Shr) {
+        return None;
+    }
+    if !matches!(lhs, Operand::Constant(ConstValue::Int(_))) {
+        return None;
+    }
+    if !place.projections.is_empty() {
+        return None;
+    }
+    let dest_ty = &func.body.locals.get(place.local)?.ty;
+    // A shifted SIGNED literal has a signed result type. If the destination reads
+    // otherwise the two do not describe the same operation — decline rather than
+    // reinterpret.
+    match dest_ty {
+        Ty::Int { width, signed: true } => Some(Ty::Int { width: *width, signed: true }),
+        _ => None,
+    }
+}
+
+/// The shift AMOUNT as a plain non-negative constant, if it is one. `None` for a
+/// variable amount and for a negative literal (Rust panics on a negative shift
+/// amount, so no value is produced and no bound may be pre-committed).
+fn const_shift_amount(rhs: &Operand) -> Option<u128> {
+    match rhs {
+        Operand::Constant(ConstValue::Uint(v, _)) => Some(*v),
+        Operand::Constant(ConstValue::Int(v)) if *v >= 0 => Some(*v as u128),
+        _ => None,
+    }
+}
+
+/// A LEFT shift of a non-negative integer CONSTANT by a **variable** amount —
+/// `1i128 << width`, the type-extremum idiom — emitted no result range at all
+/// before this, so the consuming `- 1` / unary `-` had nothing to discharge
+/// against and trust-mc REFUTED them: with `dest` unconstrained the model is free
+/// to pick the amount that makes `1i128 << k` equal `i128::MIN`, and then `x - 1`
+/// really does underflow and `-x` really does overflow.
+///
+/// A sound range DOES exist, and it is **conditional on the amount**:
+///
+/// ```text
+/// (0 <= k  AND  k <= K)  ==>  (c <= dest  AND  dest <= c << K)
+/// ```
+///
+/// `K` is the largest amount for which `c << K` provably stays at or below the
+/// shift type's own maximum — `2^w - 1` unsigned, `2^(w-1) - 1` signed, i.e. the
+/// sign bit stays CLEAR. It is stated as an IMPLICATION because that is the honest
+/// form: **nothing here bounds `k`**, and an unconditional range would be a false
+/// PROVE. The bound becomes available exactly when the surrounding program bounds
+/// `k` — for `trust_semantics::signed_min` the enclosing
+/// `else if width >= 1 && width <= 127` guard makes `k = width - 1 <= 126 = K` a
+/// path fact the solver already holds.
+///
+/// # What the caller may rely on
+///
+/// This bounds the shift's **result value**, and only inside the antecedent. It is
+/// NOT a claim that the shift is overflow-free, and it does not discharge the
+/// `ShiftOverflow` VC (`k < w`), which stays a separate obligation: `K <= w - 1`
+/// means a satisfied antecedent implies an in-range amount, but a FALSE antecedent
+/// says nothing at all, so the two never trade places.
+///
+/// # Soundness
+///
+/// The fact is **entailed by the shift's own definition**, not asserted alongside
+/// it, so it cannot prune a model the definition admits — it only puts the
+/// consequence in reach of a solver that will not reason through `bvshl`. Under
+/// `0 <= k <= K <= w - 1`: `IntToBv(k, w)` is exactly `k`, so `BvShl` shifts by
+/// exactly `k`; `c * 2^k <= c * 2^K <= MAX` means no bit is shifted out and (signed)
+/// the sign bit stays clear; so the bridge back — `bv2nat` for unsigned,
+/// `bv2int_signed` for signed (`chc.rs`, `try_binop_to_formula`) — reads exactly
+/// `c * 2^k`, which lies in `[c, c << K]` because `1 <= 2^k <= 2^K`.
+///
+/// Outside the antecedent nothing is claimed, and that is precisely what keeps it
+/// sound where an unconditional range would not be:
+///
+/// * `k == w - 1` on a SIGNED type sets the sign bit — `1i128 << 127` **is**
+///   `i128::MIN` — and there `K == w - 2`, so the antecedent is false and no bound
+///   is offered. This is the case a wrong range would turn into a false PROVE of
+///   the consuming `-x` / `x - 1`; it is the negative fixture below.
+/// * `k >= w` is a checked shift-overflow: the operation panics and produces no
+///   value. `K <= w - 1` keeps the antecedent false there too.
+/// * a NEGATIVE `k` (a signed shift-amount operand) also panics in Rust, while
+///   SMT-LIB `bvshl` by a huge unsigned amount would yield `0`; the explicit
+///   `0 <= k` conjunct excludes it rather than leaning on the operand's type.
+///
+/// Restricted to a CONSTANT lhs on purpose. A structurally-bounded VARIABLE lhs
+/// (`shift_lhs_unsigned_max`) would only give the weaker `0 <= dest <= B << K`, and
+/// its truth would then rest on a separate model fact about that other local rather
+/// than on the shift definition alone. No measured idiom needs it; not taken.
+fn variable_shl_result_range(
+    lhs: &Operand,
+    dest_name: &str,
+    amount: Formula,
+    width: u32,
+    signed: bool,
+) -> Option<Formula> {
+    // Real integer widths only. `range::signed_max` SATURATES to `i128::MAX` for an
+    // out-of-domain width, which would be a ceiling ABOVE the true one and would let
+    // `K` grow past the sign bit — decline instead of trusting the saturation.
+    if width == 0 || width > 128 {
+        return None;
+    }
+    let c: u128 = match lhs {
+        Operand::Constant(ConstValue::Uint(v, _)) => *v,
+        Operand::Constant(ConstValue::Int(v)) if *v >= 0 => *v as u128,
+        _ => return None,
+    };
+    // `c == 0` makes `dest == 0` for every amount, but then `K` is unbounded and the
+    // fact is worthless; `c >= 1` is also what makes the LOWER bound `c <= dest`
+    // (from `2^k >= 1`) the useful half.
+    if c < 1 {
+        return None;
+    }
+    let ceiling: u128 = if signed {
+        let m = crate::range::signed_max(width);
+        if m < 0 {
+            return None;
+        }
+        m as u128
+    } else {
+        crate::range::unsigned_max(width)
+    };
+    if c > ceiling {
+        return None;
+    }
+    // The largest `K <= width - 1` with `c * 2^K <= ceiling`. `checked_mul` is what
+    // detects the value overflow — `checked_shl` only checks the AMOUNT and would
+    // silently wrap into a too-small, unsound ceiling.
+    let mut k_max: u32 = 0;
+    while k_max + 1 <= width - 1 {
+        match c.checked_mul(1u128 << (k_max + 1)) {
+            Some(v) if v <= ceiling => k_max += 1,
+            _ => break,
+        }
+    }
+    let hi = c.checked_mul(1u128 << k_max)?;
+    debug_assert!(hi <= ceiling, "K search must not exceed the type ceiling");
+    let dest = Formula::Var(dest_name.to_string(), Sort::Int);
+    Some(Formula::Implies(
+        Box::new(Formula::And(vec![
+            Formula::Le(Box::new(Formula::Int(0)), Box::new(amount.clone())),
+            Formula::Le(Box::new(amount), Box::new(Formula::Int(i128::from(k_max)))),
+        ])),
+        Box::new(Formula::And(vec![
+            Formula::Le(Box::new(unsigned_value_to_formula(c)), Box::new(dest.clone())),
+            Formula::Le(Box::new(dest), Box::new(unsigned_value_to_formula(hi))),
+        ])),
+    ))
+}
+
+/// `lhs_ty` is the shift's own result type as the CALLER resolved it — the SAME
+/// value the `dest == lhs << rhs` equality is built with, including the
+/// `shift_result_ty_from_dest` repair. Taking it as a parameter rather than
+/// recomputing it is load-bearing: a range stated at a width the definition does not
+/// use can CONTRADICT that definition (at `k == 63`, a width-64 def forces
+/// `dest == -2^63` while a width-128 range asserts `dest >= 1`), and contradictory
+/// hypotheses vacuously prove every obligation in the body.
+///
+/// `amount` is the shift-amount operand already rendered through the SAME operand
+/// path the `dest == lhs << rhs` equality uses, so the conditional bound below names
+/// the identical symbol (same rationale as `unsigned_floor_div_le_lhs`'s LHS
+/// parameter — a differently-rendered symbol would make the implication silently
+/// unfireable rather than wrong).
 fn shift_result_range(
     func: &VerifiableFunction,
+    lhs_ty: Option<&Ty>,
     op: &BinOp,
     lhs: &Operand,
     rhs: &Operand,
     dest_name: &str,
+    amount: Formula,
 ) -> Option<Formula> {
     // Trust #50: an unsigned LEFT-shift by a constant `(x as W) << k`, where the LHS is
     // structurally bounded by `B = MAX(ELEM) <= MAX(W)`, tightens its result BELOW the type
@@ -4841,16 +5511,24 @@ fn shift_result_range(
     // `B << k > MAX(W)` and emits nothing). This is the addend-side companion to
     // `build_accumulator_bound_facts`' case (c): together they discharge `t += (x as W) << k`.
     if matches!(op, BinOp::Shl) {
-        let lhs_ty = crate::operand_ty_cow(func, lhs);
-        let Some(Ty::Int { width, signed: false }) = lhs_ty.as_deref() else {
+        let Some(Ty::Int { width, signed }) = lhs_ty else {
             return None;
         };
-        let width = *width;
-        let k = match rhs {
-            Operand::Constant(ConstValue::Uint(v, _)) => *v,
-            Operand::Constant(ConstValue::Int(v)) if *v >= 0 => *v as u128,
-            _ => return None,
+        let (width, signed) = (*width, *signed);
+        // A VARIABLE amount takes the conditional lane. It is the only lane that
+        // covers a SIGNED lhs, and the only one that says anything at all about
+        // `1i128 << width` — see `variable_shl_result_range` for why the bound must
+        // be an implication and what keeps `k == w - 1` outside it.
+        let Some(k) = const_shift_amount(rhs) else {
+            return variable_shl_result_range(lhs, dest_name, amount, width, signed);
         };
+        // A CONSTANT amount keeps the original unconditional unsigned bound. A signed
+        // lhs with a constant amount is a separate (smaller) gap: it is covered by the
+        // same construction but is not reached by any measured idiom, so it is left
+        // declining rather than widened speculatively.
+        if signed {
+            return None;
+        }
         if k >= u128::from(width) {
             return None;
         }
@@ -4864,21 +5542,16 @@ fn shift_result_range(
             return None; // the shift could overflow W — no tight linear bound
         }
         let dest = Formula::Var(dest_name.to_string(), Sort::Int);
-        return Some(Formula::Le(Box::new(dest), Box::new(u128_to_formula(scaled))));
+        return Some(Formula::Le(Box::new(dest), Box::new(unsigned_value_to_formula(scaled))));
     }
     if !matches!(op, BinOp::Shr) {
         return None;
     }
-    let lhs_ty = crate::operand_ty_cow(func, lhs);
-    let Some(Ty::Int { width, signed }) = lhs_ty.as_deref() else {
+    let Some(Ty::Int { width, signed }) = lhs_ty else {
         return None;
     };
     let (width, signed) = (*width, *signed);
-    let k = match rhs {
-        Operand::Constant(ConstValue::Uint(v, _)) => *v,
-        Operand::Constant(ConstValue::Int(v)) if *v >= 0 => *v as u128,
-        _ => return None,
-    };
+    let k = const_shift_amount(rhs)?;
     if k >= u128::from(width) {
         return None;
     }
@@ -4888,7 +5561,7 @@ fn shift_result_range(
         // Unsigned logical shift: `x: u_w => x >> k <= (2^w - 1) >> k`
         // (lower bound 0 is implicit in the unsigned range).
         let max_val = crate::range::unsigned_max(width) >> k;
-        return Some(Formula::Le(Box::new(dest), Box::new(u128_to_formula(max_val))));
+        return Some(Formula::Le(Box::new(dest), Box::new(unsigned_value_to_formula(max_val))));
     }
     // soundness-signed-shift: a SIGNED arithmetic right shift now bounds
     // its result TWO-sidedly: `-(2^(w-1) >> k) <= dest <= (2^(w-1)-1) >> k`. This
@@ -4926,7 +5599,7 @@ fn bool_to_int_formula(func: &VerifiableFunction, op: &Operand) -> Formula {
     )
 }
 
-fn float_binop_to_formula(
+pub(crate) fn float_binop_to_formula(
     func: &VerifiableFunction,
     op: BinOp,
     lhs: &Operand,
@@ -5158,6 +5831,7 @@ fn float_is_zero_operand(operand: &Operand) -> bool {
 #[cfg(test)]
 mod tests {
     use trust_types::UnwindEdge;
+
     use super::*;
 
     fn test_func() -> VerifiableFunction {
@@ -5184,6 +5858,10 @@ mod tests {
     }
 
     fn checked_literal_func(value_ty: Ty, lhs: Operand, rhs: Operand) -> VerifiableFunction {
+        checked_op_func(BinOp::Add, value_ty, lhs, rhs)
+    }
+
+    fn checked_op_func(op: BinOp, value_ty: Ty, lhs: Operand, rhs: Operand) -> VerifiableFunction {
         VerifiableFunction {
             name: "checked_literal".into(),
             def_path: "test::checked_literal".into(),
@@ -5203,7 +5881,7 @@ mod tests {
                         id: BlockId(0),
                         stmts: vec![Statement::Assign {
                             place: Place::local(2),
-                            rvalue: Rvalue::CheckedBinaryOp(BinOp::Add, lhs, rhs),
+                            rvalue: Rvalue::CheckedBinaryOp(op, lhs, rhs),
                             span: SourceSpan::default(),
                         }],
                         terminator: Terminator::Assert {
@@ -5212,7 +5890,7 @@ mod tests {
                                 projections: vec![trust_types::Projection::Field(1)],
                             }),
                             expected: false,
-                            msg: AssertMessage::Overflow(BinOp::Add),
+                            msg: AssertMessage::Overflow(op),
                             target: BlockId(1),
                             span: SourceSpan::default(),
                             unwind: UnwindEdge::Unreachable,
@@ -5228,6 +5906,131 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #222 — THE BICONDITIONAL PIN.
+    //
+    // The `unix_hardened` panic-boundary twin used to build its violation as
+    // `Not(extract_assert_passed_semantics()[0])`. It now emits
+    // `checked_binop_out_of_range_violation` instead. Those two must denote the
+    // SAME proposition on every block where either fires, or the hardened row
+    // silently stops being the negation of the safe range — a change of MEANING
+    // disguised as a change of spelling.
+    //
+    // This is the "ADMIT and EMIT helpers must agree" discipline, and an
+    // agreement between two helpers is a BICONDITIONAL, so both halves are
+    // pinned: the SHAPE (exact De Morgan dual) and the DOMAIN (`Some` exactly
+    // when the safe-range extractor is non-empty).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The De Morgan dual of `And([Le(lo, x), Le(x, hi)])`, computed here so the
+    /// assertion states the relationship rather than restating the new code.
+    fn de_morgan_dual_of_in_range(in_range: &Formula) -> Formula {
+        let Formula::And(cs) = in_range else {
+            panic!("in_range must be a two-conjunct And, got {in_range:?}");
+        };
+        assert_eq!(cs.len(), 2, "in_range must be exactly `lo <= x && x <= hi`");
+        let (Formula::Le(lo, x1), Formula::Le(x2, hi)) = (&cs[0], &cs[1]) else {
+            panic!("in_range conjuncts must both be `Le`, got {cs:?}");
+        };
+        assert_eq!(x1, x2, "both bounds must be on the SAME result term");
+        Formula::Or(vec![Formula::Lt(x1.clone(), lo.clone()), Formula::Gt(x2.clone(), hi.clone())])
+    }
+
+    #[test]
+    fn out_of_range_violation_is_the_de_morgan_dual_of_in_range() {
+        let x = Operand::Copy(Place::local(1));
+        let mut checked = 0usize;
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+            for ty in [Ty::i8(), Ty::i32(), Ty::i64(), Ty::u8(), Ty::u32(), Ty::u64()] {
+                let func = checked_op_func(op, ty.clone(), x.clone(), x.clone());
+                let block = &func.body.blocks[0];
+                let facts = extract_assert_passed_semantics(&func, block);
+                let violation = checked_binop_out_of_range_violation(&func, block);
+
+                // DOMAIN half: the two helpers fire on exactly the same blocks.
+                assert_eq!(
+                    facts.is_empty(),
+                    violation.is_none(),
+                    "domain disagreement at {op:?}/{ty:?}: the hardened twin would \
+                     fall back to a different violation than the safe-range \
+                     extractor's negation"
+                );
+                let (Some((in_range, _)), Some(violation)) = (facts.split_first(), violation)
+                else {
+                    continue;
+                };
+
+                // SHAPE half: exactly the dual, node for node.
+                assert_eq!(
+                    violation,
+                    de_morgan_dual_of_in_range(in_range),
+                    "the emitted violation is not the De Morgan dual of in_range \
+                     at {op:?}/{ty:?}"
+                );
+
+                // The property the CERTIFIER keys on. `certify_disjunctive_
+                // contradiction` scans the conjunct pool for `Formula::Or`; a
+                // violation that is not an `Or` at the top is invisible to it,
+                // which is the entire defect #222 closed. Assert the recognizer's
+                // precondition directly, not a proxy for it.
+                assert!(
+                    matches!(violation, Formula::Or(ref ds) if ds.len() == 2),
+                    "the violation must be a 2-way top-level `Or` or the kernel \
+                     recognizer cannot see it: {violation:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 18, "the matrix must actually exercise 18 op/type pairs");
+    }
+
+    /// The emitted core is the term the KERNEL names. `trust_semantics::
+    /// noOverflow_violation_formula` is the trust-types reflection of the Clean
+    /// `noOverflow` definition; `range.rs` already pins it structurally equal to
+    /// the per-statement lane's `out_of_range`. Pin the hardened twin to the same
+    /// term, so all three — primary VC, hardened twin, kernel lemma — cannot
+    /// drift apart independently.
+    #[test]
+    fn out_of_range_violation_matches_the_kernel_no_overflow_denotation() {
+        let x = Operand::Copy(Place::local(1));
+        for (ty, width, signed) in [
+            (Ty::i8(), 8u32, true),
+            (Ty::i32(), 32, true),
+            (Ty::u8(), 8, false),
+            (Ty::u32(), 32, false),
+        ] {
+            let func = checked_op_func(BinOp::Add, ty.clone(), x.clone(), x.clone());
+            let violation = checked_binop_out_of_range_violation(&func, &func.body.blocks[0])
+                .expect("a checked Add on an in-range operand must yield a violation");
+
+            // The kernel term over a variable named `result`; substitute our
+            // actual result expression for that variable and the two must be
+            // structurally identical.
+            let kernel = trust_semantics::noOverflow_violation_formula(width, signed, "result");
+            let Formula::Or(kernel_ds) = kernel else {
+                panic!("the kernel denotation stopped being an `Or` — re-derive #222");
+            };
+            let Formula::Or(ref ds) = violation else {
+                panic!("emitted violation is not an `Or`: {violation:?}");
+            };
+            assert_eq!(ds.len(), kernel_ds.len(), "disjunct count diverged at {ty:?}");
+            // Bounds and relational operators must match exactly; only the
+            // result TERM differs (kernel: `Var("result")`, emitted: `x + x`).
+            match (&ds[0], &kernel_ds[0], &ds[1], &kernel_ds[1]) {
+                (
+                    Formula::Lt(_, lo),
+                    Formula::Lt(_, kernel_lo),
+                    Formula::Gt(_, hi),
+                    Formula::Gt(_, kernel_hi),
+                ) => {
+                    assert_eq!(lo, kernel_lo, "min bound diverged from the kernel at {ty:?}");
+                    assert_eq!(hi, kernel_hi, "max bound diverged from the kernel at {ty:?}");
+                }
+                other => panic!("shape diverged from the kernel denotation: {other:?}"),
+            }
         }
     }
 
@@ -5285,14 +6088,18 @@ mod tests {
             LocalDecl { index: 0, ty: Ty::u32(), name: Some("ret".into()) },
             LocalDecl {
                 index: 1,
-                ty: Ty::Adt { adt_kind: None, layout: None, 
+                ty: Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
                     variants: Vec::new(),
                     name: "Option".into(),
                     // Enum layout per `lower_enum_adt`: `__tag` then per-variant
                     // flattened payload fields (`__v1_0` for `Some`'s field 0).
                     fields: vec![("__tag".into(), Ty::i32()), ("__v1_0".into(), Ty::u32())],
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                },
                 name: Some("o".into()),
             },
         ];
@@ -5301,7 +6108,12 @@ mod tests {
             stmts: vec![Statement::Assign {
                 place: Place::local(1),
                 rvalue: Rvalue::Aggregate(
-                    AggregateKind::Adt { name: "Option".into(), variant: 1, active_field: None, args: None },
+                    AggregateKind::Adt {
+                        name: "Option".into(),
+                        variant: 1,
+                        active_field: None,
+                        args: None,
+                    },
                     vec![Operand::Constant(ConstValue::Int(7))],
                 ),
                 span: SourceSpan::default(),
@@ -5364,14 +6176,20 @@ mod tests {
         );
 
         // Div by a ZERO constant declines: the quotient is unconstrained in the model.
-        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &zero, "dest", xf.clone()).is_none());
+        assert!(
+            unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &zero, "dest", xf.clone()).is_none()
+        );
         // Div by a VARIABLE divisor declines: it could be zero.
-        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &x, "dest", xf.clone()).is_none());
+        assert!(
+            unsigned_floor_div_le_lhs(&func, &BinOp::Div, &x, &x, "dest", xf.clone()).is_none()
+        );
 
         // SIGNED declines for both ops — the fact is FALSE for negative values
         // (`-8 >> 1 == -4`, `-8 / 2 == -4`), so emitting it would be unsound.
         let sxf = operand_to_formula(&func, &sx);
-        assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Shr, &sx, &k, "dest", sxf.clone()).is_none());
+        assert!(
+            unsigned_floor_div_le_lhs(&func, &BinOp::Shr, &sx, &k, "dest", sxf.clone()).is_none()
+        );
         assert!(unsigned_floor_div_le_lhs(&func, &BinOp::Div, &sx, &two, "dest", sxf).is_none());
 
         // Shl declines: `x << k` is not bounded above by `x`.
@@ -5410,8 +6228,16 @@ mod tests {
         let k = Operand::Constant(ConstValue::Uint(2, 32));
 
         // Unsigned Shr by const 2 → `dest <= (2^32-1) >> 2`.
-        let bound = shift_result_range(&func, &BinOp::Shr, &x, &k, "dest")
-            .expect("unsigned const Shr should emit a bound");
+        let bound = shift_result_range(
+            &func,
+            crate::operand_ty_cow(&func, &x).as_deref(),
+            &BinOp::Shr,
+            &x,
+            &k,
+            "dest",
+            operand_to_formula(&func, &k),
+        )
+        .expect("unsigned const Shr should emit a bound");
         let expected = (u128::from(u32::MAX) >> 2) as i128; // 1_073_741_823
         assert!(
             matches!(&bound, Formula::Le(l, r)
@@ -5422,15 +6248,29 @@ mod tests {
 
         // Shl of a BARE full-width value (`x: u32`, no structural bound below the type max)
         // declines: the result could wrap, so there is no tight linear bound.
-        assert!(shift_result_range(&func, &BinOp::Shl, &x, &k, "dest").is_none());
+        assert!(
+            shift_result_range(
+                &func,
+                crate::operand_ty_cow(&func, &x).as_deref(),
+                &BinOp::Shl,
+                &x,
+                &k,
+                "dest",
+                operand_to_formula(&func, &k)
+            )
+            .is_none()
+        );
         // Shl of a structurally-bounded LHS (here a non-negative constant `3`) by const `2`
         // CANNOT overflow u32, so it tightens to `dest <= 3 << 2 = 12` (#50 addend-side bound).
+        let three_u32 = Operand::Constant(ConstValue::Uint(3, 32));
         let cbound = shift_result_range(
             &func,
+            crate::operand_ty_cow(&func, &three_u32).as_deref(),
             &BinOp::Shl,
-            &Operand::Constant(ConstValue::Uint(3, 32)),
+            &three_u32,
             &k,
             "dest",
+            operand_to_formula(&func, &k),
         )
         .expect("Shl of a bounded LHS by a safe constant should emit a bound");
         assert!(
@@ -5442,8 +6282,16 @@ mod tests {
         // Signed `>>` by const 2 → two-sided `-(2^31>>2) <= dest <= (2^31-1)>>2`,
         // i.e. `-536_870_912 <= dest <= 536_870_911` (sound now that signed shifts
         // bridge via bv2int_signed).
-        let signed_bound = shift_result_range(&func, &BinOp::Shr, &sx, &k, "dest")
-            .expect("signed const Shr should emit a two-sided bound");
+        let signed_bound = shift_result_range(
+            &func,
+            crate::operand_ty_cow(&func, &sx).as_deref(),
+            &BinOp::Shr,
+            &sx,
+            &k,
+            "dest",
+            operand_to_formula(&func, &k),
+        )
+        .expect("signed const Shr should emit a two-sided bound");
         match &signed_bound {
             Formula::And(parts) if parts.len() == 2 => {
                 assert!(
@@ -5465,10 +6313,32 @@ mod tests {
         }
         // Variable shift → tightest sound bound is just the type max (useless).
         let var_k = Operand::Copy(Place::local(1));
-        assert!(shift_result_range(&func, &BinOp::Shr, &x, &var_k, "dest").is_none());
+        assert!(
+            shift_result_range(
+                &func,
+                crate::operand_ty_cow(&func, &x).as_deref(),
+                &BinOp::Shr,
+                &x,
+                &var_k,
+                "dest",
+                operand_to_formula(&func, &var_k)
+            )
+            .is_none()
+        );
         // Shift amount >= width → a checked shift-overflow, must not pre-bound.
         let big_k = Operand::Constant(ConstValue::Uint(32, 32));
-        assert!(shift_result_range(&func, &BinOp::Shr, &x, &big_k, "dest").is_none());
+        assert!(
+            shift_result_range(
+                &func,
+                crate::operand_ty_cow(&func, &x).as_deref(),
+                &BinOp::Shr,
+                &x,
+                &big_k,
+                "dest",
+                operand_to_formula(&func, &big_k)
+            )
+            .is_none()
+        );
 
         // Shl SOUNDNESS: a structurally-bounded LHS whose `base << k` would OVERFLOW the shift
         // type `W` must DECLINE (no bound) — emitting `dest <= base << k` would be unsound when
@@ -5477,8 +6347,330 @@ mod tests {
         let big_base = Operand::Constant(ConstValue::Uint(1u128 << 30, 32));
         let k5 = Operand::Constant(ConstValue::Uint(5, 32));
         assert!(
-            shift_result_range(&func, &BinOp::Shl, &big_base, &k5, "dest").is_none(),
+            shift_result_range(
+                &func,
+                crate::operand_ty_cow(&func, &big_base).as_deref(),
+                &BinOp::Shl,
+                &big_base,
+                &k5,
+                "dest",
+                operand_to_formula(&func, &k5)
+            )
+            .is_none(),
             "Shl whose base<<k overflows the shift width must not emit a bound"
+        );
+    }
+
+    /// The shift DEFINITION and the shift RANGE must be stated at one width, and for
+    /// a width-less `ConstValue::Int` that width comes from the destination. Pinned
+    /// end-to-end on the real `signed_min` block shape, because the failure mode is
+    /// not a wrong answer from either piece alone — it is the two DISAGREEING, which
+    /// makes the hypotheses contradictory and vacuously proves everything.
+    #[test]
+    fn shift_def_and_range_agree_on_the_destination_width() {
+        fn assign(i: usize, r: Rvalue) -> Statement {
+            Statement::Assign { place: Place::local(i), rvalue: r, span: SourceSpan::default() }
+        }
+        // bb: _6 = width - 1; _5 = Shl(1i128, _6); _0 = -_5   (trust_semantics::signed_min)
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::i128(), name: Some("_0".into()) },
+            LocalDecl { index: 1, ty: Ty::u32(), name: Some("width".into()) },
+            LocalDecl { index: 2, ty: Ty::Bool, name: Some("_2".into()) },
+            LocalDecl { index: 3, ty: Ty::i128(), name: Some("_3".into()) },
+            LocalDecl { index: 4, ty: Ty::i128(), name: Some("_4".into()) },
+            LocalDecl { index: 5, ty: Ty::i128(), name: Some("_5".into()) },
+            LocalDecl { index: 6, ty: Ty::u32(), name: Some("_6".into()) },
+        ];
+        func.body.arg_count = 1;
+        func.body.return_ty = Ty::i128();
+        func.body.blocks = vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![
+                assign(
+                    6,
+                    Rvalue::BinaryOp(
+                        BinOp::Sub,
+                        Operand::Copy(Place::local(1)),
+                        Operand::Constant(ConstValue::Uint(1, 32)),
+                    ),
+                ),
+                assign(
+                    5,
+                    Rvalue::BinaryOp(
+                        BinOp::Shl,
+                        Operand::Constant(ConstValue::Int(1)),
+                        Operand::Move(Place::local(6)),
+                    ),
+                ),
+                assign(0, Rvalue::UnaryOp(trust_types::UnOp::Neg, Operand::Copy(Place::local(5)))),
+            ],
+            terminator: Terminator::Return,
+        }];
+
+        // The bare operand type is the FABRICATED i64 — this is the defect being repaired,
+        // pinned so the test still means something if `operand_ty`'s inference changes.
+        assert_eq!(
+            crate::operand_ty(&func, &Operand::Constant(ConstValue::Int(1))),
+            Some(Ty::Int { width: 64, signed: true }),
+            "a width-less signed literal is inferred i64; that is what makes the repair necessary"
+        );
+        assert_eq!(
+            shift_result_ty_from_dest(
+                &func,
+                &Place::local(5),
+                &BinOp::Shl,
+                &Operand::Constant(ConstValue::Int(1)),
+            ),
+            Some(Ty::Int { width: 128, signed: true }),
+            "the destination `_5: i128` carries the shift's real result type"
+        );
+
+        let defs = extract_block_definitions(&func, &func.body.blocks[0]);
+        let mut saw_def_at_128 = false;
+        let mut saw_range_k126 = false;
+        for d in &defs {
+            if let Formula::Eq(l, r) = d
+                && l.var_name() == Some("_5")
+                && let Formula::BvToInt(_, w, true) = r.as_ref()
+            {
+                assert_eq!(*w, 128, "the shift DEF must use the destination width, got {w}");
+                saw_def_at_128 = true;
+            }
+            if let Formula::Implies(ante, _) = d
+                && let Formula::And(parts) = ante.as_ref()
+                && parts.len() == 2
+                && matches!(&parts[1], Formula::Le(_, r) if matches!(r.as_ref(), Formula::Int(126)))
+            {
+                saw_range_k126 = true;
+            }
+        }
+        assert!(saw_def_at_128, "no width-128 shift definition for `_5` in {defs:?}");
+        // K = 126, not 62. 62 is what the fabricated i64 width yields, and it is
+        // UNREACHABLE from the program's own `width <= 127` guard, so the fact would
+        // be sound and permanently inert — the silent-failure mode this pins against.
+        assert!(saw_range_k126, "no conditional range with K=126 in {defs:?}");
+
+        // The repair is DELIBERATELY narrow: a width-CARRYING operand keeps its own
+        // type even when the destination disagrees, because there the operand type is
+        // a fact and the override would be a reinterpretation.
+        assert_eq!(
+            shift_result_ty_from_dest(
+                &func,
+                &Place::local(5),
+                &BinOp::Shl,
+                &Operand::Constant(ConstValue::Uint(1, 32)),
+            ),
+            None,
+            "a width-carrying constant must not be re-typed from the destination"
+        );
+        assert_eq!(
+            shift_result_ty_from_dest(
+                &func,
+                &Place::local(5),
+                &BinOp::Shl,
+                &Operand::Copy(Place::local(1))
+            ),
+            None,
+            "a local operand must not be re-typed from the destination"
+        );
+        // Non-shift ops are untouched: `Sub` keeps `operand_ty`'s answer.
+        assert_eq!(
+            shift_result_ty_from_dest(
+                &func,
+                &Place::local(5),
+                &BinOp::Sub,
+                &Operand::Constant(ConstValue::Int(1)),
+            ),
+            None,
+            "only shifts recover their width from the destination"
+        );
+    }
+
+    /// `1i128 << width` — a signed constant LHS shifted by a VARIABLE amount, the
+    /// type-extremum idiom in `trust_semantics::signed_min`/`signed_max`/
+    /// `type_max_formula`. The bound is CONDITIONAL on the amount, and the whole
+    /// soundness argument is which amounts the antecedent lets in.
+    #[test]
+    fn variable_shl_emits_conditional_range_and_stops_at_the_sign_bit() {
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::i128(), name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u32(), name: Some("width".into()) },
+        ];
+        func.body.arg_count = 1;
+
+        let one_i128 = Operand::Constant(ConstValue::Int(1));
+        let amt = Operand::Copy(Place::local(1));
+        let amt_f = operand_to_formula(&func, &amt);
+
+        // `1i128 << width` (signed lhs, variable amount) now emits a bound where the
+        // old gate emitted nothing at all.
+        // The caller resolves the shift's result type; for a width-less
+        // `ConstValue::Int` that is the DESTINATION's type, recovered by
+        // `shift_result_ty_from_dest` (pinned by its own test below).
+        let i128_ty = Ty::i128();
+        let bound = shift_result_range(
+            &func,
+            Some(&i128_ty),
+            &BinOp::Shl,
+            &one_i128,
+            &amt,
+            "dest",
+            amt_f.clone(),
+        )
+        .expect("signed constant lhs with a variable amount should emit a conditional bound");
+
+        // Shape: `(0 <= amt AND amt <= K) => (1 <= dest AND dest <= 2^K)`.
+        //
+        // K MUST be 126, not 127. This is the negative half of the fixture and the
+        // whole point: `1i128 << 127` IS `i128::MIN`, so a K of 127 would license
+        // `dest >= 1` on an amount that really does produce the most negative value,
+        // and the consuming `-dest` / `dest - 1` would then FALSE-PROVE.
+        let (ante, cons) = match &bound {
+            Formula::Implies(a, c) => (a.as_ref(), c.as_ref()),
+            other => panic!("expected an IMPLICATION, got {other:?}"),
+        };
+        match ante {
+            Formula::And(parts) if parts.len() == 2 => {
+                assert!(
+                    matches!(&parts[0], Formula::Le(l, _)
+                        if matches!(l.as_ref(), Formula::Int(0))),
+                    "antecedent must exclude a NEGATIVE amount (bvshl would yield 0 there): {:?}",
+                    parts[0]
+                );
+                assert!(
+                    matches!(&parts[1], Formula::Le(_, r)
+                        if matches!(r.as_ref(), Formula::Int(126))),
+                    "antecedent must stop at K=126 — 1i128 << 127 is i128::MIN: {:?}",
+                    parts[1]
+                );
+            }
+            other => panic!("expected a two-conjunct antecedent, got {other:?}"),
+        }
+        match cons {
+            Formula::And(parts) if parts.len() == 2 => {
+                assert!(
+                    matches!(&parts[0], Formula::Le(l, r)
+                        if matches!(l.as_ref(), Formula::Int(1)) && r.var_name() == Some("dest")),
+                    "lower bound must be `1 <= dest` (that is what discharges `-dest`/`dest-1`): {:?}",
+                    parts[0]
+                );
+                assert!(
+                    matches!(&parts[1], Formula::Le(l, r)
+                        if l.var_name() == Some("dest")
+                        && matches!(r.as_ref(), Formula::Int(n) if *n == (1i128 << 126))),
+                    "upper bound must be 2^126: {:?}",
+                    parts[1]
+                );
+            }
+            other => panic!("expected a two-conjunct consequent, got {other:?}"),
+        }
+
+        // NEGATIVE FIXTURE 1 — a base that genuinely overflows before the sign bit.
+        // `3i128 << k` reaches `3 * 2^126 > i128::MAX` at k = 126, so K must be 125.
+        // A K of 126 here would be a range that is FALSE of the real machine value.
+        let three = Operand::Constant(ConstValue::Int(3));
+        let b3 = shift_result_range(
+            &func,
+            Some(&i128_ty),
+            &BinOp::Shl,
+            &three,
+            &amt,
+            "dest",
+            amt_f.clone(),
+        )
+        .expect("base 3 still has a non-empty safe amount window");
+        match &b3 {
+            Formula::Implies(a, _) => match a.as_ref() {
+                Formula::And(parts) => assert!(
+                    matches!(&parts[1], Formula::Le(_, r)
+                        if matches!(r.as_ref(), Formula::Int(125))),
+                    "base 3 must stop at K=125 (3*2^126 > i128::MAX): {:?}",
+                    parts[1]
+                ),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+
+        // NEGATIVE FIXTURE 2 — an UNSIGNED lhs takes the same lane and gets the
+        // strictly larger window, because there is no sign bit to protect:
+        // `1u128 << 127` is a perfectly ordinary u128 value, so K is 127.
+        // Sharing one code path between the two would silently license the signed
+        // sign-bit case; this pins that they differ by exactly one.
+        let mut ufunc = test_func();
+        ufunc.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::u128(), name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::u32(), name: Some("width".into()) },
+        ];
+        ufunc.body.arg_count = 1;
+        let one_u128 = Operand::Constant(ConstValue::Uint(1, 128));
+        let ub = shift_result_range(
+            &ufunc,
+            Some(&Ty::u128()),
+            &BinOp::Shl,
+            &one_u128,
+            &amt,
+            "dest",
+            amt_f.clone(),
+        )
+        .expect("unsigned constant lhs with a variable amount should emit a bound");
+        match &ub {
+            Formula::Implies(a, _) => match a.as_ref() {
+                Formula::And(parts) => assert!(
+                    matches!(&parts[1], Formula::Le(_, r)
+                        if matches!(r.as_ref(), Formula::Int(127))),
+                    "unsigned u128 has no sign bit, so K is 127: {:?}",
+                    parts[1]
+                ),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+
+        // NEGATIVE FIXTURE 3 — a VARIABLE lhs must still decline. `x << k` for an
+        // unconstrained `x` has no sound range at all, and the conditional lane must
+        // not manufacture one just because the amount is now handled.
+        let var_lhs = Operand::Copy(Place::local(1));
+        assert!(
+            shift_result_range(
+                &func,
+                Some(&i128_ty),
+                &BinOp::Shl,
+                &var_lhs,
+                &amt,
+                "dest",
+                amt_f.clone()
+            )
+            .is_none(),
+            "a variable LHS has no sound conditional range"
+        );
+
+        // NEGATIVE FIXTURE 4 — a lhs that already EXCEEDS the signed ceiling declines
+        // outright rather than emitting an empty-window bound.
+        let huge = Operand::Constant(ConstValue::Uint(u128::MAX, 128));
+        assert!(
+            shift_result_range(
+                &func,
+                Some(&i128_ty),
+                &BinOp::Shl,
+                &huge,
+                &amt,
+                "dest",
+                amt_f.clone()
+            )
+            .is_none(),
+            "a lhs above the type ceiling must decline"
+        );
+
+        // NEGATIVE FIXTURE 5 — `0 << k` declines: the fact would be true but carries
+        // no usable lower bound, and `K` is unbounded.
+        let zero = Operand::Constant(ConstValue::Int(0));
+        assert!(
+            shift_result_range(&func, Some(&i128_ty), &BinOp::Shl, &zero, &amt, "dest", amt_f)
+                .is_none(),
+            "a zero lhs must decline"
         );
     }
 
@@ -5604,6 +6796,128 @@ mod tests {
         );
     }
 
+    /// The length formula an array→slice cast ties its destination to, if any.
+    /// `_2` is `single_cast_func`'s destination local, so the tie is on
+    /// `_2__slice_len`.
+    fn cast_slice_len_tie(src_ty: Ty, dst_ty: Ty) -> Option<Formula> {
+        let func = single_cast_func(src_ty, dst_ty);
+        extract_block_definitions(&func, &func.body.blocks[0]).into_iter().find_map(|f| match f {
+            Formula::Eq(lhs, rhs) if lhs.var_name() == Some("_2__slice_len") => Some(*rhs),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn array_unsize_cast_ties_the_static_length() {
+        // `_2 = _1 as &[u8]` for `_1: &[u8; 8]` — the array→slice coercion. Without
+        // the tie `_2__slice_len` is free and `a.len() - 1` refutes at length 0.
+        let tie = cast_slice_len_tie(
+            Ty::Ref {
+                mutable: false,
+                inner: Box::new(Ty::Array { elem: Box::new(Ty::u8()), len: 8 }),
+            },
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) },
+        );
+        assert_eq!(
+            tie,
+            Some(Formula::Int(8)),
+            "`&[u8; 8] -> &[u8]` must tie the destination's length to the array's 8"
+        );
+
+        // `&mut [T; N] -> &mut [T]` carries the same N: a reborrow cannot change a
+        // length. Raw pointers unsize the same way (`*const [T; N] -> *const [T]`).
+        assert_eq!(
+            cast_slice_len_tie(
+                Ty::Ref {
+                    mutable: true,
+                    inner: Box::new(Ty::Array { elem: Box::new(Ty::u32()), len: 3 })
+                },
+                Ty::Ref { mutable: true, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u32()) }) },
+            ),
+            Some(Formula::Int(3)),
+            "`&mut [u32; 3] -> &mut [u32]` must tie length 3"
+        );
+        assert_eq!(
+            cast_slice_len_tie(
+                Ty::RawPtr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Array { elem: Box::new(Ty::u8()), len: 0 })
+                },
+                Ty::RawPtr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }),
+                },
+            ),
+            Some(Formula::Int(0)),
+            "`*const [u8; 0] -> *const [u8]` must tie length 0 — the EXACT length, \
+             including the empty case that makes `100 / a.len()` genuinely divide by zero"
+        );
+    }
+
+    #[test]
+    fn const_generic_array_unsize_cast_ties_the_param_symbol() {
+        // `&[u8; N] -> &[u8]` for a const-generic `N`: the tie must name the SAME
+        // per-param symbol a bare `[T; N]` resolves to (`sym_array_len_formula`), so
+        // a guard written against `N` and a bound that came through the coercion
+        // share one variable.
+        let len_sym = trust_types::ConstLen { index: 0, name: "N".into() };
+        let tie = cast_slice_len_tie(
+            Ty::Ref {
+                mutable: false,
+                inner: Box::new(Ty::SymArray {
+                    elem: Box::new(Ty::u8()),
+                    len_sym: len_sym.clone(),
+                }),
+            },
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) },
+        );
+        assert_eq!(
+            tie,
+            Some(crate::sym_array_len_formula(&len_sym)),
+            "`&[u8; N] -> &[u8]` must tie the const-param symbol, not a fresh variable"
+        );
+    }
+
+    #[test]
+    fn elem_changing_pointer_cast_does_not_tie_length() {
+        // TrustIR's `Rvalue::Cast` is the same variant used for `PtrToPtr`, so the
+        // array→slice tie must not fire on a cast that CHANGES the element type.
+        // `*const [u32; 4] -> *const [u8]` would preserve the metadata VALUE 4 while
+        // the metadata now counts BYTES, so claiming `len == 4` for the destination
+        // is not a fact about the program. Fail closed: emit nothing.
+        assert_eq!(
+            cast_slice_len_tie(
+                Ty::RawPtr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Array { elem: Box::new(Ty::u32()), len: 4 })
+                },
+                Ty::RawPtr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) })
+                },
+            ),
+            None,
+            "a cast whose element type changes must NOT tie the destination's length"
+        );
+        // A source that is ALREADY a slice carries no static length, so there is
+        // nothing to tie and the destination stays free.
+        assert_eq!(
+            cast_slice_len_tie(
+                Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) },
+                Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) },
+            ),
+            None,
+            "a slice→slice cast has no static length to tie"
+        );
+        // An int→int cast is the overwhelmingly common `Rvalue::Cast` and must be
+        // untouched by the slice-length lane.
+        assert_eq!(
+            cast_slice_len_tie(Ty::u32(), Ty::u64()),
+            None,
+            "an int→int cast must not emit a slice-length fact"
+        );
+    }
+
     /// True when `defs` contains an `input_range_constraint`-shaped fact bounding
     /// `var` from both sides (a lower `Le(_, var)` and an upper `Le(var, _)`).
     fn has_range_bound_on(defs: &[Formula], var: &str) -> bool {
@@ -5633,6 +6947,53 @@ mod tests {
             terminator: Terminator::Return,
         }];
         func
+    }
+
+    /// The snapshot-transport write set must name the derived slice-length of a
+    /// destination whose RVALUE definition extraction declines.
+    ///
+    /// `conservative_snapshot_writes` exists because extraction is partial: it
+    /// starts from `generate::block_written_names` (which derives `{d}__slice_len`
+    /// from the def names it CAN mint) and then adds every explicit place
+    /// destination as a belt-and-suspenders gate. A dest reaching the loop is by
+    /// construction one that produced no definition, so its derived name reaches
+    /// the set through this site or not at all — and a proof snapshot transported
+    /// across it would keep a length tie the write replaced.
+    ///
+    /// `Rvalue::Unsupported` is the extraction-declining shape here; the property
+    /// is about the DEST, not about that particular rvalue.
+    #[test]
+    fn snapshot_writes_name_the_derived_slice_len_of_an_unextractable_dest() {
+        let slice_ref =
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: slice_ref.clone(), name: Some("s".into()) },
+        ];
+        func.body.arg_count = 1;
+        func.body.return_ty = Ty::Unit;
+        func.body.blocks = vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(1),
+                rvalue: Rvalue::Unsupported {
+                    kind: "test".into(),
+                    detail: "extraction declines this rvalue".into(),
+                    operands: vec![],
+                },
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Return,
+        }];
+        let writes = conservative_snapshot_writes(&func, &func.body.blocks[0])
+            .expect("an Assign statement surface is value-transparent");
+        assert!(writes.contains("s"), "the written dest must be reported; got {writes:?}");
+        assert!(
+            writes.contains("s__slice_len"),
+            "writing the whole slice reference replaces its length metadata, so the \
+             snapshot write set must name `s__slice_len`; got {writes:?}"
+        );
     }
 
     #[test]
@@ -5814,6 +7175,50 @@ mod tests {
                 && matches!(rhs.as_ref(), Formula::Int(42))
             ),
             "SwitchIntMatch should produce discr == value, got: {formula:?}"
+        );
+    }
+
+    #[test]
+    fn refutation_guard_rejects_an_undecodable_switch_label_instead_of_dropping_it() {
+        let func = test_func();
+        let guard = GuardCondition::SwitchIntMatch {
+            discr: Operand::Copy(Place::local(1)),
+            value: 1u128 << 40,
+        };
+        assert!(
+            matches!(guard_to_formula(&func, &guard), Formula::Bool(true)),
+            "the proof-facing lane deliberately weakens an undecodable u32 label"
+        );
+        assert!(
+            guard_to_refutation_formula(&func, &guard).is_none(),
+            "the same weakening must never enter a SAT-as-counterexample lane"
+        );
+    }
+
+    #[test]
+    fn refutation_guard_keeps_a_boolean_discriminant_raw_for_exact_grounding() {
+        let func = test_func();
+        let guard =
+            GuardCondition::SwitchIntMatch { discr: Operand::Move(Place::local(2)), value: 0 };
+        assert!(matches!(
+            guard_to_refutation_formula(&func, &guard),
+            Some(Formula::Not(inner)) if inner.var_name() == Some("flag")
+        ));
+    }
+
+    #[test]
+    fn refutation_guard_rejects_an_unsupported_operand_instead_of_freshening_it() {
+        let func = test_func();
+        let guard = GuardCondition::AssertHolds {
+            cond: Operand::Unsupported {
+                kind: "future-operand".into(),
+                detail: "no exact source carrier".into(),
+            },
+            expected: true,
+        };
+        assert!(
+            guard_to_refutation_formula(&func, &guard).is_none(),
+            "a fresh fallback symbol cannot witness the unsupported source operand"
         );
     }
 
@@ -7006,9 +8411,37 @@ mod tests {
         );
         let mut signed = pristine.clone();
         signed.body.locals[2].ty = Ty::Int { width: 8, signed: true };
+        let signed_route = exact_switch_value_guard(&signed, &Operand::Copy(Place::local(2)), 0xff);
+        let Some(Formula::Eq(_, signed_value)) = signed_route else {
+            panic!("a signed SwitchInt target must now resolve: {signed_route:?}");
+        };
+        assert_eq!(
+            *signed_value,
+            Formula::Int(-1),
+            "the raw i8 SwitchInt target 0xff must SIGN-EXTEND to -1, never the magnitude 255 \
+             (matching `contracts::switch_edge_formula`'s decode)"
+        );
         assert!(
-            exact_switch_value_guard(&signed, &Operand::Copy(Place::local(2)), 0xff).is_none(),
-            "raw signed SwitchInt targets must fail closed until sign-extension is modeled"
+            exact_switch_value_guard(&signed, &Operand::Copy(Place::local(2)), 0x1ff).is_none(),
+            "a label with bits above the scrutinee's width is malformed and must fail closed"
+        );
+        assert_eq!(
+            exact_switch_value_guard(&signed, &Operand::Copy(Place::local(2)), 0x7f),
+            Some(Formula::Eq(
+                Box::new(operand_to_formula(&signed, &Operand::Copy(Place::local(2)))),
+                Box::new(Formula::Int(127)),
+            )),
+            "a non-negative signed label keeps its magnitude"
+        );
+        let mut unsigned = pristine.clone();
+        unsigned.body.locals[2].ty = Ty::Int { width: 8, signed: false };
+        assert_eq!(
+            exact_switch_value_guard(&unsigned, &Operand::Copy(Place::local(2)), 0xff),
+            Some(Formula::Eq(
+                Box::new(operand_to_formula(&unsigned, &Operand::Copy(Place::local(2)))),
+                Box::new(Formula::Int(255)),
+            )),
+            "the UNSIGNED row is unchanged: u8 0xff still denotes 255"
         );
 
         let mut duplicate = pristine.clone();
@@ -7353,10 +8786,17 @@ mod tests {
         assert!(matches!(&result, Formula::And(clauses) if clauses.len() == 2));
     }
 
+    /// A label above `i128::MAX` keeps the `Formula::UInt` spelling rather than
+    /// being silently truncated — but ONLY where such a label is well formed,
+    /// i.e. on a `u128` scrutinee. The fixture used to state this over
+    /// `test_func`'s `u32` local, where `2^127` has 95 bits set above the
+    /// scrutinee's width: that is a malformed target, and the guard lane now
+    /// declines it (contributing no conjunct) instead of asserting an equality
+    /// the type can never satisfy.
     #[test]
     fn test_guard_switch_int_match_u128_above_i128_max() {
-        let func = test_func();
-        // Value above i128::MAX must not be silently truncated
+        let mut func = test_func();
+        func.body.locals[1].ty = Ty::Int { width: 128, signed: false };
         let large_value: u128 = (i128::MAX as u128) + 1;
         let guard = GuardCondition::SwitchIntMatch {
             discr: Operand::Copy(Place::local(1)),
@@ -7367,11 +8807,98 @@ mod tests {
             matches!(&formula, Formula::Eq(_, rhs) if matches!(rhs.as_ref(), Formula::UInt(v) if *v == large_value)),
             "u128 value above i128::MAX should use Formula::UInt, got: {formula:?}"
         );
+
+        assert_eq!(
+            guard_to_formula(&test_func(), &guard),
+            Formula::Bool(true),
+            "the same label on the u32 fixture is out of width: decline, never constrain"
+        );
+    }
+
+    /// A raw `SwitchInt` label is a two's-complement BIT PATTERN at the
+    /// scrutinee's width. Reading it as a magnitude put `n == 4294967295` on an
+    /// `i32` `-1` arm; conjoined with `n`'s own range fact that is UNSAT, so the
+    /// arm was VACUOUS and `match n { -1 => x + 1, _ => 0 }` FALSE-PROVED while
+    /// `f(-1, 255)` panics. Pin the decode at every signed width, and pin that
+    /// the unsigned row did not move.
+    #[test]
+    fn signed_switch_labels_sign_extend_and_unsigned_labels_do_not() {
+        let signed_widths: [(u32, u128, i128); 5] = [
+            (8, 0xff, -1),
+            (16, 0xffff, -1),
+            (32, 0xffff_ffff, -1),
+            (64, 0xffff_ffff_ffff_ffff, -1),
+            (32, 0xffff_fff9, -7),
+        ];
+        for (width, raw, expected) in signed_widths {
+            let mut func = test_func();
+            func.body.locals[1].ty = Ty::Int { width, signed: true };
+            let guard = GuardCondition::SwitchIntMatch {
+                discr: Operand::Copy(Place::local(1)),
+                value: raw,
+            };
+            let formula = guard_to_formula(&func, &guard);
+            assert!(
+                matches!(&formula, Formula::Eq(lhs, rhs)
+                    if lhs.var_name() == Some("x")
+                    && matches!(rhs.as_ref(), Formula::Int(v) if *v == expected)),
+                "i{width} label {raw:#x} must decode to {expected}, got: {formula:?}"
+            );
+        }
+
+        // isize, and the sign-extending `otherwise` exclusion beside it.
+        let mut ptr = test_func();
+        ptr.body.locals[1].ty = Ty::PtrSizedInt { signed: true };
+        let otherwise = guard_to_formula(
+            &ptr,
+            &GuardCondition::SwitchIntOtherwise {
+                discr: Operand::Copy(Place::local(1)),
+                excluded_values: vec![0xffff_ffff_ffff_ffff],
+            },
+        );
+        assert!(
+            matches!(&otherwise, Formula::Not(inner)
+                if matches!(inner.as_ref(), Formula::Eq(_, rhs)
+                    if matches!(rhs.as_ref(), Formula::Int(-1)))),
+            "the isize `otherwise` arm must exclude -1, not the tautology `x != 2^64-1`: \
+             {otherwise:?}"
+        );
+
+        // MUST NOT CHANGE: the unsigned row. `test_func`'s `x` is a `u32`.
+        let unsigned = guard_to_formula(
+            &test_func(),
+            &GuardCondition::SwitchIntMatch {
+                discr: Operand::Copy(Place::local(1)),
+                value: 0xffff_ffff,
+            },
+        );
+        assert!(
+            matches!(&unsigned, Formula::Eq(_, rhs)
+                if matches!(rhs.as_ref(), Formula::Int(4294967295))),
+            "u32 0xffff_ffff still denotes the magnitude 4294967295, got: {unsigned:?}"
+        );
+
+        // A label wider than the scrutinee is malformed: contribute NO conjunct
+        // rather than a wrong one (weaker path condition, fails closed).
+        let mut narrow = test_func();
+        narrow.body.locals[1].ty = Ty::Int { width: 8, signed: true };
+        assert_eq!(
+            guard_to_formula(
+                &narrow,
+                &GuardCondition::SwitchIntMatch {
+                    discr: Operand::Copy(Place::local(1)),
+                    value: 0x1ff,
+                },
+            ),
+            Formula::Bool(true),
+            "an out-of-width label must weaken the path condition, never constrain it wrongly"
+        );
     }
 
     #[test]
     fn test_guard_switch_int_otherwise_u128_above_i128_max() {
-        let func = test_func();
+        let mut func = test_func();
+        func.body.locals[1].ty = Ty::Int { width: 128, signed: false };
         let large_value: u128 = u128::MAX;
         let guard = GuardCondition::SwitchIntOtherwise {
             discr: Operand::Copy(Place::local(1)),
@@ -7384,6 +8911,13 @@ mod tests {
                 if matches!(inner.as_ref(), Formula::Eq(_, rhs)
                     if matches!(rhs.as_ref(), Formula::UInt(v) if *v == u128::MAX))),
             "u128::MAX excluded value should use Formula::UInt, got: {formula:?}"
+        );
+
+        assert_eq!(
+            guard_to_formula(&test_func(), &guard),
+            Formula::Bool(true),
+            "an out-of-width exclusion drops out: the `otherwise` arm keeps one \
+             constraint fewer (weaker, fails closed), never a tautological one"
         );
     }
 
@@ -7485,6 +9019,7 @@ mod tests {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             },
@@ -7641,6 +9176,7 @@ mod tests {
                 span: SourceSpan::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         }];

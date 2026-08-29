@@ -68,10 +68,11 @@ pub const TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX: &str =
 ///     disambiguate_direct_call_path`). This rule fires on ANY name, sysroot or
 ///     not, and is about UNIQUENESS.
 ///  2. **SYSROOT IMPERSONATION.** The defining crate's name is `core`/`alloc`/
-///     `std` but its `StableCrateId` is not one of the compiler's real sysroot
-///     crates (`trust_mir_extract::convert::impersonates_sysroot_crate`, whose
-///     sysroot identity comes from compiler-owned lang/diagnostic-item anchors,
-///     never from a name). This rule is about IDENTITY.
+///     `std` but this compiler did not load it out of its own target library
+///     directory (`trust_mir_extract::convert::impersonates_sysroot_crate`, whose
+///     sysroot identity is ARTIFACT RESIDENCY — never a name, never an attribute
+///     the crate carries, and never a fact about which other crates the graph
+///     contains). This rule is about IDENTITY.
 ///
 /// # RULE 1 DOES NOT IMPLY RULE 2 — a corrected claim, MEASURED 2026-08-17
 ///
@@ -131,6 +132,138 @@ pub fn crate_name_wears_sysroot_spelling(crate_name: &str) -> bool {
     SYSROOT_CRATE_NAMES.contains(&crate_name)
 }
 
+/// Is a crate that WEARS a sysroot name one this COMPILER supplied?
+///
+/// The identity half of [`sysroot_identity_stamp_required`], factored here for
+/// the same reason: the extractor needs a full compiler build to run a test at
+/// all, so the rule itself is kept somewhere stable cargo can falsify it.
+///
+/// # THE INVARIANT ON THE INPUTS — read this before adding one
+///
+/// Neither input may be a function of WHICH CRATES THE GRAPH CONTAINS. The crate
+/// graph is exactly the thing the adversary supplies, so any fact computed over
+/// it is a fact the adversary can move. The two admitted inputs are:
+///
+/// * `loaded_from_this_compilers_sysroot` — every artifact in
+///   `tcx.used_crate_source(krate)` sits directly in `sess.target_tlib_path.dir`,
+///   i.e. rustc found the crate in its OWN target library directory rather than
+///   wherever an `--extern` argument pointed. A fact about ONE crate's artifact
+///   paths, decided by the filesystem the compiler was installed into;
+/// * `invocation_is_building_the_sysroot` — a COMMAND-LINE fact of this
+///   invocation (`trust_mir_extract::convert::invocation_is_building_the_sysroot`
+///   reads `-Zforce-unstable-if-unmarked`), spelled by whoever runs rustc. A
+///   crate that arrives through `--extern` has no channel to add a `-Z` flag to
+///   the invocation that consumes it, so it sits at the same trust boundary as
+///   `--sysroot`, which residency already depends on.
+///
+/// # WHY THE INJECTION RECORD IS NOT AN INPUT — REFUTED 2026-08-21, MEASURED
+///
+/// A 2026-08-21 revision of this rule read two more facts: whether rustc's own
+/// std-imports injection reached the crate (`tcx.extern_crate(krate)`'s span
+/// carrying `ExpnKind::AstPass(AstPass::StdImports)`), and whether any loaded
+/// crate named `core`/`alloc`/`std` was resident. It authenticated on
+/// `resident || (injected && !supplied)`. Both extra facts are adversary-movable
+/// and the disjunct was exploitable:
+///
+/// * `standard_library_imports::inject` writes an `extern crate std;` and then
+///   lets it RESOLVE through the ordinary `--extern` map, so `injected` says
+///   which crate landed in the injection slot, not that the compiler chose it;
+/// * `supplied` is computed over the crates that HAPPEN to be loaded. A forged
+///   `std` declaring `#![no_core]` + `#![compiler_builtins]` suppresses
+///   `inject_compiler_builtins` (`rustc_metadata/src/creader.rs`), so no real
+///   sysroot crate is ever loaded and `supplied` is false.
+///
+/// MEASURED on `trustc 1.99.0-dev (ddb545d35 2026-08-21)`, read out of
+/// `RUSTC_LOG=rustc_metadata::locator=info`: a victim compiled
+/// `--crate-type lib --emit=metadata -Ztrust-verify=on --extern std=<forgery>`
+/// opens exactly ONE artifact, the forgery, from the `--extern` path — nothing at
+/// all from the compiler's target library directory. So `resident` is false for
+/// the forgery and `supplied` is false for the whole compilation, and that rule
+/// authenticates on its middle term. It does so even for a forgery carrying no
+/// forged attribute, which the rule it replaced REFUSES today (measured: exit 1,
+/// callee rendered `__trust_crate@e22d88b308847231::…`) — a regression, not an
+/// unclosed residual. Both vectors are pinned as falsify-once tests below.
+///
+/// `injected = true` in that vector is the refutation's reading of
+/// `standard_library_imports::inject`, not a direct measurement — and it does not
+/// need to be one for THIS rule, which reads neither `injected` nor `supplied`.
+/// The measured `resident = false` decides both cases on its own. That is the
+/// point of the invariant above: a disjunct a dependency author can trigger is
+/// not an authenticator, and the fix is to have no such disjunct rather than a
+/// better-argued one.
+///
+/// FAIL CLOSED: no evidence means "not authenticated" (stamped ⇒ grants refused
+/// ⇒ visible unproved obligations), never a grant. What that costs is named at
+/// `trust_mir_extract::convert::invocation_is_building_the_sysroot`.
+#[must_use]
+pub fn sysroot_crate_is_compiler_authenticated(
+    loaded_from_this_compilers_sysroot: bool,
+    invocation_is_building_the_sysroot: bool,
+) -> bool {
+    loaded_from_this_compilers_sysroot || invocation_is_building_the_sysroot
+}
+
+/// The WHOLE identity rule — name gate, LOCAL arm, EXTERNAL arm — that
+/// `trust_mir_extract::convert::is_real_sysroot_crate` applies.
+///
+/// [`sysroot_crate_is_compiler_authenticated`] above is only the EXTERNAL arm,
+/// and for most of this rule's life it was the only arm anything could test: the
+/// other two sit next to a `TyCtxt`, which no cargo test can build. That gap was
+/// not cosmetic. Residual R2 — a crate compiled `--crate-name std` that
+/// authenticated ITSELF, went unstamped, and had its own `std::vec::Endless` read
+/// as genuine sysroot by every consumer that trusts a `std::` path root — lived
+/// in the LOCAL arm, underneath a test whose NAME claimed the whole rule and
+/// whose body called only the external arm. The local arm read
+/// `local_crate_owns_a_sysroot_anchor` until 2026-08-23.
+///
+/// # What each arm may read, and why the local arm reads so little
+///
+/// * `crate_name_wears_sysroot_spelling` — a GATE, never evidence. It is what
+///   holds this predicate's extension at `core`/`alloc`/`std`: a dozen consumers
+///   combine it with an ITEM name alone (`Extend`, `HashMap`, `Vec`), and
+///   residency by itself would start admitting `hashbrown`, which ships in the
+///   compiler's own target library directory.
+/// * `defining_crate_is_local` — `DefId::is_local()`. It SELECTS an arm and is
+///   never itself a grant; an exemption keyed on locality is exactly the R2
+///   shape, because the crate under compilation is the one the adversary wrote.
+/// * `loaded_from_this_compilers_sysroot` — EXTERNAL arm only. The compiler holds
+///   no `used_crate_source` record for the crate it is compiling, so this is not
+///   a fact about that crate at all; the local arm therefore IGNORES it rather
+///   than trusting its caller to pass `false`.
+/// * `invocation_is_building_the_sysroot` — the only input the local arm reads. A
+///   COMMAND-LINE fact (`-Zforce-unstable-if-unmarked`), spelled by whoever runs
+///   rustc, at the same trust boundary `--sysroot` and residency already sit on.
+///
+/// So for the LOCAL crate the answer is exactly "is this the compilation that is
+/// building the sysroot", never "does this crate look like the sysroot". FAIL
+/// CLOSED in both directions: the genuine `std` built outside that lane is
+/// stamped, which costs visible unproved obligations and never a grant.
+///
+/// # THE CONSUMER MUST DELEGATE TO THIS FUNCTION
+///
+/// A rule factored here and re-spelled there is a COPY, and a copy is what the
+/// tests below would then be measuring — the same disease this factoring exists
+/// to cure, one crate over. `the_extractor_delegates_the_whole_rule_to_this_crate`
+/// reads `trust-mir-extract`'s source and refuses that drift.
+#[must_use]
+pub fn crate_is_the_compilers_own_sysroot_crate(
+    crate_name_wears_sysroot_spelling: bool,
+    defining_crate_is_local: bool,
+    loaded_from_this_compilers_sysroot: bool,
+    invocation_is_building_the_sysroot: bool,
+) -> bool {
+    if !crate_name_wears_sysroot_spelling {
+        return false;
+    }
+    if defining_crate_is_local {
+        return invocation_is_building_the_sysroot;
+    }
+    sysroot_crate_is_compiler_authenticated(
+        loaded_from_this_compilers_sysroot,
+        invocation_is_building_the_sysroot,
+    )
+}
+
 /// THE producer-side decision: must this rendered def path carry the
 /// [`TRUST_UNAUTHENTICATED_CRATE_PATH_PREFIX`] stamp?
 ///
@@ -143,12 +276,14 @@ pub fn crate_name_wears_sysroot_spelling(crate_name: &str) -> bool {
 /// * `crate_name_wears_sysroot_spelling` — [`crate_name_wears_sysroot_spelling`]
 ///   on `tcx.crate_name(krate)`;
 /// * `defining_crate_is_real_sysroot` — `trust_mir_extract::convert::
-///   is_real_sysroot_crate`, i.e. the crate's `StableCrateId` equals that of a
-///   crate owning one of the compiler's own lang/diagnostic-item anchors. Those
-///   anchors are ATTRIBUTES: a crate that writes `#![feature(rustc_attrs)]` can
-///   register one, and rustc only rejects it when the real owner is also loaded.
-///   That bound is measured and named at `impersonates_sysroot_crate`; do not
-///   read this predicate as saying the stamp is unforgeable;
+///   is_real_sysroot_crate`. For an EXTERNAL crate that is
+///   [`sysroot_crate_is_compiler_authenticated`]: artifact residency, or a
+///   command-line declaration that this invocation is building the sysroot. For
+///   the LOCAL crate — the one under compilation, about which the compiler holds
+///   no loader record at all — it is still the lang/diagnostic item anchors,
+///   which are ATTRIBUTES; that residual is measured and named at
+///   `impersonates_sysroot_crate`, and it is the only arm where the stamp is
+///   still forgeable by a crate rather than by the invoker;
 /// * `crate_name_is_ambiguous` — some OTHER loaded crate renders the same name.
 ///
 /// # Why `defining_crate_is_local` does not appear in the sysroot arm
@@ -173,8 +308,7 @@ pub fn sysroot_identity_stamp_required(
     crate_name_is_ambiguous: bool,
 ) -> bool {
     let duplicate_name = !defining_crate_is_local && crate_name_is_ambiguous;
-    let impersonates_sysroot =
-        crate_name_wears_sysroot_spelling && !defining_crate_is_real_sysroot;
+    let impersonates_sysroot = crate_name_wears_sysroot_spelling && !defining_crate_is_real_sysroot;
     duplicate_name || impersonates_sysroot
 }
 
@@ -232,17 +366,34 @@ pub fn path_has_unauthenticated_crate_stamp(path: &str) -> bool {
 ///
 /// WHAT AN UNSTAMPED `core::`/`alloc::`/`std::` ROOT IS WORTH. Only as much as
 /// the producer's stamping rules: this helper is the CONSUMER half of
-/// [`sysroot_identity_stamp_required`], and the two must be read together. Since
-/// 2026-08-17 the producer stamps on IDENTITY (rule 2 on
-/// [`TRUST_UNAUTHENTICATED_CRATE_PATH_PREFIX`]), so an unstamped sysroot root
-/// means "rustc resolved this to a crate carrying the sysroot's own
-/// lang/diagnostic-item anchors" — no more and no less. Before that it meant only
-/// "no OTHER crate of this name is loaded", which a `#![no_std]` graph makes
+/// [`sysroot_identity_stamp_required`], and the two must be read together. For an
+/// EXTERNAL crate an unstamped sysroot root means exactly one of two things — no
+/// more, and each is a fact the crate graph cannot write:
+///
+///  * this compiler loaded the crate's artifacts out of its own target library
+///    directory; or
+///  * the INVOCATION declared it is building a sysroot
+///    (`-Zforce-unstable-if-unmarked`), in which case identity is delegated to
+///    whoever spelled the command line, exactly as `--sysroot` already is.
+///
+/// Three earlier meanings, each measured insufficient. Before 2026-08-17 it meant
+/// only "no OTHER crate of this name is loaded", which a `#![no_std]` graph makes
 /// trivially true for a crate built `--crate-name std` — measured, exit 0, zero
-/// diagnostics. It still does NOT mean "loaded from the compiler's sysroot": the
-/// anchors are attributes, and residual R2 at
-/// `trust_mir_extract::convert::impersonates_sysroot_crate` records, with the
-/// measurement, exactly which adversary can still register one.
+/// diagnostics. Between 2026-08-17 and 2026-08-21 it meant "the crate carries one
+/// of the sysroot's lang/diagnostic-item anchors", which are ATTRIBUTES a crate
+/// can register for itself whenever the real owner is absent from the graph. A
+/// 2026-08-21 revision then added "or rustc's std-imports injection reached it in
+/// a graph containing no resident sysroot-named crate", which was REFUTED the
+/// same day: a dependency can empty that graph (`#![no_core]` +
+/// `#![compiler_builtins]`) and the disjunct authenticates the forgery. See
+/// [`sysroot_crate_is_compiler_authenticated`] for the measurement.
+///
+/// The LOCAL crate has no loader record — the compiler holds none about the crate
+/// it is compiling — so it authenticates from the command-line fact alone
+/// (`invocation_is_building_the_sysroot`). Residual R2, which let a crate
+/// self-authenticate by owning a lang/diagnostic-item anchor, is CLOSED as of
+/// 2026-08-23: the anchors are source-declarable attributes read from a
+/// graph-wide registry, i.e. exactly the input this rule forbids.
 #[must_use]
 pub fn path_root_is_authenticated_sysroot_crate(path: &str) -> bool {
     !path_has_unauthenticated_crate_stamp(path)
@@ -308,6 +459,456 @@ mod authenticated_sysroot_root_tests {
         assert!(!path_root_is_authenticated_sysroot_crate("mycrate::alloc::vec::Vec::<u8>::iter"));
         assert!(!path_root_is_authenticated_sysroot_crate("<T as mycrate::core::Iter>::iter"));
         assert!(!path_root_is_authenticated_sysroot_crate("mycrate::hash_map::Endless::iter"));
+    }
+}
+
+#[cfg(test)]
+mod compiler_authenticated_sysroot_tests {
+    use super::*;
+
+    /// Six `bool`s the compiler cannot keep in order for us. Only the first three
+    /// are inputs to the rule under test; the other three are the inputs of the
+    /// two rules this one replaces, carried here so every fact vector can state
+    /// ALL THREE verdicts instead of asserting a tautology.
+    ///
+    /// Every vector in this module is a crate that WEARS a sysroot name — that is
+    /// the only case the rule has anything to say about — so the name gate is
+    /// pinned once, separately, in
+    /// `a_name_that_is_not_core_alloc_or_std_never_authenticates`.
+    struct Supply {
+        /// New rule, input 1: which ARM. `DefId::is_local()` — is this the crate
+        /// under compilation, about which no loader record exists?
+        local: bool,
+        /// New rule, input 2 (EXTERNAL arm only): `used_crate_source` paths sit in
+        /// the compiler's own target library directory.
+        resident: bool,
+        /// New rule, input 3 (both arms): a COMMAND-LINE fact — this invocation is
+        /// building a sysroot, so its `core`/`alloc`/`std` legitimately arrive by
+        /// `--extern` and residency cannot hold for any of them.
+        building_the_sysroot: bool,
+        /// 2026-08-21 (refuted) rule: rustc's std-imports injection reached it.
+        injected: bool,
+        /// 2026-08-21 (refuted) rule: some loaded crate named `core`/`alloc`/`std`
+        /// is resident. A fact about the graph, which the adversary supplies.
+        sysroot_supplied_one: bool,
+        /// 2026-08-17 rule, AND the LOCAL arm until 2026-08-23: the crate owns a
+        /// lang/diagnostic-item anchor. A source-declarable ATTRIBUTE.
+        owns_an_anchor: bool,
+    }
+
+    fn authenticated(s: &Supply) -> bool {
+        crate_is_the_compilers_own_sysroot_crate(true, s.local, s.resident, s.building_the_sysroot)
+    }
+
+    /// The 2026-08-17 rule, written out so the tests below can assert what it
+    /// answered. It is ALSO, verbatim, the LOCAL arm that shipped until
+    /// 2026-08-23 (`convert::local_crate_owns_a_sysroot_anchor`), which is why the
+    /// local falsify-once test below plants its violation with this function.
+    fn the_anchor_rule(s: &Supply) -> bool {
+        s.owns_an_anchor
+    }
+
+    /// The 2026-08-21 rule, REFUTED and replaced, written out for the same
+    /// reason. Its middle term is the disjunct a dependency author can trigger.
+    fn the_injection_rule(s: &Supply) -> bool {
+        s.resident || (s.injected && !s.sysroot_supplied_one)
+    }
+
+    /// FALSIFY-ONCE for residual R2, BOTH states in one test.
+    ///
+    /// The fact vector is the aux measured at `impersonates_sysroot_crate`: built
+    /// `--crate-name std`, handed to a `#![no_std]` consumer as
+    /// `--extern std=aux/libstd.rlib`, and carrying
+    /// `#[rustc_diagnostic_item = "HashMap"]` under `#![feature(rustc_attrs)]`.
+    /// The planted violation is that the ANCHOR rule accepts it — assert that
+    /// first, or the refusal below witnesses nothing.
+    #[test]
+    fn the_attribute_forged_sysroot_is_accepted_by_the_anchor_rule_and_refused_here() {
+        let forged = Supply {
+            // it arrived through `--extern`, so it is an EXTERNAL crate.
+            local: false,
+            // `--extern` path, not the compiler's own target lib dir.
+            resident: false,
+            // an ordinary `cargo check` of a dependent crate sets no `-Z` flag.
+            building_the_sysroot: false,
+            // `#![no_std]` injects `core`, never `std`; this crate arrived via
+            // the consumer's own `extern crate std;`.
+            injected: false,
+            // the real `core` next to it DID come from the sysroot.
+            sysroot_supplied_one: true,
+            // and the attribute is spellable, which is the whole of R2.
+            owns_an_anchor: true,
+        };
+        assert!(
+            the_anchor_rule(&forged),
+            "planted violation is gone: the anchor rule no longer accepts the R2 forgery, \
+             so this test no longer witnesses the hole it exists for"
+        );
+        assert!(!authenticated(&forged));
+    }
+
+    /// FALSIFY-ONCE for the refutation of the 2026-08-21 injection rule — the
+    /// exploit vector, BOTH states in one test.
+    ///
+    /// MEASURED on `trustc 1.99.0-dev (ddb545d35 2026-08-21)`: a forged `std`
+    /// declaring `#![no_core]` + `#![compiler_builtins]`, handed to an ORDINARY
+    /// (non-`no_std`) victim as `--extern std=<forgery>`, is the only crate the
+    /// loader reads — `RUSTC_LOG=rustc_metadata::locator=info` reports zero
+    /// artifacts from the compiler's target library directory. So the graph
+    /// contains no resident sysroot-named crate, `sysroot_supplied_one` is false,
+    /// and the injected `extern crate std;` resolves to the forgery.
+    ///
+    /// That vector — `(resident=false, injected=true, supplied=false)` — is the
+    /// one the replaced test asserted must AUTHENTICATE. It is the exploit. The
+    /// planted violation asserted first is that the injection rule accepts it.
+    #[test]
+    fn the_injection_rule_authenticates_a_graph_with_no_sysroot_crate_in_it_and_this_rule_refuses_it()
+     {
+        let forged_graph_without_a_sysroot_crate = Supply {
+            local: false,
+            resident: false,
+            building_the_sysroot: false,
+            // the compiler's own `extern crate std;` resolved to the forgery.
+            injected: true,
+            // `#![compiler_builtins]` suppressed `inject_compiler_builtins`, so
+            // no real sysroot crate was ever loaded. The ADVERSARY set this.
+            sysroot_supplied_one: false,
+            owns_an_anchor: true,
+        };
+        assert!(
+            the_injection_rule(&forged_graph_without_a_sysroot_crate),
+            "planted violation is gone: the injection rule no longer accepts the \
+             empty-sysroot-graph forgery, so this test no longer witnesses the hole it \
+             exists for"
+        );
+        assert!(!authenticated(&forged_graph_without_a_sysroot_crate));
+    }
+
+    /// FALSIFY-ONCE for the hole the injection rule OPENED, BOTH states in one
+    /// test. Same forgery, carrying NO forged attribute at all.
+    ///
+    /// MEASURED on the same binary, same reproducer: today's anchor rule refuses
+    /// it (exit 1, `__trust_crate@e22d88b308847231::<u32 as std::convert::From<u8>
+    /// >::from` on the callee), and the injection rule would have authenticated
+    /// it — a regression, not merely an unclosed residual. The planted violation
+    /// is the pair: the anchor rule refuses AND the injection rule accepts.
+    #[test]
+    fn the_injection_rule_opened_the_unanchored_forgery_the_anchor_rule_already_refused() {
+        let unanchored_forgery = Supply {
+            local: false,
+            resident: false,
+            building_the_sysroot: false,
+            injected: true,
+            sysroot_supplied_one: false,
+            // no `#[rustc_diagnostic_item]`, no `#![feature(rustc_attrs)]`.
+            owns_an_anchor: false,
+        };
+        assert!(
+            !the_anchor_rule(&unanchored_forgery),
+            "planted violation is gone: the anchor rule no longer refuses the unanchored \
+             forgery, so this test no longer witnesses the regression it exists for"
+        );
+        assert!(
+            the_injection_rule(&unanchored_forgery),
+            "planted violation is gone: the injection rule no longer accepts the unanchored \
+             forgery, so this test no longer witnesses the regression it exists for"
+        );
+        assert!(!authenticated(&unanchored_forgery));
+    }
+
+    /// The other direction, and the one an over-decline would break: every
+    /// honest supply configuration still authenticates.
+    #[test]
+    fn every_honest_supply_configuration_still_authenticates() {
+        // ordinary build: sysroot `std`/`alloc`/`core`, loaded out of the
+        // compiler's own target library directory.
+        assert!(authenticated(&Supply {
+            local: false,
+            resident: true,
+            building_the_sysroot: false,
+            injected: true,
+            sysroot_supplied_one: true,
+            owns_an_anchor: true,
+        }));
+        // `#![no_std]` + `extern crate alloc;`: `alloc` is NOT injected (the
+        // consumer names it itself) but it is the sysroot's own artifact.
+        assert!(authenticated(&Supply {
+            local: false,
+            resident: true,
+            building_the_sysroot: false,
+            injected: false,
+            sysroot_supplied_one: true,
+            owns_an_anchor: true,
+        }));
+        // A sysroot-building lane, taken at its worst case for this rule: the
+        // sysroot crates arrive by `--extern` and NOTHING is resident. The
+        // invocation carries `-Zforce-unstable-if-unmarked` — MEASURED for
+        // `cargo -Zbuild-std` (20 of its 21 rustc invocations), read from
+        // `src/bootstrap` for the bootstrap lane — which the crate graph cannot
+        // set. Without this case the rule silently becomes residency-only and
+        // that lane over-declines.
+        assert!(authenticated(&Supply {
+            local: false,
+            resident: false,
+            building_the_sysroot: true,
+            injected: true,
+            sysroot_supplied_one: false,
+            owns_an_anchor: true,
+        }));
+        // The real `core`/`alloc`/`std` while it IS the crate under compilation:
+        // no loader record exists for it, and the only thing that authenticates it
+        // is the same command-line fact. Without this case the local arm could be
+        // hardened to a constant `false` and every other test here would stay
+        // green while bootstrap's own `library/` verification lane lost its
+        // sysroot grants.
+        assert!(authenticated(&Supply {
+            local: true,
+            resident: false,
+            building_the_sysroot: true,
+            injected: false,
+            sysroot_supplied_one: false,
+            owns_an_anchor: true,
+        }));
+    }
+
+    /// FAIL CLOSED: no residency and no sysroot-build lane is a refusal, whatever
+    /// the graph looks like. Pinned over every combination of the three facts the
+    /// rule does NOT read, which is the invariant that broke last round — and over
+    /// BOTH arms, which is the invariant this test's own name claimed and its body
+    /// did not deliver until 2026-08-24.
+    ///
+    /// Until then it called [`sysroot_crate_is_compiler_authenticated`], the
+    /// EXTERNAL arm, and the LOCAL arm — where residual R2 actually lived — was
+    /// unexercised in either state. Sweeping `local` is what makes the name true.
+    #[test]
+    fn no_fact_about_the_crate_graph_can_grant() {
+        for local in [false, true] {
+            for injected in [false, true] {
+                for sysroot_supplied_one in [false, true] {
+                    for owns_an_anchor in [false, true] {
+                        let s = Supply {
+                            local,
+                            resident: false,
+                            building_the_sysroot: false,
+                            injected,
+                            sysroot_supplied_one,
+                            owns_an_anchor,
+                        };
+                        assert!(
+                            !authenticated(&s),
+                            "graph facts granted at local={local} injected={injected} \
+                             supplied={sysroot_supplied_one} anchor={owns_an_anchor}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// FALSIFY-ONCE for residual R2's LOCAL arm — the half
+    /// `no_fact_about_the_crate_graph_can_grant` never reached, and the half the
+    /// hole was actually in. BOTH states in one test.
+    ///
+    /// The fact vector is the crate under compilation in the measured `#![no_std]`
+    /// forgery: built `--crate-name std`, owning `#[rustc_diagnostic_item =
+    /// "HashMap"]` under `#![feature(rustc_attrs)]`, with the real `std` kept out
+    /// of the graph so rustc's duplicate-registration error never fires. It is
+    /// LOCAL, so there is no loader record and `resident` is not even a fact about
+    /// it; and it is an ordinary `rustc`/`cargo check` invocation, so no `-Z` flag
+    /// is set.
+    ///
+    /// THE MUTATION THIS WATCHES. Restore the pre-2026-08-23 local arm — i.e. have
+    /// [`crate_is_the_compilers_own_sysroot_crate`]'s `defining_crate_is_local`
+    /// branch answer from the crate's own anchors instead of from
+    /// `invocation_is_building_the_sysroot`, which is `the_anchor_rule` below and
+    /// was `convert::local_crate_owns_a_sysroot_anchor` in the shipped extractor.
+    /// The first assertion here says that rule ACCEPTS this vector; the second
+    /// says today's rule refuses it. Re-point the second assertion at
+    /// `the_anchor_rule` and watch it go red — that is the exact shape of the code
+    /// that shipped, and it is why `std::vec::Endless` was read as genuine sysroot.
+    ///
+    /// Nothing else in the tree neutralises that mutation: the local arm has no
+    /// other caller under cargo (it needs a `TyCtxt`), and every other vector in
+    /// this module is `local: false`, so the external arm's rows cannot answer for
+    /// it.
+    #[test]
+    fn the_local_crate_named_std_is_accepted_by_the_pre_patch_local_rule_and_refused_here() {
+        let self_named_std = Supply {
+            // the crate under compilation — `DefId::is_local()`.
+            local: true,
+            // no `used_crate_source` record exists for it at all.
+            resident: false,
+            // an ordinary compilation sets no `-Zforce-unstable-if-unmarked`.
+            building_the_sysroot: false,
+            // `#![no_std]`: rustc injects `core`, and this crate is not it.
+            injected: false,
+            // the forgery is the only sysroot-named crate in the graph.
+            sysroot_supplied_one: false,
+            // …and the attribute is spellable, which is the whole of R2.
+            owns_an_anchor: true,
+        };
+        assert!(
+            the_anchor_rule(&self_named_std),
+            "planted violation is gone: the pre-2026-08-23 local arm no longer accepts a \
+             crate that declares its own sysroot anchor, so this test no longer witnesses \
+             the hole it exists for"
+        );
+        assert!(
+            !authenticated(&self_named_std),
+            "a crate compiled `--crate-name std` authenticated ITSELF as the sysroot: its \
+             paths go unstamped and every `std::` root anchor downstream reads them as \
+             genuine"
+        );
+    }
+
+    /// The LOCAL arm reads the command line and NOTHING else — asserted as an
+    /// equality over all sixteen combinations of the four facts it must ignore,
+    /// so the arm cannot acquire a second grant without this going red.
+    ///
+    /// THREE MUTATIONS THIS WATCHES, none of them reachable by any other test:
+    ///
+    /// 1. `if defining_crate_is_local { return true }` — the "obviously ours"
+    ///    exemption someone will reach for the next time `cargo -Zbuild-std`'s
+    ///    user unit over-declines. Red on every `building_the_sysroot == false`
+    ///    row.
+    /// 2. `if defining_crate_is_local { return loaded_from_this_compilers_sysroot
+    ///    || invocation_is_building_the_sysroot }` — dropping the early return and
+    ///    letting the external arm answer. Red on `(resident = true, building =
+    ///    false)`. That row is not reachable from today's extractor, whose
+    ///    `crate_is_sysroot_resident` returns `false` for `LOCAL_CRATE`; it is a
+    ///    pin on the RULE, so the rule stays fail-closed no matter what a future
+    ///    caller passes rather than depending on the caller to pass `false`.
+    /// 3. restoring the anchor arm, as in the falsify-once test above. Red on
+    ///    `(anchor = true, building = false)`.
+    #[test]
+    fn the_local_arm_answers_from_the_command_line_alone() {
+        for resident in [false, true] {
+            for building_the_sysroot in [false, true] {
+                for injected in [false, true] {
+                    for sysroot_supplied_one in [false, true] {
+                        for owns_an_anchor in [false, true] {
+                            let s = Supply {
+                                local: true,
+                                resident,
+                                building_the_sysroot,
+                                injected,
+                                sysroot_supplied_one,
+                                owns_an_anchor,
+                            };
+                            assert_eq!(
+                                authenticated(&s),
+                                building_the_sysroot,
+                                "the local arm read something other than the command line at \
+                                 resident={resident} building={building_the_sysroot} \
+                                 injected={injected} supplied={sysroot_supplied_one} \
+                                 anchor={owns_an_anchor}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The NAME GATE is load-bearing, not decoration, and it is the only thing
+    /// holding this predicate's extension at `core`/`alloc`/`std`.
+    ///
+    /// A dozen call sites in `trust_mir_extract::convert` combine
+    /// `is_real_sysroot_crate` with an ITEM name alone — `item_name == "Extend"`,
+    /// `"HashMap"`, `"Vec"`. `hashbrown` ships INSIDE the compiler's own target
+    /// library directory and is therefore resident, and it has both a `HashMap`
+    /// and `Extend` impls, so a residency test without the name gate widens those
+    /// grants to a crate nobody decided about.
+    ///
+    /// THE MUTATION: delete the `if !crate_name_wears_sysroot_spelling { return
+    /// false }` gate. Red on all four rows. No other test can catch it — every
+    /// [`Supply`] vector in this module passes `true` for the gate, and
+    /// [`sysroot_identity_stamp_required`]'s own name input is a different
+    /// function's, tested next door against the STAMP rule rather than this one.
+    #[test]
+    fn a_name_that_is_not_core_alloc_or_std_never_authenticates() {
+        for local in [false, true] {
+            for building_the_sysroot in [false, true] {
+                assert!(
+                    !crate_is_the_compilers_own_sysroot_crate(
+                        false,
+                        local,
+                        // resident: `hashbrown` really does live in the compiler's
+                        // own target library directory.
+                        true,
+                        building_the_sysroot,
+                    ),
+                    "a crate that does not wear a sysroot name authenticated at \
+                     local={local} building={building_the_sysroot}"
+                );
+            }
+        }
+        // Control: the SAME residency, worn under a sysroot name, does authenticate
+        // — so the four refusals above come from the gate and not from a predicate
+        // that answers `false` for everything.
+        assert!(crate_is_the_compilers_own_sysroot_crate(true, false, true, false));
+    }
+
+    /// With the sysroot-build lane off — every ordinary compilation — the EXTERNAL
+    /// arm is residency and nothing else. Pinned so a later edit cannot slip a
+    /// second grant in beside it.
+    #[test]
+    fn outside_the_sysroot_build_lane_the_rule_is_residency_alone() {
+        for resident in [false, true] {
+            assert_eq!(sysroot_crate_is_compiler_authenticated(resident, false), resident);
+            // and the whole rule agrees, for an EXTERNAL crate wearing the name.
+            assert_eq!(
+                crate_is_the_compilers_own_sysroot_crate(true, false, resident, false),
+                resident
+            );
+        }
+    }
+
+    /// THE REACHABILITY GUARD. A rule factored into a testable crate is worth
+    /// exactly nothing if the shipped consumer keeps its own copy, and this file
+    /// has now spent two rounds on rules whose tests were measuring something the
+    /// compiler did not run.
+    ///
+    /// `trust-types` is deliberately decoupled from rustc, so it cannot call
+    /// `convert::is_real_sysroot_crate` and cannot build a `TyCtxt` to feed it.
+    /// What it CAN do is read the extractor's source and refuse the drift. Two
+    /// checks, both fail-closed:
+    ///
+    /// * the extractor CALLS [`crate_is_the_compilers_own_sysroot_crate`] — the
+    ///   trailing `(` keeps a doc-comment mention from satisfying it; and
+    /// * the pre-2026-08-23 local anchor helper is GONE, so a rewire that
+    ///   delegates on one arm while keeping the anchor arm alive on the other
+    ///   cannot pass.
+    ///
+    /// If the sibling crate cannot be read at all, this FAILS rather than skips:
+    /// an unreadable consumer is an unchecked consumer.
+    ///
+    /// THE MUTATION: re-inline the rule in `convert::is_real_sysroot_crate` (which
+    /// is precisely the state this crate was in before this test) and it goes red.
+    #[test]
+    fn the_extractor_delegates_the_whole_rule_to_this_crate() {
+        let convert =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../trust-mir-extract/src/convert.rs");
+        let source = std::fs::read_to_string(convert).unwrap_or_else(|e| {
+            panic!(
+                "cannot read the extractor at `{convert}` ({e}), so the delegation this \
+                 module's tests depend on is UNCHECKED. If the crate moved, re-point this \
+                 test; do not delete it."
+            )
+        });
+        assert!(
+            source.contains("crate_is_the_compilers_own_sysroot_crate("),
+            "`convert::is_real_sysroot_crate` does not call \
+             `trust_types::crate_is_the_compilers_own_sysroot_crate`, so every test in this \
+             module is measuring a COPY of the rule and not the one the compiler runs. \
+             Apply the delegation."
+        );
+        assert!(
+            !source.contains("local_crate_owns_a_sysroot_anchor"),
+            "the pre-2026-08-23 local anchor helper is still present in the extractor: \
+             residual R2's self-authentication route is spelled somewhere the tests in this \
+             module cannot see"
+        );
     }
 }
 
@@ -755,9 +1356,7 @@ mod rustc_total_primitive_method_tests {
 
     #[test]
     fn wrapping_refutation_method_classifier_is_exact_and_fail_closed() {
-        assert!(
-            RustcWrappingRefutationCarrier::PointerSized { signed: false }.matches(64, false)
-        );
+        assert!(RustcWrappingRefutationCarrier::PointerSized { signed: false }.matches(64, false));
         assert!(
             !RustcWrappingRefutationCarrier::PointerSized { signed: false }.matches(8, false),
             "pointer-sized identity must validate the pinned target width as well as signedness"
@@ -1005,6 +1604,10 @@ pub mod trust_wp_bridge;
 // dependency) so the trust-wp bridge and compiler can lower symbolic
 // `trust-types.Formula@1` predicates into replayable typed pure-expr claims.
 pub mod trust_formula_v1;
+// The portable vocabulary for a caller-side precondition carried by a minted
+// Clean-origin `def`. Here, and not on either side, because `trust-vcgen` (the
+// consumer) and `trust-clean-carrier` (the producer) share only this crate.
+pub mod clean_origin_precondition;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
@@ -1013,11 +1616,14 @@ pub use annotation::*;
 pub use atomic_intrinsics::parse_atomic_intrinsic;
 pub use bitvector::*;
 pub use boundary::*;
+pub use clean_origin_precondition::{
+    CleanOriginPrecondition, PreconditionOperand, PreconditionRelation,
+};
 pub use concurrency::*;
 pub use digest::{
-    canonical_json_bytes, canonical_json_sha256, canonical_json_value,
-    canonicalize_json_in_place, is_canonical_json, is_stable_sha256_hex, lowercase_hex,
-    stable_sha256_hex, stable_sha256_hex_parts, stable_sha256_hex_reader,
+    canonical_json_bytes, canonical_json_sha256, canonical_json_value, canonicalize_json_in_place,
+    is_canonical_json, is_stable_sha256_hex, lowercase_hex, stable_sha256_hex,
+    stable_sha256_hex_parts, stable_sha256_hex_reader,
 };
 pub use facts::*;
 pub use formula::*;

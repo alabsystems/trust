@@ -58,16 +58,14 @@ pub(super) fn is_bool_from_call(callee: &str) -> bool {
             || callee.contains("as std::")
             || callee.contains("as From<bool>")))
         || ((callee.starts_with("core::") || callee.starts_with("std::"))
-            && (callee.ends_with("convert::From::from")
-                || callee.ends_with("convert::Into::into")))
+            && (callee.ends_with("convert::From::from") || callee.ends_with("convert::Into::into")))
 }
 
 /// Whether `callee` is rooted at the genuine `core`/`std` primitive-number
 /// inherent implementation. Callers use this before minting value-range facts;
 /// a same-named user function must leave the destination unconstrained.
 pub(super) fn is_std_num_intrinsic(callee: &str) -> bool {
-    (callee.starts_with("core::") || callee.starts_with("std::"))
-        && callee.contains("::num::")
+    (callee.starts_with("core::") || callee.starts_with("std::")) && callee.contains("::num::")
 }
 
 /// The std integer `wrapping_neg` inherent method (`core::num::<impl i128>::
@@ -318,5 +316,60 @@ pub(super) fn float_bits_call_dest_fact(
             ))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod ord_method_spelling_tests {
+    use super::ord_method;
+
+    /// The spellings `ord_method` DOES recognize. Both the free function and the
+    /// fully-qualified trait-impl form resolve to the method name.
+    #[test]
+    fn recognized_spellings() {
+        assert_eq!(ord_method("core::cmp::max"), Some("max"));
+        assert_eq!(ord_method("core::cmp::min"), Some("min"));
+        assert_eq!(ord_method("<u32 as core::cmp::Ord>::max"), Some("max"));
+        assert_eq!(ord_method("core::cmp::Ord::clamp"), Some("clamp"));
+    }
+
+    /// MEASURED GAP, pinned so it is a known boundary rather than a surprise.
+    ///
+    /// `trust-mir-extract` writes a monomorphized free-function call as
+    /// `core::cmp::max::<u32>` (verified against the extracted MIR of
+    /// `tests/fixtures/hv_havoc_decline_fx.rs`), and `ord_method` splits the path
+    /// on `::` and takes the LAST segment — which for that spelling is `<u32>`,
+    /// not `max`. So the `Ord::min/max` result model does NOT fire on the form
+    /// the compiler actually emits for `core::cmp::max(x, 1)`.
+    ///
+    /// Closing this is a fact-ADDING change (it makes the verifier assume a bound
+    /// it does not assume today) and belongs in its own review, not in a
+    /// drop-only reclassification pass.
+    #[test]
+    fn turbofish_free_function_spelling_is_not_recognized_today() {
+        assert_eq!(ord_method("core::cmp::max::<u32>"), None);
+        assert_eq!(ord_method("core::cmp::min::<usize>"), None);
+    }
+
+    /// The comparator-taking variants must stay unrecognized in every spelling:
+    /// their result bound depends on the closure, so assuming `min` semantics
+    /// would be UNSOUND.
+    #[test]
+    fn comparator_variants_are_never_recognized() {
+        for callee in [
+            "core::cmp::min_by",
+            "core::cmp::max_by_key",
+            "<u32 as core::cmp::Ord>::min_by",
+            "core::cmp::Ord::max_by_key",
+        ] {
+            assert_eq!(ord_method(callee), None, "{callee} is comparator-dependent");
+        }
+    }
+
+    /// A user function that merely spells `min` is not `core::cmp::min`.
+    #[test]
+    fn user_paths_are_not_credited() {
+        assert_eq!(ord_method("mycrate::util::min"), None);
+        assert_eq!(ord_method("mycrate::cmp::min"), None);
     }
 }

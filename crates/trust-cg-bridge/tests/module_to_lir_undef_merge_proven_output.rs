@@ -60,16 +60,13 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{ICmpOp, Inst};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
 use trust_ir::{Block, Constant, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build the REAL VF->Module shape for `mx(a,b) = if a>b {a} else {b}`: the
@@ -113,8 +110,7 @@ fn make_undef_merge_module(name: &str, op: ICmpOp) -> Module {
         volatile: false,
         align: None,
     }));
-    bb0.body
-        .push(InstrNode::new(Inst::ICmp { op, ty: Ty::I32, lhs: a, rhs: b }).with_result(cmp));
+    bb0.body.push(InstrNode::new(Inst::ICmp { op, ty: Ty::I32, lhs: a, rhs: b }).with_result(cmp));
     bb0.body.push(
         InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) }).with_result(tru),
     );
@@ -132,8 +128,7 @@ fn make_undef_merge_module(name: &str, op: ICmpOp) -> Module {
 
     // bb1: %9 = copy a ; store %9 -> *%5 ; br bb3.
     let mut bb1 = Block::new(BlockId::new(1));
-    bb1.body
-        .push(InstrNode::new(Inst::Copy { ty: Ty::I32, operand: a }).with_result(then_v));
+    bb1.body.push(InstrNode::new(Inst::Copy { ty: Ty::I32, operand: a }).with_result(then_v));
     bb1.body.push(InstrNode::new(Inst::Store {
         ty: Ty::I32,
         ptr: slot,
@@ -145,8 +140,7 @@ fn make_undef_merge_module(name: &str, op: ICmpOp) -> Module {
 
     // bb2: %10 = copy b ; store %10 -> *%5 ; br bb3.
     let mut bb2 = Block::new(BlockId::new(2));
-    bb2.body
-        .push(InstrNode::new(Inst::Copy { ty: Ty::I32, operand: b }).with_result(else_v));
+    bb2.body.push(InstrNode::new(Inst::Copy { ty: Ty::I32, operand: b }).with_result(else_v));
     bb2.body.push(InstrNode::new(Inst::Store {
         ty: Ty::I32,
         ptr: slot,
@@ -394,7 +388,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort in machine output for {name}: {other:?}"),
     }
@@ -551,9 +546,24 @@ fn module_uses_real_undef_seed_merge() {
         .count();
     assert_eq!(undefs, 1, "the real VF->Module merge must seed the slot with exactly one Undef");
     // And the merge is through memory: an Alloca + >=2 Stores + a Load.
-    let allocas = f.blocks.iter().flat_map(|b| &b.body).filter(|n| matches!(n.inst, Inst::Alloca { .. })).count();
-    let stores = f.blocks.iter().flat_map(|b| &b.body).filter(|n| matches!(n.inst, Inst::Store { .. })).count();
-    let loads = f.blocks.iter().flat_map(|b| &b.body).filter(|n| matches!(n.inst, Inst::Load { .. })).count();
+    let allocas = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.body)
+        .filter(|n| matches!(n.inst, Inst::Alloca { .. }))
+        .count();
+    let stores = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.body)
+        .filter(|n| matches!(n.inst, Inst::Store { .. }))
+        .count();
+    let loads = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.body)
+        .filter(|n| matches!(n.inst, Inst::Load { .. }))
+        .count();
     assert_eq!(allocas, 1, "one stack slot");
     assert_eq!(stores, 3, "seed store + two arm overwrites");
     assert_eq!(loads, 1, "one join load");

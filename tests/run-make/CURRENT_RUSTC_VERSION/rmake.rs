@@ -11,7 +11,13 @@ fn main() {
 
     let output =
         rustc().input("main.rs").emit("metadata").extern_("stable", "libstable.rmeta").run();
-    let version = rfs::read_to_string(source_root().join("src/version"));
+    // Trust: `since = "CURRENT_RUSTC_VERSION"` parses to `StableSince::Current`
+    // (`compiler/rustc_attr_parsing/src/attributes/stability.rs`), which renders
+    // from `env!("CFG_RELEASE")` — bootstrap's `rust_release()`, sourced from
+    // `src/rust-compat-version`. Trust's own product version in `src/version`
+    // (0.1.0) is a different numbering entirely, so asserting against it looks
+    // for "stable since 0.1.0" in a diagnostic that says 1.99.0.
+    let version = rfs::read_to_string(source_root().join("src/rust-compat-version"));
     let expected_string = format!("stable since {}", version.trim());
     output.assert_stderr_contains(expected_string);
 }

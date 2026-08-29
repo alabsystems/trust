@@ -7,10 +7,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use indexmap::IndexMap;
-use num_bigint::BigInt;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use indexmap::IndexMap;
+use num_bigint::BigInt;
 
 /// A JS string as UTF-16 code units.
 pub type Units = Vec<u16>;
@@ -48,11 +49,7 @@ pub fn array_index_of(u: &[u16]) -> Option<u32> {
         }
         n = n * 10 + u64::from(c - 0x30);
     }
-    if n <= u64::from(u32::MAX - 1) {
-        Some(u32::try_from(n).expect("bounded above"))
-    } else {
-        None
-    }
+    if n <= u64::from(u32::MAX - 1) { Some(u32::try_from(n).expect("bounded above")) } else { None }
 }
 
 /// Heap handle.
@@ -165,10 +162,16 @@ impl Value {
 /// The kind-specific half of a property: a data slot or an accessor pair.
 #[derive(Debug, Clone)]
 pub enum PropVal {
-    Data { value: Value, writable: bool },
+    Data {
+        value: Value,
+        writable: bool,
+    },
     /// `get`/`set` hold the function object, or None for the absent/undefined
     /// side.
-    Accessor { get: Option<ObjId>, set: Option<ObjId> },
+    Accessor {
+        get: Option<ObjId>,
+        set: Option<ObjId>,
+    },
 }
 
 /// One own property. `synthetic` marks a data value whose TEXT is
@@ -186,10 +189,7 @@ impl Prop {
     #[must_use]
     pub fn data(value: Value) -> Prop {
         Prop {
-            val: PropVal::Data {
-                value,
-                writable: true,
-            },
+            val: PropVal::Data { value, writable: true },
             enumerable: true,
             configurable: true,
             synthetic: false,
@@ -198,12 +198,7 @@ impl Prop {
 
     #[must_use]
     pub fn with_attrs(value: Value, writable: bool, enumerable: bool, configurable: bool) -> Prop {
-        Prop {
-            val: PropVal::Data { value, writable },
-            enumerable,
-            configurable,
-            synthetic: false,
-        }
+        Prop { val: PropVal::Data { value, writable }, enumerable, configurable, synthetic: false }
     }
 
     #[must_use]
@@ -213,12 +208,7 @@ impl Prop {
         enumerable: bool,
         configurable: bool,
     ) -> Prop {
-        Prop {
-            val: PropVal::Accessor { get, set },
-            enumerable,
-            configurable,
-            synthetic: false,
-        }
+        Prop { val: PropVal::Accessor { get, set }, enumerable, configurable, synthetic: false }
     }
 
     #[must_use]
@@ -275,10 +265,7 @@ impl PropDesc {
 
     #[must_use]
     pub fn data(value: Value) -> PropDesc {
-        PropDesc {
-            value: Some(value),
-            ..PropDesc::default()
-        }
+        PropDesc { value: Some(value), ..PropDesc::default() }
     }
 }
 
@@ -1121,10 +1108,7 @@ impl Object {
 
     #[must_use]
     pub fn is_callable(&self) -> bool {
-        matches!(
-            self.kind,
-            ObjKind::Function(_) | ObjKind::Proxy { callable: true, .. }
-        )
+        matches!(self.kind, ObjKind::Function(_) | ObjKind::Proxy { callable: true, .. })
     }
 }
 
@@ -1141,11 +1125,7 @@ pub fn ordered_own_keys(obj: &Object) -> Vec<Units> {
         }
     }
     indices.sort_by_key(|(i, _)| *i);
-    indices
-        .into_iter()
-        .map(|(_, k)| k.clone())
-        .chain(rest.into_iter().cloned())
-        .collect()
+    indices.into_iter().map(|(_, k)| k.clone()).chain(rest.into_iter().cloned()).collect()
 }
 
 /// One declarative binding.
@@ -1167,12 +1147,7 @@ impl Binding {
     /// An ordinary initialized mutable binding.
     #[must_use]
     pub fn var(value: Value) -> Binding {
-        Binding {
-            value,
-            mutable: true,
-            initialized: true,
-            fn_name_immutable: false,
-        }
+        Binding { value, mutable: true, initialized: true, fn_name_immutable: false }
     }
 }
 

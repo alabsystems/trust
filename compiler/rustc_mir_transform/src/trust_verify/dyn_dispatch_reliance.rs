@@ -115,10 +115,9 @@ use rustc_span::Spanned;
 use rustc_span::def_id::DefId;
 
 use super::static_str_write_fmt::StaticStrWriteFmtFacts;
-use super::trait_panic_free;
 use super::{
     DYN_SUMMARY_IN_PROGRESS, item_has_trust_attr, item_has_trust_skip_attr,
-    optimized_mir_query_would_cycle,
+    optimized_mir_query_would_cycle, trait_panic_free,
 };
 
 thread_local! {
@@ -416,11 +415,7 @@ impl<'tcx> DynDispatchBundleFacts<'tcx> {
             for local in body.args_iter() {
                 self.poison_dyn_in_ty(tcx, body.local_decls[local].ty, PoisonSource::RootParam);
             }
-            self.poison_dyn_in_ty(
-                tcx,
-                body.local_decls[RETURN_PLACE].ty,
-                PoisonSource::RootReturn,
-            );
+            self.poison_dyn_in_ty(tcx, body.local_decls[RETURN_PLACE].ty, PoisonSource::RootReturn);
         }
 
         for (block_id, block) in body.basic_blocks.iter_enumerated() {
@@ -1117,7 +1112,7 @@ pub(super) fn target_decline_reason<'tcx>(
 /// (`trust-mir-extract/src/verifier_api.rs::exact_definition_site_precondition_rows`).
 /// So a body like
 ///
-/// ```ignore
+/// ```ignore (trust-contract-grammar-rustdoc-cannot-parse)
 /// fn write_str(&mut self, s: &str) -> fmt::Result requires s.len() >= 4 {
 ///     self.n = self.n.wrapping_add(s.len() as u32 - 4);
 ///     Ok(())
@@ -1392,8 +1387,8 @@ impl std::fmt::Display for PoisonSource<'_> {
 /// module did. A `fn(&mut dyn T)` value carries no vtable: it only lets a caller
 /// PASS one in, and anything a call HANDS BACK is caught on the destination place
 /// instead (`call_output_traits`). So function signatures are skipped, while
-/// closures and coroutines are descended into — their generic arguments include
-/// the captured upvars, which are real held values.
+/// closures and coroutines are descended into — a closure's captured upvars and a
+/// coroutine's saved locals are real held values.
 ///
 /// The match is EXHAUSTIVE in intent and its catch-all sets `opaque` rather than
 /// returning "carries nothing". Skipping by default would be fail-OPEN: a
@@ -1409,7 +1404,7 @@ impl std::fmt::Display for PoisonSource<'_> {
 /// field whose type is written CONCRETELY — rather than through a type
 /// parameter — was invisible to the whole analysis:
 ///
-/// ```ignore
+/// ```ignore (narrative-fragment-trait-Emit-and-Good-are-not-in-scope)
 /// pub struct Bundle<'a> { pub sink: &'a mut dyn Emit }   // no type parameter
 /// pub fn drive(b: &mut Bundle<'_>) -> u32 {
 ///     let mut g = Good;
@@ -1441,6 +1436,99 @@ impl std::fmt::Display for PoisonSource<'_> {
 /// handled arm that returns nothing is indistinguishable from a type that really
 /// carries nothing, and only the arms are auditable. Every path out of this walk
 /// is now written against that distinction.
+///
+/// ## A callable's interior is FOUR questions, not one
+///
+/// SECOND FAIL-OPEN OF THE SAME FAMILY, closed here 2026-08-20 in the arm
+/// immediately below the ADT one. `Closure`, `Coroutine`, `CoroutineClosure` and
+/// `CoroutineWitness` shared a single arm that walked `args.types()` under one
+/// stated premise — *"their held values — the captured upvars, and a coroutine's
+/// live locals — ARE their generic arguments"*. That premise holds for two of the
+/// four kinds and is FALSE for the other two:
+///
+/// | kind | parts | premise |
+/// |---|---|---|
+/// | `Closure` | `{parent_args, closure_kind_ty, closure_sig_as_fn_ptr_ty, tupled_upvars_ty}` | TRUE — upvars are an argument |
+/// | `CoroutineClosure` | `+ signature_parts_ty, coroutine_captures_by_ref_ty` | TRUE — upvars are an argument |
+/// | `Coroutine` | `{parent_args, kind_ty, resume_ty, yield_ty, return_ty, tupled_upvars_ty}` | **FALSE — no witness field** |
+/// | `CoroutineWitness` | the coroutine's own generic arguments | **FALSE — those are not the held types** |
+///
+/// A coroutine's live locals stopped being generic arguments when the witness
+/// field was removed from `CoroutineArgsParts`; they are now reachable only from
+/// the MIR coroutine layout (`tcx.mir_coroutine_witnesses`). So a `&mut dyn Emit`
+/// held across an `await` reported `principals: []` with `opaque: false` — the
+/// literal reading "this value carries no vtable" — and `poison_carriers` then
+/// poisoned nothing AND raised no `opaque_carrier_seen` flag, defeating the
+/// root-param poison the module header's completeness argument rests on.
+///
+/// The four kinds now have four arms with four separate justifications.
+///
+/// ## SEVERITY OF THAT FAIL-OPEN: **LATENT**, not live — and the masks are NAMED
+///
+/// MEASURED 2026-08-20, stage1 `b38db06a6d`, and this paragraph is the whole
+/// reason the arms above are worth reading. **This walk cannot reach a coroutine
+/// today.** The split produces ZERO observable change: fixtures built against a
+/// stage1 with and without it are byte-identical, so the coverage price of the
+/// interior walk is measured at zero rather than merely hoped to be small.
+///
+/// That is NOT evidence the defect is imaginary — the premise really is false,
+/// `CoroutineArgsParts` really has no witness field, and nothing under
+/// `trust_verify/` called `mir_coroutine_witnesses` before this. It is evidence
+/// that two UNRELATED refusals sit in front of it, each of which some future
+/// slice will lift for its own reasons, neither of which will think about this
+/// file:
+///
+/// * **MASK A — the native typed-TrustIr frontier refuses ACROSS-AWAIT SAVED
+///   LOCALS outright.** Measured verbatim: *"unsupported operation: coroutine
+///   frame field 2 is an across-await saved local (len 1); the single/multi-await
+///   native frontier is not yet modeled"*, reported as `Trust full verification
+///   failed ... native typed-TrustIr lowering did not complete`. An across-await
+///   saved local **is** the coroutine interior this walk exists to read, so the
+///   mask covers the fail-open's target exactly: every body whose interior could
+///   carry an invisible `dyn` is already refused one layer earlier.
+/// * **MASK B — a sync body whose SIGNATURE carries the coroutine never reaches
+///   extraction.** A `fn drive() -> impl Future<..>` produced no verified body at
+///   all; the only name in the report was `drive::{closure#0}`. Consistent with
+///   the `clean-skip-unrevealed-opaque` decline. This closes the door
+///   COMPLETELY, because a coroutine type is not nameable in surface Rust — the
+///   return place is the only way one can appear in a sync signature, and
+///   `observe_bundle_body`'s root-parameter door cannot be used at all.
+///
+/// The one door NOT measured is a CALL DESTINATION: a sync caller of an
+/// `async fn` holds the coroutine in a local and `call_output_traits` walks that
+/// type. It needs the callee to fall outside `observed_bodies` before
+/// `deferred_output_poisons` fires, so it may be masked too — nobody has
+/// checked. **Treat it as OPEN.** It is also the only door through which this
+/// walk could be exercised today, so it is where to look first if you want to
+/// falsify any of the above.
+///
+/// ### What fires when a mask lifts — a PAIR of fixtures, and they must stay a pair
+///
+/// `tests/ui/trust/dyn_dispatch_reliance_coroutine_interior_mask_tripwire.rs`
+/// pins MASK A **by name** and turns RED the moment the across-await frontier is
+/// modeled, and pins MASK B by the ABSENCE of any diagnostic on its sync root.
+/// Its header carries the reproduction and the exact next step. Do NOT delete it
+/// on the grounds that "the coroutine case is unreachable" — that unreachability
+/// is the thing it measures, and it is the only mechanism that will tell anyone
+/// this walk has just become load-bearing.
+///
+/// `tests/ui/trust/dyn_dispatch_reliance_poison_lane_liveness.rs` holds the
+/// controls, and the split is FORCED rather than tidy. MEASURED: **a body whose
+/// native lowering fails aborts the crate's verification before other bodies are
+/// reached, so a fixture containing one cannot carry pins on any other body.**
+/// MASK A's own evidence is such a body, so when the controls lived in the
+/// tripwire the report named `drive::{closure#0}` and nothing else — the control
+/// that must ERROR could not, and the control that must stay CLEAN was satisfied
+/// by never running. An absence is only evidence if the thing that would fill it
+/// still works, so mask B's pin depends on the liveness file staying green.
+/// Merging the two files back together compiles, stays green, and silently
+/// re-vacuums both controls.
+///
+/// Its honest residual, stated there too: if a mask lifts AND this walk has been
+/// reverted, the tripwire stays green. No test can cover that, because a
+/// differential needs a reachable door and there is none. That asymmetry is why
+/// the fix ships despite being unobservable — defense in depth is the correct
+/// disposition for a fail-open whose only protection is a refusal somewhere else.
 ///
 /// ## Termination: a VISITED SET, with fuel still failing CLOSED
 ///
@@ -1514,20 +1602,123 @@ fn dyn_principals_in_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> DynCarriers {
                     walk(tcx, instantiated_field_ty(tcx, field, args), fuel, visited, out);
                 }
             }
-            // NOT collapsed into the ADT arm. These have no `all_fields`; their
-            // held values — the captured upvars, and a coroutine's live locals —
-            // ARE their generic arguments, which is what the doc comment above
-            // means by descending into them. The visited guard is the same one,
-            // for the same reason: a boxed recursive coroutine reaches itself.
-            ty::Closure(_, args)
-            | ty::Coroutine(_, args)
-            | ty::CoroutineClosure(_, args)
-            | ty::CoroutineWitness(_, args) => {
+            // Trust: NOT collapsed into the ADT arm — a callable has no
+            // `all_fields` — and, since 2026-08-20, NOT collapsed with each
+            // other either. See "A callable's interior is FOUR questions" in
+            // the doc comment: the premise these four shared held for one and a
+            // half of them.
+            //
+            // CLOSURE. The premise is TRUE. `ClosureArgsParts` is
+            // `{parent_args, closure_kind_ty, closure_sig_as_fn_ptr_ty,
+            // tupled_upvars_ty}`, and a closure value holds exactly its
+            // captured upvars — which `tupled_upvars_ty` carries into the
+            // `Tuple` arm. `closure_sig_as_fn_ptr_ty` is a signature and lands
+            // in the `FnPtr` arm, which carries no vtable for the reason the
+            // doc comment gives. Same decomposition upstream uses to decide
+            // whether a closure is `Send`
+            // (`rustc_next_trait_solver::solve::assembly::structural_traits`).
+            //
+            // The visited guard is the ADT arm's, for the ADT arm's reason: a
+            // boxed recursive closure reaches itself.
+            ty::Closure(_, args) => {
                 if !visited.insert(ty) {
                     return;
                 }
                 for arg in args.types() {
                     walk(tcx, arg, fuel, visited, out);
+                }
+            }
+            // Trust: CORO-CLOSURE. The premise is TRUE, but for a DIFFERENT
+            // reason than the closure's, which is why it gets its own arm
+            // rather than sharing one. `CoroutineClosureArgsParts` is
+            // `{parent_args, closure_kind_ty, signature_parts_ty,
+            // tupled_upvars_ty, coroutine_captures_by_ref_ty}` — the value an
+            // async closure HOLDS is `tupled_upvars_ty` and nothing else; the
+            // two `fn`-shaped parts are signatures. The coroutine it RETURNS is
+            // a separate `ty::Coroutine` value that does not exist until the
+            // closure is called, and the place it appears is a call
+            // DESTINATION, which `call_output_traits` already walks — through
+            // the arm below, which now reaches that coroutine's interior.
+            // Upstream draws the same line: `structural_traits` answers
+            // `[tupled_upvars_ty]` for this kind.
+            ty::CoroutineClosure(_, args) => {
+                if !visited.insert(ty) {
+                    return;
+                }
+                for arg in args.types() {
+                    walk(tcx, arg, fuel, visited, out);
+                }
+            }
+            // Trust: COROUTINE. The premise is FALSE, and this was a fail-open —
+            // a LATENT one. `CoroutineArgsParts` is `{parent_args, kind_ty,
+            // resume_ty, yield_ty, return_ty, tupled_upvars_ty}` — there is NO
+            // witness field. The upvars are covered by `tupled_upvars_ty` and
+            // the signature by the resume/yield/return tys, but the locals a
+            // coroutine holds ACROSS A SUSPEND POINT appear in NONE of them.
+            // They live in the MIR coroutine layout and are reachable only
+            // through the witness, so a `&mut dyn Emit` saved across an `await`
+            // reported `principals: []`, `opaque: false` — "carries no vtable" —
+            // and `poison_carriers` then poisoned nothing AND set no flag.
+            //
+            // Same defect as the ADT arm's, in the arm immediately below it: a
+            // HANDLED arm that returns nothing is indistinguishable from a type
+            // that really carries nothing.
+            //
+            // MEASURED UNREACHABLE 2026-08-20, and the ADT one was not — do not
+            // read this arm as carrying the same urgency. Two masks stand in
+            // front of it and the doc comment names both; this code has never
+            // run on a real coroutine. It is here so that the day one of those
+            // masks lifts, the answer is already correct instead of being
+            // discovered by whoever lifted it.
+            //
+            // The witness is synthesized rather than looked up because
+            // `ty::Coroutine` no longer carries one, and it is walked as a TYPE
+            // rather than inlined so the `visited` set keys the recursion — a
+            // coroutine that awaits a boxed future of itself reaches its own
+            // witness, and the region erasure inside
+            // `new_coroutine_witness_for_coroutine` is what makes that a repeat
+            // rather than an infinite family. Exactly upstream's decomposition:
+            // `[tupled_upvars_ty, coroutine_witness]`.
+            ty::Coroutine(def_id, args) => {
+                if !visited.insert(ty) {
+                    return;
+                }
+                for arg in args.types() {
+                    walk(tcx, arg, fuel, visited, out);
+                }
+                walk(
+                    tcx,
+                    Ty::new_coroutine_witness_for_coroutine(tcx, *def_id, *args),
+                    fuel,
+                    visited,
+                    out,
+                );
+            }
+            // Trust: WITNESS. The premise is FALSE, and this is where the
+            // interior actually lives. `args` here are the typeck root's
+            // generic arguments, not the held values; the held values are the
+            // coroutine layout's saved locals, instantiated at `args`.
+            //
+            // `coroutine_interior_tys` fails CLOSED (`None`) for every reason it
+            // can be unable to answer — not a coroutine def, no layout recorded
+            // (an errored or metadata-less coroutine), or an argument list it
+            // cannot safely instantiate against. That is the same disposition
+            // the fuel exhaustion above takes, and for the same reason:
+            // unexamined is not absent.
+            ty::CoroutineWitness(def_id, args) => {
+                if !visited.insert(ty) {
+                    return;
+                }
+                for arg in args.types() {
+                    walk(tcx, arg, fuel, visited, out);
+                }
+                match coroutine_interior_tys(tcx, *def_id, *args) {
+                    Some(interior) => {
+                        for interior_ty in interior {
+                            walk(tcx, interior_ty, fuel, visited, out);
+                        }
+                    }
+                    None => out.opaque = true,
                 }
             }
             // Scalars and `!`: no interior at all.
@@ -1580,7 +1771,18 @@ fn instantiated_field_ty<'tcx>(
     field: &ty::FieldDef,
     args: ty::GenericArgsRef<'tcx>,
 ) -> Ty<'tcx> {
-    let unnormalized = field.ty(tcx, args);
+    normalized_carrier_ty(tcx, field.ty(tcx, args))
+}
+
+// Trust: the guarded-normalization tail of [`instantiated_field_ty`], factored out
+// unchanged so the coroutine-interior walk added in the same slice normalizes by
+// the SAME discipline. Two carrier paths with two normalization policies would
+// mean a `dyn` behind an associated type is seen through a struct field and not
+// through a coroutine's saved local, for no reason a reader could reconstruct.
+fn normalized_carrier_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    unnormalized: ty::Unnormalized<'tcx, Ty<'tcx>>,
+) -> Ty<'tcx> {
     let raw = unnormalized.skip_normalization();
     if !raw.has_aliases() {
         return raw;
@@ -1590,6 +1792,106 @@ fn instantiated_field_ty<'tcx>(
     }
     tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), unnormalized)
         .unwrap_or(raw)
+}
+
+/// Trust: every type a COROUTINE holds that its generic arguments do not name —
+/// the locals saved across its suspend points — at the instantiation `args`.
+///
+/// `None` means "could not be examined", and every caller must read that as
+/// `opaque`, not as "holds nothing". That is the whole point of the arm this
+/// serves: the fail-open it closes was a handled arm returning an empty answer.
+///
+/// ## Why `mir_coroutine_witnesses` and NOT `coroutine_hidden_types`
+///
+/// `coroutine_hidden_types` is the query upstream's trait solver uses for the
+/// same structural question, and it is the obvious reach. It is the wrong one
+/// HERE, on three counts, all of which point the same way:
+///
+/// * It FILTERS `ignore_for_traits`. That flag is set for a raw pointer created
+///   from a non-thread-local `static` access and for a fake borrow — both
+///   irrelevant to whether a coroutine is `Send`, and both able to carry a
+///   vtable this analysis is asking about. A filtered saved local is a silent
+///   hole of exactly the kind this slice exists to close.
+/// * It cannot say "unavailable". A coroutine with no recorded layout — errored,
+///   or foreign with no encoded MIR — yields an EMPTY type list, which reads as
+///   "holds nothing". `mir_coroutine_witnesses` returns `Option`, so the two
+///   answers stay distinguishable and the second one fails closed.
+/// * It builds an `InferCtxt` and solves `WellFormed` obligations
+///   (`compute_assumptions`). Running arbitrary trait selection from inside a
+///   MIR pass widens the re-entrancy surface for no gain; the layout query
+///   reaches strictly less.
+///
+/// ## Why calling this query from the `TrustVerify` pass cannot cycle
+///
+/// Established by reading, because an E0391 here is a fatal compiler bug and
+/// strictly worse than the fail-open it repairs. `TrustVerify` is scheduled ONLY
+/// at the end of `run_optimization_passes`, so the live query ancestors are
+/// `optimized_mir(F)` and `mir_drops_elaborated_and_const_checked(F)`.
+///
+/// * FOREIGN `def_id`: `mir_coroutine_witnesses` is `separate_provide_extern`, so
+///   the answer is a metadata table read (`rmeta::mod.rs`'s
+///   `mir_coroutine_witnesses` table) and no local query runs at all. An absent
+///   entry decodes as `None`, which this function forwards as a refusal.
+/// * LOCAL `def_id`, already computed: a cache hit cannot cycle.
+/// * LOCAL `def_id`, not yet computed: the provider borrows `tcx.mir_promoted(G).0`
+///   and then depends on the ANALYSIS pipeline (`mir_built`, `mir_borrowck` of the
+///   typeck root, `check_liveness`). Nothing in that closure calls `optimized_mir`,
+///   and the only route back to `mir_drops_elaborated_and_const_checked(F)` is
+///   `mir_for_ctfe(F)` — which `inner_optimized_mir` drives to completion with
+///   `ensure_done` BEFORE the steal for the one `hir_body_const_context` that
+///   reaches this pass (`ConstFn`; every other const context `panic!`s there
+///   rather than running `optimized_mir`). A cached `mir_for_ctfe(F)` short-circuits
+///   before it can re-enter the ancestor.
+///
+/// The neighbouring hazard is a STOLEN value, not a cycle, and it is closed by an
+/// upstream pairing rather than by anything here: `mir_promoted(_).0` has exactly
+/// ONE stealer (`mir_drops_elaborated_and_const_checked`, `rustc_mir_transform`'s
+/// `lib.rs`), and it runs `ensure_done().mir_coroutine_witnesses(def)` for every
+/// `is_coroutine` def IMMEDIATELY BEFORE stealing. So on any path where the steal
+/// has happened this query is already cached, and on any path where it has not the
+/// borrow succeeds. If that pairing is ever broken upstream, this is the caller
+/// that notices — as a `Steal` panic, loudly, not as a wrong verdict.
+fn coroutine_interior_tys<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: ty::GenericArgsRef<'tcx>,
+) -> Option<Vec<Ty<'tcx>>> {
+    // The witness arm's `def_id` is a coroutine by construction. Testing it
+    // anyway keeps the query's precondition local to its call, so a future
+    // caller that synthesizes a witness for something else refuses instead of
+    // asking a MIR query about a def that has no MIR body.
+    if !tcx.is_coroutine(def_id) {
+        return None;
+    }
+    let layout = tcx.mir_coroutine_witnesses(def_id)?;
+    // A coroutine's saved locals are written in terms of the TYPECK ROOT's
+    // parameters — the synthetic closure parameters are carried in the args and
+    // never named by a body type — so the witness args are exactly
+    // `GenericArgs::for_item(tcx, typeck_root, ..)`, which is what
+    // `Ty::new_coroutine_witness_for_coroutine` builds. Any other length means
+    // an `EarlyBinder::instantiate` below could index past the end and ICE.
+    // Refusing is the conservative answer and costs a bundle-wide decline; an
+    // out-of-range index costs the build.
+    if args.len() != tcx.generics_of(tcx.typeck_root_def_id(def_id)).count() {
+        return None;
+    }
+    let mut interior = Vec::with_capacity(layout.field_tys.len());
+    for saved in &layout.field_tys {
+        // Deliberately NOT filtered on `saved.ignore_for_traits` — see above.
+        let raw = saved.ty;
+        // `EarlyBinder::instantiate` ASSERTS rather than returns when handed an
+        // empty argument list for a value that still carries parameters. A
+        // coroutine in a non-generic typeck root has none; if one appears
+        // anyway, refuse rather than trip the assertion.
+        if args.is_empty() && raw.has_param() {
+            return None;
+        }
+        interior.push(normalized_carrier_ty(
+            tcx,
+            ty::EarlyBinder::bind(tcx, raw).instantiate(tcx, args),
+        ));
+    }
+    Some(interior)
 }
 
 /// Is this cast a pointer to an ARRAY or SLICE re-typed as a pointer to its

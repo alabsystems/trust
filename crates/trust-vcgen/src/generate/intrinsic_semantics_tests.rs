@@ -37,7 +37,10 @@ enum V {
     /// Mathematical integer (SMT `Int`).
     Int(i128),
     /// Bitvector: `val` is the unsigned reading, already masked to `width`.
-    Bv { val: u128, width: u32 },
+    Bv {
+        val: u128,
+        width: u32,
+    },
     Bool(bool),
 }
 
@@ -93,9 +96,7 @@ fn eval(f: &Formula, env: &[(&str, i128)]) -> V {
         Formula::IntToBv(a, w) => {
             let x = eval(a, env).int();
             // `x mod 2^w`, mathematical (non-negative) remainder.
-            let m = 1i128
-                .checked_shl(*w)
-                .expect("test widths stay under 127");
+            let m = 1i128.checked_shl(*w).expect("test widths stay under 127");
             let r = ((x % m) + m) % m;
             V::Bv { val: r as u128, width: *w }
         }
@@ -129,7 +130,11 @@ fn eval(f: &Formula, env: &[(&str, i128)]) -> V {
         Formula::Or(xs) => V::Bool(xs.iter().any(|x| eval(x, env).boolean())),
         Formula::Not(x) => V::Bool(!eval(x, env).boolean()),
         Formula::Ite(c, t, e) => {
-            if eval(c, env).boolean() { eval(t, env) } else { eval(e, env) }
+            if eval(c, env).boolean() {
+                eval(t, env)
+            } else {
+                eval(e, env)
+            }
         }
         other => panic!("the emitted fragment must not contain {other:?}"),
     }
@@ -196,20 +201,11 @@ fn ctpop_exhaustive_width8_matches_rust() {
     let mut checked = 0;
     for (byte, unsigned_x, signed_x) in all_width8_inputs() {
         let expected = i128::from(byte.count_ones());
-        assert_eq!(
-            eval(&def, &[("x", unsigned_x)]).int(),
-            expected,
-            "ctpop(u8 {byte:#04x})"
-        );
+        assert_eq!(eval(&def, &[("x", unsigned_x)]).int(), expected, "ctpop(u8 {byte:#04x})");
         // The SAME definition must hold when the local is `i8` and the Int lane
         // therefore carries a negative value: population count is a function of
         // the bit pattern, and `int2bv` recovers it.
-        assert_eq!(
-            eval(&def, &[("x", signed_x)]).int(),
-            expected,
-            "ctpop(i8 {})",
-            byte as i8
-        );
+        assert_eq!(eval(&def, &[("x", signed_x)]).int(), expected, "ctpop(i8 {})", byte as i8);
         checked += 1;
     }
     assert_eq!(checked, 256, "all 256 width-8 inputs must be checked");
@@ -232,7 +228,8 @@ fn bswap_width8_is_the_identity_not_a_reversal() {
 
 #[test]
 fn bswap_exhaustive_width16_matches_rust() {
-    let unsigned = Formula::BvToInt(Box::new(bswap_bits(&x_var(), 16).expect("width 16")), 16, false);
+    let unsigned =
+        Formula::BvToInt(Box::new(bswap_bits(&x_var(), 16).expect("width 16")), 16, false);
     let signed = Formula::BvToInt(Box::new(bswap_bits(&x_var(), 16).expect("width 16")), 16, true);
     for v in 0u32..=0xFFFF {
         let u = v as u16;
@@ -357,6 +354,7 @@ fn intrinsic_fn(arg_ty: Ty, dest_ty: Ty, callee: &str) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -374,11 +372,19 @@ fn intrinsic_fn(arg_ty: Ty, dest_ty: Ty, callee: &str) -> VerifiableFunction {
 }
 
 fn u8_fn(name: &str, dest_ty: Ty) -> VerifiableFunction {
-    intrinsic_fn(Ty::Int { width: 8, signed: false }, dest_ty, &format!("{MARK}core::intrinsics::{name}::<u8>"))
+    intrinsic_fn(
+        Ty::Int { width: 8, signed: false },
+        dest_ty,
+        &format!("{MARK}core::intrinsics::{name}::<u8>"),
+    )
 }
 
 fn i8_fn(name: &str, dest_ty: Ty) -> VerifiableFunction {
-    intrinsic_fn(Ty::Int { width: 8, signed: true }, dest_ty, &format!("{MARK}core::intrinsics::{name}::<i8>"))
+    intrinsic_fn(
+        Ty::Int { width: 8, signed: true },
+        dest_ty,
+        &format!("{MARK}core::intrinsics::{name}::<i8>"),
+    )
 }
 
 fn facts_of(func: &VerifiableFunction) -> Vec<Formula> {
@@ -396,7 +402,11 @@ fn facts_of(func: &VerifiableFunction) -> Vec<Formula> {
 ///
 /// The companion property — that the facts are not vacuous — is checked by
 /// `..._facts_reject_a_wrong_result`.
-fn assert_facts_true_for_all_width8(func: &VerifiableFunction, real: impl Fn(u8) -> i128, signed_arg: bool) {
+fn assert_facts_true_for_all_width8(
+    func: &VerifiableFunction,
+    real: impl Fn(u8) -> i128,
+    signed_arg: bool,
+) {
     let facts = facts_of(func);
     assert!(!facts.is_empty());
     for (byte, unsigned_x, signed_x) in all_width8_inputs() {
@@ -415,7 +425,12 @@ fn assert_facts_true_for_all_width8(func: &VerifiableFunction, real: impl Fn(u8)
 /// The facts must PIN the result: for every input there must be a wrong value
 /// of `r` that some fact refutes. Without this a definition could be trivially
 /// true (e.g. `0 <= r` alone) and the test above would still pass.
-fn assert_facts_reject(func: &VerifiableFunction, real: impl Fn(u8) -> i128, wrong: impl Fn(i128) -> i128, signed_arg: bool) {
+fn assert_facts_reject(
+    func: &VerifiableFunction,
+    real: impl Fn(u8) -> i128,
+    wrong: impl Fn(i128) -> i128,
+    signed_arg: bool,
+) {
     let facts = facts_of(func);
     for (byte, unsigned_x, signed_x) in all_width8_inputs() {
         let x = if signed_arg { signed_x } else { unsigned_x };
@@ -431,18 +446,44 @@ fn assert_facts_reject(func: &VerifiableFunction, real: impl Fn(u8) -> i128, wro
 #[test]
 fn ctpop_facts_are_true_and_exact_for_every_width8_input() {
     let u32_dest = Ty::Int { width: 32, signed: false };
-    assert_facts_true_for_all_width8(&u8_fn("ctpop", u32_dest.clone()), |b| i128::from(b.count_ones()), false);
-    assert_facts_true_for_all_width8(&i8_fn("ctpop", u32_dest.clone()), |b| i128::from((b as i8).count_ones()), true);
-    assert_facts_reject(&u8_fn("ctpop", u32_dest.clone()), |b| i128::from(b.count_ones()), |r| r + 1, false);
-    assert_facts_reject(&u8_fn("ctpop", u32_dest), |b| i128::from(b.count_ones()), |r| r - 1, false);
+    assert_facts_true_for_all_width8(
+        &u8_fn("ctpop", u32_dest.clone()),
+        |b| i128::from(b.count_ones()),
+        false,
+    );
+    assert_facts_true_for_all_width8(
+        &i8_fn("ctpop", u32_dest.clone()),
+        |b| i128::from((b as i8).count_ones()),
+        true,
+    );
+    assert_facts_reject(
+        &u8_fn("ctpop", u32_dest.clone()),
+        |b| i128::from(b.count_ones()),
+        |r| r + 1,
+        false,
+    );
+    assert_facts_reject(
+        &u8_fn("ctpop", u32_dest),
+        |b| i128::from(b.count_ones()),
+        |r| r - 1,
+        false,
+    );
 }
 
 #[test]
 fn bswap_facts_are_true_and_exact_for_every_width8_input() {
     let u8_ty = Ty::Int { width: 8, signed: false };
     let i8_ty = Ty::Int { width: 8, signed: true };
-    assert_facts_true_for_all_width8(&u8_fn("bswap", u8_ty.clone()), |b| i128::from(b.swap_bytes()), false);
-    assert_facts_true_for_all_width8(&i8_fn("bswap", i8_ty), |b| i128::from((b as i8).swap_bytes()), true);
+    assert_facts_true_for_all_width8(
+        &u8_fn("bswap", u8_ty.clone()),
+        |b| i128::from(b.swap_bytes()),
+        false,
+    );
+    assert_facts_true_for_all_width8(
+        &i8_fn("bswap", i8_ty),
+        |b| i128::from((b as i8).swap_bytes()),
+        true,
+    );
     assert_facts_reject(&u8_fn("bswap", u8_ty), |b| i128::from(b.swap_bytes()), |r| r + 1, false);
 }
 
@@ -450,9 +491,22 @@ fn bswap_facts_are_true_and_exact_for_every_width8_input() {
 fn bitreverse_facts_are_true_and_exact_for_every_width8_input() {
     let u8_ty = Ty::Int { width: 8, signed: false };
     let i8_ty = Ty::Int { width: 8, signed: true };
-    assert_facts_true_for_all_width8(&u8_fn("bitreverse", u8_ty.clone()), |b| i128::from(b.reverse_bits()), false);
-    assert_facts_true_for_all_width8(&i8_fn("bitreverse", i8_ty), |b| i128::from((b as i8).reverse_bits()), true);
-    assert_facts_reject(&u8_fn("bitreverse", u8_ty), |b| i128::from(b.reverse_bits()), |r| r + 1, false);
+    assert_facts_true_for_all_width8(
+        &u8_fn("bitreverse", u8_ty.clone()),
+        |b| i128::from(b.reverse_bits()),
+        false,
+    );
+    assert_facts_true_for_all_width8(
+        &i8_fn("bitreverse", i8_ty),
+        |b| i128::from((b as i8).reverse_bits()),
+        true,
+    );
+    assert_facts_reject(
+        &u8_fn("bitreverse", u8_ty),
+        |b| i128::from(b.reverse_bits()),
+        |r| r + 1,
+        false,
+    );
 }
 
 #[test]
@@ -463,10 +517,26 @@ fn ctlz_and_cttz_facts_are_true_for_every_width8_input_including_zero() {
     // which are UB at zero — are excluded from the model entirely.
     assert_eq!(0u8.leading_zeros(), 8);
     assert_eq!(0u8.trailing_zeros(), 8);
-    assert_facts_true_for_all_width8(&u8_fn("ctlz", u32_dest.clone()), |b| i128::from(b.leading_zeros()), false);
-    assert_facts_true_for_all_width8(&u8_fn("cttz", u32_dest.clone()), |b| i128::from(b.trailing_zeros()), false);
-    assert_facts_true_for_all_width8(&i8_fn("ctlz", u32_dest.clone()), |b| i128::from((b as i8).leading_zeros()), true);
-    assert_facts_true_for_all_width8(&i8_fn("cttz", u32_dest.clone()), |b| i128::from((b as i8).trailing_zeros()), true);
+    assert_facts_true_for_all_width8(
+        &u8_fn("ctlz", u32_dest.clone()),
+        |b| i128::from(b.leading_zeros()),
+        false,
+    );
+    assert_facts_true_for_all_width8(
+        &u8_fn("cttz", u32_dest.clone()),
+        |b| i128::from(b.trailing_zeros()),
+        false,
+    );
+    assert_facts_true_for_all_width8(
+        &i8_fn("ctlz", u32_dest.clone()),
+        |b| i128::from((b as i8).leading_zeros()),
+        true,
+    );
+    assert_facts_true_for_all_width8(
+        &i8_fn("cttz", u32_dest.clone()),
+        |b| i128::from((b as i8).trailing_zeros()),
+        true,
+    );
 
     // The bound is deliberately NOT exact here (see the module header), so the
     // vacuity check is the specific one the facts DO decide: `r == W` forces
@@ -569,7 +639,10 @@ fn saturating_intrinsic_lane_admits_add_and_sub_but_never_mul() {
     );
     // The METHOD recognizer still accepts all three, and now also routes the
     // intrinsic spelling to the SAME clamp construction.
-    assert_eq!(saturating_add_sub_method("core::num::<impl u32>::saturating_mul"), Some("saturating_mul"));
+    assert_eq!(
+        saturating_add_sub_method("core::num::<impl u32>::saturating_mul"),
+        Some("saturating_mul")
+    );
     assert_eq!(
         saturating_add_sub_method(&format!("{MARK}core::intrinsics::saturating_add::<u32>")),
         Some("saturating_add")
@@ -613,6 +686,7 @@ fn saturating_intrinsic_clamp_exhaustive_width8_matches_rust() {
                             span: SourceSpan::default(),
                             atomic: None,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                         },
                     },
@@ -627,9 +701,8 @@ fn saturating_intrinsic_clamp_exhaustive_width8_matches_rust() {
             postconditions: vec![],
             spec: Default::default(),
         };
-        let (dest, value) =
-            saturating_call_dest_value(&func, &func.body.blocks[0].terminator)
-                .expect("the marked saturating intrinsic must reach the clamp model");
+        let (dest, value) = saturating_call_dest_value(&func, &func.body.blocks[0].terminator)
+            .expect("the marked saturating intrinsic must reach the clamp model");
         assert_eq!(dest.local, 3);
         for lhs in 0u16..=255 {
             for rhs in 0u16..=255 {
@@ -666,7 +739,9 @@ fn a_non_integer_argument_is_not_modeled() {
         &format!("{MARK}core::intrinsics::ctpop::<f32>"),
     );
     let subject = Formula::Var("r".into(), Sort::Int);
-    assert!(value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).is_none());
+    assert!(
+        value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).is_none()
+    );
 }
 
 #[test]
@@ -680,7 +755,9 @@ fn a_reassigned_destination_or_argument_is_not_modeled() {
         span: SourceSpan::default(),
     });
     let subject = Formula::Var("r".into(), Sort::Int);
-    assert!(value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).is_none());
+    assert!(
+        value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).is_none()
+    );
 
     // Argument mutably borrowed: `let p = &mut x; *p = other;` rewrites `x`
     // without a visible def of `x`, so every fact naming `x` would go stale.
@@ -690,7 +767,9 @@ fn a_reassigned_destination_or_argument_is_not_modeled() {
         rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
         span: SourceSpan::default(),
     });
-    assert!(value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).is_none());
+    assert!(
+        value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).is_none()
+    );
 }
 
 #[test]
@@ -773,11 +852,7 @@ fn emitted_term_counts_match_the_documented_cost_table() {
             bitrev_d,
             "bitreverse depth W={width}"
         );
-        assert_eq!(
-            depth(&bswap_bits(&x_var(), width).unwrap()),
-            bswap_d,
-            "bswap depth W={width}"
-        );
+        assert_eq!(depth(&bswap_bits(&x_var(), width).unwrap()), bswap_d, "bswap depth W={width}");
     }
     for (width, ctpop_n, bitrev_n, bswap_n) in [
         (8u32, 39, 31, 3),

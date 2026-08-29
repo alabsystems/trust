@@ -4,11 +4,7 @@
 // range-bounds proof surface without std I/O noise.
 
 fn window_len_guarded(data: &[u32], start: usize, end: usize) -> usize {
-    if start <= end && end <= data.len() {
-        data[start..end].len()
-    } else {
-        0
-    }
+    if start <= end && end <= data.len() { data[start..end].len() } else { 0 }
 }
 
 fn main() {

@@ -1958,7 +1958,7 @@ impl<'a> Parser<'a> {
                     && match &expr.kind {
                         ExprKind::While(_, _, None, _)
                         | ExprKind::ForLoop { label: None, .. }
-                        | ExprKind::Loop(_, None, _) => true,
+                        | ExprKind::Loop(_, None, _, _) => true,
                         ExprKind::Block(block, None) => {
                             matches!(block.rules, BlockCheckMode::Default)
                         }
@@ -3059,6 +3059,12 @@ impl<'a> Parser<'a> {
             ));
         }
 
+        // Trust: `for` has no first-class clause position. Parse any clauses
+        // the author wrote anyway, so the refusal can point at them exactly,
+        // then refuse. See `reject_trust_for_loop_contract` for why.
+        let contract = self.parse_trust_loop_contract()?;
+        self.reject_trust_for_loop_contract(contract.as_deref())?;
+
         let (attrs, loop_block) = self.parse_inner_attrs_and_block(
             // Only suggest moving erroneous block label to the loop header
             // if there is not already a label there
@@ -3070,6 +3076,68 @@ impl<'a> Parser<'a> {
         self.recover_loop_else("for", lo)?;
 
         Ok(self.mk_expr_with_attrs(lo.to(self.prev_token.span), kind, attrs))
+    }
+
+    /// Trust: refuse first-class loop clauses on a `for` loop, naming the
+    /// measured reason (two-language design E4/E5).
+    ///
+    /// `while` and `loop` both carry clauses that are parsed, lowered, and
+    /// PROVED. `for` is deliberately not among them, and the reason is a
+    /// measurement rather than an omission.
+    ///
+    /// A `for` desugars to `match IntoIterator::into_iter(head) { mut iter =>
+    /// loop { match Iterator::next(&mut iter) { .. } } }`. The clause would
+    /// attach to that inner `loop`, whose natural MIR header is the block
+    /// before `Iterator::next` — so the loop is ENTERED through a call
+    /// terminator, on every `for` loop, without exception. vcgen requires a
+    /// straight-line entry to build an exact initiation model and refuses
+    /// otherwise with `e45.transition.entry-not-straight-line`. Measured on a
+    /// build that did wire the `for` clause position through end to end:
+    /// `for _x in v invariant acc <= 100`, `for _x in 0..n invariant acc == 0`
+    /// and `for _x in v decreases acc` each produced their obligations and
+    /// each came back UNKNOWN, failing the build under `-Ztrust-policy=strict`.
+    /// No `for` clause has ever been dischargeable.
+    ///
+    /// A clause position that can only ever refuse is worse than no clause
+    /// position: authors write it, get a verifier-internal blocker code, and —
+    /// as the one-elaborator amendment §1 documents actually happening — quietly
+    /// restructure their code around the refusal without learning why. Refusing
+    /// here instead states the reason, names the blocker so the vcgen work item
+    /// is findable, and gives the rewrite. It also keeps `ExprKind` at its
+    /// upstream size: `ForLoop` is the widest variant and has only 3 spare
+    /// padding bytes, so a contract field there costs `Expr` 72 -> 80 bytes,
+    /// while `While`'s and `Loop`'s cost nothing.
+    ///
+    /// When vcgen grows an exact initiation model across a call-terminator
+    /// entry, delete this refusal, restore the `contract` field on
+    /// `ExprKind::ForLoop`, and route it into
+    /// `LoweringContext::collect_trust_loop_clauses` exactly as `while` and
+    /// `loop` already do.
+    fn reject_trust_for_loop_contract(
+        &self,
+        contract: Option<&ast::LoopContract>,
+    ) -> PResult<'a, ()> {
+        let Some(contract) = contract else { return Ok(()) };
+        let Some(first) = contract.clauses.first() else { return Ok(()) };
+        let keyword = match first.kind {
+            ast::LoopClauseKind::Invariant => "invariant",
+            ast::LoopClauseKind::Decreases => "decreases",
+        };
+        let mut err = self.dcx().struct_span_err(
+            first.keyword_span,
+            "`for` loops have no first-class clause position",
+        );
+        err.span_label(first.keyword_span, format!("`{keyword}` is not accepted on a `for` loop"));
+        err.note(
+            "a `for` loop is entered through the `IntoIterator::into_iter` call, so its loop \
+             header is never reached by a straight-line path and the verifier has no exact \
+             initiation model for it (blocker `e45.transition.entry-not-straight-line`)",
+        );
+        err.help(
+            "rewrite the loop as `while` or `loop` with an explicit index or cursor; both accept \
+             `invariant` and `decreases` in the same position and both discharge them",
+        );
+        Err(err)
     }
 
     /// Recovers from an `else` clause after a loop (`for...else`, `while...else`)
@@ -3160,6 +3228,12 @@ impl<'a> Parser<'a> {
     /// Parses `loop { ... }` (`loop` token already eaten).
     fn parse_expr_loop(&mut self, opt_label: Option<Label>, lo: Span) -> PResult<'a, Box<Expr>> {
         let loop_span = self.prev_token.span;
+        // Trust: first-class loop clauses between the `loop` keyword and the
+        // body (`loop invariant P decreases e { .. }`, two-language design
+        // E4/E5) — the same call, the same parser, and the same clause grammar
+        // as `while` (`parse_expr_while`). Vanilla Rust demands `{` here, so no
+        // vanilla program changes meaning.
+        let contract = self.parse_trust_loop_contract()?;
         let (attrs, body) = self.parse_inner_attrs_and_block(
             // Only suggest moving erroneous block label to the loop header
             // if there is not already a label there
@@ -3168,7 +3242,7 @@ impl<'a> Parser<'a> {
         self.recover_loop_else("loop", lo)?;
         Ok(self.mk_expr_with_attrs(
             lo.to(self.prev_token.span),
-            ExprKind::Loop(body, opt_label, loop_span),
+            ExprKind::Loop(body, opt_label, loop_span, contract),
             attrs,
         ))
     }
@@ -4496,7 +4570,7 @@ impl MutVisitor for CondChecker<'_> {
             | ExprKind::If(_, _, _)
             | ExprKind::While(_, _, _, _)
             | ExprKind::ForLoop { .. }
-            | ExprKind::Loop(_, _, _)
+            | ExprKind::Loop(_, _, _, _)
             | ExprKind::Match(_, _, _)
             | ExprKind::Closure(_)
             | ExprKind::Block(_, _)

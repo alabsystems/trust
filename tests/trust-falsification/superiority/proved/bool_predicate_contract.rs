@@ -8,4 +8,6 @@
 // postcond's Int `_0`). Trust now re-sorts `_0` to the real return sort and
 // STATICALLY PROVES the contract, eliminating the runtime check (0 runtime-checked).
 #[core::contracts::ensures(move |r: &bool| *r == (x > 0))]
-pub fn is_positive(x: i32) -> bool { x > 0 }
+pub fn is_positive(x: i32) -> bool {
+    x > 0
+}

@@ -1,10 +1,10 @@
 # Install Trust
 
-> **Current boundary, 2026-07-20:** Trust has a private seed-first source-build
-> path for `aarch64-apple-darwin`. It does not have an authorized public package
-> or a demonstrated Linux/Windows install. A produced Stage2 sysroot is usable
-> only after current-commit inventory and acceptance gates pass; this document
-> does not assert that those gates have passed.
+> **Boundary as last reviewed 2026-07-20:** Trust has a private seed-first
+> source-build path for `aarch64-apple-darwin`. It does not have an authorized
+> public package or a demonstrated Linux/Windows install. A produced Stage2
+> sysroot is usable only after current-commit inventory and acceptance gates
+> pass; this document does not assert that those gates have passed.
 
 Trust descends from `rust-lang/rust`, but its canonical tool names are
 `trustc`, `targo`, `targo-trust`, `trustd`, `trustdoc`, `trustfmt`, `tippy`, and

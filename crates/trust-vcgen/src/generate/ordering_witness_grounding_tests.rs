@@ -9,9 +9,9 @@
 //! check_farkas `Not(is_positive)` / `is_negative` two-def join.
 
 use trust_types::{
-    AggregateKind, BasicBlock, BlockId, ConstValue, Contract, ContractKind, Formula,
-    LocalDecl, Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator,
-    Ty, UnOp, VariantDef, VcKind, VerifiableBody, VerifiableFunction,
+    AggregateKind, BasicBlock, BlockId, ConstValue, Contract, ContractKind, Formula, LocalDecl,
+    Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, UnOp,
+    VariantDef, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{generate_v2_contract_vcs_impl, parse_ok_pair_model_var, parse_sign_model_var};
@@ -25,12 +25,16 @@ fn i64_ty() -> Ty {
 }
 
 fn rat_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "rational::Rat".into(),
         fields: vec![("id".into(), Ty::Int { width: 32, signed: false })],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn pair_ty() -> Ty {
@@ -44,7 +48,9 @@ fn ref_rat_ty() -> Ty {
 /// `std::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1).
 fn result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "std::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
@@ -52,11 +58,21 @@ fn result_ty(ok_payload: Ty) -> Ty {
             ("__v1_0".into(), i64_ty()),
         ],
         variants: vec![
-            VariantDef { name: "Ok".into(), discriminant: 0, fields: vec![("0".into(), ok_payload)] },
-            VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), i64_ty())] },
+            VariantDef {
+                name: "Ok".into(),
+                discriminant: 0,
+                fields: vec![("0".into(), ok_payload)],
+            },
+            VariantDef {
+                name: "Err".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), i64_ty())],
+            },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn func_with(
@@ -70,7 +86,13 @@ fn func_with(
         name: "ord_pair".to_string(),
         def_path: "test::ord_pair".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty: ret_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty: ret_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
             span: SourceSpan::default(),
@@ -96,6 +118,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         unwind: Default::default(),
     }
 }
@@ -111,10 +134,7 @@ fn switch(discr: Operand, targets: Vec<(u128, usize)>, otherwise: usize) -> Term
 }
 
 fn downcast_field(local: usize, variant: usize) -> Place {
-    Place {
-        local,
-        projections: vec![Projection::Downcast(variant), Projection::Field(0)],
-    }
+    Place { local, projections: vec![Projection::Downcast(variant), Projection::Field(0)] }
 }
 
 fn field(local: usize, i: usize) -> Place {
@@ -123,14 +143,24 @@ fn field(local: usize, i: usize) -> Place {
 
 fn ok_aggregate(op: Operand) -> Rvalue {
     Rvalue::Aggregate(
-        AggregateKind::Adt { name: "std::result::Result".into(), variant: 0, active_field: None, args: None },
+        AggregateKind::Adt {
+            name: "std::result::Result".into(),
+            variant: 0,
+            active_field: None,
+            args: None,
+        },
         vec![op],
     )
 }
 
 fn err_aggregate(op: Operand) -> Rvalue {
     Rvalue::Aggregate(
-        AggregateKind::Adt { name: "std::result::Result".into(), variant: 1, active_field: None, args: None },
+        AggregateKind::Adt {
+            name: "std::result::Result".into(),
+            variant: 1,
+            active_field: None,
+            args: None,
+        },
         vec![op],
     )
 }
@@ -185,9 +215,7 @@ fn ungrounded_details(func: &VerifiableFunction) -> Vec<String> {
         .collect()
 }
 
-fn ok_path_vc(
-    vcs: &[trust_types::VerificationCondition],
-) -> &trust_types::VerificationCondition {
+fn ok_path_vc(vcs: &[trust_types::VerificationCondition]) -> &trust_types::VerificationCondition {
     vcs.iter()
         .find(|vc| has_ok_discr_pin(&vc.formula))
         .unwrap_or_else(|| panic!("the Ok path VC pins _0__discr == 1: {vcs:#?}"))
@@ -229,7 +257,7 @@ fn pair_wrapper_fn(
         LocalDecl { index: 12, ty: ref_rat_ty(), name: None },
         LocalDecl { index: 13, ty: ref_rat_ty(), name: None },
         LocalDecl { index: 14, ty: result_ty(pair_ty()), name: None }, // guard-Err temp
-        LocalDecl { index: 16, ty: pair_ty(), name: None },           // tuple temp
+        LocalDecl { index: 16, ty: pair_ty(), name: None },            // tuple temp
     ];
     let cmp_callee = format!("<rational::Rat as std::cmp::PartialOrd>::{cmp_method}");
     let mut ok_stmts = Vec::new();
@@ -278,8 +306,14 @@ fn pair_wrapper_fn(
                     assign(Place::local(8), Rvalue::Use(Operand::Copy(downcast_field(6, 0)))),
                     assign(Place::local(4), Rvalue::Use(Operand::Copy(field(8, 0)))),
                     assign(Place::local(5), Rvalue::Use(Operand::Copy(field(8, 1)))),
-                    assign(Place::local(12), Rvalue::Ref { mutable: false, place: Place::local(4) }),
-                    assign(Place::local(13), Rvalue::Ref { mutable: false, place: Place::local(5) }),
+                    assign(
+                        Place::local(12),
+                        Rvalue::Ref { mutable: false, place: Place::local(4) },
+                    ),
+                    assign(
+                        Place::local(13),
+                        Rvalue::Ref { mutable: false, place: Place::local(5) },
+                    ),
                 ],
                 terminator: call(
                     &cmp_callee,
@@ -303,7 +337,11 @@ fn pair_wrapper_fn(
                 terminator: Terminator::Goto(BlockId(8)),
             },
             // Ok path.
-            BasicBlock { id: BlockId(7), stmts: ok_stmts, terminator: Terminator::Goto(BlockId(8)) },
+            BasicBlock {
+                id: BlockId(7),
+                stmts: ok_stmts,
+                terminator: Terminator::Goto(BlockId(8)),
+            },
             BasicBlock { id: BlockId(8), stmts: vec![], terminator: Terminator::Return },
         ]);
     } else {
@@ -517,8 +555,8 @@ fn sign_not_hop_fn() -> VerifiableFunction {
         LocalDecl { index: 5, ty: i64_ty(), name: None },
         LocalDecl { index: 6, ty: i64_ty(), name: None },
         LocalDecl { index: 7, ty: result_ty(rat_ty()), name: None },
-        LocalDecl { index: 8, ty: Ty::Bool, name: None },  // is_positive dest
-        LocalDecl { index: 9, ty: Ty::Bool, name: None },  // contradiction (2 defs)
+        LocalDecl { index: 8, ty: Ty::Bool, name: None }, // is_positive dest
+        LocalDecl { index: 9, ty: Ty::Bool, name: None }, // contradiction (2 defs)
         LocalDecl { index: 10, ty: Ty::Bool, name: None }, // switch copy
         LocalDecl { index: 11, ty: result_ty(rat_ty()), name: None },
     ];
@@ -605,10 +643,7 @@ fn ok_pair_and_sign_model_var_parsers_are_strict() {
     let v = parse_ok_pair_model_var(OK0).expect("tuple-bind shape parses");
     assert_eq!((v.name.as_str(), v.index), (OK0, 0));
     // Versioned copies parse to the BASE name.
-    assert_eq!(
-        parse_ok_pair_model_var("_0__value.__trust_ok_1#s1_0").map(|v| v.index),
-        Some(1)
-    );
+    assert_eq!(parse_ok_pair_model_var("_0__value.__trust_ok_1#s1_0").map(|v| v.index), Some(1));
     // Trailing projections, non-numeric indices, other bases: fail closed.
     assert!(parse_ok_pair_model_var("_0__value.__trust_ok_0.1").is_none());
     assert!(parse_ok_pair_model_var("_0__value.__trust_ok_").is_none());

@@ -80,7 +80,12 @@ fn build_trust_extra_gate(product_proof_coverage: &GateReport) -> GateReport {
 
 fn check_required_metadata(root: &Path) -> GateReport {
     let mut findings = Vec::new();
-    for relative in [DEFAULT_VERSION_SOURCE_PATH, "src/version", "src/ci/channel"] {
+    // `src/rust-compat-version` is required, not optional: the bound-tool
+    // surface spells every tool's expected `--version` line from it, so a
+    // missing file would silently expect `unknown-dev` from every tool.
+    for relative in
+        [DEFAULT_VERSION_SOURCE_PATH, "src/version", "src/rust-compat-version", "src/ci/channel"]
+    {
         let valid = fs::symlink_metadata(root.join(relative)).ok().is_some_and(|metadata| {
             !metadata.file_type().is_symlink() && metadata.file_type().is_file()
         });
@@ -94,6 +99,7 @@ fn check_required_metadata(root: &Path) -> GateReport {
     GateReport::new("required-metadata", findings).with_evidence_refs([
         DEFAULT_VERSION_SOURCE_PATH,
         "src/version",
+        "src/rust-compat-version",
         "src/ci/channel",
     ])
 }
@@ -372,12 +378,19 @@ fn compatibility_aliases_for_tool(
     let aliases = match tool_name {
         "trustc" => &["rustc"][..],
         "targo" => &["cargo"][..],
-        // The selected Trust sysroot deliberately exposes every secondary
-        // tool only through its canonical Trust name. Bootstrap and stage0
-        // reject the retired Rust/upstream spellings, so treating them as
-        // required compatibility aliases makes a correct release sysroot
-        // impossible to certify. Only rustc/cargo remain load-bearing
-        // compatibility entrypoints for the Rust build ecosystem.
+        // cargo drives its doctest phase by spawning a binary named `rustdoc`,
+        // and rustup's proxy refuses a linked toolchain without it, so
+        // bootstrap installs the alias into every stage >= 1 sysroot and dist
+        // packages both names (76d408e1cd; tool.rs:1676
+        // `rustdoc_sysroot_bins`). It is the third load-bearing compatibility
+        // entrypoint, and requiring it here is what still rejects a stock
+        // rustdoc now that the name is no longer on
+        // FORBIDDEN_TRUST_PUBLIC_BIN_NAMES.
+        "trustdoc" => &["rustdoc"][..],
+        // Every other secondary tool is deliberately exposed only through its
+        // canonical Trust name. Bootstrap and stage0 reject those retired
+        // Rust/upstream spellings, so treating them as required compatibility
+        // aliases would make a correct release sysroot impossible to certify.
         _ => &[][..],
     };
     let Some(bin_dir) = tool_path.and_then(Path::parent) else {

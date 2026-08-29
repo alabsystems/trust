@@ -26,11 +26,7 @@ fn seg_lookup(table: &[(u32, u32, i32, u8)], cp: u32) -> u32 {
         return cp;
     }
     let (s, e, delta, stride) = table[idx - 1];
-    if cp <= e && (cp - s) % stride as u32 == 0 {
-        (cp as i64 + delta as i64) as u32
-    } else {
-        cp
-    }
+    if cp <= e && (cp - s) % stride as u32 == 0 { (cp as i64 + delta as i64) as u32 } else { cp }
 }
 
 /// Simple case folding (scf). Identity for unmapped code points.
@@ -44,11 +40,7 @@ pub fn scf(cp: u32) -> u32 {
 pub fn canon_nonu(unit: u32) -> u32 {
     debug_assert!(unit <= 0xFFFF);
     let up = seg_lookup(CANON_NONU, unit);
-    if unit >= 128 && up < 128 {
-        unit
-    } else {
-        up
-    }
+    if unit >= 128 && up < 128 { unit } else { up }
 }
 
 /// Canonicalize under a fold mode.
@@ -117,7 +109,7 @@ pub fn advance_width(input: &[u16], pos: usize, unicode: bool) -> usize {
 
 /// The `\s` set: WhiteSpace ∪ LineTerminator (ES2025 22.2.2.9 + 12.2/12.3).
 pub static WHITESPACE_RANGES: &[(u32, u32)] = &[
-    (0x09, 0x0D),     // TAB LF VT FF CR
+    (0x09, 0x0D), // TAB LF VT FF CR
     (0x20, 0x20),
     (0xA0, 0xA0),
     (0x1680, 0x1680),
@@ -130,16 +122,14 @@ pub static WHITESPACE_RANGES: &[(u32, u32)] = &[
 ];
 
 /// LineTerminator (for `.`, multiline `^`/`$`).
-pub static LINE_TERMINATORS: &[(u32, u32)] =
-    &[(0x0A, 0x0A), (0x0D, 0x0D), (0x2028, 0x2029)];
+pub static LINE_TERMINATORS: &[(u32, u32)] = &[(0x0A, 0x0A), (0x0D, 0x0D), (0x2028, 0x2029)];
 
 pub fn is_line_terminator(cp: u32) -> bool {
     in_ranges(LINE_TERMINATORS, cp)
 }
 
 /// Basic word characters (`\w` without the ui extension).
-pub static WORD_BASIC: &[(u32, u32)] =
-    &[(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)];
+pub static WORD_BASIC: &[(u32, u32)] = &[(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)];
 
 /// WordCharacters(rer): basic, plus — iff ignoreCase AND either unicode
 /// flag — every char whose Canonicalize (scf) lands in the basic set.

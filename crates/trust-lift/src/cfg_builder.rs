@@ -7,10 +7,10 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::{BTreeSet, VecDeque};
-use trust_types::fx::FxHashMap;
 
 use trust_disasm::operand::RegKind;
 use trust_disasm::{ControlFlow, Decoder, DisasmError, Instruction, Opcode, Operand};
+use trust_types::fx::FxHashMap;
 
 use crate::cfg::{Cfg, CfgEdge, CfgEdgeKind, CfgEdgeTarget, LiftedBlock};
 use crate::error::{LiftError, LiftProofMode};

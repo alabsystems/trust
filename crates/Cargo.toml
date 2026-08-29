@@ -86,6 +86,40 @@ debug = false
 [patch.crates-io]
 # See the root manifest: memchr is first-party (crates/trust-memchr).
 memchr = { path = "trust-memchr" }
+# NOT YET: `sha2 = { path = "trust-sha2-compat" }`.
+#
+# The line above is the whole sibling swap and it WORKS — measured 2026-08-22,
+# it removes `sha2 0.10.9` from this graph entirely and converts ay, trust-cg,
+# trust-ir, trust-mc, trust-vc, trust-wp and `rustc_span`, with zero edits to
+# any submodule. It is commented out for two measured reasons, both of which
+# must be cleared first, and NEITHER of which is a build failure you would
+# notice:
+#
+#  1. It makes the acceptance gate vacuous while leaving it GREEN.
+#     `crates/trust-sha2` dev-depends on the incumbent `sha2 = "0.10"` so that
+#     `tests/differential_sha2.rs` can compare the two implementations. This
+#     patch is graph-wide, so it captures that dev-dependency too:
+#     `trust-sha2 -> sha2 0.10.100`, i.e. the differential compares trust-sha2
+#     against ITSELF. Measured: 6/6 passed in 0.20s, and the only signal was
+#     `warning: unused import: trust_sha2::Digest` — the compiler noticing the
+#     two names had become one trait. The acceptance gate for the entire
+#     crypto-replacement program would read green while testing nothing.
+#     Fix before enabling: give the differential an incumbent that a
+#     crates-io patch cannot reach (a vendored path dep under `vendor/`, or
+#     move the test to a workspace without this patch). Deleting the test —
+#     which trust-sha2's own header proposes for "the day the patch lands" —
+#     is the one option that must NOT be taken silently, because it retires
+#     the evidence and the obligation in the same commit.
+#
+#  2. `ed25519-dalek` is captured and does not compile. This one is LOUD
+#     (`the trait bound Sha512: curve25519_dalek::digest::Digest is not
+#     satisfied`, `HashMarker` not implemented), so it gates rather than
+#     corrupts. It needs the phase-1d ed25519 replacement, or a shim
+#     implementing RustCrypto's `digest` traits for these types.
+#
+# See `crates/trust-sha2-compat/` for the crate this line points at, and its
+# `[features]` comment for the third trap (an undeclared feature silently
+# un-substitutes one consumer rather than erroring).
 rustc-hash = { path = "../first-party/ty/crates/tla-hash-fx" }
 rustc_version = { path = "../vendor/rustc_version_0_4_1" }
 
@@ -185,12 +219,109 @@ members = [
     "trust-convergence",
     "trust-temporal",
     "trust-proof-cert",
+    # Total, VERIFIED ratio and clamp arithmetic for Trust's own scorecards.
+    # The first crates/-resident component written to PASS the authenticated
+    # strict lane rather than to be retrofitted onto it: no dependencies, no
+    # `derive`, no `impl Display`, no allocation, and a grammar `ensures`
+    # clause on every public function. It exists because the repo's own
+    # percentage arithmetic is open-coded ~30 times with `.max(1)` denominators
+    # that silently substitute a population nobody chose.
+    "trust-ratio",
     "trust-clean",
     # I4 (docs/design/2026-08-04-two-language-compiler-architecture.md): Clean
     # type -> Rust carrier. The ONLY sound producer of `CarrierEvidence::Total`,
     # and therefore the gate that stands between a Clean `Nat` and a wrapping
     # `u64` in the emitted binary. Lands before any `DefId` is minted.
     "trust-clean-carrier",
+    # Phase 1 of the third-party replacement program: the Trust-owned crypto
+    # primitives that retire `sha2`/`hmac` (and, with them, `digest`,
+    # `crypto-common`, `block-buffer`, `generic-array`, `typenum`, `subtle`)
+    # from the verified lane's `dependency-policy-excluded` list. Zero
+    # third-party dependencies by construction; trust-hmac depends only on
+    # trust-sha2, because HMAC is defined over a hash. NOT yet redirected into
+    # the consumers — the `[patch.crates-io]` swap lands only after the
+    # differential against the incumbents is green.
+    "trust-sha2",
+    "trust-hmac",
+    # Phase 1b of the same program: the Trust-owned OS-entropy facade that
+    # retires `rand` (and with it `rand_chacha`, `rand_core`, `getrandom`,
+    # `wasi`) from `crates/`, and `getrandom` from `targo-trust`. Zero
+    # third-party dependencies; two fail-closed arms (getentropy(2), then
+    # /dev/urandom) and no path that returns bytes it did not get from the OS.
+    # Unlike sha2/hmac this is NOT a `package = ` rename — see the note at the
+    # `sha2`/`hmac` entries below and the crate's own Cargo.toml header.
+    "trust-rand",
+    # Phase 1d of the same program, and the largest piece: the Trust-owned
+    # Ed25519 (RFC 8032 §5.1) with the curve25519 field and group arithmetic it
+    # needs. It retires `ed25519-dalek` and the 34-package closure behind it —
+    # the `curve25519` family, `fiat-crypto`, `der`/`pkcs8`/`spki`/`const-oid`,
+    # `subtle`, `zeroize`, and crucially crates.io `sha2` itself, which phase 1a
+    # could not remove from `crates/` because this edge still pulled it.
+    # Depends only on `trust-sha2` (RFC 8032 Ed25519 IS SHA-512 by definition).
+    # RENAMED OVER `ed25519-dalek` below — the integration landed, gated on
+    # `trust-ed25519/tests/differential_ed25519.rs` (17/17, 5655 cases, 0
+    # disagreements) and `trust-rand/tests/ed25519_equivalence.rs` (the keygen
+    # call-site rewrite). The incumbent survives ONLY as those two crates'
+    # explicit-version dev-dependency, which is what keeps the gates real.
+    "trust-ed25519",
+    # Phase 2 of the same program, and the first non-crypto replacement: the
+    # Trust-owned TOML v1.0.0 reader. Measured on this workspace's shipping
+    # closure (NORMAL dep-kind edges, platform-filtered), converting the five
+    # `crates/` consumers of `toml` takes the third-party unit count 121 -> 115
+    # by retiring `toml`, `toml_edit`, `toml_datetime`, `toml_write`,
+    # `serde_spanned` and `winnow`. Unlike the `serde` stack, every in-closure
+    # parent of `toml` is a member of THIS workspace, so nothing is deferred
+    # across a `first-party/*` sibling.
+    #
+    # RENAMED over `toml` below and WIRED into every consumer. Both halves
+    # exist: the read path (`from_str`, `Value`, `Table`, `de::Error`) and the
+    # write path (`to_string` / `to_string_pretty` — 11 call sites across
+    # trust-js-differential). Both preconditions the earlier text set are met —
+    # the differential against the incumbent is green and the serialize path
+    # exists.
+    #
+    # The rename landed in ONE commit across all seven consumers plus BOTH
+    # workspace tables, because a partial rename would not fail loudly: it would
+    # compile in four consumers and leave the fifth on the registry crate, which
+    # measures as a kill of ZERO. `trust-version` needed its own edit — its
+    # manifest spelled `toml` inline, so neither workspace table reached it.
+    "trust-toml",
+    # Phase 2 of the same program, binary half: the Trust-owned `bincode 1.x`
+    # wire format. Unlike `toml` (a feature-flag question) `bincode 1.3.3` is
+    # an UNCONDITIONAL serde blocker — its manifest declares
+    # `[dependencies.serde] version = "1.0.63"` with no `optional` and no
+    # feature gate, so no flag can remove the edge and the package has to be
+    # replaced. Consumers: trust-certify (23 sites), trust-clean (9),
+    # trust-proof-cert (2), trust-types (10, dev-only), plus 11 in
+    # `first-party/trust-ir`'s `clean_expr_codec`.
+    #
+    # LANDS INERT, deliberately: it is a member so it is built and tested, and
+    # NOTHING depends on it. The swap is a separate step, and it must not be a
+    # graph-wide `[patch.crates-io] bincode` while the acceptance differential
+    # still needs the incumbent's own bytes — see the `sha2` block above for
+    # the measured instance of exactly that mistake (a differential comparing
+    # a crate to ITSELF, green, testing nothing).
+    #
+    # `bincode 2.0.1` is a different problem (its serde IS optional) and is
+    # out of this crate's scope.
+    "trust-bincode",
+    # The package-name alias `sha2` (see its manifest). `[patch.crates-io]`
+    # substitutes by package NAME and cannot rename, so the dependency-rename
+    # above reaches only manifests WE own; the `first-party/*` submodules,
+    # whose manifests we cannot edit without breaking their standalone builds,
+    # are reached by patching this crate in instead. Same shape as
+    # `trust-memchr`. Being a member only means it is built and tested here —
+    # it is NOT yet patched into anything; see its manifest for the two
+    # measured preconditions.
+    "trust-sha2-compat",
+    # Phase 2 of the third-party replacement program, JSON half: the
+    # Trust-owned `serde_json` data model, writer and parser. Zero
+    # dependencies. Its gate is a BYTE differential, not a semantic one --
+    # `crates/trust-types/src/digest.rs` hashes serialized JSON, so
+    # equally-valid-but-differently-spelled output silently rewrites every
+    # digest in the tree. NOT yet renamed over `serde_json`: the rename is
+    # blocked on the serde-traits layer, which is a six-repository change.
+    "trust-json",
     # I6, runtime half: the Trust-owned arbitrary-precision natural with Lean
     # Nat semantics EXACTLY (truncated sub, n/0 = 0, n%0 = n) — the bignum
     # carrier §5b names as the default for unbounded Clean types. Zero
@@ -201,6 +332,10 @@ members = [
     # carrier-typed faithfulness gate. Not yet wired into the compiler; see the
     # crate docs for the four measured blockers.
     "trust-clean-origin",
+    # The Clean -> TrustIR producer: the SECOND consumer of a sealed
+    # `CleanOriginPlan`, so the two authoritative languages meet in TrustIR
+    # rather than in MIR.
+    "trust-clean-ir",
     "trust-certify",
     "trust-semantics",
     "trust-decompile",
@@ -270,6 +405,18 @@ exclude = [
 # step with the root workspace's table.
 [workspace.lints.rust]
 warnings = "warn"
+# Trust: `env_mutation` is Allow-by-default in the compiler so that upstream
+# code compiles identically (it broke 8 upstream UI tests at `Warn`, whose
+# stderr is compared). The stance is kept exactly where Trust owns the code:
+# every member inheriting this table gets the full diagnostic signal.
+env_mutation = "warn"
+# ... and stock rustc does not know that lint name. The `crates/` fast lane
+# (`cargo check` under the host toolchain) would otherwise emit
+# `warning[E0602]: unknown lint` for every unit, which `warnings = "warn"`
+# above turns into noise and a `-D warnings` lane would turn into an error.
+# Allowing the META-lint keeps the real one live under trustc and silent
+# under a compiler that has never heard of it.
+unknown_lints = "allow"
 
 [workspace.package]
 version = "0.1.0"
@@ -295,7 +442,33 @@ trust-ts-embed = { path = "trust-ts-embed" }
 trust-release = { path = "trust-release" }
 trust-clean = { path = "trust-clean" }
 trust-clean-origin = { path = "trust-clean-origin" }
+trust-clean-ir = { path = "trust-clean-ir" }
 trust-bignum = { path = "trust-bignum" }
+# Phase 1 crypto replacement. trust-hmac consumes trust-sha2's `Digest`; no
+# consumer crate points at either yet.
+trust-sha2 = { path = "trust-sha2" }
+trust-hmac = { path = "trust-hmac" }
+# Phase 1d: Trust-owned Ed25519. Depends only on trust-sha2. Reached by
+# consumers under the RENAMED name `ed25519-dalek` below; this entry exists so
+# the two workspace tables stay aligned and so a future consumer can name the
+# crate directly.
+trust-ed25519 = { path = "trust-ed25519" }
+# Phase 2: the Trust-owned TOML reader AND writer. It IS aliased over `toml`
+# below — this entry is retained so the two workspace tables stay aligned and so
+# a consumer can name the crate directly, exactly as `trust-sha2`/`trust-hmac`/
+# `trust-ed25519` above do alongside their own aliases.
+trust-toml = { path = "trust-toml" }
+# Phase 2, JSON half: the Trust-owned `serde_json`. Named `trust-json`, NOT
+# aliased over `serde_json`. The alias is what makes 1350 `#[derive(Serialize)]`
+# sites resolve here, and those need the serde TRAITS, which this crate
+# deliberately does not depend on — so the rename lands with the serde layer,
+# not with this crate. A consumer that wants the writer/parser today (no derive
+# involved) names it directly.
+trust-json = { path = "trust-json" }
+# Phase 1b crypto replacement: OS entropy. Named `trust-rand`, NOT aliased over
+# `rand`, because it is not a drop-in — see the note at the `rand` entry below.
+trust-rand = { path = "trust-rand" }
+trust-ratio = { path = "trust-ratio" }
 trust-convergence = { path = "trust-convergence" }
 trust-temporal = { path = "trust-temporal" }
 trust-proof-cert = { path = "trust-proof-cert" }
@@ -335,14 +508,67 @@ trust-ts-strip = { path = "trust-ts-strip" }
 ny-cert = { path = "../first-party/ny/crates/ny-cert" }
 rustc-hash = "2.0.0"
 indexmap = "2.7"
-sha2 = "0.10"
-hmac = "0.12"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
+# PHASE 1 SUPPLY-CHAIN REPLACEMENT — these two names now resolve to Trust-owned
+# crates, via Cargo's dependency RENAMING (`package = `). Every member that
+# writes `sha2 = { workspace = true }` and `use sha2::{Digest, Sha256}` keeps
+# compiling verbatim; the crate behind the name is ours. That is deliberate:
+# the alternative (rewriting `use sha2::` to `use trust_sha2::` in 20 crates and
+# ~79 files) is a large diff whose every line is a chance to miss a call site,
+# for identical behaviour.
+#
+# The swap is gated on `crates/trust-sha2/tests/differential_sha2.rs` and
+# `crates/trust-hmac/tests/differential_hmac.rs`, which compare against the
+# INCUMBENTS — those two crates therefore name `sha2`/`hmac` by explicit version
+# in their own dev-dependencies rather than through the workspace, because here
+# the workspace name no longer means the incumbent.
+sha2 = { package = "trust-sha2", path = "trust-sha2" }
+hmac = { package = "trust-hmac", path = "trust-hmac" }
+# PHASE 1d, SAME RENAME MECHANISM. `use ed25519_dalek::{...}` compiles verbatim
+# against the Trust-owned crate; the crate behind the name is ours. This retires
+# the 34-package incumbent closure — `curve25519-dalek(+derive)`, `fiat-crypto`,
+# `ed25519`, `signature`, `subtle`, `zeroize`, `rand_core` — and, with it, the
+# last `crates/` edge into crates.io `sha2`.
+#
+# THE FEATURE LIST IS GONE, AND ITS ABSENCE IS LOAD-BEARING. `trust-ed25519`
+# declares no `[features]` at all, and Cargo hard-errors on a feature a renamed
+# dependency does not have ("... depends on X with feature `rand_core` but X
+# does not have that feature"). `rand_core` existed only to reach
+# `SigningKey::generate`, whose bound is the third-party `rand_core::
+# CryptoRngCore` trait; `trust-ed25519` deliberately omits that constructor and
+# `trust-proof-cert` now seeds `from_bytes` with `trust_rand::secret_seed_32()`.
+#
+# The gate stays REAL because `trust-ed25519` and `trust-rand` name the
+# incumbent by explicit version in their own dev-dependencies rather than
+# through this table — so the differential and the keygen-equivalence test
+# still compare against crates.io `ed25519-dalek 2.x`, not against ourselves.
+ed25519-dalek = { package = "trust-ed25519", path = "trust-ed25519" }
+# `rand` IS GONE — deliberately NOT replaced by a `rand = { package =
+# "trust-rand", ... }` alias. sha2/hmac/ed25519-dalek are drop-ins, so renaming
+# their names is a zero-source-edit swap; `rand`'s surface is enormous and
+# `trust-rand` implements the one function this tree called, so an alias would
+# make every other `rand::` path resolve to nothing and report the error at the
+# CONSUMER instead of here. Consumers name `trust-rand` directly — there is
+# exactly one, `trust-proof-cert`.
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+# trust: PHASE 1e, same rename mechanism as `sha2`/`hmac`/`ed25519-dalek`
+# above. Retires the incumbent's cluster — `toml`, `toml_edit`,
+# `toml_datetime`, `toml_write`, `serde_spanned`, `winnow` — from the shipping
+# closure. All five NORMAL consumers (trust-clean, trust-deps,
+# trust-js-differential, trust-upstream-compat, trust-version) plus the two dev
+# consumers (trust-bmc, trust-router) flip together: a PARTIAL rename measures a
+# kill of ZERO, because one surviving edge keeps `toml` in the closure.
+#
+# The acceptance gate stays REAL: `crates/trust-toml` dev-depends on the
+# incumbent by EXPLICIT VERSION (`incumbent-toml = { package = "toml", version
+# = "0.8.23" }`), not through this table, so `tests/differential_corpus.rs` and
+# `tests/serialize_differential.rs` keep comparing against crates.io rather than
+# against themselves. That dev-dep is also why `toml 0.8.23` REMAINS in
+# `crates/Cargo.lock` after a complete swap — `Cargo.lock` carries no dep-kind
+# field, so only a normal-kind, platform-filtered `targo metadata` query shows
+# the real shipping closure.
+toml = { package = "trust-toml", path = "trust-toml" }
 bincode = "1.3"
 num-bigint = "0.4"
 proptest = "1.11"

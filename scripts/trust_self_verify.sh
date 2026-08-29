@@ -44,12 +44,20 @@
 #                    soundness tripwire that makes the dogfood meaningful.
 #
 # EXIT CONTRACT (matches the task):
-#   * exit 0   — no false proof. Incompleteness (unknown / runtime_checked on a
-#                safe sample) is reported, never fatal.
+#   * exit 0   — the tripwire RAN and found no false proof. Incompleteness
+#                (unknown / runtime_checked on a safe sample) is reported, never
+#                fatal.
 #   * exit 1   — at least one FALSE PROOF (an `unsafe` sample's load-bearing
 #                obligation came back `proved`). This is a soundness regression.
-#   * exit 2   — harness/setup error (e.g. corpus failed to compile at all).
-#   * exit 0 (skip) — no stage2 trustc present; prints a clear notice.
+#   * exit 2   — harness/setup error: the tripwire could NOT run. No stage2
+#                trustc; corpus produced no verification output; zero
+#                obligations; or an `unsafe` sample emitted no obligation of its
+#                load-bearing kind (an inert tripwire).
+#
+# There is NO skip-and-succeed exit. Absence of the subject is exit 2, never 0 —
+# a self-verification lane that reports success with no compiler present is
+# indistinguishable, to every downstream consumer, from one that proved
+# something. That fail-open shape is the exact defect this lane exists to catch.
 #
 # DETERMINISTIC & RE-RUNNABLE: a fixed corpus, sorted output, no timestamps in
 # the pass/fail logic. The scorecard records the trustc path + git rev for
@@ -63,8 +71,11 @@ set -u
 set -o pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TRUSTC="${TRUSTC:-$REPO/build/host/stage2/bin/trustc}"
-SCORECARD="$REPO/reports/self-verification-scorecard.md"
+DEFAULT_TRUSTC="$REPO/build/host/stage2/bin/trustc"
+TRUSTC_EXPLICIT=0
+if [ -n "${TRUSTC:-}" ]; then TRUSTC_EXPLICIT=1; fi   # `x && y=1` would exit 1 under a future set -e
+TRUSTC="${TRUSTC:-$DEFAULT_TRUSTC}"
+SCORECARD="${SCORECARD:-$REPO/reports/self-verification-scorecard.md}"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/trust_self_verify.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -75,29 +86,67 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # stale. Re-adding these would resurrect a dead knob.
 
 # ---------------------------------------------------------------------------
-# Graceful skip when no built compiler is present.
+# Resolve the compiler. FAIL-CLOSED: an absent subject is exit 2, never 0.
 # ---------------------------------------------------------------------------
-if [ ! -x "$TRUSTC" ]; then
-    # Try common host triples before giving up.
+usable_trustc() {
+    # `-x` alone is TRUE for a directory (executable == searchable), so a stray
+    # `build/host/stage2/bin/trustc/` dir would read as "compiler present".
+    [ -f "$1" ] && [ -x "$1" ]
+}
+why_not() {
+    if   [ ! -e "$1" ]; then echo "no such path"
+    elif [ -d "$1" ];   then echo "is a directory, not an executable"
+    elif [ ! -f "$1" ]; then echo "not a regular file"
+    elif [ ! -x "$1" ]; then echo "not executable"
+    else                     echo "usable"; fi
+}
+
+SEARCHED=("$TRUSTC")
+if ! usable_trustc "$TRUSTC" && [ "$TRUSTC_EXPLICIT" -eq 0 ]; then
+    # Auto-discovery ONLY when the caller named nothing. An explicitly set
+    # $TRUSTC is honoured or refused — never silently replaced: the release lane
+    # row names build/host/stage2/bin/trustc, and falling back would measure a
+    # different compiler than the one under test and still report success.
     for host in aarch64-apple-darwin x86_64-unknown-linux-gnu host; do
         cand="$REPO/build/$host/stage2/bin/trustc"
-        if [ -x "$cand" ]; then TRUSTC="$cand"; break; fi
+        SEARCHED+=("$cand")
+        if usable_trustc "$cand"; then TRUSTC="$cand"; break; fi
     done
 fi
-if [ ! -x "$TRUSTC" ]; then
-    echo "NOTICE: no built stage2 trustc found (looked at \$TRUSTC and"
-    echo "        build/<host>/stage2/bin/trustc). Skipping self-verification."
-    echo "        Build with ./x.py build --stage 2, then re-run."
-    # Still emit a scorecard stub so downstream consumers see a deterministic file.
+
+if ! usable_trustc "$TRUSTC"; then
     {
-        echo "# Trust Self-Verification Scorecard"
-        echo
-        echo "**Status: SKIPPED** — no built stage2 \`trustc\` was found."
-        echo
-        echo "Build the compiler (\`./x.py build --stage 2\`) and re-run"
-        echo "\`scripts/trust_self_verify.sh\` to populate this scorecard."
-    } > "$SCORECARD"
-    exit 0
+        echo "REFUSE (exit 2): no usable stage2 trustc."
+        echo "  looked for: an executable regular file (the stage2 \`trustc\` binary)"
+        for p in "${SEARCHED[@]}"; do
+            printf '    %s\n        -> %s\n' "$p" "$(why_not "$p")"
+        done
+        if [ "$TRUSTC_EXPLICIT" -eq 1 ]; then
+            echo "  \$TRUSTC was set explicitly, so no fallback path was searched."
+        else
+            echo "  \$TRUSTC was unset; the default plus common host triples were searched."
+        fi
+        echo "  fix: ./x.py build --stage 2   (or set TRUSTC=<path to trustc>)"
+        echo "  this is NOT a skip: a self-verification lane that exits 0 with no"
+        echo "  compiler present is a false green — the exact shape it must catch."
+    } >&2
+    # A "SKIPPED" stub over the last real scorecard destroys the only evidence
+    # of the last real run and reads benign. Only mint one if none exists.
+    if [ ! -e "$SCORECARD" ]; then
+        mkdir -p "$(dirname "$SCORECARD")" 2>/dev/null || true
+        {
+            echo "# Trust Self-Verification Scorecard"
+            echo
+            echo "**Status: ERROR (exit 2)** — no usable stage2 \`trustc\` was found,"
+            echo "so nothing was verified. This is a refusal, not a result."
+            echo
+            echo "Build the compiler (\`./x.py build --stage 2\`) and re-run"
+            echo "\`scripts/trust_self_verify.sh\` to populate this scorecard."
+        } > "$SCORECARD"
+    else
+        echo "  left $SCORECARD untouched (last real measurement preserved)." >&2
+    fi
+    exit 2
 fi
 
 # ---------------------------------------------------------------------------
@@ -260,22 +309,31 @@ run_sample() {
 # ---------------------------------------------------------------------------
 build_corpus
 
-# Compile-and-collect every sample (compile failures are recorded, not fatal —
-# except a *total* corpus failure, which is a harness error -> exit 2).
-compiled_any=0
+# Compile-and-collect every sample. A nonzero rc can still have emitted JSON
+# (e.g. -full rejects), so health is measured by OUTPUT, not by compile status:
+# a trustc that accepted `-Z trust-verify-output=json` and emitted nothing would
+# compile all ten samples cleanly and look identical to a passing run.
+verified_any=0
+last_name=""
 for i in "${!SAMPLE_NAMES[@]}"; do
     name="${SAMPLE_NAMES[$i]}"
-    if run_sample "$name"; then compiled_any=1; fi
-    # Even a nonzero rc can still have emitted JSON (e.g. -full rejects); the
-    # analyzer reads whatever JSON was produced. We only need *some* sample to
-    # have compiled to consider the harness healthy.
-    if [ -s "$WORKDIR/$name.json" ]; then compiled_any=1; fi
+    last_name="$name"   # bash 3.2 (macOS) has no negative array subscripts
+    run_sample "$name" || true
+    if [ -s "$WORKDIR/$name.json" ]; then verified_any=1; fi
 done
 
-if [ "$compiled_any" -eq 0 ]; then
-    echo "ERROR: no corpus sample produced any verification output."
-    echo "       The stage2 trustc at $TRUSTC may be broken (its SMT backend is"
-    echo "       the in-tree pure-Rust \`ay\` solver — no external z3/library path)."
+if [ "$verified_any" -eq 0 ]; then
+    {
+        echo "REFUSE (exit 2): no corpus sample emitted any verification output."
+        echo "  looked for: \`TRUST_JSON:\` lines from"
+        echo "    $TRUSTC --edition 2021 --crate-type lib -Z trust-verify-output=json"
+        echo "  over ${#SAMPLE_NAMES[@]} samples; every one came back empty."
+        echo "  Compiling cleanly while emitting nothing is NOT a pass: with no"
+        echo "  obligations there is nothing for the false-proof tripwire to check."
+        echo "  The stage2 trustc may be broken, or verification output may be off."
+        echo "  --- last sample log tail ---"
+        tail -20 "$WORKDIR/$last_name.log" 2>/dev/null || true
+    } >&2
     exit 2
 fi
 
@@ -377,6 +435,20 @@ per_sample.sort(key=lambda t: t[0])
 kinds_sorted = sorted(by_kind.keys())
 grand_total = sum(totals.values())
 
+# ---- Anti-vacuity: the tripwire must have RUN before its silence means anything.
+# "No false proof" over zero obligations is the false-green shape, not a result.
+harness_errors = []
+if grand_total == 0:
+    harness_errors.append(
+        "the corpus produced ZERO obligations — nothing was verified")
+inert = sorted(n for (n, l, k, ko, c, t) in per_sample
+               if l == "unsafe" and ko == "none")
+if inert:
+    harness_errors.append(
+        "soundness tripwire INERT — unsafe sample(s) emitted no obligation of "
+        "their load-bearing kind, so 'not proved' is silence, not soundness: "
+        + ", ".join(inert))
+
 def pct(n, d):
     return f"{(100.0 * n / d):.1f}%" if d else "n/a"
 
@@ -419,7 +491,6 @@ for o in OUTCOMES:
     A(f"| {o} | {totals[o]} | {pct(totals[o], grand_total)} |")
 A(f"| **total** | **{grand_total}** | 100% |")
 A("")
-proved_safe = totals["proved"]
 A(f"**Proved obligations: {totals['proved']} / {grand_total} "
   f"({pct(totals['proved'], grand_total)}).** "
   f"Runtime-checked (sound, dynamically guarded): {totals['runtime_checked']}. "
@@ -454,7 +525,14 @@ A("")
 # Soundness section.
 A("## Soundness verdict")
 A("")
-if false_proofs:
+if harness_errors and not false_proofs:
+    A("**RESULT: NO VERDICT (exit 2) — the tripwire did not run.** Silence from "
+      "an instrument that never fired is not evidence of soundness:")
+    A("")
+    for e in harness_errors:
+        A(f"- ⚠️ {e}")
+    A("")
+elif false_proofs:
     A("**RESULT: FALSE PROOF DETECTED — soundness regression.** The verifier "
       "reported a reachable-panic obligation as proved:")
     A("")
@@ -470,14 +548,15 @@ else:
       "any unsafe self-code as safe.")
 A("")
 
-# Completeness note (informational).
-unsafe_keys = [(n, k, ko) for (n, l, k, ko, c, t) in per_sample if l == "safe" and ko != "proved"]
-if unsafe_keys:
+# Completeness note (informational). SAFE samples only — an unproved safe sample
+# is a capability gap; the unsafe ones are handled by the tripwire above.
+safe_gaps = [(n, k, ko) for (n, l, k, ko, c, t) in per_sample if l == "safe" and ko != "proved"]
+if safe_gaps:
     A("### Completeness frontier (safe samples not yet fully proved)")
     A("")
     A("These are NOT failures — they are proving-capability gaps to close:")
     A("")
-    for n, k, ko in sorted(unsafe_keys):
+    for n, k, ko in sorted(safe_gaps):
         A(f"- `{n}` (`{k}`): key outcome `{ko}`")
     A("")
 
@@ -494,6 +573,13 @@ if false_proofs:
     for fp in false_proofs:
         print("  -", fp)
     sys.exit(1)
+# Checked AFTER false_proofs: a detected false proof is a real finding even on a
+# degraded corpus, but an un-fired tripwire may not be reported as soundness.
+if harness_errors:
+    print("REFUSE (exit 2): the false-proof tripwire did not run:", file=sys.stderr)
+    for e in harness_errors:
+        print("  -", e, file=sys.stderr)
+    sys.exit(2)
 print("SOUNDNESS: no false proof (all unsafe samples correctly not-proved).")
 sys.exit(0)
 PY

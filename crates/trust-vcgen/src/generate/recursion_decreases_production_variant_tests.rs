@@ -1,6 +1,6 @@
 use trust_types::{
-    BasicBlock, BlockId, Contract, ContractKind, LocalDecl, Operand, Place, SourceSpan,
-    Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, Contract, ContractKind, LocalDecl, Operand, Place, SourceSpan, Terminator,
+    Ty, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::regenerate_recursion_decreases_production_variants;
@@ -28,6 +28,7 @@ fn two_recursive_calls_with_decreases() -> VerifiableFunction {
             target: Some(BlockId(target)),
             span: call_span(line),
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             atomic: None,
         },
@@ -44,11 +45,7 @@ fn two_recursive_calls_with_decreases() -> VerifiableFunction {
             blocks: vec![
                 recursive_call(0, 10, 1),
                 recursive_call(1, 20, 2),
-                BasicBlock {
-                    id: BlockId(2),
-                    stmts: Vec::new(),
-                    terminator: Terminator::Return,
-                },
+                BasicBlock { id: BlockId(2), stmts: Vec::new(), terminator: Terminator::Return },
             ],
             arg_count: 1,
             return_ty: Ty::Unit,

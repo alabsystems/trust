@@ -72,7 +72,6 @@ trust-vc-merge-contract = { path = "../first-party/trust-vc/crates/trust-vc-merg
 [patch."https://github.com/alabsystems/clean.git"]
 clean-kernel = { path = "../first-party/clean/crates/clean-kernel" }
 
-# clean-auto — which this workspace does reach — declares carcara (the second,
 # independent Alethe checker) as a *Git* dependency behind its default-off
 # `carcara-verify` feature. Nothing here activates that feature today, so the
 # entry buys nothing in the current lockfile; it exists so that the day
@@ -82,8 +81,6 @@ clean-kernel = { path = "../first-party/clean/crates/clean-kernel" }
 # match the root's regardless. Same byte-identical vendored rev the other
 # workspaces pin (ufmg-smite/carcara fecb4224def3c26f93a5d4f1804ecf58eb979650,
 # v1.1.0).
-[patch."https://github.com/ufmg-smite/carcara"]
-carcara = { path = "../vendor/carcara_1_1_0/carcara" }
 
 [workspace]
 

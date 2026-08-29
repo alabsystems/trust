@@ -310,3 +310,21 @@ overflow refutation (dropped widen, havoc'd u8 operands) is expected to hold
 already. **Soundness pin that must hold today: the mutant must keep refuting —
 if it ever proves, the entry contract leaked a data fact past the resume-state
 selector (the "never constrain captured data" violation).**
+
+## Three false-refutation shapes quarantined 2026-08-26
+
+Added while giving the gate eyes for the signed-switch-label / merged-local /
+declined-row classes. Each was written as a `proved/` candidate, measured on both
+compilers, and could not reach `proved` on either — so it is here rather than
+making the gate red. Each header carries its own runtime-oracle sweep.
+
+| fixture | pristine `70a7534fd1` | `campaign-integration` | why it is here |
+|---|---|---|---|
+| `char_cast_increment.rs` | `refuted` | `refuted` | OVER-REFUTATION, live on both. The oracle sweep is EXHAUSTIVE over `char` — 0 panics in 1112064 runs — so this is a definite wrong answer, not a coverage gap. The strongest residual of the three. |
+| `slice_match_three_arms.rs` | `refuted` | `incomplete` | Capability gap on the branch: the rows are `unsupported`/`unknown` (proof certificate "replayable but not release-admissible"; a PDR candidate awaiting private consumer replay). The branch moved it off a wrong answer onto an honest gap. |
+| `nonzero_divisor_get.rs` | `refuted` | `incomplete` | Capability gap on the branch: `NonZeroU32::get` is an `UnmodeledCalleeReturn`, so the divisor row DECLINES instead of being refuted with an invented zero. Needs the callee modelled or summarised. |
+
+An `async fn` candidate was NOT added. `proved/async_zero_await_widen.rs` is
+already the known red for that lane (`refuted` at the base, `incomplete` on the
+branch), and a second async shape measured the same way — a different body with
+the same verdict pair adds a row and no information.

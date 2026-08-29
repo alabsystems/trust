@@ -600,7 +600,9 @@ mod tests {
     #[test]
     fn proves_single_writer_mmap_model_sound_with_artifacts() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::Verified)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(
+            trust_types::SingleWriterEvidence::Verified,
+        )]);
         let evidence = engine.verify(&bundle(&obligation), &[obligation]);
         assert_eq!(evidence.len(), 1);
         let evidence = &evidence[0];
@@ -649,7 +651,9 @@ mod tests {
     #[test]
     fn ty_proof_artifacts_cannot_be_transplanted_to_another_obligation() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::Verified)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(
+            trust_types::SingleWriterEvidence::Verified,
+        )]);
         let mut evidence = engine.verify(&bundle(&obligation), &[obligation]).remove(0);
         assert!(evidence.satisfies_proof_artifact_policy());
 
@@ -663,7 +667,9 @@ mod tests {
     #[test]
     fn ty_transcript_check_pair_without_statement_lineage_is_rejected() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::Verified)]);
+        let obligation = temporal_obligation(vec![mmap_model_metadata(
+            trust_types::SingleWriterEvidence::Verified,
+        )]);
         let mut evidence =
             engine.verify(&bundle(&obligation), std::slice::from_ref(&obligation)).remove(0);
         let transcript = inline_artifact(
@@ -696,7 +702,8 @@ mod tests {
     #[test]
     fn refutes_multi_writer_mmap_model_with_trace() {
         let engine = NativeTyEngine::new();
-        let obligation = temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::None)]);
+        let obligation =
+            temporal_obligation(vec![mmap_model_metadata(trust_types::SingleWriterEvidence::None)]);
         let evidence = engine.verify(&bundle(&obligation), &[obligation]);
         assert_eq!(evidence.len(), 1);
         let evidence = &evidence[0];

@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +13,8 @@ use super::gates::{
 use super::identity::{bound_tools, file_sha256, host_executable_name};
 use super::product_proof::{
     PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS, check_product_proof_coverage,
-    product_proof_component_requirements, product_proof_components, product_proof_evidence_classes,
+    product_proof_component_requirements, product_proof_components,
+    product_proof_evidence_class_requirements, product_proof_evidence_classes,
     product_proof_report_usage_text, product_proof_stub_usage_text,
     run_product_proof_report_subcommand, run_product_proof_stub_subcommand,
 };
@@ -124,6 +126,39 @@ fn product_proof_matrix_names_the_full_toolchain() {
 }
 
 #[test]
+fn product_proof_native_authority_inventory_is_exactly_mc_vc_and_ty() {
+    let native = product_proof_evidence_class_requirements()
+        .into_iter()
+        .find(|class| class.class == "native proof engines")
+        .expect("native proof-engine evidence class");
+    assert_eq!(
+        native.required_evidence,
+        &[
+            "native TrustIr evidence",
+            "same-row trust-mc/trust-vc/TY proof evidence",
+            "replayable solver/proof artifacts",
+        ]
+    );
+
+    let engines = product_proof_component_requirements()
+        .into_iter()
+        .find(|component| component.component == "verifier engines")
+        .expect("verifier-engine product component");
+    assert_eq!(
+        engines.required_evidence,
+        &["ay", "trust-mc", "trust-vc", "ty", "model-checking engine locks"]
+    );
+    assert!(
+        native
+            .required_evidence
+            .iter()
+            .chain(engines.required_evidence)
+            .all(|entry| { !entry.to_ascii_lowercase().contains("trust-wp") }),
+        "retired TrustWP authority must not re-enter the product-proof matrix"
+    );
+}
+
+#[test]
 fn product_proof_trustd_component_uses_identity_bound_protocol_collector() {
     let trustd = product_proof_component_requirements()
         .into_iter()
@@ -164,6 +199,10 @@ fn toolchain_surface_records_only_load_bearing_compatibility_aliases() {
         match tool.name.as_str() {
             "trustc" => assert_eq!(aliases, ["rustc"]),
             "targo" => assert_eq!(aliases, ["cargo"]),
+            // Load-bearing since 76d408e1cd: cargo spawns a binary named
+            // `rustdoc` for its doctest phase, so every stage >= 1 sysroot
+            // ships the alias and the gate proves it binds to `trustdoc`.
+            "trustdoc" => assert_eq!(aliases, ["rustdoc"]),
             _ => assert!(
                 aliases.is_empty(),
                 "canonical Trust-only tool {} retained retired aliases {aliases:?}",
@@ -174,7 +213,7 @@ fn toolchain_surface_records_only_load_bearing_compatibility_aliases() {
 }
 
 #[test]
-fn toolchain_surface_accepts_canonical_tools_with_only_rustc_and_cargo_aliases() {
+fn toolchain_surface_accepts_canonical_tools_with_only_admitted_compatibility_aliases() {
     let root = temp_root("canonical-toolchain-surface");
     let mut identity = test_identity_with_candidate("abcdef1234567890");
     let bin = materialize_bound_required_test_tools(&mut identity, &root);
@@ -185,15 +224,9 @@ fn toolchain_surface_accepts_canonical_tools_with_only_rustc_and_cargo_aliases()
     assert_eq!(proof.status, "passed");
     assert!(proof.same_sysroot);
     assert_eq!(report.status, GateStatus::Pass);
-    for retired in [
-        "cargo-trust",
-        "rustdoc",
-        "rustfmt",
-        "cargo-fmt",
-        "cargo-clippy",
-        "clippy-driver",
-        "rust-analyzer",
-    ] {
+    for retired in
+        ["cargo-trust", "rustfmt", "cargo-fmt", "cargo-clippy", "clippy-driver", "rust-analyzer"]
+    {
         assert!(!bin.join(retired).exists(), "test accidentally admitted retired alias {retired}");
     }
 
@@ -1281,11 +1314,7 @@ fn product_proof_version_identity_label_only_cannot_satisfy_daemon_binding() {
         .iter()
         .find(|finding| finding.code == "product-proof-daemon-candidate-binding-missing")
         .expect("missing canonical daemon-binding blocker");
-    assert!(
-        finding.message.contains("lacks daemon tool identity"),
-        "{}",
-        finding.message
-    );
+    assert!(finding.message.contains("lacks daemon tool identity"), "{}", finding.message);
     assert!(report.evidence_refs.is_empty());
 
     let _ = std::fs::remove_dir_all(root);
@@ -1853,7 +1882,9 @@ fn product_proof_version_identity_rejects_repeated_trustd_brand_prefix() {
         // already asserted the fail-closed half, which is the only contract this
         // host can witness. See task #43.
         assert!(
-            !findings.iter().any(|finding| finding.message.contains("invalid identity/protocol fields")),
+            !findings
+                .iter()
+                .any(|finding| finding.message.contains("invalid identity/protocol fields")),
             "off macOS the brand-prefix check should be unreachable, but it ran: {findings:#?}"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -1870,7 +1901,6 @@ fn product_proof_version_identity_rejects_repeated_trustd_brand_prefix() {
 
     let _ = std::fs::remove_dir_all(root);
 }
-
 
 /// Product-proof runtime-closure evidence is macOS-only BY SCHEMA (task #43):
 /// `TrustdRuntimeClosure` requires `native_format == "mach-o-thin"` and a
@@ -4285,9 +4315,7 @@ fn materialized_trust_tool_identity_json(
 fn write_native_trustd_test_file(path: &Path, commit: &str, reject_loader_env: bool) {
     assert!(
         commit.len() == 40
-            && commit
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            && commit.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "native trustd fixture requires a canonical candidate commit"
     );
     let source_path = path.with_extension("fixture.c");
@@ -4315,10 +4343,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 "#
-    .replace(
-        "__REJECT_LOADER_ENV__",
-        if reject_loader_env { "1" } else { "0" },
-    )
+    .replace("__REJECT_LOADER_ENV__", if reject_loader_env { "1" } else { "0" })
     .replace("__PROTOCOL__", trust_router::coordinator::STATUS_VERSION)
     .replace("__COMMIT__", commit);
     std::fs::write(&source_path, source).expect("write native trustd fixture source");
@@ -4366,10 +4391,7 @@ fn materialized_version_identity_json(
 
 fn candidate_daemon_from_json(root: &Path, identity: &serde_json::Value) -> BoundToolIdentity {
     let path_text = identity["path"].as_str().expect("daemon identity path");
-    let path = root
-        .join(path_text)
-        .canonicalize()
-        .expect("canonical daemon identity path");
+    let path = root.join(path_text).canonicalize().expect("canonical daemon identity path");
     BoundToolIdentity {
         name: "trustd".to_string(),
         path: Some(path.display().to_string()),
@@ -4689,7 +4711,7 @@ fn materialize_bound_required_test_tools(
         tool.sha256 = file_sha256(&path);
         tool.path = Some(path.display().to_string());
     }
-    for alias in ["rustc", "cargo"] {
+    for alias in ["rustc", "cargo", "rustdoc"] {
         write_executable_test_file(&bin.join(alias), b"canonical Trust tool fixture\n");
     }
     bin

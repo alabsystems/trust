@@ -297,62 +297,9 @@
                                 "RawPtr": {
                                   "mutable": false,
                                   "pointee": {
-                                    "Adt": {
+                                    "Datatype": {
                                       "name": "clean_kernel::fuel::Fuel",
-                                      "fields": [
-                                        [
-                                          "__tag",
-                                          {
-                                            "Int": {
-                                              "width": 64,
-                                              "signed": true
-                                            }
-                                          }
-                                        ],
-                                        [
-                                          "__v1_0",
-                                          {
-                                            "RawPtr": {
-                                              "mutable": false,
-                                              "pointee": {
-                                                "Datatype": {
-                                                  "name": "clean_kernel::fuel::Fuel",
-                                                  "variants": []
-                                                }
-                                              }
-                                            }
-                                          }
-                                        ]
-                                      ],
-                                      "variants": [
-                                        {
-                                          "name": "Z",
-                                          "discriminant": 0,
-                                          "fields": []
-                                        },
-                                        {
-                                          "name": "S",
-                                          "discriminant": 1,
-                                          "fields": [
-                                            [
-                                              "0",
-                                              {
-                                                "RawPtr": {
-                                                  "mutable": false,
-                                                  "pointee": {
-                                                    "Datatype": {
-                                                      "name": "clean_kernel::fuel::Fuel",
-                                                      "variants": []
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          ]
-                                        }
-                                      ],
-                                      "disc_index_safe": true,
-                                      "faithful_enum_repr": null
+                                      "variants": []
                                     }
                                   }
                                 }
@@ -361,14 +308,20 @@
                           ],
                           "variants": [],
                           "disc_index_safe": false,
-                          "faithful_enum_repr": null
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
                         }
                       }
                     ]
                   ],
                   "variants": [],
                   "disc_index_safe": false,
-                  "faithful_enum_repr": null
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
                 }
               }
             }
@@ -455,62 +408,9 @@
                                 "RawPtr": {
                                   "mutable": false,
                                   "pointee": {
-                                    "Adt": {
+                                    "Datatype": {
                                       "name": "clean_kernel::fuel::Fuel",
-                                      "fields": [
-                                        [
-                                          "__tag",
-                                          {
-                                            "Int": {
-                                              "width": 64,
-                                              "signed": true
-                                            }
-                                          }
-                                        ],
-                                        [
-                                          "__v1_0",
-                                          {
-                                            "RawPtr": {
-                                              "mutable": false,
-                                              "pointee": {
-                                                "Datatype": {
-                                                  "name": "clean_kernel::fuel::Fuel",
-                                                  "variants": []
-                                                }
-                                              }
-                                            }
-                                          }
-                                        ]
-                                      ],
-                                      "variants": [
-                                        {
-                                          "name": "Z",
-                                          "discriminant": 0,
-                                          "fields": []
-                                        },
-                                        {
-                                          "name": "S",
-                                          "discriminant": 1,
-                                          "fields": [
-                                            [
-                                              "0",
-                                              {
-                                                "RawPtr": {
-                                                  "mutable": false,
-                                                  "pointee": {
-                                                    "Datatype": {
-                                                      "name": "clean_kernel::fuel::Fuel",
-                                                      "variants": []
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          ]
-                                        }
-                                      ],
-                                      "disc_index_safe": true,
-                                      "faithful_enum_repr": null
+                                      "variants": []
                                     }
                                   }
                                 }
@@ -519,14 +419,20 @@
                           ],
                           "variants": [],
                           "disc_index_safe": false,
-                          "faithful_enum_repr": null
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
                         }
                       }
                     ]
                   ],
                   "variants": [],
                   "disc_index_safe": false,
-                  "faithful_enum_repr": null
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
                 }
               }
             }
@@ -2737,7 +2643,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -2949,7 +2856,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 54,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -3071,7 +2987,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 54,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -3090,7 +3015,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     []
@@ -3142,7 +3068,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -3214,7 +3141,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -3275,7 +3203,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -3451,7 +3380,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 54,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -3518,7 +3456,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 2,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -3585,7 +3524,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -3839,6 +3779,194 @@
               ]
             ]
           ]
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::E": {
+          "Adt": {
+            "name": "clean_kernel::expr::E",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_1",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "A",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "B",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "M",
+                "discriminant": 2,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "clean_kernel::fuel::Fuel": {
+          "Adt": {
+            "name": "clean_kernel::fuel::Fuel",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::fuel::Fuel",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Z",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "S",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::fuel::Fuel",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
         }
       }
     },
@@ -6514,7 +6642,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -6696,7 +6825,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 58,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -6849,7 +6987,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 58,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -6924,7 +7071,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     []
@@ -6951,7 +7099,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -7083,7 +7232,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -7117,7 +7267,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -7326,7 +7477,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 58,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -7453,7 +7613,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 2,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -7493,7 +7654,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -7642,6 +7804,194 @@
               ]
             ]
           ]
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::E": {
+          "Adt": {
+            "name": "clean_kernel::expr::E",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_1",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "A",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "B",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "M",
+                "discriminant": 2,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "clean_kernel::fuel::Fuel": {
+          "Adt": {
+            "name": "clean_kernel::fuel::Fuel",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::fuel::Fuel",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Z",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "S",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::fuel::Fuel",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
         }
       }
     },
@@ -8026,62 +8376,9 @@
                                 "RawPtr": {
                                   "mutable": false,
                                   "pointee": {
-                                    "Adt": {
+                                    "Datatype": {
                                       "name": "clean_kernel::fuel::Fuel",
-                                      "fields": [
-                                        [
-                                          "__tag",
-                                          {
-                                            "Int": {
-                                              "width": 64,
-                                              "signed": true
-                                            }
-                                          }
-                                        ],
-                                        [
-                                          "__v1_0",
-                                          {
-                                            "RawPtr": {
-                                              "mutable": false,
-                                              "pointee": {
-                                                "Datatype": {
-                                                  "name": "clean_kernel::fuel::Fuel",
-                                                  "variants": []
-                                                }
-                                              }
-                                            }
-                                          }
-                                        ]
-                                      ],
-                                      "variants": [
-                                        {
-                                          "name": "Z",
-                                          "discriminant": 0,
-                                          "fields": []
-                                        },
-                                        {
-                                          "name": "S",
-                                          "discriminant": 1,
-                                          "fields": [
-                                            [
-                                              "0",
-                                              {
-                                                "RawPtr": {
-                                                  "mutable": false,
-                                                  "pointee": {
-                                                    "Datatype": {
-                                                      "name": "clean_kernel::fuel::Fuel",
-                                                      "variants": []
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          ]
-                                        }
-                                      ],
-                                      "disc_index_safe": true,
-                                      "faithful_enum_repr": null
+                                      "variants": []
                                     }
                                   }
                                 }
@@ -8090,14 +8387,20 @@
                           ],
                           "variants": [],
                           "disc_index_safe": false,
-                          "faithful_enum_repr": null
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
                         }
                       }
                     ]
                   ],
                   "variants": [],
                   "disc_index_safe": false,
-                  "faithful_enum_repr": null
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
                 }
               }
             }
@@ -8184,62 +8487,9 @@
                                 "RawPtr": {
                                   "mutable": false,
                                   "pointee": {
-                                    "Adt": {
+                                    "Datatype": {
                                       "name": "clean_kernel::fuel::Fuel",
-                                      "fields": [
-                                        [
-                                          "__tag",
-                                          {
-                                            "Int": {
-                                              "width": 64,
-                                              "signed": true
-                                            }
-                                          }
-                                        ],
-                                        [
-                                          "__v1_0",
-                                          {
-                                            "RawPtr": {
-                                              "mutable": false,
-                                              "pointee": {
-                                                "Datatype": {
-                                                  "name": "clean_kernel::fuel::Fuel",
-                                                  "variants": []
-                                                }
-                                              }
-                                            }
-                                          }
-                                        ]
-                                      ],
-                                      "variants": [
-                                        {
-                                          "name": "Z",
-                                          "discriminant": 0,
-                                          "fields": []
-                                        },
-                                        {
-                                          "name": "S",
-                                          "discriminant": 1,
-                                          "fields": [
-                                            [
-                                              "0",
-                                              {
-                                                "RawPtr": {
-                                                  "mutable": false,
-                                                  "pointee": {
-                                                    "Datatype": {
-                                                      "name": "clean_kernel::fuel::Fuel",
-                                                      "variants": []
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            ]
-                                          ]
-                                        }
-                                      ],
-                                      "disc_index_safe": true,
-                                      "faithful_enum_repr": null
+                                      "variants": []
                                     }
                                   }
                                 }
@@ -8248,14 +8498,20 @@
                           ],
                           "variants": [],
                           "disc_index_safe": false,
-                          "faithful_enum_repr": null
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
                         }
                       }
                     ]
                   ],
                   "variants": [],
                   "disc_index_safe": false,
-                  "faithful_enum_repr": null
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
                 }
               }
             }
@@ -10466,7 +10722,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -10678,7 +10935,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 53,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -10800,7 +11066,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 53,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -10819,7 +11094,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     []
@@ -10871,7 +11147,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -10943,7 +11220,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -11004,7 +11282,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -11180,7 +11459,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 53,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -11247,7 +11535,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 2,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -11314,7 +11603,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": null
                       }
                     },
                     [
@@ -11568,6 +11858,194 @@
               ]
             ]
           ]
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::E": {
+          "Adt": {
+            "name": "clean_kernel::expr::E",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_1",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "A",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "B",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "M",
+                "discriminant": 2,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "clean_kernel::fuel::Fuel": {
+          "Adt": {
+            "name": "clean_kernel::fuel::Fuel",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::fuel::Fuel",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Z",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "S",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::fuel::Fuel",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
         }
       }
     },
@@ -14243,7 +14721,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -14425,7 +14904,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 57,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -14578,7 +15066,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 57,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -14653,7 +15150,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     []
@@ -14680,7 +15178,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -14812,7 +15311,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 1,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -14846,7 +15346,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -15055,7 +15556,16 @@
               },
               "atomic": null,
               "is_foreign": false,
-              "is_unsafe_sig": false
+              "is_unsafe_sig": false,
+              "unwind": "Continue",
+              "callee_identity": {
+                "stable_crate_id": 6076012663662397016,
+                "def_index": 57,
+                "substs_digest": [
+                  14241860155052752853,
+                  2268345107747320411
+                ]
+              }
             }
           }
         },
@@ -15182,7 +15692,8 @@
                       "Adt": {
                         "name": "clean_kernel::expr::E",
                         "variant": 2,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::expr::E"
                       }
                     },
                     [
@@ -15222,7 +15733,8 @@
                       "Adt": {
                         "name": "clean_kernel::res::Res",
                         "variant": 0,
-                        "active_field": null
+                        "active_field": null,
+                        "args": "clean_kernel::res::Res"
                       }
                     },
                     [
@@ -15371,6 +15883,194 @@
               ]
             ]
           ]
+        }
+      },
+      "datatype_defs": {
+        "clean_kernel::expr::E": {
+          "Adt": {
+            "name": "clean_kernel::expr::E",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "__v2_1",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::expr::E",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "A",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "B",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "M",
+                "discriminant": 2,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "1",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::expr::E",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "clean_kernel::fuel::Fuel": {
+          "Adt": {
+            "name": "clean_kernel::fuel::Fuel",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "RawPtr": {
+                    "mutable": false,
+                    "pointee": {
+                      "Datatype": {
+                        "name": "clean_kernel::fuel::Fuel",
+                        "variants": []
+                      }
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Z",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "S",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "RawPtr": {
+                        "mutable": false,
+                        "pointee": {
+                          "Datatype": {
+                            "name": "clean_kernel::fuel::Fuel",
+                            "variants": []
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
         }
       }
     },

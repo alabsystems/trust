@@ -10,4 +10,6 @@ clean {
 }
 pub fn f(x: u64) -> u64
     ensures result == ident_isl(x) && result == diff_isl(x)
-{ x }
+{
+    x
+}

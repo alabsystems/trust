@@ -13,13 +13,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use trust_js_value::{
+    ElemType, ErrKind, JsBigInt, JsObject, JsValue, NativeFn, ObjId, ObjKind, PropKey, SymId,
+    TypedArrayData, Units, WkSym, bigint_from_i64, bigint_from_u64, bigint_to_i64_wrap,
+    bigint_to_u64_wrap, decode_le, encode_le, ordered_own_keys, to_integer_or_infinity,
+    units_from_str,
+};
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::props::PartialDesc;
-use trust_js_value::{
-    bigint_from_i64, bigint_from_u64, bigint_to_i64_wrap, bigint_to_u64_wrap, decode_le, encode_le,
-    ordered_own_keys, to_integer_or_infinity, units_from_str, ElemType, ErrKind, JsBigInt, JsObject,
-    JsValue, NativeFn, ObjId, ObjKind, PropKey, SymId, TypedArrayData, Units, WkSym,
-};
 
 /// Cap on any single data-block allocation; larger requests refuse
 /// (NoCoverage) rather than risk exhausting host memory. Well above every
@@ -229,7 +231,12 @@ impl Interp {
 
     /// TypedArraySetElement(O, index, value): coerce (always observable), then
     /// store if the index is valid.
-    pub(crate) fn ta_set_element(&mut self, oid: ObjId, idx: f64, v: JsValue) -> Result<(), Abrupt> {
+    pub(crate) fn ta_set_element(
+        &mut self,
+        oid: ObjId,
+        idx: f64,
+        v: JsValue,
+    ) -> Result<(), Abrupt> {
         let info = self.ta_info(oid).expect("typed array");
         if info.element.is_bigint() {
             // ToBigInt is always performed (observable), then stored if valid.
@@ -377,21 +384,13 @@ impl Interp {
         if s.is_nullish() {
             return Ok(JsValue::Obj(default));
         }
-        if self.is_constructor(&s) {
-            Ok(s)
-        } else {
-            Err(self.throw_type_error())
-        }
+        if self.is_constructor(&s) { Ok(s) } else { Err(self.throw_type_error()) }
     }
 
     /// TypedArrayCreate(constructor, argList): Construct then re-validate.
     fn typed_array_create(&mut self, ctor: &JsValue, args: Vec<JsValue>) -> Result<ObjId, Abrupt> {
         let single_len = if args.len() == 1 {
-            if let JsValue::Num(n) = &args[0] {
-                Some(*n)
-            } else {
-                None
-            }
+            if let JsValue::Num(n) = &args[0] { Some(*n) } else { None }
         } else {
             None
         };
@@ -569,11 +568,7 @@ fn clamp_rel(n: f64, len: usize) -> usize {
     if n < 0.0 {
         let k = lenf + n;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        if k < 0.0 {
-            0
-        } else {
-            k as usize
-        }
+        if k < 0.0 { 0 } else { k as usize }
     } else if n > lenf {
         len
     } else {
@@ -698,7 +693,12 @@ impl Interp {
         Ok(JsValue::Undefined)
     }
 
-    fn array_buffer_transfer(&mut self, this: &JsValue, new_length: &JsValue, to_fixed: bool) -> ERes {
+    fn array_buffer_transfer(
+        &mut self,
+        this: &JsValue,
+        new_length: &JsValue,
+        to_fixed: bool,
+    ) -> ERes {
         let ab = self.require_array_buffer(this)?;
         if self.ab_is_detached(ab) {
             return Err(self.throw_type_error());
@@ -863,16 +863,8 @@ impl Interp {
         let get_index = self.to_index(request_index)?;
         // The numeric coercion (ToBigInt for the BigInt views, ToNumber
         // otherwise) is observable and happens before the bounds re-check.
-        let big = if et.is_bigint() {
-            Some(self.to_bigint(value)?)
-        } else {
-            None
-        };
-        let n = if et.is_bigint() {
-            0.0
-        } else {
-            self.to_number(value)?
-        };
+        let big = if et.is_bigint() { Some(self.to_bigint(value)?) } else { None };
+        let n = if et.is_bigint() { 0.0 } else { self.to_number(value)? };
         let is_le = self.to_boolean(little_endian);
         if self.dv_out_of_bounds(dv) {
             return Err(self.throw_type_error());
@@ -917,7 +909,12 @@ impl Interp {
         self.alloc_obj(JsObject::new(ObjKind::TypedArray(data), Some(proto)))
     }
 
-    fn ta_from_length(&mut self, proto: ObjId, et: ElemType, length: usize) -> Result<ObjId, Abrupt> {
+    fn ta_from_length(
+        &mut self,
+        proto: ObjId,
+        et: ElemType,
+        length: usize,
+    ) -> Result<ObjId, Abrupt> {
         let byte_len = length
             .checked_mul(et.bytes_per_element())
             .ok_or_else(|| Abrupt::Fatal("typed array byte length overflow".to_string()))?;
@@ -1015,11 +1012,12 @@ impl Interp {
                 Some((buf_len - offset) / bpe)
             }
         } else {
-            let need = offset
-                .checked_add(explicit_len.checked_mul(bpe).ok_or_else(|| {
-                    Abrupt::Fatal("typed array byte length overflow".to_string())
-                })?)
-                .ok_or_else(|| Abrupt::Fatal("typed array byte length overflow".to_string()))?;
+            let need =
+                offset
+                    .checked_add(explicit_len.checked_mul(bpe).ok_or_else(|| {
+                        Abrupt::Fatal("typed array byte length overflow".to_string())
+                    })?)
+                    .ok_or_else(|| Abrupt::Fatal("typed array byte length overflow".to_string()))?;
             if need > buf_len {
                 return Err(self.throw_native(ErrKind::Range));
             }
@@ -1036,12 +1034,15 @@ impl Interp {
         if self.get_fast_iterator(v).is_ok() {
             return Ok(true);
         }
-        Ok(self
-            .get_method(v, &PropKey::Sym(SymId::WellKnown(WkSym::Iterator)))?
-            .is_some())
+        Ok(self.get_method(v, &PropKey::Sym(SymId::WellKnown(WkSym::Iterator)))?.is_some())
     }
 
-    fn ta_init_from_list(&mut self, proto: ObjId, et: ElemType, iterable: &JsValue) -> Result<ObjId, Abrupt> {
+    fn ta_init_from_list(
+        &mut self,
+        proto: ObjId,
+        et: ElemType,
+        iterable: &JsValue,
+    ) -> Result<ObjId, Abrupt> {
         let mut values: Vec<JsValue> = Vec::new();
         let mut it = self.get_iterator_or_type_error(iterable)?;
         loop {
@@ -1062,12 +1063,18 @@ impl Interp {
         Ok(out)
     }
 
-    fn ta_init_from_array_like(&mut self, proto: ObjId, et: ElemType, src: ObjId) -> Result<ObjId, Abrupt> {
+    fn ta_init_from_array_like(
+        &mut self,
+        proto: ObjId,
+        et: ElemType,
+        src: ObjId,
+    ) -> Result<ObjId, Abrupt> {
         let len = usize::try_from(self.length_of_array_like(src)?)
             .map_err(|_| Abrupt::Fatal("array-like length overflow".to_string()))?;
         let out = self.ta_from_length(proto, et, len)?;
         for k in 0..len {
-            let kv = self.get_from_object(src, &PropKey::from_str(&k.to_string()), JsValue::Obj(src))?;
+            let kv =
+                self.get_from_object(src, &PropKey::from_str(&k.to_string()), JsValue::Obj(src))?;
             #[allow(clippy::cast_precision_loss)]
             self.ta_set_element(out, k as f64, kv)?;
         }
@@ -1107,7 +1114,11 @@ impl Interp {
                 .map_err(|_| Abrupt::Fatal("array-like length overflow".to_string()))?;
             let mut vals = Vec::with_capacity(len);
             for k in 0..len {
-                vals.push(self.get_from_object(obj, &PropKey::from_str(&k.to_string()), JsValue::Obj(obj))?);
+                vals.push(self.get_from_object(
+                    obj,
+                    &PropKey::from_str(&k.to_string()),
+                    JsValue::Obj(obj),
+                )?);
             }
             vals
         };
@@ -1223,7 +1234,11 @@ impl Interp {
                     if from >= len as f64 {
                         return Ok(JsValue::Num(-1.0));
                     }
-                    let start = if from >= 0.0 { from as isize } else { (len as isize + from as isize).max(0) };
+                    let start = if from >= 0.0 {
+                        from as isize
+                    } else {
+                        (len as isize + from as isize).max(0)
+                    };
                     (start.max(0) as usize..len).collect()
                 };
                 for k in order {
@@ -1244,11 +1259,8 @@ impl Interp {
                 }
                 let search = arg(0);
                 let from = to_integer_or_infinity(self.to_number(&arg(1))?);
-                let start = if from >= 0.0 {
-                    from as isize
-                } else {
-                    (len as isize + from as isize).max(0)
-                };
+                let start =
+                    if from >= 0.0 { from as isize } else { (len as isize + from as isize).max(0) };
                 for k in start.max(0) as usize..len {
                     let v = self.ta_element_get_pure(oid, k as f64);
                     if crate::ops::same_value_zero(&v, &search) {
@@ -1373,7 +1385,8 @@ impl Interp {
                 self.make_typed_array_iterator(oid, kind)
             }
             "toLocaleString" => Err(Abrupt::Fatal(
-                "%TypedArray%.prototype.toLocaleString (locale-dependent, out of slice)".to_string(),
+                "%TypedArray%.prototype.toLocaleString (locale-dependent, out of slice)"
+                    .to_string(),
             )),
             _ => Err(Abrupt::Fatal(format!("typed-array method `{tag}` (out of slice)"))),
         }
@@ -1392,7 +1405,9 @@ impl Interp {
         let target_len = self.ta_current_length(target);
         if let JsValue::Obj(so) = source {
             if let Some(src_info) = self.ta_info(*so) {
-                if src_info.element.is_bigint() != self.ta_info(target).expect("ta").element.is_bigint() {
+                if src_info.element.is_bigint()
+                    != self.ta_info(target).expect("ta").element.is_bigint()
+                {
                     return Err(self.throw_type_error());
                 }
                 let src_len = self.ta_current_length(*so);
@@ -1417,7 +1432,8 @@ impl Interp {
         }
         let base = target_offset as usize;
         for k in 0..src_len {
-            let kv = self.get_from_object(src, &PropKey::from_str(&k.to_string()), JsValue::Obj(src))?;
+            let kv =
+                self.get_from_object(src, &PropKey::from_str(&k.to_string()), JsValue::Obj(src))?;
             self.ta_set_element(target, (base as u64 + k) as f64, kv)?;
         }
         Ok(JsValue::Undefined)
@@ -1482,21 +1498,28 @@ impl Interp {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn ta_iter_predicate(&mut self, tag: &str, this: &JsValue, cb: &JsValue, this_arg: &JsValue) -> ERes {
+    fn ta_iter_predicate(
+        &mut self,
+        tag: &str,
+        this: &JsValue,
+        cb: &JsValue,
+        this_arg: &JsValue,
+    ) -> ERes {
         let (oid, _et, len) = self.ta_validate(this)?;
         if !matches!(cb, JsValue::Obj(o) if self.heap.obj(*o).is_callable()) {
             return Err(self.throw_type_error());
         }
         let reverse = tag == "findLast" || tag == "findLastIndex";
-        let indices: Vec<usize> = if reverse {
-            (0..len).rev().collect()
-        } else {
-            (0..len).collect()
-        };
+        let indices: Vec<usize> =
+            if reverse { (0..len).rev().collect() } else { (0..len).collect() };
         for k in indices {
             self.charge_loop()?;
             let v = self.ta_element_get_pure(oid, k as f64);
-            let r = self.call_value(cb, this_arg.clone(), vec![v.clone(), JsValue::Num(k as f64), this.clone()])?;
+            let r = self.call_value(
+                cb,
+                this_arg.clone(),
+                vec![v.clone(), JsValue::Num(k as f64), this.clone()],
+            )?;
             let truthy = self.to_boolean(&r);
             match tag {
                 "every" => {
@@ -1542,7 +1565,11 @@ impl Interp {
         for k in 0..len {
             self.charge_loop()?;
             let v = self.ta_element_get_pure(oid, k as f64);
-            let mapped = self.call_value(cb, this_arg.clone(), vec![v, JsValue::Num(k as f64), this.clone()])?;
+            let mapped = self.call_value(
+                cb,
+                this_arg.clone(),
+                vec![v, JsValue::Num(k as f64), this.clone()],
+            )?;
             self.ta_set_element(out, k as f64, mapped)?;
         }
         Ok(JsValue::Obj(out))
@@ -1558,7 +1585,11 @@ impl Interp {
         for k in 0..len {
             self.charge_loop()?;
             let v = self.ta_element_get_pure(oid, k as f64);
-            let r = self.call_value(cb, this_arg.clone(), vec![v.clone(), JsValue::Num(k as f64), this.clone()])?;
+            let r = self.call_value(
+                cb,
+                this_arg.clone(),
+                vec![v.clone(), JsValue::Num(k as f64), this.clone()],
+            )?;
             if self.to_boolean(&r) {
                 kept.push(v);
             }
@@ -1571,7 +1602,13 @@ impl Interp {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn ta_reduce(&mut self, right: bool, this: &JsValue, cb: &JsValue, initial: Option<JsValue>) -> ERes {
+    fn ta_reduce(
+        &mut self,
+        right: bool,
+        this: &JsValue,
+        cb: &JsValue,
+        initial: Option<JsValue>,
+    ) -> ERes {
         let (oid, _et, len) = self.ta_validate(this)?;
         if !matches!(cb, JsValue::Obj(o) if self.heap.obj(*o).is_callable()) {
             return Err(self.throw_type_error());
@@ -1588,7 +1625,11 @@ impl Interp {
         for k in iter {
             self.charge_loop()?;
             let v = self.ta_element_get_pure(oid, k as f64);
-            acc = self.call_value(cb, JsValue::Undefined, vec![acc, v, JsValue::Num(k as f64), this.clone()])?;
+            acc = self.call_value(
+                cb,
+                JsValue::Undefined,
+                vec![acc, v, JsValue::Num(k as f64), this.clone()],
+            )?;
         }
         Ok(acc)
     }

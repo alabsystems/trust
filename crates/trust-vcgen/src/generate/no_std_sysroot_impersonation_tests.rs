@@ -23,15 +23,23 @@
 //!
 //! A duplicate-name test is a UNIQUENESS test, not an authenticator. The producer
 //! fix stamps on IDENTITY instead — `trust_mir_extract::convert::
-//! impersonates_sysroot_crate`, whose sysroot identity comes from the compiler's
-//! own lang/diagnostic-item anchors.
+//! impersonates_sysroot_crate`.
 //!
-//! THE BOUND, so nothing here is read as more than it is: those anchors are
-//! ATTRIBUTES. An aux that writes `#![feature(rustc_attrs)]` and
-//! `#[rustc_diagnostic_item = "HashMap"]` authenticates itself as `std` in a
-//! graph where the real `std` is absent — MEASURED, and recorded as residual R2
-//! on `impersonates_sysroot_crate`. The exploit closed here needs no internal
-//! feature at all; that one does.
+//! THE BOUND, so nothing here is read as more than it is. The 2026-08-17 identity
+//! rule read the compiler's lang/diagnostic-item anchors, and those are
+//! ATTRIBUTES: an aux that writes `#![feature(rustc_attrs)]` and
+//! `#[rustc_diagnostic_item = "HashMap"]` authenticated itself as `std` in a
+//! graph where the real `std` is absent — MEASURED, and recorded as residual R2.
+//! An EXTERNAL crate is now authenticated by ARTIFACT RESIDENCY instead
+//! (`crate_is_sysroot_resident`: every `used_crate_source` path sits in this
+//! compiler's own target library directory), so that aux is stamped for the same
+//! reason this one is and the substitution below is unchanged by the move. The
+//! aux here is `--extern std=aux/libstd.rlib` out of a local `aux/` directory
+//! (see the fixture PROVENANCE), so `crate_is_sysroot_resident` is false for it
+//! and its fact vector is the refusing one either way. R2 reached the crate under
+//! compilation, which has no loader record, and was CLOSED on 2026-08-23: that
+//! arm now answers from `convert::invocation_is_building_the_sysroot`, so a
+//! crate merely NAMED `std` no longer authenticates itself by owning an anchor.
 //!
 //! WHAT THIS MODULE CAN AND CANNOT MEASURE. The four `.json` fixtures are verbatim
 //! compiler output. The post-fix rendering is DERIVED here, by applying the

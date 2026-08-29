@@ -75,11 +75,8 @@ fn decode(raw: &str) -> Result<Units, String> {
                 return Err("legacy octal / \\8 \\9 escape (out of slice)".to_string());
             }
             'x' => {
-                let h: String = chars
-                    .get(i + 1..i + 3)
-                    .ok_or("truncated \\x escape")?
-                    .iter()
-                    .collect();
+                let h: String =
+                    chars.get(i + 1..i + 3).ok_or("truncated \\x escape")?.iter().collect();
                 let v = u16::from_str_radix(&h, 16).map_err(|_| "bad \\x escape".to_string())?;
                 out.push(v);
                 i += 3;
@@ -89,9 +86,7 @@ fn decode(raw: &str) -> Result<Units, String> {
                     let mut j = i + 2;
                     let mut v: u32 = 0;
                     while j < chars.len() && chars[j] != '}' {
-                        let d = chars[j]
-                            .to_digit(16)
-                            .ok_or("bad \\u{...} escape".to_string())?;
+                        let d = chars[j].to_digit(16).ok_or("bad \\u{...} escape".to_string())?;
                         v = v * 16 + d;
                         if v > 0x10_ffff {
                             return Err("\\u{...} beyond U+10FFFF (lexer bug?)".to_string());
@@ -104,11 +99,8 @@ fn decode(raw: &str) -> Result<Units, String> {
                     push_code_point(&mut out, v);
                     i = j + 1;
                 } else {
-                    let h: String = chars
-                        .get(i + 1..i + 5)
-                        .ok_or("truncated \\u escape")?
-                        .iter()
-                        .collect();
+                    let h: String =
+                        chars.get(i + 1..i + 5).ok_or("truncated \\u escape")?.iter().collect();
                     let v =
                         u16::from_str_radix(&h, 16).map_err(|_| "bad \\u escape".to_string())?;
                     out.push(v); // lone surrogates land as-is (WTF-16)
@@ -149,25 +141,17 @@ fn push_code_point(out: &mut Units, cp: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_value::units_from_str;
+
+    use super::*;
 
     #[test]
     fn escape_decoding() {
         assert_eq!(decode_string_literal("ab").unwrap(), units_from_str("ab"));
-        assert_eq!(
-            decode_string_literal("a\\nb\\t").unwrap(),
-            units_from_str("a\nb\t")
-        );
+        assert_eq!(decode_string_literal("a\\nb\\t").unwrap(), units_from_str("a\nb\t"));
         assert_eq!(decode_string_literal("\\x41").unwrap(), units_from_str("A"));
-        assert_eq!(
-            decode_string_literal("\\u00e9").unwrap(),
-            units_from_str("é")
-        );
-        assert_eq!(
-            decode_string_literal("\\u{1F600}").unwrap(),
-            units_from_str("😀")
-        );
+        assert_eq!(decode_string_literal("\\u00e9").unwrap(), units_from_str("é"));
+        assert_eq!(decode_string_literal("\\u{1F600}").unwrap(), units_from_str("😀"));
         // Lone surrogate survives.
         assert_eq!(decode_string_literal("\\uD800").unwrap(), vec![0xd800]);
         assert_eq!(decode_string_literal("\\u{D800}").unwrap(), vec![0xd800]);

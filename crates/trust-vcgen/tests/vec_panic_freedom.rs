@@ -52,11 +52,13 @@ fn unconstrained_vec_remove_reports_unknown_never_proved() {
     // `fn rm(v: Vec<u8>, i: usize) { v.remove(i); }` — genuinely unsafe (i unbounded).
     let v = vcs("vp_rm");
     assert_eq!(
-        vec_panic_unknowns(&v), 1,
+        vec_panic_unknowns(&v),
+        1,
         "Vec::remove must emit exactly one fail-honest vec-panic-method Unknown"
     );
     assert_eq!(
-        slice_bounds_checks(&v), 0,
+        slice_bounds_checks(&v),
+        0,
         "Vec::remove must NOT mint a dischargeable SliceBoundsCheck (that path could false-accept)"
     );
 }
@@ -64,8 +66,16 @@ fn unconstrained_vec_remove_reports_unknown_never_proved() {
 #[test]
 fn unconstrained_vec_swap_remove_reports_unknown() {
     let v = vcs("vp_srm");
-    assert_eq!(vec_panic_unknowns(&v), 1, "Vec::swap_remove must emit one vec-panic-method Unknown");
-    assert_eq!(slice_bounds_checks(&v), 0, "swap_remove must not mint a dischargeable bounds check");
+    assert_eq!(
+        vec_panic_unknowns(&v),
+        1,
+        "Vec::swap_remove must emit one vec-panic-method Unknown"
+    );
+    assert_eq!(
+        slice_bounds_checks(&v),
+        0,
+        "swap_remove must not mint a dischargeable bounds check"
+    );
 }
 
 #[test]
@@ -81,7 +91,8 @@ fn hashmap_remove_is_not_a_panic_method() {
     // it must NOT match the Vec panic lane (compiles clean w.r.t. it).
     let v = vcs("vp_hm");
     assert_eq!(
-        vec_panic_unknowns(&v), 0,
+        vec_panic_unknowns(&v),
+        0,
         "HashMap::remove returns Option and must not be treated as a panicking Vec method"
     );
 }
@@ -91,7 +102,8 @@ fn vec_pop_is_not_a_panic_method() {
     // `Vec::pop` is total (returns `Option<T>`, no index) — no panic obligation.
     let v = vcs("vp_pp");
     assert_eq!(
-        vec_panic_unknowns(&v), 0,
+        vec_panic_unknowns(&v),
+        0,
         "Vec::pop takes no index and never panics — it must not match the panic lane"
     );
 }
@@ -105,11 +117,13 @@ fn len_tie_across_intervening_remove_never_false_accepts() {
     // bound → FALSE-ACCEPT. The fix makes BOTH removes fail-honest Unknowns.
     let v = vcs("bat_rmrm");
     assert_eq!(
-        vec_panic_unknowns(&v), 2,
+        vec_panic_unknowns(&v),
+        2,
         "both removes must be fail-honest vec-panic-method Unknowns"
     );
     assert_eq!(
-        slice_bounds_checks(&v), 0,
+        slice_bounds_checks(&v),
+        0,
         "SOUNDNESS: no dischargeable SliceBoundsCheck may exist — the surviving \
          .len() tie must never prove the second (genuinely OOB) remove safe"
     );

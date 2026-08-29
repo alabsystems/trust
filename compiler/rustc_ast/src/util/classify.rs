@@ -101,7 +101,7 @@ pub fn expr_requires_semi_to_be_stmt(e: &ast::Expr) -> bool {
 pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
     loop {
         match &expr.kind {
-            Block(_, label) | ForLoop { label, .. } | Loop(_, label, _) | While(_, _, label, _) => {
+            Block(_, label) | ForLoop { label, .. } | Loop(_, label, _, _) | While(_, _, label, _) => {
                 return label.is_some();
             }
 

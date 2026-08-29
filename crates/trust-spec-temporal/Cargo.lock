@@ -115,7 +115,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-allsat",
  "ay-chc",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "ay-allsat"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "ay-bv"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-sys",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "ay-chc"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -229,14 +229,14 @@ dependencies = [
 
 [[package]]
 name = "ay-dispatch"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-proof-common",
  "ay-sys",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "ay-dt"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "logos 0.15.1",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "ay-intsat"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "serde",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -376,14 +376,14 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-dpll",
  "ay-lra",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "ay-model-check"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -414,14 +414,14 @@ dependencies = [
 
 [[package]]
 name = "ay-multiset"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "ay-pb-core"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -481,11 +481,11 @@ dependencies = [
 
 [[package]]
 name = "ay-prefetch"
-version = "0.13.0"
+version = "0.17.0"
 
 [[package]]
 name = "ay-proof"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -498,14 +498,14 @@ dependencies = [
 
 [[package]]
 name = "ay-proof-common"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -528,11 +528,11 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.13.0"
+version = "0.17.0"
 
 [[package]]
 name = "ay-seq"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -540,14 +540,14 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "ay-translate"
-version = "0.13.0"
+version = "0.17.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -758,7 +758,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-auto"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ay",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "clean-ck0"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "clean-compiler"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "clean-elab"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clean-auto",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "clean-kernel"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "clean-olean"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "clean-parser"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "clean-tla"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "clean-auto",
  "clean-elab",
@@ -1487,7 +1487,6 @@ version = "0.4.6"
 dependencies = [
  "num-integer",
  "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -1506,7 +1505,6 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -1667,25 +1665,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "rmp"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "rmp-serde"
-version = "1.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
-dependencies = [
- "rmp",
- "serde",
-]
 
 [[package]]
 name = "rowan"
@@ -1909,9 +1888,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "socket2"
@@ -2432,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rayon",
  "serde",
@@ -2452,21 +2428,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2474,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-jit-matrix"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2491,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -2502,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2514,11 +2490,11 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "trust-cg-ir",
@@ -2526,10 +2502,9 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rayon",
- "rmp-serde",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2545,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -2555,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -2565,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "trust-ir",
 ]
@@ -2931,4 +2906,4 @@ dependencies = [
 
 [[patch.unused]]
 name = "ay-encode"
-version = "0.13.0"
+version = "0.17.0"

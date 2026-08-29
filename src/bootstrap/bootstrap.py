@@ -99,6 +99,17 @@ STAGE0_FORBIDDEN_BINS = (
     "tcargo",
     "tcargo-trust",
     "tcargo-fmt",
+    # Forbidden in a stage0 SEED only. The seed translates the stock rustdoc to
+    # `trustdoc` (STAGE0_PROGRAM_NAMES above), so the inherited leaf must never
+    # survive into a seed tree -- assert_stage0_tool_surface and
+    # stage0_tool_surface_needs_refresh below apply this list to the seed and to
+    # nothing else. A COMPLETE stage1/stage2/installed root is the opposite
+    # case: it deliberately ships `rustdoc` as a same-surface alias of
+    # `trustdoc` (76d408e1cd -- cargo spawns a binary named `rustdoc` for its
+    # doctest phase and rustup's proxy refuses a linked toolchain without it).
+    # scripts/check_toolchain_coherence.py derives the complete-root inventory
+    # by subtracting that carve-out from this authority, the same way it
+    # subtracts the optional Miri tools, so this entry must stay here.
     "rustdoc",
     "rustfmt",
     "cargo-fmt",

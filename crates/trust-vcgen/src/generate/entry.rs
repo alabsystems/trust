@@ -81,15 +81,18 @@ pub fn regenerate_loop_decreases_with_invariant_feedback_production_variants(
     crate::validate_function(func).ok()?;
 
     let _gen_work_scope = crate::gen_work_scope();
-    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let semantic_func = tail_call_expanded.as_ref();
+    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(semantic_func);
     let arithmetic_safe_func = arithmetic_safe_func.as_ref();
-    // Generate the row from the exact caller-owned function payload so an E4
-    // candidate sealed to that payload remains usable. `generate_loop_decreases_vc`
+    // Generate the row from the exact shared TailCall semantic view so an E4
+    // candidate sealed to that view remains usable. `generate_loop_decreases_vc`
     // does not consume function pre/postcondition assumptions. Only the interval
     // environment does, and that continues to use the production-sanitized view
     // below. Passing the sanitized clone into row generation would look like body
     // drift to the fresh-context candidate and unnecessarily disable feedback.
-    let raw = contracts::regenerate_loop_decreases_with_invariant_feedback_vcs(func, feedback);
+    let raw =
+        contracts::regenerate_loop_decreases_with_invariant_feedback_vcs(semantic_func, feedback);
     let merged_env = abstract_interp::merged_interval_environment(arithmetic_safe_func);
     let augmented = abstract_interp::augment_batch(&raw, &merged_env);
     if crate::gen_work_tripped() {
@@ -118,7 +121,9 @@ pub fn regenerate_loop_contract_production_variants(
     crate::validate_function(func).ok()?;
 
     let _gen_work_scope = crate::gen_work_scope();
-    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let semantic_func = tail_call_expanded.as_ref();
+    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(semantic_func);
     let arithmetic_safe_func = arithmetic_safe_func.as_ref();
 
     let mut contract_rows = Vec::new();
@@ -133,7 +138,7 @@ pub fn regenerate_loop_contract_production_variants(
         })
         .collect::<Vec<_>>();
     raw.extend(
-        contracts::regenerate_loop_decreases_with_invariant_feedback_vcs(func, feedback)
+        contracts::regenerate_loop_decreases_with_invariant_feedback_vcs(semantic_func, feedback)
             .into_iter()
             .filter(|vc| {
                 matches!(
@@ -169,7 +174,8 @@ pub fn regenerate_recursion_decreases_production_variants(
     crate::validate_function(func).ok()?;
 
     let _gen_work_scope = crate::gen_work_scope();
-    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(tail_call_expanded.as_ref());
     let arithmetic_safe_func = arithmetic_safe_func.as_ref();
 
     let mut termination_rows = Vec::new();
@@ -228,7 +234,9 @@ pub(super) fn parsed_source_clause_matches(
 /// whose own gates emit the Unknown; public/synthetic producers are allowed to
 /// populate only the parsed vectors and must not have their rejected clauses
 /// disappear when the shared function view is sanitized.
-pub(super) fn standalone_unmodeled_contract_rows(func: &VerifiableFunction) -> Vec<VerificationCondition> {
+pub(super) fn standalone_unmodeled_contract_rows(
+    func: &VerifiableFunction,
+) -> Vec<VerificationCondition> {
     let mut rows = Vec::new();
     for (kind, formulas, detail) in [
         (
@@ -297,6 +305,15 @@ pub(super) fn generate_vcs_impl(
     if let Err(error) = crate::validate_function(func) {
         return vec![malformed_trust_ir_vc(func, &error)];
     }
+
+    // One semantic projection closes the legacy-consumer surface for MIR
+    // `TailCall`: every established call, unsafe/FFI, atomic, dataflow, and
+    // per-Return postcondition lane sees the equivalent ordinary call writing
+    // local 0 followed by a fresh Return block.  The source model itself stays
+    // unchanged, so exact E5/source identity and serialization retain the real
+    // TailCall terminator.  See `VerifiableFunction::with_tail_calls_expanded`.
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let func = tail_call_expanded.as_ref();
 
     // verifier-perf: enter the mid-generation work-meter scope. On the OUTERMOST entry
     // this resets the per-function type-clone work counter; the guard (held for this
@@ -381,7 +398,13 @@ pub(super) fn generate_vcs_impl(
     // Trust hardened profile: generate fail-closed obligations for OS/path,
     // byte/text, error-discard, panic, trust-domain, and compatibility hazards
     // that ordinary Rust type checking cannot prove away.
-    vcs.extend(hardened::generate_hardened_vcs(func, hardened));
+    // Trust (B2): `summaries` is threaded HERE too. It used to stop at the
+    // per-statement lanes above, so the hardened panic-boundary twin — same
+    // asserts, same blocks — could not see a proved callee's `ensures` and
+    // refuted arithmetic the primary lane discharged. `targo trust check` turns
+    // the `unix_hardened` profile on BY DEFAULT, so that gap was the production
+    // behaviour while the profile-less UI fixtures stayed green.
+    vcs.extend(hardened::generate_hardened_vcs(func, hardened, summaries));
 
     // Deterministic ordering after parallel generation.
     vcs.sort_by(|a, b| {
@@ -406,13 +429,57 @@ pub(super) fn generate_vcs_impl(
     // other unsafe surface to trip `has_intrinsic_unsafe_surface` below.
     vcs.extend(unsafe_verify::detection::generate_inline_asm_vcs(func));
 
-    // Unsafe code verification with SAFETY comment extraction.
-    // In the full compiler integration, comments come from the source map.
-    // At the vcgen level, callers pass comments via check_unsafe() directly.
-    // Here we run detection only (no comments available at this layer).
+    // Unsafe-block detection. This `&[]` is the ONLY production comment list —
+    // vcgen has no source-map access and nothing else calls `check_unsafe` — so
+    // `[unsafe] missing SAFETY comment` fires on documented and undocumented
+    // blocks alike (MEASURED, stage2 b1254a567). It is nonetheless load-bearing:
+    // for a blanket-only unsafe op it is the SOLE obligation. See
+    // `unsafe_verify::detection::generate_safety_vcs`.
     if has_intrinsic_unsafe_surface(func) {
         unsafe_verify::check_unsafe(func, &[], box_deref_spans, &mut vcs);
+    }
 
+    // THE SPLIT (2026-08-28). The separation engine used to run inside the SAME
+    // `if` as `check_unsafe` above. That was wrong in both directions, because
+    // `has_intrinsic_unsafe_surface` and the engine's own
+    // `sep_engine::has_unsafe_patterns` do not admit the same set and neither is
+    // a superset of the other (see that function's doc comment). The visible
+    // symptom, measured: `g_noptr_and_box(w, flag)` minted ZERO
+    // `[unsafe:sep:alloc]` rows while `e_rawptr_and_box(w, p: *const i64)` minted
+    // FOUR PROVED ones — the two bodies differing only by an unused raw-pointer
+    // parameter that is never dereferenced, merely `is_null()`-tested. The sep
+    // row set was BODY-scoped when it must be SITE-scoped.
+    //
+    // Why the two halves must be gated SEPARATELY rather than by widening the
+    // one gate: `check_unsafe`'s production output is a single always-`Bool(true)`
+    // "[unsafe] missing SAFETY comment on unsafe block" row per detected unsafe
+    // block (vcgen has no source map, so `comments` is always `&[]` and the
+    // claim-bearing arms are unreachable — see
+    // `unsafe_verify::detection::generate_safety_vcs`). That row is
+    // UNDISCHARGEABLE BY CONSTRUCTION: `Bool(true)` is always SAT, and
+    // `refute_unsafe_demand_findings` (rustc_mir_transform/trust_verify.rs)
+    // additionally forces every `[unsafe`-marked row with a CONSTANT formula to
+    // `Failed`. Widening the single gate to admit allocators would therefore have
+    // charged an unprovable row to every body containing a `Box::new`.
+    //
+    // SOUNDNESS — this ADDS no proof and re-adds nothing unconditionally. The
+    // rows still come from the UNCHANGED `check_sep_unsafe_blocked` path, which
+    // re-derives them per CALL SITE by interpreting the body, and each carries a
+    // real non-constant arithmetic formula (`ptr == 0`, or
+    // `ptr != 0 ∧ ptr == 0` for an infallible box allocator whose abort-on-OOM
+    // contract genuinely supplies the conjunct). A fallible allocator keeps the
+    // bare SAT `ptr == 0` and still FAILS. And because the refute pass spares a
+    // `Proved` result only when the formula is NOT `Formula::Bool(_)`, a row that
+    // is merely admitted here can never be graded proved without a solver having
+    // discharged a real predicate.
+    //
+    // ROW-MONOTONE: `check_sep_unsafe_blocked` already re-checks
+    // `has_unsafe_patterns` internally and returns empty when it is false, so the
+    // OLD effective condition was `has_intrinsic_unsafe_surface ∧
+    // has_unsafe_patterns` and the NEW one is `has_unsafe_patterns` alone. That is
+    // a strict weakening of a conjunction: no sep row that existed before can
+    // disappear.
+    if sep_engine::has_unsafe_patterns(func) {
         // Separation logic provenance engine — heap-aware VCs for
         // unsafe patterns (raw deref, alloc, dealloc, ptr::copy, transmute, etc.).
         // Conjoin each sep VC's block path DEFINITIONS and path GUARDS (the same
@@ -476,9 +543,12 @@ pub(super) fn generate_vcs_impl(
         }
 
         // NOTE: supersession of the always-`Bool(true)` "[unsafe] missing SAFETY
-        // comment" DOCUMENTATION lint for a bounds-complete scalar-index
-        // `get_unchecked` is performed at its SOURCE, per block, keyed on the
-        // block's OWN terminator identity — see
+        // comment" row for a bounds-complete scalar-index `get_unchecked` is
+        // performed at its SOURCE, per block, keyed on the block's own terminator
+        // identity — which is WHY the split above is safe for it. That
+        // supersession lives in `block_is_bounds_complete_unchecked_index`, inside
+        // `generate_safety_vcs`, and so is unaffected by which `if` the sep engine
+        // runs under: it never depended on the two halves sharing a gate. See
         // `unsafe_verify::detection::block_is_bounds_complete_unchecked_index` (the
         // sep engine emits the real `index >= len` obligation there, so the lint is
         // redundant for that block only). It is NOT done here by span co-location: a
@@ -504,9 +574,17 @@ pub(super) fn generate_vcs_impl(
         // `generate_call_site_vcs`' no-summary branch, which fails closed
         // (round-19 #4), so an `extern { fn compute_hash(); }` import can no
         // longer be silently treated as safe.
-        if let Terminator::Call { func: callee, args, dest, span, is_foreign, .. } =
-            &block.terminator
-            && (*is_foreign || ffi_vcgen::is_extern_call(callee, &ffi_db))
+        let call = match &block.terminator {
+            Terminator::Call { func, args, dest, span, is_foreign, .. } => {
+                Some((func, args, dest.clone(), span, *is_foreign))
+            }
+            Terminator::TailCall { func, args, span, is_foreign, .. } => {
+                Some((func, args, Place::local(0), span, *is_foreign))
+            }
+            _ => None,
+        };
+        if let Some((callee, args, dest, span, is_foreign)) = call
+            && (is_foreign || ffi_vcgen::is_extern_call(callee, &ffi_db))
         {
             let arg_formulas: Vec<Formula> =
                 args.iter().map(|op| operand_to_formula(func, op)).collect();
@@ -526,7 +604,7 @@ pub(super) fn generate_vcs_impl(
                     _ => None,
                 })
                 .collect();
-            let dest_var = place_to_var_name(func, dest);
+            let dest_var = place_to_var_name(func, &dest);
             vcs.extend(ffi_vcgen::generate_call_site_vcs(
                 &func.name,
                 callee,
@@ -547,12 +625,10 @@ pub(super) fn generate_vcs_impl(
             .body
             .blocks
             .iter()
-            .filter_map(|block| {
-                if let Terminator::Call { atomic: Some(ref op), .. } = block.terminator {
-                    Some(op.clone())
-                } else {
-                    None
-                }
+            .filter_map(|block| match &block.terminator {
+                Terminator::Call { atomic: Some(op), .. }
+                | Terminator::TailCall { atomic: Some(op), .. } => Some(op.clone()),
+                _ => None,
             })
             .collect();
         if !atomic_ops.is_empty() {
@@ -618,10 +694,39 @@ pub(super) fn generate_vcs_impl(
         }
     }
 
+    // GROUP 3: an unmodelled callee's return is a free variable, and a solver
+    // model over it is not an execution. Reclassify every safety row whose
+    // verdict rests on such a value to `UnsupportedMir` (→ Unknown) instead of
+    // letting it be reported as a refutation with a witness no run can produce.
+    // Runs LAST so it sees each row's final formula (after the SSA-token
+    // normalization above); DROP-ONLY — it can only turn a row into an Unknown.
+    havoc_decline::reclassify_havoc_only_refutations(func, &mut vcs);
+
     // Trust diagnostic (debug-only, no effect on verification): dump each
     // generated VC's location + formula when TRUST_DUMP_V2_VC is set, so the
     // exact SMT goal ay receives can be inspected (e.g. why a loop-body
     // `index += 1` overflow VC lacks its `index < n-1` guard).
+    // A conjoined `Eq(v, f(v))` with `v` free in `f` is a recurrence, not a
+    // definition: UNSAT for every program, so it vacuously discharges EVERY
+    // obligation it accompanies. It appears when a fact established BEFORE a write
+    // is read back at the POST-write version — the mint/kill fork this lane is
+    // built to avoid. `i += 100` emits `_5.0 == i + 100` (pre) and `i == _5.0`
+    // (post) over ONE symbol `i`, i.e. `i == i + 100` (2026-08-26: a guarded
+    // out-of-bounds index read `proved` under certify while the binary panicked at
+    // index 101). Fail closed — keep the obligation, refuse the proof.
+    // SOUNDNESS: DROP-ONLY. `UnsupportedMir` preclassifies to Unknown and is never
+    // Proved, so this can only LOSE proofs, never manufacture one.
+    for vc in &mut vcs {
+        if let Some(detail) = self_referential_definition(&vc.formula) {
+            *vc = unsupported_mir_vc(
+                func,
+                "SelfReferentialDefinition".to_string(),
+                detail,
+                vc.location.clone(),
+            );
+        }
+    }
+
     if std::env::var("TRUST_DUMP_V2_VC").is_ok() {
         for vc in &vcs {
             eprintln!(
@@ -637,4 +742,23 @@ pub(super) fn generate_vcs_impl(
     }
 
     vcs
+}
+
+/// The first `Eq(Var(v), rhs)` in `f` where `v` occurs free in `rhs` and `rhs` is
+/// not `v` itself, rendered for the refusal detail.
+///
+/// `x == x` is a harmless tautology and is deliberately not reported; `x == x + k`
+/// is unsatisfiable and is what poisons a block.
+fn self_referential_definition(f: &Formula) -> Option<String> {
+    if let Formula::Eq(l, r) = f
+        && let Some(name) = l.var_name()
+        && r.var_name() != Some(name)
+        && r.free_variables().iter().any(|v| v.as_str() == name)
+    {
+        return Some(format!("`{name}` is defined in terms of itself: {f:?}"));
+    }
+    // `children()` rather than a hand-written match: an arm this file forgot would
+    // silently stop DETECTING, which is the fail-open shape this guard exists to
+    // close. Same traversal `formula_mentions_redef` uses.
+    f.children().iter().find_map(|c| self_referential_definition(c))
 }

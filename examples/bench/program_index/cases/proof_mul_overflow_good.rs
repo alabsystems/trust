@@ -4,11 +4,7 @@
 // arithmetic proof surface without std I/O noise.
 
 fn multiply_guarded(a: u32, b: u32) -> u32 {
-    if a <= 65_535 && b <= 65_535 {
-        a * b
-    } else {
-        0
-    }
+    if a <= 65_535 && b <= 65_535 { a * b } else { 0 }
 }
 
 fn main() {

@@ -14,9 +14,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::value::Units;
-use num_bigint::{BigInt, Sign};
 use std::cmp::Ordering;
+
+use num_bigint::{BigInt, Sign};
+
+use crate::value::Units;
 
 /// The most bits any modeled BigInt magnitude may occupy. Operations whose
 /// result would exceed this refuse (a sound `NoCoverage`) rather than risk
@@ -52,9 +54,7 @@ pub fn zero() -> BigInt {
 
 fn guard_bits(bits: u64, what: &str) -> Result<(), BigErr> {
     if bits > MAX_BITS {
-        Err(BigErr::Refuse(format!(
-            "BigInt {what} result exceeds {MAX_BITS}-bit model cap"
-        )))
+        Err(BigErr::Refuse(format!("BigInt {what} result exceeds {MAX_BITS}-bit model cap")))
     } else {
         Ok(())
     }
@@ -209,19 +209,11 @@ fn shr_by_pos(a: &BigInt, s: &BigInt) -> Result<BigInt, BigErr> {
             // Beyond the magnitude, an arithmetic shift saturates to 0 (a ≥ 0)
             // or -1 (a < 0).
             if (n as u64) > a.bits() {
-                return Ok(if a.sign() == Sign::Minus {
-                    BigInt::from(-1)
-                } else {
-                    zero()
-                });
+                return Ok(if a.sign() == Sign::Minus { BigInt::from(-1) } else { zero() });
             }
             Ok(a >> n)
         }
-        None => Ok(if a.sign() == Sign::Minus {
-            BigInt::from(-1)
-        } else {
-            zero()
-        }),
+        None => Ok(if a.sign() == Sign::Minus { BigInt::from(-1) } else { zero() }),
     }
 }
 
@@ -272,12 +264,7 @@ pub fn as_int_n(bits: u64, x: &BigInt) -> BigInt {
 /// interpretation on read differs).
 #[must_use]
 pub fn to_u64_wrapping(x: &BigInt) -> u64 {
-    as_uint_n(64, x)
-        .magnitude()
-        .to_u64_digits()
-        .first()
-        .copied()
-        .unwrap_or(0)
+    as_uint_n(64, x).magnitude().to_u64_digits().first().copied().unwrap_or(0)
 }
 
 // -- ToString / radix --------------------------------------------------------
@@ -427,9 +414,8 @@ pub fn eq_f64(a: &BigInt, b: f64) -> bool {
 fn is_str_ws(c: u16) -> bool {
     matches!(
         c,
-        0x09 | 0x0b | 0x0c | 0x20 | 0xa0 | 0xfeff | 0x1680
-            | 0x2000..=0x200a
-            | 0x202f | 0x205f | 0x3000 | 0x0a | 0x0d | 0x2028 | 0x2029
+        0x09 | 0x0b | 0x0c | 0x20 | 0xa0 | 0xfeff | 0x1680 | 0x2000
+            ..=0x200a | 0x202f | 0x205f | 0x3000 | 0x0a | 0x0d | 0x2028 | 0x2029
     )
 }
 
@@ -453,10 +439,7 @@ pub fn string_to_bigint(u: &[u16]) -> Option<BigInt> {
         return Some(zero());
     }
     // Radix prefixes admit no sign.
-    let ascii: Option<String> = s
-        .iter()
-        .map(|&c| u8::try_from(c).ok().map(char::from))
-        .collect();
+    let ascii: Option<String> = s.iter().map(|&c| u8::try_from(c).ok().map(char::from)).collect();
     let text = ascii?; // any non-ASCII code unit ⇒ not an integer literal
     let bytes = text.as_bytes();
     if bytes.len() >= 2 && bytes[0] == b'0' {
@@ -500,8 +483,9 @@ fn checked_parse(digits: &[u8], radix: u32) -> Option<BigInt> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::str::FromStr;
+
+    use super::*;
 
     fn b(s: &str) -> BigInt {
         BigInt::from_str(s).unwrap()

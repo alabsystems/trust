@@ -1,0 +1,93 @@
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:15:1
+   |
+LL | #[creusot_contracts::ensures(result@ == x@ + 1)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: pearlite `@` lifts the value to mathematical Int, and Trust's machine encoding is exact wrapping — an Int reading of arithmetic or comparisons is the recorded false-proof vector; options: restate the property on machine values, or move it to a `clean { .. }` island theorem and cite it with `ensures .. by <theorem>`
+   = note: `-D clippy::trust-creusot-spec-sugar` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::trust_creusot_spec_sugar)]`
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:23:1
+   |
+LL | #[creusot_contracts::ensures(forall<i: Int> 0 <= i && i < 10 ==> x >= x)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: quantifier migration is DEFERRED (R4 §2 doctrine, `trust-spec-elab`): a unique machine typing for an Int-relaxed binder is measurement-only evidence, and auto-application waits for the bounded-domain encoding; options: keep the attribute (zero-authority, disclosed), or hand-write the native clause with an explicit machine-typed binder and prove it via `targo trust check`
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:31:1
+   |
+LL | #[creusot_contracts::ensures((^p) == 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `^` (pearlite prophecy/final value — and bitwise xor, which is also outside the subset) has no native carrier here; the `&mut` two-state lane is trust-wp's RustHorn prophecy domain (v6/D3); option: restructure the contract to speak only about by-value entry/exit values
+   = note: the clause reads parameter `p`, which lives behind a reference: two-state `&mut` semantics belong to the prophecy lane (trust-wp, v6/D3) and shared-borrow views are not in the machine fragment; option: restate over by-value machine parameters
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:40:1
+   |
+LL | #[creusot_contracts::ensures(result >= x)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the clause reads parameter `x`, whose binding is mutable: pearlite reads the ENTRY value, and an exit-state re-reading would silently change the proposition (MutablePostStateAmbiguity); options: drop the `mut` from the binding, or bind the entry value in a new immutable parameter and restate
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:48:1
+   |
+LL | #[creusot_contracts::ensures(result == old(x))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `old(..)` is migratable only when its operand is an immutable by-value machine parameter — there `old(x)` and `x` provably coincide (the compiler's own by-value prime-collapse rule); here `x` has a mutable binding, and the entry state has no other native spelling yet
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:57:1
+   |
+LL | #[creusot_contracts::requires(x > 1int)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: integer suffix `int` is not a machine width, and stripping it would re-read the literal at a different width — the recorded false-proof vector (the spec-surface design's pearlite-migration hazard); the width must be preserved, so this clause is not rewritten
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:67:1
+   |
+LL | #[creusot_contracts::ensures(result <= LIMIT)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `LIMIT` is not a parameter of this function; the machine-applicable subset maps only parameter reads, `result`, `old(..)`, literals, and machine operators
+
+error: creusot contract attribute outside the machine-applicable subset; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:73:1
+   |
+LL | #[creusot_contracts::requires(result > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `result` has no meaning in a precondition
+
+error: creusot/pearlite attribute has no machine-applicable migration; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:80:1
+   |
+LL | #[creusot_contracts::variant(n)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[variant(..)]` maps to the native `decreases` signature clause, but the migration harness does not cover termination measures yet; option: hand-write `decreases <expr>` in the signature and prove it via `targo trust check`
+
+error: creusot/pearlite attribute has no machine-applicable migration; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:86:1
+   |
+LL | #[creusot_contracts::logic]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: pearlite logic bodies have no ingestion rung; option: restate the definition as a `clean { .. }` island and cite it from `ensures .. by <theorem>`
+
+error: creusot/pearlite attribute has no machine-applicable migration; it carries no proof authority and is not examined by this build
+  --> tests/ui/trust_creusot_spec_sugar.rs:92:1
+   |
+LL | #[creusot_contracts::trusted]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[trusted]` asserts without proof, which Trust does not admit at any authority level; without it the function simply stays unverified until its obligations prove
+
+error: aborting due to 11 previous errors
+

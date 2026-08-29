@@ -36,11 +36,11 @@ rustc_target = { path = "../rustc_target" }
 rustc_thread_pool = { path = "../rustc_thread_pool" }
 rustc_type_ir = { path = "../rustc_type_ir" }
 smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
+thin-vec = "0.2.18"
+tracing = "0.1"
 # Trust (B): the `trust_ir_of` query returns a `&'tcx trust_ir::Module`, so the type has to be
 # nameable here. trust-ir does not depend on any rustc crate, so this adds no cycle.
 trust-ir = { workspace = true, features = ["serde"] }
-thin-vec = "0.2.18"
-tracing = "0.1"
 # tidy-alphabetical-end
 
 [features]

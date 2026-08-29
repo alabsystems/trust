@@ -1559,10 +1559,7 @@ impl<'v> RootCollector<'_, 'v> {
                 // analysis time. Keep it out of the mono-item graph entirely;
                 // pushing it as `MonoItem::GlobalAsm` ICEs the collector's
                 // GlobalAsm arm on the mismatched HIR kind.
-                if matches!(
-                    self.tcx.hir_item(id).kind,
-                    hir::ItemKind::CleanIsland { .. }
-                ) {
+                if matches!(self.tcx.hir_item(id).kind, hir::ItemKind::CleanIsland { .. }) {
                     return;
                 }
                 debug!(

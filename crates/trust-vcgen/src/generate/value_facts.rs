@@ -89,21 +89,24 @@ pub(super) fn build_checked_sub_result_facts(func: &VerifiableFunction) -> Vec<F
                     {
                         continue;
                     }
-                    let idx_var = Formula::Var(
-                        crate::place_to_var_name(
-                            func,
-                            &Place { local: dst.local, projections: Vec::new() },
-                        ),
-                        Sort::Int,
+                    let dst_name = crate::place_to_var_name(
+                        func,
+                        &Place { local: dst.local, projections: Vec::new() },
                     );
                     let lhs_f = crate::operand_to_formula(func, lhs);
                     let rhs_f = crate::operand_to_formula(func, rhs);
+                    let diff = Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone()));
+                    // `_dst = move (_c.0)` may write back the very local an operand
+                    // was read from (`x -= k`), which mints `Eq(x, Sub(x, k))` — a
+                    // recurrence, not a definition, UNSAT for any nonzero `k`. One
+                    // such hypothesis vacuously discharges every obligation it
+                    // reaches. Drop-only, so it can only weaken a prove.
+                    if diff.free_variables().iter().any(|v| v.as_str() == dst_name) {
+                        continue;
+                    }
                     facts.push(Formula::Or(vec![
-                        Formula::Lt(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-                        Formula::Eq(
-                            Box::new(idx_var),
-                            Box::new(Formula::Sub(Box::new(lhs_f), Box::new(rhs_f))),
-                        ),
+                        Formula::Lt(Box::new(lhs_f), Box::new(rhs_f)),
+                        Formula::Eq(Box::new(Formula::Var(dst_name, Sort::Int)), Box::new(diff)),
                     ]));
                 }
             }
@@ -196,19 +199,25 @@ pub(super) fn build_checked_add_result_facts(func: &VerifiableFunction) -> Vec<F
                     {
                         continue;
                     }
-                    let dst_var = Formula::Var(
-                        crate::place_to_var_name(
-                            func,
-                            &Place { local: dst.local, projections: Vec::new() },
-                        ),
-                        Sort::Int,
+                    let dst_name = crate::place_to_var_name(
+                        func,
+                        &Place { local: dst.local, projections: Vec::new() },
                     );
                     let lhs_f = crate::operand_to_formula(func, lhs);
                     let rhs_f = crate::operand_to_formula(func, rhs);
                     let sum = Formula::Add(Box::new(lhs_f), Box::new(rhs_f));
+                    // `_dst = move (_c.0)` may write back the very local an operand
+                    // was read from (`i += 100`), which mints `Eq(i, Add(i, 100))` —
+                    // a recurrence, not a definition, UNSAT for any nonzero addend.
+                    // MEASURED 2026-08-26: this is the producer that false-PROVED
+                    // `if i < 4 { i += 100; a[i] }` under certify while the binary
+                    // died at index 101 (fixture selfadd_guarded_index). Drop-only.
+                    if sum.free_variables().iter().any(|v| v.as_str() == dst_name) {
+                        continue;
+                    }
                     facts.push(Formula::Or(vec![
                         Formula::Gt(Box::new(sum.clone()), Box::new(Formula::Int(type_max))),
-                        Formula::Eq(Box::new(dst_var), Box::new(sum)),
+                        Formula::Eq(Box::new(Formula::Var(dst_name, Sort::Int)), Box::new(sum)),
                     ]));
                 }
             }
@@ -246,8 +255,8 @@ pub(crate) fn build_global_invariant_facts(func: &VerifiableFunction) -> Vec<For
     global_facts.extend(build_expect_const_facts(func));
     global_facts.extend(build_accumulator_bound_facts(func));
     global_facts.extend(build_discriminant_cse_facts(func));
-    global_facts.extend(build_exhaustive_enum_validity_facts(func));
     global_facts.extend(build_discriminant_variant_range_facts(func));
+    global_facts.extend(build_coroutine_resume_state_facts(func));
     global_facts.extend(build_immutable_index_len_tie_facts(func));
     global_facts.extend(build_immutable_read_value_tie_facts(func));
     global_facts.extend(build_vec_index_dest_value_tie_facts(func));
@@ -1180,7 +1189,11 @@ pub(super) fn clamp_upper_bound(func: &VerifiableFunction, local: usize) -> Opti
 /// preserves the value; narrowing truncates into `[0, type_max(target)]`), and a
 /// wrapping `a op b` result is `≤ a op b ≤ ub(a) op ub(b)` (the machine `mod` only
 /// decreases), each further capped by the result type's range.
-pub(super) fn unsigned_upper_bound(func: &VerifiableFunction, operand: &Operand, fuel: u32) -> Option<i128> {
+pub(super) fn unsigned_upper_bound(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    fuel: u32,
+) -> Option<i128> {
     use trust_types::{BinOp, ConstValue, Operand as Op, Projection, Ty};
     fn ty_max(t: &Ty) -> Option<i128> {
         match t {
@@ -1445,62 +1458,15 @@ pub(crate) fn build_discriminant_cse_facts(func: &VerifiableFunction) -> Vec<For
     facts
 }
 
-/// Exhaustive-enum discriminant validity. For each `SwitchInt` the extractor
-/// TyCtxt-vetted as `exhaustive_enum_unreachable` — its selector is a genuine
-/// single-assignment enum-discriminant temp, the case values (`targets.0`) are
-/// EXACTLY the enum's full discriminant tag set, and `otherwise` targets an
-/// `Unreachable` block — emit the validity fact `disc ∈ {case values}`. The
-/// `otherwise → Unreachable` path guard is `disc ∉ {case values}`, so this fact
-/// makes it UNSAT, proving the trap. Without it the V1/default lane RUNTIME-CHECKS
-/// that trap — e.g. the iterator-exhaustion `Unreachable` after a `for` loop's
-/// `Option`-discriminant match (the dominant fuzzer `[unreach]` completeness gap).
-///
-/// SOUND: the flag's TyCtxt vetting guarantees `disc` is always one of the cased
-/// values (an N-variant enum's discriminant is in its tag set), so the membership
-/// fact is a true program invariant — never a false proof. This MIRRORS the
-/// `disc ∈ {case values}` the native CHC translator already conjoins (per the
-/// `exhaustive_enum_unreachable` field doc); it just brings the default lane to
-/// parity. Emitted over the discriminant's NATIVE name (no rename), like
-/// `build_discriminant_cse_facts`, so it agrees with the path-guard's bare read.
-pub(super) fn build_exhaustive_enum_validity_facts(func: &VerifiableFunction) -> Vec<Formula> {
-    let mut facts = Vec::new();
-    for block in &func.body.blocks {
-        let Terminator::SwitchInt { discr, targets, exhaustive_enum_unreachable: true, .. } =
-            &block.terminator
-        else {
-            continue;
-        };
-        if targets.is_empty() {
-            continue;
-        }
-        let disc = crate::operand_to_formula(func, discr);
-        let cases: Vec<Formula> = targets
-            .iter()
-            .filter_map(|(v, _)| i128::try_from(*v).ok())
-            .map(|v| Formula::Eq(Box::new(disc.clone()), Box::new(Formula::Int(v))))
-            .collect();
-        // Only emit when every case value lowered (a partial set would be unsound).
-        if cases.len() != targets.len() {
-            continue;
-        }
-        facts.push(if cases.len() == 1 {
-            cases.into_iter().next().expect("len checked")
-        } else {
-            Formula::Or(cases)
-        });
-    }
-    facts
-}
-
 /// Per-ADT discriminant range bound (Lever A). For each `d = Discriminant(src)`
 /// read whose SOURCE place resolves to a modeled enum, conjoin the membership fact
 /// `d ∈ {variant tags}` — the phantom-tag refutation that collapses the spurious
 /// `__type_tag` obligation explosion (a read of a 3-variant enum can only produce
 /// a discriminant in its variant tag set, so a solver counterexample with a
-/// phantom tag `d = 7` is impossible). Complements
-/// `build_exhaustive_enum_validity_facts` (which bounds at `SwitchInt`
-/// terminators); this bounds at the `Rvalue::Discriminant` READ, independent of
-/// any switch.
+/// phantom tag `d = 7` is impossible). This is derived at the
+/// `Rvalue::Discriminant` read from the modeled datatype itself; unlike the
+/// caller-constructible `SwitchInt::exhaustive_enum_unreachable` hint, it does
+/// not grant authority to a serialized switch flag.
 ///
 /// SOUNDNESS: the bound is the enum's OWN TYPE INVARIANT — every inhabitant of the
 /// enum carries a discriminant drawn EXACTLY from its variants' tags, so the
@@ -1516,6 +1482,16 @@ pub(super) fn build_exhaustive_enum_validity_facts(func: &VerifiableFunction) ->
 /// the dest's native var name (default lane) and the canonical generated
 /// discriminant name (native CHC path), so it attaches whichever lane lowered
 /// the read; an unmatched name is inert.
+///
+/// Trust (UNINHABITED MATCH ARM, false REFUTATION): the tag set is
+/// [`inhabited_enum_variant_tag_set`], i.e. the declared tags MINUS every variant
+/// whose payload is PROVABLY uninhabited. `Result<u8, Infallible>` is bounded by
+/// `d ∈ {0}`, not `{0, 1}`, so the dead `Err` arm's `Unreachable` block stops being
+/// accused. rustc's OWN lowering already omits an uninhabited variant's `SwitchInt`
+/// target (measured: `switch _2 { 0 => .., 2 => .., otherwise => Unreachable }` for
+/// `enum E3 { A(u8), B(Infallible), C(u8) }`), so the declared-but-impossible tag was
+/// the only thing keeping that block satisfiable. See that function for the soundness
+/// argument; the `tags.is_empty()` guard below is the fail-closed half of it.
 pub(super) fn build_discriminant_variant_range_facts(func: &VerifiableFunction) -> Vec<Formula> {
     let mut facts = Vec::new();
     for block in &func.body.blocks {
@@ -1530,9 +1506,21 @@ pub(super) fn build_discriminant_variant_range_facts(func: &VerifiableFunction) 
             let Some(src_ty) = crate::place_ty_cow(func, src) else {
                 continue;
             };
-            let Some(tags) = enum_variant_tag_set(src_ty.as_ref()) else {
+            let Some(tags) = inhabited_enum_variant_tag_set(src_ty.as_ref()) else {
                 continue;
             };
+            // FAIL CLOSED on an empty set. It arises two ways — a `Ty::Adt` whose
+            // declared variants are empty (no fact was ever emitted for one) and, since
+            // the uninhabited filter, a source enum EVERY variant of which is dead. The
+            // membership over an empty set is the unsatisfiable `false`, and these facts
+            // are GLOBAL to the function: publishing it would erase every overflow /
+            // bounds / div-by-zero obligation in the body from one dead-place read.
+            // MEASURED, not argued — delete this `continue` and both `+` rows of
+            // `tests/fixtures/uninhabited_all_dead_source_mir.json` go `Failed` ->
+            // `Proved`, two real `u8` overflows discharged by a premise about a place
+            // the body never reads (`tests/uninhabited_arm_realmir.rs` fires there). The
+            // read's infeasibility is a PATH property; a whole-function premise is the
+            // wrong carrier for it, so emit nothing.
             if tags.is_empty() {
                 continue;
             }
@@ -1624,6 +1612,247 @@ pub(super) fn build_discriminant_variant_range_facts(func: &VerifiableFunction) 
     facts
 }
 
+/// Trust (coroutine executor-protocol premise, the FALSE-REFUTATION fix): the
+/// resume-state membership `selector ∈ live_states` of a recognized coroutine
+/// RESUME body, published as a WHOLE-BODY fact next to the enum-validity bound
+/// above and for exactly the same reason.
+///
+/// # What went wrong without it
+///
+/// `4ca0cb0eac` made rustc's `ResumedAfter{Return,Panic,Drop}` sentinel a real
+/// refutable `Assertion` row and kept the `Unreachable` row of an
+/// `exhaustive_enum_unreachable` switch. Both changes are RIGHT — neither the
+/// message spelling nor the serialized exhaustiveness bit is proof authority in
+/// a public TrustIR input, so neither may erase a row. What it did not do is
+/// supply the premise those rows must be DECIDED under. The rows' only
+/// reachability condition is a claim about the resume selector
+/// (`sel == RETURNED` on the sentinel arm, `sel ∉ cases` on the `otherwise`
+/// arm); on the refutation convention SAT = refuted, so an unconstrained
+/// selector REFUTES both and the verifier accused correct code. `sel` is this
+/// doc's shorthand for the resume-selector local; the diagnostics print the MIR
+/// local name.
+///
+/// # Why a GLOBAL fact and not a per-path premise
+///
+/// [`trust_types::coroutine_resume_state_contract`] declines unless the selector
+/// is written EXACTLY ONCE in the whole body (counting statement destinations
+/// and `Call` dests) and that one write is the entry block's
+/// `Discriminant(frame)` read. So the value this fact speaks about is the same
+/// value at every program point, which is the definition of a whole-body fact.
+/// Conjoining it globally also means it survives the `MAX_PATHS_PER_BLOCK`
+/// collapse in `v2_build_path_guard_map`, which a per-path premise does not.
+///
+/// # Authority
+///
+/// This adds NO trust beyond the recognizer the bridge, the compiler and
+/// `coroutine_sentinel::coroutine_sentinel_refutation_vcs` already share. The
+/// premise is discharged NOWHERE here: it is the CALLER's obligation, published
+/// as the `contract:coroutine-resume-state` / `assumption:coroutine` row, and
+/// `stamp_coroutine_conditional_rows` demotes every `Proved` row of such a body
+/// out of `Proved` before it can read as an unconditional proof. Emission is
+/// untouched — this conditions rows, it never prunes one.
+///
+/// # Fail-closed gates
+///
+/// Every doubt yields NO fact (and therefore today's behavior exactly):
+///  * the recognizer declines (not an `async fn` resume body, a `gen`/async-drop
+///    shape, a frame-state write before the entry read, a reserved arm that is
+///    not a verified panic sentinel, …);
+///  * the entry dispatch operand is not the whole-local the recognizer named;
+///  * the selector is not integer-sorted (a non-integer selector takes a
+///    different `guard_to_formula` spelling and the fact would constrain
+///    something other than a state number);
+///  * the body carries a write channel the destination counter cannot see —
+///    see [`selector_write_channel_is_unaccountable`]. The recognizer's counter
+///    only sees a write where a DESTINATION PLACE names the target; without this
+///    belt "written once" would not imply "single-valued", and the whole-body
+///    fact would speak about a value that changed;
+///  * an empty live set (impossible per
+///    `coroutine_resume_contract_states_are_valid`, which requires non-empty and
+///    containing `UNRESUMED = 0`, but an empty `Or` is `false` and would
+///    vacuously prove EVERY row — the mirror-image accident, refused explicitly).
+///
+/// The fact is spelled through the SAME [`crate::guards::guard_to_formula`] path
+/// the entry dispatch's own path guards go through, so its selector symbol
+/// unifies with theirs by construction rather than by a name coincidence a sort
+/// or token change could silently break into an inert conjunct. It is emitted
+/// BARE (unversioned) like every other global fact: the block-VC lane conjoins
+/// the global set and then version-renames the whole formula at the consuming
+/// block's terminal, so the fact and the row's own reads are renamed together.
+pub(super) fn build_coroutine_resume_state_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    let Some(contract) = trust_types::coroutine_resume_state_contract(&func.body) else {
+        return Vec::new();
+    };
+    let Some(entry) = func.body.blocks.first() else {
+        return Vec::new();
+    };
+    let Terminator::SwitchInt { discr, .. } = &entry.terminator else {
+        return Vec::new();
+    };
+    // (belt) the dispatch operand must be the whole-local selector the recognizer
+    // named; anything else and we do not know what we would be constraining.
+    if !matches!(
+        discr,
+        Operand::Copy(place) | Operand::Move(place)
+            if place.projections.is_empty() && place.local == contract.discr_local
+    ) {
+        return Vec::new();
+    }
+    // (belt) integer-sorted, like every real resume-state selector (`u32`).
+    if !matches!(
+        func.body.locals.iter().find(|l| l.index == contract.discr_local).map(|l| &l.ty),
+        Some(Ty::Int { .. })
+    ) {
+        return Vec::new();
+    }
+    if selector_write_channel_is_unaccountable(func, contract.discr_local) {
+        return Vec::new();
+    }
+    let terms: Vec<Formula> = contract
+        .live_states
+        .iter()
+        .map(|state| {
+            guards::guard_to_formula(
+                func,
+                &GuardCondition::SwitchIntMatch { discr: discr.clone(), value: *state },
+            )
+        })
+        .collect();
+    match terms.len() {
+        0 => Vec::new(),
+        1 => terms,
+        _ => vec![Formula::Or(terms)],
+    }
+}
+
+/// Is there any write channel to `local` that the recognizer's
+/// "written exactly once" counter provably cannot see? `true` ⇒ DECLINE.
+///
+/// That counter enumerates DESTINATION PLACES (`Assign` / `SetDiscriminant` /
+/// `Deinit` statements and `Call` dests), so it sees a write only where a place
+/// names the target. [`trust_types::WriteEffect::FailClosedOrBackstopped`] is
+/// the class the model's own taxonomy declares un-capturable by a place-keyed
+/// analysis, so this is the missing half of the single-assignment premise —
+/// without it "written once" does not mean "single-valued", and the whole-body
+/// fact would be about a value that changed.
+///
+/// Three channels, each refused:
+///  * an ALIAS out of the selector — see
+///    [`rvalue_opens_an_alias_channel_to`], which decides this arm over an
+///    ANCHORED match on every `Rvalue` variant rather than a short allowlist;
+///  * any `FailClosedOrBackstopped` statement or terminator anywhere in the
+///    body that carries no destination place, so no counter can attribute it;
+///    refuse the whole body rather than reason about what it might touch.
+///    `Deinit` and `Drop` are in that class too but ARE place-attributed, so
+///    they are excluded here and handled by name;
+///  * a `Drop` OF the selector, whose glue receives `&mut place`.
+///
+/// The residual this does NOT cover is a pointer FORGED from an integer
+/// (`_p = k as *mut u32`) aimed at the selector's slot. Nothing in this crate
+/// models that — `place_names_overlap`, the version oracle and every other
+/// single-assignment-gated fact in this module have exactly the same exposure —
+/// so it is a property of the place-keyed model, not of this fact.
+fn selector_write_channel_is_unaccountable(func: &VerifiableFunction, local: usize) -> bool {
+    use trust_types::WriteEffect;
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if let Statement::Assign { rvalue, .. } = stmt
+                && rvalue_opens_an_alias_channel_to(rvalue, local)
+            {
+                return true;
+            }
+            if matches!(stmt.write_effect(), WriteEffect::FailClosedOrBackstopped)
+                && !matches!(stmt, Statement::Deinit { .. })
+            {
+                return true;
+            }
+        }
+        if let Terminator::Drop { place, .. } = &block.terminator
+            && place.local == local
+        {
+            return true;
+        }
+        if matches!(block.terminator.write_effect(), WriteEffect::FailClosedOrBackstopped)
+            && !matches!(block.terminator, Terminator::Drop { .. })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does this `Rvalue` hand out a reference to — or otherwise carry unmodeled
+/// semantics over — `local`? `true` ⇒ the selector's single-assignment premise
+/// is not accountable and [`build_coroutine_resume_state_facts`] must DECLINE.
+///
+/// # Why this is a match and not an `Rvalue::Ref | AddressOf | CopyForDeref`
+/// # allowlist
+///
+/// The allowlist it replaces let `Rvalue::Unsupported` through, and
+/// `Unsupported` is exactly where an alias hides: `trust-mir-extract`'s
+/// `convert.rs` mints it for `mir::Rvalue::Reborrow` carrying
+/// `Operand::Copy(place)` — the reborrowed place itself, i.e. a handle out of
+/// `place` whose aliasing semantics the extractor explicitly declines to model
+/// ("fail closed rather than assert it behaves as a plain `&place`"). A belt
+/// that fails closed downstream of a producer that failed closed upstream must
+/// not then treat the marker as an ordinary value read.
+///
+/// # The anchor
+///
+/// `Rvalue` is `#[non_exhaustive]`, so a foreign crate cannot write a match the
+/// compiler will reject when a variant is added. The next best thing, and what
+/// this is, is a match that NAMES every variant that exists today and routes the
+/// wildcard to `true` — DECLINE. A variant added upstream therefore withdraws
+/// the fact for every body until someone classifies it here, instead of silently
+/// joining the value-only arm. `coverage.rs`'s `Rvalue` inventory is the list
+/// this was written against.
+fn rvalue_opens_an_alias_channel_to(rvalue: &Rvalue, local: usize) -> bool {
+    // A `Place` in an alias-producing position, or an `Operand` in a position
+    // whose semantics are unmodeled: either one names `local` or it does not.
+    let names = |place: &trust_types::Place| place.local == local;
+    // `Operand` is `#[non_exhaustive]` too, and its wildcard fails closed for
+    // the same reason the `Rvalue` one does — except that here the wildcard is
+    // LIVE, not merely future-proofing: `Operand` also has `Symbolic` (a lifted
+    // machine-semantics formula) and the unrepresentable-payload sentinel today,
+    // and neither can be said NOT to name the selector.
+    let operand_names = |operand: &Operand| match operand {
+        Operand::Copy(place) | Operand::Move(place) => names(place),
+        Operand::Constant(_) => false,
+        _ => true,
+    };
+    match rvalue {
+        // ALIAS PRODUCERS: the only ways a pointer/reference to a local can come
+        // into existence, and therefore the precondition of every pointer write.
+        Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) | Rvalue::CopyForDeref(place) => {
+            names(place)
+        }
+        // UNMODELED SEMANTICS over an operand that may be a place stand-in for an
+        // alias (`mir::Rvalue::Reborrow` is lowered exactly this way). The whole
+        // point of the marker is that we do not know what it does.
+        Rvalue::Unsupported { operands, .. } => operands.iter().any(operand_names),
+        // Pointer arithmetic. The base is a pointer VALUE, so naming the selector
+        // here would already be the forged-pointer residual — but it costs
+        // nothing to refuse, and refusing keeps the "any unmodeled use of the
+        // selector withdraws the fact" rule uniform.
+        Rvalue::PtrOffset { ptr, count } => operand_names(ptr) || operand_names(count),
+        // VALUE-ONLY: these read operands and produce values. Reading the
+        // selector's VALUE creates no channel by which it can be written.
+        Rvalue::Use(_)
+        | Rvalue::BinaryOp(..)
+        | Rvalue::CheckedBinaryOp(..)
+        | Rvalue::UncheckedBinaryOp(..)
+        | Rvalue::UnaryOp(..)
+        | Rvalue::Cast(..)
+        | Rvalue::Aggregate(..)
+        | Rvalue::Discriminant(_)
+        | Rvalue::Len(_)
+        | Rvalue::Repeat(..) => false,
+        // THE ANCHOR. A variant that did not exist when this was written is
+        // unclassified, so it is unaccountable. Fail closed.
+        _ => true,
+    }
+}
+
 /// The actual discriminant tag set of a MODELED enum type, in declaration order.
 /// `Ty::Adt` carries the real `VariantDef.discriminant` per variant (so a
 /// `#[repr]` enum's explicit non-contiguous tags are honored); a `Ty::Datatype`
@@ -1640,6 +1869,198 @@ pub(super) fn enum_variant_tag_set(ty: &Ty) -> Option<Vec<i128>> {
         }
         _ => None,
     }
+}
+
+/// Trust (UNINHABITED MATCH ARM, false REFUTATION): [`enum_variant_tag_set`]
+/// narrowed to the variants that can actually OCCUR — the declared tag set minus
+/// every variant PROVED uninhabited by [`ty_is_provably_uninhabited`].
+///
+/// THE DEFECT this closes. `match r { Ok(v) => .., Err(e) => match e {} }` over
+/// `Result<u8, Infallible>` lowers to `_2 = Discriminant(r)`, `SwitchInt(_2) { 0
+/// => ok_arm, otherwise => bb_unreachable }`. `Infallible` has NO inhabitants, so
+/// `Err` cannot be the value's variant and the `Unreachable` block is dead by
+/// construction — the code is CORRECT. The declared tag set `{0, 1}` nevertheless
+/// satisfies the block's path condition `_2 != 0` at `_2 = 1`, so the `Unreachable`
+/// row was REFUTED and the user's build failed. Dropping `Err` from the tag set
+/// makes the fact `_2 == 0`, which refutes `_2 != 0` — the right answer, reached
+/// by the SAME producer and the same authority as the non-empty case.
+///
+/// RE-MEASURED per row through the real `generate_vcs` +
+/// `Router::deterministic_in_process_ay` + `trust_certify::certify_vc`, at HEAD and
+/// with this filter, over a matrix of MIR dumped from source. Row totals are
+/// deliberately not quoted — they describe the matrix, not the change, and cannot
+/// be rechecked from the tree. The INVARIANTS can be:
+///
+///  * every row that leaves `Failed` goes to `PROVED` and KERNEL-CERTIFIES;
+///  * NOT ONE refutation is lost, and no row `Proved` at HEAD regresses.
+///
+/// The rows that flip are the `Unreachable` sinks of `Result<u8, Infallible>`,
+/// `Result<u8, Void>`, `Result<u8, !>`, `Result<u8, (u8, Infallible)>` and of each
+/// adversarial body below. Two shapes are recorded as ALREADY PROVED AT HEAD and
+/// so are NOT evidence for this filter: `Result<u8, Wrap(Infallible)>` and
+/// `Result<u8, [Infallible; 1]>` matched with `Err(_) => 0`. What stays refuted is
+/// the genuine violations: a real overflow, a div-by-zero, BOTH out-of-range reads
+/// of `Idx { A(u8), B(Infallible), C(u8), D(u8), E(u8) }` indexed per-arm into
+/// `[u8; 3]` (tags 3 and 4 are LIVE) whose dead tag-1 arm proves in the same body,
+/// the reachable `unreachable!()` of a live sibling variant (refuted at its live
+/// tag `_2 = 2`, witness byte-identical to HEAD), the two real `+` overflows of a
+/// body whose scrutinee enum is WHOLLY uninhabited, and a lint row.
+/// `[Infallible; 0]` and a union keep their tag — asserted at unit granularity in
+/// `uninhabited_variant_tests`, since both were already `Proved` at HEAD here and
+/// a row-level matrix cannot distinguish "declined" from "never accused".
+///
+/// EVERY ONE of those adversarial rows is MUTATION-CHECKED in
+/// `tests/uninhabited_arm_realmir.rs`: mutate this function to
+/// `.filter(|(v, _)| v.discriminant == 0)` — an over-eager filter that deletes the
+/// LIVE tags — and the out-of-range reads, the live sibling's panic and the
+/// wholly-uninhabited body's overflows all flip to `Proved`, firing three separate
+/// assertions. A "must still refute" caption that no mutant can falsify is not
+/// coverage; these were written until one could.
+///
+/// SOUNDNESS — the load-bearing part. This can only ever REMOVE tags, i.e. STRENGTHEN
+/// a globally-published premise, so an error in the uninhabitedness judgement is a
+/// FALSE PROOF, strictly worse than the false refutation it fixes. Three separate
+/// walls hold it:
+///
+///  1. `ty_is_provably_uninhabited` is a THEOREM about the declared type, not a bit
+///     that states the answer: a type is dropped only when the declaration itself
+///     forces the value set empty (zero declared variants; every declared variant
+///     carrying an uninhabited field; a product with an uninhabited component). It
+///     fails closed — "inhabited" — on EVERY shape whose declaration does not settle
+///     the question.
+///  2. The tag set is read from the same `VariantDef` list, on the same channel and
+///     with the same authority, that [`enum_variant_tag_set`] already publishes as
+///     `d ∈ {tags}`. No verdict bit (`exhaustive_enum_unreachable` and friends) is
+///     consulted; nothing here can be enabled by a flag in a serialized input.
+///  3. If the filter empties the set the caller emits NO fact at all (its existing
+///     `tags.is_empty()` guard). Publishing the empty membership would mean the
+///     unsatisfiable `false`, and these facts are GLOBAL to the function — a `false`
+///     would erase every overflow/bounds/div-by-zero obligation in the body, which is
+///     exactly the false-proof channel this must not open. The infeasibility of a
+///     discriminant read on a wholly-uninhabited place is a PATH property and does not
+///     belong in a whole-function premise; declining it costs a proof, not soundness.
+///
+/// RESIDUAL — the SCALE cliff, and it is NOT a degenerate model from the solver.
+/// The tag fact stops closing the `Unreachable` row once the block it guards is
+/// reached by more than `MAX_PATHS_PER_BLOCK` (= 64) distinct paths: at that point
+/// `v2_build_path_guard_map` (`generate::safety`, the `paths.clear()` arm) CLEARS
+/// the block's guard set and substitutes ONE UNGUARDED path — and the same
+/// degenerate map is returned for every block at once when the global BFS budget
+/// (`steps > cap`) is exhausted, where the function returns `vec![Vec::new()]` for
+/// EVERY block at once. A VC with no path condition asserts only "this block is
+/// reachable", which is SAT however tight the published tag set is, so the row is
+/// refuted again. That is a MECHANISM in deterministic vcgen code, not formula size
+/// defeating the backend, and the `0 <= len` lane in
+/// `type_ranges::conjoin_length_nonneg_bounds` hits the SAME wall at the SAME N.
+/// Supplying the missing reachability condition is the collapse invariant's job,
+/// in `generate::safety`: an `Unreachable` row's violation formula is content-free,
+/// so on a degraded block that invariant re-conditions it on the block's in-edge
+/// disjunction, or DECLINES it when no summary is available. The outcome on those
+/// cells is therefore decided there, not by how tight this tag set is, and nothing
+/// here should be tuned around them.
+pub(super) fn inhabited_enum_variant_tag_set(ty: &Ty) -> Option<Vec<i128>> {
+    let declared = enum_variant_tag_set(ty)?;
+    // Only `Ty::Adt` carries per-variant FIELD types to judge. A `Ty::Datatype`'s
+    // empty-`variants` spelling is a BY-NAME back-reference, never "zero variants"
+    // (see `Ty::Datatype`'s own doc), so its structure is deliberately not read
+    // here: it keeps the declared positional set unfiltered.
+    let Ty::Adt { variants, .. } = ty else {
+        return Some(declared);
+    };
+    debug_assert_eq!(declared.len(), variants.len(), "tag set is one tag per declared variant");
+    Some(
+        variants
+            .iter()
+            .zip(declared)
+            .filter(|(variant, _)| !variant_is_provably_uninhabited(variant))
+            .map(|(_, tag)| tag)
+            .collect(),
+    )
+}
+
+/// A declared variant is uninhabited exactly when one of its fields is: a value of
+/// the variant is a PRODUCT of its field values, so a single empty factor empties
+/// the product. A FIELDLESS variant (`None`, a unit variant) is the empty product,
+/// which has exactly one value — INHABITED — and `any` correctly reports `false`
+/// for it.
+fn variant_is_provably_uninhabited(variant: &trust_types::VariantDef) -> bool {
+    variant.fields.iter().any(|(_, field_ty)| ty_is_provably_uninhabited(field_ty))
+}
+
+/// Depth budget for [`ty_is_provably_uninhabited`]. Extraction cuts every recursive
+/// ADT to a by-name `Ty::Datatype` marker, so a lowered `Ty` is a shallow finite
+/// tree; this only bounds the cost of a pathologically deep (or adversarially
+/// nested) serialized type. Exhausting it returns the fail-closed "inhabited".
+const UNINHABITED_WALK_DEPTH: u32 = 24;
+
+/// Trust (UNINHABITED MATCH ARM): is EVERY value of `ty` impossible — i.e. is the
+/// type's declaration itself proof that no inhabitant exists?
+///
+/// `true` is an ASSERTION that the value set is empty and is consumed to delete a
+/// discriminant tag, so it must be a theorem. `false` means "not proved
+/// uninhabited" and is the answer for every shape below that is not listed as
+/// `true`, INCLUDING every shape the model cannot resolve. The four `true` rules,
+/// and why each is a theorem about the input program:
+///
+///  * `Ty::Never` — the primitive `!`. Empty by definition.
+///  * an ENUM with ZERO declared variants (`enum Void {}`, `core::convert::Infallible`)
+///    — a value of an enum is one of its variants, and there are none. The
+///    `adt_kind == Some(Enum)` conjunct is what makes the emptiness READABLE: a
+///    `Ty::Adt` carrying `variants: []` is ALSO how a STRUCT is spelled (`Ty::adt`),
+///    and how every pre-Phase-4 serialized `Ty::Adt` deserializes, so `variants: []`
+///    ALONE means nothing. `adt_kind` is stamped only by `trust-mir-extract` from
+///    rustc's own `AdtDef` (`ty_convert::lower_enum_adt`), and every hand-built,
+///    synthetic, or pre-W19 `Ty::Adt` leaves it `None` — which declines here.
+///  * an ENUM all of whose declared variants are uninhabited (`enum E { A(Infallible),
+///    B(Infallible) }`) — the value set is the union of the variants' value sets.
+///    This rule is sound ONLY because the variant list is COMPLETE, never truncated:
+///    `lower_enum_adt` either walks `adt_def.variants()` to the end or abandons the
+///    whole type to a fail-closed `Ty::Unsupported` marker (its produced-node-budget
+///    bail returns `produced_budget_degraded_leaf()`, its recursion back-edge returns
+///    a by-name `Ty::Datatype`) — neither of which is an `Adt` and neither of which
+///    reaches this arm. A partially-lowered enum can therefore never masquerade as an
+///    all-dead one.
+///  * a PRODUCT with an uninhabited component — a struct field, a tuple element, or
+///    the element of an array of length >= 1. `[T; 0]` is DELIBERATELY EXCLUDED: it
+///    holds exactly one value (the empty array) and IS inhabited however dead `T` is;
+///    getting that backwards would bless UB. A fieldless struct is likewise the empty
+///    product and stays inhabited. Truncating a product's component list could only
+///    LOSE an uninhabited factor and answer "inhabited", so the product rules are
+///    insensitive to any field-list degradation upstream.
+///
+/// EVERYTHING ELSE DECLINES, on purpose:
+///  * `Ty::Unsupported` (incl. the pre-monomorphization `TyKind::Param` marker),
+///    `Ty::Dynamic`, `Ty::Datatype` — unresolved / opaque / by-name; the declaration
+///    is not in hand.
+///  * `Ty::Adt { adt_kind: None | Some(Struct/Union with no dead field), .. }` — a
+///    `None` kind is the un-migrated spelling and cannot be read as an enum. A UNION
+///    declines unconditionally: rustc itself holds unions ALWAYS inhabited, and a
+///    union's fields overlap rather than compose, so the product rule is not even the
+///    right shape.
+///  * `Ty::Ref` / `Ty::RawPtr` / `Ty::Slice` / `Ty::SymArray` — behind a pointer, or a
+///    length that is a symbol rather than a number, so `len >= 1` is not decidable
+///    here.
+///  * `Ty::Closure` / `Ty::Coroutine` — their upvar lists are captures, not a complete
+///    value decomposition on this side of the model.
+fn ty_is_provably_uninhabited(ty: &Ty) -> bool {
+    fn walk(ty: &Ty, depth: u32) -> bool {
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        match ty {
+            Ty::Never => true,
+            Ty::Adt { variants, adt_kind: Some(trust_types::AdtKind::Enum), .. } => variants
+                .iter()
+                .all(|variant| variant.fields.iter().any(|(_, field_ty)| walk(field_ty, depth))),
+            Ty::Adt { fields, adt_kind: Some(trust_types::AdtKind::Struct), .. } => {
+                fields.iter().any(|(_, field_ty)| walk(field_ty, depth))
+            }
+            Ty::Tuple(elems) => elems.iter().any(|elem| walk(elem, depth)),
+            Ty::Array { elem, len } => *len >= 1 && walk(elem, depth),
+            _ => false,
+        }
+    }
+    walk(ty, UNINHABITED_WALK_DEPTH)
 }
 
 /// Trust (P0 enumdisc-narrowing-cast false proof): the EXACT value of Rust's
@@ -1739,7 +2160,11 @@ pub(super) fn init_rvalue_stable_len(
 
 /// `_t = CheckedSub(Copy/Move(L), c)` with `c >= 1`? Returns the decrement constant
 /// `c` (`_t.0` is the decremented value `L - c`) for a self-decrement of `L`.
-pub(super) fn checked_self_decrement_const(func: &VerifiableFunction, l: usize, t: usize) -> Option<i128> {
+pub(super) fn checked_self_decrement_const(
+    func: &VerifiableFunction,
+    l: usize,
+    t: usize,
+) -> Option<i128> {
     let Some(Rvalue::CheckedBinaryOp(trust_types::BinOp::Sub, lhs, rhs)) =
         crate::unique_whole_local_def(func, t)
     else {

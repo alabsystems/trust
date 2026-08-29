@@ -7,7 +7,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_sem::{evaluate_case, SemOutcome};
+use trust_js_sem::{SemOutcome, evaluate_case};
 use trust_js_trace::{Completion, HostEvent, ProjectedValue, PropKey};
 
 fn stdout_of(body: &str) -> Vec<ProjectedValue> {
@@ -149,10 +149,7 @@ fn nested_class_distinct_brands() {
              var o = new Outer();\n\
              console.log(Outer.hasOuter(o), InnerC.hasInner(o));"
         ),
-        vec![
-            ProjectedValue::Bool { v: true },
-            ProjectedValue::Bool { v: false },
-        ]
+        vec![ProjectedValue::Bool { v: true }, ProjectedValue::Bool { v: false },]
     );
     // A nested class can reference an OUTER private name (up the chain).
     assert_eq!(
@@ -222,10 +219,7 @@ fn private_field_name_inference() {
 #[test]
 fn private_not_projected() {
     let c = completion("class C { #x = 1; #m() {} y = 2; } new C();");
-    let Completion::Normal {
-        v: Some(ProjectedValue::Obj { props, .. }),
-    } = c
-    else {
+    let Completion::Normal { v: Some(ProjectedValue::Obj { props, .. }) } = c else {
         panic!("expected object completion");
     };
     let keys: Vec<String> = props
@@ -243,9 +237,7 @@ fn private_not_projected() {
 fn early_errors() {
     // Undeclared private reference (incl. nested resolution failing).
     assert!(is_syntax_error("class C { m() { return this.#y; } }"));
-    assert!(is_syntax_error(
-        "class C { #x; m() { class D { n(o) { return o.#y; } } } }"
-    ));
+    assert!(is_syntax_error("class C { #x; m() { class D { n(o) { return o.#y; } } } }"));
     // Duplicate private names (except get/set pairing).
     assert!(is_syntax_error("class C { #x = 1; #x = 2; }"));
     assert!(is_syntax_error("class C { #x = 1; #x() {} }"));
@@ -258,29 +250,17 @@ fn early_errors() {
     assert!(is_syntax_error("#x;"));
     assert!(is_syntax_error("var y = #x in {};"));
     // The RHS of `#x in` is a ShiftExpression: an arrow there is a SyntaxError.
-    assert!(is_syntax_error(
-        "class C { #field; constructor() { #field in () => {}; } }"
-    ));
-    assert!(is_syntax_error(
-        "class C { #field; m() { return #field in x => x; } }"
-    ));
+    assert!(is_syntax_error("class C { #field; constructor() { #field in () => {}; } }"));
+    assert!(is_syntax_error("class C { #field; m() { return #field in x => x; } }"));
     // ...but valid `#x in obj` forms parse (a parenthesized arrow RHS is fine).
-    assert!(!is_syntax_error(
-        "class C { #x = 1; static c(o) { return #x in o; } }"
-    ));
-    assert!(!is_syntax_error(
-        "class C { #x = 1; m(o) { return #x in (o) && true; } }"
-    ));
+    assert!(!is_syntax_error("class C { #x = 1; static c(o) { return #x in o; } }"));
+    assert!(!is_syntax_error("class C { #x = 1; m(o) { return #x in (o) && true; } }"));
     // delete of a private reference.
     assert!(is_syntax_error("class C { #x = 1; m() { delete this.#x; } }"));
     assert!(is_syntax_error("class C { #x = 1; m() { delete (this.#x); } }"));
     // A get/set private pair with matching static-ness is legal.
-    assert!(!is_syntax_error(
-        "class C { get #x() { return 1; } set #x(v) {} }"
-    ));
-    assert!(!is_syntax_error(
-        "class C { static get #x() { return 1; } static set #x(v) {} }"
-    ));
+    assert!(!is_syntax_error("class C { get #x() { return 1; } set #x(v) {} }"));
+    assert!(!is_syntax_error("class C { static get #x() { return 1; } static set #x(v) {} }"));
 }
 
 #[test]

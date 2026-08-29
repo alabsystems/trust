@@ -8,9 +8,7 @@
 
 mod common;
 use common::*;
-use trust_js_modules::{
-    BindingName, GraphError, ModuleGraph, ResolveExportResult, Status,
-};
+use trust_js_modules::{BindingName, GraphError, ModuleGraph, ResolveExportResult, Status};
 
 fn ord(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
@@ -423,10 +421,7 @@ fn re_evaluate_returns_same_promise() {
 fn mixed_imports_link_and_evaluate() {
     let mut host = TestHost::new();
     let mut lib = logger("lib", &[]);
-    lib.local_exports = vec![
-        export_local("default", "*default*"),
-        export_local("foo", "foo"),
-    ];
+    lib.local_exports = vec![export_local("default", "*default*"), export_local("foo", "foo")];
     host.insert("lib", lib);
     let mut main = logger("main", &["lib"]);
     main.imports = vec![

@@ -37,11 +37,7 @@ fn repo_root() -> PathBuf {
 /// cargo is present, in which case `+toolchain` work must be skipped.
 fn rustup_cargo() -> Option<PathBuf> {
     let candidate = dirs_home()?.join(".cargo").join("bin").join("cargo");
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
+    if candidate.exists() { Some(candidate) } else { None }
 }
 
 /// Best-effort home directory lookup without pulling in extra deps.

@@ -1,10 +1,9 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue,
-    SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+    Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
-use super::{generate_v2_safety_vcs, v2_build_path_guard_map};
+use super::{PathGuardCollapse, ReachSummary, generate_v2_safety_vcs, v2_analyze_path_guards};
 
 fn joined_unreachable_from_infeasible_and_feasible_paths() -> VerifiableFunction {
     VerifiableFunction {
@@ -38,6 +37,7 @@ fn joined_unreachable_from_infeasible_and_feasible_paths() -> VerifiableFunction
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::panicking::unreachable_display".to_string(),
                         args: vec![],
@@ -178,11 +178,7 @@ fn signed_max_guarded_i128_shift_uses_result_width_128() {
         });
         found
     };
-    assert!(
-        mentions_127,
-        "guard `width <= 127` must reach the shift VC; got {:?}",
-        shift.formula
-    );
+    assert!(mentions_127, "guard `width <= 127` must reach the shift VC; got {:?}", shift.formula);
 }
 
 /// ADVERSARIAL guardrail: a genuinely-unbounded shift `1i128 << n` (no guard on
@@ -504,9 +500,11 @@ fn signed_max_fixture() -> VerifiableFunction {
     func
 }
 
-#[test]
-fn v2_path_guard_saturation_weakens_to_unguarded() {
-    let func = VerifiableFunction {
+/// Build `many_paths`: `arms` switch arms from bb0 into bb1, `otherwise` to bb2.
+/// With `arms > MAX_PATHS_PER_BLOCK` bb1 SATURATES, which is the state every
+/// collapse test below needs to be in.
+fn many_paths_fixture(arms: u128) -> VerifiableFunction {
+    VerifiableFunction {
         name: "many_paths".to_string(),
         def_path: "many_paths".to_string(),
         span: SourceSpan::default(),
@@ -521,7 +519,7 @@ fn v2_path_guard_saturation_weakens_to_unguarded() {
                     stmts: vec![],
                     terminator: Terminator::SwitchInt {
                         discr: Operand::Copy(Place::local(1)),
-                        targets: (0..65).map(|value| (value, BlockId(1))).collect(),
+                        targets: (0..arms).map(|value| (value, BlockId(1))).collect(),
                         otherwise: BlockId(2),
                         exhaustive_enum_unreachable: false,
                         span: SourceSpan::default(),
@@ -538,12 +536,94 @@ fn v2_path_guard_saturation_weakens_to_unguarded() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
-    };
+    }
+}
 
-    let paths = v2_build_path_guard_map(&func);
-    let saturated = paths.get(&BlockId(1)).expect("target block should be reachable");
-    assert_eq!(saturated.len(), 1);
-    assert!(saturated[0].is_empty(), "saturated path set must weaken to an unguarded formula");
+/// Saturation weakens a block to ONE UNGUARDED path, and the PATH MAP keeps
+/// saying so — every consumer of `v2_build_path_guard_map` stays exactly as it
+/// was. What the repair adds is a SEPARATE channel: the weakest condition that
+/// is still a theorem about reaching the block, the disjunction of its in-edge
+/// guards, which `generate_v2_safety_vcs` splices onto the rows that have no
+/// violation condition of their own.
+///
+/// 65 switch arms into one block: over `MAX_PATHS_PER_BLOCK`, so the block DOES
+/// saturate — that is what keeps this test on the path it guards.
+#[test]
+fn v2_path_guard_saturation_reports_the_in_edge_disjunction_separately() {
+    let func = many_paths_fixture(65);
+
+    let analysis = v2_analyze_path_guards(&func);
+    assert_eq!(
+        analysis.collapse,
+        PathGuardCollapse::SaturatedBlocks,
+        "the fixture's value is that 65 arms exceed MAX_PATHS_PER_BLOCK; if that \
+         drifts the repair below is not being exercised"
+    );
+    let paths = analysis.paths.get(&BlockId(1)).expect("target block should be reachable");
+    assert_eq!(paths.len(), 1);
+    assert!(
+        paths[0].is_empty(),
+        "the PATH MAP itself is unchanged by the repair — a saturated block still \
+         weakens to one unguarded path, so the map's other consumers are \
+         unaffected: {paths:?}"
+    );
+    assert!(analysis.degraded.contains(&BlockId(1)), "bb1 is the degraded block");
+
+    let Some(ReachSummary::Guards(edges)) = analysis.reachability.get(&BlockId(1)) else {
+        panic!("bb1 must carry a real in-edge disjunction: {:?}", analysis.reachability);
+    };
+    assert_eq!(edges.len(), 65, "one guard per in-edge: {edges:?}");
+    assert!(
+        edges.iter().all(|(src, _)| *src == BlockId(0)),
+        "each guard is sourced at the branch that created it: {edges:?}"
+    );
+
+    // FAIL-CLOSED CONTROL: give the block one UNGUARDED in-edge. The disjunction
+    // is then `true` — which is POSITIVE information, not absence: the block is
+    // reachable on every execution. Nothing is restored, and a content-free row
+    // of that block must stay REFUTABLE.
+    let mut with_goto = func.clone();
+    with_goto.body.blocks.push(BasicBlock {
+        id: BlockId(3),
+        stmts: vec![],
+        terminator: Terminator::Goto(BlockId(1)),
+    });
+    let analysis = v2_analyze_path_guards(&with_goto);
+    assert_eq!(analysis.collapse, PathGuardCollapse::SaturatedBlocks);
+    assert!(
+        matches!(analysis.reachability.get(&BlockId(1)), Some(ReachSummary::Unconditional)),
+        "an unguarded in-edge makes the disjunction `true`, which must be reported \
+         as UNCONDITIONAL (reachable) and never as absence: {:?}",
+        analysis.reachability
+    );
+}
+
+/// THERE IS NO IN-DEGREE BUDGET, and this is the test that used to say there
+/// was: an earlier `MAX_RESTORED_IN_EDGE_GUARDS` cap reported `Guards` up to a
+/// fixed in-degree and `Unavailable` past it, and the collapse invariant
+/// declines on `Unavailable`. Reporting ABSENCE because a real, available
+/// condition is merely LARGE is not a safe answer — it is a bug lost.
+///
+/// The in-degree is a LINEAR quantity (at most the body's terminator-clause
+/// count) and the restored disjunction is exactly one guard per in-edge, so the
+/// row is linear in the in-degree — see the size rule on `ReachSummary::Guards`,
+/// asserted in `path_guard_collapse_tests`. What changed is that no size is
+/// treated as absence.
+#[test]
+fn v2_path_guard_in_edge_summary_has_no_size_budget() {
+    for arms in [512usize, 513, 1024, 4096] {
+        let analysis = v2_analyze_path_guards(&many_paths_fixture(arms as u128));
+        assert_eq!(analysis.collapse, PathGuardCollapse::SaturatedBlocks, "{arms} arms");
+        assert!(
+            matches!(
+                analysis.reachability.get(&BlockId(1)),
+                Some(ReachSummary::Guards(e)) if e.len() == arms
+            ),
+            "{arms} in-edges must be summarised in full — there is no size at which a \
+             real condition becomes ABSENCE: {:?}",
+            analysis.reachability
+        );
+    }
 }
 
 fn formula_contains_or(formula: &Formula) -> bool {

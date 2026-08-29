@@ -33,7 +33,9 @@ Profiles:
   quick     Fast local confidence path. Not replacement evidence.
   fast      Everything that needs no stage2 build: drift, supply-chain,
             style/lint ratchets, workspace compile, script tests, and the
-            payload-independent js262 lanes. This is the pre-push tier.
+            payload-independent js262 lanes.
+  push      The pre-push tier. scripts/hooks/pre-push DERIVES its lane list
+            from `--list push`; do not hand-list lanes there.
   suites    The compiletest suites, one gate per suite, in Trust mode.
   slow      Overnight lanes: Clean-kernel re-derivation, js262 calibration.
   manifest  Static harness/script/ledger checks only. Not replacement evidence.
@@ -56,8 +58,15 @@ case "$MODE" in
         ;;
     --list|list)
         MODE="${2:-release}"
+        case "$MODE" in
+            release|quick|fast|push|suites|slow|manifest) ;;
+            # A typo'd profile used to print the `all` rows and exit 0 — a SHORT
+            # LIST that reads GREEN. scripts/hooks/pre-push derives its lane set
+            # from `--list push`, so that fail-open is now a narrowed push gate.
+            *) echo "FAIL: unknown profile for --list: $MODE" >&2; exit 2 ;;
+        esac
         ;;
-    release|quick|fast|suites|slow|manifest)
+    release|quick|fast|push|suites|slow|manifest)
         ;;
     *)
         usage >&2
@@ -88,14 +97,13 @@ safe_log_name() {
 
 gate_selected() {
     local profiles="$1"
-    case ",$profiles," in
-        *",all,"*|*",$MODE,"*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    case ",$profiles," in *",$MODE,"*) return 0 ;; esac
+    # `all` deliberately does NOT imply `push`: an `all` row is written by
+    # someone thinking about coverage, and the push tier is a time budget. Left
+    # implied, any future `all` row silently becomes a pre-push lane.
+    [ "$MODE" = "push" ] && return 1
+    case ",$profiles," in *",all,"*) return 0 ;; esac
+    return 1
 }
 
 # The `trust.examples.complete-corpus-diagnostic` row remains a required
@@ -107,6 +115,61 @@ gate_selected() {
 # on-disk lane inventory and fails when a lane is unnamed here. Adding a gate
 # script, an e2e, a witness/elide regression, or a compiletest suite without a
 # row is therefore a hard error, not a silent omission.
+#
+# `oracle.*` rows check a verdict against RUNTIME truth, catching a false proof no
+# self-consistent proof check can. All three were named by no row until 2026-08-26.
+# The two trustc oracles cost under 1s each; `oracle.falseproof-search` sweeps 637
+# variants in 4554s (measured 2026-08-26), too slow for the pre-push `fast` tier.
+# It is RED on arrival by design — it finds the live `i += 100` false proof in all
+# three lanes, certify included (guards.rs models it `x == x + 100`; UNSAT poisons
+# the hypothesis, so the block proves vacuously). Do not skip it to get green.
+#
+# The block after `slow.js262-calibrate` is the 2026-08-26 catch-all sweep. Every
+# lane class in `check_gate_lane_coverage.py` matched on a NAME, so every class had
+# a next blind spot: `check_*` missed four adversarial oracles, `trust_*_gate.sh`
+# missed two HYPHENATED gates. A catch-all now sweeps whatever the named classes
+# do not claim; it surfaced 73 scripts, of which 46 are verdict-bearing and are
+# rowed below. Several are RED on arrival and that is the point — `check-unsafe-
+# coverage.sh` has all five expect-caught rows failing on a drifted exact-match
+# grep while docs/high2-obligation-demo.md claims it "also passes live", and
+# `run_trust_conformance.py` is missing a publication.json its own corpus requires.
+# Do not silence a red here to get green; the red is the instrument working.
+#
+# Two rows in that block are green ONLY once something lands with them:
+# `release.certified-scoreboard` names a baseline file that does not exist yet
+# (without --baseline the scoreboard exits 0 unconditionally, which is a green
+# that proves nothing), and `slow.corpus-census-faithfulness` needs the census
+# binary built AND its awk summary taught to enforce KERNEL_REJECTED == 0, which
+# it prints as "(MUST be 0)" and does not check.
+#
+# The `push` profile IS the pre-push gate. scripts/hooks/pre-push hand-listed
+# eight ids until 2026-08-27; the two lists could drift by eye, and one of them
+# bundled ten checks behind a single id (`fast.pr-gate`), so a red inside the
+# bundle could only be quarantined by darkening all ten. Adding `push` to a row
+# is now the entire act of adding a pre-push lane. Measured 2026-08-27, 19 lanes,
+# 15.7s wall on a docs-only push: toolchain-coherence 2.7s, pin-coherence 2.6s,
+# tag-families-selftest 1.6s, measurement-provenance-selftest 1.4s,
+# pin-regression-selftest 1.3s, oracle-freeze-selftest 0.87s, the rest <0.4s
+# each, with `scoped.compiler-check` skipping instantly. Nothing enforces that
+# ceiling; a row that costs minutes is how a gate teaches people --no-verify.
+#
+# Three push lanes need the refs git is pushing, which a fixed command string
+# cannot receive. They take `--push-context`: the hook exports
+# TRUST_PUSHED_REFS, and with it UNSET the same command widens to its history
+# reading, so the row stays runnable standalone.
+#
+# `scripts/check_all.sh` (release.check-all) is the only runner for three gates:
+# the temporal-fixture boundary, G19 build determinism, and stage2
+# verify-examples. Its boundary gate has no standalone entry point —
+# `run_temporal_fixture_boundary_gate` is private and asserts against
+# `crate::temporal_cli::UNBOUND_TEMPORAL_EVIDENCE` (targo-trust/src/script_cli.rs:2185),
+# so re-expressing it as a shell grep would mirror a constant into a file with
+# nothing checking the mirror. A second, different exercise of that script lives
+# in tests/e2e_check_all_tcargo_provenance.sh, which copies and RUNS the real
+# scripts/check_all.sh in a synthetic repo.
+#
+# The FULL producer measurement (scripts/run_measurement_sweep.sh) is covered by
+# no row; `fast.trust-ir-seam-blockers*` pin only the taxonomy.
 #
 # Columns: gate_id|profiles|category|required|last_green|command
 #
@@ -127,16 +190,31 @@ manifest.syntax.gate-scripts|all|harness|true|2026-07-25|bash scripts/check_gate
 manifest.ledgers|all|harness|true|2026-07-25|test -f tests/upstream-rust/test-exceptions.toml && test -f tests/upstream-rust/patches.toml && test -f tests/upstream-rust/divergence-audit.toml && test -f tests/trust-added/compiletest-exceptions.toml && test -f tests/trust-added/manifest.toml && test -f tests/trust-comprehensive/divergences.toml
 manifest.canonical-targo-e2e-names|all|harness|true|2026-07-25|test -x tests/e2e_targo_trust_cli.sh && test -x tests/e2e_targo_trust_root_resolution.sh && test ! -e tests/e2e_cargo_trust_cli.sh && test ! -e tests/e2e_cargo_trust_root_resolution.sh
 manifest.lane-coverage|all|harness|true|2026-07-25|python3 scripts/check_gate_lane_coverage.py
-fast.ledger-expirations|fast|ledger|true|2026-07-25|python3 scripts/check_ledger_expirations.py --warn-days 14
-fast.pr-gate|fast|drift|true|2026-07-25|bash scripts/pr_gate.sh
-fast.pin-coherence|fast|supply-chain|true|2026-07-25|bash scripts/check_pin_coherence.sh
-fast.oracle-freeze|fast|soundness|true|2026-08-20|bash scripts/check_frozen_files.sh
-fast.oracle-freeze-selftest|fast|soundness|true|2026-08-20|bash scripts/check_frozen_files.sh --selftest
-fast.revert-rationale|fast|soundness|true|never|bash scripts/check_revert_rationale.sh --history
-fast.measurement-provenance|fast|soundness|true|2026-08-20|bash scripts/check_measurement_provenance.sh --history
-fast.measurement-provenance-selftest|fast|soundness|true|2026-08-20|bash scripts/check_measurement_provenance.sh --selftest
-fast.bridge-pin|fast|supply-chain|true|never|bash scripts/check_bridge_pin.sh --check
-scoped.compiler-check|all|supply-chain|true|never|bash scripts/check_compiler_targets_build.sh
+fast.ledger-expirations|fast,push|ledger|true|2026-08-27|python3 scripts/check_ledger_expirations.py --warn-days 14
+fast.toolchain-coherence|fast,push|drift|true|2026-08-27|python3 scripts/check_toolchain_coherence.py
+fast.seed-freshness|fast,push|bootstrap|true|2026-08-27|python3 scripts/check_seed_freshness.py
+fast.trust-ir-tag-families|fast,push,release|drift|true|2026-08-27|python3 scripts/trust_ir_tag_families.py --check
+fast.trust-ir-tag-families-selftest|fast,push,release|drift|true|2026-08-27|python3 scripts/trust_ir_tag_families.py --selftest
+fast.trust-ir-seam-blockers|fast,push,release|drift|true|2026-08-27|python3 scripts/trust_ir_producer_scorecard.py --check-seam-blockers
+fast.trust-ir-seam-blockers-selftest|fast,push,release|drift|true|2026-08-27|python3 scripts/trust_ir_producer_scorecard.py --selftest-seam-blockers
+fast.mir-transform-ratchet-selftest|fast,push,release|drift|true|2026-08-27|bash scripts/check_trust_verify_suite_ratchet.sh --selftest
+fast.pin-coherence|fast,push|supply-chain|true|2026-08-27|bash scripts/check_pin_coherence.sh
+fast.oracle-freeze|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh
+fast.oracle-freeze-selftest|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh --selftest
+fast.revert-rationale|fast,push|soundness|true|never|bash scripts/check_revert_rationale.sh --push-context
+fast.measurement-provenance|fast,push|soundness|true|2026-08-20|bash scripts/check_measurement_provenance.sh --push-context
+fast.measurement-provenance-selftest|fast,push|soundness|true|2026-08-27|bash scripts/check_measurement_provenance.sh --selftest
+fast.bridge-pin|fast,push|supply-chain|true|2026-08-27|bash scripts/check_bridge_pin.sh --check
+fast.patch-binds|fast,push|supply-chain|true|2026-08-27|python3 scripts/check_patch_binds.py
+fast.cargo-lock-hygiene|fast|supply-chain|true|never|python3 scripts/check_cargo_lock_hygiene.py
+fast.cargo-manifest-alignment|fast|supply-chain|true|never|python3 scripts/check_cargo_manifest_alignment.py
+fast.submodule-remote-reachability|fast,push|supply-chain|true|2026-08-28|python3 scripts/check_submodule_remote_reachability.py
+fast.doc-counts|fast|docs|true|never|bash scripts/check_doc_counts.sh
+slow.frontier-ratchet|slow|frontier|true|never|bash scripts/check_frontier_ratchet.sh
+slow.upstream-rust-test-toolchain|slow|upstream|true|never|bash scripts/check_upstream_rust_test_toolchain.sh
+release.ay-projection-certificate|release|supply-chain|true|never|bash scripts/check_ay_projection_certificate.sh
+release.trust-mir-extract|release|compile|true|never|bash scripts/check_trust_mir_extract.sh
+scoped.compiler-check|all,push|supply-chain|true|never|bash scripts/check_compiler_targets_build.sh
 fast.tcb-panic-freedom|fast|soundness|true|2026-07-25|bash scripts/check_tcb_panic_freedom.sh
 fast.tcb-document-exhaustiveness|fast|soundness|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml -p trust-integration-tests --test tcb_document_exhaustiveness --locked
 fast.tcb-direct-trust-vc-certificate-boundary|fast|soundness|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml -p trust-vc-bridge --features trust-build direct_mir_memory_admission_binds_the_alethe_certificate_but_never_rechecks_it --locked
@@ -182,6 +260,9 @@ verify.ownership|release|soundness|true|never|bash scripts/trust_ownership_gate.
 verify.superiority|release|soundness|true|never|bash scripts/trust_superiority_gate.sh
 verify.temporal|release|soundness|true|never|bash scripts/trust_temporal_gate.sh
 verify.clean-certification|release|soundness|true|never|bash scripts/trust_clean_certification_gate.sh
+oracle.array-bounds-soundness|fast,release|soundness|true|2026-08-26|python3 scripts/trustc_array_bounds_soundness_oracle.py
+oracle.generics-soundness|fast,release|soundness|true|2026-08-26|python3 scripts/trustc_generics_soundness_oracle.py
+oracle.falseproof-search|slow,release|soundness|true|never|python3 scripts/trust_falseproof_search.py
 witness.replay-regression|release|witness|true|never|python3 tests/trust-witness/replay_regression.py
 witness.auto-router-smoke|release|witness|true|never|python3 tests/trust-witness/auto_router_smoke.py
 witness.closure-parity-smoke|release|witness|true|never|python3 tests/trust-witness/closure_parity_smoke.py
@@ -210,7 +291,70 @@ suite.rustdoc-js|suites|compiletest|true|never|python3 x.py test --stage 2 tests
 suite.rustdoc-js-std|suites|compiletest|true|never|python3 x.py test --stage 2 tests/rustdoc-js-std
 suite.rustdoc-gui|suites|compiletest|false|never|python3 x.py test --stage 2 tests/rustdoc-gui
 slow.kernel-derivation|slow|kernel|true|never|bash scripts/trust_kernel_derivation_lane.sh
+canary.is-whnf-mint-gate|slow,release|soundness|true|2026-08-24|bash scripts/trust_control_canary.sh
 slow.js262-calibrate|slow|trustjs|true|never|bash scripts/js262/calibrate.sh
+fast.cutover-gate-validator|fast|harness|true|2026-08-26|python3 scripts/cutover_gate/test_validate.py
+fast.pin-regression|fast,push|supply-chain|true|never|bash scripts/check_pin_regression.sh --push-context
+fast.pin-regression-selftest|fast,push|supply-chain|true|2026-08-27|bash scripts/check_pin_regression.sh --selftest
+fast.seal-driver-guard-mutation|fast,release|harness|true|2026-08-26|bash scripts/seal_driver.sh guardtest
+fast.self-verify-crate-selftest|fast|soundness|true|2026-08-26|bash scripts/trust_self_verify_crate.sh --selftest
+fast.submodule-worktree-pins|fast|drift|true|2026-08-26|bash scripts/submodule_sync.sh
+fast.trust-conformance|fast,release|conformance|true|never|python3 scripts/run_trust_conformance.py
+fast.trust-ir-flip-burnin-selftest|fast,release|soundness|true|2026-08-26|python3 scripts/trust_ir_flip_burnin.py --selftest
+fast.trust-ir-frontier-table-selftest|fast,release|drift|true|2026-08-26|python3 scripts/trust_ir_frontier_table.py --selftest
+slow.bridge-replay|slow,release|soundness|true|never|bash scripts/trust_bridge_replay_lane.sh
+slow.corpus-census-faithfulness|slow,release|drift|true|never|bash scripts/corpus_census.sh crates/target/debug/corpus-census-2026-07-24 crates/trust-clean/fixtures build/census 1800
+slow.mf-r5-full-union|slow,release|drift|true|never|R=reports/build/mf-r5-$(date -u +%Y%m%dT%H%M%SZ); python3 scripts/mf_r5_full_union.py --output $R --receipt $R.json
+slow.mir-transform-ratchet|slow,release|drift|true|never|bash scripts/check_trust_verify_suite_ratchet.sh
+slow.self-verify-crate-ratchet|slow,release|soundness|true|never|bash scripts/trust_self_verify_crate.sh
+slow.showcase-demo|slow|demo|true|never|bash scripts/showcase-demo.sh --quick
+slow.submodule-coherence|slow,release|supply-chain|true|never|bash scripts/submodule-coherence-gate.sh
+slow.win-cross-check|slow,release|compatibility|true|never|bash scripts/win_cross_check.sh
+release.assumption-ledger-stage1|release|soundness|true|never|bash scripts/gate_assumption_ledger_stage1.sh
+release.certified-monitor-e2e|release|harness|true|never|bash scripts/stage2_certified_monitor_e2e.sh
+release.certified-scoreboard|release|soundness|true|never|python3 scripts/trust_certified_scoreboard.py --baseline tests/self-proof/certified-scoreboard.baseline
+release.cite-discharge|release|soundness|true|never|python3 scripts/trust_cite_discharge.py --structural target/trust/survey/ny-cert-structural.json --contracts target/trust/survey/ny-cert-contracts.json --cite-map first-party/ny/crates/ny-cert/proofs/cite-map.json --corpus first-party/clean
+release.crates-io-native-compat|release|compatibility|true|never|bash scripts/compat_check.sh
+release.ddc-double-compilation|release|soundness|false|never|bash scripts/ddc_compare.sh config-stage0 trust-stage2
+release.fresh-clone-seed-consume|release|bootstrap|true|never|bash scripts/ci_fresh_clone_consume_test.sh --stage 2
+release.lambda-calculus-downstream-diagnostic|release|diagnostic|false|never|python3 scripts/collect_lambda_calculus_diagnostic.py --repo-root . --output build/evidence/lambda-calculus-diagnostic.json
+release.mint-and-prove-seed|release|bootstrap|true|never|S=build/seed-$(date -u +%Y%m%dT%H%M%SZ); bash scripts/mint_and_prove_seed.sh --seed-dir $S --proof-build-dir $S-proof
+release.native-solver-sample-verification|release|soundness|true|never|python3 scripts/run_native_solver_sample_verification.py
+release.off-stock-rust-preflight|release|supply-chain|true|never|bash scripts/prove_rust_free_build.sh
+release.realcode-coverage-receipt|release|evidence|true|never|python3 scripts/collect_realcode_coverage_evidence.py --repo-root . --output build/evidence/realcode-coverage-receipt.json
+release.repro-backend-dylib-selfcompare|slow,release|reproducibility|true|never|bash scripts/repro_build_selfcompare.sh
+release.repro-wholestage2-selfcompare|slow,release|reproducibility|false|never|bash scripts/repro_wholestage2_selfcompare.sh
+release.rustc-mir-differential-oracle|release|soundness|true|never|TRUSTC=build/host/stage2/bin/trustc bash scripts/differential/rustc_mir_differential_oracle.sh
+release.self-proof-all-trust|release|soundness|true|never|PATH=build/host/stage2/bin:$PATH bash scripts/prove_self_all_trust.sh
+release.self-verify-oracle|release|soundness|true|never|TRUSTC=build/host/stage2/bin/trustc bash scripts/trust_self_verify.sh
+release.stage0-payload-fetchability|release|supply-chain|true|2026-08-26|python3 scripts/fetch_trust_stage0_payloads.py --json
+release.stage0-seed-discovery|release|bootstrap|false|never|python3 scripts/discover_trust_stage0_seed.py --json
+release.stage2-noverify-mir-transform|release|compile|true|never|bash scripts/stage2_noverify_rustc_mir_transform_test.sh
+release.stage2-noverify-self-build|release|bootstrap|true|never|bash scripts/stage2_noverify_self_build.sh
+release.stage2-verify-self-build|release|soundness|true|never|bash scripts/stage2_verify_self_build.sh
+release.strict-superiority-artifacts|release|evidence|true|never|bash scripts/collect_strict_superiority_artifacts.sh
+release.tests-after-build|release|harness|true|never|bash scripts/run_tests_after_build.sh
+release.trust-frontend-proof|fast,release|harness|true|never|sh scripts/prove-trust-frontend-gate.sh
+release.trust-ir-flip-burnin|release|soundness|true|never|python3 scripts/trust_ir_flip_burnin.py --trustc build/host/stage2/bin/trustc --out-dir target/trust/flip-burnin
+release.trust-ir-lineage-reconcile|release|soundness|true|never|python3 scripts/trust_ir_lineage_reconcile.py --dump target/trust/ir-dump --flip-log target/trust/ir-dump/flip.log
+release.trustir-olean-vendor-identity|release|supply-chain|true|never|bash scripts/regen-trustir-oleans.sh --check
+release.unsafe-coverage-completeness|release|soundness|true|never|bash scripts/check-unsafe-coverage.sh
+release.upstream-rust-adopted-evidence|release|upstream|true|never|python3 scripts/run_upstream_rust_adopted_evidence.py --strict-exit
+suites.ledger-max-same-day|fast,release|ledger|true|2026-08-27|python3 tests/ledger/test_max_same_day.py
+suites.trust-contract-probes|release|soundness|true|2026-08-27|bash tests/trust-contract/contract_clause_sort_match.sh && bash tests/trust-contract/contract_field_projection.sh && bash tests/trust-contract/contract_inline_repro.sh
+suites.provability-ratchet|release|soundness|true|2026-08-27|python3 tests/trust-provability/ratchet.py --check
+suites.e6-fragment-probe|release|harness|true|never|python3 tests/e6-fragment-probe/run.py
+suites.two-language-battery|release|harness|true|never|python3 tests/two-language-battery/test_run.py
+fast.ir-cohort|fast,release|supply-chain|true|2026-08-27|python3 scripts/check_ir_cohort.py
+release.spec-surface-parity|release|soundness|true|2026-08-27|python3 scripts/check_spec_surface_parity.py --toolchain-bin build/host/stage2/bin
+fast.raw-enum-tag-fixtures|fast,release|soundness|true|2026-08-27|python3 scripts/regen_raw_enum_tag_fixtures.py --check
+fast.trust-ir-corpus-lock|fast,release|supply-chain|true|2026-08-27|python3 scripts/trust_ir_corpus_lock.py --check
+release.ratio-strict|release|soundness|true|never|bash scripts/trust_ratio_strict_gate.sh
+release.strict-pass-frontier|release|soundness|true|never|bash scripts/trust_strict_pass_frontier.sh
+fast.kernel-authority-vacuity|fast,release|soundness|true|2026-08-28|python3 scripts/check_kernel_authority_vacuity.py
+release.check-all|release|harness|true|never|bash scripts/check_all.sh
+acceptance.b4-slot-distinguishability|release|acceptance|false|never|bash scripts/b4_slot_acceptance.sh build/host/stage2/bin/rustc
+supply-chain.first-party-pin-reachability|release|supply-chain|true|never|python3 scripts/audit_first_party_pins.py --fetch --probe
 EOF
 }
 

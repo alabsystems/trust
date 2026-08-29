@@ -1,0 +1,2404 @@
+{
+  "name": "f",
+  "def_path": "nb13_nonasync_budget::f",
+  "span": {
+    "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 17,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": "Bool",
+        "name": "b0"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": "b1"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": "b2"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": "b3"
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": "b4"
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": "b5"
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": "b6"
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": "b7"
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": "b8"
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": "b9"
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": "b10"
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": "b11"
+      },
+      {
+        "index": 13,
+        "ty": "Bool",
+        "name": "b12"
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 40,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 41,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 42,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 43,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 1,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 3,
+              "col_start": 4,
+              "line_end": 3,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    16
+                  ]
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 29,
+              "projections": []
+            },
+            "target": 43,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 3,
+              "col_start": 18,
+              "line_end": 3,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      16
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 3,
+                "col_start": 4,
+                "line_end": 3,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 4,
+              "col_start": 4,
+              "line_end": 4,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 15,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 30,
+              "projections": []
+            },
+            "target": 44,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 4,
+              "col_start": 18,
+              "line_end": 4,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 15,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 4,
+                "col_start": 4,
+                "line_end": 4,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                8
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 5,
+              "col_start": 4,
+              "line_end": 5,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 16,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 31,
+              "projections": []
+            },
+            "target": 45,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 5,
+              "col_start": 18,
+              "line_end": 5,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 16,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 5,
+                "col_start": 4,
+                "line_end": 5,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                11
+              ]
+            ],
+            "otherwise": 10,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 6,
+              "col_start": 4,
+              "line_end": 6,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 17,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 32,
+              "projections": []
+            },
+            "target": 46,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 6,
+              "col_start": 18,
+              "line_end": 6,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 17,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 6,
+                "col_start": 4,
+                "line_end": 6,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 12
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                14
+              ]
+            ],
+            "otherwise": 13,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 7,
+              "col_start": 4,
+              "line_end": 7,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 18,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 33,
+              "projections": []
+            },
+            "target": 47,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 7,
+              "col_start": 18,
+              "line_end": 7,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 18,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 7,
+                "col_start": 4,
+                "line_end": 7,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                17
+              ]
+            ],
+            "otherwise": 16,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 8,
+              "col_start": 4,
+              "line_end": 8,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 19,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 34,
+              "projections": []
+            },
+            "target": 48,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 8,
+              "col_start": 18,
+              "line_end": 8,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 19,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 8,
+                "col_start": 4,
+                "line_end": 8,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                20
+              ]
+            ],
+            "otherwise": 19,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 9,
+              "col_start": 4,
+              "line_end": 9,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 35,
+              "projections": []
+            },
+            "target": 49,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 9,
+              "col_start": 18,
+              "line_end": 9,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 20,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 9,
+                "col_start": 4,
+                "line_end": 9,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 21
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                23
+              ]
+            ],
+            "otherwise": 22,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 10,
+              "col_start": 4,
+              "line_end": 10,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 21,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 36,
+              "projections": []
+            },
+            "target": 50,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 10,
+              "col_start": 18,
+              "line_end": 10,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 21,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 10,
+                "col_start": 4,
+                "line_end": 10,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 24
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 9,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                26
+              ]
+            ],
+            "otherwise": 25,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 11,
+              "col_start": 4,
+              "line_end": 11,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 22,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 37,
+              "projections": []
+            },
+            "target": 51,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 11,
+              "col_start": 18,
+              "line_end": 11,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 22,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 11,
+                "col_start": 4,
+                "line_end": 11,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 27
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                29
+              ]
+            ],
+            "otherwise": 28,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 12,
+              "col_start": 4,
+              "line_end": 12,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 28,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 23,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 38,
+              "projections": []
+            },
+            "target": 52,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 12,
+              "col_start": 18,
+              "line_end": 12,
+              "col_end": 18
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 29,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 23,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 12,
+                "col_start": 4,
+                "line_end": 12,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 30
+        }
+      },
+      {
+        "id": 30,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                32
+              ]
+            ],
+            "otherwise": 31,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 13,
+              "col_start": 4,
+              "line_end": 13,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 31,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 24,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 39,
+              "projections": []
+            },
+            "target": 53,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 13,
+              "col_start": 19,
+              "line_end": 13,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 32,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 24,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 13,
+                "col_start": 4,
+                "line_end": 13,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 33
+        }
+      },
+      {
+        "id": 33,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                35
+              ]
+            ],
+            "otherwise": 34,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 14,
+              "col_start": 4,
+              "line_end": 14,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 34,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 25,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 40,
+              "projections": []
+            },
+            "target": 54,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 14,
+              "col_start": 19,
+              "line_end": 14,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 35,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 25,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 14,
+                "col_start": 4,
+                "line_end": 14,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 36
+        }
+      },
+      {
+        "id": 36,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 13,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                38
+              ]
+            ],
+            "otherwise": 37,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 15,
+              "col_start": 4,
+              "line_end": 15,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 37,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u16>::wrapping_add",
+            "args": [
+              {
+                "Copy": {
+                  "local": 26,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    16
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 41,
+              "projections": []
+            },
+            "target": 55,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 15,
+              "col_start": 19,
+              "line_end": 15,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 38,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 26,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 15,
+                "col_start": 4,
+                "line_end": 15,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 39,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 42,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 14,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 16,
+                "col_start": 8,
+                "line_end": 16,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 42,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                41
+              ],
+              [
+                1,
+                40
+              ]
+            ],
+            "otherwise": 56,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+              "line_start": 16,
+              "col_start": 8,
+              "line_end": 16,
+              "col_end": 8
+            }
+          }
+        }
+      },
+      {
+        "id": 40,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 43,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 14,
+                      "projections": [
+                        {
+                          "Downcast": 1
+                        },
+                        {
+                          "Field": 0
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 16,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 16,
+                "col_start": 29,
+                "line_end": 16,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 43,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 16,
+                "col_start": 8,
+                "line_end": 16,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 42
+        }
+      },
+      {
+        "id": 41,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      16
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 16,
+                "col_start": 8,
+                "line_end": 16,
+                "col_end": 8
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 42
+        }
+      },
+      {
+        "id": 42,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitOr",
+                  {
+                    "Copy": {
+                      "local": 27,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 28,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 16,
+                "col_start": 4,
+                "line_end": 16,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 43,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 29,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 3,
+                "col_start": 4,
+                "line_end": 3,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 44,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 30,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 4,
+                "col_start": 4,
+                "line_end": 4,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 45,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 31,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 5,
+                "col_start": 4,
+                "line_end": 5,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 46,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 32,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 6,
+                "col_start": 4,
+                "line_end": 6,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 12
+        }
+      },
+      {
+        "id": 47,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 33,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 7,
+                "col_start": 4,
+                "line_end": 7,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 15
+        }
+      },
+      {
+        "id": 48,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 34,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 8,
+                "col_start": 4,
+                "line_end": 8,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 49,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 35,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 9,
+                "col_start": 4,
+                "line_end": 9,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 21
+        }
+      },
+      {
+        "id": 50,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 36,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 10,
+                "col_start": 4,
+                "line_end": 10,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 24
+        }
+      },
+      {
+        "id": 51,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 37,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 11,
+                "col_start": 4,
+                "line_end": 11,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 27
+        }
+      },
+      {
+        "id": 52,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 38,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 12,
+                "col_start": 4,
+                "line_end": 12,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 30
+        }
+      },
+      {
+        "id": 53,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 39,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 13,
+                "col_start": 4,
+                "line_end": 13,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 33
+        }
+      },
+      {
+        "id": 54,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 40,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 14,
+                "col_start": 4,
+                "line_end": 14,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 36
+        }
+      },
+      {
+        "id": 55,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 41,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "tests/data/path_budget_nonasync_merged_unreachable.rs",
+                "line_start": 15,
+                "col_start": 4,
+                "line_end": 15,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 39
+        }
+      },
+      {
+        "id": 56,
+        "stmts": [],
+        "terminator": "Unreachable"
+      }
+    ],
+    "arg_count": 14,
+    "return_ty": {
+      "Int": {
+        "width": 16,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_42",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_42",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

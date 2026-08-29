@@ -82,6 +82,7 @@
 # ===========================================================================
 #   scripts/check_measurement_provenance.sh --log FILE...       # the log gate
 #   scripts/check_measurement_provenance.sh --pre-push          # git's stdin
+#   scripts/check_measurement_provenance.sh --push-context      # --pre-push via $TRUST_PUSHED_REFS
 #   scripts/check_measurement_provenance.sh --history [<since>] # second net
 #   scripts/check_measurement_provenance.sh <rev-range>...
 #   scripts/check_measurement_provenance.sh --audit-runners [<dir>]
@@ -240,6 +241,26 @@ audit_runners() {
 # ===========================================================================
 # commit modes
 # ===========================================================================
+
+# --push-context is --pre-push with the ref lines taken from TRUST_PUSHED_REFS.
+# A manifest command string is fixed and receives no stdin, so scripts/hooks/pre-push
+# exports the refs instead and the SAME row text runs in both runners. UNSET means
+# no push is in flight and the subject WIDENS to --history; it never narrows to
+# nothing. Unset, not empty: an empty-but-set var is a real push with no updated
+# refs, which must stay the green it is today. SUBJECT: says which reading it took,
+# so a `push` run outside a hook cannot be mistaken for a rehearsal of one.
+if [ "${1:-}" = "--push-context" ]; then
+  shift
+  self="$0"; case "$self" in /*) ;; *) self="$PWD/$self" ;; esac
+  if [ -n "${TRUST_PUSHED_REFS+x}" ]; then
+    refcount="$(printf '%s' "$TRUST_PUSHED_REFS" | grep -c . || true)"
+    echo "SUBJECT: push ($refcount ref update(s))"
+    exec bash "$self" --pre-push "$@" <<< "$TRUST_PUSHED_REFS"
+  fi
+  echo "SUBJECT: history (no push in flight; TRUST_PUSHED_REFS unset)"
+  exec bash "$self" --history "$@"
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || true
 
 REVS_ARGS=()

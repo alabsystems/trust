@@ -55,10 +55,16 @@ pub enum ParseNatError {
     #[cfg_attr(feature = "rustc-dep-of-std", stable(feature = "trust_bignum", since = "1.0.0"))]
     InvalidDigit {
         /// Byte offset of the offending character in the input.
-        #[cfg_attr(feature = "rustc-dep-of-std", stable(feature = "trust_bignum", since = "1.0.0"))]
+        #[cfg_attr(
+            feature = "rustc-dep-of-std",
+            stable(feature = "trust_bignum", since = "1.0.0")
+        )]
         offset: usize,
         /// The offending character itself.
-        #[cfg_attr(feature = "rustc-dep-of-std", stable(feature = "trust_bignum", since = "1.0.0"))]
+        #[cfg_attr(
+            feature = "rustc-dep-of-std",
+            stable(feature = "trust_bignum", since = "1.0.0")
+        )]
         found: char,
     },
 }
@@ -67,10 +73,7 @@ pub enum ParseNatError {
 impl core::fmt::Display for ParseNatError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Empty => write!(
-                f,
-                "empty string is not a natural number; write `0` for zero"
-            ),
+            Self::Empty => write!(f, "empty string is not a natural number; write `0` for zero"),
             Self::InvalidDigit { offset, found } => write!(
                 f,
                 "invalid character {found:?} at byte offset {offset}: a Nat numeral is \
@@ -146,10 +149,11 @@ impl Nat {
 
 #[cfg(test)]
 mod tests {
-    use super::ParseNatError;
-    use crate::Nat;
     use alloc::string::ToString;
     use alloc::vec;
+
+    use super::ParseNatError;
+    use crate::Nat;
 
     #[test]
     fn round_trips_exactly_on_and_past_the_limb_boundary() {
@@ -158,11 +162,11 @@ mod tests {
             "1",
             "9",
             "10",
-            "18446744073709551615",                    // 2^64 - 1: last single-limb value
-            "18446744073709551616",                    // 2^64: first two-limb value
+            "18446744073709551615", // 2^64 - 1: last single-limb value
+            "18446744073709551616", // 2^64: first two-limb value
             "340282366920938463463374607431768211456", // 2^128
-            "10000000000000000000",                    // 10^19: the chunk boundary itself
-            "9999999999999999999",                     // 10^19 - 1
+            "10000000000000000000", // 10^19: the chunk boundary itself
+            "9999999999999999999",  // 10^19 - 1
             "100000000000000000000000000000000000000000000000000000000000000000000000000000001",
         ] {
             let parsed = Nat::from_decimal(text).expect("valid numeral");
@@ -173,14 +177,8 @@ mod tests {
     #[test]
     fn parses_known_limb_values_exactly() {
         assert_eq!(Nat::from_decimal("0").unwrap(), Nat::ZERO);
-        assert_eq!(
-            Nat::from_decimal("18446744073709551615").unwrap(),
-            Nat::from_u64(u64::MAX)
-        );
-        assert_eq!(
-            Nat::from_decimal("18446744073709551616").unwrap(),
-            Nat::from_limbs(vec![0, 1])
-        );
+        assert_eq!(Nat::from_decimal("18446744073709551615").unwrap(), Nat::from_u64(u64::MAX));
+        assert_eq!(Nat::from_decimal("18446744073709551616").unwrap(), Nat::from_limbs(vec![0, 1]));
         assert_eq!(
             Nat::from_decimal("340282366920938463463374607431768211456").unwrap(),
             Nat::from_limbs(vec![0, 0, 1])
@@ -199,13 +197,13 @@ mod tests {
     fn refuses_everything_that_is_not_an_ascii_numeral() {
         assert_eq!(Nat::from_decimal(""), Err(ParseNatError::Empty));
         for (text, offset, found) in [
-            ("+1", 0, '+'),   // no sign — ℕ has none
-            ("-1", 0, '-'),   // no negatives, ever
-            (" 1", 0, ' '),   // no whitespace
+            ("+1", 0, '+'), // no sign — ℕ has none
+            ("-1", 0, '-'), // no negatives, ever
+            (" 1", 0, ' '), // no whitespace
             ("1 ", 1, ' '),
             ("1_000", 1, '_'), // no separators
             ("12a3", 2, 'a'),
-            ("١٢", 0, '١'),   // no non-ASCII digits: fail closed, never guess
+            ("١٢", 0, '١'), // no non-ASCII digits: fail closed, never guess
             ("⁵", 0, '⁵'),
         ] {
             assert_eq!(

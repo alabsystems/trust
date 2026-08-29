@@ -5,9 +5,9 @@
 
 //! Contract types for trust_wp verification.
 //!
-//! These are standalone types that mirror trust-wp's contract representation
-//! without depending on trust-wp-core (which requires nightly). In Phase 2,
-//! these will bridge to trust-wp-core's native `Formula` / `PureExpr` types.
+//! These standalone compatibility types mirror trust-wp's contract
+//! representation without depending on trust-wp-core (which requires nightly).
+//! They do not form a compiler/full-verifier request or authority boundary.
 
 use serde::{Deserialize, Serialize};
 
@@ -84,9 +84,9 @@ impl ContractSet {
 
 /// A single contract clause.
 ///
-/// In Phase 1, contracts are represented as string expressions matching
-/// trust-wp's attribute syntax. In Phase 2, these will carry parsed
-/// `PureExpr` trees from trust-wp-core.
+/// Compatibility contracts are represented as string expressions matching
+/// trust-wp's attribute syntax. The separate native standalone API carries
+/// typed expressions without turning this string form into proof authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contract {
     /// The kind of contract.

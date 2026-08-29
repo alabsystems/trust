@@ -5,8 +5,9 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::value::{EnvId, JsValue, ObjId};
 use std::collections::HashMap;
+
+use crate::value::{EnvId, JsValue, ObjId};
 
 /// One declarative binding.
 #[derive(Debug, Clone)]

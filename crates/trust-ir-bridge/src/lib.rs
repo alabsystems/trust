@@ -62,37 +62,44 @@ mod vcgen_proto;
 mod contract_vcgen_proto;
 
 pub use cache_key::module_stable_content_hash;
+// Phase-2 prototype: trust-ir-native L1 contract VC generation (shadow mode).
+pub use contract_vcgen_proto::{TrustIrContractVc, contract_vcs_from_trust_ir};
 pub use flip::{
+    FlipDecision, FlipReport, NativeGenOutcome, ObligationKey, ObligationSetDiff,
     flip_contract_verdicts_to_spine, flip_contract_verdicts_with_module,
     flip_safety_verdicts_to_spine, flip_safety_verdicts_with_module,
     generate_native_or_flip_safety_vcs, generate_native_or_flip_safety_vcs_with_discharged,
-    l0_obligation_set_diff, l0_obligation_set_diff_with_discharged, FlipDecision, FlipReport,
-    NativeGenOutcome, ObligationKey, ObligationSetDiff,
+    l0_obligation_set_diff, l0_obligation_set_diff_with_discharged,
 };
 pub use layout_evidence::{
     TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_FEATURE, TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_STAGE,
     TRUST_IR_LAYOUT_EVIDENCE_COMMIT, TrustIrLayoutSensitiveCastBlocker,
     collect_layout_sensitive_cast_blockers, ensure_layout_sensitive_cast_evidence,
 };
+#[cfg(feature = "compiler-context")]
+pub use lower::lower_to_trust_ir_functions_with_compiler_context;
+// Trust (bundled-member derived preconditions — the bundled-Assert remedy):
+// the entry-prefix div/rem requires derivation and its fail-closed admission
+// classification for would-be-bundled members.
 pub use lower::{
-    BinOpMapping, BridgeError, NativeBoolPredSummary, SYMBOLIC_AGGREGATE_ATTR_FIELD_COUNT,
+    BundledMemberAssertAdmission, bundled_member_assert_admission,
+    member_entry_prefix_assert_requires,
+};
+pub use lower::{
+    BinOpMapping, BridgeError, CoroutineResumeContractModuleEvidence, NativeBoolPredSummary,
+    NativeCalleeSummaryContext, NativeCalleeSummaryGuard, SYMBOLIC_AGGREGATE_ATTR_FIELD_COUNT,
     SYMBOLIC_AGGREGATE_ATTR_KIND, SYMBOLIC_AGGREGATE_OP, SYMBOLIC_FORMULA_ATTR_CONTEXT,
     SYMBOLIC_FORMULA_ATTR_DEBUG, SYMBOLIC_FORMULA_ATTR_JSON, SYMBOLIC_FORMULA_ATTR_SCHEMA,
     SYMBOLIC_FORMULA_ATTR_SMTLIB, SYMBOLIC_FORMULA_ATTR_SORT, SYMBOLIC_FORMULA_DIALECT,
     SYMBOLIC_FORMULA_OP, SYMBOLIC_MEMORY_STATE_OP, TRUST_OBLIGATION_SOURCE_SCHEMA,
-    CoroutineResumeContractModuleEvidence, coroutine_resume_contract_module_evidence,
-    generate_native_safety_vcs, lower_functions_to_trust_ir, lower_to_trust_ir,
-    lower_to_trust_ir_function, lower_to_trust_ir_functions,
-    lower_to_trust_ir_functions_with_abi_total_context,
+    coroutine_resume_contract_module_evidence, generate_native_safety_vcs,
+    is_diverging_panic_site_obligation_description, is_panicking_primitive_int_div_method,
+    lower_functions_to_trust_ir, lower_to_trust_ir, lower_to_trust_ir_function,
+    lower_to_trust_ir_functions, lower_to_trust_ir_functions_with_abi_total_context,
     lower_to_trust_ir_functions_with_assumed_total_context,
     lower_to_trust_ir_functions_with_context, lower_to_trust_ir_functions_with_expected_absent,
-    map_binop, map_type, map_unop, pin_enum_tag_lane, NativeCalleeSummaryContext,
-    NativeCalleeSummaryGuard, verifiable_function_lowers_in_module_context,
+    map_binop, map_type, map_unop, pin_enum_tag_lane, verifiable_function_lowers_in_module_context,
 };
-#[cfg(feature = "compiler-context")]
-pub use lower::lower_to_trust_ir_functions_with_compiler_context;
-pub use lower::is_panicking_primitive_int_div_method;
-pub use lower::is_diverging_panic_site_obligation_description;
 // Explicit names for production call sites that still require the MIR migration
 // adapter. The historical short names remain for API compatibility, but new
 // compiler code should make this boundary visible in its spelling.
@@ -102,19 +109,13 @@ pub use lower::{
     lower_to_trust_ir_functions_with_context as lower_mir_compat_functions_to_trust_ir_with_context,
 };
 pub use native_request::{
-    NativeVerificationBundleBuildError, TRUST_NATIVE_REQUEST_TRANSFORM_VERSION,
-    native_verification_bundle_from_module,
+    NativeBundleOwner, NativeVerificationBundleBuildError,
+    TRUST_NATIVE_REQUEST_TRANSFORM_VERSION, native_verification_bundle_from_module,
+    native_verification_bundle_from_module_owners,
 };
 pub use parity::{
     ObligationKindSummary, lowered_obligation_summary, obligation_count, obligation_kind_summary,
 };
-// Phase-2 prototype: trust-ir-native VC generation (shadow mode).
-pub use vcgen_proto::{
-    safety_obligations_from_trust_ir_module, safety_vcs_from_trust_ir, TrustIrSafetyObligation,
-    TrustIrSafetyVc,
-};
-// Phase-2 prototype: trust-ir-native L1 contract VC generation (shadow mode).
-pub use contract_vcgen_proto::{contract_vcs_from_trust_ir, TrustIrContractVc};
 pub use provenance::{
     BINARY_PROVENANCE_ATTR_ARTIFACT_SHA256, BINARY_PROVENANCE_ATTR_BINARY_PATH,
     BINARY_PROVENANCE_ATTR_BLOCK_ID, BINARY_PROVENANCE_ATTR_ENCODING,
@@ -137,14 +138,19 @@ pub use provenance::{
     collect_canonical_binary_provenance, lower_decompilation_artifact_to_trust_ir,
 };
 pub use trust_ir::{
-    TrustVcNativeRequest, TrustVcRequestOptions, TrustVcVerificationMode,
     NATIVE_VERIFICATION_BUNDLE_SCHEMA_VERSION, NativeAdapterInput, NativeAssertionId,
     NativeBundleProducer, NativeDiagnosticsPolicy, NativeObligationCause, NativeObligationSource,
     NativeRequestId, NativeRequestProvenance, NativeToolIdentity, NativeVerificationBundle,
     NativeVerificationBundleError, NativeVerificationRequest, ProofDigest,
-    SourceGenerationAuthority, SourceGenerationAuthorityMintError, TrustWpNativeRequest,
-    TrustWpRequestOptions, TrustWpVerificationMode, TrustMcChcOptions, TrustMcNativeRequest,
-    TrustMcRequestOptions, TrustMcVerificationMode,
+    SourceGenerationAuthority, SourceGenerationAuthorityMintError, TrustMcChcOptions,
+    TrustMcNativeRequest, TrustMcRequestOptions, TrustMcVerificationMode, TrustVcNativeRequest,
+    TrustVcRequestOptions, TrustVcVerificationMode, TrustWpNativeRequest, TrustWpRequestOptions,
+    TrustWpVerificationMode,
+};
+// Phase-2 prototype: trust-ir-native VC generation (shadow mode).
+pub use vcgen_proto::{
+    TrustIrSafetyObligation, TrustIrSafetyVc, safety_obligations_from_trust_ir_module,
+    safety_vcs_from_trust_ir,
 };
 
 #[cfg(test)]

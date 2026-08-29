@@ -1196,6 +1196,7 @@ fn test_unstable_options_tracking_hash() {
             mir_only: true,
             native_bundle: Some(PathBuf::from("/tmp/trust-native")),
             ir: Some(PathBuf::from("/tmp/trust-ir")),
+            spec_clean: Some(PathBuf::from("/tmp/trust-spec-clean")),
         }
     );
 

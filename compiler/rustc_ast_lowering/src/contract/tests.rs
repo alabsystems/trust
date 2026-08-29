@@ -140,9 +140,6 @@ fn inconsistent_marker_stream_is_rejected_without_span_fallback() {
     }];
     assert_eq!(
         restore_contract_clause_authored_order(&invalid_decreases_lane, lanes),
-        Err(ContractClauseOrderError::InvalidLane {
-            kind: Kind::Decreases,
-            lane: Lane::Typed,
-        })
+        Err(ContractClauseOrderError::InvalidLane { kind: Kind::Decreases, lane: Lane::Typed })
     );
 }

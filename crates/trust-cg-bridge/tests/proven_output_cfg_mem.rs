@@ -171,12 +171,10 @@ fn emit_text(func: &VerifiableFunction) -> (Vec<u8>, u64) {
 
 /// Extract the `__text` section bytes + vmaddr from a 64-bit Mach-O object.
 fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let rd_u32 = |o: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?))
-    };
-    let rd_u64 = |o: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?))
-    };
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
+    let rd_u64 =
+        |o: usize| -> Option<u64> { Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?)) };
     if rd_u32(0)? != 0xfeed_facf {
         return None;
     }
@@ -266,7 +264,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort in machine output for {name}: {other:?}"),
     }
@@ -276,9 +275,9 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
     match f {
         Formula::Var(name, sort) => var_term(solver, name, sort),
         Formula::Bool(b) => solver.bool_const(*b),
-        Formula::BitVec { value, width } => solver
-            .try_bv_const_bigint(&BigInt::from(*value), *width)
-            .expect("bv const"),
+        Formula::BitVec { value, width } => {
+            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
+        }
         Formula::BvAdd(a, b, _) => bin2(solver, a, b, Solver::try_bvadd),
         Formula::BvSub(a, b, _) => bin2(solver, a, b, Solver::try_bvsub),
         Formula::BvMul(a, b, _) => bin2(solver, a, b, Solver::try_bvmul),
@@ -392,11 +391,7 @@ fn prove_output_equiv(func: &VerifiableFunction, ir_spec: &Formula) -> Verdict {
     let (code, base) = emit_text(func);
     assert!(!code.is_empty(), "emitted __text is empty for {}", func.name);
     let machine_out = symbolic_machine_output(&code, base);
-    if discharge_equal(&machine_out, ir_spec) {
-        Verdict::Proven
-    } else {
-        Verdict::CounterExample
-    }
+    if discharge_equal(&machine_out, ir_spec) { Verdict::Proven } else { Verdict::CounterExample }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,22 +438,16 @@ fn cmp_ge_proven_and_negctrl() {
     let f = make_cmp_fn("cfg_ge", BinOp::Ge);
     // PROVEN: byte-derived Csinc Ite == (a >=s b) ? 1 : 0, i.e. !(a <s b) ? 1 : 0.
     // i32 `>=` now lowers to a SIGNED condition code (lower.rs cmp-signedness fix).
-    let spec = pred_to_i32(Formula::Not(Box::new(Formula::BvSLt(
-        Box::new(wn(0)),
-        Box::new(wn(1)),
-        32,
-    ))));
+    let spec =
+        pred_to_i32(Formula::Not(Box::new(Formula::BvSLt(Box::new(wn(0)), Box::new(wn(1)), 32))));
     assert_eq!(
         prove_output_equiv(&f, &spec),
         Verdict::Proven,
         "ge: emitted Subs+Csinc bytes were not proven to equal (a >=s b ? 1 : 0)"
     );
     // NEGATIVE CONTROL: the bytes are NOT unsigned-ge (differs at a=-1, b=0). SAT.
-    let wrong = pred_to_i32(Formula::Not(Box::new(Formula::BvULt(
-        Box::new(wn(0)),
-        Box::new(wn(1)),
-        32,
-    ))));
+    let wrong =
+        pred_to_i32(Formula::Not(Box::new(Formula::BvULt(Box::new(wn(0)), Box::new(wn(1)), 32))));
     assert_eq!(
         prove_output_equiv(&f, &wrong),
         Verdict::CounterExample,
@@ -497,10 +486,7 @@ fn cmp_eq_proven_and_negctrl() {
         "eq: emitted Subs+Csinc bytes were not proven to equal (a == b ? 1 : 0)"
     );
     // NEGATIVE CONTROL: the bytes are NOT inequality (differs at a == b).
-    let wrong = pred_to_i32(Formula::Not(Box::new(Formula::Eq(
-        Box::new(wn(0)),
-        Box::new(wn(1)),
-    ))));
+    let wrong = pred_to_i32(Formula::Not(Box::new(Formula::Eq(Box::new(wn(0)), Box::new(wn(1))))));
     assert_eq!(
         prove_output_equiv(&f, &wrong),
         Verdict::CounterExample,

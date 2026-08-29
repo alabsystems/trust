@@ -1,6 +1,6 @@
 use trust_types::{
-    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan,
-    Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan, Statement,
+    Terminator, Ty, VerifiableBody, VerifiableFunction,
 };
 
 use super::postcondition_references_mutated_param;

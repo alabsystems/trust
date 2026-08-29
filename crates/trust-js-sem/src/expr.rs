@@ -8,17 +8,18 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
 use crate::ast::{BinOp, Expr, FuncLit, LogOp, MemberProp, ObjKey, PropDef, TplPart, UnOp};
 use crate::interp::{
-    strict_eq, Abrupt, Ctx, ERes, Interp, JsRef, RefKey, MAX_CALL_DEPTH, MAX_STRING_UNITS,
+    Abrupt, Ctx, ERes, Interp, JsRef, MAX_CALL_DEPTH, MAX_STRING_UNITS, RefKey, strict_eq,
 };
 use crate::number::{js_number_to_string, to_number_str};
 use crate::value::{
-    array_index_of, units_eq_ascii, units_from_str, units_to_lossy, ArgsMap, Binding, EnvId,
-    FnImpl, NativeErrorKind, ObjId, ObjKind, Object, Prop, PropDesc, PropVal, PropertyKey, Units,
-    Value,
+    ArgsMap, Binding, EnvId, FnImpl, NativeErrorKind, ObjId, ObjKind, Object, Prop, PropDesc,
+    PropVal, PropertyKey, Units, Value, array_index_of, units_eq_ascii, units_from_str,
+    units_to_lossy,
 };
-use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
@@ -48,7 +49,7 @@ impl Interp {
                 let mut idx: u64 = 0;
                 for el in elems {
                     match el {
-                        None => idx += 1, // elision: a hole
+                        None => idx += 1,                     // elision: a hole
                         Some(Expr::SpreadTrailingComma) => {} // `[...e,]`: no element
                         Some(Expr::Spread(inner)) => {
                             // SpreadElement: iterate the value via the general
@@ -91,12 +92,10 @@ impl Interp {
                 for def in entries {
                     let (key_ast, lit_or_none) = match def {
                         PropDef::Data(k, _) => (k, None),
-                        PropDef::ProtoData(_) => {
-                            return Err(Abrupt::Fatal(
-                                "object literal `__proto__` survived to evaluation (parser invariant)"
-                                    .to_string(),
-                            ))
-                        }
+                        PropDef::ProtoData(_) => return Err(Abrupt::Fatal(
+                            "object literal `__proto__` survived to evaluation (parser invariant)"
+                                .to_string(),
+                        )),
                         PropDef::Method(k, lit)
                         | PropDef::Getter(k, lit)
                         | PropDef::Setter(k, lit) => (k, Some(lit)),
@@ -331,11 +330,7 @@ impl Interp {
                 }
             }
             Expr::Delete(target) => self.eval_delete(target, ctx),
-            Expr::Update {
-                inc,
-                prefix,
-                target,
-            } => {
+            Expr::Update { inc, prefix, target } => {
                 let r = self.eval_ref_assign(target, ctx)?;
                 let old = self.ref_get(&r, ctx)?;
                 // 13.4: ToNumeric(old), then ±1 in the operand's type.
@@ -479,10 +474,7 @@ impl Interp {
                 "super property outside a method (parser invariant)".to_string(),
             ));
         };
-        let this_tdz = ctx
-            .ctor_frame
-            .as_ref()
-            .is_some_and(|f| f.cell.borrow().is_none());
+        let this_tdz = ctx.ctor_frame.as_ref().is_some_and(|f| f.cell.borrow().is_none());
         if this_tdz && assign_flavor && matches!(prop, MemberProp::Computed(_)) {
             return Err(Abrupt::Fatal(
                 "assignment to a computed super key under uninitialized `this` (engine-divergent order)"
@@ -497,14 +489,10 @@ impl Interp {
             MemberProp::Private(_) => {
                 return Err(Abrupt::Fatal(
                     "private name on a super reference (parser invariant)".to_string(),
-                ))
+                ));
             }
         };
-        Ok(JsRef::SuperMember {
-            start: self.obj(home).proto,
-            this_v,
-            key,
-        })
+        Ok(JsRef::SuperMember { start: self.obj(home).proto, this_v, key })
     }
 
     /// `delete` (13.5.1): member deletes go through [[Delete]] with the
@@ -547,7 +535,7 @@ impl Interp {
                     MemberProp::Private(_) => {
                         return Err(Abrupt::Fatal(
                             "delete of a private reference (parser invariant)".to_string(),
-                        ))
+                        ));
                     }
                 };
                 if matches!(base, Value::Undefined | Value::Null) {
@@ -813,21 +801,11 @@ impl Interp {
             }
             // Number/Boolean primitives: the virtual wrapper has no own
             // properties; everything resolves through the prototype.
-            Value::Num(_) => {
-                self.get_with_receiver(self.intr.number_proto, key, base.clone())
-            }
-            Value::BigInt(_) => {
-                self.get_with_receiver(self.intr.bigint_proto, key, base.clone())
-            }
-            Value::Bool(_) => {
-                self.get_with_receiver(self.intr.boolean_proto, key, base.clone())
-            }
-            Value::Sym(_) => {
-                self.get_with_receiver(self.intr.symbol_proto, key, base.clone())
-            }
-            Value::Undefined | Value::Null => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Value::Num(_) => self.get_with_receiver(self.intr.number_proto, key, base.clone()),
+            Value::BigInt(_) => self.get_with_receiver(self.intr.bigint_proto, key, base.clone()),
+            Value::Bool(_) => self.get_with_receiver(self.intr.boolean_proto, key, base.clone()),
+            Value::Sym(_) => self.get_with_receiver(self.intr.symbol_proto, key, base.clone()),
+            Value::Undefined | Value::Null => Err(self.throw_native(NativeErrorKind::TypeError)),
         }
     }
 
@@ -856,9 +834,7 @@ impl Interp {
                 ObjKind::Function(FnImpl::User { lit, .. }) if !lit.strict && !lit.is_method
             )
         {
-            return Some(format!(
-                "sloppy function legacy own `{name}` (engine surface, non-spec)"
-            ));
+            return Some(format!("sloppy function legacy own `{name}` (engine surface, non-spec)"));
         }
         self.intr
             .danger_reason(o, name)
@@ -975,7 +951,14 @@ impl Interp {
                 // Otherwise the prototype chain governs (a setter there runs
                 // with the primitive receiver); a data hit or chain end
                 // fails: CreateDataProperty on a primitive receiver is false.
-                self.set_walk_chain(Some(self.intr.string_proto), key, v, strict, base.clone(), None)
+                self.set_walk_chain(
+                    Some(self.intr.string_proto),
+                    key,
+                    v,
+                    strict,
+                    base.clone(),
+                    None,
+                )
             }
             Value::Num(_) | Value::Bool(_) => {
                 // The virtual wrapper has no own properties; a setter on the
@@ -988,24 +971,28 @@ impl Interp {
                 };
                 self.set_walk_chain(Some(start), key, v, strict, base.clone(), None)
             }
-            Value::Sym(_) => {
-                self.set_walk_chain(Some(self.intr.symbol_proto), key, v, strict, base.clone(), None)
-            }
-            Value::BigInt(_) => {
-                self.set_walk_chain(Some(self.intr.bigint_proto), key, v, strict, base.clone(), None)
-            }
-            Value::Undefined | Value::Null => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Value::Sym(_) => self.set_walk_chain(
+                Some(self.intr.symbol_proto),
+                key,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::BigInt(_) => self.set_walk_chain(
+                Some(self.intr.bigint_proto),
+                key,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::Undefined | Value::Null => Err(self.throw_native(NativeErrorKind::TypeError)),
         }
     }
 
     pub(crate) fn set_reject(&mut self, strict: bool) -> Result<(), Abrupt> {
-        if strict {
-            Err(self.throw_native(NativeErrorKind::TypeError))
-        } else {
-            Ok(())
-        }
+        if strict { Err(self.throw_native(NativeErrorKind::TypeError)) } else { Ok(()) }
     }
 
     /// OrdinarySet (10.1.9) on an object receiver.
@@ -1117,12 +1104,8 @@ impl Interp {
             // A proxy in the prototype chain routes the [[Set]] through its
             // trap with the ORIGINAL receiver.
             if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) {
-                let ok = self.mop_set(
-                    o,
-                    &crate::value::PropertyKey::Str(key.clone()),
-                    v,
-                    receiver,
-                )?;
+                let ok =
+                    self.mop_set(o, &crate::value::PropertyKey::Str(key.clone()), v, receiver)?;
                 return if ok { Ok(()) } else { self.set_reject(strict) };
             }
             // Integer-indexed exotic [[Set]] (23.2.3.x) reached through the
@@ -1444,11 +1427,7 @@ impl Interp {
         priv_env: Option<Rc<crate::interp::PrivEnvFrame>>,
     ) -> ObjId {
         let needs_self_binding = !is_decl && lit.name.is_some() && !lit.inferred_name;
-        let closure_env = if needs_self_binding {
-            self.alloc_env(Some(env))
-        } else {
-            env
-        };
+        let closure_env = if needs_self_binding { self.alloc_env(Some(env)) } else { env };
         // A generator function's [[Prototype]] is %GeneratorFunction.prototype%;
         // an async function's is %AsyncFunction.prototype%.
         let fn_proto = if lit.is_generator {
@@ -1459,11 +1438,7 @@ impl Interp {
             self.intr.function_proto
         };
         let fobj = self.alloc(Object::new(
-            ObjKind::Function(FnImpl::User {
-                lit: Rc::clone(lit),
-                env: closure_env,
-                home: None,
-            }),
+            ObjKind::Function(FnImpl::User { lit: Rc::clone(lit), env: closure_env, home: None }),
             Some(fn_proto),
         ));
         if needs_self_binding {
@@ -1542,11 +1517,7 @@ impl Interp {
             self.intr.function_proto
         };
         let fobj = self.alloc(Object::new(
-            ObjKind::Function(FnImpl::User {
-                lit: Rc::clone(lit),
-                env,
-                home: Some(home),
-            }),
+            ObjKind::Function(FnImpl::User { lit: Rc::clone(lit), env, home: Some(home) }),
             Some(fn_proto),
         ));
         let plen = expected_arg_count(lit);
@@ -1595,16 +1566,13 @@ impl Interp {
             Some(self.intr.object_proto),
         ));
         for (i, v) in args.iter().enumerate() {
-            self.obj_mut(ao)
-                .props
-                .insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
+            self.obj_mut(ao).props.insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
         }
         #[allow(clippy::cast_precision_loss)]
         let len = args.len() as f64;
-        self.obj_mut(ao).props.insert(
-            units_from_str("length"),
-            Prop::with_attrs(Value::Num(len), true, false, true),
-        );
+        self.obj_mut(ao)
+            .props
+            .insert(units_from_str("length"), Prop::with_attrs(Value::Num(len), true, false, true));
         // @@iterator = %Array.prototype.values% (writable, non-enumerable,
         // configurable) per CreateMapped/UnmappedArgumentsObject (10.4.4.6-7).
         let iter_sid = self.intr.wk(crate::builtins::WK_ITERATOR);
@@ -1614,9 +1582,7 @@ impl Interp {
             .get(&iter_sid)
             .and_then(|p| p.data_value().cloned())
         {
-            self.obj_mut(ao)
-                .sym_props
-                .insert(iter_sid, Prop::with_attrs(vf, true, false, true));
+            self.obj_mut(ao).sym_props.insert(iter_sid, Prop::with_attrs(vf, true, false, true));
         }
         if lit.strict {
             let tte = self.intr.throw_type_error;
@@ -1643,24 +1609,15 @@ impl Interp {
             }
             Value::Num(n) => {
                 let n = *n;
-                Ok(self.alloc(Object::new(
-                    ObjKind::NumberObj(n),
-                    Some(self.intr.number_proto),
-                )))
+                Ok(self.alloc(Object::new(ObjKind::NumberObj(n), Some(self.intr.number_proto))))
             }
             Value::Bool(b) => {
                 let b = *b;
-                Ok(self.alloc(Object::new(
-                    ObjKind::BoolObj(b),
-                    Some(self.intr.boolean_proto),
-                )))
+                Ok(self.alloc(Object::new(ObjKind::BoolObj(b), Some(self.intr.boolean_proto))))
             }
             Value::BigInt(n) => {
                 let n = Rc::clone(n);
-                Ok(self.alloc(Object::new(
-                    ObjKind::BigIntObj(n),
-                    Some(self.intr.bigint_proto),
-                )))
+                Ok(self.alloc(Object::new(ObjKind::BigIntObj(n), Some(self.intr.bigint_proto))))
             }
             _ => Err(Abrupt::Fatal("ToObject on non-primitive".to_string())),
         }
@@ -1734,16 +1691,8 @@ impl Interp {
         match impl_ {
             FnImpl::Builtin(b) => self.dispatch_builtin(b, fid, this, args, false),
             FnImpl::Native(nc) => self.call_native(&nc, this, args),
-            FnImpl::User { lit, env, home } => {
-                self.call_user(&lit, env, fid, this, args, home)
-            }
-            FnImpl::Arrow {
-                lit,
-                env,
-                this_v,
-                home,
-                frame,
-            } => {
+            FnImpl::User { lit, env, home } => self.call_user(&lit, env, fid, this, args, home),
+            FnImpl::Arrow { lit, env, this_v, home, frame } => {
                 // An async arrow returns a promise and suspends on `await` via
                 // the same resumable machine; a FDI throw rejects that promise.
                 if lit.is_async {
@@ -1767,11 +1716,7 @@ impl Interp {
             }
             // Class constructors throw on [[Call]].
             FnImpl::ClassCtor(_) => Err(self.throw_native(NativeErrorKind::TypeError)),
-            FnImpl::Bound {
-                target,
-                this_v,
-                args: bound,
-            } => {
+            FnImpl::Bound { target, this_v, args: bound } => {
                 let mut all = bound.as_ref().clone();
                 all.extend(args);
                 self.call_function(target, *this_v, all, false)
@@ -2009,11 +1954,7 @@ impl Interp {
                 r
             }
             FnImpl::ClassCtor(rec) => self.construct_class(fid, &rec, args, new_target),
-            FnImpl::Bound {
-                target,
-                args: bound,
-                ..
-            } => {
+            FnImpl::Bound { target, args: bound, .. } => {
                 // 10.4.1.2: [[Construct]] forwards to the bound target with
                 // the bound arguments prepended; when F == newTarget the
                 // target substitutes.
@@ -2062,14 +2003,10 @@ impl Interp {
             Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
             Value::Undefined => Ok(f64::NAN),
             Value::Null => Ok(0.0),
-            Value::Str(s) => {
-                to_number_str(&units_to_lossy(s)).map_err(Abrupt::Fatal)
-            }
+            Value::Str(s) => to_number_str(&units_to_lossy(s)).map_err(Abrupt::Fatal),
             // ToNumber(symbol) and ToNumber(BigInt) are TypeErrors (7.1.4);
             // `Number(bigint)` converts through a separate path in NumberFn.
-            Value::Sym(_) | Value::BigInt(_) => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Value::Sym(_) | Value::BigInt(_) => Err(self.throw_native(NativeErrorKind::TypeError)),
             Value::Obj(_) => {
                 let p = self.to_primitive(v, Hint::Number)?;
                 self.to_number(&p)
@@ -2131,11 +2068,8 @@ impl Interp {
 
     /// OrdinaryToPrimitive (7.1.1.1): valueOf/toString in hint order.
     pub(crate) fn ordinary_to_primitive(&mut self, v: &Value, hint: Hint) -> ERes {
-        let order: [&str; 2] = if hint == Hint::String {
-            ["toString", "valueOf"]
-        } else {
-            ["valueOf", "toString"]
-        };
+        let order: [&str; 2] =
+            if hint == Hint::String { ["toString", "valueOf"] } else { ["valueOf", "toString"] };
         for m in order {
             let mv = self.get_prop_value(v, &units_from_str(m))?;
             if let Value::Obj(mid) = &mv {
@@ -2278,12 +2212,10 @@ impl Interp {
                     BinOp::Rem => a % b,
                     BinOp::Exp => match crate::builtins::math_pow_exact(a, b) {
                         Some(v) => v,
-                        None => {
-                            return Err(Abrupt::Fatal(
-                                "`**` on Numbers outside the exactly-determined domain (out of slice)"
-                                    .to_string(),
-                            ))
-                        }
+                        None => return Err(Abrupt::Fatal(
+                            "`**` on Numbers outside the exactly-determined domain (out of slice)"
+                                .to_string(),
+                        )),
                     },
                     BinOp::BitAnd => f64::from(to_int32(a) & to_int32(b)),
                     BinOp::BitOr => f64::from(to_int32(a) | to_int32(b)),
@@ -2308,9 +2240,7 @@ impl Interp {
             Err(crate::bigint::BigErr::Range) => {
                 Err(self.throw_native(NativeErrorKind::RangeError))
             }
-            Err(crate::bigint::BigErr::Type) => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Err(crate::bigint::BigErr::Type) => Err(self.throw_native(NativeErrorKind::TypeError)),
             Err(crate::bigint::BigErr::Refuse(m)) => Err(Abrupt::Fatal(m)),
         }
     }
@@ -2488,11 +2418,7 @@ pub(crate) fn to_uint32(n: f64) -> u32 {
             (((m >> sh) & 0xffff_ffff) as u32)
         }
     };
-    if neg {
-        low.wrapping_neg()
-    } else {
-        low
-    }
+    if neg { low.wrapping_neg() } else { low }
 }
 
 /// ToInt32 (7.1.6): ToUint32 reinterpreted as a signed 32-bit value.

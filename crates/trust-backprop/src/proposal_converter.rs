@@ -7,12 +7,13 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_strengthen::{Proposal, ProposalKind};
+
 use crate::ast_rewriter::{
     AstRewriteError, AstRewriteTarget, SemanticRewrite, contract_sort_environment, resolve_target,
 };
 use crate::rewriter::RewriteError;
 use crate::{ContractClauseKind, RewriteKind, SourceRewrite};
-use trust_strengthen::{Proposal, ProposalKind};
 
 /// Errors specific to proposal conversion.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -279,8 +280,9 @@ fn validate_resolved_rewrite(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_strengthen::{Proposal, ProposalKind};
+
+    use super::*;
 
     fn make_source() -> &'static str {
         "pub fn get_midpoint(a: u64, b: u64) -> u64 {\n    (a + b) / 2\n}\n"

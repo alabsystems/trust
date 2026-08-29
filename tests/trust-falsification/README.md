@@ -64,6 +64,40 @@ Do not "deduplicate" a pair by deleting the plain variant. The pair is a
 differential: the plain one shows the obligation refutes on its own merits, the
 sibling one shows the whole-function solve cannot launder it.
 
+## What this gate CANNOT see: declined rows in the trust-clean certification tiers
+
+There is a false-proof class this corpus is structurally unable to cover, and
+saying so is part of the corpus's job. A DECLINED row (`UnsupportedMir`, e.g.
+`UnmodeledCalleeReturn`) carries a `Bool(false)` placeholder formula; read as a
+formula rather than as a KIND, it "discharges" via `RefutedModulo3`, and a
+function whose entire safety-VC set is declined reads as vacuously discharged
+over an empty filtered set. Two ways for a certification tier to certify a body
+it never proved.
+
+**A `.rs` fixture cannot reach it**, for three independent reasons, each checked
+rather than assumed:
+
+1. Those tiers live in the **`trust-clean`** crate. `trust-clean` is not in the
+   compiler's link closure — the compiler crates depend on `trust-clean-carrier`
+   and `trust-clean-origin`, and neither of those depends on `trust-clean`. The
+   gate drives `trustc`; `clean` is a separate binary the gate never invokes.
+2. Under the gate's `-Ztrust-policy=certify`, a declined row is a build error.
+   Measured on a body whose only unproved row is exactly the decline
+   (`a / f()` for `f: &dyn Fn() -> u32`, whose return is an
+   `UnmodeledCalleeReturn`): the compiler answers `incomplete`, never `proved`.
+3. `classify_verdict`'s `contains_incomplete_static_accept` is a second,
+   independent refusal to read such an exit as `proved`.
+
+So the coverage belongs in a crate test, and it is already there:
+`crates/trust-clean/src/decline_gate_tests.rs` covers both channels by name —
+`declined_row_blocks_the_safety_discharge_gate`,
+`declined_row_trips_the_unmodeled_safety_gate`,
+`no_declined_row_carries_a_refutable_placeholder` (which pins the
+`RefutedModulo3` spelling itself),
+`declined_row_blocks_the_trustir_safety_faithfulness_gate` (the empty-filtered-set
+channel), and the `decline_free_controls_keep_their_verdicts` control. Add to
+that file, not to this corpus.
+
 ## Known backend limitations (future fixtures)
 
 Some guarded obligations are sound but the current backends cannot yet PROVE
@@ -97,3 +131,16 @@ false-accept — was restored to the gated `mutant/` lane on 2026-07-24 once its
 fix (`3f93cbb5bd`) was confirmed to refute it. A soundness fixture belongs in
 `pending/` only while its fix is genuinely absent; quarantine is for capability
 gaps, never for a hole we already closed.
+
+## A gated fixture that is RED on purpose
+
+`mutant/grid_merged_loopvar_index.rs` reports **SURVIVING MUTANT** on both the
+pristine base and this branch. It is not a capability gap and it does not belong
+in `pending/`: the compiler answers `proved`, with every obligation
+kernel-certified, on a body the runtime oracle panics on. An affirmative proof of
+a false statement is precisely what this corpus exists to make visible, so the
+row stays in the gated lane and the gate stays red until the defect is fixed.
+Its safe twin `proved/grid_unmerged_loopvar_index.rs` — same nested loops, same
+`y * 3 + x`, no merge — must stay green throughout, so a fix can be told apart
+from a blanket refusal. The fixture's own header records the near-neighbour
+shapes that do NOT reproduce it, which is the search space a fix has to explain.

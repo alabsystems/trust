@@ -19,6 +19,37 @@ pub struct Statement<'tcx> {
     pub kind: StatementKind<'tcx>,
     /// Some debuginfos appearing before the primary statement.
     pub debuginfos: StmtDebugInfos<'tcx>,
+    /// Trust: this `StatementKind::Assign` holds an integer `Rvalue::BinaryOp`
+    /// whose arithmetic is MODULAR BY DEFINITION — it is what
+    /// `LowerIntrinsics` produced from `intrinsics::wrapping_{add,sub,mul}`.
+    ///
+    /// Why the flag has to exist at all: that lowering maps `wrapping_add` onto
+    /// the *same* `BinOp::Add` a source-level `+` lowers to once overflow checks
+    /// are off, and after it the two are indistinguishable — the extracted MIR
+    /// for `a + b` and for `intrinsics::wrapping_add(a, b)` is byte-identical
+    /// (measured). Trust's verifier must charge a no-overflow obligation for the
+    /// former and must NOT for the latter, so the identity has to be carried
+    /// from the pass that destroys it. Nothing downstream can re-derive it.
+    ///
+    /// Set ONLY by `LowerIntrinsics`, ONLY on the `wrapping_*` arm — never on
+    /// the `unchecked_*` arm beside it, whose ops are UB on overflow and keep
+    /// their obligation. Every other producer leaves it `false` via
+    /// [`Statement::new`], which is the fail-closed default: an unflagged
+    /// statement is charged exactly as it is today.
+    ///
+    /// It rides the statement rather than a side table on purpose — later passes
+    /// move, clone and inline statements freely, and a flag in the statement
+    /// survives all of that, while a `Location`-keyed table would be invalidated
+    /// by the first `SimplifyCfg`.
+    ///
+    /// ENCODING: `Statement` is `TyEncodable` and MIR bodies ride crate
+    /// metadata, so adding this field changed the rmeta wire format — landing
+    /// it without a `METADATA_VERSION` bump made drivers ICE mid-decode on
+    /// older sysroots while the header still claimed compatibility (the
+    /// "`StmtDebugInfo` tag 15" ICE). The bump landed separately (12 -> 13);
+    /// the next field added to any `TyEncodable` MIR type must bump
+    /// `rustc_metadata::rmeta::METADATA_VERSION` in the SAME commit.
+    pub trust_modular_arith: bool,
 }
 
 impl<'tcx> Statement<'tcx> {
@@ -28,6 +59,9 @@ impl<'tcx> Statement<'tcx> {
         if self.kind == StatementKind::Nop {
             return;
         }
+        // Trust: a `Nop` performs no arithmetic, so the modular certificate must
+        // not survive the rewrite — dropping it is the fail-closed direction.
+        self.trust_modular_arith = false;
         let replaced_stmt = std::mem::replace(&mut self.kind, StatementKind::Nop);
         if !drop_debuginfo {
             let Some(debuginfo) = replaced_stmt.as_debuginfo() else {
@@ -38,7 +72,19 @@ impl<'tcx> Statement<'tcx> {
     }
 
     pub fn new(source_info: SourceInfo, kind: StatementKind<'tcx>) -> Self {
-        Statement { source_info, kind, debuginfos: StmtDebugInfos::default() }
+        Statement {
+            source_info,
+            kind,
+            debuginfos: StmtDebugInfos::default(),
+            trust_modular_arith: false,
+        }
+    }
+
+    /// Trust: [`Statement::new`] plus the MODULAR-arithmetic certificate. The
+    /// only caller is `LowerIntrinsics`'s `wrapping_{add,sub,mul}` rewrite; see
+    /// [`Statement::trust_modular_arith`].
+    pub fn new_trust_modular_arith(source_info: SourceInfo, kind: StatementKind<'tcx>) -> Self {
+        Statement { trust_modular_arith: true, ..Statement::new(source_info, kind) }
     }
 }
 

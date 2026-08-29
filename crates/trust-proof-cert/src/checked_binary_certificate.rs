@@ -1,19 +1,18 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust-proof-cert checked binary certificate production path scaffold
 //
 // This module keeps raw solver proof bytes separate from independently checked
 // binary proof certificates. Raw bytes are audit evidence only; production gate
 // coverage starts at BinaryCertificateChecker::check.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
+
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    io::{self, Read},
-    path::{Component, Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
 use thiserror::Error;
 use trust_types::digest::{stable_sha256_hex, stable_sha256_hex_reader};
 use trust_types::{
@@ -6038,7 +6037,9 @@ pub fn persist_solver_proof_export_artifacts(
         .normalized_metadata()
         .validate_structure()
         .map_err(|err| crate::CertError::InvalidCertificate { reason: err.to_string() })?;
-    if export.proof_bytes.is_empty() || stable_sha256_hex(&export.proof_bytes) != export.proof_sha256 {
+    if export.proof_bytes.is_empty()
+        || stable_sha256_hex(&export.proof_bytes) != export.proof_sha256
+    {
         return Err(crate::CertError::InvalidCertificate {
             reason: "solver proof export payload is empty or does not match proof_sha256"
                 .to_string(),

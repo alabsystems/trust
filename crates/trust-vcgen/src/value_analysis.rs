@@ -473,7 +473,7 @@ fn vs_terminator_successors(term: &Terminator) -> Vec<BlockId> {
         Terminator::Assert { target, .. } => vec![*target],
         Terminator::Call { target, .. } => target.iter().copied().collect(),
         Terminator::Opaque { targets, .. } => targets.clone(),
-        Terminator::Return | Terminator::Unreachable => vec![],
+        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => vec![],
         _ => vec![],
     }
 }
@@ -481,6 +481,8 @@ fn vs_terminator_successors(term: &Terminator) -> Vec<BlockId> {
 /// Analyze an entire function, computing value sets at each block entry.
 #[must_use]
 pub fn analyze_function(func: &VerifiableFunction) -> FxHashMap<String, ValueSet> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
     let mut block_states: FxHashMap<BlockId, ValueSetState> = FxHashMap::default();
 
     // Initialize all blocks to bottom (unreachable).

@@ -148,9 +148,8 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{BasicBlock, Body, Operand, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
-use rustc_span::Spanned;
 use rustc_span::def_id::DefId;
-use rustc_span::sym;
+use rustc_span::{Spanned, sym};
 
 use super::dyn_dispatch_reliance::{
     CallKeyLedger, dyn_target_is_verified_panic_free, target_decline_reason,
@@ -225,7 +224,7 @@ impl<'tcx> StaticStrWriteFmtFacts<'tcx> {
     /// The caller holds the reliance re-entrancy guard, so the
     /// `trust_proof_results` forcing below cannot open a query cycle this module
     /// does not already decline.
-    pub(crate) fn resolve_reliance(
+    pub(super) fn resolve_reliance(
         &self,
         tcx: TyCtxt<'tcx>,
         root_def_id: DefId,

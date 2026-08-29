@@ -661,17 +661,11 @@ mod tests {
                 trust_mc_core::PropertyKind::ArithmeticOverflow,
                 TrustMcPropertyKind::ArithmeticOverflow,
             ),
-            (
-                trust_mc_core::PropertyKind::DivisionByZero,
-                TrustMcPropertyKind::DivisionByZero,
-            ),
+            (trust_mc_core::PropertyKind::DivisionByZero, TrustMcPropertyKind::DivisionByZero),
             (trust_mc_core::PropertyKind::OutOfBounds, TrustMcPropertyKind::OutOfBounds),
             (trust_mc_core::PropertyKind::NullPointer, TrustMcPropertyKind::NullPointer),
             (trust_mc_core::PropertyKind::MemorySafety, TrustMcPropertyKind::MemorySafety),
-            (
-                trust_mc_core::PropertyKind::PointerOverflow,
-                TrustMcPropertyKind::PointerOverflow,
-            ),
+            (trust_mc_core::PropertyKind::PointerOverflow, TrustMcPropertyKind::PointerOverflow),
             (trust_mc_core::PropertyKind::Unreachable, TrustMcPropertyKind::Unreachable),
             (trust_mc_core::PropertyKind::Panic, TrustMcPropertyKind::Panic),
             (
@@ -681,10 +675,7 @@ mod tests {
             (trust_mc_core::PropertyKind::Precondition, TrustMcPropertyKind::Precondition),
             (trust_mc_core::PropertyKind::Postcondition, TrustMcPropertyKind::Postcondition),
             (trust_mc_core::PropertyKind::LoopInvariant, TrustMcPropertyKind::LoopInvariant),
-            (
-                trust_mc_core::PropertyKind::LoopDecreases,
-                TrustMcPropertyKind::LoopDecreases,
-            ),
+            (trust_mc_core::PropertyKind::LoopDecreases, TrustMcPropertyKind::LoopDecreases),
             (trust_mc_core::PropertyKind::Other, TrustMcPropertyKind::Other),
         ];
 

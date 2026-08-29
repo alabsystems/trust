@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -544,13 +545,20 @@ fn release_transcript_candidate_identity_is_not_stale_across_repositories_or_hea
 fn test_proof_grade_release_transcript_row_accepts_fully_populated_typed_evidence() {
     let candidate_commit = current_release_candidate_commit();
     let vc_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript vc");
-    let certificate_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript checked certificate");
-    let replay_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript machine replay");
-    let provenance_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript provenance");
-    let target_evidence_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript target evidence");
-    let target_binding_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript target binding");
-    let exact_source_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript exact source ownership");
-    let type_ownership_sha256 = trust_types::digest::stable_sha256_hex(b"release transcript type ownership");
+    let certificate_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript checked certificate");
+    let replay_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript machine replay");
+    let provenance_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript provenance");
+    let target_evidence_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript target evidence");
+    let target_binding_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript target binding");
+    let exact_source_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript exact source ownership");
+    let type_ownership_sha256 =
+        trust_types::digest::stable_sha256_hex(b"release transcript type ownership");
     let target_consumer = TargetConsumerDigestBinding {
         required: true,
         evidence_sha256: Some(target_evidence_sha256.clone()),
@@ -651,16 +659,22 @@ fn test_proof_grade_release_transcript_row_accepts_fully_populated_typed_evidenc
 #[test]
 fn test_proof_grade_release_transcript_row_accepts_all_vc_checked_certificate_inventory() {
     let candidate_commit = current_release_candidate_commit();
-    let vc_sha256s =
-        vec![trust_types::digest::stable_sha256_hex(b"release transcript vc 0"), trust_types::digest::stable_sha256_hex(b"release transcript vc 1")];
+    let vc_sha256s = vec![
+        trust_types::digest::stable_sha256_hex(b"release transcript vc 0"),
+        trust_types::digest::stable_sha256_hex(b"release transcript vc 1"),
+    ];
     let certificate_sha256s = vec![
         trust_types::digest::stable_sha256_hex(b"release transcript checked certificate 0"),
         trust_types::digest::stable_sha256_hex(b"release transcript checked certificate 1"),
     ];
     let target_consumer = TargetConsumerDigestBinding {
         required: true,
-        evidence_sha256: Some(trust_types::digest::stable_sha256_hex(b"release transcript all-vc target evidence")),
-        binding_sha256: Some(trust_types::digest::stable_sha256_hex(b"release transcript all-vc target binding")),
+        evidence_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release transcript all-vc target evidence",
+        )),
+        binding_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release transcript all-vc target binding",
+        )),
     };
 
     let row = proof_grade_release_transcript_row_report(ProofGradeReleaseTranscriptRowInput {
@@ -669,14 +683,20 @@ fn test_proof_grade_release_transcript_row_accepts_all_vc_checked_certificate_in
         binary_artifact_digest_identity: &fixture_binary_artifact_digest_identity(),
         vc_sha256s: vc_sha256s.clone(),
         checked_certificate_sha256s: certificate_sha256s.clone(),
-        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"release transcript all-vc replay")],
-        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"release transcript all-vc provenance")],
+        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"release transcript all-vc replay",
+        )],
+        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"release transcript all-vc provenance",
+        )],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
         exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
             b"release transcript all-vc exact source ownership",
         )),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"release transcript all-vc type ownership")),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release transcript all-vc type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     });
 
@@ -723,13 +743,19 @@ fn test_proof_grade_release_transcript_digest_tampering_rejects() {
         candidate_commit: Some(current_release_candidate_commit()),
         binary_artifact_digest_identity: &fixture_binary_artifact_digest_identity(),
         vc_sha256s: vec![trust_types::digest::stable_sha256_hex(b"tamper vc")],
-        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(b"tamper checked certificate")],
+        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"tamper checked certificate",
+        )],
         replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"tamper replay")],
         provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"tamper provenance")],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
-        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"tamper exact source ownership")),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"tamper type ownership")),
+        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"tamper exact source ownership",
+        )),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"tamper type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     });
     assert!(row.accepted, "{:?}", row.blockers);
@@ -764,13 +790,19 @@ fn test_proof_grade_release_transcript_row_blocks_non_empty_accepted_blockers() 
         candidate_commit: Some(current_release_candidate_commit()),
         binary_artifact_digest_identity: &fixture_binary_artifact_digest_identity(),
         vc_sha256s: vec![trust_types::digest::stable_sha256_hex(b"blocker vc")],
-        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(b"blocker checked certificate")],
+        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"blocker checked certificate",
+        )],
         replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"blocker replay")],
         provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"blocker provenance")],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
-        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"blocker exact source ownership")),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"blocker type ownership")),
+        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"blocker exact source ownership",
+        )),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"blocker type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     });
     assert!(row.accepted, "{:?}", row.blockers);
@@ -804,13 +836,19 @@ fn test_proof_grade_release_transcript_row_blocks_stale_candidate_commit() {
         candidate_commit: Some("0".repeat(40)),
         binary_artifact_digest_identity: &fixture_binary_artifact_digest_identity(),
         vc_sha256s: vec![trust_types::digest::stable_sha256_hex(b"stale vc")],
-        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(b"stale checked certificate")],
+        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"stale checked certificate",
+        )],
         replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"stale replay")],
         provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"stale provenance")],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
-        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"stale exact source ownership")),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"stale type ownership")),
+        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"stale exact source ownership",
+        )),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"stale type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     });
 
@@ -841,14 +879,20 @@ fn test_proof_grade_release_transcript_row_blocks_missing_target_consumer_fields
         checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(
             b"missing target consumer checked certificate",
         )],
-        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"missing target consumer replay")],
-        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"missing target consumer provenance")],
+        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"missing target consumer replay",
+        )],
+        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"missing target consumer provenance",
+        )],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
         exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
             b"missing target consumer exact source ownership",
         )),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"missing target consumer type ownership")),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"missing target consumer type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     });
 
@@ -869,21 +913,35 @@ fn test_proof_grade_release_transcript_row_blocks_missing_target_consumer_fields
 fn test_proof_grade_release_transcript_row_blocks_missing_artifact_binding() {
     let target_consumer = TargetConsumerDigestBinding {
         required: true,
-        evidence_sha256: Some(trust_types::digest::stable_sha256_hex(b"missing binding target evidence")),
-        binding_sha256: Some(trust_types::digest::stable_sha256_hex(b"missing binding target binding")),
+        evidence_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"missing binding target evidence",
+        )),
+        binding_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"missing binding target binding",
+        )),
     };
     let mut row = proof_grade_release_transcript_row_report(ProofGradeReleaseTranscriptRowInput {
         evidence_origin: "targo_trust_release_export",
         candidate_commit: Some(current_release_candidate_commit()),
         binary_artifact_digest_identity: &fixture_binary_artifact_digest_identity(),
         vc_sha256s: vec![trust_types::digest::stable_sha256_hex(b"missing binding vc")],
-        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(b"missing binding checked certificate")],
-        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"missing binding replay")],
-        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"missing binding provenance")],
+        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"missing binding checked certificate",
+        )],
+        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"missing binding replay",
+        )],
+        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"missing binding provenance",
+        )],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
-        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"missing binding exact source ownership")),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"missing binding type ownership")),
+        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"missing binding exact source ownership",
+        )),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"missing binding type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     });
     assert!(row.accepted, "{:?}", row.blockers);
@@ -983,12 +1041,15 @@ fn test_proof_grade_release_transcript_writes_synthetic_unit_fixture_from_typed_
         .load_and_import_checked_certificate_artifacts([path.as_path()])
         .expect("checked artifact should load into typed import rows");
     let mut import_row = import_report.artifacts.remove(0);
-    let replay_transcript_digest =
-        trust_types::digest::stable_sha256_hex(b"synthetic unit proof-grade release replay transcript");
-    import_row.manifest_identity_sha256 =
-        Some(trust_types::digest::stable_sha256_hex(b"synthetic unit checked certificate manifest identity"));
-    import_row.source_backpropagation_gate_sha256 =
-        Some(trust_types::digest::stable_sha256_hex(b"synthetic unit source backpropagation gate identity"));
+    let replay_transcript_digest = trust_types::digest::stable_sha256_hex(
+        b"synthetic unit proof-grade release replay transcript",
+    );
+    import_row.manifest_identity_sha256 = Some(trust_types::digest::stable_sha256_hex(
+        b"synthetic unit checked certificate manifest identity",
+    ));
+    import_row.source_backpropagation_gate_sha256 = Some(trust_types::digest::stable_sha256_hex(
+        b"synthetic unit source backpropagation gate identity",
+    ));
     import_row.source_backpropagation_gate = accepted_checked_source_gate();
     import_row.production_checker_evidence_sha256 =
         Some(trust_types::digest::stable_sha256_hex(b"synthetic unit production checker evidence"));
@@ -1054,7 +1115,8 @@ fn test_proof_grade_release_transcript_writes_synthetic_unit_fixture_from_typed_
 fn test_convert_json_exports_real_accepted_proof_grade_release_transcript_row() {
     let root = temp_test_dir("real-proof-grade-release-transcript");
     let proof_bytes = b"normalized real release proof payload";
-    let replay_transcript_digest = trust_types::digest::stable_sha256_hex(b"real proof-grade release replay transcript");
+    let replay_transcript_digest =
+        trust_types::digest::stable_sha256_hex(b"real proof-grade release replay transcript");
 
     let (mut dispatch, _) = importable_binary_dispatch("real-release:vc0");
     dispatch.replay = ReplayStatus::Replayed;
@@ -1277,21 +1339,35 @@ fn test_convert_json_exports_real_accepted_proof_grade_release_transcript_row() 
 fn accepted_release_transcript_row_for_artifact_tests() -> ProofGradeReleaseTranscriptRowReport {
     let target_consumer = TargetConsumerDigestBinding {
         required: true,
-        evidence_sha256: Some(trust_types::digest::stable_sha256_hex(b"release artifact target consumer evidence")),
-        binding_sha256: Some(trust_types::digest::stable_sha256_hex(b"release artifact target consumer binding")),
+        evidence_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release artifact target consumer evidence",
+        )),
+        binding_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release artifact target consumer binding",
+        )),
     };
     proof_grade_release_transcript_row_report(ProofGradeReleaseTranscriptRowInput {
         evidence_origin: "targo_trust_release_export",
         candidate_commit: Some(current_release_candidate_commit()),
         binary_artifact_digest_identity: &fixture_binary_artifact_digest_identity(),
         vc_sha256s: vec![trust_types::digest::stable_sha256_hex(b"release artifact vc")],
-        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(b"release artifact checked certificate")],
-        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(b"release artifact replay transcript")],
-        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(b"release artifact provenance")],
+        checked_certificate_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"release artifact checked certificate",
+        )],
+        replay_transcript_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"release artifact replay transcript",
+        )],
+        provenance_sha256s: vec![trust_types::digest::stable_sha256_hex(
+            b"release artifact provenance",
+        )],
         unsupported_ledgers_empty: true,
         target_consumer: &target_consumer,
-        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"release artifact exact source ownership")),
-        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(b"release artifact type ownership")),
+        exact_source_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release artifact exact source ownership",
+        )),
+        type_ownership_sha256: Some(trust_types::digest::stable_sha256_hex(
+            b"release artifact type ownership",
+        )),
         aarch64_ordering_monitor_evidence: Vec::new(),
     })
 }
@@ -1434,8 +1510,10 @@ fn test_verify_binary_readback_release_transcript_preserves_actual_digest_fields
     let mut import_report = proof_evidence.import_checked_certificate_artifacts(&[artifact]);
     assert_eq!(import_report.imported, 1, "{import_report:#?}");
     let import_row = import_report.artifacts.get_mut(0).expect("imported row");
-    let replay_transcript_digest = trust_types::digest::stable_sha256_hex(b"actual digest readback replay transcript");
-    import_row.manifest_identity_sha256 = Some(trust_types::digest::stable_sha256_hex(b"actual digest manifest identity"));
+    let replay_transcript_digest =
+        trust_types::digest::stable_sha256_hex(b"actual digest readback replay transcript");
+    import_row.manifest_identity_sha256 =
+        Some(trust_types::digest::stable_sha256_hex(b"actual digest manifest identity"));
     import_row.source_backpropagation_gate_sha256 =
         Some(trust_types::digest::stable_sha256_hex(b"actual digest source gate identity"));
     import_row.production_checker_evidence_sha256 =
@@ -5015,7 +5093,9 @@ fn test_verify_binary_dispatch_context_binds_selected_image_identity_and_assumpt
         std::slice::from_ref(&vc),
     );
     let identity = BinaryArtifactDigestIdentity {
-        root_artifact_digest: Some(BinaryArtifactDigest::sha256(trust_types::digest::stable_sha256_hex(b"root artifact"))),
+        root_artifact_digest: Some(BinaryArtifactDigest::sha256(
+            trust_types::digest::stable_sha256_hex(b"root artifact"),
+        )),
         selected_image: Some(BinarySelectedImageIdentity {
             file_offset: 8,
             file_size: 64,
@@ -5248,7 +5328,8 @@ fn test_verify_binary_production_manifest_readback_requires_aligned_row_identity
     let proof_bytes = b"normalized verify-binary readback proof payload";
     let proof_path = proof_dir.join("vc0.lrat");
     std::fs::write(&proof_path, proof_bytes).expect("proof export should be written");
-    let replay_transcript_digest = trust_types::digest::stable_sha256_hex(b"deterministic replay transcript for vc0");
+    let replay_transcript_digest =
+        trust_types::digest::stable_sha256_hex(b"deterministic replay transcript for vc0");
 
     let (mut dispatch, canonical_vc_bytes) = importable_binary_dispatch("manifest-readback:vc0");
     dispatch.replay = ReplayStatus::Replayed;
@@ -5438,7 +5519,9 @@ fn test_verify_binary_production_manifest_readback_requires_aligned_row_identity
     )
     .expect("audit export JSON should parse");
     audit_value["acceptance_record"]["solver_proof_export"]["metadata_sha256"] =
-        serde_json::Value::String(trust_types::digest::stable_sha256_hex(b"tampered proof metadata digest"));
+        serde_json::Value::String(trust_types::digest::stable_sha256_hex(
+            b"tampered proof metadata digest",
+        ));
     let audit_json =
         serde_json::to_string_pretty(&audit_value).expect("tampered audit export should serialize");
     std::fs::write(&audit_export_path, audit_json.as_bytes())
@@ -5601,9 +5684,12 @@ fn test_verify_binary_production_row_missing_selected_image_blocks_release_trans
     let transcript_sha256 = trust_types::digest::stable_sha256_hex(b"production replay transcript");
     {
         let row = import_report.artifacts.get_mut(0).expect("imported row");
-        row.manifest_identity_sha256 = Some(trust_types::digest::stable_sha256_hex(b"manifest identity"));
-        row.source_backpropagation_gate_sha256 = Some(trust_types::digest::stable_sha256_hex(b"source gate"));
-        row.production_checker_evidence_sha256 = Some(trust_types::digest::stable_sha256_hex(b"production checker"));
+        row.manifest_identity_sha256 =
+            Some(trust_types::digest::stable_sha256_hex(b"manifest identity"));
+        row.source_backpropagation_gate_sha256 =
+            Some(trust_types::digest::stable_sha256_hex(b"source gate"));
+        row.production_checker_evidence_sha256 =
+            Some(trust_types::digest::stable_sha256_hex(b"production checker"));
         row.production_checker_evidence_status = "present".to_string();
         row.replay_transcript_digest = Some(transcript_sha256.clone());
         row.replay_digest_identity = checked_certificate_replay_digest_identity_record(
@@ -6026,7 +6112,10 @@ fn test_verify_binary_checked_certificate_export_produces_artifact_with_producti
     .expect("proof metadata JSON should parse");
     assert_eq!(proof_export_metadata["dispatch_id"], "verify-production-export:vc0");
     assert_eq!(proof_export_metadata["format"], "lrat");
-    assert_eq!(proof_export_metadata["proof_sha256"], trust_types::digest::stable_sha256_hex(proof_bytes));
+    assert_eq!(
+        proof_export_metadata["proof_sha256"],
+        trust_types::digest::stable_sha256_hex(proof_bytes)
+    );
     assert_json_canonical_sha256(
         &proof_export_metadata["assumption_digest"],
         "normalized proof assumption digest",
@@ -6244,10 +6333,12 @@ fn test_verify_binary_checked_certificate_export_covers_all_required_vc_proof_ex
         None,
         &CheckedBinaryCertificateSourceBackpropagationGate::default(),
     );
-    let expected_vc_digests =
-        [trust_types::digest::stable_sha256_hex(&first_canonical_vc_bytes), trust_types::digest::stable_sha256_hex(&second_canonical_vc_bytes)]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    let expected_vc_digests = [
+        trust_types::digest::stable_sha256_hex(&first_canonical_vc_bytes),
+        trust_types::digest::stable_sha256_hex(&second_canonical_vc_bytes),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let mut proof_evidence = VerifyBinaryEvidence::from_solver_dispatch_records(
         2,
         vec![first_dispatch, second_dispatch],
@@ -6577,7 +6668,8 @@ fn test_verify_binary_checked_certificate_export_blocks_mismatched_per_vc_proof_
 fn test_verify_binary_checked_certificate_export_binds_replay_transcript_digest() {
     let root = temp_test_dir("verify-binary-production-export-replay-digest");
     let proof_bytes = b"normalized verify-binary replay-bound proof payload";
-    let replay_transcript_digest = trust_types::digest::stable_sha256_hex(b"verify-binary replay transcript digest");
+    let replay_transcript_digest =
+        trust_types::digest::stable_sha256_hex(b"verify-binary replay transcript digest");
 
     let (mut dispatch, canonical_vc_bytes) =
         importable_binary_dispatch("verify-production-replay:vc0");
@@ -12040,7 +12132,10 @@ fn trust_ir_identity_report(output_content: String, function_entry: u64) -> Deco
 #[test]
 fn test_decompile_trust_ir_json_emits_content_addressed_target_consumer_evidence() {
     let output_content = trust_ir_identity_output_content("entry", 0x401000);
-    let expected_output = format!("trust_ir-json:sha256:{}", trust_types::digest::stable_sha256_hex(output_content.as_bytes()));
+    let expected_output = format!(
+        "trust_ir-json:sha256:{}",
+        trust_types::digest::stable_sha256_hex(output_content.as_bytes())
+    );
     let report = trust_ir_identity_report(output_content, 0x401000);
 
     let json = serialize_decompile_json_with_checked_certificate_loader(
@@ -13792,7 +13887,8 @@ fn test_trust_config_loads_trust_profile() {
     let root = temp_test_dir("trust-profile-config");
     write_trust_table(&root, "trust_profile = \"coreutils_hardened\"\n");
 
-    let config = TrustConfig::load_for_verification(&root, None).expect("valid trust profile config");
+    let config =
+        TrustConfig::load_for_verification(&root, None).expect("valid trust profile config");
 
     assert_eq!(config.trust_profile.as_deref(), Some("coreutils_hardened"));
 
@@ -13802,10 +13898,7 @@ fn test_trust_config_loads_trust_profile() {
 #[test]
 fn test_trust_config_loads_hardened_opt_out() {
     let root = temp_test_dir("trust-hardened-config");
-    write_trust_table(
-        &root,
-        "hardened = false\ntrust_profile = \"coreutils_hardened\"\n",
-    );
+    write_trust_table(&root, "hardened = false\ntrust_profile = \"coreutils_hardened\"\n");
 
     let config = TrustConfig::load_for_verification(&root, None).expect("valid hardened config");
 
@@ -14558,7 +14651,8 @@ fn test_cargo_context_z_options_are_not_misclassified_as_rustc_policy() {
     let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _plain = TestEnvVar::unset("RUSTFLAGS");
     let _encoded = TestEnvVar::unset("CARGO_ENCODED_RUSTFLAGS");
-    let cargo_args = vec!["-Zcodegen-backend".into(), "--package".into(), "trust-verify=off".into()];
+    let cargo_args =
+        vec!["-Zcodegen-backend".into(), "--package".into(), "trust-verify=off".into()];
     assert_eq!(
         trust_verify_disable_diagnostic(&cargo_args, false),
         None,
@@ -14778,7 +14872,8 @@ fn write_trust_toml(dir: &Path, contents: &str) {
 /// Write the canonical surface: a manifest carrying a `[trust]` table.
 fn write_trust_table(dir: &Path, contents: &str) {
     std::fs::create_dir_all(dir).expect("should create temp dir");
-    let manifest = format!("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[trust]\n{contents}");
+    let manifest =
+        format!("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[trust]\n{contents}");
     std::fs::write(dir.join("Cargo.toml"), manifest).expect("should write manifest");
 }
 
@@ -15485,12 +15580,7 @@ fn violated_usize_tailcall_aborts_before_return() {{
     assert!(positive_returned.is_file(), "satisfying extended-carrier monitors did not return");
 
     for (target, started, returned, lane) in [
-        (
-            "i128_ensures_violation",
-            &i128_started,
-            &i128_returned,
-            "i128 ensures",
-        ),
+        ("i128_ensures_violation", &i128_started, &i128_returned, "i128 ensures"),
         ("e5_loop_violation", &loop_started, &loop_returned, "u128 E5 loop"),
         (
             "e5_recursion_violation",
@@ -16411,6 +16501,8 @@ fn test_report_json_serialization() {
             raw_line: "note: Trust [overflow:add]: arithmetic overflow -- PROVED (ay-smtlib, 8ms)"
                 .into(),
         }],
+        // Trust (#220): fixture report, not built from a live publication pass.
+        publication_boundary: None,
         zero_obligation_functions: Vec::new(),
         compiler_diagnostics: vec![],
         duration_ms: 42,
@@ -16454,6 +16546,8 @@ fn test_report_success_logic() {
         cached: 0,
         total: 2,
         results: vec![],
+        // Trust (#220): fixture report, not built from a live publication pass.
+        publication_boundary: None,
         zero_obligation_functions: Vec::new(),
         compiler_diagnostics: vec![],
         duration_ms: 10,
@@ -16490,6 +16584,8 @@ fn test_report_success_logic() {
         cached: 0,
         total: 2,
         results: vec![],
+        // Trust (#220): fixture report, not built from a live publication pass.
+        publication_boundary: None,
         zero_obligation_functions: Vec::new(),
         compiler_diagnostics: vec![],
         duration_ms: 10,

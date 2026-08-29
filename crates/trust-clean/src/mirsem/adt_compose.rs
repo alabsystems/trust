@@ -365,8 +365,8 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
     callees: &std::collections::BTreeMap<String, CalleeFact>,
 ) -> Option<SemAdtMapCompose> {
     use trust_types::{
-        AggregateKind, BasicBlock, BlockId, ClosureCallKind, Operand, Projection, Rvalue, Statement,
-        Terminator, Ty,
+        AggregateKind, BasicBlock, BlockId, ClosureCallKind, Operand, Projection, Rvalue,
+        Statement, Terminator, Ty,
     };
     if callees.is_empty() {
         return None; // no certified callee ⇒ the closure can never resolve.
@@ -392,14 +392,19 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
     // executable/effectful residue and must not be skipped merely because the loop
     // below is looking for Assigns. Also reject projected Assign writes outright.
     if body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-        !matches!(s, Statement::Assign { .. } | Statement::StorageLive(_) | Statement::StorageDead(_))
-    })
-    {
+        !matches!(
+            s,
+            Statement::Assign { .. } | Statement::StorageLive(_) | Statement::StorageDead(_)
+        )
+    }) {
         return None;
     }
-    if body.blocks.iter().flat_map(|b| &b.stmts).any(
-        |s| matches!(s, Statement::Assign { place, .. } if !place.projections.is_empty()),
-    ) {
+    if body
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .any(|s| matches!(s, Statement::Assign { place, .. } if !place.projections.is_empty()))
+    {
         return None;
     }
 
@@ -490,7 +495,8 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
     if param_reassigned_by_stmt(body, self_local) || param_reassigned_by_stmt(body, closure_local) {
         return None;
     }
-    let Ty::Closure { name: closure_name, upvars: _upvars, call } = &body.locals.get(closure_local)?.ty
+    let Ty::Closure { name: closure_name, upvars: _upvars, call } =
+        &body.locals.get(closure_local)?.ty
     else {
         return None;
     };
@@ -588,14 +594,16 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
     if *nname != enum_name || *nvar != none_tag || !nops.is_empty() {
         return None;
     }
-    let Terminator::Drop { place: drop_place, target: none_join, .. } = &none_block.terminator else {
+    let Terminator::Drop { place: drop_place, target: none_join, .. } = &none_block.terminator
+    else {
         return None;
     };
     if drop_place.local != closure_local || !drop_place.projections.is_empty() {
         return None; // Drop admitted ONLY for the bare zero-upvar closure param.
     }
     // The ONLY Drop anywhere is this one (a Drop of any other place declines).
-    if body.blocks.iter().filter(|b| matches!(&b.terminator, Terminator::Drop { .. })).count() != 1 {
+    if body.blocks.iter().filter(|b| matches!(&b.terminator, Terminator::Drop { .. })).count() != 1
+    {
         return None;
     }
 
@@ -716,7 +724,11 @@ pub fn sem_adt_map_compose_of_discriminant_switch(
             if crate::prove::local_write_count(body, call_dest_local) != 0 {
                 return None;
             }
-            if body.blocks.iter().any(|b| matches!(&b.terminator, Terminator::Call { dest, .. } if dest.local == 0)) {
+            if body
+                .blocks
+                .iter()
+                .any(|b| matches!(&b.terminator, Terminator::Call { dest, .. } if dest.local == 0))
+            {
                 return None; // `_0` is never a Call dest in the Some-rewrap shape.
             }
         }
@@ -869,8 +881,8 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
     callees: &std::collections::BTreeMap<String, CalleeFact>,
 ) -> Option<SemAdtFilterCompose> {
     use trust_types::{
-        AggregateKind, BasicBlock, BlockId, ClosureCallKind, Operand, Projection, Rvalue, Statement,
-        Terminator, Ty,
+        AggregateKind, BasicBlock, BlockId, ClosureCallKind, Operand, Projection, Rvalue,
+        Statement, Terminator, Ty,
     };
     if callees.is_empty() {
         return None;
@@ -887,9 +899,12 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
     {
         return None;
     }
-    if body.blocks.iter().flat_map(|b| &b.stmts).any(
-        |s| matches!(s, Statement::Assign { place, .. } if !place.projections.is_empty()),
-    ) {
+    if body
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .any(|s| matches!(s, Statement::Assign { place, .. } if !place.projections.is_empty()))
+    {
         return None;
     }
     if arg_count != 2 {
@@ -970,12 +985,8 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
         _ => None,
     })?;
     let Rvalue::Discriminant(disc_place) = disc_rvalue else { return None };
-    let _base = sem_discriminant_base_of_mir(
-        body,
-        disc_place,
-        &param_index,
-        Some((switch_bid, None)),
-    )?;
+    let _base =
+        sem_discriminant_base_of_mir(body, disc_place, &param_index, Some((switch_bid, None)))?;
     if !disc_place.projections.is_empty() {
         return None;
     }
@@ -1002,7 +1013,8 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
     if param_reassigned_by_stmt(body, self_local) || param_reassigned_by_stmt(body, closure_local) {
         return None;
     }
-    let Ty::Closure { name: closure_name, upvars: _upvars, call } = &body.locals.get(closure_local)?.ty
+    let Ty::Closure { name: closure_name, upvars: _upvars, call } =
+        &body.locals.get(closure_local)?.ty
     else {
         return None;
     };
@@ -1194,10 +1206,14 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
         return None;
     }
     // EXACTLY one Call in the body; its dest is `_b`; `_0` is NEVER a Call dest.
-    if body.blocks.iter().filter(|b| matches!(&b.terminator, Terminator::Call { .. })).count() != 1 {
+    if body.blocks.iter().filter(|b| matches!(&b.terminator, Terminator::Call { .. })).count() != 1
+    {
         return None;
     }
-    if body.blocks.iter().any(|b| matches!(&b.terminator, Terminator::Call { dest, .. } if dest.local == 0))
+    if body
+        .blocks
+        .iter()
+        .any(|b| matches!(&b.terminator, Terminator::Call { dest, .. } if dest.local == 0))
     {
         return None;
     }
@@ -1283,7 +1299,8 @@ pub fn sem_adt_filter_compose_of_discriminant_switch(
     if drop_block.stmts.iter().any(|s| matches!(s, Statement::Assign { .. })) {
         return None;
     }
-    let Terminator::Drop { place: pdrop, target: drop_none_bid, .. } = &drop_block.terminator else {
+    let Terminator::Drop { place: pdrop, target: drop_none_bid, .. } = &drop_block.terminator
+    else {
         return None;
     };
     if pdrop.local != payload_temp || !pdrop.projections.is_empty() {
@@ -2247,7 +2264,9 @@ pub(super) fn chain_arm_value_for(
             AggregateKind::Adt {
                 name: nested_name,
                 variant: nested_variant,
-                active_field: nested_active, .. },
+                active_field: nested_active,
+                ..
+            },
             nested_ops,
         ) if nested_active.is_none() && nested_ops.is_empty() => SemAdtPayload::NullaryNested {
             enum_name: nested_name.clone(),

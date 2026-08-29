@@ -151,11 +151,7 @@ fn str_simd_narrow_lanes_take_the_low_bits_of_the_fp_register() {
     assert_eq!(peek(&post_b, BASE, 1), 0x99, "str b3 stored the wrong register file");
 
     let post_h = replay(0x7d00_08a2, &pre);
-    assert_eq!(
-        peek(&post_h, BASE + 0x100 + 4, 2),
-        0x8899,
-        "str h2 stored the wrong register file"
-    );
+    assert_eq!(peek(&post_h, BASE + 0x100 + 4, 2), 0x8899, "str h2 stored the wrong register file");
 }
 
 /// `ldr d11,[x11,#0x50]` (fd40296b) must write V11 and LEAVE X11 ALONE.
@@ -283,10 +279,7 @@ fn ubfiz_masks_the_source_to_imms_plus_one_bits() {
     pre.gpr[4] = 0x8;
 
     let post = replay(0x5304_008f, &pre);
-    assert_eq!(
-        post.gpr[15], 0,
-        "ubfiz w15,w4,#28,#1 must mask the source to imms+1 = 1 bit"
-    );
+    assert_eq!(post.gpr[15], 0, "ubfiz w15,w4,#28,#1 must mask the source to imms+1 = 1 bit");
 
     // And the bit that IS in the field still arrives.
     pre.gpr[4] = 0x9;
@@ -312,8 +305,7 @@ fn ubfiz_masks_the_source_in_the_sixty_four_bit_form() {
     pre.gpr[10] = 0b1101;
     let post = replay(0xd344_0549, &pre);
     assert_eq!(
-        post.gpr[9],
-        0x1000_0000_0000_0000,
+        post.gpr[9], 0x1000_0000_0000_0000,
         "ubfiz x9,x10,#60,#2 must place bit 0 of the source at bit 60"
     );
 }

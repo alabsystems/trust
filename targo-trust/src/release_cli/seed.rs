@@ -1,17 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _};
-use std::path::{Component, Path};
-
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::{Component, Path};
 
 use sha2::{Digest as _, Sha256};
 use trust_release::{GateFinding, GateReport};
 
-use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
-
 use super::types::ReleaseProfile;
+use crate::input_limits::{MAX_RELEASE_METADATA_BYTES, read_bounded_utf8_file};
 
 const REQUIRED_PAYLOAD_FAMILIES: &[(&str, &str)] = &[
     ("targo-", "compiler_version"),
@@ -472,10 +470,11 @@ fn same_payload_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use trust_release::GateStatus;
+
     use super::*;
     use crate::release_cli::release_gate_filter_includes;
     use crate::release_cli::types::ReleaseVisibility;
-    use trust_release::GateStatus;
 
     #[test]
     fn version_and_date_parsers_are_complete_and_canonical() {

@@ -40,7 +40,9 @@ pub(crate) struct LargeAssignmentsLint {
 // upstream renamed this crate's `errors` module to `diagnostics` (the rename took
 // upstream's version, which did not carry this Trust-added lint).
 #[derive(Diagnostic)]
-#[diag("this function's stack frame is estimated to be {$size} bytes, which exceeds the limit of {$limit} bytes")]
+#[diag(
+    "this function's stack frame is estimated to be {$size} bytes, which exceeds the limit of {$limit} bytes"
+)]
 pub(crate) struct LargeStackFrameLint {
     #[label("this function")]
     pub span: Span,

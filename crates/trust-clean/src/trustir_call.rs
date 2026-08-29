@@ -809,8 +809,7 @@ pub(crate) fn check_call_then_project_instance_inner(
     let wrap: Box<dyn Fn(Expr) -> Expr> = Box::new(move |x: Expr| {
         Expr::apps(cst(crate::trustir_anchor::TRUSTIR_IDX_ELEM), [x, field_key.clone()])
     });
-    let inst_ty =
-        call_then_pureop_instance_type_ir(callee_id, call_arg, &wrap, claimed_concl_pred);
+    let inst_ty = call_then_pureop_instance_type_ir(callee_id, call_arg, &wrap, claimed_concl_pred);
     let inst_proof = call_then_pureop_instance_proof_ir(callee_id, call_arg, &wrap);
     // The check/register/audit tail, byte-identical to the pureop instance's.
     {

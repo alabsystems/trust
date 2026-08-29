@@ -672,13 +672,8 @@ fn strip_trust_no_verify_removes_joined_and_split_forms() {
 
     // Values and underscore spellings are controls too, while a positional
     // lookalike after `--` is source input and must remain untouched.
-    let mut valued = rustc_args(&[
-        "-Ztrust_verify=on",
-        "-Z",
-        "trust-verify=off",
-        "--",
-        "-Ztrust-verify=off",
-    ]);
+    let mut valued =
+        rustc_args(&["-Ztrust_verify=on", "-Z", "trust-verify=off", "--", "-Ztrust-verify=off"]);
     strip_trust_no_verify(&mut valued);
     assert_eq!(valued, rustc_args(&["--", "-Ztrust-verify=off"]));
 

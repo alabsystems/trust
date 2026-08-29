@@ -9,8 +9,8 @@
 //! s1c_arith_true_ensures_proves) where the full pipeline runs.
 
 use trust_types::{
-    BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula, LocalDecl,
-    Operand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,
+    BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula, LocalDecl, Operand,
+    Place, Rvalue, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,
     VerifiableFunction,
 };
 
@@ -120,13 +120,8 @@ fn unsupported_rows(func: &VerifiableFunction) -> Vec<trust_types::VerificationC
 /// `bvadd`/`bvult` at 64, zero mathematical-integer arithmetic anywhere.
 #[test]
 fn arith_tautology_emits_declared_width_bv_row() {
-    let func = machine_fn(
-        u64_ty(),
-        "result + 1 > result",
-        vec![assign_ret_from_x()],
-        vec![],
-        vec![],
-    );
+    let func =
+        machine_fn(u64_ty(), "result + 1 > result", vec![assign_ret_from_x()], vec![], vec![]);
     let rows = postcondition_rows(&func);
     assert_eq!(rows.len(), 1, "one body-aware row per Return block: {rows:#?}");
     let formula = &rows[0].formula;
@@ -186,13 +181,7 @@ fn true_arith_ensures_emits_pure_bv_row() {
 /// would misread every negative value.
 #[test]
 fn signed_domain_uses_signed_bv_comparisons() {
-    let func = machine_fn(
-        i32_ty(),
-        "result + 0 >= x",
-        vec![assign_ret_from_x()],
-        vec![],
-        vec![],
-    );
+    let func = machine_fn(i32_ty(), "result + 0 >= x", vec![assign_ret_from_x()], vec![], vec![]);
     let rows = postcondition_rows(&func);
     assert_eq!(rows.len(), 1, "one body-aware row: {rows:#?}");
     let formula = &rows[0].formula;
@@ -271,8 +260,7 @@ fn out_of_width_literal_is_not_admitted() {
 /// Rust expression traps.
 #[test]
 fn spec_division_is_not_admitted() {
-    let func =
-        machine_fn(u64_ty(), "result / 2 == x", vec![assign_ret_from_x()], vec![], vec![]);
+    let func = machine_fn(u64_ty(), "result / 2 == x", vec![assign_ret_from_x()], vec![], vec![]);
     assert!(
         !contracts::machine_faithful_clause_admissible(
             &func,
@@ -297,11 +285,8 @@ fn machine_tautology_negation_translates_to_refutable_bv() {
     let func =
         machine_fn(u64_ty(), "result + 1 > result", vec![assign_ret_from_x()], vec![], vec![]);
     let post = trust_types::parse_spec_expr("result + 1 > result").expect("clause parses");
-    let translated = contracts::machine_faithful_vc_formula(
-        &func,
-        &Formula::Not(Box::new(post)),
-    )
-    .expect("the tautology clause is inside the declared-width fragment");
+    let translated = contracts::machine_faithful_vc_formula(&func, &Formula::Not(Box::new(post)))
+        .expect("the tautology clause is inside the declared-width fragment");
     assert_eq!(int_arith_nodes(&translated), 0, "no Int arithmetic: {translated:?}");
     assert!(
         count_nodes(&translated, &|f| matches!(f, Formula::BvAdd(_, _, 64))) >= 1,

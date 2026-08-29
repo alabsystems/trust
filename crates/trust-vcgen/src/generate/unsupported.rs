@@ -5,7 +5,7 @@
 
 use super::*;
 
-pub(super) fn unsupported_mir_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
+pub(crate) fn unsupported_mir_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
     let mut vcs = Vec::new();
 
     collect_body_type_unsupported(func, &mut vcs);
@@ -32,7 +32,9 @@ pub(super) fn unsupported_mir_vcs(func: &VerifiableFunction) -> Vec<Verification
 /// emits thousands of identical-`kind` leaves at a single span that otherwise
 /// flow downstream as distinct raw obligations and feed the result-assembly
 /// pass; here they coalesce to one entry per distinct display key.
-pub(super) fn dedup_unsupported_by_display_key(vcs: Vec<VerificationCondition>) -> Vec<VerificationCondition> {
+pub(super) fn dedup_unsupported_by_display_key(
+    vcs: Vec<VerificationCondition>,
+) -> Vec<VerificationCondition> {
     let mut seen: FxHashSet<(String, SourceSpan)> = FxHashSet::default();
     let mut out = Vec::new();
     for vc in vcs {
@@ -51,7 +53,10 @@ pub(super) fn dedup_unsupported_by_display_key(vcs: Vec<VerificationCondition>) 
     out
 }
 
-pub(super) fn collect_body_type_unsupported(func: &VerifiableFunction, vcs: &mut Vec<VerificationCondition>) {
+pub(super) fn collect_body_type_unsupported(
+    func: &VerifiableFunction,
+    vcs: &mut Vec<VerificationCondition>,
+) {
     // verifier-perf: dedup the per-type "unsupported" walk by structural
     // type. A single function's MIR often threads one large (or recursive) type
     // — e.g. a `syn::Item` — through hundreds of temporaries; without this guard
@@ -336,6 +341,58 @@ pub(super) fn collect_place_type_unsupported(
     }
 }
 
+/// The violation formula EVERY `UnsupportedMir` row must carry, whether the row
+/// is built fresh or an existing row is demoted into one.
+///
+/// A VC is a VIOLATION formula: discharge means UNSAT. `Bool(true)` is SAT, so a
+/// consumer that reads `vc.formula` without first preclassifying by kind gets
+/// "not discharged", which is the honest reading of "unsupported". `Bool(false)`
+/// is UNSAT and those same consumers would read it as DISCHARGED — a proof
+/// manufactured out of a row that means "I do not know".
+///
+/// `UnsupportedMir::proof_level()` is `L0Safety`, so any consumer that selects
+/// obligations by proof level rather than by kind admits this row and then reads
+/// only its formula. `trust_clean::whole_program::{certify_function_in_graph,
+/// ensures_certified_modulo_3}` were exactly that, and they now refuse a
+/// declined row by KIND before the formula is consulted — so this polarity is
+/// the SECOND, independent defence there rather than the only one. It stays the
+/// first and only defence for every direct-solver caller;
+/// `crates/trust-vcgen/src/tests.rs` pins that path.
+pub(crate) fn unsupported_mir_fail_closed_formula() -> Formula {
+    Formula::Bool(true)
+}
+
+/// Rewrite `vc` in place into a fail-closed `UnsupportedMir` row.
+///
+/// Demotion is DROP-ONLY: the row's verdict can only become Unknown. The
+/// formula is reset to [`unsupported_mir_fail_closed_formula`] so no consumer
+/// can read the demoted row as discharged, and the safety-row payload
+/// (`obligation`, `contract_metadata`) is cleared because it describes an
+/// obligation this row no longer states.
+pub(super) fn demote_to_unsupported_mir(
+    vc: &mut VerificationCondition,
+    kind: String,
+    detail: String,
+) {
+    vc.kind = VcKind::UnsupportedMir { kind, detail };
+    vc.formula = unsupported_mir_fail_closed_formula();
+    vc.obligation = None;
+    vc.contract_metadata = None;
+}
+
+/// Whether `vc` is an `UnsupportedMir` row carrying anything OTHER than the
+/// fail-closed violation formula — i.e. a row a kind-blind consumer could read
+/// as discharged. Used by the emitters' own post-conditions.
+///
+/// The required formula is written here as the LITERAL `Bool(true)` rather than
+/// as a call to [`unsupported_mir_fail_closed_formula`], deliberately: a check
+/// that reads the same definition it is checking moves with it, and would go
+/// silently inert the moment that definition is changed. This is the independent
+/// oracle, so it must state the value itself.
+pub(super) fn is_unsupported_mir_with_wrong_formula(vc: &VerificationCondition) -> bool {
+    matches!(vc.kind, VcKind::UnsupportedMir { .. }) && vc.formula != Formula::Bool(true)
+}
+
 pub(super) fn unsupported_mir_vc(
     func: &VerifiableFunction,
     kind: String,
@@ -349,7 +406,7 @@ pub(super) fn unsupported_mir_vc(
         // Direct solver callers fail closed: VCs are violation formulas, so
         // `true` is SAT and must never be reported as a proof. The compiler
         // path preclassifies this VC as Unknown before solver dispatch.
-        formula: Formula::Bool(true),
+        formula: unsupported_mir_fail_closed_formula(),
         contract_metadata: None,
         obligation: None,
     }
@@ -541,13 +598,20 @@ pub(super) fn collect_statement_unsupported(
     }
 }
 
-pub(super) fn retag_is_metadata_noop(func: &VerifiableFunction, place: &trust_types::Place) -> bool {
+pub(super) fn retag_is_metadata_noop(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+) -> bool {
     // Retag only changes Stacked Borrows/provenance metadata. It is verification-inert
     // for safe MIR, but raw-pointer or unresolved places need a provenance model.
     crate::place_ty(func, place).is_some() && !has_intrinsic_unsafe_surface(func)
 }
 
-pub(super) fn intrinsic_is_metadata_noop(func: &VerifiableFunction, name: &str, args: &[Operand]) -> bool {
+pub(super) fn intrinsic_is_metadata_noop(
+    func: &VerifiableFunction,
+    name: &str,
+    args: &[Operand],
+) -> bool {
     // trust-mir-extract lowers rustc's NonDivergingIntrinsic::Assume to this
     // statement form. We deliberately do not add it as a solver assumption;
     // ignoring it over-approximates behavior and avoids proving from optimizer
@@ -598,7 +662,7 @@ pub(crate) fn set_discriminant_definitions(
     let explicit = crate::explicit_discriminant_field_for_place(func, place)?;
     let (explicit_sort, explicit_value) =
         crate::explicit_discriminant_value_formula(&explicit.ty, variant_index)?;
-    let canonical_value = crate::u128_to_formula(variant_index as u128);
+    let canonical_value = crate::unsigned_value_to_formula(variant_index as u128);
     let place_name = place_to_var_name(func, place);
     let explicit_name = place_to_var_name(func, &explicit.place);
 
@@ -804,6 +868,20 @@ pub(super) fn collect_terminator_unsupported(
                     ),
                     span.clone(),
                 ));
+            }
+        }
+        Terminator::TailCall { func: callee, args, span, .. } => {
+            // The bridge handles this through the ordinary call path with the
+            // implicit return destination. Keep every unsupported argument
+            // visible here rather than silently dropping it.
+            if !is_panic_intrinsic_call(callee) {
+                collect_operands_unsupported(
+                    func,
+                    format!("bb{} tail-call args", block.0),
+                    span,
+                    args,
+                    vcs,
+                );
             }
         }
         _ => {}

@@ -4,8 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::build_steps::compile::{
-    ArtifactKeepMode, add_to_sysroot, run_cargo, rustc_cargo, std_cargo,
-    std_crates_for_run_make,
+    ArtifactKeepMode, add_to_sysroot, run_cargo, rustc_cargo, std_cargo, std_crates_for_run_make,
 };
 use crate::core::build_steps::tool;
 use crate::core::build_steps::tool::{

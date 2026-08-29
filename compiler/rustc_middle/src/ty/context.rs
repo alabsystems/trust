@@ -791,6 +791,23 @@ pub struct GlobalCtxt<'tcx> {
     /// leaves it empty and `thir_body` rebuilds normally (fail-safe).
     pub trust_witness_thir_lookaside:
         Lock<FxHashMap<LocalDefId, (crate::thir::Thir<'tcx>, crate::thir::ExprId)>>,
+
+    /// Trust (wall A, the INSTANCE flip seam): the freshly BUILT sibling body retained for the
+    /// bodies the instance-flip registry admitted — the GENERIC `agreed` population, tens of
+    /// bodies, never every lowered body.
+    ///
+    /// Why a `TyCtxt`-lifetimed side table and not `Session` state: the per-INSTANCE flip must
+    /// hand the FROZEN comparator (`trust_thir_lower::mir_differential::compare_derived`) an
+    /// incumbent at the phase that comparator is written for — the `mir_built` body — but
+    /// instantiated at the instance's concrete args. `mir_built`'s `Steal` is consumed by
+    /// `mir_promoted` long before the `codegen_mir` seam, and a `Body<'tcx>` cannot live in the
+    /// `'static` Session state the rest of the flip registry uses. So the hook arena-allocates
+    /// ONE clone per admitted body and parks the reference here, exactly as
+    /// [`Self::trust_witness_thir_lookaside`] parks replay THIR.
+    ///
+    /// Absence is always safe: the instance flip refuses a body with no retained sibling, which
+    /// falls back to rustc's own MIR.
+    pub trust_instance_flip_siblings: Lock<FxHashMap<LocalDefId, &'tcx crate::mir::Body<'tcx>>>,
 }
 
 impl<'tcx> GlobalCtxt<'tcx> {
@@ -1007,6 +1024,7 @@ impl<'tcx> TyCtxt<'tcx> {
             jobserver_proxy,
             trust_witness_minted: Default::default(),
             trust_witness_thir_lookaside: Default::default(),
+            trust_instance_flip_siblings: Default::default(),
         });
 
         // This is a separate function to work around a crash with parallel rustc (#135870)
@@ -1191,6 +1209,34 @@ impl<'tcx> TyCtxt<'tcx> {
         def_id: LocalDefId,
     ) -> Option<(crate::thir::Thir<'tcx>, crate::thir::ExprId)> {
         self.trust_witness_thir_lookaside.lock().remove(&def_id)
+    }
+
+    /// Trust (wall A, instance flip seam): retain the freshly BUILT sibling of an
+    /// instance-flip-registry member. Called once per admitted body from the `mir_built` hook,
+    /// with a body the hook still owns.
+    ///
+    /// A second call for the same def is a producer invariant violation. This table keeps the
+    /// FIRST body rather than overwriting — overwriting would silently prefer the later build —
+    /// and the instance registry's own poison list (`SessionInstanceRegistry`, which sees the
+    /// same second record) is what refuses the def for the rest of the session. Retention and
+    /// admission are therefore never out of step: a poisoned def yields no registry entry, so
+    /// the retained body is simply never read.
+    pub fn trust_instance_flip_retain(
+        self,
+        def_id: LocalDefId,
+        body: &'tcx crate::mir::Body<'tcx>,
+    ) {
+        let mut table = self.trust_instance_flip_siblings.lock();
+        table.entry(def_id).or_insert(body);
+    }
+
+    /// Trust (wall A, instance flip seam): the retained BUILT sibling for `def_id`, if the hook
+    /// admitted it. `None` is the normal answer for every body outside the wall-A population.
+    pub fn trust_instance_flip_sibling(
+        self,
+        def_id: LocalDefId,
+    ) -> Option<&'tcx crate::mir::Body<'tcx>> {
+        self.trust_instance_flip_siblings.lock().get(&def_id).copied()
     }
 
     /// Trust (P1 follow-on): reclaim any un-taken check-THIR entries; returns the count.

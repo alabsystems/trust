@@ -79,9 +79,10 @@ pub fn compile_functions_to_wasm(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_ir::{BinOp, Ty};
     use trust_ir_build::ModuleBuilder;
+
+    use super::*;
 
     /// A trust-ir module with `add(a, b) = a + b` over i32.
     fn add_module() -> TrustIrModule {

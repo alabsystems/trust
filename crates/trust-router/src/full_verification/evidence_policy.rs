@@ -173,7 +173,7 @@ pub(super) fn evidence_satisfies_route_artifact_policy(
                 && has(EvidenceArtifactKind::ReplayLog)
                 && has(EvidenceArtifactKind::ProofCheckReport)
         }
-        ProofFamily::TyTemporal | ProofFamily::TrustWpFunctional => {
+        ProofFamily::TyTemporal => {
             has(EvidenceArtifactKind::SolverTranscript)
                 && has(EvidenceArtifactKind::ProofCheckReport)
         }

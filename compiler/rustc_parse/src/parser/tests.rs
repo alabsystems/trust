@@ -2990,6 +2990,89 @@ fn function_contract_markers_preserve_global_interleaving_across_all_lanes() {
     });
 }
 
+/// Trust (D4): the `#[trust::decreases(e)]` desugaring injects the contextual
+/// clause ident followed by the author's payload tokens UNWRAPPED, so what the
+/// parser sees is byte-for-byte what a native author would have written. That
+/// is what makes the two surfaces one implementation rather than two.
+///
+/// The cost of choosing unwrapped injection over a brace-delimited payload is
+/// that the native clause's TERMINATOR WALK — not a delimiter — decides where
+/// the measure ends, for payloads an author of the native grammar might rarely
+/// write but an attribute author easily can. This test pins those shapes, so a
+/// future change to the walk cannot silently truncate an attribute-authored
+/// measure into a shorter, still-parsing, DIFFERENT one. A truncated measure is
+/// the dangerous failure here: it would still lower, and it would constrain
+/// something other than what was written.
+#[test]
+fn native_decreases_payload_survives_unwrapped_attribute_injection() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // Each entry is (source after the `decreases` keyword, expected
+        // token-rendered payload).
+        let cases: &[(&str, &str)] = &[
+            // A parenthesised arithmetic measure: depth tracking must not stop
+            // at the inner delimiters.
+            ("(n + m) * 2", "(n + m) * 2"),
+            // A call-shaped measure: the parenthesis run is balanced and the
+            // body brace is still the terminator.
+            ("f(n, m)", "f(n, m)"),
+            // A block-introducing keyword at depth zero. The body `{` normally
+            // ENDS the clause; here the braces belong to the measure and the
+            // parser's pending-block rule must claim them.
+            ("if n > 0 { n } else { m }", "if n > 0 { n } else { m }"),
+        ];
+        for (case, (measure, expected)) in cases.iter().enumerate() {
+            let source = format!("fn g(n: u32, m: u32) -> u32 decreases {measure} {{ n }}");
+            // The filename must be UNIQUE per case. `SourceMap::new_source_file`
+            // dedupes on `StableSourceFileId::from_filename_in_current_crate`
+            // and returns the EXISTING file when the name repeats, so a shared
+            // name here made cases 2 and 3 silently re-parse case 1's source.
+            // This test shipped in that state and had never been executed: it
+            // failed on first run with `left: "(n+m)*2"  right: "f(n,m)"`, i.e.
+            // case 2 reading case 1's payload. The parser was never at fault —
+            // measured end-to-end, two contracted functions in ONE compilation
+            // unit keep their own measures, and a false measure on the second
+            // is still refused.
+            let item = parse_item_from_source_str(
+                filename(psess.source_map(), &format!("attr-decreases-desugar-{case}.rs")),
+                source.clone(),
+                &psess,
+            )
+            .unwrap()
+            .unwrap();
+            let ast::ItemKind::Fn(function) = &item.kind else {
+                panic!("fixture must parse as a function: {source}");
+            };
+            let contract =
+                function.contract.as_deref().expect("the decreases clause must be retained");
+            use ast::ast::{FnContractClauseKind as Kind, FnContractClauseLane as Lane};
+            assert_eq!(
+                contract
+                    .clause_order
+                    .iter()
+                    .map(|marker| (marker.kind, marker.lane))
+                    .collect::<Vec<_>>(),
+                [(Kind::Decreases, Lane::Native)],
+                "an attribute-desugared measure must take the NATIVE lane, not the \
+                 opaque or typed attribute lanes: {source}"
+            );
+            assert_eq!(contract.trust_native_decreases.len(), 1);
+            // Compared with whitespace removed. The payload is rendered token
+            // by token with separators driven by `Spacing`, and pinning that
+            // exact spelling here would assert a pretty-printing detail rather
+            // than the property under test. TRUNCATION is the property under
+            // test: a clause walk that stopped early would drop tokens, and no
+            // whitespace rule can hide a missing token.
+            let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            assert_eq!(
+                squash(contract.trust_native_decreases[0].payload.as_str()),
+                squash(expected),
+                "the whole authored measure must survive, not a truncated prefix: {source}"
+            );
+        }
+    });
+}
+
 #[test]
 fn duplicate_function_decreases_is_rejected() {
     create_default_session_globals_then(|| {

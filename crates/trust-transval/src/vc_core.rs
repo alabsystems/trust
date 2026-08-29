@@ -8,7 +8,6 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::FxHashMap;
-
 use trust_types::{
     BasicBlock,
     BlockId,
@@ -207,6 +206,19 @@ pub(crate) fn check_data_flow_preservation(
                         ));
                     }
                     rvalue_to_formula(target, rvalue)?
+                } else if source_place.projections.is_empty()
+                    && matches!(source_rvalue, Rvalue::Use(Operand::Constant(_)))
+                    && !local_value_is_read(source, source_place.local)
+                {
+                    // A whole-local assignment of a constant has no trap,
+                    // memory, or control-flow effect. If that local's value is
+                    // never read anywhere in the source, omitting the
+                    // assignment is genuine dead-code elimination and owes no
+                    // equality VC. This check must precede the relation's
+                    // positional fallback: an identity variable map says where
+                    // a retained value lives, not that a removed dead
+                    // definition still exists in the target.
+                    continue;
                 } else if let Some(mapped) = relation.resolve_variable(source_place.local, target) {
                     mapped
                 } else {
@@ -558,10 +570,105 @@ fn find_assignment_to<'a>(
     })
 }
 
+/// Whether the value stored in `local` is read anywhere in `func`.
+///
+/// This is deliberately conservative: unsupported or future MIR variants count
+/// as reads. It is used only to recognize removal of a side-effect-free
+/// whole-local constant assignment, so a false positive merely leaves an
+/// obligation in place while a false negative could unsoundly erase one.
+fn local_value_is_read(func: &VerifiableFunction, local: usize) -> bool {
+    local == 0
+        || func.body.blocks.iter().any(|block| {
+            block.stmts.iter().any(|statement| statement_reads_local(statement, local))
+                || terminator_reads_local(&block.terminator, local)
+        })
+}
+
+fn statement_reads_local(statement: &Statement, local: usize) -> bool {
+    match statement {
+        Statement::Assign { place, rvalue, .. } => {
+            destination_projection_reads_local(place, local) || rvalue_reads_local(rvalue, local)
+        }
+        Statement::StorageLive(_) | Statement::StorageDead(_) => false,
+        Statement::SetDiscriminant { place, .. }
+        | Statement::Deinit { place }
+        | Statement::Retag { place }
+        | Statement::PlaceMention(place) => place_reads_local(place, local),
+        Statement::Intrinsic { args, .. } | Statement::Unsupported { operands: args, .. } => {
+            args.iter().any(|operand| operand_reads_local(operand, local))
+        }
+        Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => false,
+        _ => true,
+    }
+}
+
+fn rvalue_reads_local(rvalue: &Rvalue, local: usize) -> bool {
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::UnaryOp(_, operand)
+        | Rvalue::Cast(operand, _)
+        | Rvalue::Repeat(operand, _) => operand_reads_local(operand, local),
+        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+            operand_reads_local(lhs, local) || operand_reads_local(rhs, local)
+        }
+        Rvalue::Ref { place, .. }
+        | Rvalue::Discriminant(place)
+        | Rvalue::Len(place)
+        | Rvalue::AddressOf(_, place)
+        | Rvalue::CopyForDeref(place) => place_reads_local(place, local),
+        Rvalue::Aggregate(_, operands) | Rvalue::Unsupported { operands, .. } => {
+            operands.iter().any(|operand| operand_reads_local(operand, local))
+        }
+        Rvalue::PtrOffset { ptr, count } => {
+            operand_reads_local(ptr, local) || operand_reads_local(count, local)
+        }
+        _ => true,
+    }
+}
+
+fn terminator_reads_local(terminator: &Terminator, local: usize) -> bool {
+    match terminator {
+        Terminator::Goto(_)
+        | Terminator::Return
+        | Terminator::Opaque { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => false,
+        Terminator::SwitchInt { discr, .. } => operand_reads_local(discr, local),
+        Terminator::Call { args, dest, .. } => {
+            args.iter().any(|operand| operand_reads_local(operand, local))
+                || destination_projection_reads_local(dest, local)
+        }
+        Terminator::Assert { cond, .. } => operand_reads_local(cond, local),
+        Terminator::Drop { place, .. } => place_reads_local(place, local),
+        _ => true,
+    }
+}
+
+fn operand_reads_local(operand: &Operand, local: usize) -> bool {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => place_reads_local(place, local),
+        Operand::Constant(_) | Operand::Symbolic(_) => false,
+        Operand::Unsupported { .. } => true,
+        _ => true,
+    }
+}
+
+fn destination_projection_reads_local(place: &Place, local: usize) -> bool {
+    !place.projections.is_empty() && place_reads_local(place, local)
+}
+
+fn place_reads_local(place: &Place, local: usize) -> bool {
+    place.local == local
+        || place.projections.iter().any(
+            |projection| matches!(projection, trust_types::Projection::Index(index) if *index == local),
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::*;
+
+    use super::*;
 
     /// Build a simple "add two i32s" function for testing.
     fn simple_add_function(name: &str) -> VerifiableFunction {
@@ -901,5 +1008,93 @@ mod tests {
             "error must be explicit: {msg}"
         );
         assert!(msg.contains("place projection"), "error should identify projection: {msg}");
+    }
+
+    #[test]
+    fn unused_constant_definition_removed_by_target_owes_no_data_flow_vc() {
+        let mut source = simple_add_function("source");
+        source.body.locals.push(LocalDecl { index: 4, ty: Ty::i32(), name: Some("dead".into()) });
+        source.body.blocks[0].stmts.insert(
+            1,
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(42))),
+                span: SourceSpan::default(),
+            },
+        );
+
+        let mut target = source.clone();
+        target.name = "target".into();
+        target.body.blocks[0].stmts.remove(1);
+
+        let relation = infer_identity_relation(&source, &target).unwrap();
+        let vcs = generate_refinement_vcs(&source, &target, &relation).unwrap();
+        assert!(
+            vcs.iter().all(|vc| !vc.check.description.contains("local 4")),
+            "removing an unread constant definition must not create a free-variable equality: {vcs:#?}"
+        );
+    }
+
+    #[test]
+    fn removed_definition_still_owes_vc_when_its_value_is_read() {
+        let mut source = simple_add_function("source");
+        source.body.locals.push(LocalDecl { index: 4, ty: Ty::i32(), name: Some("live".into()) });
+        source.body.blocks[0].stmts.insert(
+            1,
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(42))),
+                span: SourceSpan::default(),
+            },
+        );
+        source.body.blocks[0].stmts[2] = Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(4))),
+            span: SourceSpan::default(),
+        };
+
+        let mut target = source.clone();
+        target.name = "target".into();
+        target.body.blocks[0].stmts.remove(1);
+
+        let relation = infer_identity_relation(&source, &target).unwrap();
+        let vcs = generate_refinement_vcs(&source, &target, &relation).unwrap();
+        assert!(
+            vcs.iter().any(|vc| vc.check.description.contains("local 4")),
+            "a removed live definition must remain a refinement obligation"
+        );
+    }
+
+    #[test]
+    fn removed_unused_potentially_trapping_definition_still_owes_vc() {
+        let mut source = simple_add_function("source");
+        source.body.locals.push(LocalDecl {
+            index: 4,
+            ty: Ty::i32(),
+            name: Some("dead_div".into()),
+        });
+        source.body.blocks[0].stmts.insert(
+            1,
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::BinaryOp(
+                    BinOp::Div,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Constant(ConstValue::Int(0)),
+                ),
+                span: SourceSpan::default(),
+            },
+        );
+
+        let mut target = source.clone();
+        target.name = "target".into();
+        target.body.blocks[0].stmts.remove(1);
+
+        let relation = infer_identity_relation(&source, &target).unwrap();
+        let vcs = generate_refinement_vcs(&source, &target, &relation).unwrap();
+        assert!(
+            vcs.iter().any(|vc| vc.check.description.contains("local 4")),
+            "a potentially trapping definition must not be discarded merely because its result is unread"
+        );
     }
 }

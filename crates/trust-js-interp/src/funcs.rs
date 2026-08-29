@@ -7,14 +7,16 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{hoist, Abrupt, Ctx, ERes, Interp, MAX_CALL_DEPTH};
 use std::collections::HashSet;
 use std::rc::Rc;
+
 use trust_js_parse::ast::{Func, Pat};
 use trust_js_value::{
-    units_from_str, ArgsData, Binding, BoundFn, FnData, FnFlavor, JsObject, JsValue, ObjId,
-    ObjKind, PropKey, Property, SymId, UserFn, WkSym,
+    ArgsData, Binding, BoundFn, FnData, FnFlavor, JsObject, JsValue, ObjId, ObjKind, PropKey,
+    Property, SymId, UserFn, WkSym, units_from_str,
 };
+
+use crate::interp::{Abrupt, Ctx, ERes, Interp, MAX_CALL_DEPTH, hoist};
 
 impl Interp {
     /// Address-cached Rc of an AST function (so closure creation in loops
@@ -44,11 +46,7 @@ impl Interp {
     ) -> Result<ObjId, Abrupt> {
         let needs_self_binding =
             !is_decl && flavor == FnFlavor::Normal && f.name.is_some() && name_override.is_none();
-        let closure_env = if needs_self_binding {
-            self.alloc_env(Some(env))
-        } else {
-            env
-        };
+        let closure_env = if needs_self_binding { self.alloc_env(Some(env)) } else { env };
         let rc = self.rc_func(f);
         // [[Prototype]]: %AsyncGeneratorFunction.prototype% for async generators,
         // %GeneratorFunction.prototype% for generators, %AsyncFunction.prototype%
@@ -92,10 +90,8 @@ impl Interp {
             PropKey::from_str("length"),
             Property::with_attrs(JsValue::Num(len), false, false, true),
         );
-        let name: String = name_override
-            .map(str::to_string)
-            .or_else(|| f.name.clone())
-            .unwrap_or_default();
+        let name: String =
+            name_override.map(str::to_string).or_else(|| f.name.clone()).unwrap_or_default();
         self.heap.obj_mut(fobj).props.insert(
             PropKey::from_str("name"),
             Property::with_attrs(JsValue::str_from(&name), false, false, true),
@@ -110,10 +106,7 @@ impl Interp {
             } else {
                 self.intr.generator_proto
             };
-            let proto_obj = self.alloc_obj(JsObject::new(
-                ObjKind::Plain,
-                Some(proto_parent),
-            ))?;
+            let proto_obj = self.alloc_obj(JsObject::new(ObjKind::Plain, Some(proto_parent)))?;
             self.heap.obj_mut(fobj).props.insert(
                 PropKey::from_str("prototype"),
                 Property::with_attrs(JsValue::Obj(proto_obj), true, false, false),
@@ -240,8 +233,7 @@ impl Interp {
                 };
                 self.heap.env_mut(fenv).this_val = Some(this_val);
             }
-            self.heap.env_mut(fenv).new_target =
-                Some(new_target.unwrap_or(JsValue::Undefined));
+            self.heap.env_mut(fenv).new_target = Some(new_target.unwrap_or(JsValue::Undefined));
             self.heap.env_mut(fenv).home_object = uf.home;
             self.heap.env_mut(fenv).active_fn = Some(fid);
         }
@@ -358,9 +350,7 @@ impl Interp {
                         _ => JsValue::Obj(obj),
                     })
                 }
-                FnFlavor::ClassCtor { derived } => {
-                    self.construct_class(*fid, derived, args, nt)
-                }
+                FnFlavor::ClassCtor { derived } => self.construct_class(*fid, derived, args, nt),
                 _ => Err(self.throw_type_error()), // not a constructor
             },
             FnData::Native(nf) => {
@@ -501,11 +491,8 @@ impl Interp {
         let has_param_exprs = f.params.iter().any(contains_expression);
         let analysis = hoist::analyze(&f.body, strict).map_err(Abrupt::Fatal)?;
         let lexical = hoist::lexical_decls(&f.body).map_err(Abrupt::Fatal)?;
-        let func_names: HashSet<&str> = analysis
-            .funcs
-            .iter()
-            .filter_map(|g| g.name.as_deref())
-            .collect();
+        let func_names: HashSet<&str> =
+            analysis.funcs.iter().filter_map(|g| g.name.as_deref()).collect();
 
         let arguments_needed = flavor != FnFlavor::Arrow
             && !param_names.iter().any(|n| n == "arguments")
@@ -546,10 +533,7 @@ impl Interp {
             } else {
                 Binding::var(JsValue::Obj(ao))
             };
-            self.heap
-                .env_mut(fenv)
-                .bindings
-                .insert("arguments".to_string(), binding);
+            self.heap.env_mut(fenv).bindings.insert("arguments".to_string(), binding);
         }
 
         // IteratorBindingInitialization over the actual argument list.
@@ -592,10 +576,7 @@ impl Interp {
                 } else {
                     JsValue::Undefined
                 };
-                self.heap
-                    .env_mut(ve)
-                    .bindings
-                    .insert(v.clone(), Binding::var(initial));
+                self.heap.env_mut(ve).bindings.insert(v.clone(), Binding::var(initial));
             }
             ve
         } else {
@@ -626,20 +607,14 @@ impl Interp {
         // distinction is unneeded); so does a body with no lexical
         // declarations, where the separate frame would be empty and
         // unobservable.
-        let lex_env = if !strict && !lexical.is_empty() {
-            self.alloc_env(Some(var_env))
-        } else {
-            var_env
-        };
+        let lex_env =
+            if !strict && !lexical.is_empty() { self.alloc_env(Some(var_env)) } else { var_env };
 
         // Lexical declarations (TDZ) into lexEnv; top-level function
         // declarations close over lexEnv but are bound (var-scoped) into
         // varEnv.
         for (n, mutable) in lexical {
-            self.heap
-                .env_mut(lex_env)
-                .bindings
-                .insert(n, Binding::tdz(mutable));
+            self.heap.env_mut(lex_env).bindings.insert(n, Binding::tdz(mutable));
         }
         for g in &analysis.funcs {
             let fo = self.instantiate_hoisted_function(g, lex_env)?;
@@ -649,10 +624,7 @@ impl Interp {
             );
         }
 
-        Ok(Ctx {
-            env: lex_env,
-            strict,
-        })
+        Ok(Ctx { env: lex_env, strict })
     }
 
     /// CreateMappedArgumentsObject / CreateUnmappedArgumentsObject.
@@ -683,10 +655,10 @@ impl Interp {
             Some(self.intr.object_proto),
         ))?;
         for (i, v) in args.iter().enumerate() {
-            self.heap.obj_mut(ao).props.insert(
-                PropKey::Str(units_from_str(&i.to_string())),
-                Property::data(v.clone()),
-            );
+            self.heap
+                .obj_mut(ao)
+                .props
+                .insert(PropKey::Str(units_from_str(&i.to_string())), Property::data(v.clone()));
         }
         #[allow(clippy::cast_precision_loss)]
         self.heap.obj_mut(ao).props.insert(
@@ -734,8 +706,8 @@ impl Interp {
         let mut len = 0.0f64;
         if let Some(p) = self.own_prop_checked(target, &PropKey::from_str("length"))? {
             if let Some(JsValue::Num(n)) = p.data_value() {
-                let adj = trust_js_value::to_integer_or_infinity(*n)
-                    - args_len_f64(bound_args.len());
+                let adj =
+                    trust_js_value::to_integer_or_infinity(*n) - args_len_f64(bound_args.len());
                 len = adj.max(0.0);
             }
         }
@@ -752,12 +724,7 @@ impl Interp {
         }
         self.heap.obj_mut(bf).props.insert(
             PropKey::from_str("name"),
-            Property::with_attrs(
-                JsValue::Str(Rc::new(name_units)),
-                false,
-                false,
-                true,
-            ),
+            Property::with_attrs(JsValue::Str(Rc::new(name_units)), false, false, true),
         );
         Ok(bf)
     }

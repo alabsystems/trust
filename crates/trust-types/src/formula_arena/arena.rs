@@ -6,10 +6,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use super::types::{FormulaNode, FormulaRef};
 use crate::formula::Formula;
 use crate::fx::FxHashMap;
-
-use super::types::{FormulaNode, FormulaRef};
 
 /// Hash-consing key for N-ary nodes (And/Or).
 ///

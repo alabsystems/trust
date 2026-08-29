@@ -7,7 +7,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,38 @@ use crate::digest::{stable_sha256_hex, stable_sha256_hex_parts};
 use crate::spec::FunctionSpec;
 
 const LOWERED_COMPILER_CONTRACT_PREFIX: &str = "__trust_lowered_compiler_contract__:";
+
+/// Lowercase hex digits, indexed by nibble.
+///
+/// Both nibbles of a `u8` — `b >> 4` and `b & 0xf` — are STATICALLY in `0..=15`,
+/// so indexing this 16-element table is total and has no panic path at all.
+/// The byte-to-hex sites below used `char::from_digit(.., 16).expect("nibble < 16")`,
+/// which is a panic on a production path in the verifier's trusted core standing
+/// in for a fact the types already guarantee.
+const HEX_LOWER: [char; 16] =
+    ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+
+/// The smallest block identity not present in `occupied`.
+///
+/// TOTAL by pigeonhole: a set of `n` identities cannot cover `0..=n`, so the
+/// ascending scan settles at or before `n` and can neither overflow nor fail.
+/// `BTreeSet` iterates in ascending order, which is what makes one pass enough.
+///
+/// This replaces a pair of `checked_add(1).expect("a finite MIR body must have
+/// an unoccupied block identity")` loops — panics on a production path in the
+/// verifier's trusted core standing in for exactly this counting argument.
+/// Stating the argument in code costs nothing and removes the abort.
+fn smallest_free_block_id(occupied: &BTreeSet<usize>) -> usize {
+    let mut candidate = 0usize;
+    for &id in occupied {
+        if id == candidate {
+            candidate = candidate.saturating_add(1);
+        } else if id > candidate {
+            break;
+        }
+    }
+    candidate
+}
 
 /// Serialize Trust model material for stable semantic hashing.
 ///
@@ -429,6 +461,97 @@ pub struct VerifiableFunction {
 }
 
 impl VerifiableFunction {
+    /// Return a semantic view in which every MIR tail call is represented by
+    /// the ordinary call-plus-return shape understood by legacy consumers.
+    ///
+    /// The serialized/source model deliberately retains [`Terminator::TailCall`]
+    /// so exact call-site identity and the absence of a MIR continuation remain
+    /// visible.  This projection is for semantic consumers that already model
+    /// an ordinary call result and a `Return`: the call writes local 0, targets
+    /// a fresh bookkeeping-only return block, and preserves the original
+    /// callee, arguments, span, atomic metadata, and compiler-authenticated
+    /// safety flags.  It is an over-approximation for a callee that never
+    /// returns, which can only lose proofs.
+    ///
+    /// No clone is made when the body contains no tail calls.
+    #[must_use]
+    pub fn with_tail_calls_expanded(&self) -> std::borrow::Cow<'_, Self> {
+        if !self
+            .body
+            .blocks
+            .iter()
+            .any(|block| matches!(&block.terminator, Terminator::TailCall { .. }))
+        {
+            return std::borrow::Cow::Borrowed(self);
+        }
+
+        let mut expanded = self.clone();
+        // Proof-capable entry points reject non-positional block identities,
+        // but this model helper is also used by bridge and diagnostic paths.
+        // Pick a genuinely fresh identity instead of assuming `blocks.len()`
+        // is unoccupied, so malformed/sparse input cannot make the projection
+        // manufacture a duplicate block before the owning boundary rejects it.
+        let mut occupied_block_ids =
+            expanded.body.blocks.iter().map(|block| block.id.0).collect::<BTreeSet<_>>();
+        let mut next_return_block = smallest_free_block_id(&occupied_block_ids);
+        let tail_blocks = expanded
+            .body
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                matches!(&block.terminator, Terminator::TailCall { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        for block_index in tail_blocks {
+            let return_block = BlockId(next_return_block);
+            occupied_block_ids.insert(next_return_block);
+            next_return_block = smallest_free_block_id(&occupied_block_ids);
+            let tail = expanded.body.blocks[block_index].terminator.clone();
+            let Terminator::TailCall {
+                func,
+                args,
+                span,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                callee_identity,
+            } = tail
+            else {
+                // Unreachable: `block_index` came from `tail_blocks`, collected
+                // from this same body while it was immutable. If it ever did
+                // happen, SKIP the expansion — the block keeps its TailCall
+                // terminator for the owning boundary to reject — rather than
+                // aborting the whole compilation from inside the TCB.
+                continue;
+            };
+            expanded.body.blocks[block_index].terminator = Terminator::Call {
+                func,
+                args,
+                dest: Place::local(0),
+                target: Some(return_block),
+                span,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                callee_identity,
+                // MIR TailCall has no in-frame cleanup successor, but a panic
+                // from the callee still unwinds through this frame to its
+                // caller.  `Continue` is the exact ordinary-call analogue;
+                // `Unreachable` would incorrectly claim the callee is nounwind.
+                unwind: UnwindEdge::Continue,
+            };
+            expanded.body.blocks.push(BasicBlock {
+                id: return_block,
+                stmts: Vec::new(),
+                terminator: Terminator::Return,
+            });
+        }
+
+        std::borrow::Cow::Owned(expanded)
+    }
+
     /// Compute a stable content hash of the function body for caching.
     ///
     /// Uses SHA-256 over the serde_json serialization of the body, contracts,
@@ -693,7 +816,8 @@ pub fn datatype_marker_variants<'a>(
 /// had an answer keeps it.
 #[must_use]
 pub fn resolved_datatype<'a>(defs: &DatatypeDefs, ty: &'a Ty) -> std::borrow::Cow<'a, Ty> {
-    resolve_datatype_marker(defs, ty).map_or(std::borrow::Cow::Borrowed(ty), std::borrow::Cow::Owned)
+    resolve_datatype_marker(defs, ty)
+        .map_or(std::borrow::Cow::Borrowed(ty), std::borrow::Cow::Owned)
 }
 
 /// MIR body simplified for verification.
@@ -5520,9 +5644,27 @@ pub struct EnumLayoutInfo {
 pub struct VariantDef {
     /// Variant name (e.g. `Some`, `None`, `A`, `B`).
     pub name: String,
-    /// The discriminant tag this variant carries in `SwitchInt`. Stored as
-    /// `i128` so it spans both signed (`#[repr(i8)] enum`) and the common
-    /// non-negative tags; the `SwitchInt` tag set is `u128` and converts in.
+    /// The variant's discriminant tag, as the MATHEMATICAL INTEGER it denotes —
+    /// `Ordering::Less` is `-1`, not the `255` its `#[repr(i8)]` bit pattern
+    /// spells, and a `repr(Rust)` `A = -1` is `-1`, not `2^64-1`.
+    ///
+    /// THIS IS A DECODED VALUE. rustc's `Discr::val` is a raw two's-complement
+    /// pattern at the discriminant type's width; it is decoded exactly once, at
+    /// the extraction boundary (`trust_mir_extract::ty_convert::decode_discr_tag`,
+    /// the sibling of `trust_thir_lower`'s `enum_discriminants`), so NO consumer
+    /// downstream of extraction has to know about the raw encoding — and, in
+    /// particular, so that the `min_disc >= 0` gates in `trust_vcgen::guards`'s
+    /// enum-disc-index cast lane and `trust_ir_bridge::lower`'s
+    /// `Assume(min..=max)` can actually DECLINE a negative-tag enum. On the raw
+    /// convention they never could: no sub-128-bit raw pattern is negative.
+    ///
+    /// A raw MIR `SwitchInt` ARM LABEL is NOT in this encoding — it stays raw by
+    /// rustc's definition and must be put through [`Ty::decode_switch_label`] at
+    /// the point of use before it is compared with a value from this field.
+    ///
+    /// `i128` cannot represent a `#[repr(u128)]` tag above `i128::MAX`; that one
+    /// case keeps the historical lossy `val as i128` (unchanged, and both
+    /// `min_disc` gates decline on the negative it produces).
     pub discriminant: i128,
     /// This variant's own fields, in MIR definition order: `(field_name, ty)`.
     /// A field-less variant (`None`, `B`) has `fields: []` (a nullary
@@ -6203,6 +6345,95 @@ impl Ty {
         matches!(self, Ty::Int { signed: true, .. } | Ty::PtrSizedInt { signed: true })
     }
 
+    /// Decode a RAW two's-complement `SwitchInt` arm label into the mathematical
+    /// integer it denotes when compared against a value of THIS type.
+    ///
+    /// MIR stores every `SwitchInt` target as a bare `u128` holding the arm
+    /// constant's BIT PATTERN at the scrutinee's width — `-1` at `i32` arrives
+    /// as `4294967295`. Nothing sign-extends it on the way in, so a SIGNED
+    /// scrutinee needs the reinterpretation to happen at the point of use. See
+    /// [`decode_raw_two_complement`] for the arithmetic and the reasons a
+    /// caller must fail CLOSED on `None`.
+    ///
+    /// `Bool` returns `None` deliberately: a bool switch is a POLARITY, not an
+    /// integer equality, and every caller renders it itself.
+    pub fn decode_switch_label(&self, raw: u128) -> Option<i128> {
+        let width = self.int_width()?;
+        if matches!(self, Ty::Char)
+            && (raw > u128::from(char::MAX as u32) || (0xD800..=0xDFFF).contains(&raw))
+        {
+            return None;
+        }
+        decode_raw_two_complement(raw, width, self.is_signed())
+    }
+}
+
+/// Decode a RAW two's-complement bit pattern — a MIR `SwitchInt` arm label or a
+/// rustc `Discr::val` enum tag — into the mathematical integer it denotes at
+/// `width`/`signed`.
+///
+/// This is the ONE definition of the decode. Both raw channels route through it:
+///
+///  * enum TAG VALUES are decoded at the EXTRACTION boundary
+///    (`trust_mir_extract::ty_convert`'s `VariantDef::discriminant` and
+///    `place_enum_tags`), so `VariantDef::discriminant` is the TRUE signed tag
+///    and no downstream consumer can be raw; and
+///  * `SwitchInt` ARM LABELS are decoded at each point of use, because a MIR
+///    label is raw by rustc's own definition and cannot be fixed upstream.
+///
+/// Returns `None` — and every caller must then fail CLOSED (drop the equality,
+/// decline the lane, emit no fact) rather than fall back to the raw value — in
+/// exactly THREE cases:
+///
+///  1. the width is outside `1..=128`;
+///  2. the pattern has bits set ABOVE the width (a malformed label); and
+///  3. the pattern has no `i128` spelling at all — an UNSIGNED pattern above
+///     `i128::MAX`, i.e. `width == 128 && !signed && raw > i128::MAX`. Those
+///     are the only inputs the final `i128::try_from` can reject: the width
+///     mask bounds `raw` by `i128::MAX` for every `width <= 127`, and a signed
+///     128-bit pattern with its high bit set is already returned by the
+///     sign-fill arm. `u128::MAX` at `(128, unsigned)` is the witness — it
+///     denotes `2^128 - 1`, which the return type cannot hold. This case is
+///     what makes a `#[repr(u128)]` tag above `i128::MAX` fail CLOSED rather
+///     than wrap to a negative value.
+///
+/// A raw pattern is never "close enough": reading `-1` at
+/// `i32` as the magnitude `4294967295` is UNSAT against that scrutinee's own
+/// type-range fact, which makes the arm's path condition VACUOUS and discharges
+/// every obligation under it — a FALSE PROOF, not a lost one.
+#[must_use]
+pub fn decode_raw_two_complement(raw: u128, width: u32, signed: bool) -> Option<i128> {
+    if !(1..=128).contains(&width) {
+        return None;
+    }
+    let mask = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+    if raw & !mask != 0 {
+        return None;
+    }
+    if signed && (raw >> (width - 1)) & 1 == 1 {
+        // Sign bit set: fill the high bits. `mask` covers the low `width` bits,
+        // so `raw | !mask` is the 128-bit two's-complement extension and its
+        // `as i128` reinterpretation is exactly the denoted value.
+        return Some((raw | !mask) as i128);
+    }
+    i128::try_from(raw).ok()
+}
+
+/// The inverse of [`decode_raw_two_complement`]: the RAW `width`-bit pattern a
+/// decoded tag is stored as. Used where a decoded tag must be handed to a lane
+/// whose domain is the raw MIR encoding. `None` when `value` is not
+/// representable at `width`/`signed` (so no wrong pattern is ever synthesized).
+#[must_use]
+pub fn encode_raw_two_complement(value: i128, width: u32, signed: bool) -> Option<u128> {
+    if !(1..=128).contains(&width) {
+        return None;
+    }
+    let mask = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+    let raw = (value as u128) & mask;
+    (decode_raw_two_complement(raw, width, signed) == Some(value)).then_some(raw)
+}
+
+impl Ty {
     /// Returns true if this is any integer type.
     pub fn is_integer(&self) -> bool {
         matches!(self, Ty::Int { .. })
@@ -6293,9 +6524,7 @@ impl Ty {
             Ty::Int { width, signed } => {
                 Some(format!("{}{width}", if *signed { "i" } else { "u" }))
             }
-            Ty::PtrSizedInt { signed } => {
-                Some(if *signed { "isize" } else { "usize" }.to_string())
-            }
+            Ty::PtrSizedInt { signed } => Some(if *signed { "isize" } else { "usize" }.to_string()),
             Ty::Float { width } => Some(format!("f{width}")),
             Ty::Unit => Some("()".to_string()),
             Ty::Tuple(elems) => {
@@ -6303,9 +6532,7 @@ impl Ty {
                     elems.iter().map(Ty::vtable_source_type_key).collect();
                 Some(format!("({})", parts?.join(", ")))
             }
-            Ty::Array { elem, len } => {
-                Some(format!("[{}; {len}]", elem.vtable_source_type_key()?))
-            }
+            Ty::Array { elem, len } => Some(format!("[{}; {len}]", elem.vtable_source_type_key()?)),
             Ty::Ref { mutable, inner } => Some(format!(
                 "&{}{}",
                 if *mutable { "mut " } else { "" },
@@ -6825,9 +7052,10 @@ pub enum ConstValue {
     /// NO value, so value/div/index/equality obligations over it stay `unknown` and
     /// are never falsely proved (see the div-zero and const-eq folds in trust-vcgen,
     /// which must treat this as unknown-valued, never as a known-nonzero/known-unequal
-    /// constant). Each occurrence lowers to an independent fresh symbol, so distinct
-    /// reads are never asserted equal — strictly weaker than the truth, never falsely
-    /// proved.
+    /// constant). This carrier has NO occurrence identity: a consumer must either
+    /// freshen each occurrence independently or refuse any proof step for which
+    /// aliasing two occurrences could matter. The generic formula renderer cannot
+    /// provide that identity, so arithmetic proof builders fail closed on it.
     OpaqueScalar {
         width: u32,
         signed: bool,
@@ -6901,8 +7129,8 @@ impl ConstValue {
         );
         s.reserve(def_path.len() * 2);
         for b in def_path.as_bytes() {
-            s.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble < 16"));
-            s.push(char::from_digit(u32::from(b & 0xf), 16).expect("nibble < 16"));
+            s.push(HEX_LOWER[usize::from(b >> 4)]);
+            s.push(HEX_LOWER[usize::from(b & 0xf)]);
         }
         s
     }
@@ -6919,8 +7147,8 @@ impl ConstValue {
         let mut s = String::with_capacity("__trust_str_".len() + bytes.len() * 2);
         s.push_str("__trust_str_");
         for b in bytes {
-            s.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble < 16"));
-            s.push(char::from_digit(u32::from(b & 0xf), 16).expect("nibble < 16"));
+            s.push(HEX_LOWER[usize::from(b >> 4)]);
+            s.push(HEX_LOWER[usize::from(b & 0xf)]);
         }
         s
     }
@@ -6957,9 +7185,11 @@ pub enum Rvalue {
     /// binop-form widening starts from a faithful extraction instead of
     /// rediscovering this hazard.
     ///
-    /// Consumers that want the old behaviour opt in per match arm (vcgen does,
-    /// keeping its overflow obligation and value encoding identical); every
-    /// consumer that does not name this variant fails closed through its
+    /// Consumers opt in per match arm. Vcgen's safety lane does so only for the
+    /// three audited arithmetic operations and emits the same mandatory
+    /// overflow obligation; it does not silently reinterpret this spelling as
+    /// wrapping arithmetic in a standalone value model. Every consumer that
+    /// does not name this variant must remain conservative through its
     /// `#[non_exhaustive]` wildcard — which is the direction that matters.
     // Trust: R2/C4 — preserve UB-on-overflow provenance; never collapse into BinaryOp.
     UncheckedBinaryOp(BinOp, Operand, Operand),
@@ -7012,7 +7242,10 @@ pub enum Rvalue {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Hash` is derived so a `BinOp` can key a set alongside a `SourceSpan` — the
+// compiler's per-`(span, op)` modular-arithmetic certificate
+// (`VcgenContext::with_modular_arith_ops`) needs exactly that pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum BinOp {
     Add,
@@ -7054,7 +7287,9 @@ pub enum UnOp {
     Not,
     Neg,
     /// Extracts metadata (e.g., length) from a fat pointer.
-    /// Semantically a no-op for verification: produces an unconstrained usize.
+    /// Vcgen models slice, string, and array lengths when provenance is
+    /// available, and emits a fail-closed `UnsupportedMir` row for raw/dynamic
+    /// metadata that cannot be modeled soundly.
     // Trust: #386 — proper variant instead of fallback to Not.
     PtrMetadata,
 }
@@ -7638,6 +7873,96 @@ impl UnwindEdge {
     }
 }
 
+/// The NON-FORGEABLE identity of a called function: rustc's `DefId` split into
+/// its two stable halves, plus a digest of the call's generic arguments.
+///
+/// # Why this type exists (FALSE PROOF #14)
+///
+/// Every callee-keyed decision in this pipeline has historically been a test on
+/// [`Terminator::Call::func`], a rendered path STRING. A rendered path is
+/// source-forgeable: `str`, `u64` and `usize` are legal generic-parameter names,
+/// and a `ty::Param` prints BARE with no crate path, so
+///
+/// ```ignore
+/// #![allow(non_camel_case_types)]
+/// pub fn attack<u64: TryFrom<u32>>(x: u32) -> Result<u64, <u64 as TryFrom<u32>>::Error> {
+///     <u64 as TryFrom<u32>>::try_from(x)   // `u64` here is a TYPE PARAMETER
+/// }
+/// ```
+///
+/// renders a callee string byte-identical to the one a real `u64::try_from`
+/// call renders, while `Self = Evil` resolves to a body that panics on every
+/// input. That was live in a shipped driver from 2026-08-12 to 2026-08-22.
+/// A `DefId` cannot be spelled in source at all, so no name a user may choose
+/// changes what this carries.
+///
+/// It is ALSO the fix for a COMPLETENESS defect of the same root cause. A string
+/// key must be spelled the same on both sides of every seam, and the producers
+/// do not agree on spelling. MEASURED on ny-cert (gate R43):
+///
+/// ```text
+/// [PF_REG]      fn=ny_cert::json::Parser::<'a>::peek established=true nrows=0
+/// [PF_CALLGATE] fn=…::skip_whitespace UNREGISTERED callee blocks discharge:
+///               ny_cert::json::Parser::<'_>::peek
+/// ```
+///
+/// — registered with the DECLARED lifetime, queried with the ELIDED one, 11 call
+/// sites over 3 keys blocking 9 caller functions on a fact the session already
+/// held. That is the THIRD desync of this class, after the
+/// `::<__trust_args@HASH>` monomorph tag and the crate-less/crate-qualified
+/// def-path split. Normalizing MORE spellings is the wrong repair — it is the
+/// forgeable-spelling move that produced false proof #14 in the first place.
+///
+/// # What `substs_digest` is, exactly
+///
+/// A [`rustc_data_structures::fingerprint::Fingerprint`] over the call's generic
+/// arguments AFTER `TyCtxt::erase_and_anonymize_regions`, split into two `u64`
+/// halves (fixed-width, so the pair is injective as data where a hex rendering
+/// is not).
+///
+/// * Region erasure is what makes the `'a`/`'_` desync close for the RIGHT
+///   reason. Lifetimes are erased before codegen, so two instantiations that
+///   differ only in a region denote the same code; erasing before digesting
+///   makes them the same identity by construction rather than by string
+///   rewriting. It is deliberately the SAME erasure rustc's own
+///   `Instance`/codegen path applies.
+/// * It is NOT erased any further. Two monomorphizations that differ in a TYPE
+///   or CONST argument are different code and get different digests, so a fact
+///   proven about one can never discharge the other.
+///
+/// # Fail-closed admission
+///
+/// An identity is minted ONLY for a fully concrete (region-modulo)
+/// instantiation — see `trust_mir_extract::convert::callee_identity_for`, which
+/// refuses `has_non_region_param` / `has_non_region_infer` /
+/// `has_non_region_placeholders`. In particular a call `f::<T>` from inside a
+/// generic body carries NO identity, so the generic body's own proof can never
+/// be transferred to it. "The generic body verified" does not imply "every
+/// instantiation is panic-free", and this type must never be the thing that
+/// forgets that.
+///
+/// Absent identity therefore always means "no identity-based decision is
+/// available here", never "fall back to comparing the strings".
+// DELIBERATELY NOT `Default`. A defaulted `CalleeIdentity` would be
+// `{0, 0, [0, 0]}` — a value that LOOKS like an identity and would be minted
+// silently by any `..Default::default()` struct update. Absence is carried by
+// `Option` and by nothing else; there is no blank identity to accidentally
+// compare equal to a registered one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CalleeIdentity {
+    /// `tcx.stable_crate_id(def_id.krate).as_u64()` — the crate half of the
+    /// `DefId`, in the form that is stable across compilations and across the
+    /// serialized-artifact boundary (a raw `CrateNum` is not).
+    pub stable_crate_id: u64,
+    /// `def_id.index.as_u32()` — the within-crate half of the `DefId`.
+    pub def_index: u32,
+    /// Fingerprint of the region-erased generic arguments, low half then high
+    /// half. `[0, 0]` is a legitimate value (it is whatever the empty argument
+    /// list hashes to), so emptiness is NOT a sentinel — absence is carried by
+    /// `Option`, never by a magic value.
+    pub substs_digest: [u64; 2],
+}
+
 /// How a block ends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -7700,6 +8025,60 @@ pub enum Terminator {
         /// [`UnwindEdge::is_unreachable`]).
         #[serde(default, skip_serializing_if = "UnwindEdge::is_unreachable")]
         unwind: UnwindEdge,
+        /// Trust: the callee's NON-FORGEABLE `DefId`+substs identity, recorded at
+        /// extraction from the real `TyCtxt` at the point `func` is rendered.
+        ///
+        /// `func` above stays exactly what it is — the DISPLAY spelling, which
+        /// every diagnostic, log, trace and gate-log parser in this campaign
+        /// reads. This field is what DECISIONS are supposed to key on. See
+        /// [`CalleeIdentity`] for the false proof that motivates the split and
+        /// for the measured `'a`/`'_` desync it closes.
+        ///
+        /// `None` means "no identity was available" and MUST fail closed at
+        /// every consumer: an indirect call, a call whose arguments still mention
+        /// a type/const parameter, a synthetic/test body, and any artifact
+        /// serialized before this field existed all land here. A consumer that
+        /// answered a `None` by comparing `func` instead would have re-created
+        /// exactly the forgeable-string decision this field exists to retire.
+        ///
+        /// SERDE DISCIPLINE (same rule as `datatype_defs` and `unwind`): `None`
+        /// is the pre-carrier meaning and must not appear on the wire at all, so
+        /// a bundle with no identities re-serializes byte-identically and every
+        /// audited content-hash pin survives. A PRESENT identity IS hash-visible:
+        /// it asserts which function this call reaches, so two bodies that agree
+        /// everywhere else but disagree on a callee identity are different
+        /// objects and must not share a content hash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        callee_identity: Option<CalleeIdentity>,
+    },
+    /// A rustc MIR `TailCall` (`become f(args)`). Unlike an ordinary call, the
+    /// callee returns directly to this function's caller, so there is no
+    /// destination place or in-function continuation block. Keeping this as a
+    /// distinct, argument-bearing terminator is load-bearing for caller
+    /// preconditions and direct-recursion E5: lowering it to `Opaque` would hide
+    /// the call edge and could make an authored decreases clause vacuous.
+    TailCall {
+        func: String,
+        args: Vec<Operand>,
+        span: SourceSpan,
+        /// Present when the tail call is a recognized atomic intrinsic. The
+        /// operation's destination is the implicit return place.
+        #[serde(default)]
+        atomic: Option<AtomicOperation>,
+        /// Compiler-authenticated foreign-item identity, with the same meaning
+        /// as `Call::is_foreign`.
+        #[serde(default)]
+        is_foreign: bool,
+        /// Compiler-authenticated unsafe-signature identity, with the same
+        /// meaning as `Call::is_unsafe_sig`.
+        #[serde(default)]
+        is_unsafe_sig: bool,
+        /// The same compiler-authenticated direct-callee identity carried by
+        /// [`Terminator::Call`]. Tail calls are still calls: omitting this field
+        /// would make the panic-freedom gate fall back to display text exactly
+        /// when MIR chooses the tail-call representation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        callee_identity: Option<CalleeIdentity>,
     },
     Assert {
         cond: Operand,
@@ -7752,6 +8131,103 @@ pub enum Terminator {
     Resume,
 }
 
+// Source-owned coverage censuses. Each generated classifier is deliberately a
+// wildcard-free match in the crate that owns these `#[non_exhaustive]` enums.
+// Adding a variant therefore fails compilation until this census is updated;
+// downstream coverage reports can compare against the exported names without
+// relying on a second self-referential hard-coded count.
+macro_rules! declare_model_variant_census {
+    (
+        $names:ident,
+        $classifier:ident,
+        $ty:ty,
+        $( $pattern:pat => $name:literal ),+ $(,)?
+    ) => {
+        pub const $names: &[&str] = &[$($name),+];
+
+        #[deny(unreachable_patterns)]
+        fn $classifier(value: &$ty) -> &'static str {
+            match value {
+                $( $pattern => $name ),+
+            }
+        }
+
+        // Keep the exhaustive classifier live without suppressing the crate's
+        // dead-code audit. A new source variant must fail this wildcard-free
+        // match even though downstream users consume only the names census.
+        const _: fn(&$ty) -> &'static str = $classifier;
+    };
+}
+
+declare_model_variant_census!(
+    RVALUE_VARIANT_NAMES,
+    rvalue_variant_name_for_census,
+    Rvalue,
+    Rvalue::Use(..) => "Rvalue::Use",
+    Rvalue::BinaryOp(..) => "Rvalue::BinaryOp",
+    Rvalue::CheckedBinaryOp(..) => "Rvalue::CheckedBinaryOp",
+    Rvalue::UncheckedBinaryOp(..) => "Rvalue::UncheckedBinaryOp",
+    Rvalue::UnaryOp(..) => "Rvalue::UnaryOp",
+    Rvalue::Ref { .. } => "Rvalue::Ref",
+    Rvalue::Cast(..) => "Rvalue::Cast",
+    Rvalue::Aggregate(..) => "Rvalue::Aggregate",
+    Rvalue::Discriminant(..) => "Rvalue::Discriminant",
+    Rvalue::Len(..) => "Rvalue::Len",
+    Rvalue::Repeat(..) => "Rvalue::Repeat",
+    Rvalue::AddressOf(..) => "Rvalue::AddressOf",
+    Rvalue::CopyForDeref(..) => "Rvalue::CopyForDeref",
+    Rvalue::PtrOffset { .. } => "Rvalue::PtrOffset",
+    Rvalue::Unsupported { .. } => "Rvalue::Unsupported",
+);
+
+declare_model_variant_census!(
+    TERMINATOR_VARIANT_NAMES,
+    terminator_variant_name_for_census,
+    Terminator,
+    Terminator::Goto(..) => "Terminator::Goto",
+    Terminator::SwitchInt { .. } => "Terminator::SwitchInt",
+    Terminator::Return => "Terminator::Return",
+    Terminator::Call { .. } => "Terminator::Call",
+    Terminator::TailCall { .. } => "Terminator::TailCall",
+    Terminator::Assert { .. } => "Terminator::Assert",
+    Terminator::Drop { .. } => "Terminator::Drop",
+    Terminator::Opaque { .. } => "Terminator::Opaque",
+    Terminator::Unreachable => "Terminator::Unreachable",
+    Terminator::Resume => "Terminator::Resume",
+);
+
+declare_model_variant_census!(
+    BINOP_VARIANT_NAMES,
+    binop_variant_name_for_census,
+    BinOp,
+    BinOp::Add => "BinOp::Add",
+    BinOp::Sub => "BinOp::Sub",
+    BinOp::Mul => "BinOp::Mul",
+    BinOp::Div => "BinOp::Div",
+    BinOp::Rem => "BinOp::Rem",
+    BinOp::Eq => "BinOp::Eq",
+    BinOp::Ne => "BinOp::Ne",
+    BinOp::Lt => "BinOp::Lt",
+    BinOp::Le => "BinOp::Le",
+    BinOp::Gt => "BinOp::Gt",
+    BinOp::Ge => "BinOp::Ge",
+    BinOp::BitAnd => "BinOp::BitAnd",
+    BinOp::BitOr => "BinOp::BitOr",
+    BinOp::BitXor => "BinOp::BitXor",
+    BinOp::Shl => "BinOp::Shl",
+    BinOp::Shr => "BinOp::Shr",
+    BinOp::Cmp => "BinOp::Cmp",
+);
+
+declare_model_variant_census!(
+    UNOP_VARIANT_NAMES,
+    unop_variant_name_for_census,
+    UnOp,
+    UnOp::Not => "UnOp::Not",
+    UnOp::Neg => "UnOp::Neg",
+    UnOp::PtrMetadata => "UnOp::PtrMetadata",
+);
+
 impl Terminator {
     /// The write-completeness classification of this terminator. EXHAUSTIVE (no
     /// wildcard): a new `Terminator` variant fails to compile until classified, so
@@ -7759,6 +8235,7 @@ impl Terminator {
     pub fn write_effect(&self) -> WriteEffect {
         match self {
             Terminator::Call { .. } => WriteEffect::Captured, // dest + &mut-arg havoc
+            Terminator::TailCall { .. } => WriteEffect::Captured, // implicit return + &mut-arg havoc
             Terminator::Drop { .. } => WriteEffect::FailClosedOrBackstopped, // needs a &mut escape
             Terminator::Opaque { .. } => WriteEffect::FailClosedOrBackstopped, // asm → UnsupportedMir
             Terminator::Goto(_)
@@ -7849,6 +8326,7 @@ impl Terminator {
             Terminator::Opaque { targets, .. } => targets.clone(),
             Terminator::SwitchInt { .. }
             | Terminator::Return
+            | Terminator::TailCall { .. }
             | Terminator::Assert { .. }
             | Terminator::Unreachable
             | Terminator::Resume => vec![],
@@ -7865,7 +8343,7 @@ impl Terminator {
     /// Exit categories directly reachable from this terminator.
     pub fn exit_targets(&self) -> Vec<ClauseTarget> {
         let mut exits = match self {
-            Terminator::Return => vec![ClauseTarget::Return],
+            Terminator::Return | Terminator::TailCall { .. } => vec![ClauseTarget::Return],
             Terminator::Unreachable => vec![ClauseTarget::Unreachable],
             // a `Resume` sink propagates an in-flight unwind out of the
             // function. It contributes no in-CFG exit edge and no obligation —
@@ -8181,13 +8659,25 @@ pub enum VtableKeyTy {
     Closed(Ty),
     /// A nominal type: its def path plus its NON-LIFETIME generic arguments, in
     /// declaration order.
-    Nominal { path: String, args: Vec<VtableKeyTy> },
+    Nominal {
+        path: String,
+        args: Vec<VtableKeyTy>,
+    },
     /// A tuple with at least one element the closed grammar refuses — `dyn Fn(&Path)`
     /// desugars to `Fn<(&Path,)>`, so this arm is what carries the whole `Fn`-family.
     Tuple(Vec<VtableKeyTy>),
-    Array { elem: Box<VtableKeyTy>, len: u128 },
-    Ref { mutable: bool, inner: Box<VtableKeyTy> },
-    RawPtr { mutable: bool, pointee: Box<VtableKeyTy> },
+    Array {
+        elem: Box<VtableKeyTy>,
+        len: u128,
+    },
+    Ref {
+        mutable: bool,
+        inner: Box<VtableKeyTy>,
+    },
+    RawPtr {
+        mutable: bool,
+        pointee: Box<VtableKeyTy>,
+    },
 }
 
 impl VtableKeyTy {
@@ -8302,6 +8792,173 @@ pub fn key_component_is_unambiguous(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ONE decode both raw channels route through, pinned at the
+    /// boundaries. A raw `SwitchInt` label / `Discr::val` tag is a two's-
+    /// complement bit pattern at the scrutinee's width; reading it as a
+    /// magnitude put `n == 4294967295` on an `i32` `-1` arm, which is UNSAT
+    /// against `n`'s own range fact and made the arm VACUOUS.
+    #[test]
+    fn raw_two_complement_decode_at_every_signed_width() {
+        assert_eq!(decode_raw_two_complement(0xff, 8, true), Some(-1));
+        assert_eq!(decode_raw_two_complement(0x80, 8, true), Some(-128));
+        assert_eq!(decode_raw_two_complement(0x7f, 8, true), Some(127));
+        assert_eq!(decode_raw_two_complement(0xffff, 16, true), Some(-1));
+        assert_eq!(decode_raw_two_complement(0xffff_ffff, 32, true), Some(-1));
+        assert_eq!(decode_raw_two_complement(0xffff_fff9, 32, true), Some(-7));
+        assert_eq!(decode_raw_two_complement(u128::from(u64::MAX), 64, true), Some(-1));
+        assert_eq!(decode_raw_two_complement(u128::MAX, 128, true), Some(-1));
+        assert_eq!(decode_raw_two_complement(1, 1, true), Some(-1));
+
+        // MUST NOT CHANGE: unsigned patterns keep their magnitude.
+        assert_eq!(decode_raw_two_complement(0xff, 8, false), Some(255));
+        assert_eq!(decode_raw_two_complement(0x80, 8, false), Some(128));
+        assert_eq!(decode_raw_two_complement(512, 16, false), Some(512));
+
+        // Fail CLOSED rather than fabricate a value.
+        assert_eq!(decode_raw_two_complement(0x1ff, 8, true), None, "bits above the width");
+        assert_eq!(decode_raw_two_complement(0, 0, true), None, "width 0");
+        assert_eq!(decode_raw_two_complement(0, 129, true), None, "width > 128");
+        assert_eq!(
+            decode_raw_two_complement(u128::MAX, 128, false),
+            None,
+            "a 128-bit unsigned pattern above i128::MAX has no i128 spelling"
+        );
+    }
+
+    #[test]
+    fn raw_two_complement_encode_round_trips_and_refuses_the_unrepresentable() {
+        assert_eq!(encode_raw_two_complement(-1, 8, true), Some(0xff));
+        assert_eq!(encode_raw_two_complement(-1, 64, true), Some(u128::from(u64::MAX)));
+        assert_eq!(encode_raw_two_complement(2, 8, true), Some(2));
+        assert_eq!(encode_raw_two_complement(255, 8, false), Some(255));
+        assert_eq!(encode_raw_two_complement(255, 8, true), None, "255 is not an i8");
+        assert_eq!(encode_raw_two_complement(-1, 8, false), None, "-1 is not a u8");
+    }
+
+    #[test]
+    fn switch_label_decode_is_typed_and_declines_bool() {
+        let i8_ty = Ty::Int { width: 8, signed: true };
+        let u8_ty = Ty::Int { width: 8, signed: false };
+        assert_eq!(i8_ty.decode_switch_label(0xff), Some(-1));
+        assert_eq!(u8_ty.decode_switch_label(0xff), Some(255));
+        assert_eq!(
+            Ty::PtrSizedInt { signed: true }.decode_switch_label(u128::from(u64::MAX)),
+            Some(-1),
+            "isize `-1` is the repr(Rust) discriminant spelling"
+        );
+        assert_eq!(Ty::PtrSizedInt { signed: false }.decode_switch_label(7), Some(7));
+        assert_eq!(Ty::Char.decode_switch_label(u128::from('z' as u32)), Some(122));
+        assert_eq!(Ty::Char.decode_switch_label(0xD800), None, "a surrogate is not a scalar value");
+        assert_eq!(Ty::Char.decode_switch_label(0x11_0000), None, "above char::MAX");
+        assert_eq!(
+            Ty::Bool.decode_switch_label(1),
+            None,
+            "a bool switch is a POLARITY; every caller renders it itself"
+        );
+        assert_eq!(Ty::Unit.decode_switch_label(0), None, "an unclassifiable type fails closed");
+    }
+
+    fn explicit_tail_call_function() -> VerifiableFunction {
+        VerifiableFunction {
+            name: "tail_forward".to_string(),
+            def_path: "test::tail_forward".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                    LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".to_string()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: Vec::new(),
+                    terminator: Terminator::TailCall {
+                        func: "test::callee".to_string(),
+                        args: vec![Operand::Copy(Place::local(1))],
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_foreign: true,
+                        is_unsafe_sig: true,
+                        callee_identity: None,
+                    },
+                }],
+                arg_count: 1,
+                return_ty: Ty::u32(),
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: FunctionSpec::default(),
+        }
+    }
+
+    #[test]
+    fn tail_call_projection_preserves_call_semantics_without_mutating_wire_form() {
+        let original = explicit_tail_call_function();
+        let wire = serde_json::to_string(&original).expect("TailCall must serialize");
+        assert!(wire.contains("TailCall"), "wire/source identity must retain TailCall");
+
+        let expanded = original.with_tail_calls_expanded();
+        let expanded = expanded.as_ref();
+        assert_eq!(expanded.body.blocks.len(), 2);
+        match &expanded.body.blocks[0].terminator {
+            Terminator::Call {
+                func,
+                args,
+                dest,
+                target,
+                is_foreign,
+                is_unsafe_sig,
+                unwind,
+                ..
+            } => {
+                assert_eq!(func, "test::callee");
+                assert!(matches!(
+                    args.as_slice(),
+                    [Operand::Copy(place)] if *place == Place::local(1)
+                ));
+                assert_eq!(dest, &Place::local(0));
+                assert_eq!(*target, Some(BlockId(1)));
+                assert!(*is_foreign);
+                assert!(*is_unsafe_sig);
+                assert_eq!(unwind, &UnwindEdge::Continue);
+            }
+            other => panic!("TailCall projected to {other:?}"),
+        }
+        assert!(matches!(expanded.body.blocks[1].terminator, Terminator::Return));
+        assert!(matches!(original.body.blocks[0].terminator, Terminator::TailCall { .. }));
+
+        let round_trip: VerifiableFunction =
+            serde_json::from_str(&wire).expect("TailCall must deserialize");
+        assert!(matches!(round_trip.body.blocks[0].terminator, Terminator::TailCall { .. }));
+    }
+
+    #[test]
+    fn tail_call_projection_borrows_unchanged_bodies() {
+        let mut func = explicit_tail_call_function();
+        func.body.blocks[0].terminator = Terminator::Return;
+        assert!(matches!(func.with_tail_calls_expanded(), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn tail_call_projection_never_collides_with_sparse_block_identity() {
+        let mut func = explicit_tail_call_function();
+        // This body is deliberately non-positional and will be rejected by
+        // proof-capable validation.  Bridge/diagnostic projections must still
+        // not turn it into a body with duplicate identities: the old
+        // `BlockId(blocks.len())` strategy collided with this bb1.
+        func.body.blocks[0].id = BlockId(1);
+
+        let expanded = func.with_tail_calls_expanded();
+        let expanded = expanded.as_ref();
+        assert_eq!(expanded.body.blocks[0].id, BlockId(1));
+        assert_eq!(expanded.body.blocks[1].id, BlockId(0));
+        assert!(matches!(
+            expanded.body.blocks[0].terminator,
+            Terminator::Call { target: Some(BlockId(0)), .. }
+        ));
+    }
 
     /// The defect this fixes: two builds of the SAME toolchain sources at different
     /// commits rendered the SAME sysroot file under two different `/rustc/<sha>/`
@@ -10723,10 +11380,7 @@ mod tests {
                 "m::Big".to_string(),
                 Ty::Datatype {
                     name: "m::Big".to_string(),
-                    variants: vec![(
-                        "m::Big::One".to_string(),
-                        vec![("0".to_string(), field)],
-                    )],
+                    variants: vec![("m::Big::One".to_string(), vec![("0".to_string(), field)])],
                 },
             )])
         };
@@ -10867,9 +11521,11 @@ mod tests {
             assert_eq!(resolve_datatype_marker(&table, &ty), None, "{label}");
             assert_eq!(datatype_marker_variants(&table, &ty), None, "{label}");
             assert_eq!(ty.num_variants_in(&table), None, "{label}");
-            assert!(matches!(resolved_datatype(&table, &ty), std::borrow::Cow::Borrowed(_)),
+            assert!(
+                matches!(resolved_datatype(&table, &ty), std::borrow::Cow::Borrowed(_)),
                 "{label}: an unresolved marker must come back BORROWED — the identity, \
-                 not a copy that merely compares equal");
+                 not a copy that merely compares equal"
+            );
         }
 
         // ADDITIVE: the identity on an inline definition (so the inline arm always
@@ -10963,8 +11619,7 @@ mod tests {
             Some(vec![&i64_ty()]),
             "an ADT definition's per-variant field list must be readable through the table",
         );
-        let Some(Ty::Adt { variants, .. }) = resolve_datatype_marker(&defs, &marker("Tree"))
-        else {
+        let Some(Ty::Adt { variants, .. }) = resolve_datatype_marker(&defs, &marker("Tree")) else {
             panic!("Tree resolves to an Adt");
         };
         assert_eq!(
@@ -11855,9 +12510,7 @@ mod tests {
     fn coroutine_resume_contract_declines_frame_field_projection() {
         // A field projection reads frame DATA, not the resume-state selector.
         let mut body = zero_await_resume_body();
-        let Statement::Assign { rvalue, .. } = &mut body.blocks[0].stmts[0] else {
-            unreachable!()
-        };
+        let Statement::Assign { rvalue, .. } = &mut body.blocks[0].stmts[0] else { unreachable!() };
         *rvalue = Rvalue::Discriminant(Place {
             local: 1,
             projections: vec![Projection::Deref, Projection::Field(0)],
@@ -11973,10 +12626,7 @@ mod tests {
         let mut body = zero_await_resume_body();
         body.blocks[2] = BasicBlock {
             id: BlockId(2),
-            stmts: vec![Statement::SetDiscriminant {
-                place: Place::local(0),
-                variant_index: 0,
-            }],
+            stmts: vec![Statement::SetDiscriminant { place: Place::local(0), variant_index: 0 }],
             terminator: Terminator::Return,
         };
         assert_eq!(coroutine_resume_state_contract(&body), None);
@@ -12024,6 +12674,7 @@ mod tests {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 unwind: UnwindEdge::Unreachable,
             },
         };
@@ -12079,7 +12730,9 @@ mod tests {
         }
         // and the exact spellings the shipped globals depend on
         assert_eq!(
-            Ty::Int { width: 32, signed: true }.vtable_source_type_key_in_body("krate::f").as_deref(),
+            Ty::Int { width: 32, signed: true }
+                .vtable_source_type_key_in_body("krate::f")
+                .as_deref(),
             Some("i32")
         );
         assert_eq!(
@@ -12185,10 +12838,7 @@ mod tests {
     #[test]
     fn in_body_key_param_parse_is_strict() {
         for bad in [
-            Ty::Unsupported {
-                kind: "TyKind::Param".to_string(),
-                detail: "T/#0".to_string(),
-            },
+            Ty::Unsupported { kind: "TyKind::Param".to_string(), detail: "T/#0".to_string() },
             Ty::Unsupported {
                 kind: "TyKind::Param".to_string(),
                 detail: "generic parameter T/#0".to_string(),
@@ -12357,10 +13007,13 @@ mod tests {
     #[test]
     fn nominal_key_arg_list_is_unambiguously_delimited() {
         let two = nom("krate::Pair", vec![i32_k(), u64_k()]);
-        let one_tuple = nom("krate::Pair", vec![closed(Ty::Tuple(vec![
-            Ty::Int { width: 32, signed: true },
-            Ty::Int { width: 64, signed: false },
-        ]))]);
+        let one_tuple = nom(
+            "krate::Pair",
+            vec![closed(Ty::Tuple(vec![
+                Ty::Int { width: 32, signed: true },
+                Ty::Int { width: 64, signed: false },
+            ]))],
+        );
         assert_eq!(render(&two), "krate::Pair<i32, u64>");
         assert_eq!(render(&one_tuple), "krate::Pair<(i32, u64)>");
         assert_ne!(render(&two), render(&one_tuple), "arity must be recoverable from the key");
@@ -12418,10 +13071,7 @@ mod tests {
         // a param NESTED inside a nominal keeps its owner scope, so two bodies' `Vec<T>`
         // do not merge.
         let vt = nom("alloc::vec::Vec", vec![closed(param_ty("T/#0"))]);
-        assert_eq!(
-            vt.render_in_body("krate::f").unwrap(),
-            "alloc::vec::Vec<param(T/#0)@krate::f>"
-        );
+        assert_eq!(vt.render_in_body("krate::f").unwrap(), "alloc::vec::Vec<param(T/#0)@krate::f>");
         assert_ne!(vt.render_in_body("krate::f"), vt.render_in_body("krate::g"));
     }
 
@@ -12431,10 +13081,7 @@ mod tests {
     #[test]
     fn unrenderable_shapes_still_refuse_with_a_per_shape_tag() {
         // a path with no crate root cannot be told apart from the grammar's own keywords
-        assert_eq!(
-            nom("Foo", vec![]).render_in_body(OWNER),
-            Err(RefusalShape::UnkeyablePath)
-        );
+        assert_eq!(nom("Foo", vec![]).render_in_body(OWNER), Err(RefusalShape::UnkeyablePath));
         // metacharacters would make the argument split ambiguous
         for bad in ["krate::Fo,o", "krate::Fo<o", "krate::Fo$o", "krate::Fo(o", "krate::Fo[o"] {
             assert_eq!(
@@ -12550,5 +13197,241 @@ mod tests {
         assert!(!key_component_is_unambiguous("Vec<i32"), "unbalanced");
         assert!(!key_component_is_unambiguous("i32>"), "unbalanced");
         assert!(!key_component_is_unambiguous("a$b"));
+    }
+}
+
+/// FALSE PROOF #14 at the MODEL layer: what a callee STRING cannot tell you, and
+/// what [`CalleeIdentity`] must therefore be relied on for instead.
+///
+/// Every case below builds two `Terminator::Call`s whose `func` strings are
+/// BYTE-IDENTICAL and whose callees are DIFFERENT functions. That is the whole
+/// defect in one sentence: a rendered path is not an identity. These tests do not
+/// re-derive rustc's rendering (that needs a `TyCtxt`, and this crate is
+/// deliberately buildable by stable cargo so the rules can be falsified cheaply)
+/// — they pin the CONSEQUENCE, which is that no predicate over `func` can
+/// separate the pairs, and that the model's decision key is not derived from
+/// `func` at any point.
+#[cfg(test)]
+mod callee_identity_forgery_tests {
+    use super::*;
+
+    /// The identity a genuine, fully concrete call carries.
+    fn honest(index: u32) -> CalleeIdentity {
+        CalleeIdentity {
+            stable_crate_id: 0x1973_d11b_2baa_21fa,
+            def_index: index,
+            substs_digest: [11, 22],
+        }
+    }
+
+    fn call(func: &str, identity: Option<CalleeIdentity>) -> Terminator {
+        Terminator::Call {
+            func: func.to_string(),
+            args: vec![],
+            dest: Place::local(0),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            unwind: UnwindEdge::Unreachable,
+            callee_identity: identity,
+        }
+    }
+
+    fn rendered(terminator: &Terminator) -> String {
+        match terminator {
+            Terminator::Call { func, .. } => func.clone(),
+            _ => unreachable!("constructed as a Call"),
+        }
+    }
+
+    fn identity_of(terminator: &Terminator) -> Option<CalleeIdentity> {
+        match terminator {
+            Terminator::Call { callee_identity, .. } => *callee_identity,
+            _ => unreachable!("constructed as a Call"),
+        }
+    }
+
+    /// THE ANCHORED PRIMITIVES. `#![allow(non_camel_case_types)]` makes `u64`,
+    /// `usize`, `str`, `i32`, `char`, `bool` and friends legal TYPE PARAMETER
+    /// names, and a `ty::Param` renders BARE — no crate, no path. That is FALSE
+    /// PROOF #14: `pub fn attack<u64: TryFrom<u32>>(x: u32) { <u64 as
+    /// TryFrom<u32>>::try_from(x) }` rendered exactly what the honest primitive
+    /// call renders while `Self = Evil` resolved to a body that panics on every
+    /// input.
+    ///
+    /// MEASURED CURRENT STATE, so this test does not overclaim. On the deployed
+    /// driver `342ac1c89edcc2d0` this tree already tags the collision AT THE
+    /// RENDERER (`rustc_middle::ty::print::pretty` prints `{name}#ty_param` when
+    /// `hir::PrimTy::from_name` matches), and the A/B reads:
+    ///
+    /// ```text
+    /// [PF_CALLGATE] fn=CIF::honest_u64 arm=typed-self-total discharges callee:
+    ///               <u64 as core::convert::TryFrom<u32>>::try_from
+    /// [PF_ZEROGATE] fn=CIF::attack_u64 arm=NONE (blocks registration) callee=
+    ///               <u64#ty_param as core::convert::TryFrom<u32>>::try_from
+    /// ```
+    ///
+    /// So the two no longer render alike — but that mitigation IS ANOTHER STRING
+    /// RULE, and its own doc records the class it does not close: "two parameters
+    /// named `T` in two DIFFERENT generic scopes still render one string, and
+    /// `ty::ParamTy` carries only `{index, name}` — no owner — so that class
+    /// cannot be separated here. It is MEASURED open."
+    ///
+    /// THIS test pins the law that does not depend on any renderer: whenever two
+    /// calls DO share a rendering, the identity is what separates them, and a
+    /// call whose substs mention a `ty::Param` carries NO identity at all — so it
+    /// reaches no identity-keyed decision whatever it renders as, under the
+    /// `#ty_param` tag or without it.
+    #[test]
+    fn a_parametric_call_carries_no_identity_whatever_it_renders_as() {
+        for primitive in ["u64", "usize", "str", "i32", "i64", "u8", "u32", "char", "bool", "f64"] {
+            // Both spellings the renderer has used for this family, so the test
+            // survives a renderer change in either direction.
+            for path in [
+                format!("<{primitive} as core::convert::TryFrom<u32>>::try_from"),
+                format!("<{primitive}#ty_param as core::convert::TryFrom<u32>>::try_from"),
+            ] {
+                let real = call(&path, Some(honest(7)));
+                let forged = call(&path, None);
+                assert_eq!(
+                    rendered(&real),
+                    rendered(&forged),
+                    "same text on both sides is the premise of the test: {path}"
+                );
+                assert_ne!(
+                    identity_of(&real),
+                    identity_of(&forged),
+                    "identity must separate what the string cannot: {path}"
+                );
+                assert_eq!(
+                    identity_of(&forged),
+                    None,
+                    "a call whose substs mention a `ty::Param` must carry NO identity, so it \
+                     can reach no identity-keyed decision: {path}"
+                );
+            }
+        }
+        // The residual the `#ty_param` tag explicitly leaves open: two parameters
+        // named `T` in different generic scopes render ONE string. Both such calls
+        // are parametric, so both are unidentified and both fail closed.
+        let t_call = "<T as core::convert::TryFrom<u32>>::try_from";
+        assert_eq!(identity_of(&call(t_call, None)), None);
+    }
+
+    /// THE `__trust_crate@` IMPOSTOR. The stamp is a producer-minted marker on a
+    /// path whose crate name is ambiguous or impersonates a sysroot crate, and
+    /// its own producer documents that it "is intentionally not an authority
+    /// token".
+    ///
+    /// MEASURED BOUND, stated so the next reader does not overclaim in either
+    /// direction. `@` is not identifier-spellable, so a user MODULE cannot carry
+    /// the literal prefix: the closest legal spelling (`mod
+    /// __trust_crate_at_1973d11b2baa21fa`) rendered
+    /// `CIF::__trust_crate_at_1973d11b2baa21fa::len` on deployed driver
+    /// `342ac1c89edcc2d0` and does NOT satisfy
+    /// `path_has_unauthenticated_crate_stamp`. What is NOT bounded that way is
+    /// the rest of the path — generic arguments and `<Self as Trait>` headers are
+    /// rendered from types a user chooses, which is exactly why
+    /// `path_has_unauthenticated_crate_stamp` scans the WHOLE path rather than
+    /// its root.
+    ///
+    /// Either way an identity cannot be forged, because it is never parsed out of
+    /// the path at all.
+    #[test]
+    fn a_trust_crate_stamp_is_text_and_authenticates_nothing() {
+        let stamped = "__trust_crate@1973d11b2baa21fa::alloc::vec::Vec::<u8>::len";
+        let real = call(stamped, Some(honest(9)));
+        let impostor = call(stamped, None);
+        assert!(crate::path_has_unauthenticated_crate_stamp(stamped));
+        assert_eq!(rendered(&real), rendered(&impostor));
+        assert_eq!(identity_of(&impostor), None);
+        assert_ne!(identity_of(&real), identity_of(&impostor));
+        // And a DIFFERENT crate with the same rendered stamp is a different
+        // identity, which is the fact the hex digits in the string only *look*
+        // like they carry.
+        let other_crate = CalleeIdentity { stable_crate_id: 0x1973_d11b_2baa_21fb, ..honest(9) };
+        assert_ne!(Some(other_crate), identity_of(&real));
+    }
+
+    /// THE PATH-MIMICKING MODULE. `mod core { pub mod option { .. } }` — a user
+    /// item whose def path renders as a sysroot one.
+    ///
+    /// MEASURED on deployed driver `342ac1c89edcc2d0`: a user `core::option::
+    /// Option::<T>::unwrap` whose body is `panic!(..)` renders
+    /// `CIM::core::option::Option::<u32>::unwrap` — the crate root is present, so
+    /// the mimicry is bounded by the leading segment for a whole-path predicate,
+    /// and NOT bounded at all for the many predicates in this pipeline that match
+    /// on a SUFFIX or a method tail. The two are different crates, so their
+    /// `stable_crate_id` differs and the identity separates them unconditionally,
+    /// whatever a given predicate chose to look at.
+    #[test]
+    fn a_path_mimicking_module_collides_as_text_and_not_as_identity() {
+        for mimic in [
+            "core::option::Option::<u64>::unwrap",
+            "alloc::string::String::len",
+            "std::vec::Vec::<u8>::push",
+            "core::slice::<impl [u8]>::iter",
+        ] {
+            let real = call(mimic, Some(honest(3)));
+            let user_module =
+                call(mimic, Some(CalleeIdentity { stable_crate_id: 42, ..honest(3) }));
+            assert_eq!(rendered(&real), rendered(&user_module), "identical as text: {mimic}");
+            assert_ne!(
+                identity_of(&real),
+                identity_of(&user_module),
+                "a user module that renders like a sysroot path is a different crate: {mimic}"
+            );
+        }
+        // The same item name in the same crate at a different `DefIndex` — two
+        // sibling `fn S` / `struct S` members that rustc's disambiguator prints
+        // identically (see `apply_cross_namespace_tag`) — also separates.
+        assert_ne!(honest(3), honest(4));
+    }
+
+    /// SERIALIZED-IR COMPATIBILITY, both directions.
+    ///
+    /// An artifact written before this field existed must still load, and must
+    /// load as `None` — i.e. it must fail CLOSED into "no identity-based
+    /// discharge", never into "compare the strings".
+    #[test]
+    fn an_artifact_without_the_field_loads_and_fails_closed() {
+        // The pre-carrier wire form, built the only way that cannot drift from
+        // what a real old artifact contains: serialize with no identity, which
+        // (see `none_is_invisible_on_the_wire_and_some_is_not`) omits the key
+        // entirely and is therefore byte-identical to what the previous model
+        // wrote.
+        let legacy = serde_json::to_string(&call("krate::f", None)).expect("serializes");
+        assert!(!legacy.contains("callee_identity"), "the fixture must really lack the field");
+        let decoded: Terminator =
+            serde_json::from_str(&legacy).expect("a pre-carrier artifact must still load");
+        assert_eq!(identity_of(&decoded), None, "absent field ⇒ absent identity ⇒ fail closed");
+        assert_eq!(rendered(&decoded), "krate::f", "the display field is untouched");
+        // An artifact that spells the field explicitly null loads the same way.
+        let explicit_null = legacy.replace(r#""func":"#, r#""callee_identity":null,"func":"#);
+        assert!(explicit_null.contains("callee_identity"));
+        let decoded: Terminator =
+            serde_json::from_str(&explicit_null).expect("an explicit null must load");
+        assert_eq!(identity_of(&decoded), None);
+    }
+
+    /// A `None` identity must not appear on the wire AT ALL, so a bundle that
+    /// carries no identities re-serializes byte-identically to the pre-carrier
+    /// form and every audited content-hash pin survives. A `Some` identity is
+    /// hash-visible, because it asserts which function the call reaches.
+    #[test]
+    fn none_is_invisible_on_the_wire_and_some_is_not() {
+        let without = serde_json::to_string(&call("krate::f", None)).expect("serializes");
+        assert!(
+            !without.contains("callee_identity"),
+            "an absent identity must not move any shipped content hash: {without}"
+        );
+        let with = serde_json::to_string(&call("krate::f", Some(honest(5)))).expect("serializes");
+        assert!(with.contains("callee_identity"), "a present identity IS content: {with}");
+        assert_ne!(without, with);
+        // Round-trip: what we write, we read back unchanged.
+        let back: Terminator = serde_json::from_str(&with).expect("round-trips");
+        assert_eq!(identity_of(&back), Some(honest(5)));
     }
 }

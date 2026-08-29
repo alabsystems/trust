@@ -1,5 +1,6 @@
 use rustc_abi::Integer;
 use rustc_const_eval::const_eval::mk_eval_cx_for_const_val;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet}; // Trust: correlated-branch-chain gate
 use rustc_middle::mir::interpret::Scalar; // Trust: for the simplify_switch_comparison rewrite
 use rustc_middle::mir::visit::{PlaceContext, Visitor}; // Trust: liveness check for the range fold
 use rustc_middle::mir::*;
@@ -22,6 +23,24 @@ impl<'tcx> crate::MirPass<'tcx> for MatchBranchSimplification {
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let typing_env = body.typing_env(tcx);
+        // Trust: places that more than one `SwitchInt` in this body tests -- a correlated-branch
+        // chain. `simplify_switch_comparison` must leave every switch in such a chain alone; see
+        // the gate in that function for why. Computed once here rather than per candidate block:
+        // the check is symmetric, so a predecessor/successor scan from inside the per-block loop
+        // would depend on visit order and protect only one end of the pair.
+        let mut switch_discr_counts: FxHashMap<Place<'tcx>, u32> = FxHashMap::default();
+        for bb in body.basic_blocks.indices() {
+            if let TerminatorKind::SwitchInt { discr, .. } =
+                &body.basic_blocks[bb].terminator().kind
+                && let Some(place) = discr.place()
+            {
+                *switch_discr_counts.entry(place).or_insert(0) += 1;
+            }
+        }
+        let correlated: FxHashSet<Place<'tcx>> = switch_discr_counts
+            .into_iter()
+            .filter_map(|(place, n)| (n > 1).then_some(place))
+            .collect();
         let mut changed = false;
         for bb in body.basic_blocks.indices() {
             // Trust: arms that unify collapse via `simplify_match`; a switch whose arms
@@ -29,7 +48,7 @@ impl<'tcx> crate::MirPass<'tcx> for MatchBranchSimplification {
             // contiguous range is rewritten to the comparison shape if/else produces.
             if candidate_match(body, bb) {
                 changed |= simplify_match(tcx, typing_env, body, bb);
-            } else if simplify_switch_comparison(tcx, body, bb) {
+            } else if simplify_switch_comparison(tcx, body, bb, &correlated) {
                 changed = true;
             } else if simplify_range_comparison(tcx, body, bb) {
                 changed = true;
@@ -359,6 +378,7 @@ fn simplify_switch_comparison<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mut Body<'tcx>,
     switch_bb: BasicBlock,
+    correlated: &FxHashSet<Place<'tcx>>,
 ) -> bool {
     let TerminatorKind::SwitchInt { discr, targets } =
         &body.basic_blocks[switch_bb].terminator().kind
@@ -405,6 +425,21 @@ fn simplify_switch_comparison<'tcx>(
     {
         return false;
     }
+    // Don't split a correlated-branch chain. `JumpThreading` runs after this pass but BEFORE
+    // `EarlyOtherwiseBranch` guarded above, and it correlates a switch with a dominating switch
+    // by comparing the two terminators' discriminant *places*. Rewriting one switch of such a
+    // pair onto a fresh bool temp makes the two terminators read unrelated locals, so the
+    // correlation is lost permanently and a redundant guard survives into codegen. The damage is
+    // invisible in the final MIR because `SimplifyComparisonIntegral` converts the survivor back,
+    // leaving no `Eq` behind -- which is why this outlived the commit that introduced the rewrite.
+    //
+    // The condition is on the WHOLE body, not on this block's predecessors: the relation is
+    // symmetric, and a predecessor-only scan protects whichever end the visit order happens to
+    // reach first while rewriting the other -- measured, it left the pair on `_5` and `_13` and
+    // fixed nothing. Regression test: `tests/mir-opt/pre-codegen/drop_boxed_slice.rs`.
+    if correlated.contains(&discr_place) {
+        return false;
+    }
     let source_info = body.basic_blocks[switch_bb].terminator().source_info;
     let span = source_info.span;
     let discr = discr.clone();
@@ -413,7 +448,9 @@ fn simplify_switch_comparison<'tcx>(
         span,
         user_ty: None,
         const_: Const::Val(
-            ConstValue::Scalar(Scalar::Int(ScalarInt::try_from_uint(size.truncate(val), size).unwrap())),
+            ConstValue::Scalar(Scalar::Int(
+                ScalarInt::try_from_uint(size.truncate(val), size).unwrap(),
+            )),
             discr_ty,
         ),
     }));
@@ -424,7 +461,11 @@ fn simplify_switch_comparison<'tcx>(
         block: switch_bb,
         statement_index: body.basic_blocks[switch_bb].statements.len(),
     };
-    patch.add_assign(loc, Place::from(eq), Rvalue::BinaryOp(BinOp::Eq, Box::new((discr, val_const))));
+    patch.add_assign(
+        loc,
+        Place::from(eq),
+        Rvalue::BinaryOp(BinOp::Eq, Box::new((discr, val_const))),
+    );
     // bool switch: 0 (discr != val) -> otherwise ; otherwise (== 1, discr == val) -> val_bb.
     patch.patch_terminator(
         switch_bb,
@@ -555,7 +596,9 @@ fn simplify_range_comparison<'tcx>(
             span,
             user_ty: None,
             const_: Const::Val(
-                ConstValue::Scalar(Scalar::Int(ScalarInt::try_from_uint(size.truncate(v), size).unwrap())),
+                ConstValue::Scalar(Scalar::Int(
+                    ScalarInt::try_from_uint(size.truncate(v), size).unwrap(),
+                )),
                 discr_ty,
             ),
         }))

@@ -65,6 +65,9 @@ pub mod chc;
 /// E6 structural facet scan — Pure/Total/Deterministic/NoPanic findings for
 /// definitional spec use of program functions (two-language design §3.1).
 pub mod facets;
+// The exactness rules for meeting two declared machine-integer domains, and the
+// scan that says which of the three reasons a formula has no single domain.
+pub(crate) mod machine_domain;
 // Made pub for trust_wp contract IR builder access.
 pub(crate) mod contracts;
 pub use contracts::{
@@ -227,8 +230,10 @@ pub(crate) mod witness_gen;
 // Solver-agnostic proof witness extraction and validation.
 pub(crate) mod witness_validate;
 // horn_clause.rs removed — CHC generation now via chc.rs and ay/trust-mc directly.
-// sp.rs + sp_engine.rs removed — SP now handled by trust_wp.
-// MIR-to-Formula coverage matrix for systematic gap analysis.
+// sp.rs + sp_engine.rs removed — active VC handling now flows through
+// `generate`, `chc`, and `guards`; TrustWP is a zero-capability compatibility
+// surface and carries no verdict authority.
+// MIR handling coverage matrix for systematic gap analysis.
 pub(crate) mod coverage;
 // Certified translation validation with clean-backed proof certificates.
 pub(crate) mod certified_transval;
@@ -273,7 +278,7 @@ pub use binary_analysis::relift::{
 pub use call_graph::{
     Scc, build_call_graph, detect_cycles, is_self_recursive, recursive_functions,
 };
-// sp_engine re-exports removed — SP now in trust_wp.
+// sp_engine re-exports removed; no SP compatibility API remains.
 
 // Re-export certified translation validation API.
 pub use certified_transval::{
@@ -347,7 +352,9 @@ pub use memory_provenance::{BorrowStack, ProvenanceTracker, check_provenance};
 // Trust: Re-export modular verification API.
 pub use modular::{
     ContractCheck, FunctionSummary, ModularVcResult, ModularVerifier, SummaryDatabase,
-    clean_origin_wrapping_binop_postconditions, generate_modular_vcs, modular_vcgen,
+    clean_origin_declared_precondition, clean_origin_declared_preconditions,
+    clean_origin_summary, clean_origin_wrapping_binop_postconditions, generate_modular_vcs,
+    modular_vcgen,
 };
 // Re-export ownership and borrow checking API.
 pub use ownership::{BorrowKind, BorrowRecord, BorrowState, BorrowViolation, scan_body};
@@ -408,6 +415,9 @@ pub use summaries::{SummaryStore, substitute_callee_summary};
 pub use trait_verify::{
     ImplContract, TraitContract, liskov_contracts_have_exact_identity, verify_liskov,
 };
+// Trust: McCarthy array-theory channel uses FxHashMap for the linear version
+// prepass and BlockId to key per-block entry versions.
+use trust_types::fx::FxHashMap;
 // bounds re-exports removed — functionality migrated to trust-bmc.
 
 // The translation-validation vocabulary is defined once, in
@@ -419,17 +429,14 @@ pub use trust_types::translation_validation::{
     CheckKind, RefinementVc, SimulationRelation, TranslationCheck, TranslationValidationError,
     infer_identity_relation,
 };
-// Trust: McCarthy array-theory channel uses FxHashMap for the linear version
-// prepass and BlockId to key per-block entry versions.
-use trust_types::fx::FxHashMap;
 use trust_types::{
-    AggregateKind, BlockId, ConstValue, DiscoveredClause, Formula, Operand, PathMapEntry, Place,
-    Projection, ProofLevel, Rvalue, Sort, SortFromTy, Statement, Terminator, Ty,
+    AggregateKind, BinOp, BlockId, ConstValue, DiscoveredClause, Formula, Operand, PathMapEntry,
+    Place, Projection, ProofLevel, Rvalue, Sort, SortFromTy, SourceSpan, Statement, Terminator, Ty,
     VerifiableFunction, VerificationCondition,
 };
 #[cfg(test)]
 use trust_types::{
-    AssertMessage, AtomicOpKind, AtomicOperation, AtomicOrdering, BasicBlock, BinOp, ClauseTarget,
+    AssertMessage, AtomicOpKind, AtomicOperation, AtomicOrdering, BasicBlock, ClauseTarget,
     GuardCondition, LocalDecl, VerifiableBody,
 };
 // Re-export type state verification API.
@@ -600,6 +607,469 @@ fn validate_operand_references(
     }
 }
 
+/// The fixed-width integer identity accepted for UB-bearing unchecked
+/// arithmetic. Rust has only these five concrete integer widths; accepting an
+/// arbitrary serialized `Ty::Int` width would let a hand-built carrier select
+/// bounds that no Rust operation has.
+pub(crate) fn fixed_width_integer_descriptor(ty: &Ty) -> Option<(u32, bool)> {
+    let (width, signed) = match ty {
+        Ty::Int { width, signed } => (*width, *signed),
+        Ty::PtrSizedInt { signed } => (64, *signed),
+        _ => return None,
+    };
+    matches!(width, 8 | 16 | 32 | 64 | 128).then_some((width, signed))
+}
+
+fn signed_constant_fits_width(value: i128, width: u32) -> bool {
+    if width == 128 {
+        return true;
+    }
+    let limit = 1_i128 << (width - 1);
+    (-limit..=limit - 1).contains(&value)
+}
+
+fn unsigned_constant_fits_width(value: u128, width: u32) -> bool {
+    width == 128 || value < (1_u128 << width)
+}
+
+fn unchecked_operand_matches_integer_type(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    expected: (u32, bool),
+) -> bool {
+    let (width, signed) = expected;
+    match operand {
+        // Preserve the exact fail-closed marker: `generate::unsupported`
+        // traverses this operand and emits its `UnsupportedMir` row. It is
+        // admissible only after the assignment destination itself established
+        // a real fixed-width integer operation.
+        Operand::Unsupported { .. } => true,
+        // Signed constants intentionally carry no width in TrustIR. Bind them
+        // to the assignment's integer type and require representability.
+        Operand::Constant(ConstValue::Int(value)) => {
+            signed && signed_constant_fits_width(*value, width)
+        }
+        Operand::Constant(ConstValue::Uint(value, encoded_width)) => {
+            !signed && *encoded_width == width && unsigned_constant_fits_width(*value, width)
+        }
+        // The safety walker does not yet authorize projection-bearing reads in
+        // this newly admitted carrier. Keep admission to whole locals so an
+        // indexed/dereferenced load cannot acquire only an overflow row while
+        // silently missing its own memory-safety obligation.
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
+            operand_ty_cow(func, operand)
+                .and_then(|ty| fixed_width_integer_descriptor(&ty))
+                .is_some_and(|actual| actual == expected)
+        }
+        // `OpaqueScalar` occurrences carry no identity. The generic formula
+        // renderer aliases two same-typed occurrences, so accepting them here
+        // could turn `opaque_a - opaque_b` into the false proof `x - x`.
+        Operand::Constant(ConstValue::OpaqueScalar { .. }) => false,
+        Operand::Constant(_) => operand_ty_cow(func, operand)
+            .and_then(|ty| fixed_width_integer_descriptor(&ty))
+            .is_some_and(|actual| actual == expected),
+        // Formula sorts do not retain Rust's signed fixed-width identity. A
+        // symbolic `Int` must not be guessed to mean i64 at this authority
+        // boundary.
+        Operand::Copy(_) | Operand::Move(_) | Operand::Symbolic(_) => false,
+        _ => false,
+    }
+}
+
+fn validate_unchecked_assignment_types(
+    func: &VerifiableFunction,
+    destination: &Place,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Result<(), VcgenError> {
+    let destination_ty = place_ty_cow(func, destination);
+    // Trust: the error is built in a `let` rather than inline in `ok_or_else`
+    // because rustfmt does not CONVERGE on the inline spelling — `x.py fmt`
+    // emits one layout and tidy's own fmt check demands another, so the file
+    // is unformattable-in-place either way (measured 2026-08-22).
+    let malformed = VcgenError::MalformedMir {
+        function: func.name.clone(),
+        detail: "UncheckedBinaryOp assignment destination must be a supported fixed-width integer"
+            .to_string(),
+    };
+    let expected =
+        destination_ty.as_deref().and_then(fixed_width_integer_descriptor).ok_or(malformed)?;
+
+    for (side, operand) in [("lhs", lhs), ("rhs", rhs)] {
+        if !unchecked_operand_matches_integer_type(func, operand, expected) {
+            return Err(VcgenError::MalformedMir {
+                function: func.name.clone(),
+                detail: format!(
+                    "UncheckedBinaryOp {side} must match the destination's supported fixed-width integer type"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_checked_assignment_types(
+    func: &VerifiableFunction,
+    destination: &Place,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Result<(), VcgenError> {
+    // Faithful `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow` MIR writes
+    // one whole `(value, overflow)` tuple local.  A projected destination is a
+    // different carrier: it can alias an earlier tuple definition and breaks
+    // the statement identity used by the checked-assert recovery code.
+    if !destination.projections.is_empty() {
+        return Err(VcgenError::MalformedMir {
+            function: func.name.clone(),
+            detail: "CheckedBinaryOp assignment destination must be a whole tuple local"
+                .to_string(),
+        });
+    }
+    let destination_ty = place_ty_cow(func, destination);
+    let expected = match destination_ty.as_deref() {
+        Some(Ty::Tuple(fields)) if fields.len() == 2 && fields[1] == Ty::Bool => {
+            fixed_width_integer_descriptor(&fields[0])
+        }
+        _ => None,
+    }
+    .ok_or_else(|| VcgenError::MalformedMir {
+        function: func.name.clone(),
+        detail: "CheckedBinaryOp assignment destination must be exactly (supported fixed-width integer, bool)"
+            .to_string(),
+    })?;
+
+    for (side, operand) in [("lhs", lhs), ("rhs", rhs)] {
+        // Real overflow-checked MIR reads projection-bearing places —
+        // `AddWithOverflow(copy (_1.0), copy (_1.1))` is rustc's spelling of
+        // `t.0 + t.1` — so a place operand is admitted exactly like the plain
+        // BinaryOp lane: by its RESOLVED type matching the integer identity the
+        // tuple destination already established. This stays fail-closed (an
+        // unresolvable or mismatched projection type still rejects). The
+        // UncheckedBinaryOp whole-local restriction is deliberately NOT copied
+        // here: that lane is UB-bearing and its comment records a safety-walker
+        // gap; the checked lane is panic-guarded, and its projected reads carry
+        // their own independent memory-safety obligations.
+        let matches_expected = match operand {
+            Operand::Copy(_) | Operand::Move(_) => operand_ty_cow(func, operand)
+                .as_deref()
+                .and_then(fixed_width_integer_descriptor)
+                .is_some_and(|actual| actual == expected),
+            _ => unchecked_operand_matches_integer_type(func, operand, expected),
+        };
+        if !matches_expected {
+            return Err(VcgenError::MalformedMir {
+                function: func.name.clone(),
+                detail: format!(
+                    "CheckedBinaryOp {side} must match the tuple payload's supported fixed-width integer type"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn supported_binary_integer(ty: &Ty) -> bool {
+    fixed_width_integer_descriptor(ty).is_some()
+}
+
+fn supported_binary_float(ty: &Ty) -> bool {
+    matches!(ty, Ty::Float { width: 32 | 64 })
+}
+
+fn supported_binary_comparison_input(ty: &Ty) -> bool {
+    matches!(ty, Ty::Bool | Ty::Char | Ty::RawPtr { .. } | Ty::FnPtr { .. })
+        || supported_binary_integer(ty)
+        || supported_binary_float(ty)
+}
+
+fn ordering_result_type(ty: &Ty) -> bool {
+    matches!(ty, Ty::Adt { name, .. }
+        if matches!(name.as_str(), "cmp::Ordering" | "core::cmp::Ordering" | "std::cmp::Ordering"))
+}
+
+/// Whether `operand` is a faithful spelling of a value with the exact Rust
+/// type `expected`.  Constants are contextual in MIR: a signed literal carries
+/// no width in TrustIR, so the destination/input type supplies that identity
+/// and the value must fit it.  Identity-less OpaqueScalar and explicit
+/// Unsupported carriers are admitted only when a surrounding typed operand or
+/// destination already established the type; the global unsupported walker
+/// then emits the mandatory fail-closed row before any proof can publish.
+fn binary_operand_matches_type(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    expected: &Ty,
+) -> bool {
+    match operand {
+        Operand::Copy(_) | Operand::Move(_) => {
+            operand_ty_cow(func, operand).as_deref() == Some(expected)
+        }
+        Operand::Unsupported { .. } => true,
+        Operand::Constant(ConstValue::Bool(_)) => expected == &Ty::Bool,
+        Operand::Constant(ConstValue::Int(value)) => fixed_width_integer_descriptor(expected)
+            .is_some_and(|(width, signed)| signed && signed_constant_fits_width(*value, width)),
+        Operand::Constant(ConstValue::Uint(value, encoded_width)) => match expected {
+            Ty::Char => {
+                *encoded_width == 32
+                    && u32::try_from(*value).ok().and_then(char::from_u32).is_some()
+            }
+            _ => fixed_width_integer_descriptor(expected).is_some_and(|(width, signed)| {
+                !signed && *encoded_width == width && unsigned_constant_fits_width(*value, width)
+            }),
+        },
+        Operand::Constant(ConstValue::Float(_)) => expected == &Ty::Float { width: 64 },
+        Operand::Constant(ConstValue::FloatBits { bits, width }) => {
+            expected == &Ty::Float { width: *width }
+                && matches!(*width, 32 | 64)
+                && unsigned_constant_fits_width(*bits, *width)
+        }
+        // The MIR extractor uses the otherwise-impossible unsigned width-one
+        // spelling for `const B: bool`.  Preserve that identity as Bool rather
+        // than rejecting faithful `B & x` / `B == x` carriers as malformed.
+        Operand::Constant(ConstValue::ConstParam { width: 1, signed: false, .. }) => {
+            expected == &Ty::Bool
+        }
+        Operand::Constant(ConstValue::ConstParam { width, signed, .. }) => {
+            fixed_width_integer_descriptor(expected) == Some((*width, *signed))
+        }
+        Operand::Constant(ConstValue::OpaqueScalar { width, signed }) => {
+            fixed_width_integer_descriptor(expected) == Some((*width, *signed))
+        }
+        Operand::Constant(
+            ConstValue::Unit
+            | ConstValue::Str { .. }
+            | ConstValue::OpaqueConst
+            | ConstValue::UnitVariantRef { .. }
+            | ConstValue::CallableItem { .. },
+        ) => false,
+        // A symbolic operand carries a FORMULA sort, not a Rust type. A
+        // mathematical `Sort::Int` is widthless and must never be guessed to
+        // mean i64 (or any fixed width) at this authority boundary — that
+        // shape stays rejected, as does any other sort. An exact-width
+        // `Sort::BitVec(w)` is the one spelling that authenticates the WIDTH
+        // precisely: admit it only when `w` equals the audited destination
+        // integer width, where the two value spaces coincide bit-for-bit, and
+        // let the validated destination supply signedness exactly as it
+        // already does for widthless constants. `binary_operand_self_type`
+        // still returns `None` for symbolic operands, so a formula can never
+        // ESTABLISH the type — an already-validated destination or typed peer
+        // must.
+        Operand::Symbolic(formula) => fixed_width_integer_descriptor(expected)
+            .is_some_and(|(width, _signed)| formula_sort(formula) == Some(Sort::BitVec(width))),
+        _ => false,
+    }
+}
+
+/// A type an operand can establish without contextual help.  In particular,
+/// `ConstValue::Int` deliberately returns `None`: TrustIR does not retain its
+/// Rust width, so two signed literals cannot authenticate a public comparison
+/// carrier.  Opaque/Unsupported operands likewise never establish authority.
+fn binary_operand_self_type(func: &VerifiableFunction, operand: &Operand) -> Option<Ty> {
+    match operand {
+        Operand::Copy(_) | Operand::Move(_) => {
+            operand_ty_cow(func, operand).map(|ty| ty.into_owned())
+        }
+        Operand::Constant(ConstValue::Bool(_)) => Some(Ty::Bool),
+        Operand::Constant(ConstValue::Uint(value, width))
+            if matches!(*width, 8 | 16 | 32 | 64 | 128)
+                && unsigned_constant_fits_width(*value, *width) =>
+        {
+            Some(Ty::Int { width: *width, signed: false })
+        }
+        Operand::Constant(ConstValue::Float(_)) => Some(Ty::Float { width: 64 }),
+        Operand::Constant(ConstValue::FloatBits { bits, width })
+            if matches!(*width, 32 | 64) && unsigned_constant_fits_width(*bits, *width) =>
+        {
+            Some(Ty::Float { width: *width })
+        }
+        Operand::Constant(ConstValue::ConstParam { width: 1, signed: false, .. }) => Some(Ty::Bool),
+        Operand::Constant(ConstValue::ConstParam { width, signed, .. })
+            if matches!(*width, 8 | 16 | 32 | 64 | 128) =>
+        {
+            Some(Ty::Int { width: *width, signed: *signed })
+        }
+        _ => None,
+    }
+}
+
+fn exact_binary_input_type(func: &VerifiableFunction, lhs: &Operand, rhs: &Operand) -> Option<Ty> {
+    // EITHER side may be the one that establishes the shared input type: rustc
+    // spells `c == 'a'` and `'a' == c` symmetrically, so try BOTH self-types
+    // and accept the first under which both operands authenticate. Each
+    // candidate is still an ESTABLISHED identity (a resolved place type or a
+    // width-carrying constant), never a guess.
+    let candidates = [binary_operand_self_type(func, lhs), binary_operand_self_type(func, rhs)];
+    for expected in candidates.into_iter().flatten() {
+        if binary_operand_matches_type(func, lhs, &expected)
+            && binary_operand_matches_type(func, rhs, &expected)
+        {
+            return Some(expected);
+        }
+    }
+    // Literal-literal comparisons are real MIR — rustc emits
+    // `Eq(const 2_i32, const 0_i32)` on the constant-divisor `n % 2` path — and
+    // have NO width-carrying side, because trust-mir-extract lowers every
+    // signed literal to widthless `ConstValue::Int`. Bind both as the WIDEST
+    // signed check: both concrete values are exactly established, mathematical
+    // comparison of two definite integers agrees with Rust's comparison at any
+    // width where both are representable, and the comparison destination is
+    // `bool`, which carries no width identity a wrong binding could violate.
+    if let (
+        Operand::Constant(ConstValue::Int(lhs_value)),
+        Operand::Constant(ConstValue::Int(rhs_value)),
+    ) = (lhs, rhs)
+        && signed_constant_fits_width(*lhs_value, 128)
+        && signed_constant_fits_width(*rhs_value, 128)
+    {
+        return Some(Ty::Int { width: 128, signed: true });
+    }
+    None
+}
+
+/// A RESOLVED raw-pointer type whose pointee is statically sized, so the value
+/// is one thin address word with no metadata. `SymArray` is excluded because the
+/// native TrustIr bridge currently carries it with the slice fat-pointer
+/// representation (see `thread_local_ref_thin_address_ty` in
+/// `generate::slice_conversion`).
+fn thin_raw_pointer_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::RawPtr { pointee, .. } => !matches!(
+            pointee.as_ref(),
+            Ty::Slice { .. }
+                | Ty::Str
+                | Ty::SymArray { .. }
+                | Ty::Dynamic { .. }
+                | Ty::Unsupported { .. }
+        ),
+        _ => false,
+    }
+}
+
+/// The pointer-identity comparison the extraction emits around thin
+/// pointer-to-pointer casts: `Eq(copy casted, copy src)` where the two RESOLVED
+/// raw-pointer types differ only in pointee/mutability (`*const u32` vs
+/// `*const u8`). Admission is granted only from established identity: both
+/// operands must be typed reads whose resolved types are THIN raw pointers, so
+/// each models as the same Int-sorted address term, and thin-pointer `==`/`!=`
+/// in Rust is exactly address equality — independent of pointee type and
+/// mutability. Fat pointers never qualify (their `==` also compares metadata,
+/// which an address-only formula would drop), and constants carry no resolved
+/// pointer identity here.
+fn thin_pointer_address_comparison(
+    func: &VerifiableFunction,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> bool {
+    [lhs, rhs].into_iter().all(|operand| {
+        matches!(operand, Operand::Copy(_) | Operand::Move(_))
+            && operand_ty_cow(func, operand).as_deref().is_some_and(thin_raw_pointer_ty)
+    })
+}
+
+fn malformed_binary_carrier(func: &VerifiableFunction, op: BinOp, family: &str) -> VcgenError {
+    VcgenError::MalformedMir {
+        function: func.name.clone(),
+        detail: format!(
+            "BinaryOp({op:?}) does not match the audited Rust {family} operand/destination types"
+        ),
+    }
+}
+
+fn validate_binary_assignment_types(
+    func: &VerifiableFunction,
+    destination: &Place,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Result<(), VcgenError> {
+    let destination_ty = place_ty_cow(func, destination)
+        .map(|ty| ty.into_owned())
+        .ok_or_else(|| malformed_binary_carrier(func, op, "unknown"))?;
+
+    let valid = match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            (supported_binary_integer(&destination_ty) || supported_binary_float(&destination_ty))
+                && binary_operand_matches_type(func, lhs, &destination_ty)
+                && binary_operand_matches_type(func, rhs, &destination_ty)
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            (supported_binary_integer(&destination_ty) || destination_ty == Ty::Bool)
+                && binary_operand_matches_type(func, lhs, &destination_ty)
+                && binary_operand_matches_type(func, rhs, &destination_ty)
+        }
+        BinOp::Shl | BinOp::Shr => {
+            supported_binary_integer(&destination_ty)
+                && binary_operand_matches_type(func, lhs, &destination_ty)
+                && match rhs {
+                    // rustc spells a literal shift amount as a bare signed
+                    // constant — `Shl(copy _1, const 3_i32)` for `x << 3` — and
+                    // trust-mir-extract lowers every signed literal to widthless
+                    // `ConstValue::Int`. The amount's concrete VALUE is fully
+                    // established even though its Rust width is not retained,
+                    // and the amount's width never touches the destination's
+                    // arithmetic identity: the shift-amount bound obligation is
+                    // emitted independently by the safety lane against the
+                    // destination width. Value-less carriers (OpaqueScalar,
+                    // Symbolic, unresolvable reads) still must self-authenticate
+                    // below or reject.
+                    Operand::Constant(ConstValue::Int(_)) => true,
+                    _ => binary_operand_self_type(func, rhs).as_ref().is_some_and(|ty| {
+                        supported_binary_integer(ty) && binary_operand_matches_type(func, rhs, ty)
+                    }),
+                }
+        }
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            destination_ty == Ty::Bool
+                && (exact_binary_input_type(func, lhs, rhs)
+                    .as_ref()
+                    .is_some_and(supported_binary_comparison_input)
+                    || (matches!(op, BinOp::Eq | BinOp::Ne)
+                        && thin_pointer_address_comparison(func, lhs, rhs)))
+        }
+        BinOp::Cmp => {
+            ordering_result_type(&destination_ty)
+                && exact_binary_input_type(func, lhs, rhs)
+                    .as_ref()
+                    .is_some_and(|ty| supported_binary_integer(ty) || matches!(ty, Ty::Char))
+        }
+        // Pointer offset has a dedicated Rvalue whose fail-closed bounds lane
+        // carries the required provenance; every future BinOp is unaudited.
+        _ => false,
+    };
+
+    if valid { Ok(()) } else { Err(malformed_binary_carrier(func, op, "binary operation")) }
+}
+
+fn validate_ptr_metadata_assignment_types(
+    func: &VerifiableFunction,
+    destination: &Place,
+    operand: &Operand,
+) -> Result<(), VcgenError> {
+    if !destination.projections.is_empty() {
+        return Err(VcgenError::MalformedMir {
+            function: func.name.clone(),
+            detail: "PtrMetadata assignment destination must be a whole local".to_string(),
+        });
+    }
+    let destination_ty = place_ty_cow(func, destination);
+    let valid = match ptr_metadata_model(func, operand) {
+        PtrMetadataModel::Length(_) => destination_ty.as_deref() == Some(&Ty::usize()),
+        PtrMetadataModel::Unit => destination_ty.as_deref() == Some(&Ty::Unit),
+        // Preserve an explicit unsupported metadata carrier so the unsupported
+        // collector can emit the visible fail-closed row.
+        PtrMetadataModel::Unsupported => true,
+        PtrMetadataModel::Invalid => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(VcgenError::MalformedMir {
+            function: func.name.clone(),
+            detail: "PtrMetadata requires a pointer operand and its exact Rust metadata destination type"
+                .to_string(),
+        })
+    }
+}
+
 fn validate_rvalue_references(
     func: &VerifiableFunction,
     rvalue: &Rvalue,
@@ -609,10 +1079,40 @@ fn validate_rvalue_references(
         | Rvalue::UnaryOp(_, operand)
         | Rvalue::Cast(operand, _)
         | Rvalue::Repeat(operand, _) => validate_operand_references(func, operand),
-        Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+        Rvalue::BinaryOp(_, lhs, rhs) => {
             validate_operand_references(func, lhs)?;
             validate_operand_references(func, rhs)
         }
+        // rustc's `CheckedBinaryOp` carrier is the `(value, overflow)` tuple
+        // produced only by AddWithOverflow/SubWithOverflow/MulWithOverflow.
+        // Other public BinOp spellings have no audited tuple semantics and must
+        // not reach consumers that assume this shape.
+        Rvalue::CheckedBinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, lhs, rhs) => {
+            validate_operand_references(func, lhs)?;
+            validate_operand_references(func, rhs)
+        }
+        Rvalue::CheckedBinaryOp(op, _, _) => Err(VcgenError::MalformedMir {
+            function: func.name.clone(),
+            detail: format!(
+                "CheckedBinaryOp({op:?}) is not an admitted WithOverflow operation; only Add, Sub, and Mul produce the audited (value, bool) carrier"
+            ),
+        }),
+        // `UncheckedBinaryOp` is a live rustc MIR carrier, but only for the
+        // three arithmetic operations whose overflow is UB. Admit exactly
+        // those operations so they reach `generate::safety`'s mandatory
+        // `ArithmeticOverflow` obligation. A hand-built/stale bundle cannot
+        // smuggle another `BinOp` through this spelling: such an operation has
+        // no audited unchecked semantics and remains malformed/fail-closed.
+        Rvalue::UncheckedBinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, lhs, rhs) => {
+            validate_operand_references(func, lhs)?;
+            validate_operand_references(func, rhs)
+        }
+        Rvalue::UncheckedBinaryOp(op, _, _) => Err(VcgenError::MalformedMir {
+            function: func.name.clone(),
+            detail: format!(
+                "UncheckedBinaryOp({op:?}) is not an admitted unchecked arithmetic operation; only Add, Sub, and Mul have audited UB-on-overflow semantics"
+            ),
+        }),
         Rvalue::Ref { place, .. }
         | Rvalue::Discriminant(place)
         | Rvalue::Len(place)
@@ -649,7 +1149,23 @@ fn validate_statement_references(
     match statement {
         Statement::Assign { place, rvalue, .. } => {
             validate_place_references(func, place)?;
-            validate_rvalue_references(func, rvalue)
+            validate_rvalue_references(func, rvalue)?;
+            if let Rvalue::UncheckedBinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, lhs, rhs) =
+                rvalue
+            {
+                validate_unchecked_assignment_types(func, place, lhs, rhs)?;
+            }
+            if let Rvalue::CheckedBinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, lhs, rhs) = rvalue
+            {
+                validate_checked_assignment_types(func, place, lhs, rhs)?;
+            }
+            if let Rvalue::BinaryOp(op, lhs, rhs) = rvalue {
+                validate_binary_assignment_types(func, place, *op, lhs, rhs)?;
+            }
+            if let Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, operand) = rvalue {
+                validate_ptr_metadata_assignment_types(func, place, operand)?;
+            }
+            Ok(())
         }
         Statement::StorageLive(local) | Statement::StorageDead(local) => {
             validate_local_reference(func, *local)
@@ -712,6 +1228,18 @@ fn validate_terminator_references(
             validate_place_references(func, dest)?;
             if let Some(target) = target {
                 validate_block_reference(func, *target)?;
+            }
+            if let Some(atomic) = atomic {
+                validate_place_references(func, &atomic.place)?;
+                if let Some(dest) = &atomic.dest {
+                    validate_place_references(func, dest)?;
+                }
+            }
+            Ok(())
+        }
+        Terminator::TailCall { args, atomic, .. } => {
+            for arg in args {
+                validate_operand_references(func, arg)?;
             }
             if let Some(atomic) = atomic {
                 validate_place_references(func, &atomic.place)?;
@@ -882,12 +1410,64 @@ pub struct VcgenContext {
     def_path: String,
     single_writer: bool,
     backing: bool,
+    /// The function belongs to the standard-library crate currently being
+    /// compiled, rather than being std code inlined into another subject.
+    ///
+    /// This bit is compiler-derived at the MIR boundary. It only removes
+    /// the std-*dependency* span exemption from behavioral separation-logic
+    /// rows. Compatibility callers that have no crate-ownership information,
+    /// and owner-mismatched contexts, keep the historical dependency policy.
+    verify_stdlib_subject_memory_safety: bool,
     contract_panic_annotations: Vec<String>,
     callee_summaries: CalleeSummaryContext,
+    /// Spans of assignments the COMPILER certified as MODULAR arithmetic, with
+    /// the operation each one performs.
+    ///
+    /// Populated only by `rustc_mir_transform::trust_verify` from
+    /// `mir::Statement::trust_modular_arith`, a flag `LowerIntrinsics` sets when
+    /// it rewrites `intrinsics::wrapping_{add,sub,mul}` into a bare
+    /// `Rvalue::BinaryOp`. That rewrite is where the wrapping identity is
+    /// destroyed: MIR's plain integer `Add` IS defined wrapping, but so is the
+    /// lowering of a source-level `+` under `-Coverflow-checks=off`, and the two
+    /// are then byte-identical in the extracted MIR (measured: the same
+    /// `BinaryOp("Add", Copy(_1), Copy(_2))` for `a + b` and for
+    /// `intrinsics::wrapping_add(a, b)`). So the tag CANNOT be recovered at the
+    /// extraction seam — it has to be carried from the pass that dropped it, and
+    /// this is the carrier.
+    ///
+    /// FAIL-CLOSED: an empty set (any caller that is not the compiler, an
+    /// unflagged statement, a span that does not match exactly) leaves every
+    /// overflow obligation exactly as it is today. The set can only ever REMOVE
+    /// the obligation for an operation rustc itself certified as modular.
+    modular_arith_ops: trust_types::fx::FxHashSet<(SourceSpan, BinOp)>,
+}
+
+/// Canonical crate-name set paired with stdlib source-span recognition.
+///
+/// The compiler uses this same predicate when deciding whether stdlib is the
+/// local verification subject; keeping one list prevents subject classification
+/// from drifting away from the dependency-span exemption it controls.
+#[must_use]
+pub fn is_stdlib_crate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "core"
+            | "alloc"
+            | "std"
+            | "proc_macro"
+            | "test"
+            | "panic_abort"
+            | "panic_unwind"
+            | "std_detect"
+            | "unwind"
+    )
 }
 
 impl VcgenContext {
-    /// Start a fail-closed context owned by exactly `def_path`.
+    /// Start an empty context owned by exactly `def_path`.
+    ///
+    /// Compiler integration must add every compiler-derived policy bit,
+    /// including stdlib subject ownership, before entering generation.
     #[must_use]
     pub fn for_function(def_path: impl Into<String>) -> Self {
         Self { def_path: def_path.into(), ..Self::default() }
@@ -907,6 +1487,16 @@ impl VcgenContext {
         self
     }
 
+    /// Mark this exact function as belonging to the stdlib compilation subject.
+    ///
+    /// The default is `false`, preserving the trusted-dependency treatment for
+    /// std code whose source spans appear in a different crate's MIR.
+    #[must_use]
+    pub fn with_stdlib_subject_memory_safety(mut self, on: bool) -> Self {
+        self.verify_stdlib_subject_memory_safety = on;
+        self
+    }
+
     /// Install this function's extraction-validated contract-panic payloads.
     #[must_use]
     pub fn with_contract_panic_annotations(mut self, payloads: Vec<String>) -> Self {
@@ -918,6 +1508,22 @@ impl VcgenContext {
     #[must_use]
     pub fn with_callee_summaries(mut self, summaries: CalleeSummaryContext) -> Self {
         self.callee_summaries = summaries;
+        self
+    }
+
+    /// Install the compiler's MODULAR-arithmetic certificate for this function:
+    /// the `(span, op)` of every assignment `LowerIntrinsics` produced from
+    /// `intrinsics::wrapping_{add,sub,mul}`.
+    ///
+    /// Only `rustc_mir_transform::trust_verify` can supply this — it reads
+    /// `mir::Statement::trust_modular_arith` off the very body it is verifying.
+    /// See the field's own note for why the fact cannot be re-derived downstream.
+    #[must_use]
+    pub fn with_modular_arith_ops(
+        mut self,
+        ops: trust_types::fx::FxHashSet<(SourceSpan, BinOp)>,
+    ) -> Self {
+        self.modular_arith_ops = ops;
         self
     }
 }
@@ -975,7 +1581,8 @@ pub(crate) fn with_vcgen_context<R>(context: &VcgenContext, f: impl FnOnce() -> 
 
 /// Run a public generation entry under `context` only when it belongs to the
 /// function being generated. A mismatched owner receives a fresh empty frame:
-/// function-local policy and crate-derived callee facts both fail closed.
+/// proof-granting policy and crate-derived callee facts cannot cross owners,
+/// while stdlib-span handling falls back to its compatibility dependency mode.
 pub(crate) fn with_function_vcgen_context<R>(
     def_path: &str,
     context: &VcgenContext,
@@ -1025,6 +1632,34 @@ pub(crate) fn single_writer_hint_for(def_path: &str) -> bool {
 #[must_use]
 pub(crate) fn backing_hint_for(def_path: &str) -> bool {
     with_current_vcgen_context(def_path, |context| context.backing).unwrap_or(false)
+}
+
+/// Did the COMPILER certify the assignment at `span` performing `op` as MODULAR
+/// arithmetic — i.e. is it the `Rvalue::BinaryOp` that `LowerIntrinsics`
+/// produced from `intrinsics::wrapping_{add,sub,mul}`?
+///
+/// A `true` here means the operation cannot overflow BY DEFINITION and its
+/// no-overflow obligation is a FALSE obligation. Everything about this predicate
+/// is fail-closed: it answers `false` for a missing context, for a context owned
+/// by a different function (no cross-function stamping — the same owner check
+/// every other policy read uses), for a span that does not match exactly, and
+/// for a different operation at the same span.
+#[must_use]
+pub(crate) fn is_certified_modular_arith(def_path: &str, span: &SourceSpan, op: BinOp) -> bool {
+    with_current_vcgen_context(def_path, |context| {
+        context.modular_arith_ops.contains(&(span.clone(), op))
+    })
+    .unwrap_or(false)
+}
+
+/// Whether stdlib-span behavioral memory-safety rows belong to this exact
+/// compilation subject. Missing or mismatched context returns `false`, matching
+/// the pre-context dependency behavior; compiler integration always supplies
+/// the crate-ownership classification explicitly.
+#[must_use]
+pub(crate) fn verify_stdlib_subject_memory_safety_for(def_path: &str) -> bool {
+    with_current_vcgen_context(def_path, |context| context.verify_stdlib_subject_memory_safety)
+        .unwrap_or(false)
 }
 
 /// The contract-panic payloads for `def_path`, or empty when no active context
@@ -1123,16 +1758,24 @@ pub fn callee_return_bool_pred(callee: &str) -> Option<generate::ReturnBoolPredS
 }
 
 pub use backing_cert::certify_backing_invariants;
-pub use paired_condvar_cert::{
-    CertifiedCondvarPair, PairedCondvarCandidate, certify_paired_condvars,
-};
 pub use generate::{
-    ReturnBoolPredKind, ReturnBoolPredSummary, ReturnDiscCases, ReturnDiscSummary, SetterSrc,
-    SetterSummary, compute_return_bool_pred_summaries, compute_return_bound_summaries,
-    compute_return_const_set_summaries, compute_return_disc_summaries,
-    compute_return_lower_bound_summaries, compute_trivial_setter_summaries,
+    ReturnBoolPredKind,
+    ReturnBoolPredSummary,
+    ReturnDiscCases,
+    ReturnDiscSummary,
+    SetterSrc,
+    SetterSummary,
+    compute_return_bool_pred_summaries,
+    compute_return_bound_summaries,
+    compute_return_const_set_summaries,
+    compute_return_disc_summaries,
+    compute_return_lower_bound_summaries,
+    compute_trivial_setter_summaries,
     // Trust (runtime ledger): proven-overflow-check elision origin surface.
     overflow_vc_block_origins,
+};
+pub use paired_condvar_cert::{
+    CertifiedCondvarPair, PairedCondvarCandidate, certify_paired_condvars,
 };
 
 /// Whether Trust already COVERS this call — either the separation engine models
@@ -1156,9 +1799,22 @@ pub fn call_has_unsafe_model(callee: &str) -> bool {
     // keeps the compiler from double-flagging those calls with an
     // always-refuting [unsafe:unmodeled-call] VC; safe ::ffi:: paths never get
     // here, so the old false-positive surface cannot return through this door.
+    //
+    // `"::intrinsics::"` is retained for EXACTLY the same reason, and by the
+    // same argument. `is_unsafe_fn_call` no longer answers `true` for the whole
+    // intrinsics namespace (it now decides on the callee's declared safety), so
+    // without this arm every rustc-unsafe intrinsic outside the transcribed
+    // leaf sets — `intrinsics::simd::*`, `intrinsics::mir::*`, anything
+    // `library/core` adds later — would newly acquire an always-refuting
+    // `[unsafe:unmodeled-call]` VC. Those calls ARE covered by the block-
+    // obligation lane through the authoritative `is_unsafe_sig`. And the
+    // reverse direction cannot leak: a SAFE intrinsic never reaches this
+    // predicate, because the compiler gates on `fn_sig().safety()` first
+    // (`trust_verify.rs:15666-15691`).
     sep_engine::call_is_modeled(&lower)
         || unsafe_verify::detection::is_unsafe_fn_call(callee)
         || lower.contains("::ffi::")
+        || lower.contains("::intrinsics::")
 }
 
 /// Trust: Filter VCs by verification level.
@@ -1174,26 +1830,21 @@ pub fn filter_vcs_by_level(
 }
 
 // Core VC generation logic extracted to generate.rs.
-#[cfg(test)]
-pub(crate) use generate::build_semantic_guard_map;
 // The AUTHORITATIVE post-call dest spelling in emitted VC formulas — the token a
 // composition lane must rebind assumed callee-ensures facts onto (pairs
 // `version_terminator_dest_fact` with the SSA-collapse license).
-pub use generate::all_callsites_precondition_dominated;
-pub use generate::call_dest_fact_token;
+#[cfg(test)]
+pub(crate) use generate::build_semantic_guard_map;
 // Its pairing partner for call ARGUMENTS: the licensed spelling of the value an
 // actual passes (bare only under the same SSA-collapse license; `None` = no
 // licensed spelling ⇒ a composition lane must transfer NOTHING through that
 // formal — the reassigned-actual fail-closed discipline).
 pub use generate::call_arg_fact_token;
-// `-full`-only assert refutation.
-pub use generate::generate_full_assert_refutation_vcs;
-// Trust: the PER-PATH, REFUTE-ONLY assert lane. Its formula UNDER-approximates
-// (exact symbolic execution of enumerated acyclic paths), so it may report a
-// refutation and nothing else — an asymmetry carried by the returned
-// `RefuteOnlyVc` type, not by a flag. See `generate::per_path_refute`.
-pub use generate::{
-    generate_per_path_assert_refutation_vcs, generate_per_path_assert_refutation_vcs_with_context,
+// Trust (coroutine resume-state contract): the sentinel refutation lane. See
+// `generate::coroutine_sentinel` for exactly what an UNSAT here does and does
+// NOT establish.
+pub use generate::coroutine_sentinel::{
+    body_has_coroutine_protocol_sentinel, coroutine_sentinel_refutation_vcs,
 };
 /// Prospective measurement-only raw-VC rehydration; this is not a compiler
 /// verdict/cache-hit authority path and must not replace fresh VC generation.
@@ -1201,15 +1852,13 @@ pub use generate::discharge_captured_raw_body_with_context;
 // Bounded-model-checking refutation of a statically-sized array reduction whose
 // accumulator genuinely overflows (refutation-only; see `bmc_reduction`).
 pub use generate::generate_bounded_reduction_bmc_refutation_candidates;
-// Trust (coroutine resume-state contract): the sentinel refutation lane. See
-// `generate::coroutine_sentinel` for exactly what an UNSAT here does and does
-// NOT establish.
-pub use generate::coroutine_sentinel::{
-    body_has_coroutine_protocol_sentinel, coroutine_sentinel_refutation_vcs,
-};
+// `-full`-only assert refutation.
+pub use generate::generate_full_assert_refutation_vcs;
 pub use generate::{
-    derive_float_result_range, generate_callsite_l0_replay_candidates,
-    generate_callsite_precondition_vcs, generate_callsite_precondition_vcs_attributed,
+    all_callsites_precondition_dominated, call_dest_fact_token, derive_float_result_range,
+    composed_formula_is_caller_entry_grounded, generate_callsite_l0_replay_candidates,
+    generate_callsite_precondition_vcs,
+    generate_callsite_precondition_vcs_attributed,
     generate_full_assert_refutation_vcs_with_context, generate_vcs,
     generate_vcs_capturing_raw_body_with_context, generate_vcs_with_context,
     generate_vcs_with_discharge, generate_vcs_with_discharge_and_summaries,
@@ -1220,6 +1869,13 @@ pub use generate::{
     generate_vcs_with_extra_precondition, regenerate_loop_contract_production_variants,
     regenerate_loop_decreases_with_invariant_feedback_production_variants,
     regenerate_recursion_decreases_production_variants,
+};
+// Trust: the PER-PATH, REFUTE-ONLY assert lane. Its formula UNDER-approximates
+// (exact symbolic execution of enumerated acyclic paths), so it may report a
+// refutation and nothing else — an asymmetry carried by the returned
+// `RefuteOnlyVc` type, not by a flag. See `generate::per_path_refute`.
+pub use generate::{
+    generate_per_path_assert_refutation_vcs, generate_per_path_assert_refutation_vcs_with_context,
 };
 
 /// Extract discovered guard clauses from a function's MIR control flow.
@@ -1273,9 +1929,9 @@ pub fn operand_ty(func: &VerifiableFunction, op: &Operand) -> Option<Ty> {
             ConstValue::Float(_) => Ty::Float { width: 64 },
             ConstValue::FloatBits { width, .. } => Ty::Float { width: *width },
             ConstValue::Unit | ConstValue::CallableItem { .. } => Ty::Unit,
-            // A typed opaque integer constant carries its declared integer type so
-            // the arithmetic/bounds VCs it feeds get the correct sort. Its VALUE is
-            // a fresh unconstrained symbol, so nothing is falsely proved.
+            // A typed opaque integer constant carries only its declared integer
+            // type. It has no occurrence identity; proof consumers must freshen
+            // or refuse it rather than infer equality from this type information.
             ConstValue::OpaqueScalar { width, signed } => {
                 Ty::Int { width: *width, signed: *signed }
             }
@@ -1432,10 +2088,16 @@ fn formula_bit_width(formula: &Formula) -> Option<u32> {
 // `place_ty`/`place_sort`/`operand_ty` query, of which there are O(places ×
 // statements). When the declared type is a deeply-nested recursive ADT — the kernel's
 // `Expr`/`ExprKind`/`Name`/`Environment` lower to fat `Ty::Adt` trees (flattened
-// enums) — those repeated deep clones drive VC-gen to multi-GB RSS and never complete.
+// enums) — those repeated deep clones drive VC-gen to multi-GB RSS.
 // `clean-kernel`'s `build_ind_app` (`for fv in param_fvars { app = Expr::app(app, fv) }`)
 // is the witness: modest declared signature, thousands of fat-`Adt` clones, minutes of
-// stall with the verifier making zero progress.
+// stall with the verifier making zero visible progress.
+//
+// (This sentence used to end "and never complete", one clause before offering "minutes
+// of stall" as its own evidence. See the CORRECTION on `MAX_BUNDLE_ADT_BUDGET` below:
+// the observation on record is memory exhaustion and multi-minute stalls, never a
+// demonstrated non-termination, and the escalation to "non-terminating" in
+// `tests/self-proof/trust-semantics.baseline` was measured false on 2026-08-28.)
 //
 // FIX (a TRUE mid-generation work-bound): meter the ACTUAL generation work — the
 // structural `Ty`-node count materialized by every type clone the generation walk
@@ -1987,9 +2649,28 @@ fn gen_work_degraded_leaf() -> Ty {
 // (`trust_verify::build_full_verification_input` → `function_to_verifier_api_bundle` /
 // `trust_ir_bridge::lower`) that recursively walks the UN-degraded declared `Ty::Adt`
 // tree with many O(datatype-size) walks. For the kernel's `Expr`/`ExprKind`/`Name`
-// cluster (a 464 MB serialized recursor type) those walks drive RSS to multi-GB and
-// never complete — the `build_ind_app` stall — and the per-function wall-clock budget is
-// enforced only at SMT dispatch, AFTER bundle construction, so it does not bound this.
+// cluster (a 464 MB serialized recursor type) those walks drive RSS to multi-GB — the
+// `build_ind_app` stall — and the per-function wall-clock budget is enforced only at
+// SMT dispatch, AFTER bundle construction, so it does not bound this.
+//
+// CORRECTION 2026-08-28 — this comment used to say those walks "never complete", and
+// that phrase propagated into `tests/self-proof/trust-semantics.baseline` as
+// "NEVER COMPLETES ... raising it re-opens a NON-TERMINATING lowering", which is what
+// stopped anyone from raising a budget for two months. No run ever backed it. The
+// runs on record (`b9b201ecc4`) describe an OOM-KILL WITH PROGRESS — "29/1771 fns in
+// 40 min" — i.e. memory exhaustion, not divergence, and the process was killed rather
+// than hung. `trust_mir_extract::ty_convert`'s own block comment already said OOM and
+// already said the stall lives in the EXTRACTOR, "not in trust-vcgen". Measured
+// directly on 2026-08-28 by ablating the extractor's budget to 100_000_000 under a
+// 900 s watchdog: extraction TERMINATED on its own in 164 s against a 171 s baseline.
+// Say "exhausts memory" or "is superlinear"; do not say "does not terminate" unless a
+// run shows it.
+//
+// SCOPE, so this correction is not over-read: the ablation was on
+// `crates/trust-semantics`, where THIS budget (`MAX_BUNDLE_ADT_BUDGET`) fires ZERO
+// times — its `"over per-function bundle ADT budget"` marker occurs nowhere in a full
+// verified run of that crate. Nothing here is a measurement of the clean-kernel
+// corpus this bound was written for, and this bound is NOT being relaxed.
 //
 // FIX: degrade an over-budget function's fat recursive `Ty::Adt` declared types to the
 // existing recursive-ADT fail-closed marker `Ty::Unsupported { kind: "TyKind::Adt",
@@ -2176,8 +2857,8 @@ pub(crate) fn operand_sort(func: &VerifiableFunction, op: &Operand) -> Option<So
             ConstValue::FloatBits { width, .. } => Sort::BitVec(*width),
             ConstValue::Unit | ConstValue::CallableItem { .. } => Sort::Int,
             // A typed opaque integer constant has integer sort (matching the
-            // Int/Uint arms above, which also map to the Int theory). Its value is a
-            // fresh unconstrained symbol.
+            // Int/Uint arms above). Sort recovery supplies no occurrence identity;
+            // proof consumers must freshen or explicitly refuse this carrier.
             ConstValue::OpaqueScalar { .. } => Sort::Int,
             // Trust: piece #7a — a const-generic PARAM value has integer sort,
             // identical to `OpaqueScalar`; its identity lives in the symbol name.
@@ -2315,9 +2996,7 @@ fn place_sort_from_declared_type(func: &VerifiableFunction, place: &Place) -> Op
             Cow::Borrowed(t) => Cow::Borrowed(declared_ty_step(t, proj, &mut pending_variant)?),
             // Owning a table-resolved definition, whose borrow cannot escape this
             // frame: step against it and clone the (small) field result to re-own.
-            Cow::Owned(t) => {
-                Cow::Owned(declared_ty_step(&t, proj, &mut pending_variant)?.clone())
-            }
+            Cow::Owned(t) => Cow::Owned(declared_ty_step(&t, proj, &mut pending_variant)?.clone()),
         };
     }
     // The place may land ON a datatype (a local or field whose own type is the
@@ -2775,13 +3454,7 @@ fn is_single_pointer_newtype_adt(ty: &Ty, fuel: u32) -> bool {
 }
 
 fn is_thin_pointer_pointee(ty: &Ty) -> bool {
-    !matches!(
-        ty,
-        Ty::Slice { .. }
-            | Ty::Str
-            | Ty::Dynamic { .. }
-            | Ty::Unsupported { .. }
-    )
+    !matches!(ty, Ty::Slice { .. } | Ty::Str | Ty::Dynamic { .. } | Ty::Unsupported { .. })
 }
 
 pub(crate) fn project_ty(ty: Ty, proj: &Projection) -> Option<Ty> {
@@ -3197,6 +3870,14 @@ pub(crate) fn slice_len_formula(func: &VerifiableFunction, operand: &Operand) ->
         Ty::Ref { inner, .. } if matches!(inner.as_ref(), Ty::Slice { .. }) => Some(
             Formula::var_owned(format!("{}__slice_len", place_to_var_name(func, place)), Sort::Int),
         ),
+        // `str` metadata is its UTF-8 byte length, exactly the same scalar
+        // metadata carried by `[u8]`. References and raw pointers to `str` are
+        // fat pointers; reading their metadata therefore yields this canonical
+        // length term without inventing provenance or character semantics.
+        Ty::Ref { inner, .. } if matches!(inner.as_ref(), Ty::Str) => Some(Formula::var_owned(
+            format!("{}__slice_len", place_to_var_name(func, place)),
+            Sort::Int,
+        )),
         // A raw pointer to a slice (e.g. the `FakeForPtrMetadata` pointer that
         // `<[T]>::len()` reads on a `&mut [T]`) is a fat pointer whose metadata is
         // the slice length; its `__slice_len` var is tied to the referent slice's
@@ -3204,7 +3885,14 @@ pub(crate) fn slice_len_formula(func: &VerifiableFunction, operand: &Operand) ->
         Ty::RawPtr { pointee, .. } if matches!(pointee.as_ref(), Ty::Slice { .. }) => Some(
             Formula::var_owned(format!("{}__slice_len", place_to_var_name(func, place)), Sort::Int),
         ),
+        Ty::RawPtr { pointee, .. } if matches!(pointee.as_ref(), Ty::Str) => Some(
+            Formula::var_owned(format!("{}__slice_len", place_to_var_name(func, place)), Sort::Int),
+        ),
         Ty::Slice { .. } => Some(Formula::var_owned(
+            format!("{}__slice_len", place_to_var_name(func, place)),
+            Sort::Int,
+        )),
+        Ty::Str => Some(Formula::var_owned(
             format!("{}__slice_len", place_to_var_name(func, place)),
             Sort::Int,
         )),
@@ -3222,6 +3910,96 @@ pub(crate) fn slice_len_formula(func: &VerifiableFunction, operand: &Operand) ->
     }
 }
 
+/// The exact Rust `PtrMetadata` shape for a public TrustIR operand.
+///
+/// Collection length and pointer metadata are deliberately separate: arrays
+/// have a useful collection length but pointers to arrays are thin and their
+/// metadata type is `()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PtrMetadataModel {
+    /// Slice/str fat-pointer metadata, represented by the canonical byte/item
+    /// length term.
+    Length(Formula),
+    /// Metadata for a pointer to a sized pointee.
+    Unit,
+    /// A pointer-shaped operand whose metadata (notably a dyn vtable) is not
+    /// modeled and must remain an explicit fail-closed row.
+    Unsupported,
+    /// Not a faithful pointer operand at all.
+    Invalid,
+}
+
+pub(crate) fn ptr_metadata_model(func: &VerifiableFunction, operand: &Operand) -> PtrMetadataModel {
+    let Some(ty) = operand_ty_cow(func, operand) else {
+        return match operand {
+            Operand::Unsupported { .. } => PtrMetadataModel::Unsupported,
+            // A pointer-shaped CONSTANT whose type the producer does not retain
+            // — a GVN-propagated `PtrMetadata(const "abc")` `Str`, an opaque
+            // reference constant, a promoted `&Enum::Variant` reference — is a
+            // faithful rustc carrier whose metadata value simply is not
+            // modeled. Keep it a row-level fail-closed obligation (the
+            // unsupported walker emits the visible `Rvalue::UnaryOp(PtrMetadata)`
+            // row) rather than collapsing the whole function as malformed.
+            // Every other unresolvable operand stays Invalid.
+            Operand::Constant(
+                ConstValue::Str { .. }
+                | ConstValue::OpaqueConst
+                | ConstValue::UnitVariantRef { .. },
+            ) => PtrMetadataModel::Unsupported,
+            _ => PtrMetadataModel::Invalid,
+        };
+    };
+    let pointee = match ty.as_ref() {
+        Ty::Ref { inner, .. } | Ty::RawPtr { pointee: inner, .. } => inner.as_ref(),
+        _ => return PtrMetadataModel::Invalid,
+    };
+    match pointee {
+        Ty::Slice { .. } | Ty::Str => slice_len_formula(func, operand)
+            .map_or(PtrMetadataModel::Unsupported, PtrMetadataModel::Length),
+        Ty::Dynamic { .. } | Ty::Unsupported { .. } => PtrMetadataModel::Unsupported,
+        // A thin pointer's metadata is `()`. That unit model is authoritative
+        // only where the extraction agrees with it: if this body writes THIS
+        // operand's metadata into any non-`()` destination, the metadata lane
+        // is not the faithfully-typed rustc shape, and the read must stay a
+        // row-level fail-closed obligation — neither an asserted unit model nor
+        // a whole-function malformed collapse.
+        _ => {
+            if thin_metadata_written_to_non_unit_destination(func, operand) {
+                PtrMetadataModel::Unsupported
+            } else {
+                PtrMetadataModel::Unit
+            }
+        }
+    }
+}
+
+/// Whether any `PtrMetadata` read of `operand` in this body is assigned to a
+/// destination that is not `()`-typed (or whose type cannot be resolved).
+/// Consulted only on the thin-pointee arm of [`ptr_metadata_model`].
+fn thin_metadata_written_to_non_unit_destination(
+    func: &VerifiableFunction,
+    operand: &Operand,
+) -> bool {
+    let (Operand::Copy(source) | Operand::Move(source)) = operand else {
+        return false;
+    };
+    func.body.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        let Statement::Assign {
+            place,
+            rvalue:
+                Rvalue::UnaryOp(
+                    trust_types::UnOp::PtrMetadata,
+                    Operand::Copy(read) | Operand::Move(read),
+                ),
+            ..
+        } = stmt
+        else {
+            return false;
+        };
+        read == source && place_ty_cow(func, place).as_deref() != Some(&Ty::Unit)
+    })
+}
+
 /// Trust: piece #7a — the ONE canonical length formula for a const-generic
 /// array, a fresh unconstrained `Sort::Int` var named on the param identity. It
 /// deliberately does NOT end with `__slice_len`, so `conjoin_slice_len_bounds`
@@ -3233,16 +4011,55 @@ pub(crate) fn sym_array_len_formula(len_sym: &trust_types::ConstLen) -> Formula 
     Formula::var_owned(trust_types::const_param_symbol(len_sym.index, &len_sym.name), Sort::Int)
 }
 
-/// Convert a u128 discriminant/switch value into a Formula without truncation.
+/// Convert an already-decoded NON-NEGATIVE magnitude into a Formula without
+/// truncation.
 ///
 /// Values that fit in i128 become `Formula::Int` for compatibility with the
 /// mathematical-integer encoding used elsewhere. Values above `i128::MAX`
 /// use `Formula::UInt` to avoid silent high-bit truncation.
-pub(crate) fn u128_to_formula(value: u128) -> Formula {
+///
+/// # NOT for a raw MIR `SwitchInt` arm label
+///
+/// A MIR arm label is a two's-complement BIT PATTERN at the scrutinee's width,
+/// not a magnitude: on an `i32`, `-1` arrives here as `4294967295`, and this
+/// function renders it as the mathematical integer `4294967295`. Conjoined with
+/// that scrutinee's own (correct) `i32` range fact it is UNSAT, so the arm's
+/// path condition becomes VACUOUS and every obligation under it discharges for
+/// free — a FALSE PROOF. The typed decode is [`switch_label_to_formula`]; this
+/// function deliberately takes no type parameter precisely because it may only
+/// be reached with a value whose sign is already settled (a variant INDEX, a
+/// shift bound, a computed magnitude).
+pub(crate) fn unsigned_value_to_formula(value: u128) -> Formula {
     match i128::try_from(value) {
         Ok(n) => Formula::Int(n),
         Err(_) => Formula::UInt(value),
     }
+}
+
+/// Decode a RAW two's-complement `SwitchInt` arm label into the mathematical
+/// integer it denotes UNDER `ty` — the declared type of the scrutinee it is
+/// compared against — and render it as a Formula constant.
+///
+/// The single decode is `trust_types::decode_raw_two_complement`, shared with
+/// the extraction boundary that decodes enum TAG values, so an arm constant and
+/// the `_d ∈ {tags}` membership fact are byte-identical terms and cancel.
+///
+/// Returns `None` — and every caller must then fail CLOSED (drop the equality,
+/// decline the lane) rather than fall back to the raw value — when `ty` is not
+/// an integer-like type whose width and signedness this can establish (`Bool`
+/// included: a bool switch is a polarity, not an equality, and each caller
+/// renders it itself), when the label has bits set ABOVE `ty`'s width, or when
+/// `ty` is `char` and the label is not a valid scalar value.
+///
+/// For an UNSIGNED `ty` the result is byte-identical to
+/// [`unsigned_value_to_formula`], so the unsigned switch row is unchanged.
+pub(crate) fn switch_label_to_formula(ty: &Ty, value: u128) -> Option<Formula> {
+    // A 128-bit unsigned label above `i128::MAX` has no `i128` spelling; keep
+    // the `Formula::UInt` rendering the untyped helper gives it.
+    if ty.int_width() == Some(128) && !ty.is_signed() {
+        return Some(unsigned_value_to_formula(value));
+    }
+    ty.decode_switch_label(value).map(Formula::Int)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3339,7 +4156,7 @@ pub(crate) fn explicit_discriminant_value_formula(
                 ));
             }
 
-            Ok((Sort::Int, u128_to_formula(value)))
+            Ok((Sort::Int, unsigned_value_to_formula(value)))
         }
         other => {
             Err(format!("discriminant/tag field type {other:?} is not modeled as bool or integer"))
@@ -3433,18 +4250,19 @@ pub(crate) fn operand_to_formula_with_array_ctx(
                 Formula::var_owned(ConstValue::str_smt_var_name(bytes), Sort::Int)
             }
             // A typed opaque integer constant (const-generic `N`, associated const,
-            // `size_of::<T>()` in a generic body): an unconstrained integer-sorted
-            // symbol. Sound: it asserts no value, so any obligation depending on its
-            // value stays satisfiable-as-negation (Unknown/Failed), never falsely
-            // proved. The two value-decision folds that COULD false-prove over it —
+            // `size_of::<T>()` in a generic body): an integer-sorted symbol. This
+            // carrier has no identity, so the by-name symbol below is safe ONLY for
+            // consumers that freshen each occurrence or explicitly refuse proof
+            // steps where aliasing matters. The two value-decision folds that could
+            // otherwise false-prove over it —
             // `v2_const_eq_truth` (branch pruning) and `v2_divisor_is_zero_formula`
             // (div/rem-by-zero) — match on the `ConstValue` STRUCTURALLY before
             // formula conversion and are fixed to treat `OpaqueScalar` as
             // unknown-valued, so they never consult this symbol. The native-bundle
             // path lowers each occurrence to an INDEPENDENT fresh symbol in
-            // `emit_const`; this general formula renderer keeps the existing
-            // by-name interning, identical to the pre-existing `__unknown_const`
-            // behavior, and is only an over-approximation — never a false prove.
+            // `emit_const`; overflow builders reject this carrier before calling
+            // the generic renderer. Other callers must preserve one of those two
+            // boundaries rather than treating the by-name interning as authority.
             ConstValue::OpaqueScalar { width, signed } => Formula::var_owned(
                 format!("__trust_opaque_scalar_{}{}", if *signed { "i" } else { "u" }, width),
                 Sort::Int,
@@ -3757,6 +4575,7 @@ fn terminator_target_blocks(terminator: &Terminator) -> Vec<BlockId> {
         Terminator::Opaque { targets, .. } => targets.clone(),
         Terminator::Return
         | Terminator::Call { target: None, .. }
+        | Terminator::TailCall { .. }
         | Terminator::Unreachable
         | Terminator::Resume => vec![],
         // `Terminator` is non_exhaustive; an unknown terminator has no modeled
@@ -4435,6 +5254,47 @@ fn canonicalize_place(func: &VerifiableFunction, place: Place, fuel: u32) -> Pla
 /// prefixes `@` to any segment that would.
 const PROJECTION_SEGMENT_LEAD: &[char] = &['.', '[', '*', '@'];
 
+/// The `#`-token namespace the E4/E5 LOOP-TRANSITION model mints its HAVOCS in.
+///
+/// # Why this exists, and what it prevents
+///
+/// The `#`-suffix convention in this crate is overloaded. Almost every producer
+/// mints an SSA VERSION token (`x#s6_t`) — a second spelling of the SAME dynamic
+/// value — and `normalize_ssa_version_tokens` is built on that reading: for a
+/// local with one static write, the establish token, every terminal token, and
+/// the bare name all denote the one assigned value, so collapsing them to the
+/// bare name is an identity that CONNECTS facts the spellings kept apart.
+///
+/// The loop-transition model mints something else entirely under the same `#`
+/// syntax: a HAVOC. `symbolic_loop_transitions` writes `chunk#e45_call_bb2` for
+/// "whatever the call at bb2 put in `chunk` during THIS iteration", and
+/// `summarize_nested_loop` writes `x#e45_nested_bb3_1` for "whatever the inner
+/// loop left in `x`". Neither denotes the same value as the bare name: the bare
+/// name is the value at the header on ENTRY to the iteration, the token is the
+/// value at the END of it. A single-static-assignment local does not make them
+/// equal — one static write inside a loop executes once per iteration, with a
+/// different value each time.
+///
+/// Collapsing a havoc token to its bare name is therefore NOT an identity; it
+/// asserts that the iteration did not change the local. MEASURED, before this
+/// namespace existed: with `invariant chunk == 0` on a loop whose body is
+/// `chunk = observe(xs)`, the consecution row rendered as
+/// `chunk == 0 AND guard AND NOT(chunk == 0)` — trivially UNSAT, i.e. PROVED —
+/// for a program in which `observe` may return anything. That is a false proof
+/// of a false invariant, produced with no bad callee summary anywhere in it.
+///
+/// Every mint site and every collapse site reads this ONE constant so the two
+/// halves cannot drift apart.
+pub(crate) const LOOP_TRANSITION_HAVOC_TOKEN_PREFIX: &str = "e45_";
+
+/// True when a `#`-token is a loop-transition HAVOC rather than an SSA version,
+/// i.e. when collapsing it onto its bare name would ASSERT that an iteration
+/// left the local unchanged. See [`LOOP_TRANSITION_HAVOC_TOKEN_PREFIX`].
+pub(crate) fn version_token_is_loop_transition_havoc(name: &str) -> bool {
+    name.split_once('#')
+        .is_some_and(|(_, token)| token.starts_with(LOOP_TRANSITION_HAVOC_TOKEN_PREFIX))
+}
+
 // Trust (leaf-assert-unhostage, 2026-07-11): `pub` (was `pub(crate)`) — the
 // SINGLE SOURCE OF TRUTH for the VC formula variable vocabulary. trust-clean's
 // guard-implied-assert augmentation (`prove.rs`, ordering-sentinel cmp facts)
@@ -4666,7 +5526,8 @@ mod f5_e2e_repro {
 
     #[test]
     fn f5_e2e_shape_dominance_fires() {
-        let text = "(a) <= (1.0e150) && (a) >= (-(1.0e150)) && (b) <= (1.0e150) && (b) >= (-(1.0e150))";
+        let text =
+            "(a) <= (1.0e150) && (a) >= (-(1.0e150)) && (b) <= (1.0e150) && (b) >= (-(1.0e150))";
         let pre = trust_types::parse_spec_expr(text).expect("parses");
         eprintln!("PARSED: {pre:?}");
         let func = VerifiableFunction {
@@ -4692,6 +5553,7 @@ mod f5_e2e_repro {
                         terminator: Terminator::Call {
                             unwind: trust_types::UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "test::callee".to_string(),
                             args: vec![
@@ -4728,10 +5590,8 @@ mod f5_e2e_repro {
             .with_precondition(pre);
         db.insert(summary);
         let vcs = crate::generate::generate_callsite_precondition_vcs(&func, &db);
-        let precond: Vec<_> = vcs
-            .iter()
-            .filter(|vc| matches!(vc.kind, VcKind::Precondition { .. }))
-            .collect();
+        let precond: Vec<_> =
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Precondition { .. })).collect();
         assert!(
             precond.is_empty(),
             "F5 dominance must skip the exactly-matching precondition; got {:#?}",

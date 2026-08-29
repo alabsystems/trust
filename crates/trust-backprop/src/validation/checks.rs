@@ -6,6 +6,7 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use trust_types::fx::FxHashSet;
 use trust_types::parse_spec_expr_result;
 
 use super::helpers::{
@@ -14,7 +15,6 @@ use super::helpers::{
     strip_spec_lines,
 };
 use super::types::{CheckResult, ValidationCheck};
-use trust_types::fx::FxHashSet;
 
 /// Check that the rewritten source is syntactically valid Rust.
 pub(crate) fn check_syntax_valid(rewritten: &str) -> CheckResult {

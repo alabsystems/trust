@@ -15,7 +15,7 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_integration_tests::ay_test_support::{require_ay, ay_available};
+use trust_integration_tests::ay_test_support::{ay_available, require_ay};
 use trust_router::VerificationBackend;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
@@ -46,13 +46,20 @@ use trust_types::{
 /// `assert!(var.0 <= i32::MAX)` guard protects the literal encoding invariant,
 /// not the shift operator's RHS bound.
 ///
+/// CANONICAL CHECKED-SHIFT SPELLING (2026-08-21): `CheckedBinaryOp(Shl)` does
+/// not exist — admission outlaws it (only Add/Sub/Mul produce the audited
+/// `(value, bool)` carrier, and the extractor never emits checked shifts).
+/// rustc guards a shift with the Lt-condition assert (opposite polarity to the
+/// flag asserts), then performs the PLAIN shift in the assert's target block.
+///
 /// MIR layout:
 ///   _0: u32  (return — the encoded literal)
 ///   _1: u32  (arg: var.0)
-///   _2: (u32, bool)  (checked result of _1 << 1)
+///   _2: u32  (_1 << 1 — the shifted value)
+///   _3: bool (shift-amount-in-range condition)
 ///
-/// bb0: _2 = CheckedShl(_1, 1); assert(!_2.1, overflow) -> bb1
-/// bb1: _0 = _2.0; return
+/// bb0: _3 = Lt(1, 32); assert(_3, expected: true, Overflow(Shl)) -> bb1
+/// bb1: _2 = Shl(_1, 1); _0 = _2; return
 ///
 /// VCs: ShiftOverflow { op: Shl, operand_ty: u32, shift_ty: u32 }
 fn build_literal_positive_model() -> VerifiableFunction {
@@ -70,18 +77,19 @@ fn build_literal_positive_model() -> VerifiableFunction {
             locals: vec![
                 LocalDecl { index: 0, ty: Ty::u32(), name: None },
                 LocalDecl { index: 1, ty: Ty::u32(), name: Some("var_id".into()) },
-                LocalDecl { index: 2, ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]), name: None },
+                LocalDecl { index: 2, ty: Ty::u32(), name: None },
+                LocalDecl { index: 3, ty: Ty::Bool, name: Some("shift_ok".into()) },
             ],
             blocks: vec![
-                // bb0: _2 = CheckedShl(_1, 1); assert(!_2.1, overflow) -> bb1
+                // bb0: _3 = Lt(1, 32); assert(_3, true, Overflow(Shl)) -> bb1
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![Statement::Assign {
-                        place: Place::local(2),
-                        rvalue: Rvalue::CheckedBinaryOp(
-                            BinOp::Shl,
-                            Operand::Copy(Place::local(1)),
+                        place: Place::local(3),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Lt,
                             Operand::Constant(ConstValue::Uint(1, 32)),
+                            Operand::Constant(ConstValue::Uint(32, 32)),
                         ),
                         span: SourceSpan {
                             file: "ay/crates/ay-sat/src/literal.rs".to_string(),
@@ -92,22 +100,39 @@ fn build_literal_positive_model() -> VerifiableFunction {
                         },
                     }],
                     terminator: Terminator::Assert {
-                        cond: Operand::Copy(Place::field(2, 1)),
-                        expected: false,
+                        cond: Operand::Move(Place::local(3)),
+                        expected: true,
                         msg: AssertMessage::Overflow(BinOp::Shl),
                         target: BlockId(1),
                         unwind: trust_types::UnwindEdge::Unreachable,
                         span: SourceSpan::default(),
                     },
                 },
-                // bb1: _0 = _2.0; return
+                // bb1: _2 = Shl(_1, 1); _0 = _2; return
                 BasicBlock {
                     id: BlockId(1),
-                    stmts: vec![Statement::Assign {
-                        place: Place::local(0),
-                        rvalue: Rvalue::Use(Operand::Copy(Place::field(2, 0))),
-                        span: SourceSpan::default(),
-                    }],
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                            span: SourceSpan {
+                                file: "ay/crates/ay-sat/src/literal.rs".to_string(),
+                                line_start: 53,
+                                col_start: 14,
+                                line_end: 53,
+                                col_end: 26,
+                            },
+                        },
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                            span: SourceSpan::default(),
+                        },
+                    ],
                     terminator: Terminator::Return,
                 },
             ],
@@ -124,19 +149,21 @@ fn build_literal_positive_model() -> VerifiableFunction {
 
 /// Build model of `Literal::negative(var)` — `Self((var.0 << 1) | 1)`.
 ///
-/// Same checked shift model: `(var.0 << 1) | 1`.
+/// Same canonical shift model as `positive`: `(var.0 << 1) | 1`, spelled as the
+/// Lt-condition assert plus the plain shift in the target block (see
+/// `build_literal_positive_model` for why `CheckedBinaryOp(Shl)` is outlawed).
 /// The shift amount is the in-range constant 1. The BitOr with 1 does not
 /// overflow (it just sets the lowest bit).
 ///
 /// MIR layout:
 ///   _0: u32  (return — the encoded literal)
 ///   _1: u32  (arg: var.0)
-///   _2: (u32, bool)  (checked result of _1 << 1)
-///   _3: u32  (_2.0 — the doubled value)
+///   _2: bool (shift-amount-in-range condition)
+///   _3: u32  (_1 << 1 — the doubled value)
 ///   _4: u32  (_3 | 1 — the final literal encoding)
 ///
-/// bb0: _2 = CheckedShl(_1, 1); assert(!_2.1, overflow) -> bb1
-/// bb1: _3 = _2.0; _4 = _3 | 1; _0 = _4; return
+/// bb0: _2 = Lt(1, 32); assert(_2, expected: true, Overflow(Shl)) -> bb1
+/// bb1: _3 = Shl(_1, 1); _4 = _3 | 1; _0 = _4; return
 ///
 /// VCs: ShiftOverflow { op: Shl, operand_ty: u32, shift_ty: u32 }
 fn build_literal_negative_model() -> VerifiableFunction {
@@ -154,20 +181,20 @@ fn build_literal_negative_model() -> VerifiableFunction {
             locals: vec![
                 LocalDecl { index: 0, ty: Ty::u32(), name: None },
                 LocalDecl { index: 1, ty: Ty::u32(), name: Some("var_id".into()) },
-                LocalDecl { index: 2, ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]), name: None },
+                LocalDecl { index: 2, ty: Ty::Bool, name: Some("shift_ok".into()) },
                 LocalDecl { index: 3, ty: Ty::u32(), name: None },
                 LocalDecl { index: 4, ty: Ty::u32(), name: None },
             ],
             blocks: vec![
-                // bb0: _2 = CheckedShl(_1, 1); assert(!_2.1, overflow) -> bb1
+                // bb0: _2 = Lt(1, 32); assert(_2, true, Overflow(Shl)) -> bb1
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![Statement::Assign {
                         place: Place::local(2),
-                        rvalue: Rvalue::CheckedBinaryOp(
-                            BinOp::Shl,
-                            Operand::Copy(Place::local(1)),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Lt,
                             Operand::Constant(ConstValue::Uint(1, 32)),
+                            Operand::Constant(ConstValue::Uint(32, 32)),
                         ),
                         span: SourceSpan {
                             file: "ay/crates/ay-sat/src/literal.rs".to_string(),
@@ -178,22 +205,32 @@ fn build_literal_negative_model() -> VerifiableFunction {
                         },
                     }],
                     terminator: Terminator::Assert {
-                        cond: Operand::Copy(Place::field(2, 1)),
-                        expected: false,
+                        cond: Operand::Move(Place::local(2)),
+                        expected: true,
                         msg: AssertMessage::Overflow(BinOp::Shl),
                         target: BlockId(1),
                         unwind: trust_types::UnwindEdge::Unreachable,
                         span: SourceSpan::default(),
                     },
                 },
-                // bb1: _3 = _2.0; _4 = _3 | 1; _0 = _4; return
+                // bb1: _3 = Shl(_1, 1); _4 = _3 | 1; _0 = _4; return
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![
                         Statement::Assign {
                             place: Place::local(3),
-                            rvalue: Rvalue::Use(Operand::Copy(Place::field(2, 0))),
-                            span: SourceSpan::default(),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                            span: SourceSpan {
+                                file: "ay/crates/ay-sat/src/literal.rs".to_string(),
+                                line_start: 65,
+                                col_start: 14,
+                                line_end: 65,
+                                col_end: 30,
+                            },
                         },
                         Statement::Assign {
                             place: Place::local(4),
@@ -246,18 +283,23 @@ fn build_literal_negative_model() -> VerifiableFunction {
 
 /// Build model of LEB128 read_u64 loop body shift.
 ///
+/// Canonical checked-shift spelling (see `build_literal_positive_model`): the
+/// Lt-condition assert guards the shift amount against the SHIFTED value's
+/// width (u64 → 64), then the plain shift executes in the target block.
+///
 /// MIR layout:
 ///   _0: u64  (return — unused, we care about the shift VC)
 ///   _1: u32  (arg: shift — the current shift amount)
 ///   _2: u32  (arg: byte — raw byte from input)
 ///   _3: u32  (byte & 0x7f — masked value)
 ///   _4: u64  (u64::from(_3) — widened to u64)
-///   _5: (u64, bool)  (checked result of _4 << _1)
-///   _6: u64  (_5.0 — the shifted value)
+///   _5: u64  (_4 << _1 — the shifted value)
+///   _6: u64  (copy of the shifted value)
+///   _7: bool (shift-amount-in-range condition)
 ///
-/// bb0: _3 = _2 & 0x7f; _4 = cast(_3 as u64); _5 = CheckedShl(_4, _1);
-///      assert(!_5.1, ShiftOverflow) -> bb1
-/// bb1: _6 = _5.0; _0 = _6; return
+/// bb0: _3 = _2 & 0x7f; _4 = cast(_3 as u64); _7 = Lt(_1, 64);
+///      assert(_7, expected: true, Overflow(Shl)) -> bb1
+/// bb1: _5 = Shl(_4, _1); _6 = _5; _0 = _6; return
 ///
 /// VCs: ShiftOverflow { op: Shl, operand_ty: u64, shift_ty: u32 }
 fn build_leb128_shift_model() -> VerifiableFunction {
@@ -278,12 +320,13 @@ fn build_leb128_shift_model() -> VerifiableFunction {
                 LocalDecl { index: 2, ty: Ty::u32(), name: Some("byte".into()) },
                 LocalDecl { index: 3, ty: Ty::u32(), name: None }, // byte & 0x7f
                 LocalDecl { index: 4, ty: Ty::u64(), name: None }, // cast to u64
-                LocalDecl { index: 5, ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]), name: None }, // checked shl result
-                LocalDecl { index: 6, ty: Ty::u64(), name: None }, // shifted value
+                LocalDecl { index: 5, ty: Ty::u64(), name: None }, // shifted value
+                LocalDecl { index: 6, ty: Ty::u64(), name: None }, // copy of shifted value
+                LocalDecl { index: 7, ty: Ty::Bool, name: Some("shift_ok".into()) },
             ],
             blocks: vec![
-                // bb0: _3 = _2 & 0x7f; _4 = cast(_3 as u64);
-                //      _5 = CheckedShl(_4, _1); assert(!_5.1) -> bb1
+                // bb0: _3 = _2 & 0x7f; _4 = cast(_3 as u64); _7 = Lt(_1, 64);
+                //      assert(_7, true, Overflow(Shl)) -> bb1
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![
@@ -308,10 +351,39 @@ fn build_leb128_shift_model() -> VerifiableFunction {
                             rvalue: Rvalue::Cast(Operand::Copy(Place::local(3)), Ty::u64()),
                             span: SourceSpan::default(),
                         },
-                        // Checked shift left
+                        // Shift-amount range condition (against the u64 width)
+                        Statement::Assign {
+                            place: Place::local(7),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Lt,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(64, 32)),
+                            ),
+                            span: SourceSpan {
+                                file: "ay/crates/ay-proof-common/src/leb128.rs".to_string(),
+                                line_start: 19,
+                                col_start: 9,
+                                line_end: 19,
+                                col_end: 52,
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(Place::local(7)),
+                        expected: true,
+                        msg: AssertMessage::Overflow(BinOp::Shl),
+                        target: BlockId(1),
+                        unwind: trust_types::UnwindEdge::Unreachable,
+                        span: SourceSpan::default(),
+                    },
+                },
+                // bb1: _5 = Shl(_4, _1); _6 = _5; _0 = _6; return
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
                         Statement::Assign {
                             place: Place::local(5),
-                            rvalue: Rvalue::CheckedBinaryOp(
+                            rvalue: Rvalue::BinaryOp(
                                 BinOp::Shl,
                                 Operand::Copy(Place::local(4)),
                                 Operand::Copy(Place::local(1)),
@@ -324,23 +396,9 @@ fn build_leb128_shift_model() -> VerifiableFunction {
                                 col_end: 52,
                             },
                         },
-                    ],
-                    terminator: Terminator::Assert {
-                        cond: Operand::Copy(Place::field(5, 1)),
-                        expected: false,
-                        msg: AssertMessage::Overflow(BinOp::Shl),
-                        target: BlockId(1),
-                        unwind: trust_types::UnwindEdge::Unreachable,
-                        span: SourceSpan::default(),
-                    },
-                },
-                // bb1: _6 = _5.0; _0 = _6; return
-                BasicBlock {
-                    id: BlockId(1),
-                    stmts: vec![
                         Statement::Assign {
                             place: Place::local(6),
-                            rvalue: Rvalue::Use(Operand::Copy(Place::field(5, 0))),
+                            rvalue: Rvalue::Use(Operand::Copy(Place::local(5))),
                             span: SourceSpan::default(),
                         },
                         Statement::Assign {
@@ -688,9 +746,16 @@ fn test_real_ay_literal_negative_shift_safe() {
 /// The full invariant (shift < 64 AND shift % 7 == 0) makes the shift VC UNSAT,
 /// but even the weaker constraint (shift < 64) suffices for shift safety.
 ///
-/// We test without preconditions: the shift VC should be SAT (ay finds
-/// shift=64 or similar as a counterexample). This demonstrates that ay
-/// correctly identifies the need for the loop guard.
+/// We test without preconditions: the operation's REFUTABLE shift VC must be
+/// SAT (ay finds shift=64 or similar as a counterexample). This demonstrates
+/// that ay correctly identifies the need for the loop guard.
+///
+/// DUAL ROWS (2026-08-21 campaign): trust-vcgen now dual-emits at the shift —
+/// the safety-walk STATEMENT row (the unconditioned `shift >= 64` question ay
+/// must refute) plus the cond-bound ASSERT-lane row, whose exact `shift_ok =
+/// Lt(shift, 64)` binding contradicts the violation on the guarded path, so it
+/// legitimately PROVES. The pinned strength is unchanged: exactly one row is
+/// refuted, and it carries the shift >= 64 counterexample.
 #[test]
 fn test_real_ay_leb128_shift_without_guard() {
     if !ay_available() {
@@ -707,6 +772,7 @@ fn test_real_ay_leb128_shift_without_guard() {
         .collect();
     assert!(!shift_vcs.is_empty(), "must have ShiftOverflow VC");
 
+    let mut failed = 0usize;
     for vc in &shift_vcs {
         if !ay.can_handle(vc) {
             continue;
@@ -714,16 +780,27 @@ fn test_real_ay_leb128_shift_without_guard() {
         let result = ay.verify(vc);
         eprintln!("ay result for leb128 shift (no guard) {:?}: {:?}", vc.kind, result);
 
-        // Without the guard, shift can be >= 64, causing overflow
-        assert!(
-            result.is_failed(),
-            "ay must find shift overflow when shift is unconstrained. Got: {result:?}"
-        );
-
-        if let VerificationResult::Failed { counterexample: Some(cex), .. } = &result {
-            eprintln!("  Counterexample (shift >= 64 causes overflow): {cex}");
+        match &result {
+            // The statement row: without the guard, shift can be >= 64.
+            VerificationResult::Failed { counterexample, .. } => {
+                failed += 1;
+                if let Some(cex) = counterexample {
+                    eprintln!("  Counterexample (shift >= 64 causes overflow): {cex}");
+                }
+            }
+            // The cond-bound assert-lane row self-discharges (guarded path).
+            r if r.is_proved() => {}
+            other => panic!(
+                "each leb128 shift row must either refute (statement row) or prove \
+                 (cond-bound assert-lane row). Got: {other:?}"
+            ),
         }
     }
+    assert_eq!(
+        failed, 1,
+        "exactly one shift row (the unconditioned statement row) must be refuted \
+         when shift is unconstrained"
+    );
 }
 
 /// AY checks the VSIDS bump_score model: activity addition can overflow f64

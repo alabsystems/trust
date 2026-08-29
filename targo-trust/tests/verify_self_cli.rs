@@ -1209,13 +1209,20 @@ fn verify_self_refuses_complete_claim_without_execution_bound_stage2_bytes() {
         "execution identity gap must be explicit: {}",
         report["proof"]
     );
+    // f28b7e0dd4 pulled trustd into the identity set and reworded the reason
+    // accordingly: trustd is bound by an exact-sibling identity probe, not by a
+    // `-Vv` verbose-version string, so the shared claim is now
+    // "Targo/trustc/trustdoc/trustd version agreement". Pin all four names —
+    // dropping one from the probe set is exactly the silent weakening this
+    // reason exists to deny.
     assert!(
         report["proof"]["reasons"]
             .as_array()
             .expect("proof reasons")
             .iter()
             .filter_map(Value::as_str)
-            .any(|reason| reason.contains("verbose-version agreement")
+            .any(|reason| reason.contains("Targo/trustc/trustdoc/trustd version agreement")
+                && reason.contains("diagnostic consistency")
                 && reason.contains("not source provenance")),
         "source provenance gap must be explicit: {}",
         report["proof"]
@@ -1223,66 +1230,142 @@ fn verify_self_refuses_complete_claim_without_execution_bound_stage2_bytes() {
     assert_eq!(report["exit"]["exit_code"], 1);
 }
 
+/// Every non-proved outcome fails `verify self` closed — but at two different
+/// layers, and the layer is the point.
+///
+/// A spelling inside the shared [`trust_types::Outcome`] taxonomy authenticates
+/// on the compiler->targo transport and is counted under its normalized bucket,
+/// so the harness can say WHICH incomplete outcome it saw. A spelling outside
+/// that taxonomy is protocol drift: since 576db732cd the wire field carries the
+/// outcome as a TYPE rather than a String, and an unrecognized spelling refuses
+/// the whole compiler-message rather than guessing a bucket for it. That is the
+/// stricter refusal of the two — the run ends with no authenticated transport
+/// at all — so both halves are asserted, each against its own layer.
 #[test]
 fn verify_self_fails_closed_on_incomplete_and_unrecognized_outcomes() {
-    let cases = [
+    // (case label, spelling the fake compiler emits, normalized bucket, proof-reason fragment)
+    let taxonomy_cases = [
         ("timed-out", "timed-out", "timed_out", "timed out"),
         ("unknown", "unknown", "unknown", "unknown"),
         ("skipped", "skipped", "skipped", "skipped"),
         ("runtime-checked", "runtime checked", "runtime_checked", "runtime_checked"),
-        ("no-verification", "no verification", "no_verification", "no_verification"),
-        ("unverified", "Unverified", "unverified", "unverified"),
-        ("unrecognized", "solver_gave_up", "solver_gave_up", "unrecognized outcome"),
+    ];
+    // Spellings no released Trust toolchain has ever written for an outcome.
+    let drift_cases = [
+        ("no-verification", "no verification"),
+        ("unverified", "Unverified"),
+        ("unrecognized", "solver_gave_up"),
     ];
 
-    for (case, emitted_outcome, normalized_outcome, reason_fragment) in cases {
-        let fixture = Fixture::new(&format!("targo-trust-verify-self-outcome-{case}"));
-        fixture.install_stage2_targo();
-        let output = Command::new(targo_trust_binary())
-            .args([
-                "trust",
-                "verify",
-                "self",
-                "--repo-root",
-                fixture.repo_str(),
-                "--report-dir",
-                fixture.report_str(),
-                "--timeout",
-                FIXTURE_TIMEOUT_SEC,
-                "--full-verifier",
-            ])
-            .env("SELF_VERIFY_FAKE_MODE", "outcome")
-            .env("SELF_VERIFY_FAKE_OUTCOME", emitted_outcome)
-            .output()
-            .expect("run verify self with incomplete outcome");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    for (case, emitted_outcome, normalized_outcome, reason_fragment) in taxonomy_cases {
+        let (report, stdout, stderr, code) =
+            run_verify_self_with_fake_outcome(case, emitted_outcome);
         assert_eq!(
-            output.status.code(),
+            code,
             Some(1),
             "{case} should fail closed\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-
-        let report = fixture.report();
         assert_eq!(report["status"], "incomplete", "{case} report status");
         assert_eq!(report["proof"]["complete"], false, "{case} proof completeness");
+        assert_eq!(
+            report["solver_suite"]["authenticated_cargo_transport"], true,
+            "{case} is a recognized outcome, so its transport must still authenticate"
+        );
         assert_eq!(
             report["solver_suite"]["outcomes"][normalized_outcome], 1,
             "{case} normalized outcome count"
         );
-        let reasons = report["proof"]["reasons"]
-            .as_array()
-            .expect("proof reasons")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let reasons = proof_reasons(&report);
         assert!(
             reasons.contains(reason_fragment),
             "{case} reasons should mention {reason_fragment:?}\n{reasons}"
         );
     }
+
+    for (case, emitted_outcome) in drift_cases {
+        let (report, stdout, stderr, code) =
+            run_verify_self_with_fake_outcome(case, emitted_outcome);
+        assert_eq!(
+            code,
+            Some(1),
+            "{case} should fail closed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(report["status"], "incomplete", "{case} report status");
+        assert_eq!(report["proof"]["complete"], false, "{case} proof completeness");
+        assert_eq!(
+            report["solver_suite"]["authenticated_cargo_transport"], false,
+            "{case} is protocol drift: the whole compiler-message must be refused, not bucketed\n{}",
+            report["solver_suite"]
+        );
+        assert_eq!(
+            report["solver_suite"]["obligation_rows"], 0,
+            "{case} must contribute no obligation rows once its transport is refused\n{}",
+            report["solver_suite"]
+        );
+        let parse_errors = report["solver_suite"]["parse_errors"]
+            .as_array()
+            .expect("parse errors")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            parse_errors.contains("malformed Trust transport")
+                && parse_errors.contains(emitted_outcome)
+                && parse_errors.contains("expected a verification outcome"),
+            "{case} must name the refused spelling {emitted_outcome:?} in its parse errors\n{parse_errors}"
+        );
+        let reasons = proof_reasons(&report);
+        assert!(
+            reasons
+                .contains("canonical Cargo compiler evidence could not be parsed or authenticated"),
+            "{case} reasons should name the unauthenticated evidence\n{reasons}"
+        );
+        assert!(
+            reasons.contains("no per-obligation solver evidence rows were observed"),
+            "{case} reasons should record that no obligation row survived\n{reasons}"
+        );
+    }
+}
+
+fn run_verify_self_with_fake_outcome(
+    case: &str,
+    emitted_outcome: &str,
+) -> (Value, String, String, Option<i32>) {
+    let fixture = Fixture::new(&format!("targo-trust-verify-self-outcome-{case}"));
+    fixture.install_stage2_targo();
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "verify",
+            "self",
+            "--repo-root",
+            fixture.repo_str(),
+            "--report-dir",
+            fixture.report_str(),
+            "--timeout",
+            FIXTURE_TIMEOUT_SEC,
+            "--full-verifier",
+        ])
+        .env("SELF_VERIFY_FAKE_MODE", "outcome")
+        .env("SELF_VERIFY_FAKE_OUTCOME", emitted_outcome)
+        .output()
+        .expect("run verify self with incomplete outcome");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code();
+    (fixture.report(), stdout, stderr, code)
+}
+
+fn proof_reasons(report: &Value) -> String {
+    report["proof"]["reasons"]
+        .as_array()
+        .expect("proof reasons")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -2302,11 +2385,11 @@ fn write_publication_grade_fixture_evidence(repo_root: &Path) {
 fn publication_grade_fixture_evidence(
     repo_root: &Path,
 ) -> (TransportNativeTrustIrEvidence, TransportProofEvidence) {
-    const SUITE: &str = "trust-wp";
+    const SUITE: &str = "trust-mc";
     const REQUEST_ID: &str = "1";
     const PROOF_ID: &str = "1";
     const OBLIGATION_ID: &str = "self-verify-obligation-1";
-    const NATIVE_ID: &str = "trust_ir-native-trust-wp-request-1-proof-1";
+    const NATIVE_ID: &str = "trust_ir-native-trust-mc-request-1-proof-1";
 
     let native_artifacts = native_fixture_artifacts(SUITE, REQUEST_ID, PROOF_ID, NATIVE_ID);
     let native = TransportNativeTrustIrEvidence {
@@ -2726,13 +2809,13 @@ printf '%s\n' '{"kind":"solver-transcript","proved":true}' > "$solver_path"
 printf '%s\n' '{"kind":"proof-check","accepted":true}' > "$check_path"
 
 request_id="1"
-native_id="trust_ir-native-trust-wp-request-1-proof-1"
+native_id="trust_ir-native-trust-mc-request-1-proof-1"
 proof_native_id="$native_id"
 native_backend="trust-full-verifier"
 native_bundle_digest="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 native_request_digest="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 native_bundle_uri="trust_ir-native://verification-bundle/$native_bundle_digest"
-native_artifacts="[{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_bundle_digest\"},\"uri\":\"$native_bundle_uri\"},{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-wp/request/$request_id\"},{\"kind\":\"NormalizedObligation\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-wp/request/$request_id/proof/1\"}]"
+native_artifacts="[{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_bundle_digest\"},\"uri\":\"$native_bundle_uri\"},{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-mc/request/$request_id\"},{\"kind\":\"NormalizedObligation\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-mc/request/$request_id/proof/1\"}]"
 solver_uri="$solver_path"
 check_uri="$check_path"
 solver_declared_digest="$solver_digest"
@@ -2743,11 +2826,11 @@ proof_diagnostics='[]'
 proof_artifacts="[{\"kind\":\"SolverTranscript\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$solver_declared_digest\"},\"uri\":\"$solver_uri\"},{\"kind\":\"ProofCheckReport\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$check_declared_digest\"},\"uri\":\"$check_uri\"}]"
 case "$evidence_mode" in
   missing)
-    proof_evidence='{"suite":"trust-wp","backend":"trust-full-verifier","status":"proved"}'
+    proof_evidence='{"suite":"trust-mc","backend":"trust-full-verifier","status":"proved"}'
     ;;
   string-only)
-    solver_uri='artifact://trust-wp/solver-transcript'
-    check_uri='artifact://trust-wp/proof-check'
+    solver_uri='artifact://trust-mc/solver-transcript'
+    check_uri='artifact://trust-mc/proof-check'
     proof_artifacts="[{\"kind\":\"SolverTranscript\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$solver_digest\"},\"uri\":\"$solver_uri\"},{\"kind\":\"ProofCheckReport\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$check_digest\"},\"uri\":\"$check_uri\"},{\"kind\":\"clean_cic\",\"metadata\":{\"artifact_digest\":\"sha256:$solver_digest\",\"artifact_path\":\"$solver_path\"}}]"
     ;;
   mismatched)
@@ -2761,10 +2844,10 @@ case "$evidence_mode" in
     native_backend="attacker-backend"
     ;;
   native-wrong-kind)
-    native_artifacts="[{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_bundle_digest\"},\"uri\":\"$native_bundle_uri\"},{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-wp/request/$request_id\"},{\"kind\":\"banana\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-wp/request/$request_id/proof/1\"}]"
+    native_artifacts="[{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_bundle_digest\"},\"uri\":\"$native_bundle_uri\"},{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-mc/request/$request_id\"},{\"kind\":\"banana\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-mc/request/$request_id/proof/1\"}]"
     ;;
   native-wrong-uri)
-    native_artifacts="[{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_bundle_digest\"},\"uri\":\"$native_bundle_uri\"},{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-wp/request/attacker\"},{\"kind\":\"NormalizedObligation\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-wp/request/attacker/proof/1\"}]"
+    native_artifacts="[{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_bundle_digest\"},\"uri\":\"$native_bundle_uri\"},{\"kind\":\"EngineInput\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-mc/request/attacker\"},{\"kind\":\"NormalizedObligation\",\"digest\":{\"algorithm\":\"trust_ir-stable-v1\",\"value\":\"$native_request_digest\"},\"uri\":\"$native_bundle_uri/trust-mc/request/attacker/proof/1\"}]"
     ;;
   weak-strength)
     proof_assurance='{"reasoning":"Deductive","assurance":"Unchecked"}'
@@ -2782,14 +2865,14 @@ case "$evidence_mode" in
     proof_artifacts="[{\"kind\":\"SolverTranscript\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$check_digest\"},\"uri\":\"$solver_uri\"},{\"kind\":\"ProofCheckReport\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$solver_digest\"},\"uri\":\"$check_uri\"}]"
     ;;
   uri-only)
-    proof_artifacts="[{\"kind\":\"SolverTranscript\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$solver_digest\"},\"uri\":\"artifact://trust-wp/solver-transcript\"},{\"kind\":\"ProofCheckReport\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$check_digest\"},\"uri\":\"artifact://trust-wp/proof-check\"}]"
+    proof_artifacts="[{\"kind\":\"SolverTranscript\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$solver_digest\"},\"uri\":\"artifact://trust-mc/solver-transcript\"},{\"kind\":\"ProofCheckReport\",\"digest\":{\"algorithm\":\"sha256\",\"value\":\"$check_digest\"},\"uri\":\"artifact://trust-mc/proof-check\"}]"
     ;;
   metadata-only)
-    proof_artifacts='[{"kind":"SolverTranscript","digest":{"algorithm":"sha256","value":"2f92c544693c749e38d49de497b5b54eebcce349b4defcf5e716a5703b2b1816"},"uri":"artifact://trust-wp/solver-transcript","metadata":"solver metadata"},{"kind":"ProofCheckReport","digest":{"algorithm":"sha256","value":"a31f9a85de1bf6b0d75e31e76fdd500f7e864ad0187d90f58fc9435d892ea680"},"uri":"artifact://trust-wp/proof-check","metadata":"check metadata"}]'
+    proof_artifacts='[{"kind":"SolverTranscript","digest":{"algorithm":"sha256","value":"2f92c544693c749e38d49de497b5b54eebcce349b4defcf5e716a5703b2b1816"},"uri":"artifact://trust-mc/solver-transcript","metadata":"solver metadata"},{"kind":"ProofCheckReport","digest":{"algorithm":"sha256","value":"a31f9a85de1bf6b0d75e31e76fdd500f7e864ad0187d90f58fc9435d892ea680"},"uri":"artifact://trust-mc/proof-check","metadata":"check metadata"}]'
     ;;
 esac
 
-native_trust_ir="{\"suite\":\"trust-wp\",\"backend\":\"$native_backend\",\"request_id\":\"$request_id\",\"native_id\":\"$native_id\",\"present\":true,\"artifacts\":$native_artifacts}"
+native_trust_ir="{\"suite\":\"trust-mc\",\"backend\":\"$native_backend\",\"request_id\":\"$request_id\",\"native_id\":\"$native_id\",\"present\":true,\"artifacts\":$native_artifacts}"
 if [ "$evidence_mode" = "materialized" ]; then
   if [ -n "${SELF_VERIFY_NATIVE_JSON:-}" ] && [ -n "${SELF_VERIFY_PROOF_JSON:-}" ]; then
     native_trust_ir="$SELF_VERIFY_NATIVE_JSON"
@@ -2799,7 +2882,7 @@ if [ "$evidence_mode" = "materialized" ]; then
     proof_evidence="$(cat "$repo/.self-verify-proof-fixture.json")"
   fi
 elif [ "$evidence_mode" != "missing" ]; then
-  proof_evidence="{\"suite\":\"trust-wp\",\"backend\":\"trust-full-verifier\",\"request_id\":\"$request_id\",\"proof_id\":\"self-verify-proof-1\",\"native_id\":\"$proof_native_id\",\"status\":\"proved\",\"strength\":$proof_strength,\"evidence\":$proof_assurance,\"artifacts\":$proof_artifacts,\"diagnostics\":$proof_diagnostics}"
+  proof_evidence="{\"suite\":\"trust-mc\",\"backend\":\"trust-full-verifier\",\"request_id\":\"$request_id\",\"proof_id\":\"self-verify-proof-1\",\"native_id\":\"$proof_native_id\",\"status\":\"proved\",\"strength\":$proof_strength,\"evidence\":$proof_assurance,\"artifacts\":$proof_artifacts,\"diagnostics\":$proof_diagnostics}"
 fi
 
 proved=0

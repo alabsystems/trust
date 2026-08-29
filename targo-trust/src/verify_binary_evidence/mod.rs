@@ -468,7 +468,8 @@ mod tests {
         id: &str,
         certificate: ProofCertificateStatus,
     ) -> SolverDispatchRecord {
-        let binary_sha256 = trust_types::digest::stable_sha256_hex(b"checked-certificate-test-binary");
+        let binary_sha256 =
+            trust_types::digest::stable_sha256_hex(b"checked-certificate-test-binary");
         SolverDispatchRecord {
             id: id.to_string(),
             function: Some("main".to_string()),
@@ -548,7 +549,8 @@ mod tests {
 
     #[test]
     fn production_report_preserves_missing_binary_identity_and_rejects_it() {
-        let certificate_sha256 = trust_types::digest::stable_sha256_hex(b"checked certificate fixture");
+        let certificate_sha256 =
+            trust_types::digest::stable_sha256_hex(b"checked certificate fixture");
         let valid_dispatch = test_checked_certificate_dispatch(
             "missing-binary-identity:vc0",
             ProofCertificateStatus::Checked {
@@ -629,9 +631,9 @@ mod tests {
             actual_binary_dispatch_and_artifact("import-binary-digest-mismatch");
         let binary_sha256 = trust_types::digest::stable_sha256_hex(&binary_bytes);
         current.binary_artifact_digest_identity = Some(BinaryArtifactDigestIdentity {
-            root_artifact_digest: Some(BinaryArtifactDigest::sha256(trust_types::digest::stable_sha256_hex(
-                b"stale root binary digest",
-            ))),
+            root_artifact_digest: Some(BinaryArtifactDigest::sha256(
+                trust_types::digest::stable_sha256_hex(b"stale root binary digest"),
+            )),
             selected_image: Some(BinarySelectedImageIdentity {
                 file_offset: 0,
                 file_size: u64::try_from(binary_bytes.len()).expect("fixture binary len fits u64"),
@@ -809,7 +811,8 @@ mod tests {
 
     #[test]
     fn noncanonical_checked_certificate_digest_does_not_satisfy_coverage() {
-        let canonical_certificate_sha256 = trust_types::digest::stable_sha256_hex(b"checked certificate");
+        let canonical_certificate_sha256 =
+            trust_types::digest::stable_sha256_hex(b"checked certificate");
         let noncanonical_certificate_sha256 = canonical_certificate_sha256.to_uppercase();
         let noncanonical_dispatch = test_checked_certificate_dispatch(
             "checked-noncanonical:vc0",
@@ -845,7 +848,8 @@ mod tests {
 
     #[test]
     fn production_report_rejects_noncanonical_normalized_proof_export_digest() {
-        let proof_sha256 = trust_types::digest::stable_sha256_hex(b"normalized proof export").to_uppercase();
+        let proof_sha256 =
+            trust_types::digest::stable_sha256_hex(b"normalized proof export").to_uppercase();
         let dispatch = test_checked_certificate_dispatch(
             "proof-export-noncanonical:vc0",
             ProofCertificateStatus::Present {

@@ -262,9 +262,10 @@ pub(crate) fn load_doctor_config(crate_root: &Path) -> (TrustConfig, DoctorConfi
 
     match resolve_trust_config(crate_root, None) {
         Ok(resolved) => {
-            let mut detail = resolved.workspace_defaults_from.as_ref().map(|workspace| {
-                format!("unset keys inherited from {}", workspace.display())
-            });
+            let mut detail = resolved
+                .workspace_defaults_from
+                .as_ref()
+                .map(|workspace| format!("unset keys inherited from {}", workspace.display()));
             let (kind, path) = match resolved.source {
                 TrustConfigSource::Manifest(path) => (DoctorConfigSourceKind::Manifest, path),
                 TrustConfigSource::LegacyFile(path) => {
@@ -272,8 +273,8 @@ pub(crate) fn load_doctor_config(crate_root: &Path) -> (TrustConfig, DoctorConfi
                     (DoctorConfigSourceKind::LegacyFile, path)
                 }
                 TrustConfigSource::Defaults => {
-                    let path = discover_manifest(crate_root)
-                        .unwrap_or_else(|| crate_root.to_path_buf());
+                    let path =
+                        discover_manifest(crate_root).unwrap_or_else(|| crate_root.to_path_buf());
                     detail = Some("no [trust] table declared".to_string());
                     (DoctorConfigSourceKind::Defaults, path)
                 }
@@ -481,12 +482,10 @@ fn doctor_next_steps(report: &DoctorReport) -> Vec<String> {
         );
     }
     if report.config.source.has_error() {
-        steps.push(
-            format!(
-                "Fix or remove {} so targo-trust can load configuration cleanly.",
-                report.config.path.display()
-            ),
-        );
+        steps.push(format!(
+            "Fix or remove {} so targo-trust can load configuration cleanly.",
+            report.config.path.display()
+        ));
     }
 
     steps
@@ -500,7 +499,7 @@ pub(crate) fn supported_source_solver_names() -> &'static str {
     "ay"
 }
 
-const DEFAULT_NATIVE_SOURCE_ROUTES: &[&str] = &["trust-mc", "trust-wp", "trust-vc"];
+const DEFAULT_NATIVE_SOURCE_ROUTES: &[&str] = &["trust-mc", "trust-vc"];
 
 fn missing_default_native_source_routes(
     verifier_suites: &[DoctorVerifierSuiteStatus],
@@ -636,7 +635,7 @@ fn doctor_native_suite_for_solver<'a>(
 
 pub(crate) fn doctor_suite_has_native_source_route(suite: &DoctorVerifierSuiteStatus) -> bool {
     suite.adapter_compiled
-        && matches!(suite.name, "trust-mc" | "trust-wp" | "trust-vc")
+        && matches!(suite.name, "trust-mc" | "trust-vc")
         && suite.manifest.capabilities.iter().any(|capability| {
             matches!(capability.support, SupportLevel::Supported | SupportLevel::Preferred)
         })
@@ -1173,19 +1172,22 @@ mod tests {
     fn fully_capable_default_native_suites() -> Vec<DoctorVerifierSuiteStatus> {
         let mut suites = verifier_suite_statuses();
         for suite in &mut suites {
-            assert!(
-                DEFAULT_NATIVE_SOURCE_ROUTES.contains(&suite.name),
-                "unexpected default verifier suite in test fixture: {}",
-                suite.name
-            );
-            assert!(
-                !suite.manifest.capabilities.is_empty(),
-                "{} test fixture must declare at least one capability",
-                suite.name
-            );
             suite.adapter_compiled = true;
-            for capability in &mut suite.manifest.capabilities {
-                capability.support = SupportLevel::Supported;
+            if DEFAULT_NATIVE_SOURCE_ROUTES.contains(&suite.name) {
+                assert!(
+                    !suite.manifest.capabilities.is_empty(),
+                    "{} test fixture must declare at least one capability",
+                    suite.name
+                );
+                for capability in &mut suite.manifest.capabilities {
+                    capability.support = SupportLevel::Supported;
+                }
+            } else {
+                assert_eq!(suite.name, "trust-wp", "unexpected diagnostic verifier suite");
+                assert!(
+                    suite.manifest.capabilities.is_empty(),
+                    "retired trust-wp source authority must remain zero-capability"
+                );
             }
         }
         suites
@@ -1420,27 +1422,49 @@ mod tests {
             );
         }
 
-        let mut incapable_suite = capable_suites.clone();
-        let trust_wp = incapable_suite
-            .iter_mut()
+        let trust_wp = capable_suites
+            .iter()
             .find(|suite| suite.name == "trust-wp")
-            .expect("trust-wp fixture");
-        for capability in &mut trust_wp.manifest.capabilities {
-            capability.support =
-                SupportLevel::Experimental { reason: "test-only unwired route".to_string() };
+            .expect("trust-wp diagnostic fixture");
+        assert!(trust_wp.manifest.capabilities.is_empty());
+        assert!(!doctor_suite_has_native_source_route(trust_wp));
+        let mut forged_trust_wp = trust_wp.clone();
+        forged_trust_wp.manifest.capabilities = capable_suites
+            .iter()
+            .find(|suite| suite.name == "trust-mc")
+            .expect("trust-mc fixture")
+            .manifest
+            .capabilities
+            .clone();
+        for capability in &mut forged_trust_wp.manifest.capabilities {
+            capability.support = SupportLevel::Supported;
         }
         assert!(
-            !doctor_is_ready(&report.compiler, &report.config, 1, &incapable_suite),
-            "an installed ay must not make an incapable trust-wp route ready"
+            !doctor_suite_has_native_source_route(&forged_trust_wp),
+            "even a drifted historical TrustWP manifest must not revive a source route"
+        );
+        assert!(
+            doctor_is_ready(&report.compiler, &report.config, 1, &capable_suites),
+            "zero-capability trust-wp diagnostics must not block required native routes"
+        );
+
+        let without_trust_wp = capable_suites
+            .iter()
+            .filter(|suite| suite.name != "trust-wp")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            doctor_is_ready(&report.compiler, &report.config, 1, &without_trust_wp),
+            "retired trust-wp inventory must not be a readiness requirement"
         );
 
         let mut steps_report = report;
-        steps_report.verifier_suites = incapable_suite;
+        steps_report.verifier_suites = without_trust_wp;
         steps_report.solvers.routed_available = 1;
         let steps = doctor_next_steps(&steps_report);
         assert!(
-            steps.iter().any(|step| step.contains("trust-wp")),
-            "doctor remediation must name the missing native route: {steps:?}"
+            steps.iter().all(|step| !step.contains("trust-wp")),
+            "doctor must not prescribe rebuilding retired trust-wp authority: {steps:?}"
         );
     }
 

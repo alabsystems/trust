@@ -354,6 +354,22 @@ fn encode_site_ty(out: &mut Vec<u8>, t: &SiteTy) {
             out.push(9);
             encode_site_ty(out, elem);
         }
+        // Trust (wave-CRT): a reference. Tag 10 is APPENDED, never inserted: tags 0..=9 keep
+        // their meaning, so every body whose site args contain no reference encodes
+        // BYTE-IDENTICALLY to before this wave and its lineage digest does not move. That is
+        // load-bearing — link 2c pins those digests, and a renumbering would churn every one of
+        // them for a change that does not affect them.
+        //
+        // The REGION is absent by construction (`SiteTy::Ref` does not carry one), so the digest
+        // is region-blind here exactly as the comparator is.
+        SiteTy::Ref(pointee, mutbl) => {
+            out.push(10);
+            out.push(match mutbl {
+                rustc_middle::ty::Mutability::Not => 0,
+                rustc_middle::ty::Mutability::Mut => 1,
+            });
+            encode_site_ty(out, pointee);
+        }
     }
 }
 
@@ -418,13 +434,13 @@ mod tests {
             &probe_module("probe"),
             &[probe_callee(false)],
         )
-            .expect("single-function module must digest");
+        .expect("single-function module must digest");
         let b = body_lineage_digest(
             probe_definition(3),
             &probe_module("probe"),
             &[probe_callee(false)],
         )
-            .expect("single-function module must digest");
+        .expect("single-function module must digest");
         assert_eq!(a, b, "identical (module, ledger) inputs must produce identical digests");
     }
 
@@ -444,12 +460,10 @@ mod tests {
     #[test]
     fn test_lineage_digest_perturbed_ledger_returns_different_digest() {
         let module = probe_module("probe");
-        let base =
-            body_lineage_digest(probe_definition(3), &module, &[probe_callee(false)])
-                .expect("digest");
-        let havoced =
-            body_lineage_digest(probe_definition(3), &module, &[probe_callee(true)])
-                .expect("digest");
+        let base = body_lineage_digest(probe_definition(3), &module, &[probe_callee(false)])
+            .expect("digest");
+        let havoced = body_lineage_digest(probe_definition(3), &module, &[probe_callee(true)])
+            .expect("digest");
         assert_ne!(base, havoced, "the callee ledger must be bound by the digest");
         let empty = body_lineage_digest(probe_definition(3), &module, &[]).expect("digest");
         assert_ne!(base, empty, "dropping a ledger row must change the digest");
@@ -505,10 +519,10 @@ mod tests {
     #[test]
     fn test_lineage_digest_binds_the_crate_as_well_as_the_index() {
         let module = probe_module("probe");
-        let local = body_lineage_digest(DefinitionIdentity::test_only(1, 7), &module, &[])
-            .expect("digest");
-        let foreign = body_lineage_digest(DefinitionIdentity::test_only(2, 7), &module, &[])
-            .expect("digest");
+        let local =
+            body_lineage_digest(DefinitionIdentity::test_only(1, 7), &module, &[]).expect("digest");
+        let foreign =
+            body_lineage_digest(DefinitionIdentity::test_only(2, 7), &module, &[]).expect("digest");
         assert_ne!(local, foreign, "the same index in a different crate is a different body");
     }
 }

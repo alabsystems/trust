@@ -11,12 +11,13 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
 use crate::ast::{ObjKey, PatElem, Pattern};
 use crate::interp::{Abrupt, Ctx, ERes, Interp};
 use crate::value::{
-    units_from_str, NativeErrorKind, ObjId, ObjKind, Object, Prop, SymId, Units, Value,
+    NativeErrorKind, ObjId, ObjKind, Object, Prop, SymId, Units, Value, units_from_str,
 };
-use std::rc::Rc;
 
 /// How a pattern leaf lands.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,11 +55,7 @@ pub(crate) enum SliceIter {
     /// reads `done`/`value` off the result; IteratorClose calls `return`. This
     /// covers user-defined iterables AND the Map/Set iterator objects (whose
     /// `next` is a modeled intrinsic). `done` gates a post-completion close.
-    General {
-        iterator: ObjId,
-        next: Value,
-        done: bool,
-    },
+    General { iterator: ObjId, next: Value, done: bool },
 }
 
 impl Interp {
@@ -244,11 +241,7 @@ impl Interp {
             return Err(self.throw_native(NativeErrorKind::TypeError));
         };
         let next = self.get_from_object(ioid, &units_from_str("next"))?;
-        Ok(SliceIter::General {
-            iterator: ioid,
-            next,
-            done: false,
-        })
+        Ok(SliceIter::General { iterator: ioid, next, done: false })
     }
 
     /// Is `oid` a generator whose iteration protocol is provably the intrinsic
@@ -419,7 +412,10 @@ impl Interp {
         match it {
             SliceIter::Generator(gid) => {
                 let gid = *gid;
-                let res = self.generator_resume(gid, crate::generator::Resumption::Normal(Value::Undefined))?;
+                let res = self.generator_resume(
+                    gid,
+                    crate::generator::Resumption::Normal(Value::Undefined),
+                )?;
                 let Value::Obj(roid) = res else {
                     return Err(Abrupt::Fatal("generator result not an object".to_string()));
                 };
@@ -514,10 +510,7 @@ impl Interp {
     /// The array/string/arguments iterators have no `return` method, so this
     /// is a no-op; generator-backed iterators route through the generator's
     /// `return` (added with the own-generator fast path).
-    pub(crate) fn slice_iterator_close(
-        &mut self,
-        it: &mut SliceIter,
-    ) -> Result<(), Abrupt> {
+    pub(crate) fn slice_iterator_close(&mut self, it: &mut SliceIter) -> Result<(), Abrupt> {
         match it {
             // Array/string iterators, Array Iterator objects, and RegExp
             // String Iterators have no `return` method — IteratorClose is a
@@ -603,12 +596,7 @@ impl Interp {
 
     /// The default-initializer step, with NamedEvaluation for anonymous
     /// function/class defaults landing on a NAME leaf.
-    fn apply_default(
-        &mut self,
-        v: Value,
-        elem: &PatElem,
-        ctx: &Ctx,
-    ) -> ERes {
+    fn apply_default(&mut self, v: Value, elem: &PatElem, ctx: &Ctx) -> ERes {
         if !matches!(v, Value::Undefined) {
             return Ok(v);
         }
@@ -649,7 +637,7 @@ impl Interp {
                         crate::value::PropertyKey::Sym(_) => {
                             return Err(Abrupt::Fatal(
                                 "symbol-keyed destructuring target (out of slice)".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -687,7 +675,7 @@ impl Interp {
                 _ => {
                     return Err(Abrupt::Fatal(
                         "object rest target shape (parser invariant)".to_string(),
-                    ))
+                    ));
                 }
             }
         }
@@ -809,11 +797,7 @@ impl Interp {
 
     /// One iterator step for array destructuring, tracking exhaustion. Once
     /// `done`, further elements bind `undefined` without touching the iterator.
-    fn array_dstr_step(
-        &mut self,
-        it: &mut SliceIter,
-        done: &mut bool,
-    ) -> Result<Value, Abrupt> {
+    fn array_dstr_step(&mut self, it: &mut SliceIter, done: &mut bool) -> Result<Value, Abrupt> {
         if *done {
             return Ok(Value::Undefined);
         }

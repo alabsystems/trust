@@ -19,12 +19,9 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod binary;
-pub use binary::{
-    WasmCompileError, compile_functions_to_wasm, compile_trust_ir_module_to_wasm,
-};
-
 use std::collections::HashMap;
 
+pub use binary::{WasmCompileError, compile_functions_to_wasm, compile_trust_ir_module_to_wasm};
 use thiserror::Error;
 use trust_ir::Module as TrustIrModule;
 use trust_ir::dialect::{AttrValue, DialectInst};
@@ -535,7 +532,9 @@ pub fn convert_functions_to_wat(functions: &[VerifiableFunction]) -> WasmConvers
     }
 }
 
-fn lifted_trust_ir_artifact_digest_for_functions(functions: &[VerifiableFunction]) -> Option<String> {
+fn lifted_trust_ir_artifact_digest_for_functions(
+    functions: &[VerifiableFunction],
+) -> Option<String> {
     serde_json::to_vec(functions).ok().map(|bytes| stable_sha256_hex(&bytes))
 }
 
@@ -1284,7 +1283,9 @@ fn symbolic_trust_ir_validation_records(
                 function: Some(function.clone()),
                 lifted_function: Some(function.clone()),
                 reconstructed_function: None,
-                candidate: ReconstructionCandidateKind::Other("canonical-trust_ir-to-wasm".to_string()),
+                candidate: ReconstructionCandidateKind::Other(
+                    "canonical-trust_ir-to-wasm".to_string(),
+                ),
                 status: ReconstructionValidationStatus::Failed,
                 trust_level: TrustLevel::Rejected,
                 forward: Some(validation_direction(
@@ -1297,7 +1298,8 @@ fn symbolic_trust_ir_validation_records(
                     .into_iter()
                     .map(symbolic_formula_detail)
                     .chain(std::iter::once(
-                        "canonical TrustIr symbolic formula preserved as blocker/evidence".to_string(),
+                        "canonical TrustIr symbolic formula preserved as blocker/evidence"
+                            .to_string(),
                     ))
                     .collect(),
             }
@@ -3135,8 +3137,12 @@ fn build_wasm_target_proof_binding(
         target: "wasm".to_string(),
         target_output: target_output.to_string(),
         lifted_trust_ir_artifact_digest: conversion.lifted_trust_ir_artifact_digest.clone(),
-        bound_lifted_trust_ir_artifact_digest: conversion.bound_lifted_trust_ir_artifact_digest.clone(),
-        lifted_trust_ir_artifact_digest_matched: wasm_lifted_trust_ir_artifact_digest_matches(conversion),
+        bound_lifted_trust_ir_artifact_digest: conversion
+            .bound_lifted_trust_ir_artifact_digest
+            .clone(),
+        lifted_trust_ir_artifact_digest_matched: wasm_lifted_trust_ir_artifact_digest_matches(
+            conversion,
+        ),
         status,
         target_semantics_consumed,
         inputs,

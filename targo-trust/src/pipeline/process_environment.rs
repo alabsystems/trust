@@ -31,6 +31,11 @@ const PROOF_COMPILER_AUTHORITY_ENV: &[&str] = &[
     "TRUST_PROP_UNSAT_WORK_BUDGET",
     "TRUST_PROVE_BUDGET_SECS",
     "TRUST_SOLVER",
+    // Trust (v6/D1): the spec-goal artifact sink is disclosure-only, but an
+    // ambient value must never pick where a verified run writes evidence.
+    // targo-trust re-stages it deliberately AFTER this scrub when (and only
+    // when) `targo trust spec` requested emission.
+    "TRUST_SPEC_EMIT_DIR",
     "TRUST_SPINE_CONTRACT_FLIP",
     "TRUST_SPINE_NATIVE_GEN",
     "TRUST_SPINE_VERDICT_FLIP",

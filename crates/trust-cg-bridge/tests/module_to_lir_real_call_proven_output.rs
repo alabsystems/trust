@@ -49,19 +49,16 @@ use std::collections::HashMap;
 
 use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::{
-    lower_trust_ir_function_to_lir, lower_trust_ir_function_to_lir_real_calls,
-};
+use trust_cg_bridge::{lower_trust_ir_function_to_lir, lower_trust_ir_function_to_lir_real_calls};
 use trust_disasm::{Instruction as DisasmInst, Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, Effect, Flags, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::interpret::{InterpretValue, Interpreter};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
 use trust_ir::{Block, Constant, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, Effect, Flags, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build the same caller(a,b) = add(a,b) + k module as the inline test, so the
@@ -204,9 +201,8 @@ fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
 /// Whether the callee symbol appears in the object's symbol table (proof it is a
 /// defined function symbol, e.g. the callee's own object).
 fn object_defines_symbol(obj: &[u8], want: &str) -> bool {
-    let rd_u32 = |o: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?))
-    };
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
     if rd_u32(0) != Some(0xfeed_facf) {
         return false;
     }
@@ -255,9 +251,7 @@ fn object_defines_symbol(obj: &[u8], want: &str) -> bool {
 /// `verify_output::parse_text_branch26_relocs`. Only external, pcrel, len==2,
 /// BRANCH26 relocations to a defined symbol are recorded.
 fn parse_branch26_relocs(obj: &[u8]) -> HashMap<u64, String> {
-    let rd_u32 = |o: usize| -> u32 {
-        u32::from_le_bytes(obj[o..o + 4].try_into().expect("u32"))
-    };
+    let rd_u32 = |o: usize| -> u32 { u32::from_le_bytes(obj[o..o + 4].try_into().expect("u32")) };
     assert_eq!(rd_u32(0), 0xfeed_facf, "not a Mach-O 64 object");
     let ncmds = rd_u32(16);
     let mut cmd_off = 32usize;
@@ -369,9 +363,7 @@ fn substitute_var(f: &Formula, name: &str, replacement: &Formula) -> Formula {
     match f {
         Formula::Var(n, _) if n == name => replacement.clone(),
         leaf @ (Formula::Var(..) | Formula::SymVar(..)) => leaf.clone(),
-        other => other
-            .clone()
-            .map_children(&mut |child| substitute_var(&child, name, replacement)),
+        other => other.clone().map_children(&mut |child| substitute_var(&child, name, replacement)),
     }
 }
 
@@ -402,9 +394,9 @@ fn composed_machine_output(code: &[u8], base: u64, relocs: &HashMap<u64, String>
         let is_call = effects.iter().any(|e| matches!(e, Effect::Call { .. }));
         if is_call {
             let sec_off = pc - base;
-            let callee = relocs
-                .get(&sec_off)
-                .unwrap_or_else(|| panic!("no BRANCH26 reloc at bl {pc:#x} (sec_off {sec_off:#x})"));
+            let callee = relocs.get(&sec_off).unwrap_or_else(|| {
+                panic!("no BRANCH26 reloc at bl {pc:#x} (sec_off {sec_off:#x})")
+            });
             assert_eq!(callee, "ir_add", "the bl must target the local pure callee");
 
             // Substitute the callee's derived pure output with the CURRENT
@@ -467,7 +459,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort {name}: {other:?}"),
     }
@@ -594,9 +587,8 @@ fn interpret_caller(module: &Module, a: i128, b: i128) -> i128 {
         InterpretValue::int(Ty::I32, a).expect("arg a"),
         InterpretValue::int(Ty::I32, b).expect("arg b"),
     ];
-    let outcome = interp
-        .execute_func(FuncId::new(0), args)
-        .expect("interpreter execute_func failed");
+    let outcome =
+        interp.execute_func(FuncId::new(0), args).expect("interpreter execute_func failed");
     outcome.returns[0].as_int().expect("integer return").as_signed()
 }
 

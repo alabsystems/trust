@@ -10,7 +10,7 @@
 
 use crate::ast::*;
 use crate::lexer::{Fail, P, TokenKind, TplKind};
-use crate::parser::{cook_string, BindTarget, Parser, ParamInfo, PResult, Pending, ScopeKind};
+use crate::parser::{BindTarget, PResult, ParamInfo, Parser, Pending, ScopeKind, cook_string};
 use crate::regex_validate::validate_regex;
 
 impl Parser {
@@ -132,20 +132,14 @@ impl Parser {
         if self.tok.is_punct(P::Star) && !self.tok.newline_before {
             self.next()?;
             let arg = self.parse_assignment(false)?;
-            return Ok(Expr::Yield {
-                arg: Some(Box::new(arg)),
-                delegate: true,
-            });
+            return Ok(Expr::Yield { arg: Some(Box::new(arg)), delegate: true });
         }
         let arg = if !self.tok.newline_before && self.token_starts_expression() {
             Some(Box::new(self.parse_assignment(false)?))
         } else {
             None
         };
-        Ok(Expr::Yield {
-            arg,
-            delegate: false,
-        })
+        Ok(Expr::Yield { arg, delegate: false })
     }
 
     fn token_starts_expression(&self) -> bool {
@@ -236,9 +230,7 @@ impl Parser {
             // Spec: early error (AssignmentTargetType is invalid). Web
             // reality (V8/JSC): parses, throws ReferenceError at runtime —
             // but only for a top-level call target, not nested in patterns.
-            return Err(Fail::unsupported(
-                "engine-divergent call-expression assignment target",
-            ));
+            return Err(Fail::unsupported("engine-divergent call-expression assignment target"));
         }
         let target = if op == "=" {
             let t = self.expr_to_assign_target(e, true)?;
@@ -250,11 +242,7 @@ impl Parser {
         };
         self.next()?;
         let value = self.parse_assignment(false)?;
-        Ok(Expr::Assign {
-            op,
-            target: Box::new(target),
-            value: Box::new(value),
-        })
+        Ok(Expr::Assign { op, target: Box::new(target), value: Box::new(value) })
     }
 
     fn parse_cond_from(&mut self, e: Expr) -> PResult<Expr> {
@@ -269,11 +257,7 @@ impl Parser {
         let cons = cons?;
         self.expect_punct(P::Colon, "':' in conditional expression")?;
         let alt = self.parse_assignment(false)?;
-        Ok(Expr::Cond {
-            test: Box::new(e),
-            cons: Box::new(cons),
-            alt: Box::new(alt),
-        })
+        Ok(Expr::Cond { test: Box::new(e), cons: Box::new(cons), alt: Box::new(alt) })
     }
 
     /// Operator table: (text, precedence, right_assoc).
@@ -344,14 +328,10 @@ impl Parser {
             let next_min = if right_assoc { prec } else { prec + 1 };
             let right = self.parse_binary_from(operand, next_min)?;
             if matches!(right, Expr::PrivateRef(_)) {
-                return Err(Fail::early(
-                    "private name must be the left operand of 'in'",
-                ));
+                return Err(Fail::early("private name must be the left operand of 'in'"));
             }
             if matches!(left, Expr::PrivateRef(_)) && op != "in" {
-                return Err(Fail::early(
-                    "private name must be the left operand of 'in'",
-                ));
+                return Err(Fail::early("private name must be the left operand of 'in'"));
             }
             left = match op {
                 "&&" | "||" | "??" => {
@@ -360,17 +340,9 @@ impl Parser {
                             "'??' cannot be mixed with '&&'/'||' without parentheses",
                         ));
                     }
-                    Expr::Logical {
-                        op,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }
+                    Expr::Logical { op, left: Box::new(left), right: Box::new(right) }
                 }
-                _ => Expr::Binary {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
+                _ => Expr::Binary { op, left: Box::new(left), right: Box::new(right) },
             };
         }
         Ok(left)
@@ -414,10 +386,7 @@ impl Parser {
                         }
                     }
                 }
-                return Ok(Expr::Unary {
-                    op,
-                    arg: Box::new(arg),
-                });
+                return Ok(Expr::Unary { op, arg: Box::new(arg) });
             }
             if self.tok.is_kw("await") && (self.ctx.await_expr || self.ctx.static_block) {
                 if self.ctx.static_block {
@@ -437,19 +406,11 @@ impl Parser {
             TokenKind::Punct(P::Tilde) => self.parse_simple_unary("~"),
             TokenKind::Punct(P::Bang) => self.parse_simple_unary("!"),
             TokenKind::Punct(P::PlusPlus) | TokenKind::Punct(P::MinusMinus) => {
-                let op: &'static str = if self.tok.is_punct(P::PlusPlus) {
-                    "++"
-                } else {
-                    "--"
-                };
+                let op: &'static str = if self.tok.is_punct(P::PlusPlus) { "++" } else { "--" };
                 self.next()?;
                 let arg = self.parse_unary()?;
                 self.check_update_target(&arg)?;
-                Ok(Expr::Update {
-                    op,
-                    prefix: true,
-                    arg: Box::new(arg),
-                })
+                Ok(Expr::Update { op, prefix: true, arg: Box::new(arg) })
             }
             _ => {
                 let e = self.parse_lhs_expression()?;
@@ -461,10 +422,7 @@ impl Parser {
     fn parse_simple_unary(&mut self, op: &'static str) -> PResult<Expr> {
         self.next()?;
         let arg = self.parse_unary()?;
-        Ok(Expr::Unary {
-            op,
-            arg: Box::new(arg),
-        })
+        Ok(Expr::Unary { op, arg: Box::new(arg) })
     }
 
     fn parse_postfix_tail(&mut self, e: Expr) -> PResult<Expr> {
@@ -472,17 +430,9 @@ impl Parser {
             && !self.tok.newline_before
         {
             self.check_update_target(&e)?;
-            let op: &'static str = if self.tok.is_punct(P::PlusPlus) {
-                "++"
-            } else {
-                "--"
-            };
+            let op: &'static str = if self.tok.is_punct(P::PlusPlus) { "++" } else { "--" };
             self.next()?;
-            return Ok(Expr::Update {
-                op,
-                prefix: false,
-                arg: Box::new(e),
-            });
+            return Ok(Expr::Update { op, prefix: false, arg: Box::new(e) });
         }
         Ok(e)
     }
@@ -498,37 +448,21 @@ impl Parser {
     /// A non-optional call expression (possibly parenthesized) — the
     /// engine-divergent assignment-target class.
     pub fn is_plain_call(e: &Expr) -> bool {
-        matches!(
-            Self::unwrap_parens(e),
-            Expr::Call {
-                optional: false,
-                in_chain: false,
-                ..
-            }
-        )
+        matches!(Self::unwrap_parens(e), Expr::Call { optional: false, in_chain: false, .. })
     }
 
     fn check_update_target(&self, e: &Expr) -> PResult<()> {
         if Self::is_plain_call(e) {
-            return Err(Fail::unsupported(
-                "engine-divergent call-expression update target",
-            ));
+            return Err(Fail::unsupported("engine-divergent call-expression update target"));
         }
         match Self::unwrap_parens(e) {
             Expr::Ident(n) => {
                 if self.ctx.strict && (n == "eval" || n == "arguments") {
-                    return Err(Fail::early(format!(
-                        "cannot update '{n}' in strict mode"
-                    )));
+                    return Err(Fail::early(format!("cannot update '{n}' in strict mode")));
                 }
                 Ok(())
             }
-            Expr::Member {
-                optional: false,
-                in_chain: false,
-                ..
-            }
-            | Expr::SuperProp(_) => Ok(()),
+            Expr::Member { optional: false, in_chain: false, .. } | Expr::SuperProp(_) => Ok(()),
             _ => Err(Fail::early("invalid increment/decrement target")),
         }
     }
@@ -538,11 +472,8 @@ impl Parser {
     pub fn parse_lhs_expression(&mut self) -> PResult<Expr> {
         let g = self.enter()?;
         let r = (|| {
-            let base = if self.tok.is_kw("new") {
-                self.parse_new_expr()?
-            } else {
-                self.parse_primary()?
-            };
+            let base =
+                if self.tok.is_kw("new") { self.parse_new_expr()? } else { self.parse_primary()? };
             self.parse_chain_from(base)
         })();
         self.leave(g);
@@ -570,15 +501,8 @@ impl Parser {
             return Ok(Expr::NewTarget);
         }
         let callee = self.parse_new_callee()?;
-        let args = if self.tok.is_punct(P::LParen) {
-            self.parse_args(false)?
-        } else {
-            Vec::new()
-        };
-        Ok(Expr::New {
-            callee: Box::new(callee),
-            args,
-        })
+        let args = if self.tok.is_punct(P::LParen) { self.parse_args(false)? } else { Vec::new() };
+        Ok(Expr::New { callee: Box::new(callee), args })
     }
 
     /// MemberExpression restricted for a new callee: member accesses and
@@ -594,11 +518,8 @@ impl Parser {
                 return Err(Fail::early("cannot use 'new' with import()"));
             }
         }
-        let mut base = if self.tok.is_kw("new") {
-            self.parse_new_expr()?
-        } else {
-            self.parse_primary()?
-        };
+        let mut base =
+            if self.tok.is_kw("new") { self.parse_new_expr()? } else { self.parse_primary()? };
         loop {
             match &self.tok.kind {
                 TokenKind::Punct(P::Dot) => {
@@ -623,10 +544,7 @@ impl Parser {
                 TokenKind::Punct(P::QuestionDot) => {
                     return Err(Fail::early("optional chain in new callee"));
                 }
-                TokenKind::Template {
-                    kind: TplKind::NoSub | TplKind::Head,
-                    ..
-                } => {
+                TokenKind::Template { kind: TplKind::NoSub | TplKind::Head, .. } => {
                     base = self.parse_tagged_template(base)?;
                 }
                 _ => break,
@@ -646,19 +564,12 @@ impl Parser {
             _ => return Err(Fail::early("expected property name after '.'")),
         };
         self.next()?;
-        Ok(Expr::Member {
-            obj: Box::new(obj),
-            prop: Box::new(key),
-            optional,
-            in_chain,
-        })
+        Ok(Expr::Member { obj: Box::new(obj), prop: Box::new(key), optional, in_chain })
     }
 
     fn parse_chain_from(&mut self, mut e: Expr) -> PResult<Expr> {
-        let mut in_chain = matches!(
-            e,
-            Expr::Member { in_chain: true, .. } | Expr::Call { in_chain: true, .. }
-        );
+        let mut in_chain =
+            matches!(e, Expr::Member { in_chain: true, .. } | Expr::Call { in_chain: true, .. });
         loop {
             match &self.tok.kind {
                 TokenKind::Punct(P::Dot) => {
@@ -682,12 +593,7 @@ impl Parser {
                 }
                 TokenKind::Punct(P::LParen) => {
                     let args = self.parse_args(false)?;
-                    e = Expr::Call {
-                        callee: Box::new(e),
-                        args,
-                        optional: false,
-                        in_chain,
-                    };
+                    e = Expr::Call { callee: Box::new(e), args, optional: false, in_chain };
                 }
                 TokenKind::Punct(P::QuestionDot) => {
                     in_chain = true;
@@ -721,17 +627,12 @@ impl Parser {
                             e = self.parse_member_prop(e, true, true)?;
                         }
                         TokenKind::Template { .. } => {
-                            return Err(Fail::early(
-                                "tagged template in optional chain",
-                            ));
+                            return Err(Fail::early("tagged template in optional chain"));
                         }
                         _ => return Err(Fail::early("unexpected token after '?.'")),
                     }
                 }
-                TokenKind::Template {
-                    kind: TplKind::NoSub | TplKind::Head,
-                    ..
-                } => {
+                TokenKind::Template { kind: TplKind::NoSub | TplKind::Head, .. } => {
                     if in_chain {
                         return Err(Fail::early("tagged template in optional chain"));
                     }
@@ -794,11 +695,7 @@ impl Parser {
         }
         self.next()?; // =>
         self.push_scope(ScopeKind::FnBody);
-        self.scopes
-            .last_mut()
-            .expect("scope")
-            .var_names
-            .insert(name.clone(), ());
+        self.scopes.last_mut().expect("scope").var_names.insert(name.clone(), ());
         let info = ParamInfo {
             params: vec![Pat::Ident(name.clone())],
             names: vec![name],
@@ -833,11 +730,8 @@ impl Parser {
             ));
         }
         let mut items = items;
-        let inner = if items.len() == 1 {
-            items.pop().expect("one item")
-        } else {
-            Expr::Seq(items)
-        };
+        let inner =
+            if items.len() == 1 { items.pop().expect("one item") } else { Expr::Seq(items) };
         let base = Expr::Paren(Box::new(inner));
         self.parse_expr_tails(base)
     }
@@ -1052,13 +946,7 @@ impl Parser {
         if has_dup && (unique || self.ctx.strict || !simple) {
             return Err(Fail::early("duplicate parameter names not allowed here"));
         }
-        Ok(ParamInfo {
-            params,
-            names,
-            simple,
-            has_dup,
-            has_rest,
-        })
+        Ok(ParamInfo { params, names, simple, has_dup, has_rest })
     }
 
     pub fn parse_binding_target(&mut self, target: BindTarget) -> PResult<Pat> {
@@ -1088,9 +976,7 @@ impl Parser {
             BindTarget::Var => self.declare_var(name)?,
             BindTarget::LetConst => {
                 if name == "let" {
-                    return Err(Fail::early(
-                        "'let' may not be a lexically bound name",
-                    ));
+                    return Err(Fail::early("'let' may not be a lexically bound name"));
                 }
                 self.declare_lexical(name, crate::parser::LexKind::LetConst)?;
             }
@@ -1178,7 +1064,7 @@ impl Parser {
                             _ => {
                                 return Err(Fail::early(
                                     "binding rest property must be an identifier",
-                                ))
+                                ));
                             }
                         }
                         if self.tok.is_punct(P::Comma) {
@@ -1245,15 +1131,11 @@ impl Parser {
         match e {
             Expr::Ident(n) => {
                 if self.ctx.strict && (n == "eval" || n == "arguments") {
-                    return Err(Fail::early(format!(
-                        "cannot assign to '{n}' in strict mode"
-                    )));
+                    return Err(Fail::early(format!("cannot assign to '{n}' in strict mode")));
                 }
                 Ok(Pat::Ident(n))
             }
-            Expr::Member {
-                optional, in_chain, ..
-            } => {
+            Expr::Member { optional, in_chain, .. } => {
                 if optional || in_chain {
                     return Err(Fail::early("optional chain is not a valid assignment target"));
                 }
@@ -1261,10 +1143,7 @@ impl Parser {
             }
             Expr::SuperProp(_) => Ok(Pat::Expr(Box::new(e))),
             Expr::Paren(inner) => self.expr_to_assign_target(*inner, false),
-            Expr::Array {
-                elems,
-                trailing_comma,
-            } if allow_pattern => {
+            Expr::Array { elems, trailing_comma } if allow_pattern => {
                 let n = elems.len();
                 let mut out: Vec<Option<Pat>> = Vec::new();
                 let mut rest: Option<Box<Pat>> = None;
@@ -1324,7 +1203,7 @@ impl Parser {
                         ObjProp::Method { .. } => {
                             return Err(Fail::early(
                                 "method is not a valid assignment-pattern property",
-                            ))
+                            ));
                         }
                         ObjProp::Spread(x) => {
                             if i + 1 != n {
@@ -1341,11 +1220,9 @@ impl Parser {
                 }
                 Ok(Pat::Object { props: out, rest })
             }
-            Expr::Assign {
-                op: "=",
-                target,
-                value,
-            } if allow_pattern => Ok(Pat::Default(target, value)),
+            Expr::Assign { op: "=", target, value } if allow_pattern => {
+                Ok(Pat::Default(target, value))
+            }
             _ => Err(Fail::early("invalid assignment target")),
         }
     }
@@ -1353,11 +1230,7 @@ impl Parser {
     /// Array/object pattern element: allows nested patterns and defaults.
     fn elem_to_target(&mut self, e: Expr) -> PResult<Pat> {
         match e {
-            Expr::Assign {
-                op: "=",
-                target,
-                value,
-            } => Ok(Pat::Default(target, value)),
+            Expr::Assign { op: "=", target, value } => Ok(Pat::Default(target, value)),
             other => self.expr_to_assign_target(other, true),
         }
     }
@@ -1378,18 +1251,12 @@ impl Parser {
                     return Err(Fail::early("legacy octal literal in strict mode"));
                 }
                 if self.ctx.strict && flags.non_octal_decimal {
-                    return Err(Fail::early(
-                        "decimal literal with leading zero in strict mode",
-                    ));
+                    return Err(Fail::early("decimal literal with leading zero in strict mode"));
                 }
                 let raw = raw.clone();
                 let bigint = flags.bigint;
                 self.next()?;
-                Ok(if bigint {
-                    Expr::BigInt(raw)
-                } else {
-                    Expr::Num(raw)
-                })
+                Ok(if bigint { Expr::BigInt(raw) } else { Expr::Num(raw) })
             }
             TokenKind::Str { raw, flags } => {
                 if self.ctx.strict && flags.legacy_octal_escape {
@@ -1406,10 +1273,7 @@ impl Parser {
                 self.next()?;
                 Ok(e)
             }
-            TokenKind::Template {
-                kind: TplKind::NoSub | TplKind::Head,
-                ..
-            } => {
+            TokenKind::Template { kind: TplKind::NoSub | TplKind::Head, .. } => {
                 let (quasis, exprs) = self.parse_template_parts(false)?;
                 Ok(Expr::Template { quasis, exprs })
             }
@@ -1480,7 +1344,7 @@ impl Parser {
                 let key = match &self.tok.kind {
                     TokenKind::Ident(n) => PropKey::Ident(n.clone()),
                     TokenKind::PrivateIdent(_) => {
-                        return Err(Fail::early("private member access on 'super'"))
+                        return Err(Fail::early("private member access on 'super'"));
                     }
                     _ => return Err(Fail::early("expected property name after 'super.'")),
                 };
@@ -1502,9 +1366,7 @@ impl Parser {
             }
             TokenKind::Punct(P::LParen) => {
                 if !self.ctx.super_call_ok {
-                    return Err(Fail::early(
-                        "'super' call outside of derived-class constructor",
-                    ));
+                    return Err(Fail::early("'super' call outside of derived-class constructor"));
                 }
                 let args = self.parse_args(false)?;
                 Ok(Expr::SuperCall(args))
@@ -1552,9 +1414,7 @@ impl Parser {
                     Err(Fail::early("expected 'meta' after 'import.'"))
                 }
             }
-            _ => Err(Fail::early(
-                "import declarations are only valid in modules",
-            )),
+            _ => Err(Fail::early("import declarations are only valid in modules")),
         }
     }
 
@@ -1626,10 +1486,7 @@ impl Parser {
             }
         }
         self.expect_punct(P::RBracket, "']'")?;
-        Ok(Expr::Array {
-            elems,
-            trailing_comma,
-        })
+        Ok(Expr::Array { elems, trailing_comma })
     }
 
     fn parse_object_literal(&mut self) -> PResult<Expr> {
@@ -1669,9 +1526,7 @@ impl Parser {
         let mut accessor: Option<MethodKind> = None;
         if self.tok.is_kw("async") {
             let p = self.peek()?;
-            if !p.newline_before
-                && (self.token_is_property_name_start(&p) || p.is_punct(P::Star))
-            {
+            if !p.newline_before && (self.token_is_property_name_start(&p) || p.is_punct(P::Star)) {
                 is_async = true;
                 self.next()?;
             }
@@ -1681,11 +1536,7 @@ impl Parser {
             self.next()?;
         }
         if !is_async && !is_gen && (self.tok.is_kw("get") || self.tok.is_kw("set")) {
-            let which = if self.tok.is_kw("get") {
-                MethodKind::Get
-            } else {
-                MethodKind::Set
-            };
+            let which = if self.tok.is_kw("get") { MethodKind::Get } else { MethodKind::Set };
             let p = self.peek()?;
             if self.token_is_property_name_start(&p) {
                 accessor = Some(which);
@@ -1755,9 +1606,7 @@ impl Parser {
                     return Err(Fail::early("\\8 and \\9 escapes in strict mode"));
                 }
                 let Some(cooked) = cook_string(raw, *flags) else {
-                    return Err(Fail::unsupported(
-                        "lone surrogate in string property key",
-                    ));
+                    return Err(Fail::unsupported("lone surrogate in string property key"));
                 };
                 self.next()?;
                 Ok(PropKey::Str(cooked))
@@ -1767,9 +1616,7 @@ impl Parser {
                     return Err(Fail::early("legacy octal literal in strict mode"));
                 }
                 if self.ctx.strict && flags.non_octal_decimal {
-                    return Err(Fail::early(
-                        "decimal literal with leading zero in strict mode",
-                    ));
+                    return Err(Fail::early("decimal literal with leading zero in strict mode"));
                 }
                 let raw = raw.clone();
                 self.next()?;
@@ -1798,11 +1645,7 @@ impl Parser {
 
     fn parse_tagged_template(&mut self, tag: Expr) -> PResult<Expr> {
         let (quasis, exprs) = self.parse_template_parts(true)?;
-        Ok(Expr::TaggedTemplate {
-            tag: Box::new(tag),
-            quasis,
-            exprs,
-        })
+        Ok(Expr::TaggedTemplate { tag: Box::new(tag), quasis, exprs })
     }
 
     fn parse_template_parts(&mut self, tagged: bool) -> PResult<(Vec<String>, Vec<Expr>)> {
@@ -1838,12 +1681,7 @@ impl Parser {
 
     fn template_piece(&self, tagged: bool) -> PResult<(TplKind, String)> {
         match &self.tok.kind {
-            TokenKind::Template {
-                kind,
-                raw,
-                invalid_escape,
-                octal_escape,
-            } => {
+            TokenKind::Template { kind, raw, invalid_escape, octal_escape } => {
                 if !tagged && (*invalid_escape || *octal_escape) {
                     return Err(Fail::early("invalid escape in template literal"));
                 }

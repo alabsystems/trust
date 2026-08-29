@@ -159,10 +159,7 @@ pub fn classify_rewrite(rewrite: &SourceRewrite, rules: &[PolicyRule]) -> Approv
 /// laxer, which is what stops a frontend from shipping a policy file that
 /// promotes its own proposals.
 #[must_use]
-pub fn frontend_ceiling(
-    provenance: ClaimProvenance,
-    classified: ApprovalPolicy,
-) -> ApprovalPolicy {
+pub fn frontend_ceiling(provenance: ClaimProvenance, classified: ApprovalPolicy) -> ApprovalPolicy {
     if provenance.requires_review() && matches!(classified, ApprovalPolicy::Auto) {
         ApprovalPolicy::Review
     } else {
@@ -280,9 +277,10 @@ pub fn default_rules() -> Vec<PolicyRule> {
 
 #[cfg(test)]
 mod tests {
+    use trust_types::frontend_firewall::FrontendLanguage;
+
     use super::*;
     use crate::{ContractClauseKind, RewriteKind, SourceRewrite};
-    use trust_types::frontend_firewall::FrontendLanguage;
 
     fn make_rewrite(func_name: &str, file_path: &str, kind: RewriteKind) -> SourceRewrite {
         SourceRewrite {

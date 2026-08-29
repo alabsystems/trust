@@ -221,7 +221,11 @@ impl InvariantInferrer {
             // so drop the strengthening entirely (no candidates, not converged) rather
             // than emit a non-inductive one. Completeness loss only, never a proof.
             if trust_types::verify_budget::budget_exhausted() {
-                return AbstractInferenceResult { candidates: Vec::new(), iterations, converged: false };
+                return AbstractInferenceResult {
+                    candidates: Vec::new(),
+                    iterations,
+                    converged: false,
+                };
             }
             iterations += 1;
 

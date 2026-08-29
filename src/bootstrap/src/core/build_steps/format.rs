@@ -247,7 +247,33 @@ pub fn format(build: &Builder<'_>, check: bool, all: bool, paths: &[PathBuf]) {
         eprintln!("fmt error: `x fmt` is not supported on this channel");
         crate::exit!(1);
     });
-    assert!(rustfmt_path.exists(), "{}", rustfmt_path.display());
+    // Trust: this assert used to be `assert!(exists, "{}", path.display())` — a
+    // bare path, which reads as "this file is missing" and sends the reader
+    // hunting for a build problem. The actual cause is almost always that the
+    // configured `build.rustfmt` points INTO a tree bootstrap manages: `x.py
+    // test --stage 2` clears `build/<host>/stage2/bin/` and only then runs this
+    // step, so a stage2-relative value names a tool bootstrap deleted seconds
+    // earlier. Measured 2026-08-22 — it also took down `targo trust domination
+    // upstream-tests --release --execute`, whose next phase re-spawns stage2's
+    // `targo` and reports a misleading ENOENT three steps downstream. v7/D3: a
+    // refusal must carry the fix.
+    assert!(
+        rustfmt_path.exists(),
+        "`build.rustfmt` names a binary that does not exist:\n  {}\n\n\
+         If that path is inside a bootstrap-managed stage tree (anything under \
+         `build/<host>/stage1|stage2/`), that is the bug: `x.py test` clears \
+         those directories before this step runs, so the tool is deleted by the \
+         very command that then requires it.\n\
+         options:\n\
+         - point `rustfmt` in bootstrap.toml at a tree bootstrap does NOT manage \
+           — `build/<host>/stage0/bin/trustfmt` is what \
+           `scripts/recreate_bootstrap.py` generates;\n\
+         - or remove the `rustfmt` key entirely and let bootstrap download its \
+           own;\n\
+         - or, if you meant to use a freshly built tool, run the build that \
+           produces it as a separate step BEFORE the one that clears the stage.",
+        rustfmt_path.display()
+    );
     let src = build.src.clone();
     let (tx, rx): (SyncSender<PathBuf>, _) = std::sync::mpsc::sync_channel(128);
     let walker = WalkBuilder::new(src.clone()).types(matcher).overrides(override_).build_parallel();

@@ -10,17 +10,22 @@
 #
 # Classification, weakest evidence to strongest:
 #
-#   MISSING   absent from the sibling's local object store. If the remote also
-#             refuses it, the pin is unrecoverable and that superproject commit
-#             can never be reproduced.
-#   ORPHAN    present, but not reachable from any remote-tracking branch. The
-#             forge still serves such objects by SHA, so the pin resolves
+#   UNKNOWN   absent from this clone with no verdict from the canonical remote.
+#             Local absence is not loss --- measured 2026-08-26, 33 of the 58
+#             pins this audit called UNRECOVERABLE were held by an exact
+#             refs/pins/<sha> on the remote and had merely never been fetched.
+#   MISSING   absent from this clone AND explicitly refused by the remote. Only
+#             then is the pin unrecoverable and that superproject commit can
+#             never be reproduced.
+#   ORPHAN    present, but on no remote-tracking branch and no remote pin ref.
+#             The forge still serves such objects by SHA, so the pin resolves
 #             today, but it survives only until a server-side gc.
-#   OK        reachable from a remote-tracking branch.
+#   OK        reachable from a remote-tracking branch, or held by an exact
+#             refs/pins/<sha> ref on the canonical remote.
 #
 # Remote-tracking refs are only as fresh as the last fetch; pass --fetch to
-# refresh them first, and --probe to ask each remote whether it can actually
-# serve the MISSING/ORPHAN pins.
+# refresh them first, and --probe to consult the remote --- its refs/pins/*
+# inventory first, then a direct-SHA probe for whatever that does not cover.
 #
 # Before deleting non-main remote heads, use --prepare-head-prune.  That mode
 # deliberately stops counting topic/archive heads as durable: every historical
@@ -663,24 +668,46 @@ def main() -> int:
             operational_failures.append((path, error))
             continue
 
-        missing, orphan = [], []
+        # Durability lives on the canonical remote, not in this clone. The
+        # refs/pins/* namespace --- what --anchor publishes --- is never in a
+        # default fetch, so a clone that has not asked for it sees an anchored
+        # pin as absent.
+        anchored_remotely: set[str] = set()
+        if args.probe:
+            if not url:
+                detail = "canonical submodule URL is missing"
+                print(f"{path:<22} ERROR {detail}")
+                operational_failures.append((path, detail))
+                continue
+            pin_refs, error = _remote_refs(git_dir, url, ["refs/pins/*"])
+            if pin_refs is None:
+                print(f"{path:<22} ERROR {error}")
+                operational_failures.append((path, error))
+                continue
+            # Exact self-naming anchors only, matching remote_pin_is_exact.
+            anchored_remotely = {
+                sha for ref, sha in pin_refs.items() if ref == f"refs/pins/{sha}"
+            }
+
+        remote_pinned, absent, orphan = [], [], []
         for sha in sorted(pins):
             if sha in reachable:
                 continue
+            if sha in anchored_remotely:
+                remote_pinned.append(sha)
             # cat-file -e is silent on success, so check the status, not stdout.
-            present = _commit_present(git_dir, sha)
-            if not present:
-                missing.append(sha)
-            else:
+            elif _commit_present(git_dir, sha):
                 orphan.append(sha)
+            else:
+                absent.append(sha)
 
-        note, indeterminate = "", []
+        missing, indeterminate = [], []
         if args.probe:
             # One decision per candidate: the remote either serves the object
             # (fragile but resolvable) or explicitly refuses it. A refusal is
             # lost only when no local copy can be anchored. A probe that could
             # not reach a verdict is reported, never assumed lost.
-            candidates = missing + orphan
+            candidates = absent + orphan
             local_presence = {
                 sha: sha in orphan
                 for sha in candidates
@@ -692,10 +719,19 @@ def main() -> int:
             missing, orphan, indeterminate = classify_probe_results(
                 local_presence, verdicts
             )
-            note = "  (probed)"
+            note, unknown_why = "  (probed)", "probe inconclusive — re-run"
+        else:
+            # No remote was asked, so no pin can be declared lost here.
+            indeterminate = absent
+            note = "  (local evidence only)"
+            unknown_why = "no remote verdict — re-run with --probe"
 
-        ok = len(pins) - len(missing) - len(orphan) - len(indeterminate)
+        ok = (
+            len(pins) - len(remote_pinned) - len(missing) - len(orphan)
+            - len(indeterminate)
+        )
         print(f"{path:<22} {len(pins):>4} pins   OK={ok:<4} "
+              f"REMOTE_PIN={len(remote_pinned):<3} "
               f"ORPHAN={len(orphan):<3} MISSING={len(missing):<3} "
               f"UNKNOWN={len(indeterminate)}{note}")
         for sha in missing:
@@ -715,7 +751,7 @@ def main() -> int:
             if not anchored:
                 fragile.append((path, sha))
         for sha in indeterminate:
-            print(f"    UNKNOWN {sha}  (probe inconclusive — re-run)")
+            print(f"    UNKNOWN {sha}  ({unknown_why})")
             indeterminate_all.append((path, sha))
 
     print()
@@ -727,7 +763,8 @@ def main() -> int:
         print(f"UNRECOVERABLE pins: {len(unrecoverable)} "
               f"(superproject commits naming them cannot be reproduced)")
     if indeterminate_all:
-        print(f"INDETERMINATE probes: {len(indeterminate_all)} — no safety claim is possible")
+        print(f"INDETERMINATE pins: {len(indeterminate_all)} — no remote verdict, "
+              "so no safety claim is possible")
     if fragile:
         if args.prepare_head_prune:
             print(f"NEEDS ANCHOR before head prune: {len(fragile)}")

@@ -1,7 +1,7 @@
 // trust_vcgen/call_graph.rs: Call graph construction and cycle detection
 //
 // Builds a CallGraph from a set of VerifiableFunction definitions by
-// scanning Terminator::Call edges. Provides cycle detection (Tarjan's SCC)
+// scanning ordinary and tail-call edges. Provides cycle detection (Tarjan's SCC)
 // for identifying recursive functions that need special summary handling.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -13,7 +13,7 @@ use trust_types::{Terminator, VerifiableFunction};
 
 /// Build a call graph from a slice of verifiable functions.
 ///
-/// Scans each function's basic blocks for `Terminator::Call` edges and
+/// Scans each function's basic blocks for ordinary and tail-call edges and
 /// constructs a directed graph of caller -> callee relationships.
 /// The first function in the slice is treated as the entry point.
 #[must_use]
@@ -38,35 +38,38 @@ pub fn build_call_graph(functions: &[VerifiableFunction]) -> CallGraph {
     // Scan for call edges
     for func in functions {
         for block in &func.body.blocks {
-            if let Terminator::Call { func: callee_name, args, span, .. } = &block.terminator {
-                // Preserve ambiguous or external spellings as unresolved
-                // edges. Proof-producing consumers must never guess which of
-                // several same-named functions was called.
-                let callee_path = resolver.resolve(callee_name).unwrap_or(callee_name).to_string();
+            let (callee_name, args, span) = match &block.terminator {
+                Terminator::Call { func, args, span, .. }
+                | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+                _ => continue,
+            };
+            // Preserve ambiguous or external spellings as unresolved
+            // edges. Proof-producing consumers must never guess which of
+            // several same-named functions was called.
+            let callee_path = resolver.resolve(callee_name).unwrap_or(callee_name).to_string();
 
+            graph.add_edge(CallGraphEdge {
+                caller: func.def_path.clone(),
+                callee: callee_path,
+                call_site: span.clone(),
+            });
+
+            // Trust: W6 closure-composition ordering — a Fn-trait
+            // `call_once`/`call_mut`/`call` dispatch names its closure by the
+            // SPAN-shaped receiver string (`<{closure@…} as FnOnce<…>>::…`), which
+            // carries NO def_path_hash, so the edge above resolves to that span text,
+            // NOT the closure BODY. Add the REAL caller→closure edge recovered from
+            // the first actual's `Ty::Closure.name` so the closure LEAF certifies
+            // BEFORE this caller in `compute_verification_order` (callees-first).
+            // Additive + sound: it only pulls a genuine callee earlier; a cycle still
+            // fails closed (Tarjan/DFS visited-set), and the closure def-path is a
+            // real corpus node when present.
+            if let Some(closure_def) = fn_trait_closure_callee(callee_name, args, &func.body) {
                 graph.add_edge(CallGraphEdge {
                     caller: func.def_path.clone(),
-                    callee: callee_path,
+                    callee: closure_def,
                     call_site: span.clone(),
                 });
-
-                // Trust: W6 closure-composition ordering — a Fn-trait
-                // `call_once`/`call_mut`/`call` dispatch names its closure by the
-                // SPAN-shaped receiver string (`<{closure@…} as FnOnce<…>>::…`), which
-                // carries NO def_path_hash, so the edge above resolves to that span text,
-                // NOT the closure BODY. Add the REAL caller→closure edge recovered from
-                // the first actual's `Ty::Closure.name` so the closure LEAF certifies
-                // BEFORE this caller in `compute_verification_order` (callees-first).
-                // Additive + sound: it only pulls a genuine callee earlier; a cycle still
-                // fails closed (Tarjan/DFS visited-set), and the closure def-path is a
-                // real corpus node when present.
-                if let Some(closure_def) = fn_trait_closure_callee(callee_name, args, &func.body) {
-                    graph.add_edge(CallGraphEdge {
-                        caller: func.def_path.clone(),
-                        callee: closure_def,
-                        call_site: span.clone(),
-                    });
-                }
             }
         }
     }
@@ -277,6 +280,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -311,6 +315,26 @@ mod tests {
             postconditions: vec![],
             spec: Default::default(),
         }
+    }
+
+    fn make_tail_func(name: &str, def_path: &str, callee: &str) -> VerifiableFunction {
+        let mut func = make_func(name, def_path, &[callee]);
+        let Terminator::Call { func: callee, args, span, atomic, callee_identity, .. } =
+            func.body.blocks[0].terminator.clone()
+        else {
+            unreachable!();
+        };
+        func.body.blocks[0].terminator = Terminator::TailCall {
+            func: callee,
+            args,
+            span,
+            atomic,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity,
+        };
+        func.body.blocks.truncate(1);
+        func
     }
 
     #[test]
@@ -411,6 +435,20 @@ mod tests {
         assert_eq!(recursive_sccs[0].members.len(), 2);
         assert!(recursive_sccs[0].members.contains(&"crate::a".to_string()));
         assert!(recursive_sccs[0].members.contains(&"crate::b".to_string()));
+    }
+
+    #[test]
+    fn tail_calls_participate_in_mutual_recursion_sccs() {
+        let funcs = vec![
+            make_tail_func("a", "crate::a", "crate::b"),
+            make_tail_func("b", "crate::b", "crate::a"),
+        ];
+        let graph = build_call_graph(&funcs);
+        assert_eq!(graph.edges.len(), 2);
+        let recursive = recursive_functions(&graph);
+        assert_eq!(recursive.len(), 2);
+        assert!(recursive.contains("crate::a"));
+        assert!(recursive.contains("crate::b"));
     }
 
     #[test]

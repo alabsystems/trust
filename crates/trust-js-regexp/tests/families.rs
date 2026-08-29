@@ -6,7 +6,7 @@
 //! Author: Andrew Yates
 //! Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_regexp::{compile, CompileError, ExecError};
+use trust_js_regexp::{CompileError, ExecError, compile};
 
 fn u16v(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
@@ -19,8 +19,8 @@ fn str_of(units: &[u16], s: usize, e: usize) -> String {
 /// exec_at(input, 0) and render as (index, [group0, group1, …]).
 #[track_caller]
 fn exec(p: &str, f: &str, input: &str) -> Option<(usize, Vec<Option<String>>)> {
-    let pat = compile(&u16v(p), f)
-        .unwrap_or_else(|e| panic!("compile of {p:?} /{f}/ failed: {e:?}"));
+    let pat =
+        compile(&u16v(p), f).unwrap_or_else(|e| panic!("compile of {p:?} /{f}/ failed: {e:?}"));
     let inp = u16v(input);
     let r = pat
         .exec_at(&inp, 0)
@@ -37,9 +37,8 @@ fn exec(p: &str, f: &str, input: &str) -> Option<(usize, Vec<Option<String>>)> {
 #[track_caller]
 fn check(p: &str, f: &str, input: &str, expected: Option<(usize, &[Option<&str>])>) {
     let got = exec(p, f, input);
-    let expected = expected.map(|(i, g)| {
-        (i, g.iter().map(|o| o.map(|s| s.to_string())).collect::<Vec<_>>())
-    });
+    let expected =
+        expected.map(|(i, g)| (i, g.iter().map(|o| o.map(|s| s.to_string())).collect::<Vec<_>>()));
     assert_eq!(got, expected, "pattern {p:?} /{f}/ on {input:?}");
 }
 
@@ -151,8 +150,7 @@ fn lookbehind() {
     check("(?<=a(?=b))b", "", "ab", Some((1, &[Some("b")])));
     // Backward greedy quantifier captures maximally to the left.
     check("(?<=(a+))b", "", "aaab", Some((3, &[Some("b"), Some("aaa")])));
-    check("(?<=(a+)(b+))c", "", "aabbc",
-        Some((4, &[Some("c"), Some("aa"), Some("bb")])));
+    check("(?<=(a+)(b+))c", "", "aabbc", Some((4, &[Some("c"), Some("aa"), Some("bb")])));
 }
 
 #[test]
@@ -304,17 +302,23 @@ fn v_mode_class_sets() {
 #[test]
 fn v_mode_string_properties() {
     // Flag sequence (RGI_Emoji_Flag_Sequence ⊂ RGI_Emoji): 🇺🇸.
-    check("\\p{RGI_Emoji}", "v", "\u{1F1FA}\u{1F1F8}",
-        Some((0, &[Some("\u{1F1FA}\u{1F1F8}")])));
+    check("\\p{RGI_Emoji}", "v", "\u{1F1FA}\u{1F1F8}", Some((0, &[Some("\u{1F1FA}\u{1F1F8}")])));
     // Keycap sequence: #️⃣ = # + VS16 + COMBINING ENCLOSING KEYCAP.
-    check("\\p{Emoji_Keycap_Sequence}", "v", "#\u{FE0F}\u{20E3}",
-        Some((0, &[Some("#\u{FE0F}\u{20E3}")])));
+    check(
+        "\\p{Emoji_Keycap_Sequence}",
+        "v",
+        "#\u{FE0F}\u{20E3}",
+        Some((0, &[Some("#\u{FE0F}\u{20E3}")])),
+    );
     // Basic_Emoji single: ⌚.
     check("\\p{Basic_Emoji}", "v", "\u{231A}", Some((0, &[Some("\u{231A}")])));
     // Longest string preferred: ZWJ family sequence beats its first emoji.
-    check("^\\p{RGI_Emoji}", "v",
+    check(
+        "^\\p{RGI_Emoji}",
+        "v",
         "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}",
-        Some((0, &[Some("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}")])));
+        Some((0, &[Some("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}")])),
+    );
 }
 
 #[test]
@@ -351,26 +355,73 @@ fn exec_surface() {
 #[test]
 fn syntax_errors_both_grammars() {
     for (p, f) in [
-        ("^*", ""), ("$*", ""), ("\\b*", ""), ("(?<=a)*", ""), ("a**", ""),
-        ("*a", ""), ("+a", ""), ("{1}", ""), ("a{2,1}", ""), ("[z-a]", ""),
-        ("(", ""), (")", ""), ("a)", ""), ("[a", ""), ("\\", ""),
-        ("(?<1a>x)", ""), ("(?i)a", ""), ("(?x:a)", ""), ("(?ii:a)", ""),
-        ("(?i-i:a)", ""), ("(?-:a)", ""), ("(?<a>x)(?<a>y)", ""),
-        ("(?<a>x)((?<a>y)|z)", ""), ("(?<a>x)\\k<b>", ""),
+        ("^*", ""),
+        ("$*", ""),
+        ("\\b*", ""),
+        ("(?<=a)*", ""),
+        ("a**", ""),
+        ("*a", ""),
+        ("+a", ""),
+        ("{1}", ""),
+        ("a{2,1}", ""),
+        ("[z-a]", ""),
+        ("(", ""),
+        (")", ""),
+        ("a)", ""),
+        ("[a", ""),
+        ("\\", ""),
+        ("(?<1a>x)", ""),
+        ("(?i)a", ""),
+        ("(?x:a)", ""),
+        ("(?ii:a)", ""),
+        ("(?i-i:a)", ""),
+        ("(?-:a)", ""),
+        ("(?<a>x)(?<a>y)", ""),
+        ("(?<a>x)((?<a>y)|z)", ""),
+        ("(?<a>x)\\k<b>", ""),
         // u-mode strictness
-        ("{", "u"), ("}", "u"), ("]", "u"), ("a{", "u"), ("\\a", "u"),
-        ("\\_", "u"), ("\\-", "u"), ("\\8", "u"), ("\\1", "u"), ("\\01", "u"),
-        ("\\c5", "u"), ("\\c", "u"), ("[a-\\d]", "u"), ("\\p{Bogus}", "u"),
-        ("\\p{Lu=true}", "u"), ("\\p{RGI_Emoji}", "u"), ("\\u{110000}", "u"),
-        ("(?=a)*", "u"), ("a{,2}", "u"), ("\\k", "u"), ("\\q", "u"),
-        ("\\x1", "u"), ("\\u{2", "u"), ("\\p", "u"),
+        ("{", "u"),
+        ("}", "u"),
+        ("]", "u"),
+        ("a{", "u"),
+        ("\\a", "u"),
+        ("\\_", "u"),
+        ("\\-", "u"),
+        ("\\8", "u"),
+        ("\\1", "u"),
+        ("\\01", "u"),
+        ("\\c5", "u"),
+        ("\\c", "u"),
+        ("[a-\\d]", "u"),
+        ("\\p{Bogus}", "u"),
+        ("\\p{Lu=true}", "u"),
+        ("\\p{RGI_Emoji}", "u"),
+        ("\\u{110000}", "u"),
+        ("(?=a)*", "u"),
+        ("a{,2}", "u"),
+        ("\\k", "u"),
+        ("\\q", "u"),
+        ("\\x1", "u"),
+        ("\\u{2", "u"),
+        ("\\p", "u"),
         // v-mode strictness
-        ("[a-]", "v"), ("[-a]", "v"), ("[--]", "v"), ("[::]", "v"),
-        ("[&&]", "v"), ("[ab--c]", "v"), ("[a--b&&c]", "v"), ("[a-b--c]", "v"),
-        ("[^\\q{ab}]", "v"), ("\\P{RGI_Emoji}", "v"), ("[\\d-x]", "v"),
-        ("[a&&&b]", "v"), ("[/]", "v"),
+        ("[a-]", "v"),
+        ("[-a]", "v"),
+        ("[--]", "v"),
+        ("[::]", "v"),
+        ("[&&]", "v"),
+        ("[ab--c]", "v"),
+        ("[a--b&&c]", "v"),
+        ("[a-b--c]", "v"),
+        ("[^\\q{ab}]", "v"),
+        ("\\P{RGI_Emoji}", "v"),
+        ("[\\d-x]", "v"),
+        ("[a&&&b]", "v"),
+        ("[/]", "v"),
         // flags
-        ("a", "uu"), ("a", "uv"), ("a", "z"),
+        ("a", "uu"),
+        ("a", "uv"),
+        ("a", "z"),
     ] {
         check_syntax(p, f);
     }
@@ -379,10 +430,9 @@ fn syntax_errors_both_grammars() {
 #[test]
 fn annex_b_refusals() {
     for p in [
-        "(?=a)*", "(?!a)?", "a{,2}", "{", "}", "]", "a{", "[a-\\d]",
-        "[\\d-a]", "\\c5", "\\c", "[\\c5]", "[\\c]", "\\8", "\\9", "\\1",
-        "\\01", "\\p{L}", "\\u{2}", "\\x1", "\\a", "\\_", "\\k<a>", "\\k",
-        "[\\1]", "[\\q{a}]",
+        "(?=a)*", "(?!a)?", "a{,2}", "{", "}", "]", "a{", "[a-\\d]", "[\\d-a]", "\\c5", "\\c",
+        "[\\c5]", "[\\c]", "\\8", "\\9", "\\1", "\\01", "\\p{L}", "\\u{2}", "\\x1", "\\a", "\\_",
+        "\\k<a>", "\\k", "[\\1]", "[\\q{a}]",
     ] {
         check_unsupported(p, "");
     }

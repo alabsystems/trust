@@ -7,7 +7,7 @@
 //!
 //! > Cross-crate: Clean-origin MIR encoding + **re-admission on import**. The
 //! > wire unit is a verdict digest (kernel version, environment digest, axiom
-//! > closure, carrier decision, defeq certificate) — **never a source hash,
+//! > closure, carrier decision, faithfulness certificate) — **never a source hash,
 //! > which binds nothing about a kernel verdict.**
 //!
 //! And its acceptance control:
@@ -35,7 +35,7 @@
 //! | environment digest | *what the checked term depended on* | refuse ([`ReadmissionRefusal::EnvironmentSkew`]) |
 //! | axiom closure | *what the verdict rests on*, by name | refuse for CALL ([`ReadmissionRefusal::AssumptionBearing`]) |
 //! | carrier decision | *the Rust type each signature position was admitted at* | refuse ([`ReadmissionRefusal::CarrierSkew`]) |
-//! | defeq evidence | *that the faithfulness gate ran, and at which carrier* | refuse ([`ReadmissionRefusal::DefeqSkew`]) |
+//! | faithfulness evidence | *how the kernel proved agreement, and at which carrier* | refuse ([`ReadmissionRefusal::FaithfulnessSkew`]) |
 //!
 //! # Sealing — the same discipline as the gate and the mint
 //!
@@ -44,7 +44,7 @@
 //! [`crate::gate::check_faithful`]. A consumer holding a `Readmitted` holds
 //! evidence that every field of the digest was compared against the local
 //! facts. On the mint side, [`mint_verdict_digest`] demands a
-//! [`crate::gate::Faithful`] — so a digest cannot claim defeq evidence that was
+//! [`crate::gate::Faithful`] — so a digest cannot claim faithfulness evidence that was
 //! never produced — and reads the axiom closure out of a sealed
 //! [`KernelStatus`], never from a caller-supplied list.
 //!
@@ -65,17 +65,21 @@
 //! No placeholder seam was needed. If the constant ever disappears, this module
 //! stops compiling, which is the fail-closed outcome (no version ⇒ no import).
 //!
-//! # The re-check seam, documented rather than built
+//! # Local re-checking is the authority
 //!
-//! A kernel-version skew has two sound resolutions: refuse, or re-check the
-//! imported declaration under the LOCAL kernel. This module implements
-//! **refusal**. The re-check lane would live beside [`readmit`] — take the
-//! local `Environment` that already holds the imported declarations, run the
-//! full kernel check and certification audit locally, and mint a *fresh local*
-//! verdict rather than laundering the foreign one. It is not built here because
-//! the rustc-side half (metadata transport of the declarations themselves) is
-//! what feeds it; until then a refusal with options is the honest verdict, and
-//! [`ReadmissionRefusal::KernelVersionSkew`]'s note names both resolutions.
+//! Re-admission is deliberately split into sealed phases. [`preflight_wire`]
+//! rejects kernel skew and assumptions before the importer rebuilds an
+//! environment. [`bind_readmission`] then binds the claim to the local
+//! dependency closure and carrier decision without doing proof search. Finally
+//! [`locally_recheck_imported_body`] runs the actual imported body through the
+//! local gate, and [`readmit`] accepts only when that unforgeable local evidence
+//! matches the preflight by declaration, environment, carrier, and proof
+//! method. Wire bytes can describe a method; they can never choose one.
+//!
+//! Kernel-version skew still refuses rather than silently translating a
+//! verdict. Rebuilding the dependency is the supported way to mint a new wire
+//! record under the local kernel; once it arrives, the importer independently
+//! rechecks the transported body as above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -83,10 +87,10 @@ use std::fmt::Write as _;
 use clean_kernel::{Environment, ExprVisitor, LevelVec, Name};
 use trust_clean_carrier::{CarrierRefused, CarrierSignature, carrier_signature_for};
 use trust_symbols::{Assumption, AssumptionKind, CarrierWidth, KernelStatus};
-use trust_types::VerifiableFunction;
+use trust_types::{Ty, VerifiableFunction};
 
-use crate::emit::{EmitRefusal, admit_lowering, plan_clean_origin_body};
-use crate::gate::Faithful;
+use crate::emit::{CleanOriginPlan, EmitRefusal, admit_lowering, plan_clean_origin_body};
+use crate::gate::{Faithful, FaithfulnessMethod};
 
 // ---------------------------------------------------------------------------
 // Kernel version
@@ -102,9 +106,9 @@ use crate::gate::Faithful;
 /// the mint side, and that asymmetry is deliberate: a mint that accepted a
 /// version string would let a caller stamp a verdict with a kernel it was not
 /// produced under, which is exactly the substitution the digest exists to make
-/// unrepresentable. (The *re-admission* side takes the local version as a
-/// parameter — see [`readmit`] — because there the value is a comparison input,
-/// not a claim.)
+/// unrepresentable. (The *re-admission* side passes the local version to
+/// [`preflight_wire`] because there the value is a comparison input, not a
+/// claim.)
 #[must_use]
 pub fn local_kernel_version() -> &'static str {
     clean_kernel::VERSION
@@ -167,7 +171,7 @@ pub const ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE: u8 = 1;
 /// binds the rendering, not the abstract term, so it is only as injective as
 /// `Display`. Within ONE kernel version that is the same rendering the kernel
 /// itself debugs with; ACROSS kernel versions it does not need to be stable at
-/// all, because [`readmit`] refuses on kernel-version skew before the
+/// all, because [`preflight_wire`] refuses on kernel-version skew before the
 /// environment digest is ever consulted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvironmentDigest {
@@ -303,12 +307,8 @@ pub fn environment_digest_for(
             Some(info) => {
                 frame(&mut record, "decl", &current);
                 frame(&mut record, "kind", &format!("{:?}", info.kind));
-                let levels = info
-                    .level_params
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let levels =
+                    info.level_params.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
                 frame(&mut record, "levels", &levels);
                 // Reducibility decides what defeq may unfold, so two
                 // environments differing only here can decide the same defeq
@@ -353,26 +353,27 @@ pub fn environment_digest_for(
 }
 
 // ---------------------------------------------------------------------------
-// Carrier decision and defeq evidence
+// Carrier decision and faithfulness evidence
 // ---------------------------------------------------------------------------
 
 /// One signature position of the carrier decision: which Clean type was
-/// carried, at which Rust type, at which exact width.
+/// carried, at which Rust type, and with which exact extent.
 ///
 /// The strings are the [`trust_symbols::CarrierWitness`] renderings — the
 /// discharged obligation's own record of the pairing — so the wire carries
 /// what was PROVED, not a re-derivation.
 ///
-/// `bits` is an EXACT FIXED width — [`CarrierWidth::Bits`] — which is the only
-/// width wire format v1 represents. An unbounded-exact carrier
-/// ([`CarrierWidth::UnboundedExact`], exact by trusted runtime) has no position
-/// here by construction: [`CarrierDecision::of_signature`] refuses it rather
-/// than collapsing it onto a number (see [`UnencodableCarrierWidth`]).
+/// Wire format v1 could represent only [`CarrierWidth::Bits`]. Format v2
+/// carries a width tag, so [`CarrierWidth::UnboundedExact`] is represented
+/// honestly rather than collapsed onto a fictitious bit count. The exact Rust
+/// carrier name remains part of the decision: for an unbounded carrier it
+/// identifies the trusted runtime whose agreement the local carrier map must
+/// independently re-confirm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CarrierPosition {
     clean_type: String,
     rust_carrier: String,
-    bits: u32,
+    width: CarrierWidth,
 }
 
 impl CarrierPosition {
@@ -388,14 +389,22 @@ impl CarrierPosition {
         &self.rust_carrier
     }
 
-    /// The common exact width, in bits.
+    /// The discharged carrier extent.
     #[must_use]
-    pub fn bits(&self) -> u32 {
-        self.bits
+    pub fn width(&self) -> CarrierWidth {
+        self.width
     }
 
     fn describe(&self) -> String {
-        format!("{} carried by {} ({} bits)", self.clean_type, self.rust_carrier, self.bits)
+        match self.width {
+            CarrierWidth::Bits(bits) => {
+                format!("{} carried by {} ({bits} bits)", self.clean_type, self.rust_carrier)
+            }
+            CarrierWidth::UnboundedExact => format!(
+                "{} carried by {} (unbounded, exact by trusted runtime)",
+                self.clean_type, self.rust_carrier
+            ),
+        }
     }
 }
 
@@ -413,46 +422,34 @@ pub struct CarrierDecision {
 }
 
 impl CarrierDecision {
-    /// Project a sealed I4 signature onto its wire record.
+    /// Project a sealed I4 signature onto its v2 wire record.
     ///
-    /// # Errors
-    ///
-    /// [`UnencodableCarrierWidth`], naming the first signature position whose
-    /// discharged width is not an exact fixed width. Wire format v1 carries
-    /// `bits: u32` per position; an unbounded-exact carrier
-    /// ([`CarrierWidth::UnboundedExact`]) has no honest v1 encoding, and
-    /// inventing a number would make the importer compare a fiction — worse,
-    /// unbounded-exact rests on a TRUSTED RUNTIME (a TCB row, not a proof),
-    /// which is exactly the kind of undisclosed rest-on the digest exists to
-    /// surface. Carrying it is a format-v2 decision, never a default.
-    /// (`CarrierWidth` is deliberately exhaustive, so a new width variant
-    /// breaks this match at compile time rather than falling through.)
-    pub fn of_signature(
-        signature: &CarrierSignature,
-    ) -> Result<Self, UnencodableCarrierWidth> {
-        fn position(
-            label: &str,
-            carrier: &trust_clean_carrier::Carrier,
-        ) -> Result<CarrierPosition, UnencodableCarrierWidth> {
+    /// `CarrierWidth` is deliberately exhaustive. A future extent therefore
+    /// breaks this construction and the wire encoder at compile time instead
+    /// of silently inheriting either existing tag.
+    #[must_use]
+    pub fn of_signature(signature: &CarrierSignature) -> Self {
+        fn position(carrier: &trust_clean_carrier::Carrier) -> CarrierPosition {
             let witness = carrier.witness();
             match witness.width() {
-                CarrierWidth::Bits(bits) => Ok(CarrierPosition {
+                CarrierWidth::Bits(bits) => CarrierPosition {
                     clean_type: witness.clean_type().to_owned(),
                     rust_carrier: witness.rust_carrier().to_owned(),
-                    bits,
-                }),
-                CarrierWidth::UnboundedExact => Err(UnencodableCarrierWidth {
-                    position: label.to_owned(),
-                    witness: witness.to_string(),
-                }),
+                    width: CarrierWidth::Bits(bits),
+                },
+                CarrierWidth::UnboundedExact => CarrierPosition {
+                    clean_type: witness.clean_type().to_owned(),
+                    rust_carrier: witness.rust_carrier().to_owned(),
+                    width: CarrierWidth::UnboundedExact,
+                },
             }
         }
         let mut arguments = Vec::with_capacity(signature.arguments().len());
-        for (index, carrier) in signature.arguments().iter().enumerate() {
-            arguments.push(position(&format!("argument {index}"), carrier)?);
+        for carrier in signature.arguments() {
+            arguments.push(position(carrier));
         }
-        let result = position("the result", signature.result())?;
-        Ok(Self { arguments, result })
+        let result = position(signature.result());
+        Self { arguments, result }
     }
 
     /// The argument positions, left to right.
@@ -468,54 +465,67 @@ impl CarrierDecision {
     }
 }
 
-/// A signature position whose discharged carrier width has no representation
-/// in wire format v1.
+/// Wire tags for the two kernel evidence forms accepted by the faithfulness
+/// gate. They remain distinct on wire: structural induction is never renamed
+/// to definitional equality.
+const FAITHFULNESS_KERNEL_DEFEQ_AT_CARRIER: u8 = 1;
+const FAITHFULNESS_KERNEL_INDUCTION_AT_CARRIER: u8 = 2;
+
+/// The wire tag for one faithfulness method, or `None` for an evidence form
+/// the format deliberately does not spell.
 ///
-/// Produced only by [`CarrierDecision::of_signature`], when a position's
-/// [`CarrierWidth`] is not an exact fixed width. Both the mint
-/// ([`DigestMintRefusal::UnencodableCarrierWidth`]) and re-admission's local
-/// recomputation ([`ReadmissionRefusal::LocalCarrierWidthUnencodable`]) turn
-/// this into their own fail-closed refusal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnencodableCarrierWidth {
-    position: String,
-    witness: String,
+/// R1 accounting: the per-defining-equation judgment
+/// ([`crate::gate::check_faithful_equations`], §6e as amended) has NO tag —
+/// a wire-format statement of the per-equation mode is its own reviewed
+/// change, and collapsing it onto either whole-term tag would tell the
+/// importer a judgment happened that never did. [`mint_verdict_digest`]
+/// refuses on `None` ([`DigestMintRefusal::UnencodableFaithfulness`]), and
+/// `decode` has no tag that maps back to it, so a [`VerdictDigest`] holds
+/// only spellable evidence. (The match is deliberately exhaustive: a new
+/// method variant breaks it at compile time rather than inheriting a tag.)
+fn faithfulness_method_tag(method: FaithfulnessMethod) -> Option<u8> {
+    match method {
+        FaithfulnessMethod::DefinitionalEquality => Some(FAITHFULNESS_KERNEL_DEFEQ_AT_CARRIER),
+        FaithfulnessMethod::StructuralInduction => Some(FAITHFULNESS_KERNEL_INDUCTION_AT_CARRIER),
+        // R2 accounting, same rule, RE-AFFIRMED when the lane was wired
+        // (2026-08-22): an F-layer verdict
+        // ([`crate::gate::check_faithful_wf_functional`]) is not whole-term
+        // defeq. It additionally rests on a BORROW and a CLOSURE AUDIT taken
+        // in THIS crate's environment — and on this lane the closure is not
+        // disclosure metadata, it is the other half of the TERMINATION
+        // argument (probe c1). No wire field carries either, so it has no tag
+        // and stays crate-local. Adding one is a reviewed format change that
+        // lands WITH the fields, and whose decode side must refuse an unknown
+        // tag rather than best-effort parse it.
+        FaithfulnessMethod::PerEquationDefeq | FaithfulnessMethod::WellFoundedFunctionalDefeq => {
+            None
+        }
+    }
 }
 
-impl UnencodableCarrierWidth {
-    /// Which signature position (`argument N` or `the result`).
-    #[must_use]
-    pub fn position(&self) -> &str {
-        &self.position
-    }
-
-    /// The witness rendering of the offending carrier, verbatim.
-    #[must_use]
-    pub fn witness(&self) -> &str {
-        &self.witness
-    }
-}
-
-/// Wire tag for the one defeq-evidence form that exists: the faithfulness gate
-/// ran, decided by kernel definitional equality, admitted at the carrier type.
-const DEFEQ_MARKER_KERNEL_AT_CARRIER: u8 = 1;
-
-/// The defeq evidence marker: the faithfulness gate ran for this declaration
-/// and admitted the lowering at the named Rust carrier type.
+/// The faithfulness evidence marker: how the gate established agreement, and
+/// the Rust carrier type at which it admitted the lowering.
 ///
 /// On the mint side this is constructible only from a [`crate::gate::Faithful`]
 /// (via [`mint_verdict_digest`]), so a freshly minted digest cannot claim
-/// defeq evidence that was never produced. A DECODED marker is a claim like
+/// faithfulness evidence that was never produced. A DECODED marker is a claim like
 /// the rest of the wire unit; [`readmit`] checks it against the locally
 /// recomputed carrier decision, and the rustc-side metadata channel is what
 /// authenticates the producer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DefeqEvidence {
+pub struct FaithfulnessEvidence {
+    method: FaithfulnessMethod,
     admitted_at_rust: String,
 }
 
-impl DefeqEvidence {
-    /// The Rust carrier type the kernel-defeq agreement was admitted at.
+impl FaithfulnessEvidence {
+    /// The proof method recorded by the sealed gate.
+    #[must_use]
+    pub fn method(&self) -> FaithfulnessMethod {
+        self.method
+    }
+
+    /// The Rust carrier type the kernel agreement was admitted at.
     ///
     /// The CARRIER type, never the Clean type — the distinction I4 exists for.
     #[must_use]
@@ -532,12 +542,19 @@ impl DefeqEvidence {
 /// kind of blob refuses immediately with a shape error, not a field error.
 pub const VERDICT_DIGEST_MAGIC: [u8; 4] = *b"TVDG";
 
-/// The one wire format version this module reads and writes.
+/// Historical wire format still accepted by the decoder.
 ///
 /// The version is CHECKED, not advisory: an unknown version is a refusal,
 /// never a best-effort parse — a field added in v2 could be exactly the field
 /// whose absence a v1 best-effort reader would fail open on.
 pub const VERDICT_DIGEST_FORMAT_V1: u8 = 1;
+/// Current wire format: adds explicit faithfulness-method and carrier-width
+/// tags. The encoder always writes v2; the decoder accepts complete v1 and v2
+/// records and refuses every unknown version.
+pub const VERDICT_DIGEST_FORMAT_V2: u8 = 2;
+
+const CARRIER_WIDTH_FIXED_BITS: u8 = 1;
+const CARRIER_WIDTH_UNBOUNDED_EXACT: u8 = 2;
 
 const ASSUMPTION_KIND_TRUST_MARKER: u8 = 1;
 const ASSUMPTION_KIND_DOMAIN_AXIOM: u8 = 2;
@@ -576,7 +593,7 @@ pub struct VerdictDigest {
     /// so "nobody looked" is not encodable as an empty list.
     assumptions: Vec<Assumption>,
     carrier: CarrierDecision,
-    defeq: DefeqEvidence,
+    faithfulness: FaithfulnessEvidence,
 }
 
 impl VerdictDigest {
@@ -610,29 +627,30 @@ impl VerdictDigest {
         &self.carrier
     }
 
-    /// The defeq evidence marker.
+    /// The kernel faithfulness evidence marker.
     #[must_use]
-    pub fn defeq(&self) -> &DefeqEvidence {
-        &self.defeq
+    pub fn faithfulness(&self) -> &FaithfulnessEvidence {
+        &self.faithfulness
     }
 
     /// Encode to the versioned wire format.
     ///
-    /// Layout (v1, all integers little-endian, strings `u32` byte-length +
+    /// Layout (v2, all integers little-endian, strings `u32` byte-length +
     /// UTF-8):
     ///
     /// ```text
     /// magic "TVDG" · format u8 · decl · kernel_version
     /// · env-mode u8 · env-digest-hex
     /// · assumption-count u32 · (kind u8 · name)*
-    /// · argument-count u32 · (clean · rust · bits u32)* · result(clean · rust · bits u32)
-    /// · defeq-tag u8 · admitted-at
+    /// · argument-count u32
+    /// · (clean · rust · width-tag u8 · [bits u32])* · result(same)
+    /// · faithfulness-tag u8 · admitted-at
     /// ```
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&VERDICT_DIGEST_MAGIC);
-        out.push(VERDICT_DIGEST_FORMAT_V1);
+        out.push(VERDICT_DIGEST_FORMAT_V2);
         put_str(&mut out, &self.decl);
         put_str(&mut out, &self.kernel_version);
         out.push(ENVIRONMENT_DIGEST_MODE_DEPENDENCY_CLOSURE);
@@ -651,17 +669,24 @@ impl VerdictDigest {
         }
         put_u32(&mut out, u32::try_from(self.carrier.arguments.len()).expect("arity"));
         for position in &self.carrier.arguments {
-            put_position(&mut out, position);
+            put_position_v2(&mut out, position);
         }
-        put_position(&mut out, &self.carrier.result);
-        out.push(DEFEQ_MARKER_KERNEL_AT_CARRIER);
-        put_str(&mut out, &self.defeq.admitted_at_rust);
+        put_position_v2(&mut out, &self.carrier.result);
+        // Both constructors refuse an unspellable method (`mint_verdict_digest`
+        // via `UnencodableFaithfulness`, `decode` by having no tag for one), so
+        // this cannot fire without one of them having been bypassed — and there
+        // is no third constructor. Same discipline as the assumption tags above.
+        out.push(
+            faithfulness_method_tag(self.faithfulness.method)
+                .expect("invariant: a VerdictDigest holds only wire-encodable faithfulness"),
+        );
+        put_str(&mut out, &self.faithfulness.admitted_at_rust);
         out
     }
 
     /// Decode the versioned wire format, fail-closed.
     ///
-    /// Everything that is not exactly a complete, well-formed v1 record
+    /// Everything that is not exactly a complete, well-formed v1/v2 record
     /// refuses: wrong magic, unknown format version, unknown mode or kind
     /// tags, non-UTF-8 text, empty required fields, a malformed digest hex,
     /// truncation anywhere, and trailing bytes after a complete record. There
@@ -679,10 +704,10 @@ impl VerdictDigest {
             return Err(DecodeRefusal::NotAVerdictDigest { found: magic.to_vec() });
         }
         let format = reader.u8("format version")?;
-        if format != VERDICT_DIGEST_FORMAT_V1 {
+        if !matches!(format, VERDICT_DIGEST_FORMAT_V1 | VERDICT_DIGEST_FORMAT_V2) {
             return Err(DecodeRefusal::UnknownFormatVersion {
                 found: format,
-                supported: VERDICT_DIGEST_FORMAT_V1,
+                supported: VERDICT_DIGEST_FORMAT_V2,
             });
         }
 
@@ -702,8 +727,7 @@ impl VerdictDigest {
             });
         }
         let hex = reader.str("environment digest")?;
-        if hex.len() != 64
-            || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Err(DecodeRefusal::Malformed {
                 field: "environment digest",
@@ -742,21 +766,33 @@ impl VerdictDigest {
         let argument_count = reader.u32("carrier argument count")?;
         let mut arguments = Vec::new();
         for _ in 0..argument_count {
-            arguments.push(read_position(&mut reader)?);
+            arguments.push(read_position(&mut reader, format)?);
         }
-        let result = read_position(&mut reader)?;
+        let result = read_position(&mut reader, format)?;
 
-        let defeq_tag = reader.u8("defeq evidence tag")?;
-        if defeq_tag != DEFEQ_MARKER_KERNEL_AT_CARRIER {
-            return Err(DecodeRefusal::Malformed {
-                field: "defeq evidence tag",
-                detail: format!(
-                    "unknown tag {defeq_tag}; the only evidence form this reader admits \
-                     is kernel-defeq-at-carrier ({DEFEQ_MARKER_KERNEL_AT_CARRIER})"
-                ),
-            });
-        }
-        let admitted_at_rust = reader.non_empty_str("defeq admitted-at")?;
+        let faithfulness_tag = reader.u8("faithfulness evidence tag")?;
+        let method = match (format, faithfulness_tag) {
+            (
+                VERDICT_DIGEST_FORMAT_V1 | VERDICT_DIGEST_FORMAT_V2,
+                FAITHFULNESS_KERNEL_DEFEQ_AT_CARRIER,
+            ) => FaithfulnessMethod::DefinitionalEquality,
+            (VERDICT_DIGEST_FORMAT_V2, FAITHFULNESS_KERNEL_INDUCTION_AT_CARRIER) => {
+                FaithfulnessMethod::StructuralInduction
+            }
+            _ => {
+                return Err(DecodeRefusal::Malformed {
+                    field: "faithfulness evidence tag",
+                    detail: format!(
+                        "unknown tag {faithfulness_tag} for format v{format}; v1 admits \
+                         only kernel-defeq-at-carrier \
+                         ({FAITHFULNESS_KERNEL_DEFEQ_AT_CARRIER}), while v2 also admits \
+                         kernel-induction-at-carrier \
+                         ({FAITHFULNESS_KERNEL_INDUCTION_AT_CARRIER})"
+                    ),
+                });
+            }
+        };
+        let admitted_at_rust = reader.non_empty_str("faithfulness admitted-at")?;
 
         if reader.at != reader.bytes.len() {
             return Err(DecodeRefusal::TrailingBytes { count: reader.bytes.len() - reader.at });
@@ -768,7 +804,7 @@ impl VerdictDigest {
             environment: EnvironmentDigest::from_validated_hex(hex),
             assumptions,
             carrier: CarrierDecision { arguments, result },
-            defeq: DefeqEvidence { admitted_at_rust },
+            faithfulness: FaithfulnessEvidence { method, admitted_at_rust },
         })
     }
 }
@@ -779,24 +815,47 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
     // The fields here are names, versions and 64-char hashes; a >4 GiB field
-    // is not a state either constructor can produce, and format v1 does not
+    // is not a state either constructor can produce, and the wire does not
     // pretend to carry one.
     put_u32(out, u32::try_from(text.len()).expect("a digest field exceeds u32 bytes"));
     out.extend_from_slice(text.as_bytes());
 }
 
-fn put_position(out: &mut Vec<u8>, position: &CarrierPosition) {
+fn put_position_v2(out: &mut Vec<u8>, position: &CarrierPosition) {
     put_str(out, &position.clean_type);
     put_str(out, &position.rust_carrier);
-    put_u32(out, position.bits);
+    match position.width {
+        CarrierWidth::Bits(bits) => {
+            out.push(CARRIER_WIDTH_FIXED_BITS);
+            put_u32(out, bits);
+        }
+        CarrierWidth::UnboundedExact => out.push(CARRIER_WIDTH_UNBOUNDED_EXACT),
+    }
 }
 
-fn read_position(reader: &mut Reader<'_>) -> Result<CarrierPosition, DecodeRefusal> {
-    Ok(CarrierPosition {
-        clean_type: reader.non_empty_str("carrier clean type")?,
-        rust_carrier: reader.non_empty_str("carrier rust type")?,
-        bits: reader.u32("carrier bits")?,
-    })
+fn read_position(reader: &mut Reader<'_>, format: u8) -> Result<CarrierPosition, DecodeRefusal> {
+    let clean_type = reader.non_empty_str("carrier clean type")?;
+    let rust_carrier = reader.non_empty_str("carrier rust type")?;
+    let width = if format == VERDICT_DIGEST_FORMAT_V1 {
+        CarrierWidth::Bits(reader.u32("carrier bits")?)
+    } else {
+        match reader.u8("carrier width tag")? {
+            CARRIER_WIDTH_FIXED_BITS => CarrierWidth::Bits(reader.u32("carrier bits")?),
+            CARRIER_WIDTH_UNBOUNDED_EXACT => CarrierWidth::UnboundedExact,
+            other => {
+                return Err(DecodeRefusal::Malformed {
+                    field: "carrier width tag",
+                    detail: format!(
+                        "unknown tag {other}; v2 admits fixed-bits \
+                         ({CARRIER_WIDTH_FIXED_BITS}) or unbounded-exact \
+                         ({CARRIER_WIDTH_UNBOUNDED_EXACT}), and guessing would change \
+                         the value domain crossing the crate boundary"
+                    ),
+                });
+            }
+        }
+    };
+    Ok(CarrierPosition { clean_type, rust_carrier, width })
 }
 
 /// A cursor over wire bytes. Every read checks the remaining length FIRST, so
@@ -831,10 +890,8 @@ impl<'a> Reader<'a> {
     fn str(&mut self, field: &'static str) -> Result<String, DecodeRefusal> {
         let len = self.u32(field)? as usize;
         let bytes = self.take(len, field)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| DecodeRefusal::Malformed {
-            field,
-            detail: "not valid UTF-8".to_owned(),
-        })
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| DecodeRefusal::Malformed { field, detail: "not valid UTF-8".to_owned() })
     }
 
     fn non_empty_str(&mut self, field: &'static str) -> Result<String, DecodeRefusal> {
@@ -864,7 +921,7 @@ pub enum DecodeRefusal {
     UnknownFormatVersion {
         /// The version tag found.
         found: u8,
-        /// The one version this reader supports.
+        /// The newest/current format version this reader supports.
         supported: u8,
     },
     /// The input ended inside a field.
@@ -954,29 +1011,14 @@ pub enum DigestMintRefusal {
         /// The declaration name.
         name: String,
     },
-    /// The closure contains an assumption kind format v1 has no tag for.
+    /// The closure contains an assumption kind the current format has no tag for.
     UnencodableAssumption {
         /// The declaration name.
         name: String,
         /// The assumption that could not be carried.
         assumption: String,
     },
-    /// Some signature position's discharged carrier width has no wire-v1
-    /// representation (it is not an exact fixed width).
-    ///
-    /// An unbounded-exact carrier is exact **by trusted runtime** — a TCB row,
-    /// not a proof — so beyond being unencodable it is also a rest-on the
-    /// digest's closure does not name. Refuse rather than invent a number or
-    /// smuggle the assumption.
-    UnencodableCarrierWidth {
-        /// The declaration name.
-        name: String,
-        /// Which signature position.
-        position: String,
-        /// The witness rendering of the offending carrier.
-        witness: String,
-    },
-    /// The defeq evidence and the carrier signature disagree about the
+    /// The faithfulness evidence and the carrier signature disagree about the
     /// admitted type — they are evidence from two different decisions, and a
     /// digest stitched from mismatched evidence would bind nothing.
     EvidenceMismatch {
@@ -986,6 +1028,22 @@ pub enum DigestMintRefusal {
         faithful_at: String,
         /// What the signature's result position carries at.
         signature_at: String,
+    },
+    /// The gate's evidence form has no wire spelling in the current format.
+    ///
+    /// R1 accounting: a `StructuralNatRec` verdict is earned by the
+    /// per-defining-equation judgment
+    /// ([`crate::gate::check_faithful_equations`]), and
+    /// [`FaithfulnessEvidence`] deliberately has no spelling that
+    /// distinguishes it from whole-term defeq — a wire-format statement of
+    /// the per-equation mode is its own reviewed change. Collapsing it onto
+    /// either existing tag would tell the importer a whole-term judgment
+    /// happened that never did, so the mint refuses instead.
+    UnencodableFaithfulness {
+        /// The declaration name.
+        name: String,
+        /// The evidence form with no wire spelling.
+        method: FaithfulnessMethod,
     },
 }
 
@@ -1015,7 +1073,7 @@ impl DigestMintRefusal {
             ),
             Self::UnencodableAssumption { name, assumption } => format!(
                 "no verdict digest for `{name}`: assumption {assumption} has a kind \
-                 wire format v1 cannot carry, and collapsing it onto another kind \
+                 the current wire format cannot carry, and collapsing it onto another kind \
                  would change what the disclosure tells its reader.\n\
                  options:\n\
                  - discharge the assumption so it leaves the closure;\n\
@@ -1023,24 +1081,8 @@ impl DigestMintRefusal {
                    version bump — old readers will then refuse rather than misread, \
                    which is the intended behaviour)."
             ),
-            Self::UnencodableCarrierWidth { name, position, witness } => format!(
-                "no verdict digest for `{name}`: {position} carries at a width wire \
-                 format v1 cannot represent ({witness}). v1 records an exact FIXED \
-                 width per position; an unbounded-exact carrier is exact by TRUSTED \
-                 RUNTIME — a TCB row, not a proof — so encoding it under v1 would \
-                 both invent a number and hide what the verdict rests on.\n\
-                 options:\n\
-                 - restate the offending position at a fixed-width Clean type \
-                   (`UInt8`/`UInt16`/`UInt32`/`UInt64`), which v1 carries exactly;\n\
-                 - keep the declaration crate-local, or cite it from proof position \
-                   — neither needs a wire certificate;\n\
-                 - extend the wire format with a width tag AND a disclosure row for \
-                   the runtime rest-on (a format version bump — old readers will \
-                   then refuse rather than misread, which is the intended \
-                   behaviour)."
-            ),
             Self::EvidenceMismatch { name, faithful_at, signature_at } => format!(
-                "no verdict digest for `{name}`: the defeq evidence was admitted at \
+                "no verdict digest for `{name}`: the faithfulness evidence was admitted at \
                  `{faithful_at}` but the carrier signature's result position carries at \
                  `{signature_at}`. These are evidence from two different decisions; a \
                  digest stitched from them would bind neither.\n\
@@ -1049,6 +1091,20 @@ impl DigestMintRefusal {
                    `plan_clean_origin_body` returned for this declaration);\n\
                  - re-run the gate against the intended signature and mint from that \
                    Faithful."
+            ),
+            Self::UnencodableFaithfulness { name, method } => format!(
+                "no verdict digest for `{name}`: its faithfulness was established by \
+                 {method:?}, an evidence form the current wire format deliberately has \
+                 no tag for — spelling it as whole-term defeq or induction would tell \
+                 the importer a judgment happened that never did.\n\
+                 options:\n\
+                 - keep the declaration crate-local and call it there (the local gate \
+                   already admitted it);\n\
+                 - restate the definition inside a whole-term-gated shape so its \
+                   evidence has a wire spelling;\n\
+                 - extend the wire format with a per-equation evidence tag (a format \
+                   version bump and its own reviewed change — old readers will then \
+                   refuse rather than misread, which is the intended behaviour)."
             ),
         }
     }
@@ -1116,13 +1172,14 @@ pub fn mint_verdict_digest(
         });
     }
 
-    let carrier = CarrierDecision::of_signature(signature).map_err(|unencodable| {
-        DigestMintRefusal::UnencodableCarrierWidth {
+    if faithfulness_method_tag(faithful.method()).is_none() {
+        return Err(DigestMintRefusal::UnencodableFaithfulness {
             name: name.to_owned(),
-            position: unencodable.position,
-            witness: unencodable.witness,
-        }
-    })?;
+            method: faithful.method(),
+        });
+    }
+
+    let carrier = CarrierDecision::of_signature(signature);
 
     Ok(VerdictDigest {
         decl: name.to_owned(),
@@ -1130,7 +1187,8 @@ pub fn mint_verdict_digest(
         environment,
         assumptions,
         carrier,
-        defeq: DefeqEvidence {
+        faithfulness: FaithfulnessEvidence {
+            method: faithful.method(),
             admitted_at_rust: signature.result().witness().rust_carrier().to_owned(),
         },
     })
@@ -1174,8 +1232,8 @@ impl ExportDigestRefusal {
                 DigestMintRefusal::NotKernelChecked { name, .. }
                 | DigestMintRefusal::ClosureUnrecorded { name }
                 | DigestMintRefusal::UnencodableAssumption { name, .. }
-                | DigestMintRefusal::UnencodableCarrierWidth { name, .. }
-                | DigestMintRefusal::EvidenceMismatch { name, .. },
+                | DigestMintRefusal::EvidenceMismatch { name, .. }
+                | DigestMintRefusal::UnencodableFaithfulness { name, .. },
             ) => name,
         }
     }
@@ -1241,6 +1299,40 @@ impl ExportDigestRefusal {
 /// nothing — and the compiler-side caller must treat that as FATAL, never as
 /// "skip the row": a missing digest row is how importers recognise ordinary
 /// Rust, so encoding nothing for a registry def would fail OPEN.
+///
+/// # RECURSIVE verdicts cannot cross a crate boundary (R1 and R2 accounting)
+///
+/// A `StructuralNatRec` verdict is earned by the PER-EQUATION judgment
+/// (`check_faithful_equations`), and [`FaithfulnessEvidence`] has no
+/// spelling that distinguishes it from whole-term defeq — a wire-format
+/// statement of the per-equation mode is its own reviewed change. Wire
+/// format v2 carries the `Nat` (unbounded-exact) carrier honestly, so the
+/// v1 width refusal that used to backstop this is gone; the fail-closed
+/// arm is now EXPLICIT: [`mint_verdict_digest`] refuses any [`Faithful`]
+/// whose method has no wire tag
+/// ([`DigestMintRefusal::UnencodableFaithfulness`]), which covers the whole
+/// per-equation slice — a recursive def stays crate-local rather than
+/// riding the whole-term evidence spelling. (The inductive-projection lane
+/// is different on purpose: its evidence IS a whole-term structural-
+/// induction verdict, which v2 spells honestly.)
+///
+/// **R2 (2026-08-22) keeps that boundary, and the reasoning is STRONGER for
+/// it — this is a decision, not an omission.** A `WellFoundedNatRec` verdict
+/// (`check_faithful_wf_functional`) rests on three things the wire unit
+/// cannot state: an F-LAYER comparison rather than a whole-term one; a BORROW
+/// of side A's decrease proofs, whose correctness is a property of the
+/// exporting environment's declaration; and an AXIOM-CLOSURE AUDIT of both
+/// sides, which is the *other half of the termination argument* on this lane
+/// (probe c1: one assumed decrease and a diverging functional admits). The
+/// digest does carry an axiom closure for the declaration — but a tag saying
+/// "well-founded functional defeq" would tell an importer that a judgment
+/// happened whose inputs the format has no field for, and the importer's own
+/// re-gate is what would then be silently doing all the work. Adding the tag
+/// is therefore a REVIEWED format change that must land with the fields, not
+/// a one-line enum arm; and the decode side must refuse an unknown tag when
+/// it does (the existing versioned-refusal discipline: an unknown tag is a
+/// refusal, never a best-effort parse). Until then a cross-crate call to a
+/// well-founded Clean def refuses at this seam, fail-closed.
 pub fn mint_encoded_digest_for_export(
     env: &Environment,
     name: &str,
@@ -1260,6 +1352,197 @@ pub fn mint_encoded_digest_for_export(
 // Re-admission
 // ---------------------------------------------------------------------------
 
+/// Sealed evidence that the ACTUAL imported body passed the local gate, bound
+/// to the exact local dependency-closure digest used for that check.
+///
+/// A caller cannot construct this from a wire method tag. The only constructor
+/// is [`locally_recheck_imported_body`], which runs [`admit_lowering`] in the
+/// exact `Environment` borrowed and sealed by [`ReadmissionPreflight`]. The
+/// token copies that precomputed environment digest; it never recomputes or
+/// accepts a caller-selected binding.
+///
+/// ```compile_fail,E0451
+/// let forged = trust_clean_origin::LocallyRechecked {
+///     faithful: todo!(),
+///     environment: todo!(),
+/// };
+/// ```
+#[derive(Debug)]
+pub struct LocallyRechecked {
+    faithful: Faithful,
+    environment: EnvironmentDigest,
+}
+
+impl LocallyRechecked {
+    /// Declaration whose actual imported body was checked.
+    #[must_use]
+    pub fn decl(&self) -> &str {
+        self.faithful.name()
+    }
+
+    /// Locally observed proof method. Diagnostic only until [`readmit`]
+    /// matches it to a complete preflight.
+    #[must_use]
+    pub fn method(&self) -> FaithfulnessMethod {
+        self.faithful.method()
+    }
+}
+
+/// Failure to bind an actual imported body to local gate evidence.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum LocalBodyRecheckRefusal {
+    /// The supplied plan belongs to another declaration.
+    PlanSubjectSkew {
+        /// Declaration established by preflight.
+        expected: String,
+        /// Declaration named by the plan.
+        planned: String,
+    },
+    /// The supplied plan's carrier signature differs from local preflight.
+    PlanCarrierSkew {
+        /// Declaration being imported.
+        decl: String,
+    },
+    /// The body did not agree with its locally planned Clean declaration.
+    Emit(EmitRefusal),
+}
+
+impl LocalBodyRecheckRefusal {
+    /// Declaration whose local re-check failed.
+    #[must_use]
+    pub fn decl(&self) -> &str {
+        match self {
+            Self::PlanSubjectSkew { expected, .. } => expected,
+            Self::PlanCarrierSkew { decl } => decl,
+            Self::Emit(refusal) => refusal.name(),
+        }
+    }
+
+    /// Whether this is emitted-body/compiler drift rather than a capability
+    /// boundary in the declaration itself.
+    #[must_use]
+    pub fn is_compiler_defect(&self) -> bool {
+        match self {
+            Self::PlanSubjectSkew { .. } | Self::PlanCarrierSkew { .. } => true,
+            Self::Emit(refusal) => refusal.is_compiler_defect(),
+        }
+    }
+
+    /// Operator-facing resolution.
+    #[must_use]
+    pub fn note(&self) -> String {
+        match self {
+            Self::PlanSubjectSkew { expected, planned } => format!(
+                "the local re-check preflight is for `{expected}`, but the supplied \
+                 emission plan is for `{planned}`. A plan for one declaration cannot \
+                 purchase proof search for another. Please report this compiler \
+                 metadata/plan pairing defect."
+            ),
+            Self::PlanCarrierSkew { decl } => format!(
+                "the local emission plan for `{decl}` has a different carrier signature \
+                 from the signature already bound by readmission preflight. Proof search \
+                 was not started. Please report this compiler planning defect."
+            ),
+            Self::Emit(refusal) => refusal.note(),
+        }
+    }
+}
+
+/// Run the local gate over one actual decoded MIR body and bind the resulting
+/// sealed evidence to the environment in which it was earned.
+///
+/// # Errors
+///
+/// [`LocalBodyRecheckRefusal`] if the plan does not match preflight or the body
+/// fails the local gate. No token exists on either path.
+pub fn locally_recheck_imported_body(
+    preflight: &ReadmissionPreflight<'_>,
+    plan: &CleanOriginPlan,
+    extracted: &VerifiableFunction,
+) -> Result<LocallyRechecked, LocalBodyRecheckRefusal> {
+    if plan.name() != preflight.decl {
+        return Err(LocalBodyRecheckRefusal::PlanSubjectSkew {
+            expected: preflight.decl.clone(),
+            planned: plan.name().to_owned(),
+        });
+    }
+    if plan.signature() != &preflight.signature {
+        return Err(LocalBodyRecheckRefusal::PlanCarrierSkew { decl: preflight.decl.clone() });
+    }
+    let faithful =
+        admit_lowering(preflight.env, plan, extracted).map_err(LocalBodyRecheckRefusal::Emit)?;
+    Ok(LocallyRechecked { faithful, environment: preflight.environment.clone() })
+}
+
+/// Cheap, sealed result of checking every wire/environment/carrier field that
+/// does not require proof search over the imported body.
+///
+/// It is deliberately not authority by itself. [`readmit`] also requires a
+/// [`LocallyRechecked`] token and binds the two by declaration, environment,
+/// carrier, and proof method.
+#[derive(Debug)]
+pub struct ReadmissionPreflight<'env> {
+    env: &'env Environment,
+    decl: String,
+    kernel_version: String,
+    environment: EnvironmentDigest,
+    admitted_at_rust: String,
+    result_carrier: Ty,
+    signature: CarrierSignature,
+    claimed_method: FaithfulnessMethod,
+}
+
+impl ReadmissionPreflight<'_> {
+    /// Locally recomputed, fully discharged carrier signature. This is exposed
+    /// read-only so the compiler can reject encoded Rust ABI skew before
+    /// planning or induction; callers still cannot construct a preflight.
+    #[must_use]
+    pub fn signature(&self) -> &CarrierSignature {
+        &self.signature
+    }
+}
+
+/// Sealed result of the checks that require only wire bytes and the local
+/// kernel identity. This phase deliberately precedes loading/re-elaborating an
+/// imported Clean environment, so a stale or assumption-bearing row cannot
+/// purchase expensive work.
+#[derive(Clone, Debug)]
+pub struct WirePreflight {
+    digest: VerdictDigest,
+    local_kernel_version: String,
+}
+
+/// Perform the constant/linear wire-only rejection phase.
+///
+/// # Errors
+///
+/// Kernel skew or any assumption-bearing CALL certificate is rejected before
+/// environment construction or proof search.
+pub fn preflight_wire(
+    digest: &VerdictDigest,
+    local_kernel_version: &str,
+) -> Result<WirePreflight, ReadmissionRefusal> {
+    let decl = digest.decl.as_str();
+    if digest.kernel_version != local_kernel_version {
+        return Err(ReadmissionRefusal::KernelVersionSkew {
+            decl: decl.to_owned(),
+            minted_under: digest.kernel_version.clone(),
+            local: local_kernel_version.to_owned(),
+        });
+    }
+    if !digest.assumptions.is_empty() {
+        return Err(ReadmissionRefusal::AssumptionBearing {
+            decl: decl.to_owned(),
+            assumptions: digest.assumptions.iter().map(|a| a.name().to_owned()).collect(),
+        });
+    }
+    Ok(WirePreflight {
+        digest: digest.clone(),
+        local_kernel_version: local_kernel_version.to_owned(),
+    })
+}
+
 /// Evidence that an imported verdict digest was checked, field by field,
 /// against the LOCAL kernel version, the LOCAL environment content, and the
 /// LOCAL carrier decision.
@@ -1273,6 +1556,7 @@ pub fn mint_encoded_digest_for_export(
 ///     decl: String::new(),
 ///     kernel_version: String::new(),
 ///     admitted_at_rust: String::new(),
+///     method: todo!(),
 /// };
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1280,6 +1564,7 @@ pub struct Readmitted {
     decl: String,
     kernel_version: String,
     admitted_at_rust: String,
+    method: FaithfulnessMethod,
 }
 
 impl Readmitted {
@@ -1300,6 +1585,13 @@ impl Readmitted {
     #[must_use]
     pub fn admitted_at_rust(&self) -> &str {
         &self.admitted_at_rust
+    }
+
+    /// How the exporter proved the body faithful, preserved without
+    /// relabelling through decode and re-admission.
+    #[must_use]
+    pub fn method(&self) -> FaithfulnessMethod {
+        self.method
     }
 }
 
@@ -1369,19 +1661,6 @@ pub enum ReadmissionRefusal {
         /// I4's refusal, verbatim.
         refusal: CarrierRefused,
     },
-    /// The LOCAL carrier decision admits some position at a width wire format
-    /// v1 cannot represent, so there is no comparable local record. A v1
-    /// digest only ever claims exact fixed widths; a local decision outside
-    /// them is a disagreement between the two compilers' carrier policies,
-    /// and comparing an invented number would hide it.
-    LocalCarrierWidthUnencodable {
-        /// The declaration.
-        decl: String,
-        /// Which signature position.
-        position: String,
-        /// The witness rendering of the local carrier at that position.
-        witness: String,
-    },
     /// The imported carrier decision and the local one disagree at some
     /// position.
     CarrierSkew {
@@ -1394,14 +1673,50 @@ pub enum ReadmissionRefusal {
         /// The local decision at that position.
         local: String,
     },
-    /// The defeq evidence marker names a carrier type that is not the local
+    /// The faithfulness evidence marker names a carrier type that is not the local
     /// result carrier.
-    DefeqSkew {
+    FaithfulnessSkew {
         /// The declaration.
         decl: String,
         /// What the marker claims the agreement was admitted at.
         claimed: String,
         /// The local result carrier.
+        local: String,
+    },
+    /// The wire records a different proof method from the method the local
+    /// compiler re-earned against the imported body.
+    FaithfulnessMethodSkew {
+        /// The declaration.
+        decl: String,
+        /// The method named by the imported digest.
+        claimed: FaithfulnessMethod,
+        /// The method observed by the local re-gate.
+        local: FaithfulnessMethod,
+    },
+    /// The sealed local gate evidence belongs to a different declaration.
+    LocalEvidenceSubjectSkew {
+        /// Declaration named by the preflighted digest.
+        decl: String,
+        /// Declaration whose body the local gate actually checked.
+        checked: String,
+    },
+    /// The sealed local gate evidence was earned over a different dependency
+    /// closure from the one preflighted for this import.
+    LocalEvidenceEnvironmentSkew {
+        /// Declaration being imported.
+        decl: String,
+        /// Environment digest bound into the local gate token.
+        checked: String,
+        /// Environment digest established by preflight.
+        local: String,
+    },
+    /// The sealed local gate evidence was earned at a different result carrier.
+    LocalEvidenceCarrierSkew {
+        /// Declaration being imported.
+        decl: String,
+        /// Carrier at which the local gate ran.
+        checked: String,
+        /// Carrier established by local signature preflight.
         local: String,
     },
 }
@@ -1417,9 +1732,12 @@ impl ReadmissionRefusal {
             | Self::EnvironmentSkew { decl, .. }
             | Self::UndisclosedAssumptions { decl, .. }
             | Self::LocalCarrierRefused { decl, .. }
-            | Self::LocalCarrierWidthUnencodable { decl, .. }
             | Self::CarrierSkew { decl, .. }
-            | Self::DefeqSkew { decl, .. } => decl,
+            | Self::FaithfulnessSkew { decl, .. }
+            | Self::FaithfulnessMethodSkew { decl, .. }
+            | Self::LocalEvidenceSubjectSkew { decl, .. }
+            | Self::LocalEvidenceEnvironmentSkew { decl, .. }
+            | Self::LocalEvidenceCarrierSkew { decl, .. } => decl,
         }
     }
 
@@ -1436,10 +1754,8 @@ impl ReadmissionRefusal {
                  options:\n\
                  - rebuild the dependency with this toolchain, so its certificates are \
                    minted under kernel {local};\n\
-                 - re-check the declaration locally (the local environment holds it; \
-                   the re-check lane beside `readmit` is the documented seam — until it \
-                   lands, rebuilding the dependency is the same computation done in the \
-                   dependency's build);\n\
+                 - rebuild the dependency, then let the importer independently re-check \
+                   every transported MIR body under this local kernel before `readmit`;\n\
                  - if the skew is unexpected — both crates supposedly built by one \
                    toolchain — report it: something pinned two kernels into one \
                    workspace."
@@ -1510,20 +1826,6 @@ impl ReadmissionRefusal {
                  - if the local refusal is the surprise, that is a carrier-map \
                    regression: report it with this note."
             ),
-            Self::LocalCarrierWidthUnencodable { decl, position, witness } => format!(
-                "the imported certificate for `{decl}` claims exact fixed widths (the \
-                 only widths wire format v1 carries), but the LOCAL carrier decision \
-                 admits {position} at a width v1 cannot represent ({witness}). The two \
-                 compilers' carrier policies disagree, and comparing an invented \
-                 number would hide that.\n\
-                 options:\n\
-                 - rebuild the dependency with this toolchain so both sides make the \
-                   same carrier decision;\n\
-                 - restate the declaration's {position} at a fixed-width Clean type \
-                   and rebuild both sides;\n\
-                 - cite `{decl}` from proof position instead — proof position needs \
-                   no carrier decision."
-            ),
             Self::CarrierSkew { decl, position, imported, local } => format!(
                 "the imported certificate for `{decl}` admits {position} at \
                  `{imported}`, but the local carrier decision is `{local}`. Emitting a \
@@ -1536,10 +1838,10 @@ impl ReadmissionRefusal {
                    is a carrier-map regression on THIS side: report it rather than \
                    forcing the import."
             ),
-            Self::DefeqSkew { decl, claimed, local } => format!(
+            Self::FaithfulnessSkew { decl, claimed, local } => format!(
                 "the imported certificate for `{decl}` says the faithfulness agreement \
                  was admitted at `{claimed}`, but the local result carrier is \
-                 `{local}`. The defeq verdict is only meaningful AT the carrier it was \
+                 `{local}`. The kernel verdict is only meaningful AT the carrier it was \
                  admitted at.\n\
                  options:\n\
                  - rebuild the dependency so the gate re-runs at the current carrier;\n\
@@ -1547,66 +1849,78 @@ impl ReadmissionRefusal {
                    that combination means the certificate was assembled from mismatched \
                    evidence, which the mint refuses — so it did not come from the mint."
             ),
+            Self::FaithfulnessMethodSkew { decl, claimed, local } => format!(
+                "the imported certificate for `{decl}` claims faithfulness method \
+                 `{claimed:?}`, but the local compiler re-earned `{local:?}` from the \
+                 actual imported body. The wire may describe evidence, but it cannot \
+                 choose which proof the local gate observed.\n\
+                 options:\n\
+                 - rebuild the dependency with this toolchain so the digest records \
+                   the proof method the current gate derives;\n\
+                 - report it if a fresh rebuild still disagrees: either the metadata \
+                   or the imported body changed after certification."
+            ),
+            Self::LocalEvidenceSubjectSkew { decl, checked } => format!(
+                "the imported certificate names `{decl}`, but the sealed local gate \
+                 evidence was earned for `{checked}`. Evidence for one declaration \
+                 cannot authorize another.\n\
+                 options:\n\
+                 - re-run the local body gate for `{decl}` and pass that token;\n\
+                 - report this if the compiler paired these rows automatically: the \
+                   metadata/body registry is internally inconsistent."
+            ),
+            Self::LocalEvidenceEnvironmentSkew { decl, checked, local } => format!(
+                "the sealed local body check for `{decl}` was earned over dependency \
+                 closure {checked}, but certificate preflight established {local}. A \
+                 proof from one environment cannot be rebound to another.\n\
+                 options:\n\
+                 - re-run the local body gate after loading the final dependency \
+                   environment;\n\
+                 - report it if one compiler session produced both values."
+            ),
+            Self::LocalEvidenceCarrierSkew { decl, checked, local } => format!(
+                "the sealed local body check for `{decl}` ran at carrier `{checked}`, \
+                 but local signature preflight established `{local}`. The gate's \
+                 equality is meaningful only at the carrier it checked.\n\
+                 options:\n\
+                 - re-plan and re-check the imported body at the current carrier;\n\
+                 - report it if the compiler paired these values automatically."
+            ),
         }
     }
 }
 
-/// Decide whether an imported verdict digest stands in the LOCAL crate.
+/// Bind a wire preflight to the local environment and carrier map before any
+/// local proof search over an imported body.
 ///
 /// The comparisons, in reporting order (coarsest first, the same rationale as
 /// `crate::mint::decide_mint` — any failure refuses, so order is not
 /// load-bearing for soundness):
 ///
-/// 1. **kernel version** — `digest` vs `local_kernel_version`. Skew refuses;
-///    the re-check alternative is a documented seam, not built (module docs).
-/// 2. **axiom closure** — must be empty (audited-empty by construction: the
-///    mint refuses unrecorded closures, so an empty list on an honest wire is
-///    an audit that found nothing). Non-empty refuses re-admission to CALL.
-/// 3. **declaration present** — the local environment must hold the subject.
-/// 4. **environment digest** — recomputed over `local_env` by the same
+/// 1. **declaration present** — the local environment must hold the subject.
+/// 2. **environment digest** — recomputed over `local_env` by the same
 ///    [`environment_digest_for`] and compared.
-/// 5. **disclosure cross-audit** — the local `axiom_deps` walk must not find
+/// 3. **disclosure cross-audit** — the local `axiom_deps` walk must not find
 ///    assumptions the digest failed to name. Refutation-only; see
 ///    [`ReadmissionRefusal::UndisclosedAssumptions`].
-/// 6. **carrier decision** — recomputed locally from the declaration's type
+/// 4. **carrier decision** — recomputed locally from the declaration's type
 ///    via the local carrier map and compared position by position.
-/// 7. **defeq marker** — must name the local result carrier.
-///
-/// `local_kernel_version` is a parameter rather than read from the linked
-/// kernel so the decision stays a total function of its inputs (the same
-/// purity rule `crate::mint` records) — the production caller passes
-/// [`local_kernel_version`]`()`.
+/// 5. **faithfulness carrier marker** — must name the local result carrier.
+///    The claimed METHOD is retained for [`readmit`] to compare with sealed
+///    locally re-earned evidence; it is never accepted as an input fact.
 ///
 /// # Errors
 ///
-/// [`ReadmissionRefusal`] naming the first mismatch. There is no partial
-/// re-admission and no "accepted with warnings" mode: an imported verdict
-/// either stands whole or it does not stand.
-pub fn readmit(
-    digest: &VerdictDigest,
-    local_kernel_version: &str,
-    local_env: &Environment,
-) -> Result<Readmitted, ReadmissionRefusal> {
+/// [`ReadmissionRefusal`] naming the first mismatch. Success is only a sealed
+/// [`ReadmissionPreflight`], not a [`Readmitted`] authority.
+pub fn bind_readmission<'env>(
+    wire: &WirePreflight,
+    local_env: &'env Environment,
+) -> Result<ReadmissionPreflight<'env>, ReadmissionRefusal> {
+    let digest = &wire.digest;
     let decl = digest.decl.as_str();
 
-    // ── 1. the acceptance control: a different kernel refuses, always ──────
-    if digest.kernel_version != local_kernel_version {
-        return Err(ReadmissionRefusal::KernelVersionSkew {
-            decl: decl.to_owned(),
-            minted_under: digest.kernel_version.clone(),
-            local: local_kernel_version.to_owned(),
-        });
-    }
-
-    // ── 2. assumption-bearing never re-admits to CALL ──────────────────────
-    if !digest.assumptions.is_empty() {
-        return Err(ReadmissionRefusal::AssumptionBearing {
-            decl: decl.to_owned(),
-            assumptions: digest.assumptions.iter().map(|a| a.name().to_owned()).collect(),
-        });
-    }
-
-    // ── 3+4. the local content must hash to what the verdict was over ──────
+    // ── 1+2. the local content must hash to what the verdict was over ──────
     let local_digest = match environment_digest_for(local_env, decl) {
         Ok(digest) => digest,
         Err(EnvironmentDigestRefusal::NoSuchDeclaration { .. }) => {
@@ -1621,7 +1935,7 @@ pub fn readmit(
         });
     }
 
-    // ── 5. refute an empty-closure claim if the local DAG names assumptions ─
+    // ── 3. refute an empty-closure claim if the local DAG names assumptions ─
     let kernel_name = Name::from_string(decl);
     match local_env.axiom_deps(&kernel_name) {
         None => {
@@ -1640,20 +1954,14 @@ pub fn readmit(
         Some(_) => {}
     }
 
-    // ── 6. the LOCAL carrier decision, recomputed, position by position ────
+    // ── 4. the LOCAL carrier decision, recomputed, position by position ────
     let Some(info) = local_env.get_const(&kernel_name) else {
         return Err(ReadmissionRefusal::DeclarationMissing { decl: decl.to_owned() });
     };
     let local_signature = carrier_signature_for(&info.type_).map_err(|refusal| {
         ReadmissionRefusal::LocalCarrierRefused { decl: decl.to_owned(), refusal }
     })?;
-    let local_decision = CarrierDecision::of_signature(&local_signature).map_err(|unencodable| {
-        ReadmissionRefusal::LocalCarrierWidthUnencodable {
-            decl: decl.to_owned(),
-            position: unencodable.position,
-            witness: unencodable.witness,
-        }
-    })?;
+    let local_decision = CarrierDecision::of_signature(&local_signature);
 
     if local_decision.arguments.len() != digest.carrier.arguments.len() {
         return Err(ReadmissionRefusal::CarrierSkew {
@@ -1684,18 +1992,89 @@ pub fn readmit(
         });
     }
 
-    // ── 7. the defeq marker must name the local result carrier ─────────────
-    if digest.defeq.admitted_at_rust != local_decision.result.rust_carrier {
-        return Err(ReadmissionRefusal::DefeqSkew {
+    // ── 5. the faithfulness marker must name the local result carrier ──────
+    if digest.faithfulness.admitted_at_rust != local_decision.result.rust_carrier {
+        return Err(ReadmissionRefusal::FaithfulnessSkew {
             decl: decl.to_owned(),
-            claimed: digest.defeq.admitted_at_rust.clone(),
+            claimed: digest.faithfulness.admitted_at_rust.clone(),
             local: local_decision.result.rust_carrier.clone(),
+        });
+    }
+    Ok(ReadmissionPreflight {
+        env: local_env,
+        decl: decl.to_owned(),
+        kernel_version: wire.local_kernel_version.clone(),
+        environment: local_digest,
+        admitted_at_rust: local_decision.result.rust_carrier.clone(),
+        result_carrier: local_signature.result().rust().clone(),
+        signature: local_signature,
+        claimed_method: digest.faithfulness.method,
+    })
+}
+
+/// Finalize a cheap preflight with sealed evidence earned from the actual
+/// imported body.
+///
+/// Neither input alone is authority: preflight validates the wire and local
+/// environment but performs no proof search; [`LocallyRechecked`] proves a
+/// body but does not say which wire row requested it. This function binds them
+/// by subject, dependency closure, carrier, and proof method.
+///
+/// A caller-supplied method is deliberately not part of this API:
+///
+/// ```compile_fail,E0061
+/// # use trust_clean_origin::{FaithfulnessMethod, LocallyRechecked, ReadmissionPreflight};
+/// fn cannot_echo_wire_method(
+///     preflight: &ReadmissionPreflight<'_>,
+///     local: &LocallyRechecked,
+/// ) {
+///     let _ = trust_clean_origin::readmit(
+///         preflight,
+///         local,
+///         FaithfulnessMethod::StructuralInduction,
+///     );
+/// }
+/// ```
+///
+/// # Errors
+///
+/// [`ReadmissionRefusal`] on any mismatch. There is no warning/partial mode.
+pub fn readmit(
+    preflight: &ReadmissionPreflight<'_>,
+    local: &LocallyRechecked,
+) -> Result<Readmitted, ReadmissionRefusal> {
+    if local.faithful.name() != preflight.decl {
+        return Err(ReadmissionRefusal::LocalEvidenceSubjectSkew {
+            decl: preflight.decl.clone(),
+            checked: local.faithful.name().to_owned(),
+        });
+    }
+    if local.environment != preflight.environment {
+        return Err(ReadmissionRefusal::LocalEvidenceEnvironmentSkew {
+            decl: preflight.decl.clone(),
+            checked: local.environment.hex.clone(),
+            local: preflight.environment.hex.clone(),
+        });
+    }
+    if local.faithful.admitted_at() != &preflight.result_carrier {
+        return Err(ReadmissionRefusal::LocalEvidenceCarrierSkew {
+            decl: preflight.decl.clone(),
+            checked: format!("{:?}", local.faithful.admitted_at()),
+            local: format!("{:?}", preflight.result_carrier),
+        });
+    }
+    if local.faithful.method() != preflight.claimed_method {
+        return Err(ReadmissionRefusal::FaithfulnessMethodSkew {
+            decl: preflight.decl.clone(),
+            claimed: preflight.claimed_method,
+            local: local.faithful.method(),
         });
     }
 
     Ok(Readmitted {
-        decl: decl.to_owned(),
-        kernel_version: local_kernel_version.to_owned(),
-        admitted_at_rust: local_decision.result.rust_carrier.clone(),
+        decl: preflight.decl.clone(),
+        kernel_version: preflight.kernel_version.clone(),
+        admitted_at_rust: preflight.admitted_at_rust.clone(),
+        method: local.faithful.method(),
     })
 }

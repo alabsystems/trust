@@ -327,8 +327,7 @@ fn test_pipeline_strengthen_improves_convergence() {
     tracker.observe(&iter0_result);
 
     // Run strengthen on the failures
-    let strengthen_output =
-        trust_strengthen::run(&iter0_result, &StrengthenConfig::default());
+    let strengthen_output = trust_strengthen::run(&iter0_result, &StrengthenConfig::default());
     assert!(
         strengthen_output.has_proposals,
         "strengthen should propose fixes for overflow + div-by-zero"
@@ -359,8 +358,7 @@ fn test_pipeline_strengthen_improves_convergence() {
     assert!(!improvements.is_empty());
 
     // Re-run strengthen on remaining failure
-    let strengthen_output2 =
-        trust_strengthen::run(&iter1_result, &StrengthenConfig::default());
+    let strengthen_output2 = trust_strengthen::run(&iter1_result, &StrengthenConfig::default());
     assert!(strengthen_output2.has_proposals);
     assert_eq!(strengthen_output2.failures_analyzed, 1);
 
@@ -1105,12 +1103,13 @@ fn test_pipeline_widening_reacts_to_convergence_decision() {
 
         match decision {
             ConvergenceDecision::Continue { verdict: StepVerdict::Stable }
-                if should_widen && widening.should_widen() => {
-                    let w = widening.widen(&abstract_state, &abstract_state);
-                    schedule.record_application();
-                    widened_state = Some(w);
-                    break;
-                }
+                if should_widen && widening.should_widen() =>
+            {
+                let w = widening.widen(&abstract_state, &abstract_state);
+                schedule.record_application();
+                widened_state = Some(w);
+                break;
+            }
             ConvergenceDecision::Converged { .. } => {
                 break;
             }

@@ -30,9 +30,7 @@ use crate::core::config::TargetSelection;
 use crate::utils::build_stamp::{self, BuildStamp};
 use crate::utils::channel::{self, Info};
 use crate::utils::exec::{BootstrapCommand, command};
-use crate::utils::helpers::{
-    exe, is_dylib, move_file, t, timeit,
-};
+use crate::utils::helpers::{exe, is_dylib, move_file, t, timeit};
 use crate::utils::tarball::{GeneratedTarball, OverlayKind, Tarball};
 use crate::{Compiler, DependencyType, FileType, LLVM_TOOLS, Mode, trace};
 
@@ -616,8 +614,10 @@ impl Step for Rustc {
                 // chance to run. Only the real pass can answer this question.
                 if !builder.config.dry_run() && !from.exists() {
                     let role = match bin.split('.').next().unwrap_or(&bin) {
-                        "ty" => "the temporal model checker (every derived-model \
-                                 obligation is discharged by it)",
+                        "ty" => {
+                            "the temporal model checker (every derived-model \
+                                 obligation is discharged by it)"
+                        }
                         "ay" => "the SAT/SMT solver behind the native verifier",
                         _ => "the CIC proof kernel",
                     };
@@ -665,7 +665,11 @@ impl Step for Rustc {
             let dst = image.join("libexec");
             t!(fs::create_dir_all(&dst));
             for bin in rust_analyzer_proc_macro_dist_bin_names(target) {
-                builder.copy_link(&ra_proc_macro_srv.tool_path, &dst.join(bin), FileType::Executable);
+                builder.copy_link(
+                    &ra_proc_macro_srv.tool_path,
+                    &dst.join(bin),
+                    FileType::Executable,
+                );
             }
 
             let libdir_relative = builder.libdir_relative(target_compiler);
@@ -2032,14 +2036,9 @@ impl Step for Extended {
                 prepare("trust-analysis");
             }
 
-            for tool in &[
-                "targo-trust",
-                "tippy",
-                "trustfmt",
-                "trust-analyzer",
-                "trust-docs",
-                "trust-miri",
-            ] {
+            for tool in
+                &["targo-trust", "tippy", "trustfmt", "trust-analyzer", "trust-docs", "trust-miri"]
+            {
                 if built_tools.contains(tool) {
                     prepare(tool);
                 }

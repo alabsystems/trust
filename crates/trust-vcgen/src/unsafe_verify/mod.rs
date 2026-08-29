@@ -18,8 +18,8 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use serde::{Deserialize, Serialize};
-use trust_types::*;
 use trust_types::fx::FxHashSet;
+use trust_types::*;
 
 pub(crate) mod detection;
 #[cfg(test)]

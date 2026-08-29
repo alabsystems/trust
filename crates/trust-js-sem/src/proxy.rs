@@ -24,20 +24,20 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::promise::NativeClosure;
 use crate::props::same_value;
 use crate::value::{
-    units_from_str, units_to_lossy, Builtin, NativeErrorKind, ObjId, ObjKind, Object, Prop,
-    PropDesc, PropVal, PropertyKey, Units, Value,
+    Builtin, NativeErrorKind, ObjId, ObjKind, Object, Prop, PropDesc, PropVal, PropertyKey, Units,
+    Value, units_from_str, units_to_lossy,
 };
-use std::rc::Rc;
 
 /// Refusal reason when a construct query targets a builtin whose driver-firewall
 /// replacement is constructable but the real intrinsic is not (see
 /// `firewall_plain_fn_ctor`).
-const FIREWALL_CTOR_REFUSAL: &str =
-    "IsConstructor(Date.now): real intrinsic is not a constructor but the driver's clock-firewall replacement is (out of slice)";
+const FIREWALL_CTOR_REFUSAL: &str = "IsConstructor(Date.now): real intrinsic is not a constructor but the driver's clock-firewall replacement is (out of slice)";
 
 /// ToLength (7.1.20) on an already-ToNumber'd value.
 fn to_length_local(n: f64) -> u64 {
@@ -72,12 +72,7 @@ impl Interp {
         let callable = self.obj(t).is_callable();
         let constructor = callable && self.is_constructor(t);
         let p = self.alloc(Object::new(
-            ObjKind::Proxy {
-                target: Some(t),
-                handler: Some(h),
-                callable,
-                constructor,
-            },
+            ObjKind::Proxy { target: Some(t), handler: Some(h), callable, constructor },
             None,
         ));
         Ok(p)
@@ -87,11 +82,7 @@ impl Interp {
     /// if it has been revoked (10.5, "If handler is null, throw a TypeError").
     fn proxy_parts(&mut self, pid: ObjId) -> Result<(ObjId, ObjId), Abrupt> {
         match self.obj(pid).kind {
-            ObjKind::Proxy {
-                target: Some(t),
-                handler: Some(h),
-                ..
-            } => Ok((t, h)),
+            ObjKind::Proxy { target: Some(t), handler: Some(h), .. } => Ok((t, h)),
             ObjKind::Proxy { .. } => Err(self.throw_native(NativeErrorKind::TypeError)),
             _ => Err(Abrupt::Fatal(
                 "proxy internal method on a non-proxy (router invariant)".to_string(),
@@ -374,10 +365,7 @@ impl Interp {
                         if !existing.is_data() || !existing.writable() {
                             return Ok(false);
                         }
-                        let d = PropDesc {
-                            value: Some(v),
-                            ..PropDesc::default()
-                        };
+                        let d = PropDesc { value: Some(v), ..PropDesc::default() };
                         self.mop_define_own(r, key, &d)
                     }
                     None => {
@@ -456,7 +444,8 @@ impl Interp {
             return self.mop_set_proto(target, proto);
         };
         let arg = proto.map_or(Value::Null, Value::Obj);
-        let r = self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), arg], false)?;
+        let r =
+            self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), arg], false)?;
         if !self.to_boolean(&r) {
             return Ok(false);
         }
@@ -510,7 +499,8 @@ impl Interp {
             return self.mop_get_own_property(target, key);
         };
         let kv = self.key_value(key);
-        let trap_result = self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), kv], false)?;
+        let trap_result =
+            self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), kv], false)?;
         if !matches!(trap_result, Value::Obj(_) | Value::Undefined) {
             return Err(self.throw_native(NativeErrorKind::TypeError));
         }
@@ -537,7 +527,7 @@ impl Interp {
             match &target_desc {
                 None => return Err(self.throw_native(NativeErrorKind::TypeError)),
                 Some(td) if td.configurable => {
-                    return Err(self.throw_native(NativeErrorKind::TypeError))
+                    return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
                 Some(td) => {
                     // A non-configurable non-writable data result must match a
@@ -592,7 +582,8 @@ impl Interp {
                 if setting_config_false && td.configurable {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
-                if td.is_data() && !td.configurable && td.writable() && desc.writable == Some(false) {
+                if td.is_data() && !td.configurable && td.writable() && desc.writable == Some(false)
+                {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
             }
@@ -607,7 +598,8 @@ impl Interp {
             return self.mop_has(target, key);
         };
         let kv = self.key_value(key);
-        let r = self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), kv], false)?;
+        let r =
+            self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), kv], false)?;
         let boolean = self.to_boolean(&r);
         if !boolean {
             if let Some(td) = self.mop_get_own_property(target, key)? {
@@ -704,7 +696,8 @@ impl Interp {
             return self.mop_delete(target, key);
         };
         let kv = self.key_value(key);
-        let r = self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), kv], false)?;
+        let r =
+            self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target), kv], false)?;
         if !self.to_boolean(&r) {
             return Ok(false);
         }
@@ -726,7 +719,8 @@ impl Interp {
         let Some(trap) = self.get_trap(handler, "ownKeys")? else {
             return self.mop_own_keys(target);
         };
-        let trap_array = self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target)], false)?;
+        let trap_array =
+            self.call_function(trap, Value::Obj(handler), vec![Value::Obj(target)], false)?;
         let trap_result = self.create_list_of_property_keys(&trap_array)?;
         // No duplicate entries (SameValue).
         for i in 0..trap_result.len() {
@@ -914,9 +908,7 @@ impl Interp {
     pub(crate) fn create_array_from_list(&mut self, list: &[Value]) -> Value {
         let arr = self.new_array(list.len());
         for (i, v) in list.iter().enumerate() {
-            self.obj_mut(arr)
-                .props
-                .insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
+            self.obj_mut(arr).props.insert(units_from_str(&i.to_string()), Prop::data(v.clone()));
         }
         #[allow(clippy::cast_precision_loss)]
         self.set_array_length_raw(arr, list.len() as f64);
@@ -933,9 +925,7 @@ impl Interp {
         let len_v = self.get_from_object(o, &units_from_str("length"))?;
         let len = to_length_local(self.to_number(&len_v)?);
         if len > 1_000_000 {
-            return Err(Abrupt::Fatal(
-                "ownKeys trap result length exceeds slice cap".to_string(),
-            ));
+            return Err(Abrupt::Fatal("ownKeys trap result length exceeds slice cap".to_string()));
         }
         let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
         for i in 0..len {
@@ -959,9 +949,7 @@ impl Interp {
         let len_v = self.get_from_object(o, &units_from_str("length"))?;
         let len = to_length_local(self.to_number(&len_v)?);
         if len > 1_000_000 {
-            return Err(Abrupt::Fatal(
-                "arguments list length exceeds slice cap".to_string(),
-            ));
+            return Err(Abrupt::Fatal("arguments list length exceeds slice cap".to_string()));
         }
         let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
         for i in 0..len {
@@ -996,9 +984,7 @@ impl Interp {
                 ObjKind::Proxy { handler: None, .. } => {
                     return Err(self.throw_native(NativeErrorKind::TypeError));
                 }
-                ObjKind::Proxy {
-                    target: Some(t), ..
-                } => cur = *t,
+                ObjKind::Proxy { target: Some(t), .. } => cur = *t,
                 ObjKind::Function(crate::value::FnImpl::Bound { target, .. }) => cur = *target,
                 _ => return Ok(()),
             }
@@ -1020,9 +1006,7 @@ impl Interp {
         loop {
             match self.obj(o).kind {
                 ObjKind::Array => return Ok(true),
-                ObjKind::Proxy {
-                    target: Some(t), ..
-                } => {
+                ObjKind::Proxy { target: Some(t), .. } => {
                     o = t;
                 }
                 ObjKind::Proxy { .. } => {
@@ -1175,9 +1159,7 @@ impl Interp {
                 self.obj_mut(result)
                     .props
                     .insert(units_from_str("proxy"), Prop::data(Value::Obj(p)));
-                self.obj_mut(result)
-                    .props
-                    .insert(units_from_str("revoke"), Prop::data(revoke));
+                self.obj_mut(result).props.insert(units_from_str("revoke"), Prop::data(revoke));
                 Ok(Value::Obj(result))
             }
             _ => Err(Abrupt::Fatal(format!("proxy dispatch: {b:?}"))),
@@ -1198,10 +1180,7 @@ impl Interp {
                 let cur = self.mop_get_own_property(pid, k)?;
                 let desc = if cur.is_some_and(|c| !c.is_data()) {
                     // Accessor: only clear configurable.
-                    PropDesc {
-                        configurable: Some(false),
-                        ..PropDesc::default()
-                    }
+                    PropDesc { configurable: Some(false), ..PropDesc::default() }
                 } else {
                     PropDesc {
                         configurable: Some(false),
@@ -1215,10 +1194,7 @@ impl Interp {
             }
         } else {
             for k in &keys {
-                let desc = PropDesc {
-                    configurable: Some(false),
-                    ..PropDesc::default()
-                };
+                let desc = PropDesc { configurable: Some(false), ..PropDesc::default() };
                 if !self.mop_define_own(pid, k, &desc)? {
                     return Ok(false);
                 }
@@ -1230,7 +1206,10 @@ impl Interp {
     /// EnumerableOwnPropertyNames(proxy, key) filtered to STRING keys whose
     /// own descriptor (via the getOwnPropertyDescriptor trap) is enumerable —
     /// the Object.keys surface of a proxy.
-    pub(crate) fn proxy_enumerable_string_keys(&mut self, pid: ObjId) -> Result<Vec<Units>, Abrupt> {
+    pub(crate) fn proxy_enumerable_string_keys(
+        &mut self,
+        pid: ObjId,
+    ) -> Result<Vec<Units>, Abrupt> {
         let keys = self.proxy_own_keys(pid)?;
         let mut out = Vec::new();
         for k in keys {
@@ -1246,7 +1225,11 @@ impl Interp {
     }
 
     /// TestIntegrityLevel over a proxy receiver (Object.isFrozen/isSealed).
-    pub(crate) fn proxy_test_integrity(&mut self, pid: ObjId, frozen: bool) -> Result<bool, Abrupt> {
+    pub(crate) fn proxy_test_integrity(
+        &mut self,
+        pid: ObjId,
+        frozen: bool,
+    ) -> Result<bool, Abrupt> {
         if self.mop_is_extensible(pid)? {
             return Ok(false);
         }
@@ -1270,10 +1253,7 @@ impl Interp {
 fn complete_prop_from_desc(d: &PropDesc) -> Prop {
     if d.is_accessor() {
         Prop {
-            val: PropVal::Accessor {
-                get: d.get.flatten(),
-                set: d.set.flatten(),
-            },
+            val: PropVal::Accessor { get: d.get.flatten(), set: d.set.flatten() },
             enumerable: d.enumerable.unwrap_or(false),
             configurable: d.configurable.unwrap_or(false),
             synthetic: false,

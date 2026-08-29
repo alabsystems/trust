@@ -456,10 +456,8 @@ fn test_m4_full_precondition_inference_loop() {
     assert_eq!(report1.summary.total_failed, 1, "Phase 1: should fail");
 
     // --- Phase 2: Strengthen proposes is_sorted precondition ---
-    let output = trust_strengthen::run(
-        &initial_crate,
-        &trust_strengthen::StrengthenConfig::default(),
-    );
+    let output =
+        trust_strengthen::run(&initial_crate, &trust_strengthen::StrengthenConfig::default());
     assert!(output.has_proposals, "Phase 2: should have proposals");
 
     // --- Phase 3: Re-verify with precondition applied ---

@@ -4,9 +4,10 @@
 // explicit admission report binds each entry to its spec, policy, verifier,
 // proof mode, source revision, replay row, and admission decision.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Schema name for release proof/query cache admission reports.
 pub const PROOF_QUERY_CACHE_ADMISSION_SCHEMA: &str = "trust.proof-query-cache-admission.v1";
@@ -352,8 +353,7 @@ impl AdmissionValidator {
             "unbounded" => {
                 // Statistics counter: saturate, same rationale as
                 // `bounded_entries` above.
-                self.metrics.unbounded_entries =
-                    self.metrics.unbounded_entries.saturating_add(1);
+                self.metrics.unbounded_entries = self.metrics.unbounded_entries.saturating_add(1);
             }
             other => self.errors.push(format!(
                 "entries[{index}].boundedness.kind must be bounded or unbounded, got {other:?}"
@@ -681,10 +681,8 @@ mod tests {
         let mut validator = AdmissionValidator::default();
         validator.metrics.verifier_hash_missing = usize::MAX;
 
-        validator.validate_verifier(
-            0,
-            Some(&json!({"identity": "trustc", "version": "1.96.0-trust"})),
-        );
+        validator
+            .validate_verifier(0, Some(&json!({"identity": "trustc", "version": "1.96.0-trust"})));
 
         assert_eq!(validator.metrics.verifier_hash_missing, usize::MAX);
         // Saturating the counter must not mask the independent fail-closed

@@ -71,15 +71,14 @@ use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch}
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_cg_lower::instructions::Opcode as LirOpcode;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::interpret::{InterpretValue, Interpreter};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FieldDef, FuncTy, StructDef, StructRepr, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, StructId, ValueId};
 use trust_ir::{Block, Constant, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build the struct-in-memory Module for the whole-aggregate round-trip shape the
@@ -389,7 +388,11 @@ fn count_single_ldr_str(code: &[u8], base: u64) -> (usize, usize) {
         if let Ok(insn) = decode_aarch64(&bytes, pc) {
             match insn.opcode {
                 Opcode::Str | Opcode::Strb | Opcode::Strh => strs += 1,
-                Opcode::Ldr | Opcode::Ldrb | Opcode::Ldrh | Opcode::Ldrsb | Opcode::Ldrsh
+                Opcode::Ldr
+                | Opcode::Ldrb
+                | Opcode::Ldrh
+                | Opcode::Ldrsb
+                | Opcode::Ldrsh
                 | Opcode::Ldrsw => ldrs += 1,
                 _ => {}
             }
@@ -451,7 +454,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort in machine output for {name}: {other:?}"),
     }
@@ -524,9 +528,7 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
             let v = formula_to_term(solver, val);
             solver.try_store(a, i, v).expect("store")
         }
-        other => panic!(
-            "formula_to_term: unhandled Formula variant in machine output: {other:?}"
-        ),
+        other => panic!("formula_to_term: unhandled Formula variant in machine output: {other:?}"),
     }
 }
 
@@ -619,8 +621,7 @@ fn interpret_struct_gep_fill(module: &Module, args_i: &[i128]) -> i128 {
 fn struct_2field_emits_slot_with_field_stores_and_loads() {
     let field_tys = [Ty::I32, Ty::I32];
     let module = make_struct_sum_module(&field_tys);
-    let lir =
-        lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("lower struct");
+    let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("lower struct");
 
     assert_eq!(lir.stack_slots.len(), 1, "expected exactly one aggregate stack slot");
     assert_eq!(lir.stack_slots[0].size, 8, "2-field i32 struct C-layout size is 8 bytes");
@@ -660,8 +661,8 @@ fn struct_2field_emits_slot_with_field_stores_and_loads() {
 fn struct_3field_emits_slot_with_three_field_stores_and_loads() {
     let field_tys = [Ty::I32, Ty::I32, Ty::I32];
     let module = make_struct_sum_module(&field_tys);
-    let lir =
-        lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("lower 3-field struct");
+    let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
+        .expect("lower 3-field struct");
 
     assert_eq!(lir.stack_slots.len(), 1, "one aggregate slot");
     assert_eq!(lir.stack_slots[0].size, 12, "3-field i32 struct C-layout size is 12 bytes");

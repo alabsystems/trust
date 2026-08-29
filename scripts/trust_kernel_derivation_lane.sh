@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # trust_kernel_derivation_lane.sh — the Clean-kernel re-derivation SLOW LANE.
 #
-# `crates/trust-certify` carries 88 `#[ignore]`d tests that each build a whole
+# `crates/trust-certify` carries dozens of `#[ignore]`d tests that each build a whole
 # `clean_verify::spec::Specification`, FULLY kernel-type-check it, then
 # re-derive and kernel-check a proof term — plus the tamper/relineage twins that
 # prove the re-check is discriminating. They are the strongest evidence in the
 # repo that the Certified tier is real (the SMT solver is outside the trusted
 # base; the CIC kernel re-checks), and they are the most expensive tests here by
-# two orders of magnitude.
+# two orders of magnitude. (The exact set is enumerated at run time from the test
+# binary, not listed here — `--list` prints it. A hard-coded count in this header
+# said 88 while the tree held 93, which is what a number in a steering comment
+# does.)
 #
 # Measured 2026-07-24 on this host (release, one test per process):
 #
@@ -28,6 +31,20 @@
 # asserts a structural property costs microseconds. Nineteen such tests carried
 # the same blanket `#[ignore]` and so ran nowhere at all; they are inline again.
 # Before adding `#[ignore]` to anything, measure it.
+#
+# THE MIDDLE RUNG — `scripts/trust_control_canary.sh` (~210 s of test). Between
+# "microseconds, inline" and "hours, overnight" sits one question that must not
+# wait for an overnight run: are the anti-masquerade controls the `is_whnf` mint
+# is GATED on still DEMONSTRABLE, so a certificate still issues at all? Control 3
+# pinned a positionally generated reflected-env constant, that constant drifted,
+# and every `is_whnf` certificate was withheld from July until 2026-08-23 with
+# nothing reporting it — every test on the path was ignored into THIS lane, which
+# is exactly as often as this lane runs. The canary pays one `Specification::new()`
+# (99.5% of its cost) and answers that one question. It is not a substitute for
+# the derivations below: it never re-checks a serialized certificate through an
+# independently rebuilt spec and never exercises tamper/relineage rejection. This
+# lane also selects it, since it is `#[ignore]`d in the same crate.
+# Write-up: reports/2026-08-23-is-whnf-mint-blocked-by-control-3.md.
 #
 # RELEASE is not an optimization here. The kernel derivations are compute-bound;
 # a debug build makes the same lane multiples longer, which is the difference

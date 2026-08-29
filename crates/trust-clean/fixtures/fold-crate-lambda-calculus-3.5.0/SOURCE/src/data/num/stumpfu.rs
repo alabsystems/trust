@@ -66,11 +66,7 @@ pub fn one() -> Term {
 /// assert_eq!(beta(app(succ(), 1.into_stumpfu()), NOR, 0), 2.into_stumpfu());
 /// ```
 pub fn succ() -> Term {
-    abs(app!(
-        Var(1),
-        abs!(4, app!(Var(2), app(church::succ(), Var(4)), Var(5))),
-        one()
-    ))
+    abs(app!(Var(1), abs!(4, app!(Var(2), app(church::succ(), Var(4)), Var(5))), one()))
 }
 
 /// Applied to a Stump-Fu-encoded number it produces its predecessor.
@@ -102,10 +98,7 @@ pub fn pred() -> Term {
 /// assert_eq!(beta(app!(add(), 2.into_stumpfu(), 3.into_stumpfu()), NOR, 0), 5.into_stumpfu());
 /// ```
 pub fn add() -> Term {
-    abs!(
-        2,
-        app!(Var(2), abs!(2, app!(Var(2), succ(), Var(3))), Var(1))
-    )
+    abs!(2, app!(Var(2), abs!(2, app!(Var(2), succ(), Var(3))), Var(1)))
 }
 
 /// Applied to two Stump-Fu-encoded numbers it produces their product.
@@ -121,14 +114,7 @@ pub fn add() -> Term {
 /// assert_eq!(beta(app!(mul(), 2.into_stumpfu(), 3.into_stumpfu()), NOR, 0), 6.into_stumpfu());
 /// ```
 pub fn mul() -> Term {
-    abs!(
-        2,
-        app!(
-            Var(2),
-            abs!(2, app!(Var(2), abs(app!(add(), Var(4), Var(1))), zero())),
-            zero()
-        )
-    )
+    abs!(2, app!(Var(2), abs!(2, app!(Var(2), abs(app!(add(), Var(4), Var(1))), zero())), zero()))
 }
 
 /// Applied to a Stump-Fu-encoded number it produces the equivalent Church-encoded number.
@@ -163,10 +149,7 @@ pub fn to_church() -> Term {
 /// assert_eq!(beta(app(to_scott(), 4.into_stumpfu()), NOR, 0), 4.into_scott());
 /// ```
 pub fn to_scott() -> Term {
-    abs(app(
-        abs(app!(Var(1), scott::succ(), scott::zero())),
-        app!(Var(1), tru(), Var(1)),
-    ))
+    abs(app(abs(app!(Var(1), scott::succ(), scott::zero())), app!(Var(1), tru(), Var(1))))
 }
 
 /// Applied to a Stump-Fu-encoded number it produces the equivalent Parigot-encoded number.
@@ -184,8 +167,5 @@ pub fn to_scott() -> Term {
 /// assert_eq!(beta(app(to_parigot(), 4.into_stumpfu()), NOR, 0), 4.into_parigot());
 /// ```
 pub fn to_parigot() -> Term {
-    abs(app(
-        abs(app!(Var(1), parigot::succ(), parigot::zero())),
-        app!(Var(1), tru(), Var(1)),
-    ))
+    abs(app(abs(app!(Var(1), parigot::succ(), parigot::zero())), app!(Var(1), tru(), Var(1))))
 }

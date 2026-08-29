@@ -62,18 +62,14 @@ fn selects(ty: Ty, n: u32) -> TrustIrGateSource {
         let arm = BlockId::new(500 + i);
         let mut arm_blk = Block::new(arm);
         arm_blk.body = vec![
-            InstrNode::new(Inst::Const {
-                ty: ty.clone(),
-                value: Constant::Int(i128::from(i) + 1),
-            })
-            .with_results(vec![res]),
+            InstrNode::new(Inst::Const { ty: ty.clone(), value: Constant::Int(i128::from(i) + 1) })
+                .with_results(vec![res]),
             InstrNode::new(Inst::Br { target: join, args: vec![res] }),
         ];
         blocks.push(arm_blk);
 
         // The test block.
-        let next_test =
-            if i + 1 == n { BlockId::new(900) } else { BlockId::new(next_blk) };
+        let next_test = if i + 1 == n { BlockId::new(900) } else { BlockId::new(next_blk) };
         let mut blk = Block::new(this);
         if i == 0 {
             blk.params.push((param, ty.clone()));
@@ -84,13 +80,8 @@ fn selects(ty: Ty, n: u32) -> TrustIrGateSource {
                 value: Constant::Int(i128::from(i) * 10 + 10),
             })
             .with_results(vec![key]),
-            InstrNode::new(Inst::ICmp {
-                op: ICmpOp::Eq,
-                ty: ty.clone(),
-                lhs: param,
-                rhs: key,
-            })
-            .with_results(vec![cmp]),
+            InstrNode::new(Inst::ICmp { op: ICmpOp::Eq, ty: ty.clone(), lhs: param, rhs: key })
+                .with_results(vec![cmp]),
             InstrNode::new(Inst::CondBr {
                 cond: cmp,
                 then_target: arm,
@@ -148,9 +139,8 @@ fn main() {
 
         // SPEC SIDE ALONE — the producer's trust-ir semantics, no bytes involved.
         let t = std::time::Instant::now();
-        match trust_cg_bridge::verify_output_trust_ir::trust_ir_function_semantics(
-            &module, func_id,
-        ) {
+        match trust_cg_bridge::verify_output_trust_ir::trust_ir_function_semantics(&module, func_id)
+        {
             Ok(spec) => println!(
                 "== SPEC-ONLY ok in {:?}  out_width={}  value_chars={}  reach={:?}  side_conds={}",
                 t.elapsed(),

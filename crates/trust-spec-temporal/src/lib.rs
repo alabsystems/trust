@@ -228,7 +228,11 @@ pub use r5_parity::{
     R5_TEMPORAL_MACRO_RETIREMENT_ALLOWED, R5_TEMPORAL_PARITY_BLOCKERS,
     R5_TEMPORAL_PARITY_REPORT_SCHEMA_V1, R5_TEMPORAL_PARITY_REPORT_SCHEMA_V2,
     R5_TEMPORAL_RETIREMENT_BLOCKERS, R5TemporalParityBlocker, R5TemporalParityReport,
-    R5TemporalParityReportValidationError, R5TemporalParityStatus, r5_temporal_parity_report,
+    R5TemporalParityReportValidationError, R5TemporalParityStatus,
+    TEMPORAL_AUTOMATIC_INTEGRATION_BLOCKERS, TEMPORAL_AUTOMATIC_INTEGRATION_READY,
+    TEMPORAL_AUTOMATIC_INTEGRATION_REPORT_SCHEMA_V1, TemporalAutomaticIntegrationReport,
+    TemporalAutomaticIntegrationReportValidationError, r5_temporal_parity_report,
+    temporal_automatic_integration_report,
 };
 /// A value in the model's (bounded-integer / boolean) semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

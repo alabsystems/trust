@@ -1,20 +1,16 @@
-// trust-ir-bridge: body-bound trust-wp claim construction (task #23, Slice 1).
+// trust-ir-bridge: historical body-bound trust-wp envelope inspection.
 //
 // Blueprint of record: docs/design-notes/2026-07-17-trust-wp-lowering-blueprint.md.
 //
-// An uncited `ensures` postcondition (e.g. `fn ge_refl(x: u64) -> u64
-// ensures result >= x { x }`) reaches the trust-wp deductive lane as a typed
-// `trust.spec-predicate.v1` predicate, but the lane fails closed because no
-// one lowers the contract into the sibling verifier's
-// `trust-wp.trust-formula.v1` claim envelope. This module builds that
-// envelope BODY-BOUND: `result` is let-bound to the function's exact defining
-// expression (recovered from the trust-ir SSA body by a fail-closed walker),
-// so the sibling's pure-expr replay proves the postcondition of THIS body,
-// not a free-variable abstraction of it.
+// This module retains the former body-bound `trust-wp.trust-formula.v1`
+// envelope builder so historical rows can be decoded and checked precisely.
+// `result` is let-bound to the function's exact defining expression, recovered
+// from the trust-ir SSA body by a fail-closed walker. No production compiler or
+// full-verifier caller routes through this helper, and an envelope it constructs
+// grants no proof or publication authority.
 //
 // v1 fragment (deliberately narrow, every exclusion fails CLOSED to the
-// existing Unsupported path — the fail-closed enumeration is in the
-// blueprint):
+// historical inspection path — the fail-closed enumeration is in the blueprint):
 //   * defining expression: the returned value must resolve, through `Copy`
 //     chains inside a SINGLE entry block, to an entry-block parameter or an
 //     i64-representable integer / bool constant. Anything else — arithmetic,
@@ -37,7 +33,7 @@ use trust_verifier_api::{
     TrustSpecBinaryOp, TrustSpecExpr, TrustSpecExprKind, TrustSpecPredicate, TrustSpecUnaryOp,
 };
 
-/// Schema string the sibling's decoder validates (pinned by
+/// Historical schema string the sibling decoder validates (pinned by
 /// first-party/trust-wp/crates/trust-wp-lib/tests/trust_ir_native_bundle.rs —
 /// note the HYPHENATED `trust-wp`, not `trust_wp`).
 pub const TRUST_WP_TRUST_FORMULA_SCHEMA: &str = "trust-wp.trust-formula.v1";
@@ -57,8 +53,8 @@ pub enum DefiningExpr {
     BoolConst(bool),
 }
 
-/// Why a claim could not be body-bound. Every variant is a fail-closed refusal
-/// — the obligation keeps today's Unsupported path.
+/// Why a historical claim could not be body-bound. Every variant is a
+/// fail-closed inspection refusal and grants no authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustWpClaimError {
     MissingFunction,
@@ -303,7 +299,10 @@ pub struct ClaimVariable {
     pub sort: &'static str,
 }
 
-/// Build the body-bound `trust-wp.trust-formula.v1` envelope.
+/// Build a historical body-bound `trust-wp.trust-formula.v1` envelope.
+///
+/// This compatibility constructor is not called by the compiler/full verifier,
+/// and successful construction is not proof or publication authority.
 ///
 /// Inputs are the ALREADY-VALIDATED pieces the finalize seam assembled:
 /// * `variables` — the ensures predicate's spec variables (each cross-checked
@@ -427,7 +426,7 @@ fn check_vars_bound(
 }
 
 /// Validate and translate one canonical `trust.spec-predicate.v1` predicate
-/// into the sibling's expression JSON, enforcing the v1 fragment.
+/// into historical sibling expression JSON, enforcing the v1 fragment.
 ///
 /// Accepted: BoolLiteral, IntLiteral (i64-parsable), Variable, Result,
 /// Unary Not, Binary {Eq, Ne, Lt, Le, Gt, Ge, And, Or, Implies}.

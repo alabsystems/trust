@@ -7,13 +7,12 @@
 // Decodes the most common x86-64 instructions from raw bytes.
 // Variable-length encoding: 1-15 bytes per instruction.
 
+use super::modrm::{ModRM, decode_rm_operand, gpr, gpr_sized, gpr8};
+use super::prefix::Prefixes;
 use crate::error::DisasmError;
 use crate::instruction::{ControlFlow, Instruction};
 use crate::opcode::Opcode;
 use crate::operand::{Condition, MemoryOperand, Operand};
-
-use super::modrm::{ModRM, decode_rm_operand, gpr, gpr8, gpr_sized};
-use super::prefix::Prefixes;
 
 /// Decode one x86-64 instruction from `bytes` at the given virtual address.
 pub(crate) fn decode_instruction(bytes: &[u8], addr: u64) -> Result<Instruction, DisasmError> {
@@ -104,8 +103,8 @@ pub(crate) fn decode_instruction(bytes: &[u8], addr: u64) -> Result<Instruction,
     // (rep pop), `f2 5c` (repne pop) and kin were accepted and #UD'd.
     if let Some(p1) = prefixes.legacy.group1 {
         let is_rep = p1 == 0xF2 || p1 == 0xF3;
-        let legal_scalar_rep = p1 == 0xF3
-            && matches!(instruction.opcode, Opcode::Nop | Opcode::Endbr64);
+        let legal_scalar_rep =
+            p1 == 0xF3 && matches!(instruction.opcode, Opcode::Nop | Opcode::Endbr64);
         if is_rep && !legal_scalar_rep {
             return Err(DisasmError::UnknownEncoding { encoding: u32::from(p1), address: addr });
         }
@@ -956,7 +955,7 @@ fn decode_group3(
             let total = offset + imm_off + imm_size;
             let enc = if is_8bit { 0xF6u32 } else { 0xF7 };
             let mut insn = make_insn(addr, total, enc, Opcode::Test, ControlFlow::Fallthrough);
-        insn.operand_size = Some(op_width as u8);
+            insn.operand_size = Some(op_width as u8);
             insn.push_operand(rm_result.operand);
             insn.push_operand(Operand::SignedImm(imm));
             Ok(insn)
@@ -1310,11 +1309,7 @@ fn insufficient(needed: usize, available: usize) -> DisasmError {
 /// decoded as a 64-bit push of RAX. Found by the x86-64 decode differential.
 /// REX.W is irrelevant here: 64 is already the default.
 fn push_pop_width(prefixes: &Prefixes) -> u16 {
-    if prefixes.legacy.operand_size {
-        16
-    } else {
-        64
-    }
+    if prefixes.legacy.operand_size { 16 } else { 64 }
 }
 
 fn unknown_enc(addr: u64, opcode: u8) -> DisasmError {

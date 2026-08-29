@@ -7,10 +7,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::FxHashMap;
-
 use serde::{Deserialize, Serialize};
 
+use crate::fx::FxHashMap;
 use crate::model::SourceSpan;
 
 /// Classification of a code region's trust level.

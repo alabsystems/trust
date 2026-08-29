@@ -591,10 +591,9 @@ pub(crate) fn local_ty(func: &VerifiableFunction, local: usize) -> Option<&Ty> {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         AggregateKind, BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue,
-        SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        SourceSpan, Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
     };
 
     use super::*;
@@ -724,6 +723,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "mirror".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -1004,7 +1004,10 @@ mod tests {
 
         let mut f = markers_everywhere(extracted_mirror_func(identity_post()));
         assert!(
-            f.body.locals.iter().all(|l| !matches!(&l.ty, Ty::Datatype { variants, .. } if !variants.is_empty())),
+            f.body
+                .locals
+                .iter()
+                .all(|l| !matches!(&l.ty, Ty::Datatype { variants, .. } if !variants.is_empty())),
             "the fixture really is markers-everywhere",
         );
 

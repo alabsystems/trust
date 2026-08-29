@@ -17,12 +17,11 @@
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
 use std::time::{Duration, Instant};
-use trust_types::fx::FxHashMap;
 
 use trust_cache::result_cache::CachePolicy;
 use trust_router::Router;
 use trust_router::solver_cache::SolverCachedRouter;
-use trust_types::fx::FxHashSet;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, Contract, ContractKind, Formula, LocalDecl, Operand,
     Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,
@@ -424,14 +423,26 @@ impl BenchmarkWorkload {
             let prefix = format!("b{batch}");
 
             // Overflow: different integer widths
-            push(&mut functions, &mut salt,
-                make_overflow_function(&format!("{prefix}_add_u8"), Ty::u8(), 8));
-            push(&mut functions, &mut salt,
-                make_overflow_function(&format!("{prefix}_add_u16"), Ty::u16(), 16));
-            push(&mut functions, &mut salt,
-                make_overflow_function(&format!("{prefix}_add_u32"), Ty::u32(), 32));
-            push(&mut functions, &mut salt,
-                make_overflow_function(&format!("{prefix}_add_u64"), Ty::usize(), 64));
+            push(
+                &mut functions,
+                &mut salt,
+                make_overflow_function(&format!("{prefix}_add_u8"), Ty::u8(), 8),
+            );
+            push(
+                &mut functions,
+                &mut salt,
+                make_overflow_function(&format!("{prefix}_add_u16"), Ty::u16(), 16),
+            );
+            push(
+                &mut functions,
+                &mut salt,
+                make_overflow_function(&format!("{prefix}_add_u32"), Ty::u32(), 32),
+            );
+            push(
+                &mut functions,
+                &mut salt,
+                make_overflow_function(&format!("{prefix}_add_u64"), Ty::usize(), 64),
+            );
 
             // Division and remainder
             push(&mut functions, &mut salt, make_division_function(&format!("{prefix}_div")));

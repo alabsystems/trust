@@ -471,11 +471,104 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-end
 ];
 
+/// Trust: entries of upstream's `PERMITTED_RUSTC_DEPENDENCIES` that Trust's own
+/// resolution no longer reaches, listed here instead of being deleted from the
+/// upstream array.
+///
+/// Deleting from `PERMITTED_RUSTC_DEPENDENCIES` would edit a merge-hot upstream
+/// list — a conflict on every sync, forever, over a divergence that is entirely
+/// ours. Listing the retirement here keeps upstream's array byte-identical and
+/// makes the divergence reviewable: one row, one reason, and it fails closed
+/// (see the re-introduction check in `check_permitted_dependencies`).
+///
+/// MEASURED 2026-08-22, and the measurement matters because the previously
+/// recorded reason for this whole lane was wrong. `docs/audits/2026-08-21-tidy-
+/// debt-ledger.md` held that the missing entries were platform-specific — absent
+/// from a macOS resolution, present on Windows/wasm hosts — and that pruning was
+/// therefore a trap. A `Cargo.lock` is host-independent, and this one proves it:
+/// `windows-sys`, `windows-core`, `windows-link`, `windows-result`,
+/// `windows-strings` and two `wasi` versions are all present in the root lock as
+/// resolved on macOS. The real mechanism is a version move — `windows-sys
+/// 0.61.2` depends on `windows-link`, not on the `windows-targets` +
+/// `windows_*_{msvc,gnu,gnullvm}` family it used to — and `blake3 1.8.7` dropped
+/// `arrayref` in favour of `arrayvec`. Those crates are gone from the graph, on
+/// every host, and the allowlist rows for them were dead.
+///
+/// The `windows_*`, `wasip2`/`wasip3`, `wit-bindgen*` and `prettyplease` rows
+/// removed at the same time were in `TRUST_PERMITTED_RUSTC_DEPENDENCIES` below —
+/// Trust-owned, so deleting them costs no merge tax. `wasip2`/`wasip3`/
+/// `wit-bindgen` remain correctly listed in `PERMITTED_STDLIB_DEPENDENCIES`,
+/// which is where the `library` workspace actually reaches them.
+#[rustfmt::skip]
+const TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES: &[&str] = &[
+    // tidy-alphabetical-start
+    "arrayref",   // blake3 1.8.7 replaced it with arrayvec
+    // tidy-alphabetical-end
+];
+
+/// Trust: the mirror image of the list above — crates the rustc graph reaches
+/// that upstream's list does not yet name, because Trust's lock is AHEAD of the
+/// merge base rather than behind it.
+///
+/// These are not Trust dependencies. Every row is an upstream crate that split
+/// or gained an optional feature in a version newer than the one upstream's
+/// allowlist was written against, so it is kept out of
+/// `TRUST_PERMITTED_RUSTC_DEPENDENCIES` — that list's whole point is that
+/// verifier-stack drift is auditable on its own, and mixing upstream drift into
+/// it would destroy exactly that.
+///
+/// Each row carries the edge that introduces it, traced 2026-08-22 through
+/// `cargo metadata --all-features` (which is the configuration tidy itself
+/// resolves, so an optional feature that upstream never activates still counts
+/// here). When a merge brings upstream's own list forward past these, the rows
+/// become duplicates and should be deleted, not left to accumulate.
+#[rustfmt::skip]
+const TRUST_UPSTREAM_DRIFT_RUSTC_DEPENDENCIES: &[&str] = &[
+    // tidy-alphabetical-start
+    "defmt",                     // rustc_driver_impl <- jiff <- jiff-static <- jiff-core <- defmt
+    "defmt-macros",              //   "  <- defmt <- defmt-macros
+    "defmt-parser",              //   "  <- defmt-macros <- defmt-parser
+    "icu_locale_fallback",       // rustc_error_messages <- icu_locale <- icu_locale_fallback
+    "icu_locale_fallback_data",  //   "  <- icu_locale_fallback <- icu_locale_fallback_data
+    "jiff-core",                 // rustc_driver_impl <- jiff <- jiff-static <- jiff-core
+    // tidy-alphabetical-end
+];
+
 /// Additional crates pulled into rustc by Trust's default native verifier stack.
 ///
 /// Keep this separate from `PERMITTED_RUSTC_DEPENDENCIES` so upstream Rust
 /// dependency drift and Trust-introduced verifier dependency drift are audited
 /// independently.
+///
+// Trust: THIS LIST IS DEP-KIND-BLIND, AND THAT IS WHY THE `ed25519` ROWS ARE STILL HERE.
+//
+// `check_permitted_dependencies` walks `metadata.resolve.nodes[].deps` via `deps_of`
+// without inspecting `dep_kinds`, so a package reachable from `rustc-main` through a
+// *dev*-dependency is indistinguishable here from one the compiler actually links.
+// `proptest` is the long-standing example; the `ed25519` family is the new one.
+//
+// Phase 1d moved `trust-proof-cert` off crates.io `ed25519-dalek` onto the Trust-owned
+// `trust-ed25519` (a `package = ` rename in both workspace manifests). Measured on the
+// resolve graph after that change, `ed25519-dalek 2.2.0` and its closure are reachable
+// from `rustc-main` by exactly one path, and every edge in its tail is dev:
+//
+//     rustc_mir_transform -> trust-router -[dev]-> trust-proof-cert
+//                                         -> trust-ed25519 -[dev]-> ed25519-dalek -> ...
+//
+// That dev-dependency is the differential acceptance gate
+// (`crates/trust-ed25519/tests/differential_ed25519.rs`), which compares the Trust
+// implementation against the incumbent and must keep naming it by explicit version.
+//
+// So: DO NOT DELETE these six as "retired by phase 1d". Measured — removing
+// curve25519-dalek, curve25519-dalek-derive, der, ed25519, ed25519-dalek and
+// fiat-crypto produces six *new* `Dependency for rustc-main not explicitly permitted`
+// errors, because the deleted names are still in the kind-blind closure. (`der` is
+// doubly wrong to remove: it arrives via `pkcs8`/`spki`, not directly.)
+//
+// They may be deleted only when the differential gate no longer dev-depends on the
+// incumbent — i.e. when the incumbent leaves the tree entirely — or if `deps_of` is
+// first taught to filter `dep_kinds`, which is a change to a shared upstream check
+// with a far wider blast radius than this list.
 #[rustfmt::skip]
 const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-start
@@ -505,12 +598,12 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "const-oid",
     "crossbeam-channel",
     "crossbeam-queue",
-    "curve25519-dalek",
-    "curve25519-dalek-derive",
-    "der",
-    "ed25519",
-    "ed25519-dalek",
-    "fiat-crypto",
+    "curve25519-dalek",       // Trust: dev-only after phase 1d: kept because deps_of ignores dep_kinds (see note above)
+    "curve25519-dalek-derive",// Trust: dev-only after phase 1d: kept because deps_of ignores dep_kinds (see note above)
+    "der",                    // Trust: dev-only after phase 1d: kept because deps_of ignores dep_kinds (see note above); arrives via pkcs8/spki
+    "ed25519",                // Trust: dev-only after phase 1d: kept because deps_of ignores dep_kinds (see note above)
+    "ed25519-dalek",          // Trust: dev-only after phase 1d: kept because deps_of ignores dep_kinds (see note above)
+    "fiat-crypto",            // Trust: dev-only after phase 1d: kept because deps_of ignores dep_kinds (see note above)
     "fixedbitset",
     "fs2",
     "gmp-mpfr-sys",
@@ -519,9 +612,7 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "home",
     "httparse",
     "hybrid-array",
-    "id-arena",
     "inventory",
-    "leb128fmt",
     "libm",
     "logos",
     "logos-codegen",
@@ -548,7 +639,6 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "percent-encoding",
     "pkcs8",
     "pkg-config",
-    "prettyplease",
     "proc-macro-crate",
     "proptest",
     "quick-error",
@@ -557,6 +647,7 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "rmp",
     "rmp-serde",
     "rug",
+    "rustc-std-workspace-core",
     "rustdoc-json-stable",
     "rustdoc-types",
     "rustversion",
@@ -564,6 +655,8 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "semver",
     "serde_spanned",
     "sha1-checked",
+    "sha2-asm",
+    "signal-hook",
     "signal-hook-registry",
     "signature",
     "socket2",
@@ -579,33 +672,14 @@ const TRUST_PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "toml_parser",
     "toml_write",
     "unarray",
-    "unicode-xid",
     "unty",
     "utf8_iter",
     "virtue",
     "wait-timeout",
-    "wasip2",
-    "wasip3",
-    "wasm-metadata",
     "winapi",
     "winapi-i686-pc-windows-gnu",
     "winapi-x86_64-pc-windows-gnu",
-    "windows-targets",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
     "winnow",
-    "wit-bindgen",
-    "wit-bindgen-core",
-    "wit-bindgen-rust",
-    "wit-bindgen-rust-macro",
-    "wit-component",
-    "wit-parser",
     "zeroize",
     "zmij",
     "zstd",
@@ -949,30 +1023,69 @@ fn check_permitted_dependencies(
     check: &mut RunningCheck,
 ) {
     let mut has_permitted_dep_error = false;
-    let trust_permitted_dependencies =
-        if descr == "rustc-main" { TRUST_PERMITTED_RUSTC_DEPENDENCIES } else { &[] };
+    // Trust: two additive lists, kept apart on purpose — verifier-stack drift
+    // (ours) and upstream drift ahead of the merge base (not ours).
+    let trust_permitted_dependencies: Vec<&'static str> = if descr == "rustc-main" {
+        TRUST_PERMITTED_RUSTC_DEPENDENCIES
+            .iter()
+            .chain(TRUST_UPSTREAM_DRIFT_RUSTC_DEPENDENCIES.iter())
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut deps = HashSet::new();
     for to_check in restricted_dependency_crates {
         let to_check = pkg_from_name(metadata, to_check);
         deps_of(metadata, &to_check.id, &mut deps);
     }
 
+    fn compare(pkg: &Package, permitted: &str) -> bool {
+        if let Some((name, version)) = permitted.split_once("@") {
+            let Ok(version) = Version::parse(version) else {
+                return false;
+            };
+            *pkg.name == name && pkg.version == version
+        } else {
+            *pkg.name == permitted
+        }
+    }
+    // Trust: entries upstream still lists that Trust's own resolution has moved
+    // past. See `TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES` for why this is a
+    // separate list rather than a deletion from the upstream array.
+    let trust_retired = if descr == "rustc-main" {
+        TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES
+    } else {
+        &[] as &[&'static str]
+    };
+
     // Check that the PERMITTED_DEPENDENCIES does not have unused entries.
     for permitted in permitted_dependencies.iter().chain(trust_permitted_dependencies.iter()) {
-        fn compare(pkg: &Package, permitted: &str) -> bool {
-            if let Some((name, version)) = permitted.split_once("@") {
-                let Ok(version) = Version::parse(version) else {
-                    return false;
-                };
-                *pkg.name == name && pkg.version == version
-            } else {
-                *pkg.name == permitted
-            }
-        }
         if !deps.iter().any(|dep_id| compare(pkg_from_id(metadata, dep_id), permitted)) {
+            // Trust: a retired entry is EXPECTED to be absent, so it is not an
+            // error — but it is still reported below if it comes back, so a
+            // retirement can never quietly outlive its reason.
+            if trust_retired.contains(permitted) {
+                continue;
+            }
             check.error(format!(
                 "could not find allowed package `{permitted}`\n\
                 Remove from PERMITTED_DEPENDENCIES list if it is no longer used.",
+            ));
+            has_permitted_dep_error = true;
+        }
+    }
+
+    // Trust: the retirement list is itself gated. If a retired dependency is
+    // back in the graph, the upstream row is live again and the retirement is
+    // stale — that must fail, exactly as an expired pin waiver does, or the
+    // list becomes a place where a real re-introduced dependency hides.
+    for retired in trust_retired {
+        if deps.iter().any(|dep_id| compare(pkg_from_id(metadata, dep_id), retired)) {
+            check.error(format!(
+                "`{retired}` is in the dependency graph again, but it is still listed in \
+                 TRUST_RETIRED_UPSTREAM_RUSTC_DEPENDENCIES.\n\
+                Delete that row: upstream's PERMITTED_RUSTC_DEPENDENCIES entry covers it once more.",
             ));
             has_permitted_dep_error = true;
         }

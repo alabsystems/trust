@@ -332,6 +332,17 @@ fn terminator_is_valid(
             certified_callees.contains(callee.as_str())
                 || callee.starts_with(crate::TRUST_RUSTC_INTRINSIC_PATH_PREFIX)
         }
+        Terminator::TailCall { func: callee, atomic, is_foreign, is_unsafe_sig, .. } => {
+            // No destination/continuation exists to validate for a tail call.
+            // Its facets are inherited only from the exact certified callee
+            // (the least fixpoint still rejects recursive cycles), or from the
+            // closed compiler-intrinsic namespace.
+            atomic.is_none()
+                && !is_foreign
+                && !is_unsafe_sig
+                && (certified_callees.contains(callee.as_str())
+                    || callee.starts_with(crate::TRUST_RUSTC_INTRINSIC_PATH_PREFIX))
+        }
         Terminator::Drop { .. }
         | Terminator::Opaque { .. }
         | Terminator::Unreachable
@@ -420,22 +431,21 @@ pub fn infer_facets(functions: &[VerifiableFunction]) -> HashMap<String, FacetSe
     // A callee must satisfy ALL FOUR facets to be usable, not merely be
     // "valid": a caller inherits its callee's behaviour, so a callee that can
     // panic makes the caller panicking too.
-    let facets_of = |func: &VerifiableFunction,
-                     certified: &std::collections::BTreeSet<String>|
-     -> FacetSet {
-        let unique = occurrences.get(func.def_path.as_str()) == Some(&1);
-        if unique && is_valid_closed_leaf(func, certified) {
-            FacetSet {
-                total: is_control_flow_loop_free(func),
-                no_panic: !has_undischarged_panic_operation(func)
-                    && is_structurally_panic_free(func),
-                pure: is_structurally_pure(func),
-                deterministic: is_structurally_deterministic(func),
+    let facets_of =
+        |func: &VerifiableFunction, certified: &std::collections::BTreeSet<String>| -> FacetSet {
+            let unique = occurrences.get(func.def_path.as_str()) == Some(&1);
+            if unique && is_valid_closed_leaf(func, certified) {
+                FacetSet {
+                    total: is_control_flow_loop_free(func),
+                    no_panic: !has_undischarged_panic_operation(func)
+                        && is_structurally_panic_free(func),
+                    pure: is_structurally_pure(func),
+                    deterministic: is_structurally_deterministic(func),
+                }
+            } else {
+                FacetSet::default()
             }
-        } else {
-            FacetSet::default()
-        }
-    };
+        };
 
     let mut certified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     loop {
@@ -477,7 +487,13 @@ mod tests {
             name: def_path.rsplit("::").next().unwrap_or(def_path).to_string(),
             def_path: def_path.to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count,
+                return_ty,
+                datatype_defs: Default::default(),
+            },
             contracts: Vec::new(),
             preconditions: Vec::new(),
             postconditions: Vec::new(),
@@ -528,6 +544,7 @@ mod tests {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         unwind: UnwindEdge::Unreachable,
                     },
                 },
@@ -553,7 +570,10 @@ mod tests {
     /// — which excluded essentially all real Rust.
     #[test]
     fn a_call_to_a_certified_callee_is_certified() {
-        let facets = infer_facets(&[identity_leaf("crate::leaf"), caller_of("crate::caller", "crate::leaf")]);
+        let facets = infer_facets(&[
+            identity_leaf("crate::leaf"),
+            caller_of("crate::caller", "crate::leaf"),
+        ]);
         let leaf = facets.get("crate::leaf").copied().unwrap_or_default();
         assert!(leaf.pure && leaf.total && leaf.no_panic && leaf.deterministic, "leaf: {leaf:?}");
         let caller = facets.get("crate::caller").copied().unwrap_or_default();
@@ -623,10 +643,8 @@ mod tests {
             "a TyCtxt-confirmed total primitive method must be usable as a callee: {f:?}"
         );
 
-        let bare = infer_facets(&[binary_caller_of(
-            "crate::winc",
-            "core::num::<impl u64>::wrapping_add",
-        )]);
+        let bare =
+            infer_facets(&[binary_caller_of("crate::winc", "core::num::<impl u64>::wrapping_add")]);
         let g = bare.get("crate::winc").copied().unwrap_or_default();
         assert!(
             !(g.pure && g.total && g.no_panic && g.deterministic),
@@ -654,12 +672,8 @@ mod tests {
 
         for mutation in ["wrong-arity", "wrong-width", "foreign", "unsafe"] {
             let mut bad = binary_caller_of("crate::bad_shape", &marked);
-            let Terminator::Call {
-                args,
-                is_foreign,
-                is_unsafe_sig,
-                ..
-            } = &mut bad.body.blocks[0].terminator
+            let Terminator::Call { args, is_foreign, is_unsafe_sig, .. } =
+                &mut bad.body.blocks[0].terminator
             else {
                 unreachable!("binary_caller_of always builds one call")
             };
@@ -740,6 +754,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         }
     }

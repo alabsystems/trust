@@ -1,16 +1,16 @@
 //! Call graph analysis for dependency-aware cross-module rewriting.
 //!
 //! Builds a call graph from `VerifiableFunction` data by inspecting
-//! `Terminator::Call` in each function's MIR blocks. Provides topological
+//! ordinary and tail calls in each function's MIR blocks. Provides topological
 //! ordering (callee-first) so rewrites propagate correctly.
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::VecDeque;
+
 use trust_types::call_graph::{CalleeResolver, resolve_unique_def_path};
 use trust_types::fx::{FxHashMap, FxHashSet};
-
 use trust_types::{Terminator, VerifiableFunction};
 
 /// A call graph mapping function def-paths to the functions they call.
@@ -86,7 +86,7 @@ impl CallGraph {
 
 /// Build a call graph from a slice of `VerifiableFunction`s.
 ///
-/// Inspects `Terminator::Call { func, .. }` in each function's MIR blocks
+/// Inspects ordinary and tail-call terminators in each function's MIR blocks
 /// to discover caller-callee relationships. Only functions present in the
 /// input slice are included as def-path-keyed nodes. External and ambiguous
 /// callees remain unresolved edges and cannot affect internal rewrite order.
@@ -105,7 +105,9 @@ pub fn build_call_graph(functions: &[VerifiableFunction]) -> CallGraph {
         let callees = edges.entry(func.def_path.clone()).or_default();
 
         for block in &func.body.blocks {
-            if let Terminator::Call { func: callee, .. } = &block.terminator {
+            if let Terminator::Call { func: callee, .. }
+            | Terminator::TailCall { func: callee, .. } = &block.terminator
+            {
                 callees.insert(resolver.resolve(callee).unwrap_or(callee).to_owned());
             }
         }
@@ -199,8 +201,9 @@ pub fn topological_order(graph: &CallGraph) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::*;
+
+    use super::*;
 
     /// Helper to make a minimal VerifiableFunction with specified callees.
     fn make_function(name: &str, callees: &[&str]) -> VerifiableFunction {
@@ -218,6 +221,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],
@@ -240,7 +244,13 @@ mod tests {
             name: name.to_string(),
             def_path: def_path.to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals: vec![], blocks, arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals: vec![],
+                blocks,
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -271,6 +281,32 @@ mod tests {
         assert_eq!(graph.len(), 2);
         assert!(graph.callees_or_empty("caller").contains("crate::callee"));
         assert!(graph.callees_or_empty("callee").is_empty());
+    }
+
+    #[test]
+    fn tail_call_orders_the_callee_before_the_caller() {
+        let mut caller = make_function("caller", &["callee"]);
+        let Terminator::Call { func, args, span, atomic, callee_identity, .. } =
+            caller.body.blocks[0].terminator.clone()
+        else {
+            unreachable!();
+        };
+        caller.body.blocks[0].terminator = Terminator::TailCall {
+            func,
+            args,
+            span,
+            atomic,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity,
+        };
+        caller.body.blocks.truncate(1);
+        let graph = build_call_graph(&[caller, make_function("callee", &[])]);
+        assert!(graph.callees_or_empty("caller").contains("crate::callee"));
+        let order = topological_order(&graph);
+        let caller_pos = order.iter().position(|name| name == "crate::caller").unwrap();
+        let callee_pos = order.iter().position(|name| name == "crate::callee").unwrap();
+        assert!(callee_pos < caller_pos);
     }
 
     #[test]

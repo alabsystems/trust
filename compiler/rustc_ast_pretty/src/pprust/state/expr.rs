@@ -514,9 +514,10 @@ impl<'a> State<'a> {
                 self.print_let(pat, scrutinee, fixup);
             }
             ast::ExprKind::If(test, blk, elseopt) => self.print_if(test, blk, elseopt.as_deref()),
-            // Trust: the loop contract (4th field) is span-only verifier
-            // vocabulary; like the fn-contract opaque lane it is not
-            // reproducible from the AST alone, so the pretty printer elides it.
+            // Trust: the loop contract (the `while`/`loop` 4th field) is
+            // span-only verifier vocabulary; like the fn-contract opaque lane
+            // it is not reproducible from the AST alone, so the pretty printer
+            // elides it on both surfaces.  `for` has no contract field.
             ast::ExprKind::While(test, blk, opt_label, _) => {
                 if let Some(label) = opt_label {
                     self.print_ident(label.ident);
@@ -547,7 +548,7 @@ impl<'a> State<'a> {
                 self.space();
                 self.print_block_with_attrs(body, attrs, cb, ib);
             }
-            ast::ExprKind::Loop(blk, opt_label, _) => {
+            ast::ExprKind::Loop(blk, opt_label, _, _) => {
                 let cb = self.cbox(0);
                 let ib = self.ibox(0);
                 if let Some(label) = opt_label {

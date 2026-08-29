@@ -218,7 +218,11 @@ fn test_generated_elf_parse_lift_trust_ir_and_binary_vcs() {
     assert_eq!(lifted.cfg.blocks[0].instructions.len(), 1, "ret should decode as one instruction");
     assert_eq!(lifted.trust_ir_body.locals.len(), LocalLayout::x86_64().total);
     assert!(
-        lifted.trust_ir_body.blocks.iter().any(|block| matches!(block.terminator, Terminator::Return)),
+        lifted
+            .trust_ir_body
+            .blocks
+            .iter()
+            .any(|block| matches!(block.terminator, Terminator::Return)),
         "lifted TrustIr should contain a return terminator"
     );
     assert!(lifted.ssa.is_some(), "lift_function should attach SSA metadata");
@@ -734,8 +738,7 @@ fn assert_target_proof_consumer_evidence_rejected(
     assert_eq!(
         blockers
             .iter()
-            .any(|blocker| blocker["code"]
-                == "symbolic-formula-not-consumed-by-target-semantics"),
+            .any(|blocker| blocker["code"] == "symbolic-formula-not-consumed-by-target-semantics"),
         expects_symbolic_formula,
         "{context}: the unconsumed-symbolic-formula blocker must be present exactly when \
          such a formula survives; got {blockers:?}"
@@ -759,7 +762,10 @@ fn assert_trust_ir_target_proof_consumer_identity_accepted(
     output_content: &str,
     context: &str,
 ) {
-    let expected_output = format!("trust_ir-json:sha256:{}", trust_types::digest::stable_sha256_hex(output_content.as_bytes()));
+    let expected_output = format!(
+        "trust_ir-json:sha256:{}",
+        trust_types::digest::stable_sha256_hex(output_content.as_bytes())
+    );
     let evidence = &json["target_proof_consumer_evidence"];
     let records =
         evidence["records"].as_array().expect("target proof-consumer records should be array");
@@ -1286,12 +1292,13 @@ fn assert_no_proof_grade_trust_fields(value: &serde_json::Value, context: &str) 
                     key.as_str(),
                     "trust_level" | "output_trust_level" | "final_trust_level"
                 ) || key.ends_with("_trust_level"))
-                    && let Some(trust_level) = child.as_str() {
-                        assert!(
-                            !matches!(trust_level, "proof_grade" | "ProofGrade"),
-                            "{context} must not emit proof-grade trust in `{key}`: {value}"
-                        );
-                    }
+                    && let Some(trust_level) = child.as_str()
+                {
+                    assert!(
+                        !matches!(trust_level, "proof_grade" | "ProofGrade"),
+                        "{context} must not emit proof-grade trust in `{key}`: {value}"
+                    );
+                }
                 assert_no_proof_grade_trust_fields(child, context);
             }
         }
@@ -2058,7 +2065,9 @@ fn test_release_gate_scaffold_records_target_consumer_binding_digest_when_blocke
 fn optional_string_sha256(value: Option<&serde_json::Value>) -> serde_json::Value {
     value
         .and_then(serde_json::Value::as_str)
-        .map(|text| serde_json::Value::String(trust_types::digest::stable_sha256_hex(text.as_bytes())))
+        .map(|text| {
+            serde_json::Value::String(trust_types::digest::stable_sha256_hex(text.as_bytes()))
+        })
         .unwrap_or(serde_json::Value::Null)
 }
 
@@ -2102,7 +2111,11 @@ fn target_proof_consumer_binding_projection(evidence: &serde_json::Value) -> ser
         });
     let target_output_sha256 = binding["target_output"]
         .as_str()
-        .map(|target_output| serde_json::Value::String(trust_types::digest::stable_sha256_hex(target_output.as_bytes())))
+        .map(|target_output| {
+            serde_json::Value::String(trust_types::digest::stable_sha256_hex(
+                target_output.as_bytes(),
+            ))
+        })
         .unwrap_or(serde_json::Value::Null);
 
     serde_json::json!({
@@ -2348,7 +2361,11 @@ fn test_host_executable_default_entry_lifts_to_trust_ir_and_vcs() {
     assert_eq!(lifted.name, "_start");
     assert!(!lifted.trust_ir_body.blocks.is_empty(), "lifted entry should contain TrustIr blocks");
     assert!(
-        lifted.trust_ir_body.blocks.iter().any(|block| matches!(block.terminator, Terminator::Return)),
+        lifted
+            .trust_ir_body
+            .blocks
+            .iter()
+            .any(|block| matches!(block.terminator, Terminator::Return)),
         "lifted executable entry should contain a return terminator"
     );
 
@@ -2949,8 +2966,7 @@ fn test_targo_trust_convert_trust_cg_release_transcript_attempt_assembles_select
     .into_iter()
     .collect();
     assert_eq!(
-        unique_blocker_codes,
-        expected_codes,
+        unique_blocker_codes, expected_codes,
         "trust-cg selected-slice target proof-consumer evidence should reject only the unconsumed real evidence (one blocker entry per preserved formula is permitted): {target_consumer_blocker_codes:?}"
     );
     let target_consumer_records = target_consumer["records"]
@@ -3238,11 +3254,10 @@ fn test_targo_trust_convert_trust_cg_json_reports_inspectable_rejected_gate() {
         "non-exact provenance should remain an explicit proof-grade blocker: {json}"
     );
     assert!(
-        json["unsupported_items"]
-            .as_array()
-            .expect("unsupported_items")
-            .iter()
-            .all(|item| !item.as_str().unwrap_or_default().contains("trust-cg conversion rejected")),
+        json["unsupported_items"].as_array().expect("unsupported_items").iter().all(|item| !item
+            .as_str()
+            .unwrap_or_default()
+            .contains("trust-cg conversion rejected")),
         "provenance blockers must not be reclassified as trust_cg translation rejection: {json}"
     );
     assert_no_proof_grade_release_claim(&json, "convert trust_cg inspectable rejected");
@@ -3416,7 +3431,8 @@ fn test_targo_trust_convert_trust_cg_rejects_after_partial_trust_ir_decompile_su
 }
 
 #[test]
-fn test_checked_in_x86_64_load_decompile_canonical_trust_ir_then_convert_trust_cg_golden_blockers() {
+fn test_checked_in_x86_64_load_decompile_canonical_trust_ir_then_convert_trust_cg_golden_blockers()
+{
     let targo_trust = match find_targo_trust_binary() {
         Some(path) => path,
         None => {
@@ -3498,8 +3514,8 @@ fn test_checked_in_x86_64_load_decompile_canonical_trust_ir_then_convert_trust_c
     // `TRUST_GOLDEN_REGENERATE=<path>` and rerun this test once; it will overwrite the
     // file pointed at by that env var.
     if let Ok(write_to) = std::env::var("TRUST_GOLDEN_REGENERATE") {
-        let pretty = serde_json::to_string_pretty(&observed)
-            .expect("observed projection should serialize");
+        let pretty =
+            serde_json::to_string_pretty(&observed).expect("observed projection should serialize");
         std::fs::write(&write_to, format!("{pretty}\n"))
             .unwrap_or_else(|e| panic!("could not write regenerated golden to {write_to}: {e}"));
         eprintln!("REGENERATED GOLDEN: {write_to}");
@@ -4542,9 +4558,10 @@ fn executable_link_arg_sets() -> Vec<Vec<&'static str>> {
 fn candidate_compilers() -> Vec<String> {
     let mut compilers = Vec::new();
     if let Ok(cc) = std::env::var("TRUST_TEST_CC")
-        && !cc.trim().is_empty() {
-            compilers.push(cc);
-        }
+        && !cc.trim().is_empty()
+    {
+        compilers.push(cc);
+    }
     compilers.push("clang".to_string());
     compilers.push("cc".to_string());
     compilers.dedup();

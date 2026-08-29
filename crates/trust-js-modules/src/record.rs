@@ -11,8 +11,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::host::{Host, ImportEntry, IndirectExport, LocalExport, StarExport};
 use indexmap::IndexMap;
+
+use crate::host::{Host, ImportEntry, IndirectExport, LocalExport, StarExport};
 
 /// A module identity within one graph: a dense index into the graph's record
 /// table. Stable for the graph's lifetime; handed to and from the consumer

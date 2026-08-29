@@ -1,6 +1,5 @@
 #![crate_name = "compiletest"]
 #![warn(unreachable_pub)]
-
 // Blessed env_mutation (2026-07-20): vendored upstream tool code, compiled by
 // the Trust toolchain's extended tools build. These files mutate process-global
 // env under their own discipline (rust-analyzer's EnvChange holds an env lock;

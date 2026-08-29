@@ -14,8 +14,8 @@ use trust_types::{
     Terminator, TrustLevel, Ty, VerifiableFunction, infer_sort,
 };
 
-use crate::validation::{ValidationError, validate_lir};
 use crate::BridgeError;
+use crate::validation::{ValidationError, validate_lir};
 
 const DIAGNOSTIC_TARGET: &str = "target=trust_cg-lir";
 const DIAGNOSTIC_SOURCE: &str = "source=binary-derived-trust_ir";
@@ -5136,11 +5136,9 @@ mod tests {
             proof_consumer.blockers
         );
         assert!(
-            proof_consumer
-                .blockers
-                .iter()
-                .any(|blocker| blocker.code == "checked-certificate-not-consumed-by-target-semantics"
-                    || blocker.code == "missing-checked-proof-certificate"),
+            proof_consumer.blockers.iter().any(|blocker| blocker.code
+                == "checked-certificate-not-consumed-by-target-semantics"
+                || blocker.code == "missing-checked-proof-certificate"),
             "certificate evidence stays unconsumed: {:?}",
             proof_consumer.blockers
         );
@@ -5149,7 +5147,10 @@ mod tests {
             "consuming one formula must not consume the artifact"
         );
 
-        assert_eq!(conversion.trust_cg_validation, BinaryTrustCgValidationStatus::InspectableRejected);
+        assert_eq!(
+            conversion.trust_cg_validation,
+            BinaryTrustCgValidationStatus::InspectableRejected
+        );
         assert_eq!(conversion.trust_level, TrustLevel::Rejected);
     }
 

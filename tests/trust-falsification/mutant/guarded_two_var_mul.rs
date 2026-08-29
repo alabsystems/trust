@@ -7,9 +7,5 @@
 // Guards that the bounded-multiply discharge uses the ACTUAL bound magnitude (a model
 // that ignored the bound value would falsely prove this real overflow).
 pub fn guarded_two_var_mul(a: u32, b: u32) -> u32 {
-    if a < 100000 && b < 100000 {
-        a * b
-    } else {
-        0
-    }
+    if a < 100000 && b < 100000 { a * b } else { 0 }
 }

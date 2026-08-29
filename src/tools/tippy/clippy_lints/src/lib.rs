@@ -97,6 +97,7 @@ mod contract_smell;
 mod copy_iterator;
 mod crate_in_macro_def;
 mod create_dir;
+mod creusot_spec_sugar;
 mod dbg_macro;
 mod default;
 mod default_constructed_unit_structs;
@@ -542,6 +543,7 @@ rustc_lint::early_lint_methods!(
         EmptyLineAfter: empty_line_after::EmptyLineAfter = empty_line_after::EmptyLineAfter::new(),
         InlineTraitBounds: inline_trait_bounds::InlineTraitBounds = inline_trait_bounds::InlineTraitBounds::default(),
         LegacySpecSugar: legacy_spec_sugar::LegacySpecSugar = legacy_spec_sugar::LegacySpecSugar,
+        CreusotSpecSugar: creusot_spec_sugar::CreusotSpecSugar = creusot_spec_sugar::CreusotSpecSugar,
         ContractSmell: contract_smell::ContractSmell = contract_smell::ContractSmell,
         // add early passes here, used by `cargo dev new_lint`
     ]]

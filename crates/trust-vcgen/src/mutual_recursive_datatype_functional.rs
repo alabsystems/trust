@@ -963,8 +963,10 @@ fn mwalk(
                     // call's output.
                     let ih_name = format!("__ih{ih_counter}");
                     *ih_counter += 1;
-                    let ret_sort =
-                        crate::sort_for_ty_in(callee_fn, peel_indirection(&callee_fn.body.return_ty));
+                    let ret_sort = crate::sort_for_ty_in(
+                        callee_fn,
+                        peel_indirection(&callee_fn.body.return_ty),
+                    );
                     let ih_var = Formula::var_owned(ih_name.clone(), ret_sort.clone());
                     state.binders.push((ih_name, ret_sort));
                     state.store.insert(dest.local, ih_var.clone());
@@ -988,8 +990,10 @@ fn mwalk(
                 WalkKind::Reference => {
                     // Definitional mode: the call IS the callee's application
                     // at the smaller fuel — `FnApp(callee, [k, arg])`, inline.
-                    let ret_sort =
-                        crate::sort_for_ty_in(callee_fn, peel_indirection(&callee_fn.body.return_ty));
+                    let ret_sort = crate::sort_for_ty_in(
+                        callee_fn,
+                        peel_indirection(&callee_fn.body.return_ty),
+                    );
                     state.store.insert(
                         dest.local,
                         Formula::FnApp {
@@ -1033,9 +1037,8 @@ fn close_over(binders: &[(String, Sort)], body: Formula) -> Formula {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
-        AggregateKind, BasicBlock, LocalDecl, Operand, Rvalue, SourceSpan, Statement,
+        AggregateKind, BasicBlock, LocalDecl, Operand, Rvalue, SourceSpan, Statement, UnwindEdge,
         VerifiableBody,
     };
 
@@ -1130,7 +1133,12 @@ mod tests {
         let raw_e = Ty::RawPtr { mutable: false, pointee: Box::new(e_dt()) };
         let adt = |name: &str, variant: usize, ops: Vec<Operand>| {
             Rvalue::Aggregate(
-                AggregateKind::Adt { name: name.to_string(), variant, active_field: None, args: None },
+                AggregateKind::Adt {
+                    name: name.to_string(),
+                    variant,
+                    active_field: None,
+                    args: None,
+                },
                 ops,
             )
         };
@@ -1289,6 +1297,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Move(Place::local(9)), Operand::Move(Place::local(10))],
@@ -1596,9 +1605,8 @@ mod literal_cluster_tests {
     //! postconditions (`_0 = FnApp(ref, [fuel, e])` with reference
     //! definitional VCs).
 
-    use trust_types::UnwindEdge;
     use trust_types::{
-        AggregateKind, BasicBlock, LocalDecl, Operand, Rvalue, SourceSpan, Statement,
+        AggregateKind, BasicBlock, LocalDecl, Operand, Rvalue, SourceSpan, Statement, UnwindEdge,
         VerifiableBody,
     };
 
@@ -1699,7 +1707,12 @@ mod literal_cluster_tests {
         let raw_t = Ty::RawPtr { mutable: false, pointee: Box::new(t_full.clone()) };
         let adt = |variant: usize, ops: Vec<Operand>| {
             Rvalue::Aggregate(
-                AggregateKind::Adt { name: "t::T".to_string(), variant, active_field: None, args: None },
+                AggregateKind::Adt {
+                    name: "t::T".to_string(),
+                    variant,
+                    active_field: None,
+                    args: None,
+                },
                 ops,
             )
         };
@@ -1734,6 +1747,7 @@ mod literal_cluster_tests {
         let call = |a: usize, b: usize, dst: usize, next: usize| Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: callee.to_string(),
             args: vec![Operand::Move(Place::local(a)), Operand::Move(Place::local(b))],

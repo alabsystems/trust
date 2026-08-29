@@ -1069,7 +1069,12 @@ pub mod fixtures {
         let raw_e = Ty::RawPtr { mutable: false, pointee: Box::new(e_dt()) };
         let adt = |dt: &str, variant: usize, ops: Vec<Operand>| {
             Rvalue::Aggregate(
-                AggregateKind::Adt { name: dt.to_string(), variant, active_field: None, args: None },
+                AggregateKind::Adt {
+                    name: dt.to_string(),
+                    variant,
+                    active_field: None,
+                    args: None,
+                },
                 ops,
             )
         };
@@ -1117,6 +1122,7 @@ pub mod fixtures {
         };
         let call = |a: usize, b: usize, dst: usize, next: usize| Terminator::Call {
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: callee.to_string(),
             args: vec![Operand::Move(Place::local(a)), Operand::Move(Place::local(b))],

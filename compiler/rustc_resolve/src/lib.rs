@@ -2092,6 +2092,16 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             self.tcx.sess.time("resolve_main", || self.resolve_main());
             self.tcx.sess.time("resolve_check_unused", || self.check_unused(use_items));
             self.tcx.sess.time("resolve_report_errors", || self.report_errors(krate));
+            // Trust (I6): the IMPORT half of the carrier decision. The mint seam
+            // settles the crate's OWN `Nat`-carrying grants, but no extern crate
+            // is registered that early, so a crate that merely imports a
+            // `Nat`-carrying Clean-origin def is decided here — after late
+            // resolution has recorded every path, and still inside the same
+            // pre-`postprocess`, pre-freeze CStore write window the mint seam
+            // records in. Exact trigger and cost: see the method's docs.
+            self.tcx.sess.time("trust_resolve_imported_carrier_crates", || {
+                self.trust_resolve_imported_carrier_crates()
+            });
             self.tcx
                 .sess
                 .time("resolve_postprocess", || self.cstore_mut().postprocess(self.tcx, krate));

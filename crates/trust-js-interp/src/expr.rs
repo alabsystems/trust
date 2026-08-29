@@ -8,25 +8,37 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_parse::ast::{Arg, Expr, ObjProp, Pat, PropKey as AstKey};
+use trust_js_value::{
+    BigOp, ErrKind, FnFlavor, JsValue, PropKey, Property, bigint_binary, bigint_from_i64,
+    bigint_neg, bigint_not, numeric_literal_mv, parse_bigint_literal, units_from_str,
+};
+
 use crate::interp::{Abrupt, Ctx, ERes, Interp, MAX_EVAL_DEPTH, MAX_STRING_UNITS};
 use crate::literals::{cook_template_piece, decode_string_literal};
-use std::rc::Rc;
-use trust_js_parse::ast::{Arg, Expr, ObjProp, Pat, PropKey as AstKey};
 use crate::ops::Numeric;
-use trust_js_value::{
-    bigint_binary, bigint_from_i64, bigint_neg, bigint_not, numeric_literal_mv,
-    parse_bigint_literal, units_from_str, BigOp, ErrKind, FnFlavor, JsValue, PropKey, Property,
-};
 
 /// A resolved Reference Record (data + accessor properties).
 pub(crate) enum JsRef {
     Env(String),
-    Member { base: JsValue, key: RefKey },
+    Member {
+        base: JsValue,
+        key: RefKey,
+    },
     /// A super reference: base = [[HomeObject]].[[GetPrototypeOf]] at
     /// GetValue/PutValue time; `this` is the actualThis receiver.
-    SuperMember { home: trust_js_value::ObjId, this: JsValue, key: RefKey },
+    SuperMember {
+        home: trust_js_value::ObjId,
+        this: JsValue,
+        key: RefKey,
+    },
     /// A private reference (`obj.#x`): the resolved private-name identity.
-    Private { base: JsValue, name: crate::private::PrivName },
+    Private {
+        base: JsValue,
+        name: crate::private::PrivName,
+    },
 }
 
 /// The [[ReferencedName]]: already a property key (dot access / literal), or
@@ -314,10 +326,7 @@ impl Interp {
                 "strict assignment to unresolved `{name}` (unmodeled realm global or context-restricted binding)"
             )));
         }
-        self.heap
-            .obj_mut(self.global)
-            .props
-            .insert(key, Property::data(v));
+        self.heap.obj_mut(self.global).props.insert(key, Property::data(v));
         Ok(())
     }
 
@@ -337,7 +346,10 @@ impl Interp {
     }
 
     /// GetThisEnvironment (9.4.3): the nearest frame with this-capability.
-    pub(crate) fn find_this_env(&self, env: trust_js_value::EnvId) -> Option<trust_js_value::EnvId> {
+    pub(crate) fn find_this_env(
+        &self,
+        env: trust_js_value::EnvId,
+    ) -> Option<trust_js_value::EnvId> {
         let mut cur = Some(env);
         while let Some(e) = cur {
             let fr = self.heap.env(e);
@@ -388,9 +400,9 @@ impl Interp {
         key: &AstKey,
         ctx: &Ctx,
     ) -> Result<(JsValue, JsValue), Abrupt> {
-        let home = self
-            .resolve_home_object(ctx)
-            .ok_or_else(|| Abrupt::Fatal("super property outside a method (parser gap?)".to_string()))?;
+        let home = self.resolve_home_object(ctx).ok_or_else(|| {
+            Abrupt::Fatal("super property outside a method (parser gap?)".to_string())
+        })?;
         let this = self.resolve_this(ctx)?;
         let k = match key {
             AstKey::Ident(n) => PropKey::from_str(n),
@@ -413,7 +425,7 @@ impl Interp {
                 self.to_property_key(&kv)?
             }
             AstKey::Private(_) => {
-                return Err(Abrupt::Fatal("private super member (out of slice)".to_string()))
+                return Err(Abrupt::Fatal("private super member (out of slice)".to_string()));
             }
         };
         let Some(base) = self.heap.obj(home).proto else {
@@ -426,14 +438,12 @@ impl Interp {
 
     /// SuperCall evaluation (13.3.7.1).
     pub(crate) fn eval_super_call(&mut self, args: &[Arg], ctx: &Ctx) -> ERes {
-        let this_env = self
-            .find_this_env(ctx.env)
-            .ok_or_else(|| Abrupt::Fatal("super() outside a constructor (parser gap?)".to_string()))?;
-        let active = self
-            .heap
-            .env(this_env)
-            .active_fn
-            .ok_or_else(|| Abrupt::Fatal("super() without an active function (parser gap?)".to_string()))?;
+        let this_env = self.find_this_env(ctx.env).ok_or_else(|| {
+            Abrupt::Fatal("super() outside a constructor (parser gap?)".to_string())
+        })?;
+        let active = self.heap.env(this_env).active_fn.ok_or_else(|| {
+            Abrupt::Fatal("super() without an active function (parser gap?)".to_string())
+        })?;
         // 1. newTarget; 2. GetSuperConstructor; 3. args; 4. IsConstructor;
         // 5. Construct.
         let nt = self.resolve_new_target(ctx)?;
@@ -473,12 +483,7 @@ impl Interp {
         }
         match inner {
             Expr::Ident(name) => Ok(JsRef::Env(name.clone())),
-            Expr::Member {
-                obj,
-                prop,
-                optional,
-                in_chain,
-            } => {
+            Expr::Member { obj, prop, optional, in_chain } => {
                 if *optional || *in_chain {
                     return Err(Abrupt::Fatal(
                         "optional chain as a reference target (out of slice)".to_string(),
@@ -511,9 +516,8 @@ impl Interp {
                 // first — no consensus, so a computed key under this-TDZ
                 // refuses. With `this` initialized the order is
                 // unobservable (this resolution is pure).
-                let this_uninit = self
-                    .find_this_env(ctx.env)
-                    .is_some_and(|e| self.heap.env(e).this_uninit);
+                let this_uninit =
+                    self.find_this_env(ctx.env).is_some_and(|e| self.heap.env(e).this_uninit);
                 if this_uninit && matches!(key.as_ref(), AstKey::Computed(_)) {
                     return Err(Abrupt::Fatal(
                         "computed super key under uninitialized this (evaluation order diverges between engines)"
@@ -529,7 +533,9 @@ impl Interp {
                     }
                     AstKey::Computed(ke) => RefKey::Raw(self.eval_expr(ke, ctx)?),
                     AstKey::Private(_) => {
-                        return Err(Abrupt::Fatal("private super member (out of slice)".to_string()))
+                        return Err(Abrupt::Fatal(
+                            "private super member (out of slice)".to_string(),
+                        ));
                     }
                 };
                 let this = self.resolve_this(ctx)?;
@@ -634,12 +640,7 @@ impl Interp {
 
     fn eval_chain(&mut self, e: &Expr, ctx: &Ctx) -> Result<(ChainVal, Option<JsValue>), Abrupt> {
         match e {
-            Expr::Member {
-                obj,
-                prop,
-                optional,
-                ..
-            } => {
+            Expr::Member { obj, prop, optional, .. } => {
                 let (bv, _) = self.eval_chain_operand(obj, ctx)?;
                 let ChainVal::Val(base) = bv else {
                     return Ok((ChainVal::ShortCircuit, None));
@@ -671,12 +672,7 @@ impl Interp {
                 let v = self.get_prop(&base, &key)?;
                 Ok((ChainVal::Val(v), Some(base)))
             }
-            Expr::Call {
-                callee,
-                args,
-                optional,
-                ..
-            } => {
+            Expr::Call { callee, args, optional, .. } => {
                 let (fv, this) = self.eval_chain_operand(callee, ctx)?;
                 let ChainVal::Val(f) = fv else {
                     return Ok((ChainVal::ShortCircuit, None));
@@ -813,10 +809,10 @@ impl Interp {
                     // NotEscapeSequence in a tagged template: TV undefined.
                     Err(_) => JsValue::Undefined,
                 };
-                self.heap.obj_mut(cooked_arr).props.insert(
-                    key.clone(),
-                    Property::with_attrs(cooked_v, false, true, false),
-                );
+                self.heap
+                    .obj_mut(cooked_arr)
+                    .props
+                    .insert(key.clone(), Property::with_attrs(cooked_v, false, true, false));
                 let raw_norm = q.replace("\r\n", "\n").replace('\r', "\n");
                 self.heap.obj_mut(raw_arr).props.insert(
                     key,
@@ -830,11 +826,7 @@ impl Interp {
             }
             for arr in [cooked_arr, raw_arr] {
                 // Freeze: length non-writable, object non-extensible.
-                if let Some(p) = self
-                    .heap
-                    .obj_mut(arr)
-                    .props
-                    .get_mut(&PropKey::from_str("length"))
+                if let Some(p) = self.heap.obj_mut(arr).props.get_mut(&PropKey::from_str("length"))
                 {
                     if let trust_js_value::PropValue::Data { writable, .. } = &mut p.v {
                         *writable = false;
@@ -842,10 +834,10 @@ impl Interp {
                 }
                 self.heap.obj_mut(arr).extensible = false;
             }
-            self.heap.obj_mut(cooked_arr).props.insert(
-                PropKey::from_str("raw"),
-                Property::frozen(JsValue::Obj(raw_arr)),
-            );
+            self.heap
+                .obj_mut(cooked_arr)
+                .props
+                .insert(PropKey::from_str("raw"), Property::frozen(JsValue::Obj(raw_arr)));
             self.tpl_cache.insert(site_key, cooked_arr);
             cooked_arr
         };
@@ -866,10 +858,10 @@ impl Interp {
                 }
                 Some(Arg::Expr(e)) => {
                     let v = self.eval_expr(e, ctx)?;
-                    self.heap.obj_mut(arr).props.insert(
-                        PropKey::Str(units_from_str(&idx.to_string())),
-                        Property::data(v),
-                    );
+                    self.heap
+                        .obj_mut(arr)
+                        .props
+                        .insert(PropKey::Str(units_from_str(&idx.to_string())), Property::data(v));
                     idx += 1;
                 }
                 Some(Arg::Spread(e)) => {
@@ -930,7 +922,9 @@ impl Interp {
                 };
                 Ok((k, name, lossy))
             }
-            AstKey::Private(_) => Err(Abrupt::Fatal("private property key (out of slice)".to_string())),
+            AstKey::Private(_) => {
+                Err(Abrupt::Fatal("private property key (out of slice)".to_string()))
+            }
         }
     }
 
@@ -979,22 +973,16 @@ impl Interp {
                     let (k, name, lossy) = self.eval_prop_key(key, ctx)?;
                     self.check_infer_name(lossy, value)?;
                     let v = self.eval_expr_named(value, &name, ctx)?;
-                    self.heap
-                        .obj_mut(oid)
-                        .props
-                        .insert(k, Property::data(v));
+                    self.heap.obj_mut(oid).props.insert(k, Property::data(v));
                 }
                 ObjProp::Shorthand(name) => {
                     let v = self.env_get(ctx, name)?;
-                    self.heap
-                        .obj_mut(oid)
-                        .props
-                        .insert(PropKey::from_str(name), Property::data(v));
+                    self.heap.obj_mut(oid).props.insert(PropKey::from_str(name), Property::data(v));
                 }
                 ObjProp::CoverInit(..) => {
                     return Err(Abrupt::Fatal(
                         "cover-initializer in an object literal (parser bug?)".to_string(),
-                    ))
+                    ));
                 }
                 ObjProp::Method { kind, key, func } => {
                     use trust_js_parse::ast::MethodKind;
@@ -1057,7 +1045,7 @@ impl Interp {
                         MethodKind::Constructor => {
                             return Err(Abrupt::Fatal(
                                 "constructor method outside class (parser bug?)".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1152,12 +1140,7 @@ impl Interp {
             inner = p;
         }
         match inner {
-            Expr::Member {
-                obj,
-                prop,
-                optional,
-                in_chain,
-            } => {
+            Expr::Member { obj, prop, optional, in_chain } => {
                 if *optional || *in_chain {
                     return Err(Abrupt::Fatal(
                         "delete of an optional chain (out of slice)".to_string(),
@@ -1173,7 +1156,7 @@ impl Interp {
                     }
                     AstKey::Computed(ke) => RefKey::Raw(self.eval_expr(ke, ctx)?),
                     AstKey::Private(_) => {
-                        return Err(Abrupt::Fatal("private member delete (S1b)".to_string()))
+                        return Err(Abrupt::Fatal("private member delete (S1b)".to_string()));
                     }
                 };
                 // 13.5.1.2: ToObject(base) THEN ToPropertyKey.
@@ -1254,8 +1237,9 @@ impl Interp {
             }
             Numeric::B(b) => {
                 let delta = bigint_from_i64(if op == "++" { 1 } else { -1 });
-                let nv = bigint_binary(BigOp::Add, &b, &delta)
-                    .map_err(|_| Abrupt::Fatal("BigInt increment overflow (out of slice)".to_string()))?;
+                let nv = bigint_binary(BigOp::Add, &b, &delta).map_err(|_| {
+                    Abrupt::Fatal("BigInt increment overflow (out of slice)".to_string())
+                })?;
                 (JsValue::BigInt(b), JsValue::bigint(nv))
             }
         };
@@ -1281,12 +1265,7 @@ impl Interp {
             return;
         }
         if let JsValue::Obj(o) = v {
-            if let Some(p) = self
-                .heap
-                .obj_mut(*o)
-                .props
-                .get_mut(&PropKey::from_str("name"))
-            {
+            if let Some(p) = self.heap.obj_mut(*o).props.get_mut(&PropKey::from_str("name")) {
                 p.synthetic = true;
             }
         }

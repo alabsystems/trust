@@ -10,7 +10,10 @@
 # the same switch, and the full gate is not a switch a single lane may flip on a
 # shared machine. Measured 2026-08-13 at 352aa0306d:
 #
-#   fast.pr-gate            11.60s   GREEN
+#   fast.pr-gate            11.60s   GREEN  (that id was RETIRED 2026-08-27 —
+#                                    the bundle became ten individually
+#                                    quarantinable rows; the 11.60s stands as
+#                                    the measurement of the bundle it named)
 #   fast.pin-coherence       0.49s   RED (first-party/trust-cg, first-party/trust-vc)
 #   fast.bridge-pin          0.44s   GREEN
 #   scoped.compiler-check   `python3 x.py check --stage 1`, self-documented
@@ -26,13 +29,23 @@
 # moving two DIVERGENT submodule pointers that the standing safety rules forbid
 # anyone to move. That is how a gate teaches people `--no-verify`.
 #
-# This directory is the pin gate WITHOUT that blast radius. It runs four
+# This directory is the pin gate WITHOUT that blast radius. It runs six
 # checkers and nothing else — `scripts/check_pin_coherence.sh` (0.49s measured),
 # `scripts/check_revert_rationale.sh` (0.49s measured over the whole
-# 7,089-commit history), `scripts/check_frozen_files.sh`, and
+# 7,089-commit history), `scripts/check_frozen_files.sh`,
 # `scripts/check_measurement_provenance.sh` (0.95s measured over 7,112 commits
-# in the wider --history mode) — for a combined budget of about two seconds. No
-# pr_gate. No bridge replay. No x.py. No build of any kind.
+# in the wider --history mode), `scripts/check_bridge_pin.sh --check` (0.23s
+# measured), and `scripts/check_ir_cohort.py` (0.84s measured, added 2026-08-27)
+# — for a combined budget of about three seconds. No x.py, no build of any kind,
+# and NOT the gate manifest's `push` profile: this list is hand-maintained here
+# on purpose, because the point of this directory is a fixed small blast radius
+# that does not grow when someone adds a row. scripts/hooks/pre-push is the one
+# that derives its lanes; folding this one in is a separate change.
+#
+# "No bridge REPLAY" still holds and is the distinction to keep straight: the
+# replay kernel-checks 185 modules and takes ~142s, which is exactly the kind of
+# lane this directory refuses. `check_bridge_pin.sh --check` runs none of it —
+# it compares the indexed gitlinks against the indexed manifest and exits.
 #
 # THE SECOND CHECKER, and why it is here rather than in the full gate: on
 # 2026-08-20 `31814afa35` reverted `8e214e90d5`, the wave-SG struct-interior
@@ -251,7 +264,7 @@ printf '%s\n' "$revert_out"
 echo
 printf '%s\n' "$prov_out"
 echo
-echo "=== pin-coherence (pin-only hook; no pr_gate, no bridge replay, no x.py) ==="
+echo "=== pin-coherence (pin-only hook; no bridge replay, no x.py, not the push profile) ==="
 
 if [ "${#STEPPED_OVER[@]}" -gt 0 ]; then
   echo
@@ -330,16 +343,104 @@ else
   FREEZE_RC=1
 fi
 
-if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ]; then
+
+# ==========================================================================
+# LANE 4 — THE OLEAN BRIDGE PROVENANCE (added 2026-08-26)
+# ==========================================================================
+# The Lean<->Clean bridge replays against VENDORED .olean artifacts, and both
+# halves of that replay are pinned submodules: `first-party/trust-ir` supplies
+# the Lean semantics the artifacts were built from, `first-party/clean` the
+# reader that decodes them and the kernel that admits them. When a gitlink moves
+# without its manifest, the bridge replays ONE revision's bytes under ANOTHER
+# revision's recorded identity, and the provenance it prints is false.
+#
+# WHY LANE 1 DOES NOT COVER THIS, which is the whole reason for a fourth lane:
+# pin coherence compares the gitlink against the CHECKOUT. Those two agree
+# throughout this failure — it is the MANIFEST that disagrees with both, and
+# nothing in lanes 1-3 reads it. Pin coherence was green for every occurrence
+# below.
+#
+# MEASURED, four occurrences, all from commits about something else entirely:
+#   3e9efe9aac  "measure: the composition ceiling is a CORPUS property"
+#   2ce0f586ee  (clean gitlink, during trustir_adt work)
+#   94d5cb9493 / edb9472dd1  "prove: key the opaque environment by (parameter, PART)"
+# Each carried a stale-or-fresh submodule worktree into the index as collateral.
+# Repaired by hand each time (aa33903220, e32e588dac, 32e25e21ab); the header of
+# `check_bridge_pin.sh` records ~10 more before that.
+#
+# It belongs in the NARROW set by this file's own admission test: 228 ms
+# measured, no build, no cargo, no x.py, no network, and it NEVER MUTATES —
+# `--check` only compares the index against the indexed manifest. The mutating
+# repair is `--fix`, which this hook does not call.
+#
+# No waiver table: unlike a submodule pin, there is no such thing as
+# legitimately-drifted bridge provenance that someone else owns. The manifest
+# either names the revision being replayed or it is wrong, and `--fix`
+# regenerates it in one command.
+BRIDGE_CHECKER="scripts/check_bridge_pin.sh"
+BRIDGE_RC=0
+echo
+if [ -f "$BRIDGE_CHECKER" ]; then
+  bash "$BRIDGE_CHECKER" --check || BRIDGE_RC=1
+else
+  echo "bridge-pin: $BRIDGE_CHECKER is missing — refusing to certify bridge provenance." >&2
+  BRIDGE_RC=1
+fi
+
+# THE SIXTH CHECKER: cohort IR semantics (M0).
+#
+# The five checkers above are all about GITLINKS. But the cohort consumes
+# trust-ir through cargo git dependencies, and until 2026-08-27 no gate here had
+# ever read one. The first run found 24 declarations spread over 6 revisions and
+# FIVE distinct semantic surfaces, every one of them reporting wire version 37 —
+# the version number is a decoding floor, not an agreement about meaning.
+#
+# It belongs in THIS directory rather than the full gate for the same reason as
+# the rest: it is git plumbing only. Measured 0.84s wall, no build, no network.
+COHORT_CHECKER="scripts/check_ir_cohort.py"
+COHORT_RC=0
+echo
+if [ -f "$COHORT_CHECKER" ]; then
+  python3 "$COHORT_CHECKER" || COHORT_RC=1
+else
+  echo "ir-cohort: $COHORT_CHECKER is missing — refusing to certify IR semantics." >&2
+  COHORT_RC=1
+fi
+
+if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ] && [ "$BRIDGE_RC" -eq 0 ] && [ "$COHORT_RC" -eq 0 ]; then
   exit 0
 fi
 
 echo
-echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc)."
-if [ "$revert_rc" -ne 0 ]; then
+echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc bridge=$BRIDGE_RC cohort=$COHORT_RC)."
+if [ "$COHORT_RC" -ne 0 ]; then
+  echo "  cohort: consumers disagree about what a trust-ir module MEANS."
+  echo "          inventory with: scripts/check_ir_cohort.py --report"
+  echo "          a divergence you do not own gets an expiring, owned row in"
+  echo "          scripts/hooks-pin/ir-cohort-waivers.txt — never a unilateral pin bump."
+fi
+if [ "$BRIDGE_RC" -ne 0 ]; then
+  echo "  bridge: the olean manifest does not name the revision it replays."
+  echo "          repair with: scripts/check_bridge_pin.sh --fix"
+fi
+# Exit 2 from either lane means "I could not do my job", NOT "I found a
+# problem" — most often a range whose remote side is not in this object store
+# because the remote advanced and nothing has fetched it yet. Saying "a revert
+# does not say WHY" in that state names the wrong defect and sends the reader
+# to rewrite a commit message that was never the problem. Measured 2026-08-26:
+# that exact misdiagnosis cost a multi-minute hunt while the real cause —
+# `git log <unfetched-sha>..HEAD failed` — was printed at the TOP of the output
+# and scrolled off. Distinguish the two.
+if [ "$revert_rc" -eq 2 ]; then
+  echo "  revert: the checker could NOT READ the range (see its message above)."
+  echo "          usually an unfetched remote sha: git fetch, rebase, retry."
+elif [ "$revert_rc" -ne 0 ]; then
   echo "  revert: a revert above does not say WHY."
 fi
-if [ "$prov_rc" -ne 0 ]; then
+if [ "$prov_rc" -eq 2 ]; then
+  echo "  provenance: the checker could NOT READ the range (see its message above)."
+  echo "              usually an unfetched remote sha: git fetch, rebase, retry."
+elif [ "$prov_rc" -ne 0 ]; then
   echo "  provenance: a measurement above does not name the tree it was taken on."
 fi
 echo "'git push --no-verify' skips this hook and leaves no record of why."

@@ -1014,11 +1014,8 @@ fn fn_sig(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_, ty::PolyFn
     // legal, and rebuilds the signature from the SAME discharged carriers the
     // mint recorded. Fixed-width Clean-origin defs never reach here (their
     // feed stands); ordinary Rust never reaches here (the vec is empty).
-    if let Some((_, params, result)) = tcx
-        .resolutions(())
-        .clean_origin_deferred_sigs
-        .iter()
-        .find(|&&(def, ..)| def == def_id)
+    if let Some((_, params, result)) =
+        tcx.resolutions(()).clean_origin_deferred_sigs.iter().find(|&&(def, ..)| def == def_id)
     {
         let carrier_ty = |c: &ty::TrustCleanCarrier| -> ty::Ty<'_> {
             match c {

@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, SourceSpan, Statement, Terminator,
-    Ty, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, SourceSpan, Statement, Terminator, Ty,
+    UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::build_vec_index_dest_value_tie_facts;
@@ -31,6 +30,7 @@ fn index_call(recv: usize, idx: usize, dest: usize, target: usize) -> Terminator
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     }
 }
@@ -94,9 +94,7 @@ fn shared_vec_two_index_calls_emit_deref_congruence() {
     match &facts[0] {
         Formula::Or(djs) => {
             assert_eq!(djs.len(), 2, "hypothesis + deref tie; got {djs:?}");
-            assert!(
-                matches!(&djs[0], Formula::Not(inner) if matches!(&**inner, Formula::Eq(..)))
-            );
+            assert!(matches!(&djs[0], Formula::Not(inner) if matches!(&**inner, Formula::Eq(..))));
             assert!(matches!(&djs[1], Formula::Eq(..)));
         }
         other => panic!("expected Or(..); got {other:?}"),
@@ -119,8 +117,8 @@ fn index_mut_callee_declines() {
     let mut func = two_index_call_func();
     for b in &mut func.body.blocks {
         if let Terminator::Call { func: callee, .. } = &mut b.terminator {
-            *callee = "<std::vec::Vec<u32> as core::ops::index::IndexMut<usize>>::index_mut"
-                .to_string();
+            *callee =
+                "<std::vec::Vec<u32> as core::ops::index::IndexMut<usize>>::index_mut".to_string();
         }
     }
     assert!(build_vec_index_dest_value_tie_facts(&func).is_empty());

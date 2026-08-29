@@ -1,15 +1,15 @@
 //! A parser for lambda expressions
 
+use std::error::Error;
+use std::fmt;
+
 use self::CToken::*;
 use self::Expression::*;
 use self::ParseError::*;
 use self::Token::*;
-use crate::term::Context;
 pub use crate::term::Notation::*;
 use crate::term::Term::*;
-use crate::term::{Notation, Term, abs, app};
-use std::error::Error;
-use std::fmt;
+use crate::term::{Context, Notation, Term, abs, app};
 
 /// An error returned by `parse()` when a parsing issue is encountered.
 #[derive(Debug, PartialEq, Eq)]
@@ -336,11 +336,7 @@ fn fold_terms(mut terms: Vec<Term>) -> Result<Term, ParseError> {
         Err(EmptyExpression)
     } else {
         let fst = terms.remove(0);
-        if terms.is_empty() {
-            Ok(fst)
-        } else {
-            Ok(terms.into_iter().fold(fst, app))
-        }
+        if terms.is_empty() { Ok(fst) } else { Ok(terms.into_iter().fold(fst, app)) }
     }
 }
 
@@ -417,10 +413,7 @@ mod tests {
     fn tokenization_success_classic_with_free_variables() {
         let ctx = Context::new(&["a", "b"]);
         let blc_dbr = "12";
-        let blc_cla = parse(blc_dbr, DeBruijn)
-            .unwrap()
-            .with_context(&ctx)
-            .to_string();
+        let blc_cla = parse(blc_dbr, DeBruijn).unwrap().with_context(&ctx).to_string();
 
         let tokens_cla = tokenize_cla(&blc_cla);
         let tokens_dbr = tokenize_dbr(blc_dbr);
@@ -428,10 +421,7 @@ mod tests {
         assert!(tokens_cla.is_ok());
         assert!(tokens_dbr.is_ok());
 
-        assert_eq!(
-            tokens_cla.and_then(|tokens| convert_classic_tokens(&ctx, &tokens)),
-            tokens_dbr
-        );
+        assert_eq!(tokens_cla.and_then(|tokens| convert_classic_tokens(&ctx, &tokens)), tokens_dbr);
     }
 
     #[test]
@@ -439,16 +429,10 @@ mod tests {
         let ctx_with_y = Context::new(&["y"]);
 
         // "x" is not defined in the empty context
-        assert_eq!(
-            parse_with_context(&Context::empty(), "x", Classic),
-            Err(UndefinedFreeVariable)
-        );
+        assert_eq!(parse_with_context(&Context::empty(), "x", Classic), Err(UndefinedFreeVariable));
 
         // "x" is not defined in this context either
-        assert_eq!(
-            parse_with_context(&ctx_with_y, "λz.x", Classic),
-            Err(UndefinedFreeVariable)
-        );
+        assert_eq!(parse_with_context(&ctx_with_y, "λz.x", Classic), Err(UndefinedFreeVariable));
 
         // "y" is defined, so this should be OK
         assert!(parse_with_context(&ctx_with_y, "y", Classic).is_ok());
@@ -481,10 +465,7 @@ mod tests {
         let y = "λ(λ2(11))(λ2(11))";
         assert_eq!(
             parse(y, DeBruijn).unwrap(),
-            abs(app(
-                abs(app(Var(2), app(Var(1), Var(1)))),
-                abs(app(Var(2), app(Var(1), Var(1))))
-            ))
+            abs(app(abs(app(Var(2), app(Var(1), Var(1)))), abs(app(Var(2), app(Var(1), Var(1))))))
         );
     }
 
@@ -500,10 +481,7 @@ mod tests {
                         abs(app(Var(1), Var(1))),
                         abs!(
                             5,
-                            app(
-                                app(Var(1), Var(4)),
-                                app(app(Var(3), app(Var(5), Var(5))), Var(2))
-                            )
+                            app(app(Var(1), Var(4)), app(app(Var(3), app(Var(5), Var(5))), Var(2)))
                         )
                     )
                 ),
@@ -595,10 +573,7 @@ mod tests {
                         )
                     )
                 ),
-                abs(app(
-                    Var(1),
-                    app(abs(app(Var(1), Var(1))), abs(app(Var(1), Var(1))))
-                ))
+                abs(app(Var(1), app(abs(app(Var(1), Var(1))), abs(app(Var(1), Var(1))))))
             )
         );
     }

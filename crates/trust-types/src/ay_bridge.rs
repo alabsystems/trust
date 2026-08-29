@@ -8,8 +8,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::formula::{Formula, RoundingMode, Sort};
 use ay_bindings::{Expr, RoundingMode as AyRm, Sort as AYSort, SortInner as AYSortInner};
+
+use crate::formula::{Formula, RoundingMode, Sort};
 
 /// Convert a trust_types::Sort to a ay_bindings::Sort.
 #[must_use]
@@ -45,15 +46,18 @@ pub fn sort_to_ay(sort: &Sort) -> AYSort {
             } else {
                 AYSort::enum_type(
                     name.clone(),
-                    constructors.iter().map(|(ctor, fields)| {
-                        (
-                            ctor.clone(),
-                            fields
-                                .iter()
-                                .map(|(fname, fsort)| (fname.clone(), sort_to_ay(fsort)))
-                                .collect::<Vec<_>>(),
-                        )
-                    }).collect::<Vec<_>>(),
+                    constructors
+                        .iter()
+                        .map(|(ctor, fields)| {
+                            (
+                                ctor.clone(),
+                                fields
+                                    .iter()
+                                    .map(|(fname, fsort)| (fname.clone(), sort_to_ay(fsort)))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
             }
         }
@@ -326,9 +330,7 @@ pub fn formula_to_expr(formula: &Formula) -> Expr {
         Formula::FpIsSubnormal(a) => formula_to_expr(a).fp_is_subnormal(),
         Formula::FpIsNegative(a) => formula_to_expr(a).fp_is_negative(),
         Formula::FpIsPositive(a) => formula_to_expr(a).fp_is_positive(),
-        Formula::FpFromBits { bits, eb, sb } => {
-            fp_from_bv_expr(formula_to_expr(bits), *eb, *sb)
-        }
+        Formula::FpFromBits { bits, eb, sb } => fp_from_bv_expr(formula_to_expr(bits), *eb, *sb),
         // `(fp.to_ieee_bv <fp>)` — reinterpret a float as its IEEE-754 bit
         // pattern (an `(eb+sb)`-wide bitvector). The EXACT inverse of
         // `FpFromBits`. Bit-preserving: NaN payloads and the sign of ±0.0 are
@@ -358,13 +360,11 @@ pub fn formula_to_expr(formula: &Formula) -> Expr {
                 sort_to_ay(sort),
             )
         }
-        Formula::Sel { datatype, field, field_sort, arg } => {
-            formula_to_expr(arg).field_select(
-                datatype.clone(),
-                field.clone(),
-                sort_to_ay(field_sort),
-            )
-        }
+        Formula::Sel { datatype, field, field_sort, arg } => formula_to_expr(arg).field_select(
+            datatype.clone(),
+            field.clone(),
+            sort_to_ay(field_sort),
+        ),
         Formula::IsCtor { datatype, ctor, arg } => {
             formula_to_expr(arg).is_constructor(datatype.clone(), ctor.clone())
         }
@@ -545,10 +545,7 @@ mod tests {
         let f = Formula::And(vec![
             Formula::BvULt(x(), max(), 64),
             Formula::Eq(ret(), Box::new(Formula::BvAdd(x(), one(), 64))),
-            Formula::Not(Box::new(Formula::Eq(
-                ret(),
-                Box::new(Formula::BvAdd(x(), one(), 64)),
-            ))),
+            Formula::Not(Box::new(Formula::Eq(ret(), Box::new(Formula::BvAdd(x(), one(), 64))))),
         ]);
         assert!(
             solve_bv_is_unsat(&[("_0", 64), ("x", 64)], &f),
@@ -849,11 +846,13 @@ mod tests {
         // And it is bit-distinct from +0.0: `sum == +0.0` is UNSATISFIABLE-to-refute
         // i.e. NOT(sum == +0.0) must hold (UNSAT of the negation's negation). We
         // assert NOT(sum == +0.0) is a THEOREM by refuting its negation:
-        let differs_from_pos_zero =
-            Formula::Not(Box::new(Formula::Eq(sum, f32_bits(0x0000_0000))));
+        let differs_from_pos_zero = Formula::Not(Box::new(Formula::Eq(sum, f32_bits(0x0000_0000))));
         // sum == +0.0 must be UNSAT, so NOT(sum == +0.0) is valid; deny it:
         let deny = Formula::Not(Box::new(differs_from_pos_zero));
-        assert!(f32_solve_is_unsat(&[], &deny), "(-0.0) + (-0.0) must NOT be +0.0 (sign preserved)");
+        assert!(
+            f32_solve_is_unsat(&[], &deny),
+            "(-0.0) + (-0.0) must NOT be +0.0 (sign preserved)"
+        );
     }
 
     #[cfg(feature = "ay-bridge-solve")]
@@ -1170,11 +1169,8 @@ mod tests {
     fn datatype_tester_bridges_to_ay_is_constructor() {
         // `((_ is succ) x)` builds a real ay DatatypeTester Expr, Bool-sorted.
         let x = Formula::Var("x".into(), level_sort());
-        let is = Formula::IsCtor {
-            datatype: "Level".into(),
-            ctor: "succ".into(),
-            arg: Box::new(x),
-        };
+        let is =
+            Formula::IsCtor { datatype: "Level".into(), ctor: "succ".into(), arg: Box::new(x) };
         let expr = formula_to_expr(&is);
         assert!(expr.sort().is_bool(), "tester is Bool-sorted");
         assert_eq!(format!("{expr}"), "((_ is succ) x)");
@@ -1186,7 +1182,8 @@ mod tests {
         // `Sort(succ l) = Sort(succ l)` shape) constructs a real ay equality
         // over two datatype-constructor terms. WRITABLE + lowers; not a proof.
         let l = || Formula::Var("l".into(), level_sort());
-        let succ = |a: Formula| Formula::Ctor { ctor: "succ".into(), args: vec![a], sort: level_sort() };
+        let succ =
+            |a: Formula| Formula::Ctor { ctor: "succ".into(), args: vec![a], sort: level_sort() };
         let eq = Formula::Eq(Box::new(succ(l())), Box::new(succ(l())));
         let expr = formula_to_expr(&eq);
         assert_eq!(format!("{expr}"), "(= (succ l) (succ l))");

@@ -120,6 +120,7 @@ fn make_caller(name: &str, callee: &str) -> VerifiableFunction {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -154,7 +155,11 @@ fn make_caller(name: &str, callee: &str) -> VerifiableFunction {
 /// The module under test: an internalized leaf, a caller of it, and a second
 /// exported leaf, so the object mixes local and global definitions.
 fn module_functions() -> Vec<VerifiableFunction> {
-    vec![make_leaf("cgu_helper"), make_caller("cgu_caller", "cgu_helper"), make_leaf("cgu_exported")]
+    vec![
+        make_leaf("cgu_helper"),
+        make_caller("cgu_caller", "cgu_helper"),
+        make_leaf("cgu_exported"),
+    ]
 }
 
 fn compiled_module(linkage: Vec<FunctionLinkage>) -> CompiledModule {
@@ -305,7 +310,9 @@ fn merge_preserves_bytes(merged: &[u8], singles: &BTreeMap<String, Vec<u8>>) -> 
             .get(start..end)
             .ok_or_else(|| format!("`{name}` symbol points past the merged text section"))?;
         if window != verified.as_slice() {
-            return Err(format!("`{name}` bytes at merged text offset {start} are not the verified bytes"));
+            return Err(format!(
+                "`{name}` bytes at merged text offset {start} are not the verified bytes"
+            ));
         }
     }
     Ok(())
@@ -322,7 +329,10 @@ fn merged_object_is_genuinely_merged() {
     let symbols = macho_text_symbols(&merged);
 
     for name in ["cgu_helper", "cgu_caller", "cgu_exported"] {
-        assert!(symbols.contains_key(name), "merged object should define `{name}`; got {symbols:?}");
+        assert!(
+            symbols.contains_key(name),
+            "merged object should define `{name}`; got {symbols:?}"
+        );
     }
 
     let offsets: Vec<u64> = symbols.values().map(|symbol| symbol.offset).collect();
@@ -559,11 +569,8 @@ fn local_callee_is_not_resolvable_from_outside_the_object() {
     std::fs::write(&obj, &merged).expect("write object");
 
     let driver = dir.path().join("driver.c");
-    std::fs::write(
-        &driver,
-        "int cgu_helper(int);\nint main(void) { return cgu_helper(1); }\n",
-    )
-    .expect("write driver");
+    std::fs::write(&driver, "int cgu_helper(int);\nint main(void) { return cgu_helper(1); }\n")
+        .expect("write driver");
 
     let exe = dir.path().join("probe");
     let build = std::process::Command::new("cc")

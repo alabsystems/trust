@@ -5,16 +5,19 @@
 #
 # There are two hook directories in this repo and they are not interchangeable:
 #
-#   scripts/hooks/      the FULL pre-push gate — pr_gate (11.6s) + pin coherence
-#                       + bridge pin + `x.py check --stage 1` (~9-11 min) on any
-#                       push touching compiler/ crates/ src/bootstrap/
+#   scripts/hooks/      the FULL pre-push gate — every gate-manifest row carrying
+#                       the `push` profile (19 lanes, 15.7s measured 2026-08-27:
+#                       drift, supply-chain, freeze, provenance, pin lanes and
+#                       their selftests) plus `x.py check --stage 1` (~9-11 min)
+#                       on any push touching compiler/ crates/ src/bootstrap/
 #                       targo-trust/ first-party/. Installed by
 #                       scripts/install-git-hooks.sh. Correct for a machine that
 #                       is yours; a large thing to switch on for every other lane
 #                       sharing a clone.
 #
-#   scripts/hooks-pin/  THIS one — submodule pin coherence and nothing else.
-#                       0.49s measured. No build, no x.py, no pr_gate.
+#   scripts/hooks-pin/  THIS one — a fixed, hand-listed set of pin/provenance
+#                       checkers. 0.49s measured for the pin lane. No build, no
+#                       x.py, and it does NOT read the gate manifest.
 #
 # `core.hooksPath` names ONE directory, so these two are mutually exclusive by
 # construction. This script refuses to take over any other configuration rather
@@ -87,8 +90,8 @@ if [ -n "$current" ] && [ "$current" != "$HOOKS_DIR" ]; then
   echo "ERROR: core.hooksPath is already set to '$current'." >&2
   if [ "$current" = "$FULL_DIR" ]; then
     echo "       That is the FULL gate, which already runs pin coherence." >&2
-    echo "       Installing this narrow gate would REMOVE pr_gate, the bridge" >&2
-    echo "       pin check and the compiler check. If that is what you want:" >&2
+    echo "       Installing this narrow gate would REMOVE most of the \`push\`" >&2
+    echo "       profile and the compiler check. If that is what you want:" >&2
   else
     echo "       Refusing to take over another hook configuration. Clear it with:" >&2
   fi
@@ -112,5 +115,5 @@ echo "            submodule by scripts/hooks-pin/pin-waivers.txt. It never moves
 echo "            a pointer and never runs a build."
 echo "  post-*    ADVISORY: announce pin drift right after a pull/rebase/switch."
 echo
-echo "  NOT run by this directory: scripts/pr_gate.sh, check_bridge_pin.sh, and"
-echo "  x.py check --stage 1. For those, use scripts/install-git-hooks.sh."
+echo "  NOT run by this directory: most of the gate manifest's \`push\` profile,"
+echo "  and x.py check --stage 1. For those, use scripts/install-git-hooks.sh."

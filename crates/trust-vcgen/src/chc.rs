@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/chc.rs: Constrained Horn Clause encoding for loop invariant inference
 //
 // Encodes MIR loops as CHC systems for ay's Spacer engine. Each loop header
@@ -17,7 +18,6 @@ use trust_types::fx::FxHashSet;
 use trust_types::*;
 
 pub use crate::loop_analysis::{LoopInfo, detect_loops};
-use crate::u128_to_formula;
 
 /// Namespace CHC-owned theory variables away from legal source identifiers.
 /// CHC formulas can contain both source locals and these derived symbols, so
@@ -57,7 +57,26 @@ fn validate_chc_function(func: &VerifiableFunction) -> Result<(), ChcError> {
     crate::validate_function(func).map_err(|error| ChcError::UnsupportedMir {
         kind: "MalformedTrustIr".to_string(),
         detail: error.to_string(),
-    })
+    })?;
+
+    // The ordinary VC pipeline's exhaustive unsupported-body walk is also a
+    // proof-admission boundary for CHC.  In particular, OpaqueScalar carries a
+    // type but no occurrence identity: two distinct runtime constants would be
+    // interned to the same solver symbol if they reached the loop encoder.  Do
+    // not duplicate a partial operand walk here; reuse the canonical statement
+    // and terminator traversal and retain its exact fail-closed diagnostic.
+    if let Some((kind, detail)) =
+        crate::generate::unsupported_mir_vcs(func).into_iter().find_map(|vc| match vc.kind {
+            VcKind::UnsupportedMir { kind, detail } if kind == "ConstValue::OpaqueScalar" => {
+                Some((kind, detail))
+            }
+            _ => None,
+        })
+    {
+        return Err(ChcError::UnsupportedMir { kind, detail });
+    }
+
+    Ok(())
 }
 
 /// Errors arising from CHC encoding.
@@ -194,15 +213,12 @@ fn operand_is_compatible_machine_value(
         Operand::Copy(place) | Operand::Move(place) => {
             place_machine_int_info(func, place) == Some(expected)
         }
-        // MIR constants are interpreted at the operation's destination type.
-        // Several historical fixtures serialize small integer literals with a
-        // wider carrier, so the destination width—not literal storage width—is
-        // load-bearing here.
+        // Public validation has already bound these constants to the exact
+        // operation type (including literal width/range). This CHC applicability
+        // check therefore only needs to recognize the identity-bearing carrier
+        // families; it must never re-admit OpaqueScalar by type alone.
         Operand::Constant(
-            ConstValue::Int(_)
-            | ConstValue::Uint(_, _)
-            | ConstValue::OpaqueScalar { .. }
-            | ConstValue::ConstParam { .. },
+            ConstValue::Int(_) | ConstValue::Uint(_, _) | ConstValue::ConstParam { .. },
         ) => true,
         Operand::Symbolic(formula) => matches!(trust_types::infer_sort(formula), Sort::Int),
         _ => false,
@@ -1474,8 +1490,23 @@ fn chc_formula_to_typed_expr(
         Formula::Add(a, b) => chc_binary_expr("add", a, b, vars),
         Formula::Sub(a, b) => chc_binary_expr("sub", a, b, vars),
         Formula::Mul(a, b) => chc_binary_expr("mul", a, b, vars),
-        Formula::Div(a, b) => chc_binary_expr("div", a, b, vars),
-        Formula::Rem(a, b) => chc_binary_expr("mod", a, b, vars),
+        // Rust integer `/` and `%` truncate toward zero; typed-CHC's plain
+        // `div`/`mod` operators are Euclidean.  A bare `mod` here therefore
+        // made every signed remainder non-negative and false-PROVED
+        // `ensures(result >= 0)` for `fn f(x: i32) { x % 2 }` even though
+        // `f(-1) == -1`.  Use the explicit truncating wire operations whose
+        // consumer reconstructs the same identities as `ay_bridge` and the
+        // SMT-LIB path:
+        //
+        //   trem(a,b) = ite(a >= 0, mod(a,b), -mod(-a,b))
+        //   tdiv(a,b) = (a - trem(a,b)) / b
+        //
+        // The final division in `tdiv` is exact, so Euclidean rounding is
+        // irrelevant there.  For non-negative operands these reduce to the
+        // old `div`/`mod`, preserving unsigned behavior.  Division by zero and
+        // MIN/-1 overflow remain governed by their separate MIR obligations.
+        Formula::Div(a, b) => chc_binary_expr("trunc_div", a, b, vars),
+        Formula::Rem(a, b) => chc_binary_expr("trunc_rem", a, b, vars),
         Formula::BvAdd(a, b, _) => chc_binary_expr("bv_add", a, b, vars),
         Formula::BvSub(a, b, _) => chc_binary_expr("bv_sub", a, b, vars),
         Formula::BvMul(a, b, _) => chc_binary_expr("bv_mul", a, b, vars),
@@ -1615,6 +1646,7 @@ fn build_init_args(
 ///
 /// Looks for a SwitchInt terminator in the header and extracts the
 /// condition under which the loop body is entered.
+#[cfg(test)]
 pub(crate) fn extract_loop_condition(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
@@ -1637,6 +1669,23 @@ pub(crate) fn extract_loop_condition(
             // `!cond` — which is semantically identical and well-typed.
             let discr_is_bool = matches!(crate::operand_sort(func, discr), Some(Sort::Bool));
 
+            // The raw MIR label is a two's-complement bit pattern at the
+            // scrutinee's width; decode it under that type rather than reading
+            // it as a magnitude (which renders an `i32` `-1` arm as
+            // `4294967295`). An undecodable label is an ENCODING FAILURE, not a
+            // `true` guard: a loop-continuation condition is used in BOTH
+            // polarities, so a weakened one is not automatically safe here.
+            let label = |value: u128| -> Result<Formula, ChcError> {
+                crate::operand_ty_cow(func, discr)
+                    .as_deref()
+                    .and_then(|ty| crate::switch_label_to_formula(ty, value))
+                    .ok_or_else(|| ChcError::EncodingFailed {
+                        reason: format!(
+                            "SwitchInt label {value} is not decodable at the discriminant's type"
+                        ),
+                    })
+            };
+
             for (value, target) in targets {
                 if body_set.contains(&target.0) && *target != loop_info.header {
                     // This target enters the loop body
@@ -1644,13 +1693,10 @@ pub(crate) fn extract_loop_condition(
                         match *value {
                             1 => discr_formula,
                             0 => Formula::Not(Box::new(discr_formula)),
-                            _ => Formula::Eq(
-                                Box::new(discr_formula),
-                                Box::new(u128_to_formula(*value)),
-                            ),
+                            _ => Formula::Eq(Box::new(discr_formula), Box::new(label(*value)?)),
                         }
                     } else {
-                        Formula::Eq(Box::new(discr_formula), Box::new(u128_to_formula(*value)))
+                        Formula::Eq(Box::new(discr_formula), Box::new(label(*value)?))
                     });
                 }
             }
@@ -1661,6 +1707,7 @@ pub(crate) fn extract_loop_condition(
 }
 
 /// Extract the loop exit condition (negation of the continuation condition).
+#[cfg(test)]
 pub(crate) fn extract_exit_condition(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
@@ -1776,6 +1823,75 @@ pub(crate) fn rvalue_to_formula(
     rvalue_to_formula_with_dest(func, rvalue, None)
 }
 
+/// Exact scalar lowering for the two non-integer families that the generic
+/// Int/BV binop bridge must never guess. `None` means neither operand is a
+/// bool/float and ordinary integer lowering may proceed. `Some(Err(..))` is a
+/// deliberate fail-closed boundary for mixed or unsupported carriers.
+fn exact_bool_or_float_binop_formula(
+    func: &VerifiableFunction,
+    op: BinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Option<Result<Formula, ChcError>> {
+    let lhs_ty = crate::operand_ty_cow(func, lhs);
+    let rhs_ty = crate::operand_ty_cow(func, rhs);
+    let is_special = |ty: Option<&Ty>| matches!(ty, Some(Ty::Bool | Ty::Float { .. }));
+    if !is_special(lhs_ty.as_deref()) && !is_special(rhs_ty.as_deref()) {
+        return None;
+    }
+
+    match (lhs_ty.as_deref(), rhs_ty.as_deref()) {
+        (Some(Ty::Float { width: lhs_width }), Some(Ty::Float { width: rhs_width }))
+            if lhs_width == rhs_width =>
+        {
+            let formula = match op {
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    crate::guards::float_binop_to_formula(func, op, lhs, rhs, *lhs_width)
+                }
+                _ => None,
+            };
+            Some(formula.ok_or_else(|| {
+                unsupported_chc_lowering(
+                    "Rvalue::BinaryOp",
+                    "float CHC lowering is limited to exact IEEE Eq/Ne/Lt/Le/Gt/Ge comparisons",
+                )
+            }))
+        }
+        (Some(Ty::Bool), Some(Ty::Bool)) => {
+            let l = match operand_to_formula_checked(func, lhs) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            let r = match operand_to_formula_checked(func, rhs) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(match op {
+                BinOp::BitAnd => Ok(Formula::And(vec![l, r])),
+                BinOp::BitOr => Ok(Formula::Or(vec![l, r])),
+                BinOp::BitXor | BinOp::Ne => {
+                    Ok(Formula::Not(Box::new(Formula::Eq(Box::new(l), Box::new(r)))))
+                }
+                BinOp::Eq => Ok(Formula::Eq(Box::new(l), Box::new(r))),
+                _ => Err(unsupported_chc_lowering(
+                    "Rvalue::BinaryOp",
+                    "bool CHC lowering is limited to Eq/Ne and BitAnd/BitOr/BitXor",
+                )),
+            })
+        }
+        _ => Some(Err(unsupported_chc_lowering(
+            "Rvalue::BinaryOp",
+            "mixed, mismatched-width, or unresolved bool/float operands are not modeled",
+        ))),
+    }
+}
+
+fn binop_touches_bool_or_float(func: &VerifiableFunction, lhs: &Operand, rhs: &Operand) -> bool {
+    [lhs, rhs].into_iter().any(|operand| {
+        matches!(crate::operand_ty_cow(func, operand).as_deref(), Some(Ty::Bool | Ty::Float { .. }))
+    })
+}
+
 fn rvalue_to_formula_with_dest(
     func: &VerifiableFunction,
     rvalue: &Rvalue,
@@ -1784,6 +1900,9 @@ fn rvalue_to_formula_with_dest(
     match rvalue {
         Rvalue::Use(op) => operand_to_formula_checked(func, op),
         Rvalue::BinaryOp(op, lhs, rhs) => {
+            if let Some(exact) = exact_bool_or_float_binop_formula(func, *op, lhs, rhs) {
+                return exact;
+            }
             let l = operand_to_formula_checked(func, lhs)?;
             let r = operand_to_formula_checked(func, rhs)?;
             let machine = dest
@@ -1841,6 +1960,12 @@ fn rvalue_to_formula_with_dest(
             }
         }
         Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
+            if binop_touches_bool_or_float(func, lhs, rhs) {
+                return Err(unsupported_chc_lowering(
+                    "Rvalue::CheckedBinaryOp",
+                    "checked tuple semantics are not modeled for bool/float carriers",
+                ));
+            }
             if matches!(
                 op,
                 BinOp::Add
@@ -1898,6 +2023,12 @@ fn rvalue_to_formula_with_dest(
             }
         }
         Rvalue::UnaryOp(UnOp::Neg, op) => {
+            if matches!(crate::operand_ty_cow(func, op).as_deref(), Some(Ty::Float { .. })) {
+                return Err(unsupported_chc_lowering(
+                    "Rvalue::UnaryOp(Neg)",
+                    "float negation requires a destination-aware IEEE value definition",
+                ));
+            }
             Ok(Formula::Neg(Box::new(operand_to_formula_checked(func, op)?)))
         }
         Rvalue::UnaryOp(UnOp::Not, op) => {
@@ -1979,7 +2110,15 @@ fn rvalue_to_formula_with_dest(
             let place_name = crate::place_to_var_name(func, place);
             Ok(Formula::Var(generated_chc_symbol(&format!("len_{place_name}")), Sort::Int))
         }
-        Rvalue::Repeat(op, _) => operand_to_formula_checked(func, op),
+        // `[value; N]` has array semantics. Returning the scalar operand here
+        // equated an array destination with one element and could feed a false
+        // contract/loop pin into CHC. The guard/value lane has a conditional
+        // Store model; this generic scalar bridge must fail closed until it can
+        // encode the full destination-aware array value.
+        Rvalue::Repeat(_, _) => Err(unsupported_chc_lowering(
+            "Rvalue::Repeat",
+            "array repeat requires destination-aware array Store semantics".to_string(),
+        )),
         Rvalue::AddressOf(_, _) => Err(unsupported_chc_lowering(
             "Rvalue::AddressOf",
             "raw pointer creation requires provenance/address semantics".to_string(),
@@ -2044,13 +2183,14 @@ fn const_value_to_formula_checked(cv: &ConstValue) -> Result<Formula, ChcError> 
         ConstValue::Str { bytes } => {
             Ok(Formula::var_owned(ConstValue::str_smt_var_name(bytes), Sort::Int))
         }
-        // A typed opaque integer constant: a fresh integer-sorted symbol asserting
-        // no value (sound over-approximation). Lowering to a CHC ERROR instead would
-        // poison via the shared ERROR relation (the GEP lesson), so emit the
-        // unconstrained symbol — value/div/index obligations over it stay unknown.
-        ConstValue::OpaqueScalar { width, signed } => Ok(Formula::var_owned(
-            format!("__trust_opaque_scalar_{}{}", if *signed { "i" } else { "u" }, width),
-            Sort::Int,
+        // OpaqueScalar has no occurrence identity.  Naming it by type aliases
+        // distinct constants and can turn `a - b` into `x - x`, which is an
+        // under-approximation and can false-prove a loop invariant.  Public CHC
+        // entry points reject it during their exhaustive body preflight; keep
+        // this lowering boundary fail closed as defense for internal callers.
+        ConstValue::OpaqueScalar { .. } => Err(unsupported_chc_lowering(
+            "ConstValue::OpaqueScalar",
+            "identity-less opaque scalar cannot be used as CHC proof input".to_string(),
         )),
         // Trust: piece #7a — a const-generic PARAM value on the NATIVE (`-full`)
         // path. It MUST mint the SAME per-param symbol `__trust_constparam_*` (via
@@ -2058,6 +2198,9 @@ fn const_value_to_formula_checked(cv: &ConstValue) -> Result<Formula, ChcError> 
         // length use, so strict verification shares the SMT term between the
         // guard `i < N` and the bounds VC. SOUNDNESS: keyed on the param identity,
         // never on `(width, signed)`; the symbol asserts no value.
+        ConstValue::ConstParam { index, name, width: 1, signed: false } => {
+            Ok(Formula::var_owned(trust_types::const_param_symbol(*index, name), Sort::Bool))
+        }
         ConstValue::ConstParam { index, name, .. } => {
             Ok(Formula::var_owned(trust_types::const_param_symbol(*index, name), Sort::Int))
         }
@@ -3041,6 +3184,29 @@ mod tests {
         assert_eq!(json["expr"]["lhs"]["width"], 8);
     }
 
+    #[test]
+    fn test_typed_chc_transport_marks_rust_division_and_remainder_as_truncating() {
+        let x = || Formula::Var("x".into(), Sort::Int);
+        for (formula, expected_op) in [
+            (Formula::Div(Box::new(x()), Box::new(Formula::Int(2))), "trunc_div"),
+            (Formula::Rem(Box::new(x()), Box::new(Formula::Int(2))), "trunc_rem"),
+        ] {
+            let mut vars = std::collections::BTreeMap::new();
+            let json = chc_formula_to_typed_expr(&formula, &mut vars)
+                .expect("Rust integer arithmetic is in the typed-CHC fragment");
+
+            assert_eq!(json["kind"], "binary");
+            assert_eq!(json["op"], expected_op);
+            assert_eq!(json["lhs"]["kind"], "var");
+            assert_eq!(json["lhs"]["name"], "x");
+            assert_eq!(json["rhs"]["kind"], "int_const");
+            assert_eq!(json["rhs"]["value"], serde_json::json!(2));
+            assert_eq!(vars.get("x"), Some(&Sort::Int));
+            assert_ne!(json["op"], "div", "bare division has Euclidean semantics");
+            assert_ne!(json["op"], "mod", "bare modulus has Euclidean semantics");
+        }
+    }
+
     /// Loop whose body BRANCHES: `while i<n { if cond { i += 1 } }`. `i` is written
     /// once but CONDITIONALLY, so `build_body_transition` would assert the too-strong
     /// unconditional `i' = i+1`. The faithfulness gate must reject it (rule b).
@@ -3106,7 +3272,7 @@ mod tests {
                             rvalue: Rvalue::BinaryOp(
                                 BinOp::Add,
                                 Operand::Copy(Place::local(2)),
-                                Operand::Constant(ConstValue::Uint(1, 64)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
                             ),
                             span: SourceSpan::default(),
                         }],
@@ -3137,7 +3303,7 @@ mod tests {
             rvalue: Rvalue::BinaryOp(
                 BinOp::Add,
                 Operand::Copy(Place::local(2)),
-                Operand::Constant(ConstValue::Uint(2, 64)),
+                Operand::Constant(ConstValue::Uint(2, 32)),
             ),
             span: SourceSpan::default(),
         });
@@ -3618,7 +3784,7 @@ mod tests {
                             rvalue: Rvalue::BinaryOp(
                                 BinOp::Add,
                                 Operand::Copy(Place::local(2)),
-                                Operand::Constant(ConstValue::Uint(1, 64)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
                             ),
                             span: SourceSpan::default(),
                         }],
@@ -3647,6 +3813,12 @@ mod tests {
         func.def_path = "test::u8_wrapping_contract_loop".to_string();
         func.body.locals[1].ty = Ty::u8();
         func.body.locals[2].ty = Ty::u8();
+        let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, rhs), .. } =
+            &mut func.body.blocks[2].stmts[0]
+        else {
+            unreachable!("counting fixture body owns one binary assignment")
+        };
+        *rhs = Operand::Constant(ConstValue::Uint(1, 8));
         func.preconditions = vec![Formula::Eq(
             Box::new(Formula::Add(
                 Box::new(Formula::Var("n".into(), Sort::Int)),
@@ -3672,7 +3844,22 @@ mod tests {
         let Statement::Assign { rvalue, .. } = &mut func.body.blocks[2].stmts[0] else {
             unreachable!("counting fixture body owns one assignment")
         };
-        *rvalue = if checked { checked_update } else { update };
+        if checked {
+            *rvalue = update;
+            let tuple_local = func.body.locals.len();
+            func.body.locals.push(LocalDecl {
+                index: tuple_local,
+                ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]),
+                name: Some("checked_update".into()),
+            });
+            func.body.blocks[2].stmts.push(Statement::Assign {
+                place: Place::local(tuple_local),
+                rvalue: checked_update,
+                span: SourceSpan::default(),
+            });
+        } else {
+            *rvalue = update;
+        }
         func
     }
 
@@ -3743,7 +3930,7 @@ mod tests {
                                 rvalue: Rvalue::BinaryOp(
                                     BinOp::Add,
                                     Operand::Copy(Place::local(2)),
-                                    Operand::Constant(ConstValue::Uint(1, 64)),
+                                    Operand::Constant(ConstValue::Uint(1, 32)),
                                 ),
                                 span: SourceSpan::default(),
                             },
@@ -3969,8 +4156,10 @@ mod tests {
             .expect_err("an invalid machine width must never select mathematical Int");
         assert!(matches!(
             err,
-            ChcError::UnsupportedBodyArithmetic { detail, .. }
-                if detail.contains("unsupported or unavailable width")
+            ChcError::UnsupportedMir { kind, detail }
+                if kind == "MalformedTrustIr"
+                    && detail.contains("BinaryOp(Lt)")
+                    && detail.contains("audited Rust binary operation")
         ));
     }
 
@@ -3989,24 +4178,34 @@ mod tests {
             .expect_err("malformed MIR must not manufacture an ill-sorted BV transition");
         assert!(matches!(
             err,
-            ChcError::UnsupportedBodyArithmetic { detail, .. }
-                if detail.contains("operands do not match")
+            ChcError::UnsupportedMir { kind, detail }
+                if kind == "MalformedTrustIr"
+                    && detail.contains("BinaryOp(Add)")
+                    && detail.contains("audited Rust binary operation")
         ));
     }
 
     #[test]
-    fn test_checked_body_arithmetic_is_rejected_before_chc_lowering() {
+    fn test_checked_body_arithmetic_is_valid_but_rejected_by_both_chc_gates() {
         let func = loop_with_body_op(BinOp::Add, true);
-        let err = encode_function_loops(&func)
+        validate_chc_function(&func).expect("the AddWithOverflow tuple is faithful public MIR");
+        let loops = detect_loops(&func);
+        assert_eq!(loops.len(), 1);
+        let semantic_gap = reject_unmodeled_loop_body_arithmetic(&func, &loops[0])
             .expect_err("CheckedBinaryOp tuple/overflow semantics are not modeled");
         assert!(matches!(
-            err,
+            semantic_gap,
             ChcError::UnsupportedBodyArithmetic {
                 block: 2,
-                statement: 0,
+                statement: 1,
                 operation,
                 ..
             } if operation == "CheckedBinaryOp"
+        ));
+
+        assert!(matches!(
+            encode_function_loops(&func),
+            Err(ChcError::UnfaithfulLoopTransition { header: 1, .. })
         ));
     }
 
@@ -4385,7 +4584,10 @@ mod tests {
             try_binop_to_formula(BinOp::Sub, x.clone(), y.clone(), None, false).unwrap(),
             Formula::Sub(_, _)
         ));
-        assert!(matches!(try_binop_to_formula(BinOp::Mul, x, y, None, false).unwrap(), Formula::Mul(_, _)));
+        assert!(matches!(
+            try_binop_to_formula(BinOp::Mul, x, y, None, false).unwrap(),
+            Formula::Mul(_, _)
+        ));
     }
 
     #[test]
@@ -4400,7 +4602,10 @@ mod tests {
             try_binop_to_formula(BinOp::Eq, x.clone(), y.clone(), None, false).unwrap(),
             Formula::Eq(_, _)
         ));
-        assert!(matches!(try_binop_to_formula(BinOp::Ne, x, y, None, false).unwrap(), Formula::Not(_)));
+        assert!(matches!(
+            try_binop_to_formula(BinOp::Ne, x, y, None, false).unwrap(),
+            Formula::Not(_)
+        ));
     }
 
     // Bitwise ops now emit proper bitvector formulas.
@@ -4408,21 +4613,26 @@ mod tests {
     fn test_binop_to_formula_bitwise_emits_bv() {
         let x = Formula::Var("x".into(), Sort::Int);
         let y = Formula::Var("y".into(), Sort::Int);
-        let result = try_binop_to_formula(BinOp::BitAnd, x.clone(), y.clone(), Some(32), false).unwrap();
+        let result =
+            try_binop_to_formula(BinOp::BitAnd, x.clone(), y.clone(), Some(32), false).unwrap();
         // Should be BvToInt(BvAnd(IntToBv(x, 32), IntToBv(y, 32), 32), 32, false)
         assert!(matches!(result, Formula::BvToInt(_, 32, false)));
 
-        let result = try_binop_to_formula(BinOp::BitOr, x.clone(), y.clone(), Some(64), false).unwrap();
+        let result =
+            try_binop_to_formula(BinOp::BitOr, x.clone(), y.clone(), Some(64), false).unwrap();
         assert!(matches!(result, Formula::BvToInt(_, 64, false)));
 
-        let result = try_binop_to_formula(BinOp::BitXor, x.clone(), y.clone(), Some(8), false).unwrap();
+        let result =
+            try_binop_to_formula(BinOp::BitXor, x.clone(), y.clone(), Some(8), false).unwrap();
         assert!(matches!(result, Formula::BvToInt(_, 8, false)));
 
-        let result = try_binop_to_formula(BinOp::Shl, x.clone(), y.clone(), Some(32), false).unwrap();
+        let result =
+            try_binop_to_formula(BinOp::Shl, x.clone(), y.clone(), Some(32), false).unwrap();
         assert!(matches!(result, Formula::BvToInt(_, 32, false)));
 
         // Unsigned Shr uses BvLShr.
-        let result = try_binop_to_formula(BinOp::Shr, x.clone(), y.clone(), Some(32), false).unwrap();
+        let result =
+            try_binop_to_formula(BinOp::Shr, x.clone(), y.clone(), Some(32), false).unwrap();
         assert!(matches!(result, Formula::BvToInt(_, 32, false)));
 
         // Signed Shr uses BvAShr.
@@ -4480,6 +4690,246 @@ mod tests {
             formula,
             Formula::BvToInt(inner, 8, false)
                 if matches!(inner.as_ref(), Formula::BvAdd(_, _, 8))
+        ));
+    }
+
+    #[test]
+    fn float_comparisons_use_exact_ieee_formulas_and_other_float_ops_fail_closed() {
+        let func = counting_loop_function();
+        let pos_zero = Operand::Constant(ConstValue::FloatBits { bits: 0, width: 32 });
+        let neg_zero = Operand::Constant(ConstValue::FloatBits { bits: 0x8000_0000, width: 32 });
+        let nan = Operand::Constant(ConstValue::FloatBits { bits: 0x7fc0_0000, width: 32 });
+        let one = Operand::Constant(ConstValue::FloatBits { bits: 0x3f80_0000, width: 32 });
+        let two = Operand::Constant(ConstValue::FloatBits { bits: 0x4000_0000, width: 32 });
+
+        let lower = |op, lhs: Operand, rhs: Operand| {
+            rvalue_to_formula(&func, &Rvalue::BinaryOp(op, lhs, rhs))
+        };
+        assert!(matches!(lower(BinOp::Eq, one, two).unwrap(), Formula::FpEq(_, _)));
+        assert!(
+            matches!(
+                lower(BinOp::Eq, pos_zero.clone(), neg_zero.clone()).unwrap(),
+                Formula::Eq(_, _)
+            ),
+            "+0.0 == -0.0 must use the exact zero-magnitude equality path"
+        );
+        assert!(matches!(
+            lower(BinOp::Ne, nan.clone(), nan.clone()).unwrap(),
+            Formula::Not(inner) if matches!(inner.as_ref(), Formula::FpEq(_, _))
+        ));
+        assert!(matches!(
+            lower(BinOp::Lt, pos_zero.clone(), nan.clone()).unwrap(),
+            Formula::FpLt(_, _)
+        ));
+        assert!(matches!(
+            lower(BinOp::Le, pos_zero.clone(), nan.clone()).unwrap(),
+            Formula::FpLe(_, _)
+        ));
+        assert!(matches!(
+            lower(BinOp::Gt, pos_zero.clone(), nan.clone()).unwrap(),
+            Formula::FpGt(_, _)
+        ));
+        assert!(matches!(
+            lower(BinOp::Ge, pos_zero.clone(), nan.clone()).unwrap(),
+            Formula::FpGe(_, _)
+        ));
+
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Rem, BinOp::Cmp] {
+            assert!(matches!(
+                lower(op, pos_zero.clone(), neg_zero.clone()),
+                Err(ChcError::UnsupportedMir { kind, .. }) if kind == "Rvalue::BinaryOp"
+            ));
+        }
+
+        let wide = Operand::Constant(ConstValue::FloatBits { bits: 0, width: 64 });
+        assert!(matches!(
+            lower(BinOp::Eq, pos_zero.clone(), wide),
+            Err(ChcError::UnsupportedMir { .. })
+        ));
+        assert!(matches!(
+            rvalue_to_formula_with_dest(
+                &func,
+                &Rvalue::BinaryOp(BinOp::Add, pos_zero.clone(), neg_zero),
+                Some(("ret", Sort::BitVec(32), None, false)),
+            ),
+            Err(ChcError::UnsupportedMir { .. })
+        ));
+        assert!(matches!(
+            rvalue_to_formula(
+                &func,
+                &Rvalue::UnaryOp(UnOp::Neg, pos_zero),
+            ),
+            Err(ChcError::UnsupportedMir { kind, .. })
+                if kind == "Rvalue::UnaryOp(Neg)"
+        ));
+    }
+
+    #[test]
+    fn bool_bitwise_chc_lowering_is_logical_not_integer_bv() {
+        let func = counting_loop_function();
+        let yes = Operand::Constant(ConstValue::Bool(true));
+        let no = Operand::Constant(ConstValue::Bool(false));
+        let lower = |op| rvalue_to_formula(&func, &Rvalue::BinaryOp(op, yes.clone(), no.clone()));
+
+        assert!(matches!(lower(BinOp::BitAnd).unwrap(), Formula::And(_)));
+        assert!(matches!(lower(BinOp::BitOr).unwrap(), Formula::Or(_)));
+        assert!(matches!(
+            lower(BinOp::BitXor).unwrap(),
+            Formula::Not(inner) if matches!(inner.as_ref(), Formula::Eq(_, _))
+        ));
+        assert!(matches!(lower(BinOp::Eq).unwrap(), Formula::Eq(_, _)));
+        assert!(matches!(
+            lower(BinOp::Ne).unwrap(),
+            Formula::Not(inner) if matches!(inner.as_ref(), Formula::Eq(_, _))
+        ));
+        assert!(matches!(
+            lower(BinOp::Add),
+            Err(ChcError::UnsupportedMir { kind, .. }) if kind == "Rvalue::BinaryOp"
+        ));
+    }
+
+    #[test]
+    fn bool_const_params_validate_and_remain_distinct_bool_symbols() {
+        let b = Operand::Constant(ConstValue::ConstParam {
+            index: 0,
+            name: "B".into(),
+            width: 1,
+            signed: false,
+        });
+        let c = Operand::Constant(ConstValue::ConstParam {
+            index: 1,
+            name: "C".into(),
+            width: 1,
+            signed: false,
+        });
+
+        let mut func = counting_loop_function();
+        let bitand = Rvalue::BinaryOp(BinOp::BitAnd, b.clone(), c.clone());
+        let Statement::Assign { rvalue, .. } = &mut func.body.blocks[1].stmts[0] else {
+            unreachable!("counting-loop header owns one assignment")
+        };
+        *rvalue = bitand.clone();
+        validate_chc_function(&func)
+            .expect("extractor-shaped bool const parameters are faithful public MIR");
+
+        let and = rvalue_to_formula(&func, &bitand)
+            .expect("bool const parameters must lower through logical conjunction");
+        let Formula::And(arms) = &and else {
+            panic!("bool BitAnd must not become an integer/BV operation: {and:?}")
+        };
+        assert_eq!(arms.len(), 2);
+        let expected =
+            [trust_types::const_param_symbol(0, "B"), trust_types::const_param_symbol(1, "C")];
+        for (arm, expected_name) in arms.iter().zip(expected.iter()) {
+            assert!(matches!(arm, Formula::Var(name, Sort::Bool) if name == expected_name));
+        }
+        assert_ne!(expected[0], expected[1], "parameter identity must not collapse");
+
+        let eq = rvalue_to_formula(&func, &Rvalue::BinaryOp(BinOp::Eq, b, c))
+            .expect("bool const-parameter equality must remain Bool-sorted");
+        assert!(matches!(
+            eq,
+            Formula::Eq(lhs, rhs)
+                if matches!(lhs.as_ref(), Formula::Var(_, Sort::Bool))
+                    && matches!(rhs.as_ref(), Formula::Var(_, Sort::Bool))
+        ));
+    }
+
+    #[test]
+    fn identityless_opaque_scalars_are_rejected_by_every_chc_entry() {
+        let mut func = counting_loop_function();
+        let Statement::Assign { rvalue, .. } = &mut func.body.blocks[2].stmts[0] else {
+            unreachable!("counting-loop body owns one assignment")
+        };
+        *rvalue = Rvalue::BinaryOp(
+            BinOp::Sub,
+            Operand::Constant(ConstValue::OpaqueScalar { width: 32, signed: false }),
+            Operand::Constant(ConstValue::OpaqueScalar { width: 32, signed: false }),
+        );
+
+        crate::validate_function(&func)
+            .expect("opaque scalar types are structurally valid before proof admission");
+        let assert_opaque = |error: ChcError| {
+            assert!(matches!(
+                error,
+                ChcError::UnsupportedMir { kind, detail }
+                    if kind == "ConstValue::OpaqueScalar"
+                        && detail.contains("identity-less opaque")
+            ));
+        };
+        assert_opaque(
+            encode_function_loops(&func)
+                .expect_err("functional CHC must not alias distinct opaque occurrences"),
+        );
+
+        let loops = detect_loops(&func);
+        let n = Operand::Copy(Place::local(1));
+        let i = Operand::Copy(Place::local(2));
+        let obligation = header_unsigned_sub(&n, &i);
+        assert_opaque(
+            try_build_loop_safety_chc_system(&func, &loops[0], &obligation)
+                .expect_err("typed safety CHC must preserve the same opaque refusal"),
+        );
+        #[allow(deprecated)]
+        let legacy = build_loop_safety_chc_system(&func, &loops[0], &obligation);
+        assert!(legacy.is_none(), "legacy wrapper must fail closed on the typed refusal");
+
+        assert!(matches!(
+            const_value_to_formula_checked(&ConstValue::OpaqueScalar {
+                width: 32,
+                signed: false,
+            }),
+            Err(ChcError::UnsupportedMir { kind, .. })
+                if kind == "ConstValue::OpaqueScalar"
+        ));
+    }
+
+    #[test]
+    fn identity_bearing_const_params_remain_distinct_in_loop_transitions() {
+        let mut func = counting_loop_function();
+        let a_name = trust_types::const_param_symbol(0, "A");
+        let b_name = trust_types::const_param_symbol(1, "B");
+        let Statement::Assign { rvalue, .. } = &mut func.body.blocks[2].stmts[0] else {
+            unreachable!("counting-loop body owns one assignment")
+        };
+        *rvalue = Rvalue::BinaryOp(
+            BinOp::Sub,
+            Operand::Constant(ConstValue::ConstParam {
+                index: 0,
+                name: "A".into(),
+                width: 32,
+                signed: false,
+            }),
+            Operand::Constant(ConstValue::ConstParam {
+                index: 1,
+                name: "B".into(),
+                width: 32,
+                signed: false,
+            }),
+        );
+
+        let system = encode_function_loops(&func)
+            .expect("identity-bearing const parameters remain supported CHC inputs");
+        let transition = &system.inductive_clauses()[0].constraint;
+        for name in [&a_name, &b_name] {
+            assert!(
+                formula_contains(transition, &|formula| {
+                    matches!(formula, Formula::Var(found, Sort::Int) if found == name)
+                }),
+                "transition must retain const-parameter identity {name}: {transition:?}"
+            );
+        }
+        assert_ne!(a_name, b_name);
+    }
+
+    #[test]
+    fn repeat_chc_lowering_never_collapses_an_array_to_its_element() {
+        let func = counting_loop_function();
+        let repeat = Rvalue::Repeat(Operand::Constant(ConstValue::Int(7)), 4);
+        assert!(matches!(
+            rvalue_to_formula(&func, &repeat),
+            Err(ChcError::UnsupportedMir { kind, detail })
+                if kind == "Rvalue::Repeat" && detail.contains("array Store")
         ));
     }
 
@@ -4833,7 +5283,8 @@ mod tests {
         let mut vars = std::collections::BTreeMap::new();
         let a = Formula::IntToBv(Box::new(Formula::Var("a".into(), Sort::Int)), 128);
         let b = Formula::IntToBv(Box::new(Formula::Var("b".into(), Sort::Int)), 128);
-        let wrap = Formula::BvToInt(Box::new(Formula::BvAdd(Box::new(a), Box::new(b), 128)), 128, true);
+        let wrap =
+            Formula::BvToInt(Box::new(Formula::BvAdd(Box::new(a), Box::new(b), 128)), 128, true);
         let json = chc_formula_to_typed_expr(&wrap, &mut vars)
             .expect("width-128 wrapping-add bridge must encode end-to-end");
         assert_eq!(json["op"], "bv_to_int");

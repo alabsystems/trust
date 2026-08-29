@@ -1,6 +1,5 @@
 //! Tests for trust-cg-bridge.
 
-use trust_types::UnwindEdge;
 use trust_cg_lower::instructions::{
     AtomicOrdering as LirAtomicOrdering, AtomicRmwOp, Block, FloatCC, IntCC, Opcode, Value,
 };
@@ -8,7 +7,7 @@ use trust_cg_lower::types::Type as LirType;
 use trust_types::{
     AggregateKind, AtomicOpKind, AtomicOperation, AtomicOrdering, BasicBlock as TrustBlock, BinOp,
     BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan, Statement,
-    Terminator, Ty, UnOp, VerifiableBody, VerifiableFunction,
+    Terminator, Ty, UnOp, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::*;
@@ -48,12 +47,16 @@ fn test_map_type_unit() {
 
 #[test]
 fn test_map_type_fieldless_adt_fails_closed() {
-    let ty = Ty::Adt { adt_kind: None, layout: None,
+    let ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     assert!(matches!(map_type(&ty), Err(BridgeError::UnsupportedType(_))));
 }
 
@@ -466,6 +469,7 @@ fn test_lower_call_basic() {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "other_fn".to_string(),
                     args: vec![],
@@ -515,6 +519,7 @@ fn test_lower_atomic_fetch_add_call() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::intrinsics::atomic_xadd_seqcst".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -1166,6 +1171,7 @@ fn test_lower_call_terminator() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "callee".to_string(),
                         args: vec![Operand::Constant(ConstValue::Int(10))],
@@ -1213,6 +1219,57 @@ fn test_lower_call_terminator() {
 }
 
 #[test]
+fn test_lower_tail_call_uses_exact_call_return_projection() {
+    let func = VerifiableFunction {
+        name: "tail_caller".to_string(),
+        def_path: "test::tail_caller".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: Ty::i32(), name: None }],
+            blocks: vec![TrustBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::TailCall {
+                    func: "callee".to_string(),
+                    args: vec![Operand::Constant(ConstValue::Int(10))],
+                    span: SourceSpan::default(),
+                    atomic: None,
+                    is_foreign: false,
+                    is_unsafe_sig: false,
+                    callee_identity: None,
+                },
+            }],
+            arg_count: 0,
+            return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+
+    let lir = lower_to_lir(&func).expect("function-level TailCall must lower exactly");
+    let entry = &lir.blocks[&Block(0)];
+    assert!(entry.instructions.iter().any(
+        |instruction| matches!(&instruction.opcode, Opcode::Call { name } if name == "callee")
+    ));
+    assert!(
+        entry
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.opcode, Opcode::Jump { .. }))
+    );
+    assert!(lir.blocks.values().any(|block| {
+        block.instructions.iter().any(|instruction| matches!(instruction.opcode, Opcode::Return))
+    }));
+
+    let error = lower_body_to_lir("bare_tail", &func.body)
+        .expect_err("body-only lowering must fail closed without return-place context");
+    assert!(error.to_string().contains("TailCall requires the VerifiableFunction"));
+}
+
+#[test]
 fn test_emit_object_scalar_call_result_return_uses_value_types() {
     let callee = VerifiableFunction {
         name: "callee_i32".to_string(),
@@ -1257,6 +1314,7 @@ fn test_emit_object_scalar_call_result_return_uses_value_types() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "callee_i32".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -1298,12 +1356,16 @@ fn test_emit_object_scalar_call_result_return_uses_value_types() {
 
 #[test]
 fn test_lower_aggregate_call_result_populates_value_types() {
-    let pair_ty = Ty::Adt { adt_kind: None, layout: None,
+    let pair_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Pair".into(),
         fields: vec![("left".into(), Ty::i64()), ("right".into(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "call_pair".to_string(),
         def_path: "test::call_pair".to_string(),
@@ -1317,6 +1379,7 @@ fn test_lower_aggregate_call_result_populates_value_types() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "make_pair".to_string(),
                         args: vec![],
@@ -1368,6 +1431,7 @@ fn test_lower_call_no_continuation() {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "abort".to_string(),
                     args: vec![],
@@ -2259,24 +2323,32 @@ fn test_lower_aggregate_adt() {
             locals: vec![
                 LocalDecl {
                     index: 0,
-                    ty: Ty::Adt { adt_kind: None, layout: None,
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "Point".into(),
                         fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::i32())],
                         disc_index_safe: false,
-                     faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: None,
                 },
                 LocalDecl { index: 1, ty: Ty::i32(), name: Some("x".into()) },
                 LocalDecl { index: 2, ty: Ty::i32(), name: Some("y".into()) },
                 LocalDecl {
                     index: 3,
-                    ty: Ty::Adt { adt_kind: None, layout: None,
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "Point".into(),
                         fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::i32())],
                         disc_index_safe: false,
-                     faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: None,
                 },
             ],
@@ -2285,7 +2357,12 @@ fn test_lower_aggregate_adt() {
                 stmts: vec![Statement::Assign {
                     place: Place::local(3),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Point".into(), variant: 0, active_field: None, args: None },
+                        AggregateKind::Adt {
+                            name: "Point".into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
                     span: SourceSpan::default(),
@@ -2293,12 +2370,16 @@ fn test_lower_aggregate_adt() {
                 terminator: Terminator::Return,
             }],
             arg_count: 2,
-            return_ty: Ty::Adt { adt_kind: None, layout: None,
+            return_ty: Ty::Adt {
+                adt_kind: None,
+                layout: None,
                 variants: Vec::new(),
                 name: "Point".into(),
                 fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::i32())],
                 disc_index_safe: false,
-             faithful_enum_repr: None, enum_layout: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+            },
             datatype_defs: Default::default(),
         },
         contracts: vec![],
@@ -2323,12 +2404,16 @@ fn test_lower_aggregate_adt() {
 fn test_lower_aggregate_adt_enum_variant_writes_discriminant() {
     // Trust: #828 — constructing an enum variant (e.g., Some(42)) must
     // write the discriminant tag at field 0 and data at field 1+.
-    let option_ty = Ty::Adt { adt_kind: None, layout: None,
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Option".into(),
         fields: vec![("tag".into(), Ty::i64()), ("value".into(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "make_some".to_string(),
         def_path: "test::make_some".to_string(),
@@ -2398,12 +2483,16 @@ fn test_lower_aggregate_adt_enum_variant_writes_discriminant() {
 #[test]
 fn test_lower_aggregate_adt_none_variant_no_data() {
     // Trust: #828 — constructing None (variant 0, no data fields).
-    let option_ty = Ty::Adt { adt_kind: None, layout: None,
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Option".into(),
         fields: vec![("tag".into(), Ty::i64()), ("value".into(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "make_none".to_string(),
         def_path: "test::make_none".to_string(),
@@ -2457,12 +2546,16 @@ fn test_lower_aggregate_adt_none_variant_no_data() {
 
 #[test]
 fn test_lower_fieldless_option_some_fails_closed() {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None,
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "make_some_fieldless".to_string(),
         def_path: "test::make_some_fieldless".to_string(),
@@ -2505,12 +2598,16 @@ fn test_lower_fieldless_option_some_fails_closed() {
 
 #[test]
 fn test_lower_checked_div_like_fieldless_option_fails_closed() {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None,
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "checked_div_like".to_string(),
         def_path: "test::checked_div_like".to_string(),
@@ -2584,12 +2681,16 @@ fn test_lower_checked_div_like_fieldless_option_fails_closed() {
 
 #[test]
 fn test_emit_object_struct_return_after_aggregate_construction() {
-    let pair_ty = Ty::Adt { adt_kind: None, layout: None,
+    let pair_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Pair".into(),
         fields: vec![("left".into(), Ty::i64()), ("right".into(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "make_pair".to_string(),
         def_path: "test::make_pair".to_string(),
@@ -2605,7 +2706,12 @@ fn test_emit_object_struct_return_after_aggregate_construction() {
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Pair".into(), variant: 0, active_field: None, args: None },
+                        AggregateKind::Adt {
+                            name: "Pair".into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
                         vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     ),
                     span: SourceSpan::default(),
@@ -2766,6 +2872,7 @@ fn make_checked_add_overflow_main_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "checked_add_overflowing".to_string(),
                         args: vec![
@@ -2957,7 +3064,9 @@ fn test_emit_object_checked_add_overflow_linked_main_does_not_self_call() {
 
 #[test]
 fn test_lower_drop_non_copy_adt_requires_resolved_drop_glue() {
-    let string_ty = Ty::Adt { adt_kind: None, layout: None,
+    let string_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "String".into(),
         fields: vec![
@@ -2966,7 +3075,9 @@ fn test_lower_drop_non_copy_adt_requires_resolved_drop_glue() {
             ("cap".into(), Ty::i64()),
         ],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "drop_string".to_string(),
         def_path: "test::drop_string".to_string(),
@@ -3431,7 +3542,13 @@ fn make_chain(n: usize) -> VerifiableFunction {
         name: format!("chain_{n}"),
         def_path: format!("test::chain_{n}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i32(), datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::i32(),
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -3876,12 +3993,16 @@ fn test_lower_discriminant_produces_struct_gep_load() {
                 LocalDecl { index: 0, ty: Ty::i64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None,
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
                         variants: Vec::new(),
                         name: "Option".into(),
                         fields: vec![("tag".into(), Ty::i64()), ("value".into(), Ty::i32())],
                         disc_index_safe: false,
-                     faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("opt".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::i64(), name: None },
@@ -3922,12 +4043,16 @@ fn test_lower_discriminant_produces_struct_gep_load() {
 
 #[test]
 fn test_lower_discriminant_fieldless_option_fails_closed() {
-    let option_ty = Ty::Adt { adt_kind: None, layout: None,
+    let option_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "get_fieldless_discr".to_string(),
         def_path: "test::get_fieldless_discr".to_string(),
@@ -3962,12 +4087,16 @@ fn test_lower_discriminant_fieldless_option_fails_closed() {
 
 #[test]
 fn test_lower_set_discriminant_explicit_tag_writes_tag_field() {
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None,
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Tagged".into(),
         fields: vec![("payload".into(), Ty::i32()), ("__discriminant".into(), Ty::u8())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "set_discr".to_string(),
         def_path: "test::set_discr".to_string(),
@@ -4017,12 +4146,16 @@ fn test_lower_set_discriminant_explicit_tag_writes_tag_field() {
 
 #[test]
 fn test_lower_set_discriminant_untagged_adt_fails_closed() {
-    let enum_ty = Ty::Adt { adt_kind: None, layout: None,
+    let enum_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Untagged".into(),
         fields: vec![("payload".into(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "set_discr_untagged".to_string(),
         def_path: "test::set_discr_untagged".to_string(),
@@ -4166,6 +4299,7 @@ fn test_lower_diverging_call_no_target() {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "panic".to_string(),
                     args: vec![],
@@ -4553,6 +4687,7 @@ fn test_lower_call_with_args_and_continuation() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "add".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -4810,7 +4945,9 @@ fn test_lower_nested_aggregate_struct_containing_tuple() {
     use trust_types::AggregateKind;
 
     let inner_tuple_ty = Ty::Tuple(vec![Ty::i32(), Ty::Bool]);
-    let outer_adt_ty = Ty::Adt { adt_kind: None, layout: None,
+    let outer_adt_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Wrapper".to_string(),
         fields: vec![
@@ -4818,7 +4955,9 @@ fn test_lower_nested_aggregate_struct_containing_tuple() {
             ("extra".to_string(), Ty::i64()),
         ],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
 
     let func = VerifiableFunction {
         name: "nested_agg".to_string(),
@@ -5156,18 +5295,26 @@ fn test_map_type_nested_ref_to_tuple() {
 #[test]
 fn test_map_type_deeply_nested_adt() {
     // Trust: ADT containing another ADT should produce nested Struct.
-    let inner = Ty::Adt { adt_kind: None, layout: None,
+    let inner = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Inner".to_string(),
         fields: vec![("x".to_string(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
-    let outer = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let outer = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "Outer".to_string(),
         fields: vec![("a".to_string(), inner), ("b".to_string(), Ty::Bool)],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let mapped = map_type(&outer).unwrap();
     assert_eq!(mapped, LirType::Struct(vec![LirType::Struct(vec![LirType::I32]), LirType::B1,]));
 }
@@ -5277,30 +5424,46 @@ fn test_stress_large_basic_block_50_statements() {
 fn test_stress_deeply_nested_aggregate_types() {
     // Struct(Struct(Struct(i32))) — 4 levels deep
     let level0 = Ty::i32();
-    let level1 = Ty::Adt { adt_kind: None, layout: None,
+    let level1 = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "L1".to_string(),
         fields: vec![("val".to_string(), level0)],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
-    let level2 = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let level2 = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "L2".to_string(),
         fields: vec![("inner".to_string(), level1.clone())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
-    let level3 = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let level3 = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "L3".to_string(),
         fields: vec![("deep".to_string(), level2.clone()), ("tag".to_string(), Ty::Bool)],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
-    let level4 = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let level4 = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "L4".to_string(),
         fields: vec![("nested".to_string(), level3), ("count".to_string(), Ty::i64())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
 
     // Verify type mapping produces the right nested structure.
     let lir_ty = map_type(&level4).unwrap();
@@ -6678,6 +6841,7 @@ fn test_lower_call_continuation_join_uses_block_param_for_call_defined_local() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "left_call".to_string(),
                         args: vec![],
@@ -6693,6 +6857,7 @@ fn test_lower_call_continuation_join_uses_block_param_for_call_defined_local() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "right_call".to_string(),
                         args: vec![],
@@ -6818,6 +6983,7 @@ fn test_lower_call_join_uses_block_param_for_projected_dest_index() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "index_write".to_string(),
                         args: vec![],
@@ -6906,6 +7072,7 @@ fn test_edge_case_closure_call() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "closure$0::call".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -6971,6 +7138,7 @@ fn test_edge_case_vtable_dispatch() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "<dyn Trait>::method".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -7139,12 +7307,16 @@ fn test_edge_case_aggregate_construction_tuple() {
 #[test]
 fn test_edge_case_aggregate_construction_adt() {
     // Construct an ADT with variant.
-    let adt_ty = Ty::Adt { adt_kind: None, layout: None,
+    let adt_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "MyStruct".to_string(),
         fields: vec![("x".to_string(), Ty::i32()), ("y".to_string(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "make_adt".to_string(),
         def_path: "test::make_adt".to_string(),
@@ -7192,12 +7364,16 @@ fn test_edge_case_aggregate_construction_adt() {
 fn test_edge_case_downcast_and_field_access() {
     // Simulate accessing a field through a downcast projection:
     // place = _1.downcast(0).field(0)
-    let adt_ty = Ty::Adt { adt_kind: None, layout: None,
+    let adt_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "MyEnum".to_string(),
         fields: vec![("data".to_string(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "downcast_field".to_string(),
         def_path: "test::downcast_field".to_string(),
@@ -8121,12 +8297,16 @@ fn test_subslice_projection() {
 
 #[test]
 fn test_drop_adt_fails_without_resolved_drop_glue() {
-    let adt_ty = Ty::Adt { adt_kind: None, layout: None,
+    let adt_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         variants: Vec::new(),
         name: "TestStruct".to_string(),
         fields: vec![("x".to_string(), Ty::i32())],
         disc_index_safe: false,
-     faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "drop_adt".to_string(),
         def_path: "test::drop_adt".to_string(),

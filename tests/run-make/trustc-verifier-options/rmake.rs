@@ -145,7 +145,10 @@ fn main() {
         // cross-check that had to be kept in step with the callers.
         // Trust: `certify` joined the policy vocabulary (tcb-closure campaign), so the
         // rejection banner enumerates four values now, not three.
-        ("-Ztrust-policy=memory-safe,advisory", "one of `strict`, `certify`, `advisory`, or `memory-safe`"),
+        (
+            "-Ztrust-policy=memory-safe,advisory",
+            "one of `strict`, `certify`, `advisory`, or `memory-safe`",
+        ),
         ("-Ztrust-policy=survey", "one of `strict`, `certify`, `advisory`, or `memory-safe`"),
         ("-Ztrust-verify", "requires one of `on` or `off`"),
         ("-Ztrust-verify=yes", "one of `on` or `off`"),

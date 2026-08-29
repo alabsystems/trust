@@ -27,10 +27,7 @@ fn generator_dialect_forms_register_in_the_island_environment() {
         ("ne", "def ne_pin (a : Int) (b : Int) : Prop := (a \u{2260} b)"),
         ("unary_neg", "def neg_pin (x : Int) : Int := (- x)"),
         ("div_mod", "def dm_pin (x : Int) : Int := ((x / 2) + (x % 2))"),
-        (
-            "truth_not",
-            "def truth_pin : Prop := (True \u{2227} (\u{00ac} False))",
-        ),
+        ("truth_not", "def truth_pin : Prop := (True \u{2227} (\u{00ac} False))"),
         (
             "disjunction_ge_gt",
             "def disj_pin (a : Int) (b : Int) : Prop := ((a > b) \u{2228} (b \u{2265} a))",
@@ -41,10 +38,7 @@ fn generator_dialect_forms_register_in_the_island_environment() {
             "let_chain",
             "def let_pin (x : Int) : Int := (let y := (x + 1); (let z := (y * y); (z - 1)))",
         ),
-        (
-            "ite_cmp",
-            "def abs_pin (x : Int) : Int := (if (x < 0) then (- x) else x)",
-        ),
+        ("ite_cmp", "def abs_pin (x : Int) : Int := (if (x < 0) then (- x) else x)"),
         (
             "ite_conj_nested",
             "def sign_pin (x : Int) (n : Int) : Int := (if ((0 \u{2264} x) \u{2227} (x < n)) then x else (if (x = 0) then 0 else 1))",
@@ -74,10 +68,7 @@ fn generator_dialect_forms_register_in_the_island_environment() {
             "forall_int",
             "def allq_pin (n : Int) : Prop := (forall i : Int, ((0 \u{2264} i) \u{2192} (i \u{2264} (n + i))))",
         ),
-        (
-            "exists_unicode",
-            "def wit_pin (n : Int) : Prop := (\u{2203} j : Int, (n = (j + j)))",
-        ),
+        ("exists_unicode", "def wit_pin (n : Int) : Prop := (\u{2203} j : Int, (n = (j + j)))"),
         (
             "nested_quantifiers",
             "def dense_pin : Prop := (forall i : Int, (\u{2203} j : Int, (i \u{2264} j)))",
@@ -107,20 +98,14 @@ fn generator_dialect_forms_register_in_the_island_environment() {
             "seq_type_alias",
             "def SeqPin (a : Type) : Type := List a\n\ndef seq_alias_use (xs : SeqPin Int) : Prop := (xs = xs)",
         ),
-        (
-            "seq_len_int",
-            "def seq_len_pin (xs : List Int) : Int := (Int.ofNat xs.length)",
-        ),
+        ("seq_len_int", "def seq_len_pin (xs : List Int) : Int := (Int.ofNat xs.length)"),
         (
             "seq_index_get",
             "def seq_get_pin (xs : List Int) (i : Nat) : Prop := (xs.get? i = xs.get? i)",
         ),
         // §3 entry 4: membership — pearlite `xs.contains(x)` renders the
         // kernel's List.Mem Prop directly (Bool-eq spellings do not register).
-        (
-            "seq_contains_mem",
-            "def seq_mem_pin (xs : List Int) (x : Int) : Prop := (List.Mem x xs)",
-        ),
+        ("seq_contains_mem", "def seq_mem_pin (xs : List Int) (x : Int) : Prop := (List.Mem x xs)"),
         // The machine-element bounding lane's foundation form: the
         // well-formedness predicate for a u64-element collection, expressed
         // entirely in already-pinned vocabulary (membership + the bounded

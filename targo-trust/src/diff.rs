@@ -882,7 +882,6 @@ fn certified_test_execution_integrity_errors(
     errors
 }
 
-
 /// Classify how a function's verification status changed.
 fn classify_change(
     baseline: &FunctionSnapshot,

@@ -57,12 +57,20 @@
 //   * a TAMPERED / wrong ctor (`is_whnf.sort n` against an `is_whnf(KExpr.lam ..)`
 //     goal) MUST be kernel-REJECTED — `KExpr.sort n` is not def-equal to
 //     `KExpr.lam ..`, so the kernel refuses the mismatch;
-//   * the known delta-reducing const `kcre_name_116` MUST link as a
-//     `NeutralConst` candidate but be kernel-REJECTED, proving that const-head
-//     classification alone cannot mint evidence;
-//   * minting is GATED on all three controls failing as required — each mint
-//     returns `None` unless the stuck-app link fails, the wrong ctor is rejected,
-//     AND the reducing-const candidate is rejected.
+//   * a DELTA-REDUCING const MUST link as a `NeutralConst` candidate and still be
+//     kernel-REJECTED, proving that const-head classification alone cannot mint
+//     evidence. The witness is DISCOVERED, not pinned: this control used to name
+//     `kcre_name_116`, the reflected env was regenerated, that positionally
+//     generated name drifted into the no-delta-reduct set, and — because minting
+//     is gated on the control — every certificate was silently withheld from July
+//     until 2026-08-23. See `discriminating_delta_const` and
+//     reports/2026-08-23-is-whnf-mint-blocked-by-control-3.md;
+//   * minting is GATED on all four controls (stuck app, beta redex, wrong ctor,
+//     delta-reducing const) failing as required — each mint returns `None` unless
+//     every one of them is demonstrated. `tests::mint_gate_canary_controls_
+//     demonstrable_and_mint_closes` (opt-in lane `scripts/trust_control_canary.sh`)
+//     is the instrument that reports when one of them stops being demonstrable,
+//     because a blocked gate is otherwise indistinguishable from a bare `None`.
 //
 // GROUNDING CAVEAT (stated honestly): this is a MODEL-LEVEL discharge over
 // clean-verify's 7-constructor `KExpr` abstraction of the kernel's ~20-ctor Rust
@@ -103,9 +111,23 @@ const IS_WHNF_LINEAGE_DOMAIN: &str = "trust-certify.cleancic.checker-core.is-whn
 /// step MUST fail closed on it.
 const STUCK_APP_KEXPR_SRC: &str = "KExpr.app (KExpr.bvar Nat.zero) (KExpr.sort Level.zero)";
 
-/// A definition present in `the_red_env`. It therefore has a delta reduct and
-/// MUST NOT inhabit `const_whnf`; this is the discriminating const-head control.
-const DELTA_REDUCING_CONST_KEXPR_SRC: &str = "KExpr.const kcre_name_116 (ListType.nil Level)";
+/// FAST-PATH candidates for the discriminating const-head control: reflected
+/// environment names observed to delta-reduce. This list is an OPTIMIZATION,
+/// never the authority — if every entry has drifted, [`discriminating_delta_const`]
+/// finds a live witness by scan. Historical note: this control used to hardcode
+/// `kcre_name_116` alone. These names are POSITIONALLY GENERATED, so a
+/// regenerated environment silently repoints them; `kcre_name_116` did drift
+/// into the no-delta-reduct set, which blocked every mint (the gate correctly
+/// refused to certify while it could not demonstrate its own negative control).
+/// See reports/2026-08-23-is-whnf-mint-blocked-by-control-3.md.
+const DELTA_REDUCING_CONST_CANDIDATES: &[&str] =
+    &["kcre_name_15", "kcre_name_31", "kcre_name_116"];
+
+/// Name stems and index bound for the fallback scan. Rejections cluster early,
+/// and the scan STOPS at the first witness, so the common cost is a handful of
+/// kernel checks.
+const DELTA_SCAN_STEMS: &[&str] = &["kcre_name", "kcre_expr", "kcre_nat"];
+const DELTA_SCAN_LIMIT: u32 = 256;
 
 /// The statically-classified WHNF head of a concrete `KExpr` `_0`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -383,10 +405,61 @@ fn wrong_ctor_kernel_rejected(env: &Environment) -> bool {
 /// the kernel because its delta reduct is not `none`. This pins the distinction
 /// between syntactic const-head classification and a valid `const_whnf` witness.
 fn delta_reducing_const_kernel_rejected(env: &Environment) -> bool {
-    let Some(linked) = link_whnf(env, DELTA_REDUCING_CONST_KEXPR_SRC) else {
-        return false;
-    };
-    linked.head == WhnfHead::NeutralConst && !kernel_checks_goal(env, &linked.proof, &linked.goal)
+    discriminating_delta_const(env).is_some()
+}
+
+/// Whether `name` is a LIVE witness that the delta-reduct computation still
+/// discriminates: its `KExpr.const` PASSES syntactic `NeutralConst`
+/// classification (so it is a genuine candidate, not an elaboration failure)
+/// and the kernel nonetheless REJECTS the derived `is_whnf.neutral` proof —
+/// which it can only do by computing `delta_reduct (red_def the_red_env) …` to
+/// something other than `none`.
+fn const_is_kernel_discriminated(env: &Environment, name: &str) -> bool {
+    let src = format!("KExpr.const {name} (ListType.nil Level)");
+    match link_whnf(env, &src) {
+        Some(linked) if linked.head == WhnfHead::NeutralConst => {
+            !kernel_checks_goal(env, &linked.proof, &linked.goal)
+        }
+        // Not a const-head candidate at all (absent/ill-formed): says nothing
+        // about discrimination either way, so it is not a witness.
+        _ => false,
+    }
+}
+
+/// Find a constant the kernel demonstrably discriminates against, returning its
+/// name for diagnostics.
+///
+/// WHY THIS SEARCHES INSTEAD OF PINNING. The old control asserted a hardcoded,
+/// positionally-generated name and returned a bare `false` when it stopped
+/// delta-reducing. That collapsed two outcomes with opposite severity into one
+/// symptom: "my premise went stale" (benign, and what actually happened) and
+/// "the kernel accepted a const that DOES delta-reduce" (a masquerade hole).
+/// Because minting is gated on this control, the stale premise silently
+/// withheld every certificate, and the two readings were indistinguishable
+/// without a multi-hour bisect.
+///
+/// Searching removes the ambiguity by construction. A `Some` is a POSITIVE,
+/// freshly re-earned demonstration that the gate still discriminates — the same
+/// property the pinned vector was there to show, no weaker. A `None` is now the
+/// strictly stronger, genuinely alarming statement that NOTHING in the scanned
+/// space is discriminated, which is the condition actually worth failing closed
+/// on. The fast path keeps the common case at one kernel check.
+fn discriminating_delta_const(env: &Environment) -> Option<String> {
+    for candidate in DELTA_REDUCING_CONST_CANDIDATES {
+        if const_is_kernel_discriminated(env, candidate) {
+            return Some((*candidate).to_string());
+        }
+    }
+    // Every pinned candidate drifted: re-earn the demonstration by scan.
+    for index in 0..DELTA_SCAN_LIMIT {
+        for stem in DELTA_SCAN_STEMS {
+            let name = format!("{stem}_{index}");
+            if const_is_kernel_discriminated(env, &name) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 /// SHA-256 lineage digest binding the proof term, the empty closed context, the
@@ -581,8 +654,31 @@ const MIR_SORT_JSON: &str =
     include_str!("../fixtures/checker_core_is_whnf_mir/clean_kernel.expr.Expr.sort.json");
 const MIR_ARROW_JSON: &str =
     include_str!("../fixtures/checker_core_is_whnf_mir/clean_kernel.expr.Expr.arrow.json");
+// SPEC-BEARING sealed variants (provenance: fixture directory `PROVENANCE.md`).
+// Each is byte-for-byte its audited base fixture above — the fork-extracted MIR
+// (`body`, `def_path`, `span`, …) is VERBATIM, no instruction touched — except
+// that `spec.ensures` is `["is_whnf(result)"]`: the one contract clause whose
+// obligation this lane discharges, in exactly the representation the vcgen EMIT
+// lane consumes. They exist so an end-to-end EMIT->DISCHARGE pin can present a
+// function that CARRIES the `is_whnf(result)` ensures without mutating sealed
+// material after load. [`sealed_constructor_material`] does not take these files
+// on faith: a variant is admitted ONLY if its bytes equal the in-code derivation
+// (base + that single ensures), so an edited variant file can never widen
+// authority beyond the audited base MIR + the exact contract string.
+const MIR_PROP_ENSURES_JSON: &str = include_str!(
+    "../fixtures/checker_core_is_whnf_mir/clean_kernel.expr.Expr.prop.ensures_is_whnf.json"
+);
+const MIR_ARROW_ENSURES_JSON: &str = include_str!(
+    "../fixtures/checker_core_is_whnf_mir/clean_kernel.expr.Expr.arrow.ensures_is_whnf.json"
+);
 const MIR_FROM_KIND_JSON: &str =
     include_str!("../fixtures/checker_core_is_whnf_mir/clean_kernel.expr.Expr.from_kind.json");
+
+/// The exact `ensures` clause whose obligation this lane discharges. The sealed
+/// corpus admits each audited constructor either with an EMPTY spec (the
+/// verbatim fork extraction) or with exactly this single ensures — no other
+/// contract content may ride on sealed MIR.
+const IS_WHNF_RESULT_ENSURES: &str = "is_whnf(result)";
 
 /// The rustc return slot is always local `_0`.
 const RETURN_LOCAL: usize = 0;
@@ -777,10 +873,27 @@ fn embedded_mir(json: &str) -> Option<(VerifiableFunction, Vec<u8>)> {
     Some((func, bytes))
 }
 
-/// Seal certificate authority to the three audited literal constructors and
-/// the separately audited, kind-preserving `Expr::from_kind` implementation.
-/// Exact bincode equality covers def-path, callee paths, CFG, statements,
-/// contracts, and all other serialized MIR fields.
+/// The spec-bearing sealed form of an audited base fixture: identical in every
+/// serialized field except `spec.ensures = ["is_whnf(result)"]`. This is the
+/// SOLE derivation the seal accepts beyond the verbatim extraction — the MIR
+/// body is untouched by construction, and the added contract states exactly the
+/// proposition the minted certificate discharges, so admitting it claims
+/// nothing the empty-spec base did not already prove about the same body.
+fn with_is_whnf_ensures(base: &VerifiableFunction) -> Option<Vec<u8>> {
+    let mut variant = base.clone();
+    variant.spec.ensures = vec![IS_WHNF_RESULT_ENSURES.to_string()];
+    bincode::serialize(&variant).ok()
+}
+
+/// Seal certificate authority to the three audited literal constructors —
+/// each admitted with its verbatim EMPTY spec and (for `prop`/`arrow`) with the
+/// single `is_whnf(result)` ensures derived in-code from that same audited base
+/// — and the separately audited, kind-preserving `Expr::from_kind`
+/// implementation. Exact bincode equality covers def-path, callee paths, CFG,
+/// statements, contracts, and all other serialized MIR fields; the committed
+/// spec-bearing fixture files are cross-checked against the in-code derivation
+/// before they may admit anything, so no MIR outside the audited extracts — and
+/// no contract other than the exact discharged ensures — can ever mint.
 fn sealed_constructor_material(func: &VerifiableFunction) -> Option<(WhnfHead, Vec<u8>)> {
     let (from_kind, _) = embedded_mir(MIR_FROM_KIND_JSON)?;
     if !mir_from_kind_is_kind_preserving(&from_kind) {
@@ -788,10 +901,28 @@ fn sealed_constructor_material(func: &VerifiableFunction) -> Option<(WhnfHead, V
     }
 
     let presented = bincode::serialize(func).ok()?;
-    for json in [MIR_PROP_JSON, MIR_SORT_JSON, MIR_ARROW_JSON] {
+    for (json, ensures_json) in [
+        (MIR_PROP_JSON, Some(MIR_PROP_ENSURES_JSON)),
+        (MIR_SORT_JSON, None),
+        (MIR_ARROW_JSON, Some(MIR_ARROW_ENSURES_JSON)),
+    ] {
         let (canonical, canonical_bytes) = embedded_mir(json)?;
         if presented == canonical_bytes {
             return Some((extract_whnf_head_from_mir(&canonical)?, canonical_bytes));
+        }
+        let Some(ensures_json) = ensures_json else {
+            continue;
+        };
+        // Admit the committed spec-bearing variant ONLY if it byte-equals the
+        // in-code derivation from the audited base (fail closed on any drift:
+        // an edited variant file cannot widen authority). The head is read from
+        // the BASE MIR — the variant's body is byte-identical by construction.
+        let (_, variant_bytes) = embedded_mir(ensures_json)?;
+        if variant_bytes != with_is_whnf_ensures(&canonical)? {
+            continue;
+        }
+        if presented == variant_bytes {
+            return Some((extract_whnf_head_from_mir(&canonical)?, variant_bytes));
         }
     }
     None
@@ -895,10 +1026,13 @@ fn certify_from_mir_with_spec(
 
 /// Mint a kernel-CHECKED `CleanCic` certificate that `is_whnf(_0)` holds for the
 /// value returned by one of the three exact build-embedded, audited clean-kernel
-/// constructor fixtures (`prop`, `sort`, or `arrow`). The separately embedded
-/// `from_kind` fixture must also validate as kind-preserving. Arbitrary MIR is
-/// advisory-only and cannot mint. Fail-closed (`None`) on any fixture mismatch,
-/// spec-build, MIR-extraction (non-WHNF head),
+/// constructor fixtures (`prop`, `sort`, or `arrow`) — presented either with the
+/// verbatim empty spec or (for `prop`/`arrow`) with exactly the single
+/// `is_whnf(result)` ensures, the sealed spec-bearing variants derived from the
+/// same audited base. The separately embedded `from_kind` fixture must also
+/// validate as kind-preserving. Arbitrary MIR is advisory-only and cannot mint,
+/// and no other contract content may ride on sealed MIR. Fail-closed (`None`) on
+/// any fixture mismatch, spec-build, MIR-extraction (non-WHNF head),
 /// kernel-check, negative-control, serialization, or round-trip failure.
 #[must_use]
 pub fn certify_is_whnf_from_mir(func: &VerifiableFunction) -> Option<trust_ir::ProofEvidence> {
@@ -2895,6 +3029,161 @@ mod tests {
     // everything: they ran nowhere, which is the same as not existing. Keep the
     // split by what a test actually does, not by which module it lives in.
 
+    /// CANARY — the four anti-masquerade controls that minting is GATED on are
+    /// still DEMONSTRABLE, so the `is_whnf` Certified tier is not silently
+    /// blocked. Runs in the named opt-in lane `scripts/trust_control_canary.sh`.
+    ///
+    /// WHAT IT PROVES. Against the exact `Environment` the production entry
+    /// points build — the same `Specification::new()` that
+    /// `certify_is_whnf_from_mir` and `recheck_is_whnf_from_mir` call:
+    ///
+    /// * control 3 ([`discriminating_delta_const`]) FINDS a live witness: a
+    ///   reflected-environment constant whose `KExpr.const` passes syntactic
+    ///   `NeutralConst` classification and is nonetheless kernel-REJECTED, i.e.
+    ///   the kernel still computes `delta_reduct (red_def the_red_env) …`
+    ///   discriminatingly;
+    /// * controls 1, 1b and 2 still fail closed as required;
+    /// * and CONSEQUENTLY both heavy mint bodies actually MINT — the
+    ///   MIR-grounded [`certify_from_mir_with_spec`] on the audited `Expr::prop`
+    ///   fixture, and the model-level [`certify_with_spec`] on [`WHNF_SORT`].
+    ///
+    /// The mint assertions are what make this a canary rather than a unit test
+    /// of one predicate: they are the property a user cares about ("a
+    /// certificate issues"), and each control assertion above them exists to
+    /// name WHY it stopped issuing.
+    ///
+    /// WHAT IT DOES NOT PROVE. It is NOT the derivation test. It never re-checks
+    /// a serialized certificate through an INDEPENDENTLY rebuilt spec, never
+    /// exercises tamper / relineage / consumer-independence rejection, covers one
+    /// fixture per mint body rather than the corpus, and says nothing about the
+    /// literal-reducer or checker-core lemma lanes. Those are
+    /// `mir_grounded_public_api_is_consumer_independent` and its siblings, in
+    /// `scripts/trust_kernel_derivation_lane.sh` (hours). A green canary means
+    /// "the gate is open", never "the derivation is sound".
+    ///
+    /// WHY IT EXISTS. Control 3 used to assert one hardcoded, POSITIONALLY
+    /// generated constant (`kcre_name_116`). The reflected environment was
+    /// regenerated, that name drifted into the no-delta-reduct set, the control
+    /// could no longer be demonstrated — and because minting is GATED on it,
+    /// EVERY `is_whnf` certificate was withheld from July until 2026-08-23 while
+    /// every mint returned a bare, reasonless `None`. Nothing in the default gate
+    /// could report that: every test on this path is `#[ignore]`d into the
+    /// overnight lane, and the one non-ignored consumer
+    /// (`trust-integration-tests::checker_core_is_whnf_emit_discharge_e2e`) was
+    /// independently red, which masked it. Full write-up:
+    /// `reports/2026-08-23-is-whnf-mint-blocked-by-control-3.md`. The control now
+    /// DISCOVERS its witness and so self-heals; this canary is the instrument
+    /// that reports when it cannot.
+    ///
+    /// COST — measured on this host, release, one test per process:
+    /// `Specification::new()` 209.582 s, control 3 4 ms, both mints ~16 ms
+    /// together; the two runs that landed this test measured 220.03 s and
+    /// 212.14 s, of which `Specification::new()` was 219.438 s and 211.213 s
+    /// while control 3 was 4 ms BOTH times — the few-percent spread is the spec
+    /// build's, never the canary's. The spec build is 99.5% of the run and is
+    /// irreducible here,
+    /// because the control has to be demonstrated in the environment the
+    /// production path actually uses; trimming the canary's own work cannot
+    /// help, since its work is milliseconds. The default `targo test` lane is
+    /// DEBUG, where the same build measures 3.37x slower (~706 s, ~12 min), so
+    /// inlining this would wedge the per-crate quick gate — which is what
+    /// `#[ignore]` is for. Measured before ignoring, per the lane script's own
+    /// rule.
+    #[test]
+    #[ignore = "opt-in CANARY lane: one `Specification::new()` (measured 209.6 s release / ~706 s debug on this host) dominates the 4 ms control check it exists to run, so inline it would put ~12 min on every debug `targo --unverified test -p trust-certify`. Run it via `scripts/trust_control_canary.sh` (release, ~3.5 min after the build) — wired into the gate manifest as `canary.is-whnf-mint-gate` (profiles slow,release) and into `scripts/run_tests_after_build.sh` (tier T1d). The overnight `scripts/trust_kernel_derivation_lane.sh` also selects it."]
+    fn mint_gate_canary_controls_demonstrable_and_mint_closes() {
+        let outcome = run_on_large_stack(|| {
+            let spec_started = std::time::Instant::now();
+            let spec = Specification::new().expect("clean-verify Specification must build");
+            let spec_ms = spec_started.elapsed().as_millis();
+            let env = spec.env();
+
+            // Control 3 FIRST and timed on its own: it is the one that rotted,
+            // and the lane log should carry its cost next to the spec build's.
+            let control3_started = std::time::Instant::now();
+            let witness = discriminating_delta_const(env);
+            let control3_ms = control3_started.elapsed().as_millis();
+
+            let stuck = stuck_app_link_fails_closed(env);
+            let redex = redex_app_link_fails_closed(env);
+            let wrong_ctor = wrong_ctor_kernel_rejected(env);
+
+            // The mints themselves, on the ONE spec that has already been paid
+            // for: the MIR-grounded production body and the model-level body.
+            let mir_minted =
+                certify_from_mir_with_spec(&spec, &load_mir_fixture(FX_PROP)).is_some();
+            let model_minted = certify_with_spec(&spec, &WHNF_SORT).is_some();
+
+            (spec_ms, control3_ms, witness, stuck, redex, wrong_ctor, mir_minted, model_minted)
+        })
+        .expect("canary thread must not panic");
+        let (spec_ms, control3_ms, witness, stuck, redex, wrong_ctor, mir_minted, model_minted) =
+            outcome;
+
+        // Printed unconditionally: a PASSING canary should still say what it
+        // found, so a witness quietly migrating from the pinned fast path to the
+        // scan is visible in the lane log before it becomes a failure.
+        println!(
+            "is_whnf mint canary: Specification::new() {spec_ms} ms; control 3 {control3_ms} ms, \
+             witness {witness:?}; controls stuck_app={stuck} redex={redex} \
+             wrong_ctor={wrong_ctor}; mint mir={mir_minted} model={model_minted}"
+        );
+
+        assert!(
+            witness.is_some(),
+            "CONTROL 3 HAS NO WITNESS — the `is_whnf` Certified mint is BLOCKED.\n\
+             `discriminating_delta_const` found no reflected-environment constant that the clean \
+             kernel discriminates against: it tried the pinned candidates \
+             {DELTA_REDUCING_CONST_CANDIDATES:?}, then scanned stems {DELTA_SCAN_STEMS:?} over \
+             indices 0..{DELTA_SCAN_LIMIT}. Minting is GATED on this control \
+             (`certify_from_mir_with_spec` step 4, `certify_with_spec` step 3), so while it \
+             cannot be demonstrated EVERY certificate is withheld and every public mint returns a \
+             bare, reasonless `None`.\n\
+             Two readings, in order of likelihood: (1) BENIGN — the reflected environment was \
+             regenerated and its delta-reducing names moved outside the scanned space; widen \
+             DELTA_SCAN_STEMS / DELTA_SCAN_LIMIT to the new stems and re-pin the fast path. \
+             (2) SOUNDNESS-CRITICAL — the kernel stopped computing `delta_reduct` \
+             discriminatingly, so a const that DOES delta-reduce would now be accepted as a \
+             neutral WHNF; that is a masquerade hole and must not be `#[ignore]`d away.\n\
+             This is the exact failure of reports/2026-08-23-is-whnf-mint-blocked-by-control-3.md, \
+             which nothing reported for a month."
+        );
+        assert!(
+            stuck,
+            "CONTROL 1 no longer fails closed: `link_whnf` built a proof for the bvar-headed \
+             stuck application {STUCK_APP_KEXPR_SRC}, which is NOT a weak-head normal form. \
+             Minting is gated on this control, so certificates are blocked — but read this as a \
+             masquerade hole first: the recursive `is_neutral.app` spine must have no bvar base."
+        );
+        assert!(
+            redex,
+            "CONTROL 1b no longer fails closed: a lam-headed application (a genuine beta REDEX, \
+             not a normal form) linked to a proof. Minting is blocked, and the spine walk is \
+             accepting a head it must refuse."
+        );
+        assert!(
+            wrong_ctor,
+            "CONTROL 2 no longer rejects: the clean kernel ACCEPTED the `is_whnf.sort` proof \
+             against the `is_whnf(KExpr.lam ..)` goal. `KExpr.sort 0` is not def-equal to \
+             `KExpr.lam ..`, so this is the kernel check failing to discriminate — the discharge \
+             would be a rubber stamp."
+        );
+        assert!(
+            mir_minted,
+            "the MIR-GROUNDED mint (`certify_from_mir_with_spec` on the audited `Expr::prop` \
+             fixture) returned None while all four anti-masquerade controls were demonstrable. \
+             The block is therefore NOT control 3 this time: look at sealed-fixture membership \
+             (`sealed_constructor_material`), the LINK step, the kernel discharge, or the \
+             serialize/round-trip re-check."
+        );
+        assert!(
+            model_minted,
+            "the MODEL-LEVEL mint (`certify_with_spec` on WHNF_SORT) returned None while all \
+             four anti-masquerade controls were demonstrable — the MIR-grounded body's twin \
+             failure; same suspects, minus the sealed-MIR membership step."
+        );
+    }
+
     /// THE MILESTONE (first kernel-discharged checker-core STRUCTURAL
     /// postcondition) + the full no-masquerade story, all on a SINGLE expensive
     /// `Specification::new()` build:
@@ -3110,6 +3399,11 @@ mod tests {
     const FX_PROP: &str = "clean_kernel.expr.Expr.prop.json"; // ExprKind::Sort (variant 2)
     const FX_SORT: &str = "clean_kernel.expr.Expr.sort.json"; // ExprKind::Sort (variant 2)
     const FX_ARROW: &str = "clean_kernel.expr.Expr.arrow.json"; // ExprKind::Pi (variant 6)
+    // SPEC-BEARING sealed variants: byte-identical to the bases above except
+    // `spec.ensures = ["is_whnf(result)"]` (see PROVENANCE.md + the embedded-
+    // constant comment on `MIR_PROP_ENSURES_JSON`).
+    const FX_PROP_ENSURES: &str = "clean_kernel.expr.Expr.prop.ensures_is_whnf.json";
+    const FX_ARROW_ENSURES: &str = "clean_kernel.expr.Expr.arrow.ensures_is_whnf.json";
     // NEGATIVE (non-WHNF) fixtures — one real literal constructor per representative
     // non-WHNF `ExprKind` variant; EACH must fail closed at MIR extraction.
     const FX_BVAR: &str = "clean_kernel.expr.Expr.bvar.json"; // ExprKind::BVar  (variant 0)
@@ -3217,6 +3511,100 @@ mod tests {
             "NO MASQUERADE: Expr::bvar builds ExprKind::BVar (variant 0) \
              -> MUST fail closed at MIR extraction"
         );
+    }
+
+    /// SEAL CONTROLS (fast, no spec build): the sealed corpus admits EXACTLY the
+    /// audited bases and the two committed `is_whnf(result)` spec-bearing
+    /// variants — and refuses every other spec or MIR delta, byte-exactly.
+    ///
+    /// * PROVENANCE PIN: each committed `*.ensures_is_whnf.json` variant must
+    ///   bincode-equal the IN-CODE derivation from its audited base (base with
+    ///   ONLY `spec.ensures = ["is_whnf(result)"]` set) — the guard that keeps
+    ///   the variant files unable to smuggle unaudited MIR or contract text.
+    /// * ADMISSION: bases (`prop`/`sort`/`arrow`) and variants (`prop`/`arrow`
+    ///   + ensures) are sealed material with the audited heads.
+    /// * REFUSALS (each red-on-forgery): a different ensures string, a doubled
+    ///   ensures, a ride-along `requires` or invariant on a sealed variant, an
+    ///   ensures on a base with NO committed variant (`sort`), an ensures on a
+    ///   non-corpus body (`app`), and a body-drifted spec-bearing variant ALL
+    ///   yield `None`.
+    #[test]
+    fn sealed_corpus_admits_spec_bearing_variants_and_refuses_all_other_drift() {
+        // ── PROVENANCE PIN: committed variant == in-code derivation from base ──
+        for (base_fx, variant_fx) in [(FX_PROP, FX_PROP_ENSURES), (FX_ARROW, FX_ARROW_ENSURES)] {
+            let base = load_mir_fixture(base_fx);
+            let variant = load_mir_fixture(variant_fx);
+            assert_eq!(
+                bincode::serialize(&variant).ok(),
+                with_is_whnf_ensures(&base),
+                "{variant_fx} must be byte-exactly {base_fx} + the single \
+                 is_whnf(result) ensures — any other delta is unaudited material"
+            );
+        }
+
+        // ── ADMISSION: bases and committed spec-bearing variants are sealed ──
+        for (fx, head) in [
+            (FX_PROP, WhnfHead::Sort),
+            (FX_SORT, WhnfHead::Sort),
+            (FX_ARROW, WhnfHead::Pi),
+            (FX_PROP_ENSURES, WhnfHead::Sort),
+            (FX_ARROW_ENSURES, WhnfHead::Pi),
+        ] {
+            let sealed = sealed_constructor_material(&load_mir_fixture(fx));
+            assert_eq!(
+                sealed.as_ref().map(|(h, _)| *h),
+                Some(head),
+                "{fx} must be sealed constructor material with the audited head"
+            );
+        }
+
+        // ── REFUSALS: everything else fails closed at the seal ──
+        // A different ensures string (even one the lane could conceivably prove).
+        let mut wrong_ensures = load_mir_fixture(FX_PROP);
+        wrong_ensures.spec.ensures = vec!["true".to_string()];
+        assert!(sealed_constructor_material(&wrong_ensures).is_none());
+        // The right string plus trailing whitespace — byte-exactness, not parsing.
+        let mut padded = load_mir_fixture(FX_PROP);
+        padded.spec.ensures = vec![format!("{IS_WHNF_RESULT_ENSURES} ")];
+        assert!(sealed_constructor_material(&padded).is_none());
+        // The exact ensures, doubled.
+        let mut doubled = load_mir_fixture(FX_PROP);
+        doubled.spec.ensures =
+            vec![IS_WHNF_RESULT_ENSURES.to_string(), IS_WHNF_RESULT_ENSURES.to_string()];
+        assert!(sealed_constructor_material(&doubled).is_none());
+        // A ride-along requires on an otherwise-sealed spec-bearing variant.
+        let mut with_requires = load_mir_fixture(FX_PROP_ENSURES);
+        with_requires.spec.requires = vec!["true".to_string()];
+        assert!(sealed_constructor_material(&with_requires).is_none());
+        // A ride-along loop invariant on an otherwise-sealed spec-bearing variant.
+        let mut with_invariant = load_mir_fixture(FX_ARROW_ENSURES);
+        with_invariant.spec.invariants = vec!["true".to_string()];
+        assert!(sealed_constructor_material(&with_invariant).is_none());
+        // `sort` has NO committed spec-bearing variant: extending the sealed
+        // corpus takes a committed, derivation-checked fixture, never a caller
+        // edit. (When the lane needs it, add the file the same audited way.)
+        let mut sort_ensures = load_mir_fixture(FX_SORT);
+        sort_ensures.spec.ensures = vec![IS_WHNF_RESULT_ENSURES.to_string()];
+        assert!(sealed_constructor_material(&sort_ensures).is_none());
+        // The exact ensures on a body OUTSIDE the positive corpus (non-WHNF App).
+        let mut app_ensures = load_mir_fixture(FX_APP);
+        app_ensures.spec.ensures = vec![IS_WHNF_RESULT_ENSURES.to_string()];
+        assert!(sealed_constructor_material(&app_ensures).is_none());
+        // Body drift ON a spec-bearing variant: flip the aggregate's variant
+        // index (Sort -> App). The contract alone must never carry authority.
+        let mut body_drift = load_mir_fixture(FX_PROP_ENSURES);
+        for bb in &mut body_drift.body.blocks {
+            for stmt in &mut bb.stmts {
+                if let Statement::Assign {
+                    rvalue: Rvalue::Aggregate(AggregateKind::Adt { variant, .. }, _),
+                    ..
+                } = stmt
+                {
+                    *variant = 4;
+                }
+            }
+        }
+        assert!(sealed_constructor_material(&body_drift).is_none());
     }
 
     /// FULL-`ExprKind` ROBUSTNESS (fast, no spec build): the variant->WHNF-head
@@ -3952,9 +4340,19 @@ mod tests {
             // ad-hoc fixture: its const occurs in `the_red_env`, so LINK must
             // classify it as a NeutralConst candidate while the kernel and the
             // internal mint both reject its false `const_whnf` witness.
+            // The witness is DISCOVERED, not pinned: these names are
+            // positionally generated and drift when the environment is
+            // regenerated (see `discriminating_delta_const`). Leaking the one
+            // string keeps `WhnfFixture`'s `&'static str` contract without
+            // reintroducing a hardcoded vector that can go stale.
+            let reducing_name = discriminating_delta_const(env)
+                .expect("the kernel must still discriminate SOME delta-reducing const");
+            let reducing_src: &'static str = Box::leak(
+                format!("KExpr.const {reducing_name} (ListType.nil Level)").into_boxed_str(),
+            );
             let reducing_fixture = WhnfFixture {
                 label: "delta-reducing const must fail closed",
-                kexpr_src: DELTA_REDUCING_CONST_KEXPR_SRC,
+                kexpr_src: reducing_src,
             };
             let reducing_linked = link_whnf(env, reducing_fixture.kexpr_src)
                 .expect("the reducing const must LINK as a candidate");
@@ -4616,4 +5014,5 @@ mod tests {
             "a loop whose changed arm exits directly (skipping cache + re-loop) must fail"
         );
     }
+
 }

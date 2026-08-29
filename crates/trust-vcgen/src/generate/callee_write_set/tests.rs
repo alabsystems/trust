@@ -11,10 +11,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
-    Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::*;
@@ -30,10 +29,7 @@ fn g_ty() -> Ty {
         "p::G",
         vec![(
             "storage".into(),
-            Ty::adt(
-                "p::Storage",
-                vec![("flag".into(), Ty::Bool), ("other".into(), u32_ty())],
-            ),
+            Ty::adt("p::Storage", vec![("flag".into(), Ty::Bool), ("other".into(), u32_ty())]),
         )],
     )
 }
@@ -113,6 +109,7 @@ fn caller_calling(callee: &str) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -257,6 +254,7 @@ fn nested_call_with_a_pointer_argument_fails_closed() {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     assert!(
@@ -284,6 +282,7 @@ fn nested_call_with_only_scalar_arguments_is_admitted() {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     let ws = derive_callee_write_set(&f)
@@ -429,7 +428,11 @@ fn index_projection_in_a_write_path_fails_closed() {
 fn atomic_call_fails_closed() {
     let mut f = helper_writing_field(1);
     let Terminator::Return = f.body.blocks[0].terminator else { unreachable!() };
-    f.body.blocks.push(BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return });
+    f.body.blocks.push(BasicBlock {
+        id: BlockId(1),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
     f.body.blocks[0].terminator = Terminator::Call {
         unwind: UnwindEdge::Continue,
         func: "core::sync::atomic::AtomicU32::fetch_add".into(),
@@ -446,6 +449,7 @@ fn atomic_call_fails_closed() {
             span: SourceSpan::default(),
         }),
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     assert!(
@@ -463,10 +467,7 @@ fn projected_actual_is_not_a_replaceable_root() {
     // Retype local 1 as a tuple of two `&mut G` and pass `Copy(_1.0)`.
     caller.body.locals[1].ty = Ty::Tuple(vec![mut_g_ref(), mut_g_ref()]);
     if let Terminator::Call { args, .. } = &mut caller.body.blocks[0].terminator {
-        *args = vec![Operand::Copy(Place {
-            local: 1,
-            projections: vec![Projection::Field(0)],
-        })];
+        *args = vec![Operand::Copy(Place { local: 1, projections: vec![Projection::Field(0)] })];
     }
     let ws = derive_callee_write_set(&helper_writing_field(1)).expect("in-fragment helper");
     let _scope = enter_test_callee_write_sets(map_with("p::G::helper", ws));

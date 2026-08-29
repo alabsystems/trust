@@ -65,7 +65,13 @@ pub fn slotpc(bin: &str) -> (u64, u64, usize, usize) {
 
 /// Run the executor over `words`, resuming past kills, returning one record
 /// per word.
-pub fn run(bin: &str, ctx_path: &str, words_path: &str, recs_path: &str, count: usize) -> Vec<Record> {
+pub fn run(
+    bin: &str,
+    ctx_path: &str,
+    words_path: &str,
+    recs_path: &str,
+    count: usize,
+) -> Vec<Record> {
     let _ = std::fs::remove_file(recs_path);
     let mut done = 0usize;
     while done < count {

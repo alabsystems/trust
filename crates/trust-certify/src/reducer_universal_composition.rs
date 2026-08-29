@@ -744,10 +744,7 @@ fn dispatch_reflection_body() -> Option<Expr> {
         let arm = Expr::apps(kc("MirArm.mk"), [nat_expr(*v), flag]);
         arms_expr = Expr::apps(kc("ListType.cons"), [kc("MirArm"), arm, arms_expr]);
     }
-    let arms_ok = Expr::apps(
-        kc("mir_arms_ok_from"),
-        [nat_expr(25), nat_expr(0), arms_expr],
-    );
+    let arms_ok = Expr::apps(kc("mir_arms_ok_from"), [nat_expr(25), nat_expr(0), arms_expr]);
     let g = graph_expr(&whnf_impl)?;
     let n = whnf_impl.body.blocks.len();
     let routing = reaches_expr(&g, n, n, n, otherwise.0, stack_safe.0);
@@ -789,10 +786,7 @@ fn beta_iota_gating_body() -> Option<Expr> {
         pos(beta, subst),
         conj(
             pos(iota, try_iota),
-            conj(
-                pos(iota, reduce_native),
-                conj(neg(sat(beta, try_iota)), neg(sat(iota, subst))),
-            ),
+            conj(pos(iota, reduce_native), conj(neg(sat(beta, try_iota)), neg(sat(iota, subst)))),
         ),
     );
     Some(body)
@@ -831,9 +825,8 @@ fn core_inner_routing_body() -> Option<Expr> {
     let g = graph_expr(&core)?;
     let fuel = core.body.blocks.len();
     let (cf, ct) = (lm.backedge_from.0, lm.head.0);
-    let arm = |v: usize| -> Option<usize> {
-        lm.arms.iter().find(|(av, _)| *av == v).map(|(_, t)| t.0)
-    };
+    let arm =
+        |v: usize| -> Option<usize> { lm.arms.iter().find(|(av, _)| *av == v).map(|(_, t)| t.0) };
     let (konst, app, proj, path_app, hcomp) = (arm(3)?, arm(4)?, arm(9)?, arm(18)?, arm(19)?);
 
     let conj = |a: Expr, b: Expr| Expr::apps(kc("mir_band"), [a, b]);
@@ -852,10 +845,7 @@ fn core_inner_routing_body() -> Option<Expr> {
                         pos(hcomp, lm.kan_hcomp.0),
                         conj(
                             neg(sat(app, lm.delta_unfold.0)),
-                            conj(
-                                neg(sat(konst, lm.beta_iota[0].0)),
-                                neg(sat(app, lm.kan_hcomp.0)),
-                            ),
+                            conj(neg(sat(konst, lm.beta_iota[0].0)), neg(sat(app, lm.kan_hcomp.0))),
                         ),
                     ),
                 ),
@@ -964,10 +954,7 @@ fn delta_interior_body() -> Option<Expr> {
                         neg(r(lm.nonconst_arm.0, lm.insert.0)),
                         conj(
                             r(lm.const_arm.0, lm.env_unfold.0),
-                            conj(
-                                r(lm.some_arm.0, lm.insert.0),
-                                neg(r(lm.none_arm.0, lm.insert.0)),
-                            ),
+                            conj(r(lm.some_arm.0, lm.insert.0), neg(r(lm.none_arm.0, lm.insert.0))),
                         ),
                     ),
                 ),
@@ -1199,8 +1186,16 @@ fn single_composite_theorem_pair(env: &Environment, bodies: [Expr; 8]) -> Option
         }
     };
 
-    let [dispatch_body, cached_body, fixpoint_body, core_routing_body, beta_iota_body, recurse_body, delta_body, proj_body] =
-        bodies;
+    let [
+        dispatch_body,
+        cached_body,
+        fixpoint_body,
+        core_routing_body,
+        beta_iota_body,
+        recurse_body,
+        delta_body,
+        proj_body,
+    ] = bodies;
     let band = |a: Expr, b: Expr| Expr::apps(kc("mir_band"), [a, b]);
     let programmatic = eq_bool_true_pair(band(
         band(band(dispatch_body, cached_body), band(fixpoint_body, core_routing_body)),
@@ -1288,8 +1283,7 @@ mod tests {
     /// fixtures/gates, and a tampered L input fails the composite's L check.
     #[test]
     fn composition_l_and_f_components_hold_and_fail_closed() {
-        let (l1, l2, l3, l4, l5, l6, l7, l8, l9, l10) =
-            l_components().expect("fixtures must load");
+        let (l1, l2, l3, l4, l5, l6, l7, l8, l9, l10) = l_components().expect("fixtures must load");
         assert!(l1, "dispatch totality must hold with the expected classes");
         assert!(l2, "payload passthrough must hold");
         assert!(l3, "cached reducer must hold");

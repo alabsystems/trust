@@ -43,11 +43,7 @@ pub fn array_index_of(u: &[u16]) -> Option<u32> {
         }
         n = n * 10 + u64::from(c - 0x30);
     }
-    if n < u64::from(u32::MAX) {
-        Some(u32::try_from(n).expect("bounded above"))
-    } else {
-        None
-    }
+    if n < u64::from(u32::MAX) { Some(u32::try_from(n).expect("bounded above")) } else { None }
 }
 
 #[cfg(test)]
@@ -60,10 +56,7 @@ mod tests {
         assert_eq!(array_index_of(&units_from_str("42")), Some(42));
         assert_eq!(array_index_of(&units_from_str("01")), None);
         assert_eq!(array_index_of(&units_from_str("-1")), None);
-        assert_eq!(
-            array_index_of(&units_from_str("4294967294")),
-            Some(4_294_967_294)
-        );
+        assert_eq!(array_index_of(&units_from_str("4294967294")), Some(4_294_967_294));
         assert_eq!(array_index_of(&units_from_str("4294967295")), None);
         assert_eq!(array_index_of(&units_from_str("length")), None);
         assert_eq!(array_index_of(&units_from_str("")), None);

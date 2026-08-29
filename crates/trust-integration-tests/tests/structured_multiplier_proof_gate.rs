@@ -93,7 +93,8 @@ fn structured_multiplier_proof_gate() {
         serde_json::from_str(&report_text).expect("export-cert report must be JSON");
 
     assert_eq!(
-        report["all_axiom_closures_foundational_only"], true,
+        report["all_axiom_closures_foundational_only"],
+        true,
         "every exported theorem's axiom closure must be ⊆ FOUNDATIONAL (no domain axioms); \
          export-cert stdout:\n{}",
         String::from_utf8_lossy(&cert.stdout)

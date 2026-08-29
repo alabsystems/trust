@@ -111,7 +111,8 @@ pub fn predict(
 ) -> Result<Predicted, Skip> {
     let insn = decode_aarch64(&word.to_le_bytes(), pc).map_err(|_| Skip::NotDecoded)?;
     let sym = MachineState::symbolic();
-    let effects = mutation.apply(Aarch64Semantics.effects(&sym, &insn).map_err(|_| Skip::NoEffects)?);
+    let effects =
+        mutation.apply(Aarch64Semantics.effects(&sym, &insn).map_err(|_| Skip::NoEffects)?);
 
     // CONTROL-FLOW MARKERS ARE ANNOTATIONS, AND REFUSING THEM COST FOUR OPCODES.
     //

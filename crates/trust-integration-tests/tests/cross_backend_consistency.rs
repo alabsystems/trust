@@ -13,9 +13,9 @@
 // Trust: Allow std HashMap — FxHash lint only applies to compiler internals
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_router::constant_folder::ConstantFolderBackend;
 // ay_backend removed — ay integration now via ay-direct.
 use trust_router::VerificationBackend;
+use trust_router::constant_folder::ConstantFolderBackend;
 use trust_types::*;
 
 // ---------------------------------------------------------------------------

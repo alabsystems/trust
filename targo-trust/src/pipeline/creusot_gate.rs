@@ -12,18 +12,46 @@
 //! with the Kani gate — v5 reclassifies the Creusot attribute surface as a
 //! *zero-authority ingestion lane* on the same terms, and this gate is
 //! explicitly the same boundary shape, so the two must not desynchronize.
+//! (Until 2026-08-21 this file's detection arm still REJECTED while the doc
+//! above claimed disclosure; the flip below closes that desynchronization.)
 //!
-//! The specs really are unverified: no reader has been built yet. But the
-//! false-green risk was never the *dependency*, it was the word "silently".
-//! Rejecting the build for declaring the dependency also blocks the migration
-//! the amendment authorizes — you cannot port specs you are not allowed to
-//! compile alongside. So detection is kept and the rejection is replaced with an
-//! unmissable disclosure: the build proceeds, and the operator is told plainly
-//! that the Creusot specs carried no authority and were not examined.
+//! A reader now exists for the supported subset: tippy's
+//! `trust_creusot_spec_sugar` lint machine-applicably rewrites boolean,
+//! comparison and machine-arithmetic clauses (plus `old()` on immutable
+//! by-value parameters and `result`) into native `requires`/`ensures`
+//! signature clauses, and discloses every unsupported attribute with its
+//! blocker. The false-green risk was never the *dependency*, it was the word
+//! "silently". Rejecting the build for declaring the dependency also blocks
+//! the migration the amendment authorizes — you cannot port specs you are not
+//! allowed to compile alongside, and the reader's own rewrite target is a
+//! crate this gate would refuse. So detection is kept and the rejection is
+//! replaced with an unmissable disclosure: the build proceeds, and the
+//! operator is told plainly that the Creusot specs carried no authority and
+//! were not examined, and where the migration path is (v7/D3: the refusal —
+//! now disclosure — carries the fix).
 //!
-//! Not fail-open: the attributes expand to no-ops outside the Creusot
-//! toolchain, so there is no verdict here to soften and no authority to withhold
-//! that is not already structurally absent. See `kani_gate` for the equivalent
+//! **Why allowing the dependency is not fail-open** (verified 2026-08-21;
+//! re-check these three if the macro transport or the router vocabulary
+//! moves):
+//!
+//! 1. The `creusot-contracts` surface Trust ships is the trust-wp shim
+//!    (`first-party/trust-wp/crates/creusot-contracts` re-exporting
+//!    `trust-wp-macros`), whose proc macros "validate contract syntax at
+//!    compile time and pass through the item unchanged" — they assert
+//!    nothing into the build. Upstream `creusot-contracts` outside the
+//!    Creusot toolchain expands to no-ops.
+//! 2. The shim's only spec transport is `#[doc = "trust-wp:..."]` attributes,
+//!    and that transport has no consumer in trustc:
+//!    `rg 'doc = "trust-wp:' compiler/ crates/` is empty (the bare
+//!    `"trust-wp:` strings in `crates/trust-wp/src/verifier_api.rs` are
+//!    evidence-id spellings, not the doc transport — target the real
+//!    transport when re-checking, not the substring).
+//! 3. No obligation kind or verdict path keys on creusot vocabulary:
+//!    `rg -i 'creusot|pearlite' compiler/` is empty. An unparsed attribute
+//!    cannot mint an obligation or a verdict.
+//!
+//! So there is no verdict here to soften and no authority to withhold that is
+//! not already structurally absent. See `kani_gate` for the equivalent
 //! three-point argument on the Kani side.
 //!
 //! Fail-closed is preserved where it still means something: a manifest that
@@ -37,7 +65,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const UNVERIFIED_CREUSOT_SPECS: &str = "unbound spec/build evidence: outside the Creusot toolchain the `creusot-contracts` attribute surface (`#[requires]` / `#[ensures]` / `#[logic]`) expands to no-ops and trustc does not import it, so this crate's Creusot specs would be silently UNVERIFIED while the build reports green; port the specs to Trust's native surface — first-class `requires`/`ensures` signature clauses and `clean { .. }` Lean islands — before building with `targo trust`";
+const UNVERIFIED_CREUSOT_SPECS: &str = "its Creusot/pearlite specs were NOT examined and carry NO proof authority. Creusot is a zero-authority ingestion lane (two-language design v5, §3.2): outside the Creusot toolchain the attribute surface (`#[requires]` / `#[ensures]` / `#[logic]`) expands to no-ops and trustc does not import it. A reader now exists for the supported subset: run tippy — lint `trust_creusot_spec_sugar` — for machine-applicable rewrites of boolean/comparison/machine-arithmetic clauses (plus `old()` on immutable by-value parameters and `result`) into native `requires`/`ensures` signature clauses; every unsupported attribute is disclosed per attribute with its blocker (Int-relaxed quantifiers stay DEFERRED per the R4 §2 doctrine). Do not read a successful build as a discharged Creusot proof; run `targo trust check` for the verdicts Trust actually stands behind";
 
 /// Cargo package names that constitute the Creusot spec-surface opt-in. A
 /// dependency on any of them (directly, renamed via `package = "..."`, in a
@@ -50,15 +78,21 @@ fn is_creusot_family_package(name: &str) -> bool {
     CREUSOT_FAMILY.contains(&name)
 }
 
-/// Post-build gate folded into `targo trust build`.
+/// Post-build disclosure gate folded into `targo trust build`.
 ///
 /// A failed build is returned immediately without resolving packages. On a
 /// successful build, every selected package manifest is inspected; a package
 /// that declares a Creusot-family dependency (directly, renamed via
 /// `package = "creusot-contracts"`, in a target-specific section, or through a
-/// workspace-inherited alias) is rejected with an explicit unverified-spec
-/// setup error. Once a crate opts in, ambient process state cannot disable the
-/// gate.
+/// workspace-inherited alias) gets a prominent disclosure on stderr — naming
+/// the tippy reader as the migration path (v7/D3) — and the build proceeds.
+/// Once a crate opts in, ambient process state cannot disable the disclosure.
+///
+/// This does not weaken any proof claim, because a Creusot spec never had one
+/// here: the ingestion lane forbids creusot-derived text from acquiring proof
+/// authority, so there is no verdict to soften. What changed is that the
+/// operator is now told, rather than the build being refused for spelling its
+/// sugar (the module docs carry the verified three-point inertness argument).
 pub(crate) fn gate_build(build_result: ExitCode, args: &[String]) -> ExitCode {
     if build_result != ExitCode::SUCCESS {
         return build_result;
@@ -76,14 +110,10 @@ pub(crate) fn gate_build(build_result: ExitCode, args: &[String]) -> ExitCode {
     };
 
     for root in package_roots {
-        match manifest_declares_creusot_dependency(&root) {
-            Ok(false) => {}
-            Ok(true) => {
-                eprintln!(
-                    "targo trust build: Creusot spec surface for {} rejected: {UNVERIFIED_CREUSOT_SPECS}",
-                    root.display()
-                );
-                return ExitCode::from(2);
+        match boundary_disclosure_for(&root) {
+            Ok(None) => {}
+            Ok(Some(disclosure)) => {
+                eprintln!("{disclosure}");
             }
             Err(error) => {
                 eprintln!(
@@ -96,6 +126,22 @@ pub(crate) fn gate_build(build_result: ExitCode, args: &[String]) -> ExitCode {
         }
     }
     build_result
+}
+
+/// The per-package boundary outcome: detection DISCLOSES (returns the line to
+/// print) rather than rejecting; an uninspectable manifest is still an error
+/// (fail-closed where it still means something). Extracted from `gate_build`
+/// so the disclose-not-reject flip is pinnable by test.
+fn boundary_disclosure_for(root: &Path) -> Result<Option<String>, String> {
+    match manifest_declares_creusot_dependency(root) {
+        Ok(false) => Ok(None),
+        Ok(true) => Ok(Some(format!(
+            "targo trust build: warning: {} declares a Creusot-family dependency — \
+             {UNVERIFIED_CREUSOT_SPECS}",
+            root.display()
+        ))),
+        Err(error) => Err(error),
+    }
 }
 
 fn dependency_table_declares_creusot(value: &toml::Value) -> bool {
@@ -306,6 +352,71 @@ mod tests {
         assert_eq!(
             gate_build(ExitCode::from(9), &["-p".to_string(), "missing".to_string()]),
             ExitCode::from(9)
+        );
+    }
+
+    /// A Creusot-family dependency DISCLOSES, it does not reject (two-language
+    /// design v5, §3.2 MIGRATE: creusot is a zero-authority ingestion lane).
+    /// Mirror of `kani_dependency_discloses_rather_than_rejecting_the_build`,
+    /// per this module's declared lockstep with the Kani gate.
+    ///
+    /// This pins the amended boundary. It is not a weakened proof claim: the
+    /// Creusot surface is inert in a trustc build — the shim macros pass items
+    /// through, the `doc = "trust-wp:"` transport has no consumer in trustc,
+    /// and no verdict path keys on creusot vocabulary. See the module docs for
+    /// the three checks that establish that. If any of them stops holding,
+    /// this test should start failing on purpose and the gate should go back
+    /// to rejecting.
+    #[test]
+    fn creusot_dependency_discloses_rather_than_rejecting_the_build() {
+        let temp = tempfile::tempdir().expect("package fixture");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='p'\nversion='0.1.0'\n[dependencies]\ncreusot-contracts='0.4'\n",
+        )
+        .expect("write manifest");
+        let disclosure = boundary_disclosure_for(temp.path())
+            .expect("inspect manifest")
+            .expect("detection must survive the amendment — the disclosure depends on it");
+        assert!(disclosure.contains("warning"), "a disclosure, not a rejection: {disclosure}");
+        assert!(
+            !disclosure.contains("rejected"),
+            "the reject wording must not survive the flip: {disclosure}"
+        );
+    }
+
+    /// v7/D3: the disclosure must carry the fix. A reader now exists, so the
+    /// disclosure names the tippy lint (the machine-applicable migration
+    /// path), the deferred quantifier doctrine, and the verified lane.
+    #[test]
+    fn creusot_disclosure_points_at_the_tippy_reader() {
+        assert!(
+            UNVERIFIED_CREUSOT_SPECS.contains("trust_creusot_spec_sugar"),
+            "the disclosure must name the lint: {UNVERIFIED_CREUSOT_SPECS}"
+        );
+        assert!(
+            UNVERIFIED_CREUSOT_SPECS.contains("machine-applicable"),
+            "the disclosure must say what the reader can do: {UNVERIFIED_CREUSOT_SPECS}"
+        );
+        assert!(
+            UNVERIFIED_CREUSOT_SPECS.contains("DEFERRED"),
+            "the disclosure must not oversell the reader past the R4 §2 deferral: \
+             {UNVERIFIED_CREUSOT_SPECS}"
+        );
+        assert!(
+            UNVERIFIED_CREUSOT_SPECS.contains("targo trust check"),
+            "the disclosure must point at the verified lane: {UNVERIFIED_CREUSOT_SPECS}"
+        );
+    }
+
+    /// A manifest that cannot be inspected is still a setup error, not a pass:
+    /// the flip converts detection to disclosure, never inspection failure.
+    #[test]
+    fn an_uninspectable_manifest_still_fails_closed() {
+        let temp = tempfile::tempdir().expect("empty dir");
+        assert!(
+            boundary_disclosure_for(temp.path()).is_err(),
+            "a missing manifest must be an error, not a silent pass"
         );
     }
 }

@@ -1,0 +1,80 @@
+error: `trust::invariant` is not a verified contract surface
+  --> $DIR/trust-spec-invariant-refused.rs:48:1
+   |
+LL | #[trust::invariant(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this attribute used to be accepted and silently discarded: it produced no obligation and no diagnostic, so it stated a guarantee that was never checked
+   = note: an `invariant` must name the program point it constrains; an attribute on an item has no loop to bind to, so it has no exact meaning to lower
+   = help: for a loop invariant, use the first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`
+   = help: for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`
+   = help: for a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`
+   = help: otherwise delete the attribute: leaving it in place states nothing
+
+error: `trust::invariant` is not a verified contract surface
+  --> $DIR/trust-spec-invariant-refused.rs:60:1
+   |
+LL | #[trust::invariant(self.value >= 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this attribute used to be accepted and silently discarded: it produced no obligation and no diagnostic, so it stated a guarantee that was never checked
+   = note: an `invariant` must name the program point it constrains; an attribute on an item has no loop to bind to, so it has no exact meaning to lower
+   = help: for a loop invariant, use the first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`
+   = help: for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`
+   = help: for a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`
+   = help: otherwise delete the attribute: leaving it in place states nothing
+
+error: `trust::invariant` is not a verified contract surface
+  --> $DIR/trust-spec-invariant-refused.rs:69:1
+   |
+LL | #[trust::invariant(this is not even an expression ~~~)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this attribute used to be accepted and silently discarded: it produced no obligation and no diagnostic, so it stated a guarantee that was never checked
+   = note: an `invariant` must name the program point it constrains; an attribute on an item has no loop to bind to, so it has no exact meaning to lower
+   = help: for a loop invariant, use the first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`
+   = help: for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`
+   = help: for a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`
+   = help: otherwise delete the attribute: leaving it in place states nothing
+
+error: `trust::invariant` is not a verified contract surface
+  --> $DIR/trust-spec-invariant-refused.rs:85:1
+   |
+LL | #[invariant(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this attribute used to be accepted and silently discarded: it produced no obligation and no diagnostic, so it stated a guarantee that was never checked
+   = note: an `invariant` must name the program point it constrains; an attribute on an item has no loop to bind to, so it has no exact meaning to lower
+   = help: for a loop invariant, use the first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`
+   = help: for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`
+   = help: for a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`
+   = help: otherwise delete the attribute: leaving it in place states nothing
+
+error: `trust::invariant` is not a verified contract surface
+  --> $DIR/trust-spec-invariant-refused.rs:91:1
+   |
+LL | #[renamed_invariant(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this attribute used to be accepted and silently discarded: it produced no obligation and no diagnostic, so it stated a guarantee that was never checked
+   = note: an `invariant` must name the program point it constrains; an attribute on an item has no loop to bind to, so it has no exact meaning to lower
+   = help: for a loop invariant, use the first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`
+   = help: for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`
+   = help: for a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`
+   = help: otherwise delete the attribute: leaving it in place states nothing
+
+error: `trust::invariant` is not a verified contract surface
+  --> $DIR/trust-spec-invariant-refused.rs:97:1
+   |
+LL | #[::trust::invariant(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this attribute used to be accepted and silently discarded: it produced no obligation and no diagnostic, so it stated a guarantee that was never checked
+   = note: an `invariant` must name the program point it constrains; an attribute on an item has no loop to bind to, so it has no exact meaning to lower
+   = help: for a loop invariant, use the first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`
+   = help: for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`
+   = help: for a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`
+   = help: otherwise delete the attribute: leaving it in place states nothing
+
+error: aborting due to 6 previous errors
+

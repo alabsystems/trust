@@ -164,7 +164,10 @@ pub(super) fn is_signed_abs_call(callee: &str) -> bool {
 /// (BV-capable discharge), where a plain `Assertion` panic-freedom kind does NOT
 /// discharge the BV bound and would FALSE-refute `(x & 0x7f).abs()`. `None` for a
 /// non-signed-int receiver (a float `abs` is total — no panic).
-pub(super) fn signed_abs_panic_body(func: &VerifiableFunction, args: &[Operand]) -> Option<(Formula, Ty)> {
+pub(super) fn signed_abs_panic_body(
+    func: &VerifiableFunction,
+    args: &[Operand],
+) -> Option<(Formula, Ty)> {
     let arg = args.first()?;
     let ty = crate::operand_ty(func, arg)?;
     let Ty::Int { width, signed: true } = ty else {
@@ -458,7 +461,10 @@ pub(super) fn eq_side_receiver(func: &VerifiableFunction, arg: &Operand) -> Opti
 ///     local whose unique def is a shared borrow of a PINNED bare local whose
 ///     unique def is a ZERO-OPERAND ADT aggregate (`ops.is_empty()` — the
 ///     payload-less gate; a `Some(x)` construction never matches).
-pub(super) fn eq_side_pinned_unit(func: &VerifiableFunction, arg: &Operand) -> Option<(String, usize)> {
+pub(super) fn eq_side_pinned_unit(
+    func: &VerifiableFunction,
+    arg: &Operand,
+) -> Option<(String, usize)> {
     if let Operand::Constant(trust_types::ConstValue::UnitVariantRef { enum_name, variant }) = arg {
         return Some((enum_name.clone(), *variant));
     }
@@ -1364,7 +1370,11 @@ pub(super) fn return_disc_tag_expr(
 
 /// Shared bridge for [`collect_terminator_unsupported`] and the dominated-success
 /// recognizer, so every known-panicking call keeps exactly one obligation.
-pub(super) fn unwrap_panic_freedom_modeled(func: &VerifiableFunction, callee: &str, args: &[Operand]) -> bool {
+pub(super) fn unwrap_panic_freedom_modeled(
+    func: &VerifiableFunction,
+    callee: &str,
+    args: &[Operand],
+) -> bool {
     unwrap_panic_freedom_body(func, callee, args).is_some()
 }
 
@@ -1563,8 +1573,12 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
             ob_record_conjoin(&mut vc, &conjoined);
         }
         if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
-            let (nf, path_terms) =
-                v2_formula_with_path_guards_recorded(func, &sv, block_guard_paths, vc.formula.clone());
+            let (nf, path_terms) = v2_formula_with_path_guards_recorded(
+                func,
+                &sv,
+                block_guard_paths,
+                vc.formula.clone(),
+            );
             vc.formula = nf;
             if let Some(ob) = vc.obligation.as_mut() {
                 ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
@@ -1595,7 +1609,9 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
     vcs
 }
 
-pub(super) fn generate_unwrap_panic_freedom_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
+pub(super) fn generate_unwrap_panic_freedom_vcs(
+    func: &VerifiableFunction,
+) -> Vec<VerificationCondition> {
     unwrap_panic_freedom_vcs_with_blocks(func).into_iter().map(|(_, vc)| vc).collect()
 }
 

@@ -1235,7 +1235,8 @@ fn canonical_trust_ir_binary_provenance_is_wasm_blocker_evidence_until_consumed(
         "canonical_provenance_binary",
         EXACT_CANONICAL_BINARY_PROVENANCE_ATTRS,
     );
-    trust_ir::parser::parse_module(&canonical).expect("canonical TrustIr provenance fixture parses");
+    trust_ir::parser::parse_module(&canonical)
+        .expect("canonical TrustIr provenance fixture parses");
 
     let conversion = convert_canonical_trust_ir_to_wat(&canonical);
 
@@ -1300,9 +1301,9 @@ fn canonical_trust_ir_binary_provenance_is_wasm_blocker_evidence_until_consumed(
         "exact-but-unconsumed provenance must not be downgraded to missing provenance"
     );
     assert!(conversion.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .contains("binary_provenance.source=canonical-trust_ir.trust_binary.provenance:unit-test")
-            && diagnostic.contains("binary_provenance.instruction_bytes=1f2003d5")
+        diagnostic.contains(
+            "binary_provenance.source=canonical-trust_ir.trust_binary.provenance:unit-test",
+        ) && diagnostic.contains("binary_provenance.instruction_bytes=1f2003d5")
             && diagnostic.contains("binary_provenance.target_semantics_consumed=false")
     }));
 }
@@ -1312,7 +1313,8 @@ fn canonical_trust_ir_malformed_binary_provenance_row_stays_missing_for_wasm() {
     let malformed_attrs = r#"[schema=str:"trust-types.BinaryProvenance@1"] [source=str:"malformed"] [binary_path=str:"fixture.bin"] [function_entry=str:"0x401000"] [instruction_address=str:"0x401004"] [instruction_size=str:"4"] [encoding=str:"0xd503201f"] [instruction_bytes=str:"not-hex"] [target_semantics_consumed=str:"true"]"#;
     let canonical =
         canonical_binary_provenance_trust_ir("canonical_malformed_provenance", malformed_attrs);
-    trust_ir::parser::parse_module(&canonical).expect("malformed provenance row stays valid TrustIr");
+    trust_ir::parser::parse_module(&canonical)
+        .expect("malformed provenance row stays valid TrustIr");
 
     let conversion = convert_canonical_trust_ir_to_wat(&canonical);
 
@@ -1352,7 +1354,8 @@ fn canonical_trust_ir_forged_consumed_binary_provenance_stays_rejected_for_wasm(
     );
     let canonical =
         canonical_binary_provenance_trust_ir("canonical_forged_provenance_consumed", &forged_attrs);
-    trust_ir::parser::parse_module(&canonical).expect("forged consumed-state row stays valid TrustIr");
+    trust_ir::parser::parse_module(&canonical)
+        .expect("forged consumed-state row stays valid TrustIr");
 
     let conversion = convert_canonical_trust_ir_to_wat(&canonical);
 
@@ -1436,7 +1439,10 @@ bb0(%0: i32):
     assert_eq!(conversion.proof_replay_evidence.len(), 1);
     let certificate = &conversion.checked_certificate_evidence[0];
     assert_eq!(certificate.function, "canonical_proof_metadata");
-    assert_eq!(certificate.source, "canonical-trust_ir.trust_proof.checked_certificate:unit-test-cert");
+    assert_eq!(
+        certificate.source,
+        "canonical-trust_ir.trust_proof.checked_certificate:unit-test-cert"
+    );
     assert_eq!(certificate.block, Some(0));
     assert_eq!(certificate.statement_index, Some(1));
     assert_eq!(

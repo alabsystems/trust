@@ -19,9 +19,10 @@
 //! unsupported statement, yields `false`. It never reports an impure function as
 //! pure.
 
+use std::collections::HashSet;
+
 use crate::structural_termination::terminator_successors;
 use crate::{BasicBlock, BlockId, Place, Projection, Statement, Terminator, VerifiableFunction};
-use std::collections::HashSet;
 
 /// Whether a written place reaches memory OUTSIDE the current stack frame — i.e.
 /// through a `Deref` projection (a `&mut`, a raw pointer, or a `static`'s
@@ -245,11 +246,15 @@ mod tests {
         // Unmodeled control flow may perform a write we cannot inspect → fail
         // closed; a modeled effect-free terminator (Return) stays pure.
         let opaque = vec![
-            block(0, Vec::new(), Terminator::Opaque {
-                kind: "InlineAsm".into(),
-                targets: vec![BlockId(1)],
-                span: SourceSpan::default(),
-            }),
+            block(
+                0,
+                Vec::new(),
+                Terminator::Opaque {
+                    kind: "InlineAsm".into(),
+                    targets: vec![BlockId(1)],
+                    span: SourceSpan::default(),
+                },
+            ),
             block(1, Vec::new(), Terminator::Return),
         ];
         assert!(!blocks_have_no_reachable_own_effect(&opaque));

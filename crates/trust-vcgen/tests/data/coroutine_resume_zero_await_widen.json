@@ -1,0 +1,2453 @@
+{
+ "name": "{closure#0}",
+ "def_path": "async_zero_await_widen::f::{closure#0}",
+ "span": {
+  "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+  "line_start": 63,
+  "col_start": 29,
+  "line_end": 65,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Adt": {
+      "name": "core::task::poll::Poll",
+      "fields": [
+       [
+        "__tag",
+        {
+         "Int": {
+          "width": 64,
+          "signed": true
+         }
+        }
+       ],
+       [
+        "__v0_0",
+        {
+         "Int": {
+          "width": 16,
+          "signed": false
+         }
+        }
+       ]
+      ],
+      "variants": [
+       {
+        "name": "Ready",
+        "discriminant": 0,
+        "fields": [
+         [
+          "0",
+          {
+           "Int": {
+            "width": 16,
+            "signed": false
+           }
+          }
+         ]
+        ]
+       },
+       {
+        "name": "Pending",
+        "discriminant": 1,
+        "fields": []
+       }
+      ],
+      "disc_index_safe": true,
+      "faithful_enum_repr": null,
+      "layout": null,
+      "enum_layout": null,
+      "adt_kind": "Enum"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Adt": {
+      "name": "core::pin::Pin",
+      "fields": [
+       [
+        "pointer",
+        {
+         "Ref": {
+          "mutable": true,
+          "inner": {
+           "Coroutine": {
+            "name": "async_zero_await_widen::f::{closure#0}",
+            "upvars": [
+             {
+              "Int": {
+               "width": 8,
+               "signed": false
+              }
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      ],
+      "variants": [],
+      "disc_index_safe": false,
+      "faithful_enum_repr": null,
+      "layout": null,
+      "enum_layout": null,
+      "adt_kind": "Struct"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Ref": {
+      "mutable": true,
+      "inner": {
+       "Adt": {
+        "name": "core::task::wake::Context",
+        "fields": [
+         [
+          "waker",
+          {
+           "Ref": {
+            "mutable": false,
+            "inner": {
+             "Adt": {
+              "name": "core::task::wake::Waker",
+              "fields": [
+               [
+                "waker",
+                {
+                 "Adt": {
+                  "name": "core::task::wake::RawWaker",
+                  "fields": [
+                   [
+                    "data",
+                    {
+                     "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                     }
+                    }
+                   ],
+                   [
+                    "vtable",
+                    {
+                     "Ref": {
+                      "mutable": false,
+                      "inner": {
+                       "Adt": {
+                        "name": "core::task::wake::RawWakerVTable",
+                        "fields": [
+                         [
+                          "clone",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": {
+                              "Datatype": {
+                               "name": "core::task::wake::RawWaker",
+                               "variants": []
+                              }
+                             }
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "wake",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": "Unit"
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "wake_by_ref",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": "Unit"
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "drop",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": "Unit"
+                            }
+                           }
+                          }
+                         ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                       }
+                      }
+                     }
+                    }
+                   ]
+                  ],
+                  "variants": [],
+                  "disc_index_safe": false,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
+                 }
+                }
+               ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
+             }
+            }
+           }
+          }
+         ],
+         [
+          "local_waker",
+          {
+           "Ref": {
+            "mutable": false,
+            "inner": {
+             "Adt": {
+              "name": "core::task::wake::LocalWaker",
+              "fields": [
+               [
+                "waker",
+                {
+                 "Adt": {
+                  "name": "core::task::wake::RawWaker",
+                  "fields": [
+                   [
+                    "data",
+                    {
+                     "RawPtr": {
+                      "mutable": false,
+                      "pointee": "Unit"
+                     }
+                    }
+                   ],
+                   [
+                    "vtable",
+                    {
+                     "Ref": {
+                      "mutable": false,
+                      "inner": {
+                       "Adt": {
+                        "name": "core::task::wake::RawWakerVTable",
+                        "fields": [
+                         [
+                          "clone",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": {
+                              "Datatype": {
+                               "name": "core::task::wake::RawWaker",
+                               "variants": []
+                              }
+                             }
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "wake",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": "Unit"
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "wake_by_ref",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": "Unit"
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "drop",
+                          {
+                           "FnPtr": {
+                            "sig": {
+                             "params": [
+                              {
+                               "RawPtr": {
+                                "mutable": false,
+                                "pointee": "Unit"
+                               }
+                              }
+                             ],
+                             "ret": "Unit"
+                            }
+                           }
+                          }
+                         ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                       }
+                      }
+                     }
+                    }
+                   ]
+                  ],
+                  "variants": [],
+                  "disc_index_safe": false,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
+                 }
+                }
+               ]
+              ],
+              "variants": [],
+              "disc_index_safe": false,
+              "faithful_enum_repr": null,
+              "layout": null,
+              "enum_layout": null,
+              "adt_kind": "Struct"
+             }
+            }
+           }
+          }
+         ],
+         [
+          "ext",
+          {
+           "Adt": {
+            "name": "core::panic::unwind_safe::AssertUnwindSafe",
+            "fields": [
+             [
+              "0",
+              {
+               "Adt": {
+                "name": "core::task::wake::ExtData",
+                "fields": [
+                 [
+                  "__tag",
+                  {
+                   "Int": {
+                    "width": 64,
+                    "signed": true
+                   }
+                  }
+                 ],
+                 [
+                  "__v0_0",
+                  {
+                   "Ref": {
+                    "mutable": true,
+                    "inner": {
+                     "Dynamic": {
+                      "trait_name": "core::any::Any",
+                      "principal_key": "core::any::Any"
+                     }
+                    }
+                   }
+                  }
+                 ],
+                 [
+                  "__v1_0",
+                  "Unit"
+                 ]
+                ],
+                "variants": [
+                 {
+                  "name": "Some",
+                  "discriminant": 0,
+                  "fields": [
+                   [
+                    "0",
+                    {
+                     "Ref": {
+                      "mutable": true,
+                      "inner": {
+                       "Dynamic": {
+                        "trait_name": "core::any::Any",
+                        "principal_key": "core::any::Any"
+                       }
+                      }
+                     }
+                    }
+                   ]
+                  ]
+                 },
+                 {
+                  "name": "None",
+                  "discriminant": 1,
+                  "fields": [
+                   [
+                    "0",
+                    "Unit"
+                   ]
+                  ]
+                 }
+                ],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ],
+         [
+          "_marker",
+          {
+           "Adt": {
+            "name": "core::marker::PhantomData",
+            "fields": [],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ],
+         [
+          "_marker2",
+          {
+           "Adt": {
+            "name": "core::marker::PhantomData",
+            "fields": [],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Struct"
+       }
+      }
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 3,
+    "ty": {
+     "Int": {
+      "width": 8,
+      "signed": false
+     }
+    },
+    "name": "x"
+   },
+   {
+    "index": 4,
+    "ty": {
+     "Int": {
+      "width": 16,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 5,
+    "ty": {
+     "Tuple": [
+      {
+       "Int": {
+        "width": 16,
+        "signed": false
+       }
+      },
+      "Bool"
+     ]
+    },
+    "name": null
+   },
+   {
+    "index": 6,
+    "ty": {
+     "Int": {
+      "width": 16,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 7,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 8,
+    "ty": {
+     "Ref": {
+      "mutable": true,
+      "inner": {
+       "Coroutine": {
+        "name": "async_zero_await_widen::f::{closure#0}",
+        "upvars": [
+         {
+          "Int": {
+           "width": 8,
+           "signed": false
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 9,
+    "ty": {
+     "Adt": {
+      "name": "core::future::ResumeTy",
+      "fields": [
+       [
+        "0",
+        {
+         "Adt": {
+          "name": "core::ptr::non_null::NonNull",
+          "fields": [
+           [
+            "pointer",
+            {
+             "RawPtr": {
+              "mutable": false,
+              "pointee": {
+               "Adt": {
+                "name": "core::task::wake::Context",
+                "fields": [
+                 [
+                  "waker",
+                  {
+                   "Ref": {
+                    "mutable": false,
+                    "inner": {
+                     "Adt": {
+                      "name": "core::task::wake::Waker",
+                      "fields": [
+                       [
+                        "waker",
+                        {
+                         "Adt": {
+                          "name": "core::task::wake::RawWaker",
+                          "fields": [
+                           [
+                            "data",
+                            {
+                             "RawPtr": {
+                              "mutable": false,
+                              "pointee": "Unit"
+                             }
+                            }
+                           ],
+                           [
+                            "vtable",
+                            {
+                             "Ref": {
+                              "mutable": false,
+                              "inner": {
+                               "Adt": {
+                                "name": "core::task::wake::RawWakerVTable",
+                                "fields": [
+                                 [
+                                  "clone",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": {
+                                      "Datatype": {
+                                       "name": "core::task::wake::RawWaker",
+                                       "variants": []
+                                      }
+                                     }
+                                    }
+                                   }
+                                  }
+                                 ],
+                                 [
+                                  "wake",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": "Unit"
+                                    }
+                                   }
+                                  }
+                                 ],
+                                 [
+                                  "wake_by_ref",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": "Unit"
+                                    }
+                                   }
+                                  }
+                                 ],
+                                 [
+                                  "drop",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": "Unit"
+                                    }
+                                   }
+                                  }
+                                 ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                               }
+                              }
+                             }
+                            }
+                           ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                         }
+                        }
+                       ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                     }
+                    }
+                   }
+                  }
+                 ],
+                 [
+                  "local_waker",
+                  {
+                   "Ref": {
+                    "mutable": false,
+                    "inner": {
+                     "Adt": {
+                      "name": "core::task::wake::LocalWaker",
+                      "fields": [
+                       [
+                        "waker",
+                        {
+                         "Adt": {
+                          "name": "core::task::wake::RawWaker",
+                          "fields": [
+                           [
+                            "data",
+                            {
+                             "RawPtr": {
+                              "mutable": false,
+                              "pointee": "Unit"
+                             }
+                            }
+                           ],
+                           [
+                            "vtable",
+                            {
+                             "Ref": {
+                              "mutable": false,
+                              "inner": {
+                               "Adt": {
+                                "name": "core::task::wake::RawWakerVTable",
+                                "fields": [
+                                 [
+                                  "clone",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": {
+                                      "Datatype": {
+                                       "name": "core::task::wake::RawWaker",
+                                       "variants": []
+                                      }
+                                     }
+                                    }
+                                   }
+                                  }
+                                 ],
+                                 [
+                                  "wake",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": "Unit"
+                                    }
+                                   }
+                                  }
+                                 ],
+                                 [
+                                  "wake_by_ref",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": "Unit"
+                                    }
+                                   }
+                                  }
+                                 ],
+                                 [
+                                  "drop",
+                                  {
+                                   "FnPtr": {
+                                    "sig": {
+                                     "params": [
+                                      {
+                                       "RawPtr": {
+                                        "mutable": false,
+                                        "pointee": "Unit"
+                                       }
+                                      }
+                                     ],
+                                     "ret": "Unit"
+                                    }
+                                   }
+                                  }
+                                 ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                               }
+                              }
+                             }
+                            }
+                           ]
+                          ],
+                          "variants": [],
+                          "disc_index_safe": false,
+                          "faithful_enum_repr": null,
+                          "layout": null,
+                          "enum_layout": null,
+                          "adt_kind": "Struct"
+                         }
+                        }
+                       ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                     }
+                    }
+                   }
+                  }
+                 ],
+                 [
+                  "ext",
+                  {
+                   "Adt": {
+                    "name": "core::panic::unwind_safe::AssertUnwindSafe",
+                    "fields": [
+                     [
+                      "0",
+                      {
+                       "Adt": {
+                        "name": "core::task::wake::ExtData",
+                        "fields": [
+                         [
+                          "__tag",
+                          {
+                           "Int": {
+                            "width": 64,
+                            "signed": true
+                           }
+                          }
+                         ],
+                         [
+                          "__v0_0",
+                          {
+                           "Ref": {
+                            "mutable": true,
+                            "inner": {
+                             "Dynamic": {
+                              "trait_name": "core::any::Any",
+                              "principal_key": "core::any::Any"
+                             }
+                            }
+                           }
+                          }
+                         ],
+                         [
+                          "__v1_0",
+                          "Unit"
+                         ]
+                        ],
+                        "variants": [
+                         {
+                          "name": "Some",
+                          "discriminant": 0,
+                          "fields": [
+                           [
+                            "0",
+                            {
+                             "Ref": {
+                              "mutable": true,
+                              "inner": {
+                               "Dynamic": {
+                                "trait_name": "core::any::Any",
+                                "principal_key": "core::any::Any"
+                               }
+                              }
+                             }
+                            }
+                           ]
+                          ]
+                         },
+                         {
+                          "name": "None",
+                          "discriminant": 1,
+                          "fields": [
+                           [
+                            "0",
+                            "Unit"
+                           ]
+                          ]
+                         }
+                        ],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                       }
+                      }
+                     ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                   }
+                  }
+                 ],
+                 [
+                  "_marker",
+                  {
+                   "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                   }
+                  }
+                 ],
+                 [
+                  "_marker2",
+                  {
+                   "Adt": {
+                    "name": "core::marker::PhantomData",
+                    "fields": [],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                   }
+                  }
+                 ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+               }
+              }
+             }
+            }
+           ]
+          ],
+          "variants": [],
+          "disc_index_safe": false,
+          "faithful_enum_repr": null,
+          "layout": null,
+          "enum_layout": null,
+          "adt_kind": "Struct"
+         }
+        }
+       ]
+      ],
+      "variants": [],
+      "disc_index_safe": false,
+      "faithful_enum_repr": null,
+      "layout": null,
+      "enum_layout": null,
+      "adt_kind": "Struct"
+     }
+    },
+    "name": "_task_context"
+   },
+   {
+    "index": 10,
+    "ty": {
+     "Adt": {
+      "name": "core::ptr::non_null::NonNull",
+      "fields": [
+       [
+        "pointer",
+        {
+         "RawPtr": {
+          "mutable": false,
+          "pointee": {
+           "Adt": {
+            "name": "core::task::wake::Context",
+            "fields": [
+             [
+              "waker",
+              {
+               "Ref": {
+                "mutable": false,
+                "inner": {
+                 "Adt": {
+                  "name": "core::task::wake::Waker",
+                  "fields": [
+                   [
+                    "waker",
+                    {
+                     "Adt": {
+                      "name": "core::task::wake::RawWaker",
+                      "fields": [
+                       [
+                        "data",
+                        {
+                         "RawPtr": {
+                          "mutable": false,
+                          "pointee": "Unit"
+                         }
+                        }
+                       ],
+                       [
+                        "vtable",
+                        {
+                         "Ref": {
+                          "mutable": false,
+                          "inner": {
+                           "Adt": {
+                            "name": "core::task::wake::RawWakerVTable",
+                            "fields": [
+                             [
+                              "clone",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": {
+                                  "Datatype": {
+                                   "name": "core::task::wake::RawWaker",
+                                   "variants": []
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             ],
+                             [
+                              "wake",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": "Unit"
+                                }
+                               }
+                              }
+                             ],
+                             [
+                              "wake_by_ref",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": "Unit"
+                                }
+                               }
+                              }
+                             ],
+                             [
+                              "drop",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": "Unit"
+                                }
+                               }
+                              }
+                             ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                           }
+                          }
+                         }
+                        }
+                       ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                     }
+                    }
+                   ]
+                  ],
+                  "variants": [],
+                  "disc_index_safe": false,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
+                 }
+                }
+               }
+              }
+             ],
+             [
+              "local_waker",
+              {
+               "Ref": {
+                "mutable": false,
+                "inner": {
+                 "Adt": {
+                  "name": "core::task::wake::LocalWaker",
+                  "fields": [
+                   [
+                    "waker",
+                    {
+                     "Adt": {
+                      "name": "core::task::wake::RawWaker",
+                      "fields": [
+                       [
+                        "data",
+                        {
+                         "RawPtr": {
+                          "mutable": false,
+                          "pointee": "Unit"
+                         }
+                        }
+                       ],
+                       [
+                        "vtable",
+                        {
+                         "Ref": {
+                          "mutable": false,
+                          "inner": {
+                           "Adt": {
+                            "name": "core::task::wake::RawWakerVTable",
+                            "fields": [
+                             [
+                              "clone",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": {
+                                  "Datatype": {
+                                   "name": "core::task::wake::RawWaker",
+                                   "variants": []
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             ],
+                             [
+                              "wake",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": "Unit"
+                                }
+                               }
+                              }
+                             ],
+                             [
+                              "wake_by_ref",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": "Unit"
+                                }
+                               }
+                              }
+                             ],
+                             [
+                              "drop",
+                              {
+                               "FnPtr": {
+                                "sig": {
+                                 "params": [
+                                  {
+                                   "RawPtr": {
+                                    "mutable": false,
+                                    "pointee": "Unit"
+                                   }
+                                  }
+                                 ],
+                                 "ret": "Unit"
+                                }
+                               }
+                              }
+                             ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                           }
+                          }
+                         }
+                        }
+                       ]
+                      ],
+                      "variants": [],
+                      "disc_index_safe": false,
+                      "faithful_enum_repr": null,
+                      "layout": null,
+                      "enum_layout": null,
+                      "adt_kind": "Struct"
+                     }
+                    }
+                   ]
+                  ],
+                  "variants": [],
+                  "disc_index_safe": false,
+                  "faithful_enum_repr": null,
+                  "layout": null,
+                  "enum_layout": null,
+                  "adt_kind": "Struct"
+                 }
+                }
+               }
+              }
+             ],
+             [
+              "ext",
+              {
+               "Adt": {
+                "name": "core::panic::unwind_safe::AssertUnwindSafe",
+                "fields": [
+                 [
+                  "0",
+                  {
+                   "Adt": {
+                    "name": "core::task::wake::ExtData",
+                    "fields": [
+                     [
+                      "__tag",
+                      {
+                       "Int": {
+                        "width": 64,
+                        "signed": true
+                       }
+                      }
+                     ],
+                     [
+                      "__v0_0",
+                      {
+                       "Ref": {
+                        "mutable": true,
+                        "inner": {
+                         "Dynamic": {
+                          "trait_name": "core::any::Any",
+                          "principal_key": "core::any::Any"
+                         }
+                        }
+                       }
+                      }
+                     ],
+                     [
+                      "__v1_0",
+                      "Unit"
+                     ]
+                    ],
+                    "variants": [
+                     {
+                      "name": "Some",
+                      "discriminant": 0,
+                      "fields": [
+                       [
+                        "0",
+                        {
+                         "Ref": {
+                          "mutable": true,
+                          "inner": {
+                           "Dynamic": {
+                            "trait_name": "core::any::Any",
+                            "principal_key": "core::any::Any"
+                           }
+                          }
+                         }
+                        }
+                       ]
+                      ]
+                     },
+                     {
+                      "name": "None",
+                      "discriminant": 1,
+                      "fields": [
+                       [
+                        "0",
+                        "Unit"
+                       ]
+                      ]
+                     }
+                    ],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                   }
+                  }
+                 ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+               }
+              }
+             ],
+             [
+              "_marker",
+              {
+               "Adt": {
+                "name": "core::marker::PhantomData",
+                "fields": [],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+               }
+              }
+             ],
+             [
+              "_marker2",
+              {
+               "Adt": {
+                "name": "core::marker::PhantomData",
+                "fields": [],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         }
+        }
+       ]
+      ],
+      "variants": [],
+      "disc_index_safe": false,
+      "faithful_enum_repr": null,
+      "layout": null,
+      "enum_layout": null,
+      "adt_kind": "Struct"
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 10,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Move": {
+           "local": 2,
+           "projections": []
+          }
+         },
+         {
+          "Adt": {
+           "name": "core::ptr::non_null::NonNull",
+           "fields": [
+            [
+             "pointer",
+             {
+              "RawPtr": {
+               "mutable": false,
+               "pointee": {
+                "Adt": {
+                 "name": "core::task::wake::Context",
+                 "fields": [
+                  [
+                   "waker",
+                   {
+                    "Ref": {
+                     "mutable": false,
+                     "inner": {
+                      "Adt": {
+                       "name": "core::task::wake::Waker",
+                       "fields": [
+                        [
+                         "waker",
+                         {
+                          "Adt": {
+                           "name": "core::task::wake::RawWaker",
+                           "fields": [
+                            [
+                             "data",
+                             {
+                              "RawPtr": {
+                               "mutable": false,
+                               "pointee": "Unit"
+                              }
+                             }
+                            ],
+                            [
+                             "vtable",
+                             {
+                              "Ref": {
+                               "mutable": false,
+                               "inner": {
+                                "Adt": {
+                                 "name": "core::task::wake::RawWakerVTable",
+                                 "fields": [
+                                  [
+                                   "clone",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": {
+                                       "Datatype": {
+                                        "name": "core::task::wake::RawWaker",
+                                        "variants": []
+                                       }
+                                      }
+                                     }
+                                    }
+                                   }
+                                  ],
+                                  [
+                                   "wake",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": "Unit"
+                                     }
+                                    }
+                                   }
+                                  ],
+                                  [
+                                   "wake_by_ref",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": "Unit"
+                                     }
+                                    }
+                                   }
+                                  ],
+                                  [
+                                   "drop",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": "Unit"
+                                     }
+                                    }
+                                   }
+                                  ]
+                                 ],
+                                 "variants": [],
+                                 "disc_index_safe": false,
+                                 "faithful_enum_repr": null,
+                                 "layout": null,
+                                 "enum_layout": null,
+                                 "adt_kind": "Struct"
+                                }
+                               }
+                              }
+                             }
+                            ]
+                           ],
+                           "variants": [],
+                           "disc_index_safe": false,
+                           "faithful_enum_repr": null,
+                           "layout": null,
+                           "enum_layout": null,
+                           "adt_kind": "Struct"
+                          }
+                         }
+                        ]
+                       ],
+                       "variants": [],
+                       "disc_index_safe": false,
+                       "faithful_enum_repr": null,
+                       "layout": null,
+                       "enum_layout": null,
+                       "adt_kind": "Struct"
+                      }
+                     }
+                    }
+                   }
+                  ],
+                  [
+                   "local_waker",
+                   {
+                    "Ref": {
+                     "mutable": false,
+                     "inner": {
+                      "Adt": {
+                       "name": "core::task::wake::LocalWaker",
+                       "fields": [
+                        [
+                         "waker",
+                         {
+                          "Adt": {
+                           "name": "core::task::wake::RawWaker",
+                           "fields": [
+                            [
+                             "data",
+                             {
+                              "RawPtr": {
+                               "mutable": false,
+                               "pointee": "Unit"
+                              }
+                             }
+                            ],
+                            [
+                             "vtable",
+                             {
+                              "Ref": {
+                               "mutable": false,
+                               "inner": {
+                                "Adt": {
+                                 "name": "core::task::wake::RawWakerVTable",
+                                 "fields": [
+                                  [
+                                   "clone",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": {
+                                       "Datatype": {
+                                        "name": "core::task::wake::RawWaker",
+                                        "variants": []
+                                       }
+                                      }
+                                     }
+                                    }
+                                   }
+                                  ],
+                                  [
+                                   "wake",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": "Unit"
+                                     }
+                                    }
+                                   }
+                                  ],
+                                  [
+                                   "wake_by_ref",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": "Unit"
+                                     }
+                                    }
+                                   }
+                                  ],
+                                  [
+                                   "drop",
+                                   {
+                                    "FnPtr": {
+                                     "sig": {
+                                      "params": [
+                                       {
+                                        "RawPtr": {
+                                         "mutable": false,
+                                         "pointee": "Unit"
+                                        }
+                                       }
+                                      ],
+                                      "ret": "Unit"
+                                     }
+                                    }
+                                   }
+                                  ]
+                                 ],
+                                 "variants": [],
+                                 "disc_index_safe": false,
+                                 "faithful_enum_repr": null,
+                                 "layout": null,
+                                 "enum_layout": null,
+                                 "adt_kind": "Struct"
+                                }
+                               }
+                              }
+                             }
+                            ]
+                           ],
+                           "variants": [],
+                           "disc_index_safe": false,
+                           "faithful_enum_repr": null,
+                           "layout": null,
+                           "enum_layout": null,
+                           "adt_kind": "Struct"
+                          }
+                         }
+                        ]
+                       ],
+                       "variants": [],
+                       "disc_index_safe": false,
+                       "faithful_enum_repr": null,
+                       "layout": null,
+                       "enum_layout": null,
+                       "adt_kind": "Struct"
+                      }
+                     }
+                    }
+                   }
+                  ],
+                  [
+                   "ext",
+                   {
+                    "Adt": {
+                     "name": "core::panic::unwind_safe::AssertUnwindSafe",
+                     "fields": [
+                      [
+                       "0",
+                       {
+                        "Adt": {
+                         "name": "core::task::wake::ExtData",
+                         "fields": [
+                          [
+                           "__tag",
+                           {
+                            "Int": {
+                             "width": 64,
+                             "signed": true
+                            }
+                           }
+                          ],
+                          [
+                           "__v0_0",
+                           {
+                            "Ref": {
+                             "mutable": true,
+                             "inner": {
+                              "Dynamic": {
+                               "trait_name": "core::any::Any",
+                               "principal_key": "core::any::Any"
+                              }
+                             }
+                            }
+                           }
+                          ],
+                          [
+                           "__v1_0",
+                           "Unit"
+                          ]
+                         ],
+                         "variants": [
+                          {
+                           "name": "Some",
+                           "discriminant": 0,
+                           "fields": [
+                            [
+                             "0",
+                             {
+                              "Ref": {
+                               "mutable": true,
+                               "inner": {
+                                "Dynamic": {
+                                 "trait_name": "core::any::Any",
+                                 "principal_key": "core::any::Any"
+                                }
+                               }
+                              }
+                             }
+                            ]
+                           ]
+                          },
+                          {
+                           "name": "None",
+                           "discriminant": 1,
+                           "fields": [
+                            [
+                             "0",
+                             "Unit"
+                            ]
+                           ]
+                          }
+                         ],
+                         "disc_index_safe": false,
+                         "faithful_enum_repr": null,
+                         "layout": null,
+                         "enum_layout": null,
+                         "adt_kind": "Enum"
+                        }
+                       }
+                      ]
+                     ],
+                     "variants": [],
+                     "disc_index_safe": false,
+                     "faithful_enum_repr": null,
+                     "layout": null,
+                     "enum_layout": null,
+                     "adt_kind": "Struct"
+                    }
+                   }
+                  ],
+                  [
+                   "_marker",
+                   {
+                    "Adt": {
+                     "name": "core::marker::PhantomData",
+                     "fields": [],
+                     "variants": [],
+                     "disc_index_safe": false,
+                     "faithful_enum_repr": null,
+                     "layout": null,
+                     "enum_layout": null,
+                     "adt_kind": "Struct"
+                    }
+                   }
+                  ],
+                  [
+                   "_marker2",
+                   {
+                    "Adt": {
+                     "name": "core::marker::PhantomData",
+                     "fields": [],
+                     "variants": [],
+                     "disc_index_safe": false,
+                     "faithful_enum_repr": null,
+                     "layout": null,
+                     "enum_layout": null,
+                     "adt_kind": "Struct"
+                    }
+                   }
+                  ]
+                 ],
+                 "variants": [],
+                 "disc_index_safe": false,
+                 "faithful_enum_repr": null,
+                 "layout": null,
+                 "enum_layout": null,
+                 "adt_kind": "Struct"
+                }
+               }
+              }
+             }
+            ]
+           ],
+           "variants": [],
+           "disc_index_safe": false,
+           "faithful_enum_repr": null,
+           "layout": null,
+           "enum_layout": null,
+           "adt_kind": "Struct"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 63,
+        "col_start": 29,
+        "line_end": 65,
+        "col_end": 1
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 9,
+        "projections": []
+       },
+       "rvalue": {
+        "Aggregate": [
+         {
+          "Adt": {
+           "name": "core::future::ResumeTy",
+           "variant": 0,
+           "active_field": null,
+           "args": "core::future::ResumeTy"
+          }
+         },
+         [
+          {
+           "Move": {
+            "local": 10,
+            "projections": []
+           }
+          }
+         ]
+        ]
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 63,
+        "col_start": 29,
+        "line_end": 65,
+        "col_end": 1
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 8,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 1,
+          "projections": [
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 63,
+        "col_start": 29,
+        "line_end": 65,
+        "col_end": 1
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 7,
+        "projections": []
+       },
+       "rvalue": {
+        "Discriminant": {
+         "local": 8,
+         "projections": [
+          "Deref"
+         ]
+        }
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 63,
+        "col_start": 29,
+        "line_end": 65,
+        "col_end": 1
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Move": {
+        "local": 7,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        6
+       ],
+       [
+        1,
+        4
+       ],
+       [
+        2,
+        3
+       ]
+      ],
+      "otherwise": 5,
+      "exhaustive_enum_unreachable": true,
+      "span": {
+       "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+       "line_start": 63,
+       "col_start": 29,
+       "line_end": 65,
+       "col_end": 1
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 6,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Move": {
+          "local": 5,
+          "projections": [
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 64,
+        "col_start": 4,
+        "line_end": 64,
+        "col_end": 18
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Aggregate": [
+         {
+          "Adt": {
+           "name": "core::task::poll::Poll",
+           "variant": 0,
+           "active_field": null,
+           "args": "core::task::poll::Poll<u16>"
+          }
+         },
+         [
+          {
+           "Move": {
+            "local": 6,
+            "projections": []
+           }
+          }
+         ]
+        ]
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 65,
+        "col_start": 1,
+        "line_end": 65,
+        "col_end": 1
+       }
+      }
+     },
+     {
+      "SetDiscriminant": {
+       "place": {
+        "local": 8,
+        "projections": [
+         "Deref"
+        ]
+       },
+       "variant_index": 1
+      }
+     }
+    ],
+    "terminator": "Return"
+   },
+   {
+    "id": 2,
+    "stmts": [
+     {
+      "SetDiscriminant": {
+       "place": {
+        "local": 8,
+        "projections": [
+         "Deref"
+        ]
+       },
+       "variant_index": 2
+      }
+     }
+    ],
+    "terminator": "Resume"
+   },
+   {
+    "id": 3,
+    "stmts": [],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Constant": {
+        "Bool": false
+       }
+      },
+      "expected": true,
+      "msg": "ResumedAfterPanic",
+      "target": 3,
+      "span": {
+       "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+       "line_start": 63,
+       "col_start": 29,
+       "line_end": 65,
+       "col_end": 1
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 4,
+    "stmts": [],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Constant": {
+        "Bool": false
+       }
+      },
+      "expected": true,
+      "msg": "ResumedAfterReturn",
+      "target": 4,
+      "span": {
+       "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+       "line_start": 63,
+       "col_start": 29,
+       "line_end": 65,
+       "col_end": 1
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 5,
+    "stmts": [],
+    "terminator": "Unreachable"
+   },
+   {
+    "id": 6,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 8,
+          "projections": [
+           "Deref",
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 63,
+        "col_start": 15,
+        "line_end": 63,
+        "col_end": 16
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 3,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 16,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 64,
+        "col_start": 4,
+        "line_end": 64,
+        "col_end": 14
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 5,
+        "projections": []
+       },
+       "rvalue": {
+        "CheckedBinaryOp": [
+         "Add",
+         {
+          "Copy": {
+           "local": 4,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            16
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+        "line_start": 64,
+        "col_start": 4,
+        "line_end": 64,
+        "col_end": 18
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 5,
+        "projections": [
+         {
+          "Field": 1
+         }
+        ]
+       }
+      },
+      "expected": false,
+      "msg": {
+       "Overflow": "Add"
+      },
+      "target": 1,
+      "span": {
+       "file": "tests/trust-falsification/proved/async_zero_await_widen.rs",
+       "line_start": 64,
+       "col_start": 4,
+       "line_end": 64,
+       "col_end": 18
+      },
+      "unwind": {
+       "Cleanup": 2
+      }
+     }
+    }
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Adt": {
+    "name": "core::task::poll::Poll",
+    "fields": [
+     [
+      "__tag",
+      {
+       "Int": {
+        "width": 64,
+        "signed": true
+       }
+      }
+     ],
+     [
+      "__v0_0",
+      {
+       "Int": {
+        "width": 16,
+        "signed": false
+       }
+      }
+     ]
+    ],
+    "variants": [
+     {
+      "name": "Ready",
+      "discriminant": 0,
+      "fields": [
+       [
+        "0",
+        {
+         "Int": {
+          "width": 16,
+          "signed": false
+         }
+        }
+       ]
+      ]
+     },
+     {
+      "name": "Pending",
+      "discriminant": 1,
+      "fields": []
+     }
+    ],
+    "disc_index_safe": true,
+    "faithful_enum_repr": null,
+    "layout": null,
+    "enum_layout": null,
+    "adt_kind": "Enum"
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -230,12 +230,10 @@ pub(crate) struct CrateCallInfo<'tcx> {
     /// `Vec`, not a set: two calls with the same source span remain two oracle
     /// edges and therefore require two generated discharge rows.
     pub direct_call_sites: Vec<DirectCallSite>,
-    /// Callees reached by an edge the vcgen producer CANNOT reproduce: a `TailCall`
-    /// (the extractor lowers it to `Terminator::Opaque`, so no precondition obligation is
-    /// emitted for it), or any edge found while scanning a non-reproducible body (a
-    /// const/static item body or a `promoted_mir` fragment). Folded into `is_public` so
-    /// such a callee is never `Total` — closing the "covered but a hidden site is
-    /// undischarged" hole.
+    /// Callees reached by an edge the vcgen producer cannot reproduce because it
+    /// was found while scanning a non-reproducible body (a const/static item body
+    /// or a `promoted_mir` fragment). Reproducible direct `Call` and `TailCall`
+    /// sites are both carried by Trust MIR and become exact precondition rows.
     pub hidden_call_target: FxHashSet<DefId>,
     /// Trust (R1 completeness #3): per-callee resolved MONOMORPHIZATION call sites. For a
     /// generic in-crate F, `mono_call_sites[F]` lists every direct call whose callee
@@ -305,11 +303,10 @@ struct CallScan<'a, 'tcx> {
     owner_typing_env: TypingEnv<'tcx>,
     address_taken: &'a mut FxHashSet<DefId>,
     edges: &'a mut Vec<(DefId, DefId)>,
-    /// Reproducible, non-tail direct sites, with multiplicity and exact span.
+    /// Reproducible direct Call/TailCall sites, with multiplicity and exact span.
     direct_call_sites: &'a mut Vec<DirectCallSite>,
-    /// Callees reached by an edge the producer cannot reproduce (a `TailCall`, or any
-    /// edge in a non-reproducible body). Recorded so such a callee is poisoned from
-    /// `Total` coverage — its call site would never become a discharge obligation.
+    /// Callees reached by an edge in a non-reproducible body. Recorded so such a
+    /// callee is poisoned from `Total` coverage.
     hidden: &'a mut FxHashSet<DefId>,
     /// Trust (R1 completeness #3): per-callee resolved mono call sites, keyed by the
     /// callee's generic DefId.
@@ -326,20 +323,19 @@ impl<'tcx> Visitor<'tcx> for CallScan<'_, 'tcx> {
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         let direct = match &terminator.kind {
             TerminatorKind::Call { func, args, .. } => {
-                func.const_fn_def().map(|(callee, gargs)| (callee, gargs, args, false))
+                func.const_fn_def().map(|(callee, gargs)| (callee, gargs, args))
             }
             TerminatorKind::TailCall { func, args, .. } => {
-                // The extractor lowers TailCall to Terminator::Opaque ⇒ no obligation.
-                func.const_fn_def().map(|(callee, gargs)| (callee, gargs, args, true))
+                func.const_fn_def().map(|(callee, gargs)| (callee, gargs, args))
             }
             _ => None,
         };
-        if let Some((callee, gargs, args, is_tail)) = direct {
+        if let Some((callee, gargs, args)) = direct {
             // Direct `FnDef` call: record the edge and visit ONLY the argument operands,
             // so the callee in `func` is NOT counted as address-taken. The destination
             // is a Place (carries no constants) and is safely skipped.
             self.edges.push((self.owner, callee));
-            if is_tail || !self.reproducible {
+            if !self.reproducible {
                 self.hidden.insert(callee);
             } else {
                 self.direct_call_sites.push(DirectCallSite {
@@ -349,11 +345,9 @@ impl<'tcx> Visitor<'tcx> for CallScan<'_, 'tcx> {
                 });
             }
             // Trust (R1 completeness #3): resolve this call's monomorphization. Only a
-            // reproducible, non-tail edge can become a per-caller discharge obligation, so
-            // only those feed `mono_call_sites`; any OTHER kind of edge into `callee`
-            // (tail-call, const/static/promoted body) is an unaccountable mono site ⇒
-            // poison. A resolve failure (unknown mono) also poisons — fail-closed.
-            if self.reproducible && !is_tail {
+            // reproducible edge can become a per-caller discharge obligation, so only
+            // those feed `mono_call_sites`; non-reproducible edges poison the callee.
+            if self.reproducible {
                 match ty::Instance::try_resolve(self.tcx, self.owner_typing_env, callee, gargs) {
                     Ok(Some(instance)) => {
                         // Record under the callee's GENERIC def_id (the shared def);

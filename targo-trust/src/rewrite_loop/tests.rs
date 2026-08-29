@@ -1632,10 +1632,7 @@ fn broken_build_is_rejected_even_though_its_frontier_reads_as_progress() {
     // frontier with nothing failing in it is what "improved" looks like to any
     // comparison. This test is the reason the build check exists.
     let looks_like_progress = LoopDecision::Continue { verdict: "improved" };
-    assert_eq!(
-        rewrite_rejection(1, 0, &looks_like_progress),
-        Some(RewriteRejection::BrokenBuild),
-    );
+    assert_eq!(rewrite_rejection(1, 0, &looks_like_progress), Some(RewriteRejection::BrokenBuild),);
     assert_eq!(
         rewrite_rejection(1, 0, &LoopDecision::Converged { stable_rounds: 2 }),
         Some(RewriteRejection::BrokenBuild),

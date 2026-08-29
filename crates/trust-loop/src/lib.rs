@@ -19,13 +19,12 @@ use trust_convergence::{
 };
 use trust_types::{SourceSpan, VerificationCondition, VerificationResult};
 
+use crate::futility::FutilityDetector;
 pub use crate::futility::{FutilityConfig, FutilityReason};
 pub use crate::iteration_metrics::IterationMetrics;
-pub use crate::vc_tracker::{RegressionEvent, VcStatus};
-
-use crate::futility::FutilityDetector;
 use crate::iteration_metrics::MetricsBuilder;
 use crate::vc_tracker::VcTracker;
+pub use crate::vc_tracker::{RegressionEvent, VcStatus};
 
 /// Configuration for iterative verification.
 #[derive(Debug, Clone)]
@@ -226,9 +225,8 @@ pub fn run_iterative_verification(
             // must be confirmed by re-verifying the FULL VC set (with
             // strengthenings) in the current context; only the full re-verification
             // result is trusted from this point on.
-            let relies_on_carried = statuses
-                .keys()
-                .any(|k| !results.iter().any(|(vc, _)| &vc_slot_key(vc) == k));
+            let relies_on_carried =
+                statuses.keys().any(|k| !results.iter().any(|(vc, _)| &vc_slot_key(vc) == k));
             if relies_on_carried {
                 let revalidation = ctx.verify_vcs(&all_vcs);
                 let revalidation_statuses = update_statuses(&BTreeMap::new(), &revalidation);
@@ -474,8 +472,9 @@ fn span_key(span: &SourceSpan) -> String {
 mod tests {
     use std::cell::Cell;
 
-    use super::*;
     use trust_types::{Formula, ProofStrength, Sort, VcKind};
+
+    use super::*;
 
     struct MockVerifyContext {
         verify_steps: Vec<Vec<(VerificationCondition, VerificationResult)>>,
@@ -572,17 +571,10 @@ mod tests {
     }
 
     fn unknown(reason: &str) -> VerificationResult {
-        VerificationResult::Unknown {
-            solver: "ay".into(),
-            reason: reason.to_string(),
-            time_ms: 1,
-        }
+        VerificationResult::Unknown { solver: "ay".into(), reason: reason.to_string(), time_ms: 1 }
     }
 
-    fn final_status(
-        result: &LoopResult,
-        vc: &VerificationCondition,
-    ) -> Option<ObligationStatus> {
+    fn final_status(result: &LoopResult, vc: &VerificationCondition) -> Option<ObligationStatus> {
         let expected_key = vc_slot_key(vc);
         result
             .final_results
@@ -749,10 +741,7 @@ mod tests {
                 // proved: 2 (a carried, b_strengthened), failed: 0, unknown: 1 (c)
                 // prev:   proved: 2, failed: 1, unknown: 0
                 // unknown increased from 0 to 1 -> regression
-                vec![
-                    (vc_b_strengthened.clone(), proved()),
-                    (vc_c.clone(), unknown("timeout")),
-                ],
+                vec![(vc_b_strengthened.clone(), proved()), (vc_c.clone(), unknown("timeout"))],
             ],
             vec![vec![vc_b_strengthened]],
         );
@@ -787,11 +776,8 @@ mod tests {
             vec![vec![vc_b_strengthened.clone()]],
         );
 
-        let result = run_iterative_verification(
-            &LoopConfig::default(),
-            vec![vc_a.clone(), vc_b],
-            &ctx,
-        );
+        let result =
+            run_iterative_verification(&LoopConfig::default(), vec![vc_a.clone(), vc_b], &ctx);
 
         assert_ne!(result.reason, TerminationReason::AllProved);
         assert_ne!(result.verdict, ConvergenceVerdict::Converged);
@@ -800,19 +786,10 @@ mod tests {
         assert_eq!(result.final_unknown, 0);
         assert_eq!(result.final_results.len(), 2);
         assert_eq!(final_status(&result, &vc_a), Some(ObligationStatus::Failed));
-        assert_eq!(
-            final_status(&result, &vc_b_strengthened),
-            Some(ObligationStatus::Proved)
-        );
+        assert_eq!(final_status(&result, &vc_b_strengthened), Some(ObligationStatus::Proved));
         assert_eq!(
             result.history[1],
-            IterationRecord {
-                iteration: 2,
-                proved: 1,
-                failed: 1,
-                unknown: 0,
-                strengthened: 0,
-            }
+            IterationRecord { iteration: 2, proved: 1, failed: 1, unknown: 0, strengthened: 0 }
         );
         assert_eq!(result.metrics_history[1].proved, 1);
         assert_eq!(result.metrics_history[1].failed, 1);
@@ -838,11 +815,8 @@ mod tests {
             vec![vec![vc_b_strengthened.clone()]],
         );
 
-        let result = run_iterative_verification(
-            &LoopConfig::default(),
-            vec![vc_a.clone(), vc_b],
-            &ctx,
-        );
+        let result =
+            run_iterative_verification(&LoopConfig::default(), vec![vc_a.clone(), vc_b], &ctx);
 
         assert_ne!(result.reason, TerminationReason::AllProved);
         assert_ne!(result.verdict, ConvergenceVerdict::Converged);
@@ -851,19 +825,10 @@ mod tests {
         assert_eq!(result.final_unknown, 1);
         assert_eq!(result.final_results.len(), 2);
         assert_eq!(final_status(&result, &vc_a), Some(ObligationStatus::Unknown));
-        assert_eq!(
-            final_status(&result, &vc_b_strengthened),
-            Some(ObligationStatus::Proved)
-        );
+        assert_eq!(final_status(&result, &vc_b_strengthened), Some(ObligationStatus::Proved));
         assert_eq!(
             result.history[1],
-            IterationRecord {
-                iteration: 2,
-                proved: 1,
-                failed: 0,
-                unknown: 1,
-                strengthened: 0,
-            }
+            IterationRecord { iteration: 2, proved: 1, failed: 0, unknown: 1, strengthened: 0 }
         );
         assert_eq!(result.metrics_history[1].proved, 1);
         assert_eq!(result.metrics_history[1].failed, 0);

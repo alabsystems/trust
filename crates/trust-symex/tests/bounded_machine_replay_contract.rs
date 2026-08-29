@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use trust_symex::{
     BinaryMachineInstructionEvidence, BinaryMachineReplayAttestationStatus,
     BinaryMachineReplayBackend, BinaryMachineReplayBoundaryEvidence,
@@ -23,8 +25,6 @@ use trust_types::{
     SolverDispatchStatus, SolverQuerySemantics, SourceSpan, TraceStep, VcKind,
     VerificationCondition, VerificationResult,
 };
-
-use std::collections::BTreeMap;
 
 const AARCH64_NOP_ENCODING: u32 = 0xd503_201f;
 const AARCH64_NOP_BYTES: [u8; 4] = [0x1f, 0x20, 0x03, 0xd5];

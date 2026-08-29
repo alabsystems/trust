@@ -1944,6 +1944,34 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 // (`declare_effect_census!` in `effect.rs`), so the drift is unrepresentable
 // rather than asserted — a stronger check that costs no unstable feature. Prefer
 // that shape to a new entry here.
+// Trust: `stdarch_x86_avx512` has been REMOVED, and this is a real TCB reduction —
+// one fewer unstable feature the compiler's own build graph is permitted to use.
+//
+// It was here for exactly one crate: curve25519-dalek gates its AVX-512 backend
+// behind it (`src/lib.rs:15-19`, under `curve25519_dalek_backend = "simd"` +
+// `nightly` + x86/x86_64), and it entered every build that used this list through
+//     targo-trust -> trust-proof-cert -> ed25519-dalek -> curve25519-dalek.
+// Phase 1d cut that chain: `trust-proof-cert` now depends on the Trust-owned
+// `trust-ed25519`, and the incumbent survives only as an acceptance-gate
+// *dev*-dependency of `trust-ed25519`/`trust-rand`.
+//
+// Checked before removing, on the resolved graphs rather than by inspection —
+// every package in BOTH closures this list applies to was scanned for the feature:
+//   * targo-trust (5 of the 6 sites; `Kind::Test` at test.rs includes dev-deps):
+//     curve25519-dalek is absent entirely, and NO package's Rust source gates on
+//     `stdarch_x86_avx512`.
+//   * trustd from `crates/trust-router` (a `--bin` build, so no dev-deps):
+//     curve25519-dalek is absent; the only two sources mentioning the feature are
+//     `rand` (needs `feature = "simd_support"` AND `target_feature = "avx512bw"`;
+//     resolved features are alloc/default/os_rng/small_rng/std/std_rng/thread_rng
+//     — `simd_support` is off) and `simd-adler32` (needs its `nightly` feature;
+//     resolved features are empty). Neither gate can fire.
+//
+// NOT verified by an actual x86_64 build — this machine is aarch64 and the feature
+// is x86-only, so the evidence above is graph-measurement, not a green compile. If
+// an x86_64 host ever fails on a missing `stdarch_x86_avx512`, the cause is a NEW
+// edge into curve25519-dalek (or `simd_support` being switched on), and the fix is
+// to remove that edge rather than to re-add the allowance.
 pub(super) const CARGO_TRUST_ALLOW_FEATURES: &str =
     "min_specialization,specialization,try_trait_v2,try_trait_v2_residual";
 

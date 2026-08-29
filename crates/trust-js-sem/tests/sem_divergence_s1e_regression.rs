@@ -32,8 +32,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
-use trust_js_trace::{extract_trace, traces_equal, Completion, ProjectedValue};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
+use trust_js_trace::{Completion, ProjectedValue, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
 // CARGO_MANIFEST_DIR so it works in any checkout; override with
@@ -66,14 +67,8 @@ const PINS: &[(&str, Disp)] = &[
         "test/built-ins/Object/freeze/frozen-object-contains-symbol-properties-strict.js",
         Disp::TraceEqual,
     ),
-    (
-        "test/built-ins/Object/getOwnPropertyDescriptors/symbols-included.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/built-ins/Object/getOwnPropertySymbols/non-object-argument-valid.js",
-        Disp::TraceEqual,
-    ),
+    ("test/built-ins/Object/getOwnPropertyDescriptors/symbols-included.js", Disp::TraceEqual),
+    ("test/built-ins/Object/getOwnPropertySymbols/non-object-argument-valid.js", Disp::TraceEqual),
     (
         "test/built-ins/Object/seal/symbol-object-contains-symbol-properties-non-strict.js",
         Disp::TraceEqual,
@@ -82,44 +77,17 @@ const PINS: &[(&str, Disp)] = &[
         "test/built-ins/Object/seal/symbol-object-contains-symbol-properties-strict.js",
         Disp::TraceEqual,
     ),
-    (
-        "test/language/expressions/assignment/dstr/obj-rest-order.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/language/statements/for-of/dstr/obj-rest-order.js",
-        Disp::TraceEqual,
-    ),
+    ("test/language/expressions/assignment/dstr/obj-rest-order.js", Disp::TraceEqual),
+    ("test/language/statements/for-of/dstr/obj-rest-order.js", Disp::TraceEqual),
     // -- Cluster 3: split / replace @@-protocol dispatch ---------------------
-    (
-        "test/built-ins/String/prototype/replace/cstm-replace-get-err.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/built-ins/String/prototype/replace/cstm-replace-invocation.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/built-ins/String/prototype/split/cstm-split-get-err.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/built-ins/String/prototype/split/cstm-split-invocation.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/built-ins/String/prototype/split/this-value-tostring-error.js",
-        Disp::TraceEqual,
-    ),
+    ("test/built-ins/String/prototype/replace/cstm-replace-get-err.js", Disp::TraceEqual),
+    ("test/built-ins/String/prototype/replace/cstm-replace-invocation.js", Disp::TraceEqual),
+    ("test/built-ins/String/prototype/split/cstm-split-get-err.js", Disp::TraceEqual),
+    ("test/built-ins/String/prototype/split/cstm-split-invocation.js", Disp::TraceEqual),
+    ("test/built-ins/String/prototype/split/this-value-tostring-error.js", Disp::TraceEqual),
     // -- Cluster 4: subclassing Date / Symbol --------------------------------
-    (
-        "test/language/expressions/class/subclass-builtins/subclass-Date.js",
-        Disp::TraceEqual,
-    ),
-    (
-        "test/language/statements/class/subclass-builtins/subclass-Date.js",
-        Disp::TraceEqual,
-    ),
+    ("test/language/expressions/class/subclass-builtins/subclass-Date.js", Disp::TraceEqual),
+    ("test/language/statements/class/subclass-builtins/subclass-Date.js", Disp::TraceEqual),
     (
         "test/language/statements/class/subclass/builtin-objects/Date/regular-subclassing.js",
         Disp::TraceEqual,
@@ -149,9 +117,7 @@ fn completion_of(o: SemOutcome) -> Completion {
 fn assert_true(src: &str) {
     assert_eq!(
         completion_of(evaluate_case(&[], src)),
-        Completion::Normal {
-            v: Some(ProjectedValue::Bool { v: true })
-        },
+        Completion::Normal { v: Some(ProjectedValue::Bool { v: true }) },
         "expected `true` completion for: {src}"
     );
 }
@@ -314,10 +280,7 @@ fn parse_frontmatter(body: &str) -> Frontmatter {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 includes.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             } else {
                 while let Some(next) = lines.peek() {
@@ -335,10 +298,7 @@ fn parse_frontmatter(body: &str) -> Frontmatter {
             if let Some(inner) = rest.strip_prefix('[') {
                 let inner = inner.trim_end_matches(']');
                 flags.extend(
-                    inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             }
         }
@@ -357,8 +317,9 @@ fn modes_for(flags: &[String]) -> &'static [bool] {
 }
 
 fn corpus_root() -> Option<PathBuf> {
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     corpus.join("harness/assert.js").is_file().then_some(corpus)
 }
 
@@ -389,11 +350,8 @@ fn pinned_s1e_divergences_local_cover() {
         };
         let fm = parse_frontmatter(&body);
         let raw = fm.flags.iter().any(|f| f == "raw");
-        let mut include_names: Vec<String> = if raw {
-            Vec::new()
-        } else {
-            vec!["assert.js".into(), "sta.js".into()]
-        };
+        let mut include_names: Vec<String> =
+            if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
         include_names.extend(fm.includes.iter().cloned());
         let mut include_srcs = Vec::new();
         for name in &include_names {
@@ -406,11 +364,7 @@ fn pinned_s1e_divergences_local_cover() {
 
         for &strict in modes_for(&fm.flags) {
             checked += 1;
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let out = evaluate_case_opts(&inc_refs, &sem_body, false);
             let mode = if strict { "strict" } else { "bare" };
             let ok = match disp {
@@ -464,11 +418,8 @@ fn pinned_s1e_divergences_vs_node() {
         let body = std::fs::read_to_string(&path).expect("read pinned case");
         let fm = parse_frontmatter(&body);
         let raw = fm.flags.iter().any(|f| f == "raw");
-        let mut include_names: Vec<String> = if raw {
-            Vec::new()
-        } else {
-            vec!["assert.js".into(), "sta.js".into()]
-        };
+        let mut include_names: Vec<String> =
+            if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
         include_names.extend(fm.includes.iter().cloned());
         let mut include_srcs = Vec::new();
         let mut include_paths = Vec::new();
@@ -485,11 +436,7 @@ fn pinned_s1e_divergences_vs_node() {
         for &strict in modes_for(&fm.flags) {
             case_no += 1;
             let mode = if strict { "strict" } else { "bare" };
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let sem = evaluate_case_opts(&inc_refs, &sem_body, false);
 
             let sem_trace = match (disp, sem) {
@@ -513,8 +460,7 @@ fn pinned_s1e_divergences_vs_node() {
             });
             let manifest_path = tmp.path().join(format!("pin-{case_no}.manifest.json"));
             let mut mf = std::fs::File::create(&manifest_path).expect("create manifest");
-            mf.write_all(manifest.to_string().as_bytes())
-                .expect("write manifest");
+            mf.write_all(manifest.to_string().as_bytes()).expect("write manifest");
             drop(mf);
 
             let out = Command::new(&node)

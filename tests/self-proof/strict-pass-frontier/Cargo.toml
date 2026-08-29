@@ -1,0 +1,13 @@
+# Trust: fixture for scripts/trust_strict_pass_frontier.sh. Do not add to any
+# workspace — the script rewrites src/lib.rs per variant and drives it directly.
+[package]
+name = "strict-pass-frontier"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "spf"
+path = "src/lib.rs"
+
+[workspace]

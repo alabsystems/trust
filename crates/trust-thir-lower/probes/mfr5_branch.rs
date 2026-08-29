@@ -87,11 +87,7 @@ pub fn k11_cond_and_arms_both(a: u32, b: u32) -> u32 {
 
 #[inline(never)]
 pub fn k12_nested_if(a: u32, b: u32, c: u32) -> u32 {
-    if a == b {
-        if b == c { a } else { b }
-    } else {
-        c
-    }
+    if a == b { if b == c { a } else { b } } else { c }
 }
 
 // --- D: short-circuit joins — two `CondBr`s and a join block that mints its own value. -----

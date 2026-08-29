@@ -53,9 +53,8 @@
 //! does not authenticate as a Trust checkout is a "cannot verify", never a
 //! silent pass).
 
-use std::fs;
-use std::io;
 use std::path::Path;
+use std::{fs, io};
 
 use anyhow::{Context, Result, bail};
 

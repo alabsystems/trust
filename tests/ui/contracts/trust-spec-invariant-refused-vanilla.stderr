@@ -1,0 +1,18 @@
+error: `trust::invariant` is not a verified contract surface: it is never checked on any lane, so it states a guarantee nothing enforces. For a loop invariant, use a first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`. For a condition that must hold on entry, use `#[trust::requires(<predicate>)]`. For a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`. Otherwise delete the attribute: leaving it in place states nothing.
+  --> $DIR/trust-spec-invariant-refused-vanilla.rs:31:1
+   |
+LL | #[trust::invariant(x > 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `trust::invariant` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: `trust::invariant` is not a verified contract surface: it is never checked on any lane, so it states a guarantee nothing enforces. For a loop invariant, use a first-class loop clause: `while <cond> invariant <predicate> { ... }` or `loop invariant <predicate> { ... }`. For a condition that must hold on entry, use `#[trust::requires(<predicate>)]`. For a condition that must hold on return, use `#[trust::ensures(move |r: &T| <predicate>)]`. Otherwise delete the attribute: leaving it in place states nothing.
+  --> $DIR/trust-spec-invariant-refused-vanilla.rs:37:1
+   |
+LL | #[trust::invariant(self.value >= 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `trust::invariant` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 2 previous errors
+

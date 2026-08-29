@@ -638,8 +638,14 @@ pub fn analyze_taint(body: &VerifiableBody, policy: &TaintPolicy) -> TaintAnalys
             }
         }
 
-        if let Terminator::Call { func, args, dest, span, .. } = &block.terminator {
-            analyze_call(&mut state, policy, block_id, func, args, dest, span);
+        match &block.terminator {
+            Terminator::Call { func, args, dest, span, .. } => {
+                analyze_call(&mut state, policy, block_id, func, args, dest, span);
+            }
+            Terminator::TailCall { func, args, span, .. } => {
+                analyze_call(&mut state, policy, block_id, func, args, &Place::local(0), span);
+            }
+            _ => {}
         }
     }
 
@@ -980,7 +986,13 @@ mod tests {
     }
 
     fn taint_body(blocks: Vec<BasicBlock>, locals: Vec<LocalDecl>) -> VerifiableBody {
-        VerifiableBody { locals, blocks, arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default() }
+        VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1011,7 +1023,9 @@ mod tests {
     fn ivcall(func: &str, args: Vec<Operand>, dest: usize, at: u32, next: usize) -> Terminator {
         Terminator::Call {
             unwind: UnwindEdge::Unreachable,
-            is_unsafe_sig: false, is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            is_foreign: false,
             func: func.into(),
             args,
             dest: Place::local(dest),
@@ -1035,19 +1049,15 @@ mod tests {
         // certificate field flows straight into the accept decision.
         let body = taint_body(
             vec![
-                BasicBlock {
-                    id: BlockId(0),
-                    stmts: vec![],
-                    terminator: ivall_seed(),
-                },
-                BasicBlock {
-                    id: BlockId(1),
-                    stmts: vec![],
-                    terminator: ivcall_accept(1),
-                },
+                BasicBlock { id: BlockId(0), stmts: vec![], terminator: ivall_seed() },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: ivcall_accept(1) },
                 BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
             ],
-            vec![local(0, "ret", Ty::Unit), local(1, "field", Ty::usize()), local(2, "v", Ty::Unit)],
+            vec![
+                local(0, "ret", Ty::Unit),
+                local(1, "field", Ty::usize()),
+                local(2, "v", Ty::Unit),
+            ],
         );
         let result = analyze_taint(&body, &untrusted_verdict_policy());
         let leaks: Vec<_> = result
@@ -1058,7 +1068,12 @@ mod tests {
                     && matches!(&v.source_label, TaintLabel::Custom(l) if l == "untrusted")
             })
             .collect();
-        assert_eq!(leaks.len(), 1, "untrusted->verdict must be flagged; got {:?}", result.violations);
+        assert_eq!(
+            leaks.len(),
+            1,
+            "untrusted->verdict must be flagged; got {:?}",
+            result.violations
+        );
     }
 
     #[test]
@@ -1072,7 +1087,13 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: ivcall("rederive_from_subject", vec![Operand::Copy(Place::local(0))], 2, 15, 2),
+                    terminator: ivcall(
+                        "rederive_from_subject",
+                        vec![Operand::Copy(Place::local(0))],
+                        2,
+                        15,
+                        2,
+                    ),
                 },
                 BasicBlock { id: BlockId(2), stmts: vec![], terminator: ivcall_accept(2) },
                 BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
@@ -1085,10 +1106,16 @@ mod tests {
             ],
         );
         let result = analyze_taint(&body, &untrusted_verdict_policy());
-        let leaks = result.violations.iter().filter(|v| {
-            matches!(&v.sink_kind, SinkKind::Custom(k) if k == "verdict")
-        });
-        assert_eq!(leaks.count(), 0, "a re-derived value must NOT be flagged; got {:?}", result.violations);
+        let leaks = result
+            .violations
+            .iter()
+            .filter(|v| matches!(&v.sink_kind, SinkKind::Custom(k) if k == "verdict"));
+        assert_eq!(
+            leaks.count(),
+            0,
+            "a re-derived value must NOT be flagged; got {:?}",
+            result.violations
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1102,7 +1129,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1114,7 +1145,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -1145,7 +1180,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1157,7 +1196,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "web::escape_html".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(2),
@@ -1169,7 +1212,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(2),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
@@ -1205,7 +1252,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "secrets::get_secret".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1217,7 +1268,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "audit::log".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -1249,7 +1304,11 @@ mod tests {
                         rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
                         span: span(10),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -1276,7 +1335,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1292,7 +1355,11 @@ mod tests {
                         rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
                         span: span(15),
                     }],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
@@ -1337,7 +1404,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1349,7 +1420,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "secrets::get_secret".into(),
                         args: vec![],
                         dest: Place::local(2),
@@ -1361,7 +1436,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(2),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -1373,7 +1452,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(3),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "audit::log".into(),
                         args: vec![Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
@@ -1415,7 +1498,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1427,7 +1514,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "db::execute_sql".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -1823,7 +1914,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),
@@ -1835,7 +1930,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::process::exec_cmd".into(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -2029,7 +2128,11 @@ mod tests {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::io::read_line".into(),
                         args: vec![],
                         dest: Place::local(1),

@@ -2090,23 +2090,22 @@ fn scan_verified_tool_runtime_library_paths(tool: &Path) -> CargoResult<Vec<Path
                         rustc_deps_root.display()
                     )
                 })?;
-                // Trust: the rustc build-deps root holds cargo's own cache
-                // siblings (`.rustc_info.json`, `CACHEDIR.TAG`) alongside the
-                // per-target build directories. A regular file is never a
-                // descendable `release/deps` runtime directory, so skip it
-                // rather than tripping the plain-directory authority check —
-                // which hard-bails on a non-directory path component and would
-                // otherwise abort verified `targo` startup whenever cargo has
-                // written its rustc-info cache. Symlink entries still fall
-                // through to the strict check below, so a reparse point cannot
-                // smuggle itself into the verified runtime library path.
+                // Trust: the rustc build-deps root holds non-directory siblings
+                // alongside the per-target build directories: cargo's cache
+                // files (`.rustc_info.json`, `CACHEDIR.TAG`) and bootstrap's
+                // `doc` symlink. Only a real directory can be a candidate
+                // target root. Skip every other file type without following it;
+                // this excludes symlinks from the loader closure instead of
+                // granting their targets authority. Real directory candidates
+                // still pass the component-by-component plain-directory check
+                // below.
                 let entry_type = entry.file_type().with_context(|| {
                     format!(
                         "failed to inspect the type of an entry in verified Targo compiler runtime directory `{}`",
                         rustc_deps_root.display()
                     )
                 })?;
-                if entry_type.is_file() {
+                if !entry_type.is_dir() {
                     continue;
                 }
                 let candidate = entry.path().join("release").join("deps");
@@ -3591,6 +3590,51 @@ mod tests {
         assert!(
             paths.contains(&canonical_target_deps),
             "the real per-target compiler deps dir must be discovered: {paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_runtime_paths_skip_bootstrap_doc_symlink_sibling() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let sysroot = directory.path().join("stage2");
+        let bin = sysroot.join("bin");
+        let rustlib_target_lib = sysroot
+            .join("lib")
+            .join("rustlib")
+            .join("aarch64-apple-darwin")
+            .join("lib");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&rustlib_target_lib).unwrap();
+        std::fs::write(bin.join("targo"), b"#!/bin/sh\n").unwrap();
+
+        let rustc_deps_root = directory.path().join("stage2-rustc");
+        let target_deps = rustc_deps_root
+            .join("aarch64-apple-darwin")
+            .join("release")
+            .join("deps");
+        std::fs::create_dir_all(&target_deps).unwrap();
+
+        // Bootstrap creates `<stage>-rustc/doc` as a symlink to its shared
+        // compiler-doc output. Give the target a plausible `release/deps`
+        // subtree so this test proves enumeration skips the symlink itself
+        // rather than following it and authenticating the redirected payload.
+        let compiler_doc = directory.path().join("compiler-doc");
+        let redirected_deps = compiler_doc.join("release").join("deps");
+        std::fs::create_dir_all(&redirected_deps).unwrap();
+        std::os::unix::fs::symlink(&compiler_doc, rustc_deps_root.join("doc")).unwrap();
+
+        let paths = scan_verified_tool_runtime_library_paths(&bin.join("targo"))
+            .expect("bootstrap's doc symlink sibling must not abort runtime-path reconstruction");
+        let canonical_target_deps = target_deps.canonicalize().unwrap();
+        let canonical_redirected_deps = redirected_deps.canonicalize().unwrap();
+        assert!(
+            paths.contains(&canonical_target_deps),
+            "the real compiler dependency directory must still be discovered: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&canonical_redirected_deps),
+            "the doc symlink target must not enter the verified loader closure: {paths:?}"
         );
     }
 }

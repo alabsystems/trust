@@ -13,6 +13,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+
 use trust_types::fx::{FxHashMap, FxHashSet};
 
 use crate::{StateId, StateMachine, Trace};

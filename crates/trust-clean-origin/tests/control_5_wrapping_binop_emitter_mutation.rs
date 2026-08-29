@@ -43,8 +43,8 @@
 
 use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level, Name};
 use trust_clean_origin::{
-    admit_lowering, check_faithful, plan_clean_origin_body, CleanOriginShape, EmitRefusal,
-    GateRefusal,
+    CleanOriginShape, EmitRefusal, GateRefusal, admit_lowering, check_faithful,
+    plan_clean_origin_body,
 };
 use trust_types::admissible_body::{ArithBinOp, ArithOperand};
 use trust_types::{
@@ -95,14 +95,7 @@ fn surface_add_via(inst: &str, lhs: Expr, rhs: Expr) -> Expr {
     let zero3 = vec![Level::zero(), Level::zero(), Level::zero()];
     Expr::apps(
         Expr::const_(Name::from_string("HAdd.hAdd"), zero3),
-        [
-            uint64(),
-            uint64(),
-            uint64(),
-            Expr::const_(Name::from_string(inst), vec![]),
-            lhs,
-            rhs,
-        ],
+        [uint64(), uint64(), uint64(), Expr::const_(Name::from_string(inst), vec![]), lhs, rhs],
     )
 }
 
@@ -158,11 +151,7 @@ fn env_with_winc6() -> Environment {
         &mut env,
         "winc6",
         u64_arrows(1),
-        Expr::lam(
-            BinderInfo::Default,
-            uint64(),
-            carrier_op("add", Expr::bvar(0), carrier_lit(6)),
-        ),
+        Expr::lam(BinderInfo::Default, uint64(), carrier_op("add", Expr::bvar(0), carrier_lit(6))),
     );
     env
 }
@@ -177,13 +166,24 @@ fn locals(n: usize, ty: Ty) -> Vec<LocalDecl> {
     (0..n).map(|index| LocalDecl { index, ty: ty.clone(), name: None }).collect()
 }
 
-fn vf(name: &str, arg_count: usize, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> VerifiableFunction {
+fn vf(
+    name: &str,
+    arg_count: usize,
+    locals: Vec<LocalDecl>,
+    blocks: Vec<BasicBlock>,
+) -> VerifiableFunction {
     let return_ty = locals[0].ty.clone();
     VerifiableFunction {
         name: name.into(),
         def_path: format!("crate::m::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: Vec::new(),
         preconditions: Vec::new(),
         postconditions: Vec::new(),
@@ -201,6 +201,7 @@ fn prim_call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> 
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         unwind: UnwindEdge::Unreachable,
     }
 }
@@ -228,7 +229,12 @@ fn emitted_binop_at(
     )
 }
 
-fn emitted_binop(name: &str, callee: &str, args: Vec<Operand>, arg_count: usize) -> VerifiableFunction {
+fn emitted_binop(
+    name: &str,
+    callee: &str,
+    args: Vec<Operand>,
+    arg_count: usize,
+) -> VerifiableFunction {
     emitted_binop_at(name, callee, args, arg_count, Ty::u64())
 }
 
@@ -483,10 +489,7 @@ fn half_7_the_natural_lowering_trap_a_BinaryOp_body_is_refused() {
     let refusal = admit_lowering(&env, &plan, &body)
         .expect_err("a bare BinaryOp body is not the authenticated-call shape");
     assert!(refusal.is_compiler_defect());
-    assert!(
-        matches!(refusal, EmitRefusal::LoweringUnrecognised { .. }),
-        "got {refusal:?}"
-    );
+    assert!(matches!(refusal, EmitRefusal::LoweringUnrecognised { .. }), "got {refusal:?}");
 }
 
 #[test]
@@ -582,10 +585,7 @@ fn half_10_a_NON_PRELUDE_instance_is_a_capability_refusal() {
     define(
         &mut env,
         "myInstHAdd",
-        Expr::apps(
-            Expr::const_(Name::from_string("HAdd"), zero3),
-            [uint64(), uint64(), uint64()],
-        ),
+        Expr::apps(Expr::const_(Name::from_string("HAdd"), zero3), [uint64(), uint64(), uint64()]),
         Expr::const_(Name::from_string("instHAddUInt64"), vec![]),
     );
     define(

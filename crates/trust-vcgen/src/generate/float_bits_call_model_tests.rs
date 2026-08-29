@@ -1,6 +1,6 @@
-use trust_types::UnwindEdge;
+use trust_types::{BasicBlock, LocalDecl, UnwindEdge, VerifiableBody};
+
 use super::*;
-use trust_types::{BasicBlock, LocalDecl, VerifiableBody};
 
 const TO_BITS_F64: &str = "core::f64::<impl f64>::to_bits";
 const TO_BITS_F32: &str = "core::f32::<impl f32>::to_bits";
@@ -10,6 +10,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
     Terminator::Call {
         unwind: UnwindEdge::Unreachable,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
         func: callee.to_string(),
         args,
@@ -104,8 +105,7 @@ fn to_bits_operand_symbol_is_exactly_what_fp_compare_reads() {
     let func = to_bits_f64_fn();
     let shared = crate::operand_to_formula(&func, &Operand::Copy(Place::local(1)));
     assert_eq!(shared, Formula::Var("v".into(), Sort::BitVec(64)));
-    let fact =
-        super::float_bits_call_dest_fact(&func, &func.body.blocks[0].terminator).unwrap();
+    let fact = super::float_bits_call_dest_fact(&func, &func.body.blocks[0].terminator).unwrap();
     let Formula::Eq(_, r) = &fact else { panic!("expected Eq") };
     let Formula::BvToInt(inner, ..) = &**r else { panic!("expected BvToInt") };
     assert_eq!(**inner, shared, "to_bits fact and fp compare must share ONE symbol");
@@ -177,8 +177,7 @@ fn to_bits_then_from_bits_round_trips_the_bitvector() {
     // pattern exactly. We check the two model facts compose without loss: the
     // from_bits arg symbol is precisely the to_bits dest symbol.
     let func = to_bits_f64_fn();
-    let to_bits =
-        super::float_bits_call_dest_fact(&func, &func.body.blocks[0].terminator).unwrap();
+    let to_bits = super::float_bits_call_dest_fact(&func, &func.body.blocks[0].terminator).unwrap();
     let Formula::Eq(dest, _) = &to_bits else { panic!() };
     let Formula::Var(bits_name, Sort::Int) = &**dest else { panic!("to_bits dest is Int var") };
     // Now feed `bits` into from_bits.
@@ -193,8 +192,7 @@ fn to_bits_then_from_bits_round_trips_the_bitvector() {
             LocalDecl { index: 3, ty: Ty::Float { width: 64 }, name: Some("back".into()) },
         ],
     );
-    let from_bits =
-        super::float_bits_call_dest_fact(&rt, &rt.body.blocks[0].terminator).unwrap();
+    let from_bits = super::float_bits_call_dest_fact(&rt, &rt.body.blocks[0].terminator).unwrap();
     let Formula::Eq(_, arg) = &from_bits else { panic!() };
     let Formula::IntToBv(inner, 64) = &**arg else { panic!("from_bits arg is int2bv") };
     assert_eq!(
@@ -307,7 +305,8 @@ fn crown_deep_shape_threads_tobits_fact_to_underflow_block() {
     let underflow_guards = guards.get(&BlockId(4)).cloned().unwrap_or_default();
     let has_tobits_fact = underflow_guards.iter().any(|f| match f {
         Formula::Eq(l, r) => {
-            let dest_ok = matches!(&**l, Formula::Var(n, Sort::Int) if n.split('#').next() == Some("bits"));
+            let dest_ok =
+                matches!(&**l, Formula::Var(n, Sort::Int) if n.split('#').next() == Some("bits"));
             let src_ok = matches!(&**r, Formula::BvToInt(inner, 64, false)
                 if matches!(&**inner, Formula::Var(vn, Sort::BitVec(64)) if vn == "v"));
             dest_ok && src_ok

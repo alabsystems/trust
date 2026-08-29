@@ -111,8 +111,9 @@ impl TrustWpConfig {
 
 /// Controls how trust_wp diagnostic messages are handled during verification.
 ///
-/// In subprocess mode, diagnostics come from stderr. In direct mode (Phase 2),
-/// diagnostics are intercepted from rustc's diagnostic system.
+/// The standalone subprocess compatibility path obtains diagnostics from
+/// stderr. Native standalone callers provide diagnostics directly; neither path
+/// is registered as compiler/full-verifier authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum DiagConfig {

@@ -1,0 +1,82 @@
+# IR-cohort waivers, read by scripts/check_ir_cohort.py.
+#
+# A row here means: "this part of the cohort is knowingly on a DIFFERENT trust-ir
+# semantics from the ratified one, someone owns moving it, and the pushing lane
+# is not the cause." The gate steps over the listed schema and BLOCKS on every
+# other divergence. It is per-schema on purpose --- a whole-gate quarantine
+# would waive the next divergence too, which is the only one the gate exists to
+# catch.
+#
+# Format (`|`-separated, one row per line):
+#     <dependency> | <schema digest> | <expires YYYY-MM-DD> | <owner> | <reason>
+#
+# Rules the gate enforces mechanically, so a row cannot rot:
+#   * past `expires`, the row stops applying and the divergence blocks again;
+#   * once the divergence is GONE, the row FAILS the gate until it is deleted.
+#
+# NOT WAIVABLE, by any row: a revision that does not resolve, and a revision not
+# contained in the dependency's origin/main. The second is the fork case --- two
+# consumers on divergent branches can disagree arbitrarily while both look
+# current, and no expiry date makes that safe to ship.
+#
+# The ratified schema is the one at the superproject's recorded gitlink for that
+# dependency. Burning a row down means moving another lane's pin, which is a
+# COORDINATED act: open it with the owning lane, do not push the bump unilaterally.
+#
+# ---------------------------------------------------------------------------
+# Seeded 2026-08-27 from the first run of the gate, at gitlink 7435e2eb, whose
+# semantics is schema 99c0465bfe9a (revision 22754291, shared by trust-cg and
+# ay-jit). The four rows below are the cohort AS FOUND --- they are the backlog
+# this protocol exists to burn down, not an approval of it. All four revisions
+# are contained in trust-ir origin/main; the spread is staleness, dated
+# 2026-08-13 to 2026-08-21, not divergence.
+#
+# Expiry is set four weeks out. That is long enough for each owning lane to take
+# a coordinated bump on its own schedule, and short enough that the backlog
+# cannot quietly become the permanent state.
+
+# RETIRED 2026-08-27, the same day it was seeded: the clean lane's row
+# (schema e47c9652d0f2, 6 declarations at a4e81b6b) is GONE, burned down by a
+# coordinated pin bump rather than by an expiry. The gate refused the push until
+# the row was deleted, which is the rule working: a waiver that outlives its
+# divergence is a lie about the cohort's state.
+#
+# The cohort head moved in the same pull (trust-ir gitlink 7435e2eb -> 3eb70832,
+# ratified schema 99c0465bfe9a -> ab5288f03219), and that inverted one row:
+# 99c0465bfe9a WAS the ratified semantics and is now a straggler, held only by
+# ay-jit. Recorded below rather than fixed here, because moving another lane's
+# pin is a coordinated act.
+
+# ---------------------------------------------------------------------------
+# 2026-08-28, the v38 transition. The ratified schema moved to 4c4a31cb9236 when
+# the cohort head advanced to trust-ir v38 (FatPtrKind::ContainerLen, wire
+# VERSION 37 -> 38). Schema ab5288f03219 is therefore not stale neglect: it is
+# the PREVIOUS ratified semantics, and every consumer still on it was correct
+# until this landed.
+#
+# Opened covering nine declarations — clean (6) and trust-mc (3) sharing one
+# schema. Clean's half is now RETIRED; the row below is narrowed to what is
+# actually left. This is the coordination cost M0 exists to make VISIBLE rather
+# than to prevent, and burning it down one lane at a time is what that looks like.
+#
+# Not waived here and not waivable: nothing in this row admits an unresolvable
+# or off-main pin. Both consumers sit on origin/main.
+
+# ---------------------------------------------------------------------------
+# 2026-08-28: ALL ROWS RETIRED. The cohort is coherent on the FACTS, not on
+# paperwork.
+#
+# Every consumer was advanced forward to the trust-ir head (4803c40d, v0.11.0);
+# clean sits one commit back at 179c2515 and needs no row, because the two
+# revisions hash to the SAME semantic surface (4c4a31cb9236). That is the whole
+# reason this gate keys on the digest rather than on the revision: different
+# commits with identical meaning are safe to mix, and flagging them would have
+# taught the next lane to waive instead of to look.
+#
+# Where it started, measured 2026-08-27: 24 declarations across 6 revisions
+# collapsing to FIVE distinct semantics, every one reporting wire version 37.
+# Where it is now: 24 declarations, 2 revisions, ONE semantics.
+#
+# An empty waiver list is the intended steady state. If rows accumulate here
+# again and merely expire rather than being burned down, the honest reading is
+# that the gate has become paperwork and should be deleted rather than tolerated.

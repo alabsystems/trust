@@ -268,11 +268,7 @@ pub fn k10_if_field_cond(s: W3, b: u64) -> u64 {
 
 #[inline(never)]
 pub fn k11_nested_if(a: u64, b: u64, c: u64) -> u64 {
-    if a == 0 {
-        if b == 0 { c } else { b }
-    } else {
-        a
-    }
+    if a == 0 { if b == 0 { c } else { b } } else { a }
 }
 
 #[inline(never)]

@@ -122,8 +122,9 @@ pub fn git_head(dir: &Path) -> Option<String> {
 
 /// Streaming SHA-256 of a file, lowercase hex.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
     use std::io::Read;
+
+    use sha2::{Digest, Sha256};
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 1 << 16];
@@ -308,7 +309,6 @@ pub fn probe_engine(engine: Engine, path: &Path) -> anyhow::Result<ProbedEngine>
     Ok(ProbedEngine { path: path.to_path_buf(), version, sha256 })
 }
 
-
 /// Does `haystack` contain `needle` as a byte subslice?
 pub fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -339,7 +339,6 @@ mod tests {
         assert!(!is_valid_date("2026-04-31"));
     }
 
-
     #[test]
     fn subslice() {
         assert!(contains_subslice(b"abc $262.detachArrayBuffer", b"$262."));
@@ -360,8 +359,8 @@ mod tests {
         let got = resolve_engine_with(Engine::Node, Some("/flag/node"), Some("/env/node"), None)
             .expect("flag resolves");
         assert_eq!(got, PathBuf::from("/flag/node"));
-        let got = resolve_engine_with(Engine::Node, None, Some("/env/node"), None)
-            .expect("env resolves");
+        let got =
+            resolve_engine_with(Engine::Node, None, Some("/env/node"), None).expect("env resolves");
         assert_eq!(got, PathBuf::from("/env/node"));
         // A blank override is not an override.
         let got = resolve_engine_with(Engine::Bun, Some("  "), Some("/env/bun"), None)

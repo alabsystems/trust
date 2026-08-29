@@ -208,8 +208,9 @@ fn span_key(span: &SourceSpan) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::{Formula, ProofStrength, Sort, VcKind};
+
+    use super::*;
 
     fn make_vc(function: &str, kind: VcKind) -> VerificationCondition {
         VerificationCondition {

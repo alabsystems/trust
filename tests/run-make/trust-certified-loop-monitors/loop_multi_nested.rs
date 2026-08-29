@@ -1,7 +1,13 @@
 fn multi_latch_and_nested(mut outer: u32) -> u32 {
-    while outer > 0 invariant outer <= 4 decreases outer {
+    while outer > 0
+        invariant outer <= 4
+        decreases outer
+    {
         let mut inner = 3u32;
-        while inner > 0 invariant inner <= 3 decreases inner {
+        while inner > 0
+            invariant inner <= 3
+            decreases inner
+        {
             if inner & 1 == 0 {
                 inner -= 1;
                 continue;

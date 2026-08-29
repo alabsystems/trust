@@ -238,10 +238,12 @@ fn classify_write_place(
 ///   * no `Rvalue::Ref { mutable: true, .. }` and no `Rvalue::AddressOf`
 ///     anywhere, so no `&mut` alias into a formal exists to be written through
 ///     out of sight of the place-rooted scan;
-///   * every nested `Call` passes only provably pointer-free arguments;
+///   * every nested `Call`/`TailCall` passes only provably pointer-free arguments;
 ///   * every written place classifies under [`classify_write_place`];
 ///   * only statement kinds with a known write effect appear.
 pub(crate) fn derive_callee_write_set(callee: &VerifiableFunction) -> Option<CalleeWriteSet> {
+    let expanded = callee.with_tail_calls_expanded();
+    let callee = expanded.as_ref();
     if callee.body.blocks.len() > WRITE_SET_MAX_BLOCKS {
         return None;
     }
@@ -407,8 +409,9 @@ pub(crate) fn enter_callee_write_sets(
         next.set(id.wrapping_add(1));
         id
     });
-    CALLEE_WRITE_SET_STACK
-        .with(|stack| stack.borrow_mut().push(WriteSetFrame { id: frame_id, map: std::rc::Rc::new(map) }));
+    CALLEE_WRITE_SET_STACK.with(|stack| {
+        stack.borrow_mut().push(WriteSetFrame { id: frame_id, map: std::rc::Rc::new(map) })
+    });
     CalleeWriteSetGuard { frame_id, _thread_affine: std::marker::PhantomData }
 }
 
@@ -423,8 +426,9 @@ pub(crate) fn enter_test_callee_write_sets(
         next.set(id.wrapping_add(1));
         id
     });
-    CALLEE_WRITE_SET_STACK
-        .with(|stack| stack.borrow_mut().push(WriteSetFrame { id: frame_id, map: std::rc::Rc::new(map) }));
+    CALLEE_WRITE_SET_STACK.with(|stack| {
+        stack.borrow_mut().push(WriteSetFrame { id: frame_id, map: std::rc::Rc::new(map) })
+    });
     CalleeWriteSetGuard { frame_id, _thread_affine: std::marker::PhantomData }
 }
 

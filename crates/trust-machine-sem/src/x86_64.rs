@@ -358,10 +358,9 @@ impl X86_64Semantics {
         // treatment as the shift flags — undefined is DECLINED, not asserted.
         let wide = dst_width * 2;
         let (wide_lhs, wide_rhs) = match &result {
-            Formula::BvMul(a, b, _) => (
-                Formula::BvSignExt(a.clone(), dst_width),
-                Formula::BvSignExt(b.clone(), dst_width),
-            ),
+            Formula::BvMul(a, b, _) => {
+                (Formula::BvSignExt(a.clone(), dst_width), Formula::BvSignExt(b.clone(), dst_width))
+            }
             _ => unreachable!("imul result is always a BvMul"),
         };
         let full = Formula::BvMul(Box::new(wide_lhs), Box::new(wide_rhs), wide);
@@ -1000,16 +999,14 @@ fn extract_dst_at(
         // were spelled `Gpr` index 4..7 and matched the `is_sp` test below,
         // making `mov ah, imm8` a write to the STACK POINTER. Unsupported is a
         // capability gap; a wrong register is a wrong program.
-        Some(Operand::Reg(r)) if r.kind == RegKind::GprHighByte => {
-            Err(SemError::InvalidOperand {
-                opcode: insn.opcode,
-                index,
-                detail: format!(
-                    "legacy high-byte register {r} (bits 15:8) is not modelled; \
+        Some(Operand::Reg(r)) if r.kind == RegKind::GprHighByte => Err(SemError::InvalidOperand {
+            opcode: insn.opcode,
+            index,
+            detail: format!(
+                "legacy high-byte register {r} (bits 15:8) is not modelled; \
                      it must not be conflated with the low byte or with SPL/BPL/SIL/DIL"
-                ),
-            })
-        }
+            ),
+        }),
         Some(Operand::Reg(r)) => {
             let is_sp = r.kind == RegKind::Sp || (r.kind == RegKind::Gpr && r.index == RSP_INDEX);
             Ok((DstOperand::Reg { index: r.index, is_sp }, u32::from(r.width)))
@@ -1717,16 +1714,10 @@ fn shift_eflags(
     let Effect::FlagUpdate { n: sf, z: zf, .. } = logic_eflags(result, width) else {
         unreachable!("logic_eflags always returns a FlagUpdate")
     };
-    let count_is_zero = Formula::Eq(
-        Box::new(masked_count.clone()),
-        Box::new(Formula::BitVec { value: 0, width }),
-    );
+    let count_is_zero =
+        Formula::Eq(Box::new(masked_count.clone()), Box::new(Formula::BitVec { value: 0, width }));
     let keep_or = |computed: Formula, prior: &Formula| {
-        Formula::Ite(
-            Box::new(count_is_zero.clone()),
-            Box::new(prior.clone()),
-            Box::new(computed),
-        )
+        Formula::Ite(Box::new(count_is_zero.clone()), Box::new(prior.clone()), Box::new(computed))
     };
     Effect::FlagUpdate {
         n: keep_or(sf, &state.flags.n),
@@ -1784,9 +1775,10 @@ fn load_le_bytes(
 
 #[cfg(test)]
 mod tests {
+    use trust_disasm::decode_x86_64;
+
     use super::*;
     use crate::concrete::ConcreteState;
-    use trust_disasm::decode_x86_64;
 
     fn sem() -> X86_64Semantics {
         X86_64Semantics
@@ -1854,7 +1846,8 @@ mod tests {
     fn imul_overflow_sets_carry_and_overflow() {
         // 48 0f af c3 = imul rax, rbx.
         // rax=0x8000..., rbx=2 overflows i64.
-        let (effects, c) = regs(&[0x48, 0x0F, 0xAF, 0xC3], &[(0, 0x8000_0000_0000_0000), (3, 2)], 0);
+        let (effects, c) =
+            regs(&[0x48, 0x0F, 0xAF, 0xC3], &[(0, 0x8000_0000_0000_0000), (3, 2)], 0);
         let (cf, ov) = effects
             .iter()
             .find_map(|e| match e {
@@ -1901,13 +1894,13 @@ mod tests {
     #[test]
     fn prefixes_the_model_cannot_honor_are_refused() {
         for bytes in [
-            vec![0xF0u8, 0x90],       // lock nop — LOCK on a non-RMW
-            vec![0xF0, 0x89, 0xC3],   // lock mov r,r — LOCK, non-memory dest
-            vec![0x65, 0x8B, 0x00],   // gs mov — segment override
-            vec![0x67, 0x8B, 0x00],   // addr-size mov
-            vec![0x63, 0xC3],         // movsxd w/o REX.W — implementation-defined
-            vec![0xF3, 0x5A],         // rep pop — illegal REP
-            vec![0xF2, 0x5C],         // repne pop
+            vec![0xF0u8, 0x90],     // lock nop — LOCK on a non-RMW
+            vec![0xF0, 0x89, 0xC3], // lock mov r,r — LOCK, non-memory dest
+            vec![0x65, 0x8B, 0x00], // gs mov — segment override
+            vec![0x67, 0x8B, 0x00], // addr-size mov
+            vec![0x63, 0xC3],       // movsxd w/o REX.W — implementation-defined
+            vec![0xF3, 0x5A],       // rep pop — illegal REP
+            vec![0xF2, 0x5C],       // repne pop
         ] {
             assert!(
                 decode_x86_64(&bytes, 0x1000).is_err(),

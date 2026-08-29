@@ -62,6 +62,21 @@ fn opaque_ty() -> Ty {
     Ty::Unit
 }
 
+/// Spell the fixture's small integer literals with the exact Rust integer type
+/// that supplies their MIR context. In particular, `ConstValue::Int` is signed
+/// and carries no width, while an unsigned literal retains both facts in
+/// `ConstValue::Uint`.
+fn integer_const(ty: &Ty, value: i128) -> ConstValue {
+    match ty {
+        Ty::Int { signed: true, .. } => ConstValue::Int(value),
+        Ty::Int { width, signed: false } => ConstValue::Uint(
+            u128::try_from(value).expect("test fixture unsigned literal is nonnegative"),
+            *width,
+        ),
+        other => panic!("test fixture expected an integer type, got {other:?}"),
+    }
+}
+
 /// How the addend is computed from the loop element.
 #[derive(Clone, Copy)]
 enum Addend {
@@ -74,27 +89,26 @@ enum Addend {
 }
 
 /// How the iterator's `Option` `SwitchInt` is spelled. The default is the
-/// simplified two-way shape; the rest exist because rustc's REAL for-each
-/// desugar closes the switch with an `otherwise -> Unreachable` arm, and the
-/// certificate that makes that arm dead must be trusted only under its own
-/// conditions (see `bmc_terminator_succs`).
+/// simplified two-way shape; the rest exercise rustc's real for-each shape and
+/// adversarial variants of its public, caller-constructible exhaustiveness bit.
+/// That bit never grants this refutation lane authority to prune a successor.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OptionSwitch {
     /// `1 -> body`, `otherwise -> return`. No `Unreachable` block anywhere.
     NoneIsOtherwise,
     /// What rustc ACTUALLY emits: `0 -> return`, `1 -> body`,
-    /// `otherwise -> bb6`, `bb6: Unreachable`, with rustc's exhaustiveness
-    /// certificate set. The dead edge is pruned, so this must be RECOGNIZED.
+    /// `otherwise -> bb6`, `bb6: Unreachable`, with the public exhaustiveness
+    /// bit set. Without provenance-bound layout evidence this must be REFUSED.
     ExhaustiveUnreachable,
     /// Same CFG, certificate NOT set — a partial match closed with
     /// `unreachable_unchecked()`. The `Unreachable` is genuinely reachable UB
     /// and MUST keep being refused.
     UncertifiedUnreachable,
-    /// Certificate set, but the `otherwise` block does NOT end in `Unreachable`
-    /// — the local belt re-check must refuse to prune.
+    /// Exhaustiveness bit set, but the `otherwise` block does NOT end in
+    /// `Unreachable`; the successor remains live and must be refused.
     CertificateWithoutUnreachable,
-    /// Certificate set and `otherwise -> bb6: Unreachable`, but `bb6` is ALSO a
-    /// live case target, so it is genuinely reached and must not be pruned.
+    /// Exhaustiveness bit set and `otherwise -> bb6: Unreachable`, but `bb6` is
+    /// ALSO a live case target, so it is genuinely reached and must be refused.
     UnreachableAlsoACaseTarget,
 }
 
@@ -167,15 +181,17 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
         LocalDecl { index: 9, ty: spec.elem_ty.clone(), name: Some("x".into()) },
         LocalDecl { index: 10, ty: spec.acc_ty.clone(), name: None },
         LocalDecl { index: 11, ty: spec.acc_ty.clone(), name: None },
-        LocalDecl { index: 12, ty: Ty::Unit, name: None },
+        LocalDecl { index: 12, ty: Ty::Tuple(vec![spec.acc_ty.clone(), Ty::Bool]), name: None },
         LocalDecl { index: 13, ty: Ty::Bool, name: None },
-        LocalDecl { index: 14, ty: Ty::Unit, name: None },
+        LocalDecl { index: 14, ty: Ty::Tuple(vec![spec.acc_ty.clone(), Ty::Bool]), name: None },
         LocalDecl { index: 15, ty: array_ty.clone(), name: None },
     ];
 
     // bb0 — init + iterator construction.
-    let mut bb0_stmts =
-        vec![assign(Place::local(2), Rvalue::Use(Operand::Constant(ConstValue::Int(0))))];
+    let mut bb0_stmts = vec![assign(
+        Place::local(2),
+        Rvalue::Use(Operand::Constant(integer_const(&spec.acc_ty, 0))),
+    )];
     let iter_source = if spec.array_is_param {
         bb0_stmts.push(assign(Place::local(3), Rvalue::Ref { mutable: false, place: deref(1) }));
         Operand::Move(Place::local(3))
@@ -184,7 +200,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
         bb0_stmts.push(assign(
             Place::local(15),
             Rvalue::Repeat(
-                Operand::Constant(ConstValue::Int(1)),
+                Operand::Constant(integer_const(&spec.elem_ty, 1)),
                 usize::try_from(spec.len).expect("test array length fits usize"),
             ),
         ));
@@ -215,7 +231,10 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 Rvalue::BinaryOp(
                     BinOp::Shl,
                     Operand::Copy(Place::local(10)),
-                    Operand::Constant(ConstValue::Int(k)),
+                    Operand::Constant(ConstValue::Uint(
+                        u128::try_from(k).expect("test fixture shift amount is nonnegative"),
+                        32,
+                    )),
                 ),
             ));
             Operand::Copy(Place::local(11))
@@ -227,7 +246,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
             Rvalue::CheckedBinaryOp(
                 BinOp::Add,
                 Operand::Copy(Place::local(2)),
-                Operand::Constant(ConstValue::Int(1)),
+                Operand::Constant(integer_const(&spec.acc_ty, 1)),
             ),
         ));
     }
@@ -242,7 +261,10 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
     // bb4 — write back and loop.
     let mut bb4_stmts = vec![assign(Place::local(2), Rvalue::Use(Operand::Copy(field(12, 0))))];
     if spec.init_inside_loop {
-        bb4_stmts.push(assign(Place::local(2), Rvalue::Use(Operand::Constant(ConstValue::Int(0)))));
+        bb4_stmts.push(assign(
+            Place::local(2),
+            Rvalue::Use(Operand::Constant(integer_const(&spec.acc_ty, 0))),
+        ));
     }
 
     let mut blocks = vec![
@@ -258,6 +280,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 unwind: UnwindEdge::Unreachable,
             },
         },
@@ -276,6 +299,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 unwind: UnwindEdge::Unreachable,
             },
         },
@@ -319,7 +343,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
             Rvalue::BinaryOp(
                 BinOp::Eq,
                 Operand::Copy(Place::local(9)),
-                Operand::Constant(ConstValue::Int(0)),
+                Operand::Constant(integer_const(&spec.elem_ty, 0)),
             ),
         ));
         blocks[3].terminator = Terminator::SwitchInt {
@@ -340,6 +364,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         };
     }
@@ -359,9 +384,9 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
             span: SourceSpan::default(),
         };
         let bb6_terminator = if spec.option_switch == OptionSwitch::CertificateWithoutUnreachable {
-            // A block the certificate CLAIMS is dead but which is not spelled
-            // `Unreachable`: the belt must keep the edge and the allowlist must
-            // then reject this call.
+            // A block the public bit CLAIMS is dead but which is not spelled
+            // `Unreachable`: every successor stays live and the allowlist must
+            // reject this call.
             Terminator::Call {
                 func: "test::side_effect".to_string(),
                 args: vec![],
@@ -371,6 +396,7 @@ fn reduction_fn(spec: &ReductionSpec) -> VerifiableFunction {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 unwind: UnwindEdge::Unreachable,
             }
         } else {
@@ -523,6 +549,30 @@ fn an_unmodelled_call_in_the_loop_is_refused() {
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&reduction_fn(&spec)).is_empty(),
         "an arbitrary call can panic, diverge, or mutate the input"
+    );
+}
+
+#[test]
+fn a_tail_call_after_the_loop_is_refused() {
+    let mut func = shift_reduction_overflow_fixture();
+    let exit = func
+        .body
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == BlockId(5))
+        .expect("fixture exit block");
+    exit.terminator = Terminator::TailCall {
+        func: "some::tail_consumer".into(),
+        args: vec![Operand::Copy(Place::local(2))],
+        span: SourceSpan::default(),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+    };
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "an arbitrary tail callee may panic or diverge before the modeled execution completes"
     );
 }
 
@@ -726,42 +776,35 @@ fn an_integer_parameter_type_range_is_certified_but_a_narrower_range_is_refused(
     );
 }
 
-// ── the exhaustive-enum dead arm (rustc's real for-each desugar) ─────────────
+// ── the caller-claimed exhaustive-enum arm ───────────────────────────────────
 
 #[test]
-fn the_real_desugar_with_a_certified_dead_unreachable_is_recognized() {
-    // The second seam: rustc closes the `Option` switch with
-    // `otherwise -> bb6: Unreachable` and stamps its own exhaustiveness
-    // certificate. That edge is statically dead, so it must not be walked into
-    // the terminator allowlist.
+fn the_public_exhaustiveness_bit_cannot_prune_an_unreachable_successor() {
+    // Rustc closes the real `Option` switch with `otherwise -> bb6:
+    // Unreachable`, but this test fixture is public TrustIR rather than a
+    // provenance-bound compiler fact. A caller can set the same boolean on an
+    // ordinary integer switch, so the BMC lane must follow the successor and
+    // decline when it reaches `Unreachable`.
     let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
     spec.option_switch = OptionSwitch::ExhaustiveUnreachable;
     let mut func = reduction_fn(&spec);
     func.preconditions.push(tag_fact("_6", [0, 1]));
-    let candidates = generate_bounded_reduction_bmc_refutation_candidates(&func);
-    assert_eq!(candidates.len(), 1, "the real desugar shape must be recognized");
-    match solve(&candidates[0]) {
-        trust_types::VerificationResult::Failed { counterexample: Some(cex), .. } => {
-            assert!(!cex.assignments.is_empty(), "the refutation must carry a witness");
-        }
-        other => panic!("expected SAT with a model, got {other:?}"),
-    }
+    assert!(
+        crate::validate_function(&func).is_ok(),
+        "the refusal must come from the BMC authority gate, not malformed TrustIR"
+    );
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "a caller-constructible exhaustiveness bit cannot erase a reachable successor"
+    );
 }
 
 #[test]
 fn a_certificate_over_a_non_option_tag_set_is_refused() {
-    // The certificate ALONE must not license pruning.
-    // `mark_exhaustive_enum_unreachable_switches` has TWO lanes, and the COROUTINE
-    // lane sets `exhaustive_enum_unreachable = true` with NO tag-set equality check
-    // (computing the tag set needs the coroutine layout query, which cycles inside
-    // that MIR pass — E0391; the extractor says so itself). Case-set exhaustiveness
-    // is therefore exactly what the flag may not carry, and exactly what makes
-    // pruning the `otherwise` edge safe. So this module re-derives it locally:
-    // only the literal `Option` tag set {0, 1} is pruned.
-    //
-    // Here the certificate is set and `otherwise` really is `Unreachable`, but the
-    // cases are {0, 2} — a gap at 1. The edge must be KEPT, and the terminator
-    // allowlist must then refuse the function.
+    // The public bit cannot license pruning even for the familiar `Option`
+    // case spelling. This malformed case set makes the danger concrete: cases
+    // {0, 2} leave a live gap at 1, so following the default successor must
+    // expose `Unreachable` and refuse the function.
     let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
     spec.option_switch = OptionSwitch::ExhaustiveUnreachable;
     let mut func = reduction_fn(&spec);
@@ -777,8 +820,8 @@ fn a_certificate_over_a_non_option_tag_set_is_refused() {
     }
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
-        "a certificate over a NON-exhaustive case set must not license pruning the \
-         `otherwise` edge — the coroutine lane can stamp it without checking"
+        "a caller-constructible bit over a non-exhaustive case set must not prune \
+         the otherwise edge"
     );
 }
 
@@ -792,21 +835,21 @@ fn an_uncertified_reachable_unreachable_is_refused() {
     func.preconditions.push(tag_fact("_6", [0, 1]));
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
-        "without rustc's exhaustiveness certificate the dead arm is not dead"
+        "a reachable Unreachable successor must make the optional refutation lane decline"
     );
 }
 
 #[test]
 fn a_certificate_whose_otherwise_block_is_not_unreachable_is_refused() {
-    // The local belt: the certificate is taken only when the `otherwise` block
-    // really ends in `Terminator::Unreachable`.
+    // The public bit does not hide even an ordinary otherwise successor. This
+    // one contains a call that the straight-line reduction allowlist refuses.
     let mut spec = ReductionSpec::new(u8_ty(), u8_ty(), 64, Addend::ShlAfterCast(4));
     spec.option_switch = OptionSwitch::CertificateWithoutUnreachable;
     let mut func = reduction_fn(&spec);
     func.preconditions.push(tag_fact("_6", [0, 1]));
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
-        "the certificate is re-checked locally, not taken on trust"
+        "the caller-constructible bit cannot hide an otherwise-block call"
     );
 }
 
@@ -896,12 +939,11 @@ fn safe_widening_reduction_is_never_refuted() {
     );
 }
 
-// ── the alternative shift spelling (a CHECKED `Shl` with its own assert) ─────
+// ── a forged checked-shift carrier ───────────────────────────────────────────
 
-/// `(x as u8) << 4` extracted as a CHECKED `Shl` tuple guarded by its own
-/// `assert(!flag)` in a separate block — the spelling `reduction_shl_operands`
-/// also accepts. The shift-amount assert is provably clear (`4 < 8`), so it
-/// cannot cut the unrolled prefix short and the reduction stays refutable.
+/// A stale/public fixture that spells a shift as `CheckedBinaryOp(Shl)`.
+/// Rustc's audited checked tuple carrier is only Add/Sub/Mul-WithOverflow, so
+/// this body must fail structural admission before the optional BMC lane runs.
 fn checked_shift_fixture() -> VerifiableFunction {
     let mut f = shift_reduction_overflow_fixture();
     f.body.blocks[3].stmts = vec![
@@ -913,7 +955,7 @@ fn checked_shift_fixture() -> VerifiableFunction {
             Rvalue::CheckedBinaryOp(
                 BinOp::Shl,
                 Operand::Copy(Place::local(10)),
-                Operand::Constant(ConstValue::Int(4)),
+                Operand::Constant(ConstValue::Uint(4, 32)),
             ),
         ),
     ];
@@ -952,30 +994,41 @@ fn checked_shift_fixture() -> VerifiableFunction {
 }
 
 #[test]
-fn checked_shift_spelling_is_recognized_and_refuted_with_a_witness() {
-    let candidates = generate_bounded_reduction_bmc_refutation_candidates(&checked_shift_fixture());
-    assert_eq!(candidates.len(), 1, "the checked-`Shl` spelling must also be recognized");
-    match solve(&candidates[0]) {
-        trust_types::VerificationResult::Failed { counterexample: Some(cex), .. } => {
-            assert!(!cex.assignments.is_empty());
-        }
-        other => panic!("expected SAT with a model, got {other:?}"),
-    }
+fn checked_shift_spelling_is_malformed_and_cannot_mint_a_candidate() {
+    let func = checked_shift_fixture();
+    assert!(
+        matches!(
+            crate::validate_function(&func),
+            Err(crate::VcgenError::MalformedMir { detail, .. })
+                if detail.contains("CheckedBinaryOp(Shl)")
+                    && detail.contains("only Add, Sub, and Mul")
+        ),
+        "the forged checked-shift carrier must fail the exact structural admission rule"
+    );
+    assert!(
+        generate_bounded_reduction_bmc_refutation_candidates(&func).is_empty(),
+        "malformed checked-shift TrustIR cannot reach the refutation lane"
+    );
 }
 
 #[test]
 fn an_unfoldable_assert_in_the_loop_is_refused() {
-    // Same body, but the shift assert's condition is an opaque local: it CAN
-    // fire, so iteration i is no longer unconditionally reached.
-    let mut f = checked_shift_fixture();
+    // Keep an otherwise valid ordinary-shift reduction, but replace the add's
+    // assert with an opaque loop guard. It CAN fire, so iteration i is no
+    // longer unconditionally reached.
+    let mut f = shift_reduction_overflow_fixture();
     f.body.blocks[3].terminator = Terminator::Assert {
         cond: Operand::Copy(Place::local(13)),
         expected: true,
-        msg: AssertMessage::Overflow(BinOp::Shl),
-        target: BlockId(6),
+        msg: AssertMessage::Custom("opaque loop guard".into()),
+        target: BlockId(4),
         span: SourceSpan::default(),
         unwind: UnwindEdge::Unreachable,
     };
+    assert!(
+        crate::validate_function(&f).is_ok(),
+        "the assert refusal test must not collapse to malformed TrustIR"
+    );
     assert!(
         generate_bounded_reduction_bmc_refutation_candidates(&f).is_empty(),
         "an assert that can fire must decline the whole unroll"

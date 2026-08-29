@@ -103,6 +103,45 @@ EXEMPT_LEDGERS: tuple[tuple[Path, str], ...] = (
     ),
 )
 
+def _reexec_under_a_toml_capable_python() -> None:
+    """Re-exec under an interpreter that HAS a TOML parser, if this one lacks one.
+
+    `tomllib` is stdlib only from 3.11. This gate is invoked as a bare `python3`
+    from the comprehensive harness (`fast.ledger-expirations`), and on a macOS
+    box `python3` is the 3.9 CommandLineTools build — so the lane hard-FAILED
+    with "no TOML parser available" while a perfectly good 3.14 sat on the same
+    PATH. A pre-push gate that refuses because of the interpreter that happened
+    to invoke it reports nothing about the tree, and blocks every push on the
+    machine until someone reads the message closely enough to notice it is not
+    about the code.
+
+    Re-exec is preferred over telling each caller which python to use: the
+    callers disagree (`${PY}`, bare `python3`), and a fix in one leaves the
+    others broken. A no-op when this interpreter already parses TOML, and it
+    never recurses -- the child has a parser, or is the same interpreter and is
+    left to raise the ordinary error.
+    """
+    import importlib.util
+    import os
+    import shutil
+    import sys
+
+    if importlib.util.find_spec("tomllib") or importlib.util.find_spec("tomli"):
+        return
+    if os.environ.get("TRUST_LEDGER_PY_REEXEC"):
+        return
+    for candidate in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        found = shutil.which(candidate)
+        if not found:
+            continue
+        os.environ["TRUST_LEDGER_PY_REEXEC"] = "1"
+        os.execv(found, [found, os.path.abspath(__file__), *sys.argv[1:]])
+    # No better interpreter exists: fall through and raise TOML_PARSER_ERROR,
+    # which names the real fix.
+
+
+_reexec_under_a_toml_capable_python()
+
 TOML_PARSER_ERROR = (
     "error: no TOML parser available for ledger checks; use Python 3.11+ "
     "for stdlib tomllib, or install tomli for this Python environment"

@@ -34,7 +34,7 @@
             "variants": [
               {
                 "name": "Less",
-                "discriminant": 255,
+                "discriminant": -1,
                 "fields": []
               },
               {
@@ -146,7 +146,7 @@
               ]
             },
             {
-              "Int": 255
+              "Int": -1
             }
           ]
         },

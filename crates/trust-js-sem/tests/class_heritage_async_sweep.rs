@@ -11,10 +11,11 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -47,7 +48,11 @@ fn parse_fm(body: &str) -> (Vec<String>, Vec<String>) {
             let rest = rest.trim();
             if let Some(inner) = rest.strip_prefix('[') {
                 includes.extend(
-                    inner.trim_end_matches(']').split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    inner
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 );
             } else {
                 while let Some(next) = lines.peek() {
@@ -62,7 +67,11 @@ fn parse_fm(body: &str) -> (Vec<String>, Vec<String>) {
         } else if let Some(rest) = t.strip_prefix("flags:") {
             if let Some(inner) = rest.trim().strip_prefix('[') {
                 flags.extend(
-                    inner.trim_end_matches(']').split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    inner
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 );
             }
         }
@@ -99,8 +108,9 @@ fn class_heritage_async_sweep_vs_node() {
         eprintln!("SKIP class_heritage_async_sweep_vs_node: set TRUST_JS_NODE");
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string()),
+    );
     assert!(corpus.join("harness/assert.js").is_file(), "corpus not found");
     let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -135,7 +145,9 @@ fn class_heritage_async_sweep_vs_node() {
             let mut inc_names: Vec<String> =
                 if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
             inc_names.extend(fm_inc);
-            if flags.iter().any(|f| f == "async") && !inc_names.iter().any(|n| n == "doneprintHandle.js") {
+            if flags.iter().any(|f| f == "async")
+                && !inc_names.iter().any(|n| n == "doneprintHandle.js")
+            {
                 inc_names.push("doneprintHandle.js".into());
             }
             let mut inc_srcs = Vec::new();
@@ -160,9 +172,12 @@ fn class_heritage_async_sweep_vs_node() {
 
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let refs: Vec<&str> = inc_srcs.iter().map(String::as_str).collect();
-                let sem = match catch_unwind(AssertUnwindSafe(|| evaluate_case_opts(&refs, &sem_body, false))) {
+                let sem = match catch_unwind(AssertUnwindSafe(|| {
+                    evaluate_case_opts(&refs, &sem_body, false)
+                })) {
                     Ok(o) => o,
                     Err(_) => {
                         panics += 1;
@@ -186,9 +201,18 @@ fn class_heritage_async_sweep_vs_node() {
                     "source": bp.display().to_string(), "mode": mode, "kind": "script",
                 });
                 let mp = tmp.path().join(format!("c-{case_no}.json"));
-                std::fs::File::create(&mp).unwrap().write_all(manifest.to_string().as_bytes()).unwrap();
-                let out = Command::new(&node).arg(&driver).arg(&mp)
-                    .env("TZ", "UTC").env("LANG", "C").env("LC_ALL", "C").output().expect("node");
+                std::fs::File::create(&mp)
+                    .unwrap()
+                    .write_all(manifest.to_string().as_bytes())
+                    .unwrap();
+                let out = Command::new(&node)
+                    .arg(&driver)
+                    .arg(&mp)
+                    .env("TZ", "UTC")
+                    .env("LANG", "C")
+                    .env("LC_ALL", "C")
+                    .output()
+                    .expect("node");
                 let node_trace = match extract_trace(&out.stdout) {
                     Ok(t) => t,
                     Err(e) => {
@@ -207,7 +231,9 @@ fn class_heritage_async_sweep_vs_node() {
             }
         }
     }
-    eprintln!("class heritage sweep: covered={covered} equal={equal} refused={refused} panics={panics}");
+    eprintln!(
+        "class heritage sweep: covered={covered} equal={equal} refused={refused} panics={panics}"
+    );
     assert!(
         failures.is_empty(),
         "class heritage sweep failures ({}):\n{}",

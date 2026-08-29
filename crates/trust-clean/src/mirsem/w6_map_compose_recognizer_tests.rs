@@ -1,8 +1,10 @@
-use super::*;
 use std::collections::BTreeMap;
+
 use trust_types::{
     AggregateKind, Operand, Projection, Rvalue, Statement, Terminator, VerifiableFunction,
 };
+
+use super::*;
 
 fn load_dump(name: &str) -> VerifiableFunction {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -60,6 +62,7 @@ fn closure_fact(func: &VerifiableFunction) -> CalleeFact {
         return_ty,
         requires: Some(vec![]),
         param_names: vec![None, Some("x".into())],
+        ret_model: None,
     }
 }
 
@@ -83,7 +86,11 @@ fn recognizes_corpus_noncapturing_map() {
         super::call_lift::stable_callee_id("map_add1::{closure#0}"),
         "the id is the stable content key of the resolved def-path, not a registry position"
     );
-    assert_eq!(shape.env_operand, SemOperand::Var(1), "the FnOnce env is closure param _2 = Var(1)");
+    assert_eq!(
+        shape.env_operand,
+        SemOperand::Var(1),
+        "the FnOnce env is closure param _2 = Var(1)"
+    );
     assert_eq!(shape.kind, super::ComposeReturn::MapWrap, "map is the Some-rewrap mode");
 }
 
@@ -100,7 +107,11 @@ fn recognizes_corpus_and_then() {
     assert_eq!(shape.call_variant, 1, "Some is variant 1");
     assert_eq!(shape.none_variant, 0, "None is variant 0");
     assert_eq!(shape.callee, "and_then_pos::{closure#0}");
-    assert_eq!(shape.env_operand, SemOperand::Var(1), "the FnOnce env is closure param _2 = Var(1)");
+    assert_eq!(
+        shape.env_operand,
+        SemOperand::Var(1),
+        "the FnOnce env is closure param _2 = Var(1)"
+    );
 }
 
 /// The AndThenFlat mode obeys the SAME mandatory exact-match gate: a registry
@@ -398,7 +409,10 @@ fn wrong_downcast_variant_declines() {
     let mut func = load_dump(MAP_NONCAP);
     // bb3 = call setup: flip the payload extract's Downcast(1) to Downcast(0).
     for s in &mut block_mut(&mut func, 3).stmts {
-        if let Statement::Assign { rvalue: Rvalue::Use(Operand::Move(p) | Operand::Copy(p)), .. } = s {
+        if let Statement::Assign {
+            rvalue: Rvalue::Use(Operand::Move(p) | Operand::Copy(p)), ..
+        } = s
+        {
             if matches!(p.projections.as_slice(), [Projection::Downcast(_), Projection::Field(_)]) {
                 p.projections[0] = Projection::Downcast(0); // != call_tag (1)
             }
@@ -415,7 +429,10 @@ fn wrong_downcast_variant_declines() {
 fn tuple_arity_two_declines() {
     let mut func = load_dump(MAP_NONCAP);
     for s in &mut block_mut(&mut func, 3).stmts {
-        if let Statement::Assign { rvalue: Rvalue::Aggregate(AggregateKind::Tuple, elems), .. } = s {
+        if let Statement::Assign {
+            rvalue: Rvalue::Aggregate(AggregateKind::Tuple, elems), ..
+        } = s
+        {
             // Duplicate the sole element ⇒ arity 2 ≠ closure call arity 1.
             let e0 = elems[0].clone();
             elems.push(e0);
@@ -429,7 +446,10 @@ fn tuple_arity_two_declines() {
 fn tuple_element_not_payload_declines() {
     let mut func = load_dump(MAP_NONCAP);
     for s in &mut block_mut(&mut func, 3).stmts {
-        if let Statement::Assign { rvalue: Rvalue::Aggregate(AggregateKind::Tuple, elems), .. } = s {
+        if let Statement::Assign {
+            rvalue: Rvalue::Aggregate(AggregateKind::Tuple, elems), ..
+        } = s
+        {
             // The sole element is a DIFFERENT local (the env temp _6), not the
             // Downcast-field payload temp _4.
             if let Operand::Copy(p) | Operand::Move(p) = &mut elems[0] {
@@ -461,7 +481,10 @@ fn env_field_projection_declines() {
     // Turn the env chain `_6 := Move(_2)` into a field read `_6 := Move(_2.0)`
     // (the capturing-upvar shape) — must decline even though upvars is [].
     for s in &mut block_mut(&mut func, 3).stmts {
-        if let Statement::Assign { rvalue: Rvalue::Use(Operand::Move(p) | Operand::Copy(p)), .. } = s {
+        if let Statement::Assign {
+            rvalue: Rvalue::Use(Operand::Move(p) | Operand::Copy(p)), ..
+        } = s
+        {
             if p.local == 2 && p.projections.is_empty() {
                 p.projections.push(Projection::Field(0));
             }
@@ -474,9 +497,7 @@ fn env_field_projection_declines() {
 #[test]
 fn effectful_residue_statement_declines() {
     let mut func = load_dump(MAP_NONCAP);
-    block_mut(&mut func, 4)
-        .stmts
-        .push(Statement::Deinit { place: trust_types::Place::local(5) });
+    block_mut(&mut func, 4).stmts.push(Statement::Deinit { place: trust_types::Place::local(5) });
     let callees = registry(&func, "map_add1::{closure#0}");
     assert!(
         sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none(),
@@ -560,6 +581,7 @@ fn second_call_in_none_arm_declines() {
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
     };
     let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());

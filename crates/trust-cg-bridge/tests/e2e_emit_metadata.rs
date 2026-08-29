@@ -318,7 +318,8 @@ fn test_emit_metadata_e2e_smoke() {
 #[test]
 fn test_emit_metadata_empty_crate() {
     let backend = TrustCgCodegenBackend::host();
-    let crate_info = CrateInfo { crate_name: "empty_crate".to_string(), functions: vec![], linkage: Vec::new() };
+    let crate_info =
+        CrateInfo { crate_name: "empty_crate".to_string(), functions: vec![], linkage: Vec::new() };
 
     let ongoing =
         backend.codegen_crate(&crate_info).expect("empty crate should codegen successfully");
@@ -371,12 +372,11 @@ fn test_emit_metadata_float_function() {
         spec: Default::default(),
     };
 
-    let crate_info =
-        CrateInfo {
-            crate_name: "float_crate".to_string(),
-            functions: vec![float_add],
-            linkage: Vec::new(),
-        };
+    let crate_info = CrateInfo {
+        crate_name: "float_crate".to_string(),
+        functions: vec![float_add],
+        linkage: Vec::new(),
+    };
 
     let ongoing = backend.codegen_crate(&crate_info).expect("float function should codegen");
 

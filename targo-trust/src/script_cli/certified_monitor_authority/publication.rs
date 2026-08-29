@@ -1,9 +1,5 @@
 //! No-replace publication of the native authority receipt.
 
-use std::path::Path;
-
-#[cfg(unix)]
-use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
@@ -16,6 +12,10 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
+
+#[cfg(unix)]
+use sha2::{Digest as _, Sha256};
 
 #[cfg(unix)]
 use super::super::{CERTIFIED_MONITOR_MAX_IDENTITY_BYTES, same_stage2_file_identity};

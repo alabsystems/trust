@@ -842,7 +842,14 @@ def check_dependency_fanout_policy(manifests: dict[str, dict[str, Any]]) -> list
             "trust-router default features must not enable native solver backends: "
             + ", ".join(enabled_forbidden)
         )
-    for dep in ("ay", "ay-bindings", "trust-mc-verifier", "trust-wp-core", "trust-vc-core"):
+    if feature_is_declared(trust_router, "trust-wp-backend"):
+        errors.append("trust-router must not restore the retired parsed TrustWP backend feature")
+    if dependency_is_declared(trust_router, "trust-wp-core"):
+        errors.append(
+            "trust-router must not restore the retired TrustWP backend dependency; "
+            "historical wire decoding belongs to the zero-capability trust-wp adapter"
+        )
+    for dep in ("ay", "ay-bindings", "trust-mc-verifier", "trust-vc-core"):
         if not dependency_is_optional(trust_router, dep):
             errors.append(f"trust-router {dep} dependency must stay optional")
 
@@ -1175,6 +1182,24 @@ def run_self_check() -> list[str]:
         "trust-router default features must not enable native solver backends",
         failures,
         "trust-router default backend regression",
+    )
+
+    case = copy.deepcopy(fanout_manifests)
+    case["trust-router"].setdefault("features", {})["trust-wp-backend"] = []
+    self_check_error_contains(
+        check_dependency_fanout_policy(case),
+        "trust-router must not restore the retired parsed TrustWP backend feature",
+        failures,
+        "trust-router retired TrustWP feature regression",
+    )
+
+    case = copy.deepcopy(fanout_manifests)
+    set_dependency_optional(case["trust-router"], "trust-wp-core", True)
+    self_check_error_contains(
+        check_dependency_fanout_policy(case),
+        "trust-router must not restore the retired TrustWP backend dependency",
+        failures,
+        "trust-router retired TrustWP dependency regression",
     )
 
     case = copy.deepcopy(fanout_manifests)

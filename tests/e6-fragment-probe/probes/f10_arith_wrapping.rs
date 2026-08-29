@@ -8,4 +8,6 @@
 clean { def winc_isl (x : UInt64) : UInt64 := x + 1 }
 pub fn winc(x: u64) -> u64
     ensures result == winc_isl(x)
-{ x.wrapping_add(1) }
+{
+    x.wrapping_add(1)
+}

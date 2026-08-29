@@ -7,7 +7,7 @@
 //! producer-well-formedness ensures.
 
 use trust_types::{
-    AggregateKind, BasicBlock, BlockId, BinOp, ConstValue, Contract, ContractKind, Formula,
+    AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, Formula,
     LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan, Statement, Terminator, Ty,
     VariantDef, VcKind, VerifiableBody, VerifiableFunction,
 };
@@ -23,7 +23,16 @@ fn usize_ty() -> Ty {
 }
 
 fn vec_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None,  faithful_enum_repr: None, name: "std::vec::Vec".into(), fields: vec![], variants: vec![], disc_index_safe: false, enum_layout: None, }
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        faithful_enum_repr: None,
+        name: "std::vec::Vec".into(),
+        fields: vec![],
+        variants: vec![],
+        disc_index_safe: false,
+        enum_layout: None,
+    }
 }
 
 fn ref_vec_ty(mutable: bool) -> Ty {
@@ -33,7 +42,9 @@ fn ref_vec_ty(mutable: bool) -> Ty {
 /// `core::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1).
 fn result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
@@ -41,11 +52,21 @@ fn result_ty(ok_payload: Ty) -> Ty {
             ("__v1_0".into(), i64_ty()),
         ],
         variants: vec![
-            VariantDef { name: "Ok".into(), discriminant: 0, fields: vec![("0".into(), ok_payload)] },
-            VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), i64_ty())] },
+            VariantDef {
+                name: "Ok".into(),
+                discriminant: 0,
+                fields: vec![("0".into(), ok_payload)],
+            },
+            VariantDef {
+                name: "Err".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), i64_ty())],
+            },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 fn func_with(
@@ -59,7 +80,13 @@ fn func_with(
         name: "len_pair".to_string(),
         def_path: "test::len_pair".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty: ret_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty: ret_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![Contract {
             kind: ContractKind::Ensures,
             span: SourceSpan::default(),
@@ -85,6 +112,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
         unwind: Default::default(),
     }
 }
@@ -95,14 +123,24 @@ fn field_place(local: usize, path: &[usize]) -> Place {
 
 fn ok_aggregate(op: Operand) -> Rvalue {
     Rvalue::Aggregate(
-        AggregateKind::Adt { name: "core::result::Result".into(), variant: 0, active_field: None, args: None },
+        AggregateKind::Adt {
+            name: "core::result::Result".into(),
+            variant: 0,
+            active_field: None,
+            args: None,
+        },
         vec![op],
     )
 }
 
 fn err_aggregate() -> Rvalue {
     Rvalue::Aggregate(
-        AggregateKind::Adt { name: "core::result::Result".into(), variant: 1, active_field: None, args: None },
+        AggregateKind::Adt {
+            name: "core::result::Result".into(),
+            variant: 1,
+            active_field: None,
+            args: None,
+        },
         vec![Operand::Constant(ConstValue::Int(1))],
     )
 }
@@ -267,7 +305,10 @@ fn len_model_var_parser_is_strict() {
     assert_eq!(v.path, vec![0, 1]);
     assert_eq!(v.name, "_0__value.0.1__len");
     // Versioned copies parse to the BASE name.
-    assert_eq!(parse_len_model_var("_0__value.2__len#s1_0").map(|v| v.name).as_deref(), Some("_0__value.2__len"));
+    assert_eq!(
+        parse_len_model_var("_0__value.2__len#s1_0").map(|v| v.name).as_deref(),
+        Some("_0__value.2__len")
+    );
     // Bare-payload length, non-numeric segments, other bases: fail closed.
     assert!(parse_len_model_var("_0__value__len").is_none());
     assert!(parse_len_model_var("_0__value.a__len").is_none());
@@ -429,18 +470,26 @@ fn second_return_path_without_construction_blocks_grounding() {
 /// (payload = struct { entailment: struct { premises: Vec, multipliers:
 /// Vec } } — component paths `.0.0` / `.0.1`).
 fn guarded_delegator_fn(mutate_before_ok: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::Entailment".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::CertifiedDeep".into(),
         fields: vec![("entailment".into(), ent_ty)],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let locals = vec![
         LocalDecl { index: 0, ty: result_ty(cert_ty.clone()), name: None },
         LocalDecl { index: 1, ty: cert_ty.clone(), name: None }, // param c
@@ -592,18 +641,26 @@ fn payload_mutation_after_guard_stays_fail_closed() {
 /// the guard: the hop's source is then unstable and everything must stay
 /// fail-closed — the returned lengths may differ from the guard snapshot).
 fn extract_then_guard_wrapper_fn(mutate_alias_source: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::Entailment".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::CertifiedDeep".into(),
         fields: vec![("entailment".into(), ent_ty)],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let locals = vec![
         LocalDecl { index: 0, ty: result_ty(cert_ty.clone()), name: None },
         LocalDecl { index: 1, ty: i64_ty(), name: None }, // param
@@ -620,7 +677,7 @@ fn extract_then_guard_wrapper_fn(mutate_alias_source: bool) -> VerifiableFunctio
         LocalDecl { index: 14, ty: usize_ty(), name: None }, // multipliers len
         LocalDecl { index: 15, ty: ref_vec_ty(false), name: None },
         LocalDecl { index: 16, ty: result_ty(cert_ty.clone()), name: None }, // guard-Err temp
-        LocalDecl { index: 20, ty: cert_ty.clone(), name: None }, // Ok operand alias
+        LocalDecl { index: 20, ty: cert_ty.clone(), name: None },            // Ok operand alias
     ];
     let len = "std::vec::Vec::<i64>::len";
     let mut ok_stmts = Vec::new();
@@ -828,13 +885,19 @@ const TWO_PAIR_ENSURES: &str = "!((result.is_ok()) && \
 /// Payload = struct { bound: i64, lambda: i64, mu_plus: Vec, mu_minus: Vec,
 /// entailment: struct { premises: Vec, multipliers: Vec } }.
 fn two_pair_guarded_fn(second_guard: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::EntailmentCertificate".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::SbarUpperCert".into(),
         fields: vec![
             ("bound".into(), i64_ty()),
@@ -845,20 +908,22 @@ fn two_pair_guarded_fn(second_guard: bool) -> VerifiableFunction {
         ],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let locals = vec![
         LocalDecl { index: 0, ty: result_ty(cert_ty.clone()), name: None },
         LocalDecl { index: 1, ty: cert_ty.clone(), name: None }, // param c
         LocalDecl { index: 2, ty: ref_vec_ty(false), name: None }, // &c.mu_plus
-        LocalDecl { index: 3, ty: usize_ty(), name: None }, // mu_plus len
+        LocalDecl { index: 3, ty: usize_ty(), name: None },      // mu_plus len
         LocalDecl { index: 4, ty: ref_vec_ty(false), name: None }, // &c.mu_minus
-        LocalDecl { index: 5, ty: usize_ty(), name: None }, // mu_minus len
-        LocalDecl { index: 6, ty: Ty::Bool, name: None }, // pair-1 Ne
+        LocalDecl { index: 5, ty: usize_ty(), name: None },      // mu_minus len
+        LocalDecl { index: 6, ty: Ty::Bool, name: None },        // pair-1 Ne
         LocalDecl { index: 7, ty: ref_vec_ty(false), name: None }, // &c.premises
-        LocalDecl { index: 8, ty: usize_ty(), name: None }, // premises len
+        LocalDecl { index: 8, ty: usize_ty(), name: None },      // premises len
         LocalDecl { index: 9, ty: ref_vec_ty(false), name: None }, // &c.multipliers
-        LocalDecl { index: 10, ty: usize_ty(), name: None }, // multipliers len
-        LocalDecl { index: 11, ty: Ty::Bool, name: None }, // pair-2 Ne
+        LocalDecl { index: 10, ty: usize_ty(), name: None },     // multipliers len
+        LocalDecl { index: 11, ty: Ty::Bool, name: None },       // pair-2 Ne
     ];
     let len = "std::vec::Vec::<i64>::len";
     // Pair-1 guard: `Ne(c.mu_plus.len(), c.mu_minus.len())`, equality edge to
@@ -1070,13 +1135,19 @@ fn two_pairs_one_guard_leaves_the_other_ungrounded() {
 /// the exact `certify_upper` asymmetry. This test pins that BOTH pairs now
 /// ground on the real shape.
 fn destructure_rebuild_two_pair_fn() -> VerifiableFunction {
-    let ent_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::EntailmentCertificate".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    let cert_ty = Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    let cert_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::SbarUpperCert".into(),
         fields: vec![
             ("bound".into(), i64_ty()),
@@ -1087,7 +1158,9 @@ fn destructure_rebuild_two_pair_fn() -> VerifiableFunction {
         ],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let cert_agg = |ops: Vec<Operand>| {
         Rvalue::Aggregate(
             AggregateKind::Adt {
@@ -1203,10 +1276,7 @@ fn destructure_rebuild_two_pair_fn() -> VerifiableFunction {
                 assign(Place::local(12), Rvalue::Use(Operand::Move(field_place(4, &[2])))),
                 assign(Place::local(13), Rvalue::Use(Operand::Move(field_place(4, &[3])))),
                 assign(Place::local(14), Rvalue::Use(Operand::Move(field_place(4, &[4])))),
-                assign(
-                    Place::local(17),
-                    Rvalue::Ref { mutable: false, place: Place::local(12) },
-                ),
+                assign(Place::local(17), Rvalue::Ref { mutable: false, place: Place::local(12) }),
             ],
             terminator: call(len, vec![Operand::Move(Place::local(17))], 16, 5),
         },
@@ -1343,18 +1413,26 @@ fn destructure_rebuild_flat_and_nested_pairs_both_ground_real_mir() {
 /// `ny::CertifiedDeep { entailment: ny::Entailment { premises: Vec,
 /// multipliers: Vec } }` — payload component paths `.0.0` / `.0.1`.
 fn nested_cert_ty() -> Ty {
-    let ent_ty = Ty::Adt { adt_kind: None, layout: None, 
+    let ent_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::Entailment".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
-    Ty::Adt { adt_kind: None, layout: None,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::CertifiedDeep".into(),
         fields: vec![("entailment".into(), ent_ty)],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 const NESTED_PAIR_ENSURES: &str =
@@ -1379,8 +1457,8 @@ fn forward_err_delegator_fn() -> VerifiableFunction {
         LocalDecl { index: 0, ty: result_ty(cert_ty.clone()), name: None },
         LocalDecl { index: 1, ty: i64_ty(), name: None }, // param seed
         LocalDecl { index: 2, ty: result_ty(cert_ty.clone()), name: None }, // inner() dest (forwarded)
-        LocalDecl { index: 3, ty: i64_ty(), name: None }, // discriminant
-        LocalDecl { index: 5, ty: cert_ty.clone(), name: None }, // c (Ok payload)
+        LocalDecl { index: 3, ty: i64_ty(), name: None },                   // discriminant
+        LocalDecl { index: 5, ty: cert_ty.clone(), name: None },            // c (Ok payload)
         LocalDecl { index: 6, ty: ref_vec_ty(false), name: None },
         LocalDecl { index: 7, ty: usize_ty(), name: None }, // premises len
         LocalDecl { index: 8, ty: ref_vec_ty(false), name: None },
@@ -1570,7 +1648,7 @@ fn ok_edge_forward_fn() -> VerifiableFunction {
         LocalDecl { index: 0, ty: result_ty(cert_ty.clone()), name: None },
         LocalDecl { index: 1, ty: i64_ty(), name: None },
         LocalDecl { index: 2, ty: result_ty(cert_ty.clone()), name: None }, // inner() dest
-        LocalDecl { index: 3, ty: i64_ty(), name: None }, // discriminant
+        LocalDecl { index: 3, ty: i64_ty(), name: None },                   // discriminant
     ];
     let blocks = vec![
         BasicBlock {

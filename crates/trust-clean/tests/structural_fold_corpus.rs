@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use trust_clean::prove_dump_dir;
 use trust_clean::trustir_anchor::RefinementVerdict;
 use trust_clean::trustir_fold::{
-    check_structural_fold_refinement, sem_structural_fold_shape_of, FoldDecline,
+    FoldDecline, check_structural_fold_refinement, sem_structural_fold_shape_of,
 };
 use trust_types::VerifiableFunction;
 
@@ -56,10 +56,8 @@ fn corpus_dir() -> PathBuf {
 
 fn load(name: &str) -> VerifiableFunction {
     let path = corpus_dir().join(format!("{name}.json"));
-    let bytes = std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 /// THE HEADLINE — the full production `prove_dump_dir` pass over the corpus:
@@ -108,10 +106,7 @@ fn structural_fold_corpus_scorecard() {
          structural_fold_member_verdicts — got {}",
         sc.fully_faithful
     );
-    assert_eq!(
-        sc.fully_faithful_via_trustir, 6,
-        "every certificate here must be trust-ir-primary"
-    );
+    assert_eq!(sc.fully_faithful_via_trustir, 6, "every certificate here must be trust-ir-primary");
     assert_eq!(sc.fully_faithful_mirsem_fallback, 0, "no MirSem lane exists for a recursive fold");
 }
 
@@ -261,12 +256,7 @@ fn pick_retraction_is_pinned_to_the_int_bool_carrier_gate() {
         "pick's return type must be the NON-scalar `&Tree` this retraction is about; \
          got {ret:?}"
     );
-    let param_ty = &f
-        .body
-        .locals
-        .get(1)
-        .expect("pick takes one parameter")
-        .ty;
+    let param_ty = &f.body.locals.get(1).expect("pick takes one parameter").ty;
     assert_eq!(
         ret, param_ty,
         "pick is the parameter-identity `&Tree -> &Tree`; the retraction is precisely \
@@ -349,22 +339,20 @@ fn recognizer_reads_real_tags_never_declaration_indices() {
 #[test]
 fn adversarial_members_decline_by_name() {
     // bad_self — recursion on the scrutinee itself (f(x) = f(x)).
-    let d = sem_structural_fold_shape_of(&load("bad_self"))
-        .expect_err("bad_self must decline");
+    let d = sem_structural_fold_shape_of(&load("bad_self")).expect_err("bad_self must decline");
     assert_eq!(d.name(), "non_subterm_recursive_arg", "bad_self: {d:?}");
     let FoldDecline::NonSubtermRecursiveArg { detail } = &d else { unreachable!() };
     assert!(detail.contains("scrutinee"), "bad_self detail: {detail}");
 
     // bad_rebuilt — recursion on a reconstructed node.
-    let d = sem_structural_fold_shape_of(&load("bad_rebuilt"))
-        .expect_err("bad_rebuilt must decline");
+    let d =
+        sem_structural_fold_shape_of(&load("bad_rebuilt")).expect_err("bad_rebuilt must decline");
     assert_eq!(d.name(), "non_subterm_recursive_arg", "bad_rebuilt: {d:?}");
     let FoldDecline::NonSubtermRecursiveArg { detail } = &d else { unreachable!() };
     assert!(detail.contains("rebuilt"), "bad_rebuilt detail: {detail}");
 
     // bad_nonsub — recursion on a sibling-call result.
-    let d = sem_structural_fold_shape_of(&load("bad_nonsub"))
-        .expect_err("bad_nonsub must decline");
+    let d = sem_structural_fold_shape_of(&load("bad_nonsub")).expect_err("bad_nonsub must decline");
     assert_eq!(d.name(), "non_subterm_recursive_arg", "bad_nonsub: {d:?}");
     let FoldDecline::NonSubtermRecursiveArg { detail } = &d else { unreachable!() };
     assert!(
@@ -390,11 +378,7 @@ fn bool_folds_recognize_with_cond_tree_arms() {
     // Leaf(v) => v == 0
     assert_eq!(
         shape.variants[0].arm,
-        FoldExpr::Cmp(
-            FoldCmpOp::Eq,
-            Box::new(FoldExpr::Payload(0)),
-            Box::new(FoldExpr::Const(0))
-        )
+        FoldExpr::Cmp(FoldCmpOp::Eq, Box::new(FoldExpr::Payload(0)), Box::new(FoldExpr::Const(0)))
     );
     // Two(a,b) => f(a) || f(b)  ≡  if f(a) { true } else { f(b) }
     assert_eq!(
@@ -471,8 +455,8 @@ fn accumulator_adversaries_decline_by_name() {
 
     // bad_acc_read — insert's bool result is consumed (rule ii: control flow
     // must never be accumulator-dependent).
-    let d = sem_structural_fold_shape_of(&load("bad_acc_read"))
-        .expect_err("bad_acc_read must decline");
+    let d =
+        sem_structural_fold_shape_of(&load("bad_acc_read")).expect_err("bad_acc_read must decline");
     assert_eq!(d.name(), "accumulator_read", "bad_acc_read: {d:?}");
 
     // bad_acc_alias — the One arm recurses with a FRESH accumulator (rule i).

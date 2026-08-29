@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 //! Public Trust verifier API boundary.
 //!
 //! This crate defines the stable data boundary between Trust and verifier
@@ -14,8 +15,6 @@ use std::time::{Duration, Instant};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use trust_types::digest::{canonicalize_json_in_place, is_stable_sha256_hex, stable_sha256_hex};
-
 // The proof-assurance vocabulary is defined in trust-ir-contract (shared
 // cross-repo vocabulary) and re-exported here so every dependent
 // (trust-router, trust-wp, trust-vc-bridge, trust-mir-extract, trust-bmc, …)
@@ -25,6 +24,7 @@ use trust_types::digest::{canonicalize_json_in_place, is_stable_sha256_hex, stab
 pub use trust_ir_contract::{
     AssuranceLevel, ProofStrength, ReasoningKind, TrustSpecVariableOrigin,
 };
+use trust_types::digest::{canonicalize_json_in_place, is_stable_sha256_hex, stable_sha256_hex};
 
 /// Schema version for serialized verifier API payloads.
 pub const SCHEMA_VERSION: &str = "trust.verifier-api.v1";
@@ -698,9 +698,7 @@ pub enum TrustSpecSort {
 pub enum TrustSpecScalarSort {
     Bool,
     Int,
-    BitVec {
-        width: u32,
-    },
+    BitVec { width: u32 },
 }
 
 impl TrustSpecScalarSort {
@@ -1972,9 +1970,7 @@ impl ObligationEvidence {
                     && artifact_has_same_binding(replay, transcripts[0])
                     && models.first().map_or_else(
                         || artifact_references_exactly(replay, &[transcripts[0]]),
-                        |model| {
-                            artifact_references_exactly(replay, &[transcripts[0], model])
-                        },
+                        |model| artifact_references_exactly(replay, &[transcripts[0], model]),
                     )
             })
             && checks.first().is_none_or(|check| {
@@ -1989,10 +1985,9 @@ impl ObligationEvidence {
                         (Some(model), None) => {
                             artifact_references_exactly(check, &[transcripts[0], model])
                         }
-                        (Some(model), Some(replay)) => artifact_references_exactly(
-                            check,
-                            &[transcripts[0], replay, model],
-                        ),
+                        (Some(model), Some(replay)) => {
+                            artifact_references_exactly(check, &[transcripts[0], replay, model])
+                        }
                     }
             })
             && dag_has_no_unreferenced_materialized_extras(
@@ -3405,10 +3400,7 @@ fn validate_trust_spec_sort(sort: TrustSpecSort) -> Result<(), String> {
     }
 }
 
-fn validate_trust_spec_scalar_sort(
-    role: &str,
-    sort: TrustSpecScalarSort,
-) -> Result<(), String> {
+fn validate_trust_spec_scalar_sort(role: &str, sort: TrustSpecScalarSort) -> Result<(), String> {
     match sort {
         TrustSpecScalarSort::Bool | TrustSpecScalarSort::Int => Ok(()),
         TrustSpecScalarSort::BitVec { width }
@@ -3579,10 +3571,8 @@ fn validate_trust_spec_expr(
         }
         TrustSpecExprKind::Old { expr: child } => {
             if matches!(child.sort, TrustSpecSort::Array { .. }) {
-                return Err(
-                    "typed TrustSpec old(array) is outside the read-only Select fragment"
-                        .to_string(),
-                );
+                return Err("typed TrustSpec old(array) is outside the read-only Select fragment"
+                    .to_string());
             }
             require_sort(expr.sort, child.sort, "old result")?;
             validate_trust_spec_expr(child, declared, bound, child_depth, nodes)
@@ -3609,10 +3599,8 @@ fn validate_trust_spec_expr(
                 );
             };
             if !matches!(&base.kind, TrustSpecExprKind::Variable { .. }) {
-                return Err(
-                    "typed TrustSpec index base must be a direct declared array variable"
-                        .to_string(),
-                );
+                return Err("typed TrustSpec index base must be a direct declared array variable"
+                    .to_string());
             }
             require_sort(index.sort, TrustSpecSort::Int, "index operand")?;
             require_sort(expr.sort, element.expression_sort(), "index result")?;
@@ -3627,17 +3615,13 @@ fn validate_trust_spec_expr(
             )?;
             validate_trust_spec_sort(*variable_sort)?;
             if matches!(*variable_sort, TrustSpecSort::Array { .. }) {
-                return Err(
-                    "typed TrustSpec quantifiers cannot bind array variables".to_string()
-                );
+                return Err("typed TrustSpec quantifiers cannot bind array variables".to_string());
             }
             // The float fragment is comparisons + literals + free variables
             // only; quantified float domains are outside it (fail-closed like
             // array binders).
             if matches!(*variable_sort, TrustSpecSort::Float { .. }) {
-                return Err(
-                    "typed TrustSpec quantifiers cannot bind float variables".to_string()
-                );
+                return Err("typed TrustSpec quantifiers cannot bind float variables".to_string());
             }
             require_sort(expr.sort, TrustSpecSort::Bool, "quantifier result")?;
             require_sort(body.sort, TrustSpecSort::Bool, "quantifier body")?;
@@ -4511,7 +4495,8 @@ impl VerificationRunSummary {
         // rows per obligation today — a multi-engine fallback would be the first
         // mechanism that does — so this is a guard placed before the mechanism
         // that needs it, not a fix to an observed miscount.
-        let mut counted_proved: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut counted_proved: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
         for item in evidence {
             if is_admission(&item.obligation_id) {
                 continue;
@@ -6559,10 +6544,8 @@ mod tests {
             format!("normalized PDR obligation for {owner}").as_bytes(),
             Vec::new(),
         );
-        let input_reference = EvidenceArtifactReference {
-            kind: input.kind,
-            hash: input.hash.clone(),
-        };
+        let input_reference =
+            EvidenceArtifactReference { kind: input.kind, hash: input.hash.clone() };
         let transcript = bound_artifact(
             EvidenceArtifactKind::SolverTranscript,
             owner,
@@ -6583,10 +6566,7 @@ mod tests {
             proof_binding_id,
             b"exact PDR replay log",
             vec![
-                EvidenceArtifactReference {
-                    kind: transcript.kind,
-                    hash: transcript.hash.clone(),
-                },
+                EvidenceArtifactReference { kind: transcript.kind, hash: transcript.hash.clone() },
                 EvidenceArtifactReference { kind: model.kind, hash: model.hash.clone() },
             ],
         );
@@ -6596,10 +6576,7 @@ mod tests {
             proof_binding_id,
             b"exact PDR proof check report",
             vec![
-                EvidenceArtifactReference {
-                    kind: transcript.kind,
-                    hash: transcript.hash.clone(),
-                },
+                EvidenceArtifactReference { kind: transcript.kind, hash: transcript.hash.clone() },
                 EvidenceArtifactReference { kind: replay.kind, hash: replay.hash.clone() },
                 EvidenceArtifactReference { kind: model.kind, hash: model.hash.clone() },
             ],
@@ -6866,9 +6843,7 @@ mod tests {
             });
             assert_eq!(
                 suite_transport
-                    .canonical_obligation_semantic_digest_sha256(
-                        &suite_transport.obligations[0],
-                    )
+                    .canonical_obligation_semantic_digest_sha256(&suite_transport.obligations[0],)
                     .unwrap_or_else(|error| panic!("known transport key {key} rejected: {error}")),
                 expected,
                 "known native transport key {key} must not rewrite the public claim"
@@ -7299,7 +7274,8 @@ mod tests {
             sort: TrustSpecSort::Int,
             origin: TrustSpecVariableOrigin::Local { index: 0 },
         };
-        let valid = TrustSpecPredicate::new(TrustSpecExpr::bool_literal(true), vec![variable.clone()]);
+        let valid =
+            TrustSpecPredicate::new(TrustSpecExpr::bool_literal(true), vec![variable.clone()]);
         valid.validate().expect("canonical typed predicate");
 
         let duplicate = TrustSpecPredicate::new(
@@ -7375,18 +7351,14 @@ mod tests {
             TrustSpecExpr::int_literal("0"),
             TrustSpecSort::Int,
         ));
-        assert!(
-            scalar_base.validate().expect_err("scalar base must fail").contains("index base")
-        );
+        assert!(scalar_base.validate().expect_err("scalar base must fail").contains("index base"));
 
         let bool_index = equality(TrustSpecExpr::index(
             array_ref(),
             TrustSpecExpr::bool_literal(false),
             TrustSpecSort::Int,
         ));
-        assert!(
-            bool_index.validate().expect_err("Bool index must fail").contains("index operand")
-        );
+        assert!(bool_index.validate().expect_err("Bool index must fail").contains("index operand"));
 
         let wrong_result = TrustSpecExpr {
             sort: TrustSpecSort::Bool,
@@ -7404,14 +7376,14 @@ mod tests {
             vec![array.clone()],
         );
         assert!(
-            wrong_result.validate().expect_err("wrong result sort must fail").contains("index result")
+            wrong_result
+                .validate()
+                .expect_err("wrong result sort must fail")
+                .contains("index result")
         );
 
-        let forged_field_base = TrustSpecExpr::field(
-            TrustSpecExpr::int_literal("0"),
-            "forged_array",
-            array_sort,
-        );
+        let forged_field_base =
+            TrustSpecExpr::field(TrustSpecExpr::int_literal("0"), "forged_array", array_sort);
         let forged_field = equality(TrustSpecExpr::index(
             forged_field_base,
             TrustSpecExpr::int_literal("0"),
@@ -7429,7 +7401,10 @@ mod tests {
             vec![array.clone()],
         );
         assert!(
-            array_equality.validate().expect_err("array equality must fail").contains("array equality")
+            array_equality
+                .validate()
+                .expect_err("array equality must fail")
+                .contains("array equality")
         );
 
         let array_quantifier = TrustSpecPredicate::new(
@@ -7449,9 +7424,7 @@ mod tests {
             TrustSpecExpr::bool_literal(true),
             vec![TrustSpecVariable {
                 name: "bytes".to_string(),
-                sort: TrustSpecSort::Array {
-                    element: TrustSpecScalarSort::BitVec { width: 0 },
-                },
+                sort: TrustSpecSort::Array { element: TrustSpecScalarSort::BitVec { width: 0 } },
                 origin: TrustSpecVariableOrigin::Local { index: 1 },
             }],
         );
@@ -7518,10 +7491,8 @@ mod tests {
             vec![x_decl(f64_sort)],
         );
         nan_equality.validate().expect("NaN payloads are representational");
-        let wire = nan_equality
-            .clone()
-            .into_contract_predicate()
-            .expect("float predicate serializes");
+        let wire =
+            nan_equality.clone().into_contract_predicate().expect("float predicate serializes");
         let decoded = TrustSpecPredicate::from_contract_predicate(&wire)
             .expect("float predicate decodes")
             .expect("typed predicate schema");
@@ -7679,10 +7650,7 @@ mod tests {
             Vec::new(),
         );
         assert!(
-            float_binder
-                .validate()
-                .expect_err("float binder must fail")
-                .contains("bind float"),
+            float_binder.validate().expect_err("float binder must fail").contains("bind float"),
         );
     }
 
@@ -7875,10 +7843,7 @@ mod tests {
             "pdr-proof",
             b"check over the mutated PDR replay",
             vec![
-                EvidenceArtifactReference {
-                    kind: transcript.kind,
-                    hash: transcript.hash.clone(),
-                },
+                EvidenceArtifactReference { kind: transcript.kind, hash: transcript.hash.clone() },
                 EvidenceArtifactReference { kind: replay.kind, hash: replay.hash.clone() },
                 EvidenceArtifactReference { kind: model.kind, hash: model.hash.clone() },
             ],
@@ -8972,8 +8937,7 @@ mod tests {
         }
 
         assert_ne!(
-            "<Button as sealed::Widget>::rank",
-            "<Button  as sealed::Widget>::rank",
+            "<Button as sealed::Widget>::rank", "<Button  as sealed::Widget>::rank",
             "accepting spaces must not normalize or collapse distinct owner ids"
         );
         assert!(canonical_artifact_owner_id("<Button  as sealed::Widget>::rank"));
@@ -9161,9 +9125,12 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.starts_with("release-blocking proof gap: obligation ")));
-        assert!(result.diagnostics.iter().any(|diagnostic| {
-            diagnostic == "engine-authored audit history"
-        }));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic == "engine-authored audit history" })
+        );
 
         let enclosing_engine = result.engine.clone();
         result.evidence[0].engine =
@@ -9961,7 +9928,7 @@ mod tests {
             "engine": {
                 "name": "unit-engine",
                 "version": "0.1.0",
-                "api_version": "0.1.0",
+                "api_version": "__API_VERSION__",
                 "kind": "Deductive"
             },
             "status": "Empty",
@@ -9979,8 +9946,25 @@ mod tests {
             "publication": {}
         }"#;
 
+        // Trust: substitute the CURRENT `API_VERSION` rather than pinning a
+        // literal.
+        //
+        // `validate_engine_manifest` requires an EXACT match, deliberately — a
+        // sibling test asserts a mismatched version must be rejected. And
+        // `API_VERSION` is `env!("CARGO_PKG_VERSION")`, which differs between the
+        // two workspaces this crate belongs to: `crates/Cargo.toml` says 0.1.0
+        // and the root workspace says 0.5.0. A literal therefore passes in one
+        // lane and fails in the other — which is exactly what happened: this test
+        // passed under `crates/` and failed inside the release gate, on
+        // "incompatible API version 0.1.0; expected 0.5.0", before it ever
+        // reached the question it exists to ask.
+        //
+        // That question is the MISSING `context` FIELD — "compatibility snapshot"
+        // here means a legacy result with no context, and the assertions below
+        // check its defaulting. The api_version was incidental to it.
+        let json = json.replace("__API_VERSION__", API_VERSION);
         let decoded: VerificationRunResult =
-            serde_json::from_str(json).expect("deserialize legacy run result");
+            serde_json::from_str(&json).expect("deserialize legacy run result");
 
         assert_eq!(decoded.context.run_id, "legacy-run");
         assert_eq!(decoded.context.invocation, VerifierInvocation::NativeTrustPipeline);

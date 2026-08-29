@@ -6,9 +6,10 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
 use crate::bigint::JsBigInt;
 use crate::units::Units;
-use std::rc::Rc;
 
 /// Heap handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

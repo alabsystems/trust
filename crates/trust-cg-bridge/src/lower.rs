@@ -1591,9 +1591,7 @@ impl<'a> LoweringCtx<'a> {
                             .bindings
                             .params
                             .iter()
-                            .map(|param| {
-                                format!("{} ({})", param.reg_name, param.var_name)
-                            })
+                            .map(|param| format!("{} ({})", param.reg_name, param.var_name))
                             .collect::<Vec<_>>()
                             .join(", ");
                         message.push_str(&format!(
@@ -2739,12 +2737,14 @@ fn emit_block_param_copies(
 /// - Scalar and aggregate types (tuples, ADTs, arrays, slices, references)
 /// - Place projections (field, deref, index, downcast, constant-index, subslice)
 /// - Memory operations (load, store, stack slots, address-of)
-/// - Function calls (direct) and drop elaboration
+/// - Function calls (direct), tail calls (through the canonical call/return
+///   projection), and drop elaboration
 /// - Supported terminators (goto, return, switch, assert, call, drop, unreachable)
 /// - Casts (int-int, float-int, int-float, float-float, ptr-ptr)
 #[must_use = "returns the lowered LIR function"]
 pub fn lower_to_lir(func: &VerifiableFunction) -> Result<LirFunction, BridgeError> {
-    lower_body_to_lir(&func.name, &func.body)
+    let expanded = func.with_tail_calls_expanded();
+    lower_body_to_lir(&expanded.name, &expanded.body)
 }
 
 #[must_use = "returns the lowered LIR function"]
@@ -2752,7 +2752,8 @@ pub fn lower_to_lir_with_options(
     func: &VerifiableFunction,
     options: &LoweringOptions,
 ) -> Result<LirFunction, BridgeError> {
-    lower_body_to_lir_with_options(&func.name, &func.body, options)
+    let expanded = func.with_tail_calls_expanded();
+    lower_body_to_lir_with_options(&expanded.name, &expanded.body, options)
 }
 
 /// Convert a trust-types `VerifiableBody` to an trust_cg LIR `Function`.
@@ -2784,6 +2785,18 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
         return Err(BridgeError::EmptyBody);
     }
 
+    // A bare body does not carry the function-level semantic projection used
+    // by `lower_to_lir{,_with_options}`. Refuse TailCall explicitly here so a
+    // body-only caller cannot accidentally lower it as an unknown no-successor
+    // terminator. The VerifiableFunction entry points preserve it as the
+    // equivalent direct Call writing local 0 followed by Return.
+    if body.blocks.iter().any(|block| matches!(block.terminator, Terminator::TailCall { .. })) {
+        return Err(BridgeError::UnsupportedOp(
+            "TailCall requires the VerifiableFunction lowering entry point so its implicit return place can be projected exactly"
+                .to_string(),
+        ));
+    }
+
     // Trust: Detect duplicate block IDs which indicate malformed MIR.
     {
         let mut seen_ids =
@@ -2811,10 +2824,9 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
                 )));
             }
             match crate::entry_binding::compute_entry_preservation(body, bindings) {
-                Ok(preservation) => Some(EntryBindingInputs::Justified {
-                    bindings: bindings.clone(),
-                    preservation,
-                }),
+                Ok(preservation) => {
+                    Some(EntryBindingInputs::Justified { bindings: bindings.clone(), preservation })
+                }
                 Err(refusal) => Some(EntryBindingInputs::Refused { reason: refusal.reason }),
             }
         }
@@ -2824,7 +2836,8 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
     // Compute the maximum block ID so the context can allocate new blocks
     // (e.g., the panic block for Assert) without collisions.
     let max_block_id = body.blocks.iter().map(|bb| bb.id.0 as u32).max().unwrap_or(0);
-    let mut ctx = LoweringCtx::new(&body.locals, body.arg_count, max_block_id, options, entry_inputs);
+    let mut ctx =
+        LoweringCtx::new(&body.locals, body.arg_count, max_block_id, options, entry_inputs);
     let initial_local_values = ctx.local_values.clone();
     let predecessors = collect_predecessors(body);
     let return_lowering = return_lowering_for(body);
@@ -2906,31 +2919,34 @@ pub fn lower_body_to_lir_with_options_and_consumptions(
 
     let consumed_symbolic = std::mem::take(&mut ctx.consumed_symbolic);
 
-    Ok((LirFunction {
-        name: name.to_string(),
-        signature,
-        blocks,
-        block_order,
-        param_pointee_types: Vec::new(),
-        #[allow(rustc::default_hash_types)]
-        trust_ir_origins: std::collections::HashMap::new(),
-        entry_block,
-        stack_slots: ctx.stack_slots,
-        // Trust: #986 — preserve call-result types for ISel when the
-        // producing opcode omits result type metadata.
-        value_types: ctx.value_types,
-        #[allow(rustc::default_hash_types)]
-        pure_callees: std::collections::HashSet::new(),
-        // trust-cg's LirFunction carries the libm callees ISel may treat as
-        // pure; the bridge asserts no libm purity, and empty is that claim.
-        libm_pure_callees: Default::default(),
-        debug_meta: Default::default(),
-        debug_value_bindings: vec![],
-        stack_protector: Default::default(),
-        // trust-cg Function carries per-function exception-handling info; the bridge does
-        // not emit EH metadata yet — Default (empty) is the validated no-EH baseline.
-        eh_info: Default::default(),
-    }, consumed_symbolic))
+    Ok((
+        LirFunction {
+            name: name.to_string(),
+            signature,
+            blocks,
+            block_order,
+            param_pointee_types: Vec::new(),
+            #[allow(rustc::default_hash_types)]
+            trust_ir_origins: std::collections::HashMap::new(),
+            entry_block,
+            stack_slots: ctx.stack_slots,
+            // Trust: #986 — preserve call-result types for ISel when the
+            // producing opcode omits result type metadata.
+            value_types: ctx.value_types,
+            #[allow(rustc::default_hash_types)]
+            pure_callees: std::collections::HashSet::new(),
+            // trust-cg's LirFunction carries the libm callees ISel may treat as
+            // pure; the bridge asserts no libm purity, and empty is that claim.
+            libm_pure_callees: Default::default(),
+            debug_meta: Default::default(),
+            debug_value_bindings: vec![],
+            stack_protector: Default::default(),
+            // trust-cg Function carries per-function exception-handling info; the bridge does
+            // not emit EH metadata yet — Default (empty) is the validated no-EH baseline.
+            eh_info: Default::default(),
+        },
+        consumed_symbolic,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4025,6 +4041,12 @@ fn lower_terminator(
                 "opaque MIR terminator `{kind}` is unsupported; targets={targets:?}"
             )));
         }
+        Terminator::TailCall { .. } => {
+            return Err(BridgeError::UnsupportedOp(
+                "TailCall reached body lowering without the required call/return projection"
+                    .to_string(),
+            ));
+        }
         _ => {
             return Err(BridgeError::UnsupportedOp("unknown terminator variant".to_string()));
         }
@@ -4240,8 +4262,7 @@ mod integer_constant_tests {
 
 #[cfg(test)]
 mod terminator_runtime_tests {
-    use trust_types::UnwindEdge;
-    use trust_types::{BlockId, SourceSpan};
+    use trust_types::{BlockId, SourceSpan, UnwindEdge};
 
     use super::*;
 
@@ -4650,12 +4671,16 @@ mod aggregate_projection_tests {
 
     #[test]
     fn adt_active_field_aggregate_fails_closed() {
-        let union_like_ty = Ty::Adt { adt_kind: None, layout: None,
+        let union_like_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "UnionLike".into(),
             fields: vec![("a".into(), Ty::i32()), ("b".into(), Ty::i64())],
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = unit_function(
             "adt_active_field",
             vec![
@@ -4793,7 +4818,10 @@ mod aggregate_projection_tests {
     fn raw_ptr_aggregate_rejects_dyn_vtable_metadata() {
         let data_ptr_ty = Ty::RawPtr { pointee: Box::new(Ty::u8()), mutable: false };
         let dyn_ptr_ty = Ty::RawPtr {
-            pointee: Box::new(Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) }),
+            pointee: Box::new(Ty::Dynamic {
+                trait_name: "Debug".into(),
+                principal_key: Some("Debug".into()),
+            }),
             mutable: false,
         };
         let func = unit_function(
@@ -4808,7 +4836,10 @@ mod aggregate_projection_tests {
                 place: Place::local(3),
                 rvalue: Rvalue::Aggregate(
                     AggregateKind::RawPtr {
-                        pointee_ty: Ty::Dynamic { trait_name: "Debug".into(), principal_key: Some("Debug".into()) },
+                        pointee_ty: Ty::Dynamic {
+                            trait_name: "Debug".into(),
+                            principal_key: Some("Debug".into()),
+                        },
                         mutable: false,
                     },
                     vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -4826,12 +4857,16 @@ mod aggregate_projection_tests {
 
     #[test]
     fn fieldless_adt_aggregate_fails_closed_as_unsupported_op() {
-        let fieldless = Ty::Adt { adt_kind: None, layout: None,
+        let fieldless = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "OptionI32".into(),
             fields: vec![],
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let func = unit_function(
             "fieldless_adt",
             vec![
@@ -4879,8 +4914,12 @@ mod entry_binding_lowering_tests {
     /// reconstruction: machine-register locals (the x86_64 LocalLayout names
     /// that matter here), arg_count 0, one surviving statement — the 8-byte
     /// little-endian load of [RDI] into RAX — and a bare return.
-    fn x86_load_fixture_body(stmts: Vec<Statement>, blocks: Option<Vec<TrustBlock>>) -> VerifiableBody {
-        let mut locals = vec![LocalDecl { index: 0, ty: u64_ty(), name: Some("_lifted_result".into()) }];
+    fn x86_load_fixture_body(
+        stmts: Vec<Statement>,
+        blocks: Option<Vec<TrustBlock>>,
+    ) -> VerifiableBody {
+        let mut locals =
+            vec![LocalDecl { index: 0, ty: u64_ty(), name: Some("_lifted_result".into()) }];
         for (index, name) in [(1, "RAX"), (8, "RDI")] {
             locals.push(LocalDecl { index, ty: u64_ty(), name: Some(name.to_string()) });
         }
@@ -5074,11 +5113,7 @@ mod entry_binding_lowering_tests {
     #[test]
     fn preserved_multiblock_load_lowers() {
         let blocks = vec![
-            TrustBlock {
-                id: BlockId(0),
-                stmts: vec![],
-                terminator: Terminator::Goto(BlockId(1)),
-            },
+            TrustBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) },
             TrustBlock {
                 id: BlockId(1),
                 stmts: vec![load_rax_from(&reg_var("X7"))],
@@ -5178,9 +5213,8 @@ mod entry_binding_lowering_tests {
     #[test]
     fn default_options_are_unchanged() {
         let body = x86_load_fixture_body(vec![load_rax_from(&reg_var("X7"))], None);
-        let err =
-            lower_body_to_lir_with_options("mir_lane", &body, &LoweringOptions::default())
-                .expect_err("the load still refuses without bindings");
+        let err = lower_body_to_lir_with_options("mir_lane", &body, &LoweringOptions::default())
+            .expect_err("the load still refuses without bindings");
         let BridgeError::UnsupportedOp(message) = err else { panic!("wrong error kind") };
         assert!(
             message.contains("symbolic operand requires target-semantic lowering"),
@@ -5278,10 +5312,7 @@ mod entry_binding_terminator_position_tests {
                     id: BlockId(0),
                     stmts: vec![],
                     terminator: Terminator::SwitchInt {
-                        discr: Operand::Symbolic(Formula::Var(
-                            "X7".to_string(),
-                            Sort::BitVec(64),
-                        )),
+                        discr: Operand::Symbolic(Formula::Var("X7".to_string(), Sort::BitVec(64))),
                         targets: vec![(1, BlockId(1))],
                         otherwise: BlockId(1),
                         exhaustive_enum_unreachable: false,

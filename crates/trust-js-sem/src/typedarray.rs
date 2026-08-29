@@ -16,14 +16,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, ERes, Interp};
-use crate::value::{
-    units_from_str, units_to_lossy, BufferData, Builtin, ElementType, NativeErrorKind, ObjId,
-    ObjKind, Object, TAMethod, Units, Value,
-};
-use crate::number::{js_number_to_string, to_number_str};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use crate::interp::{Abrupt, ERes, Interp};
+use crate::number::{js_number_to_string, to_number_str};
+use crate::value::{
+    BufferData, Builtin, ElementType, NativeErrorKind, ObjId, ObjKind, Object, TAMethod, Units,
+    Value, units_from_str, units_to_lossy,
+};
 
 /// Allocation cap (bytes) for one ArrayBuffer: within it we model exactly;
 /// beyond it (where a real engine's RangeError-vs-allocate boundary is engine
@@ -101,19 +102,11 @@ pub fn f16_bits_to_f64(bits: u16) -> f64 {
     let val = if exp == 0 {
         f64::from(mant) * 2f64.powi(-24)
     } else if exp == 0x1f {
-        if mant == 0 {
-            f64::INFINITY
-        } else {
-            f64::NAN
-        }
+        if mant == 0 { f64::INFINITY } else { f64::NAN }
     } else {
         (1.0 + f64::from(mant) / 1024.0) * 2f64.powi(i32::from(exp) - 15)
     };
-    if sign == 1 {
-        -val
-    } else {
-        val
-    }
+    if sign == 1 { -val } else { val }
 }
 
 /// Round-to-nearest-even f64 → IEEE-754 binary16 bits.
@@ -186,11 +179,7 @@ fn round_shift(sig: u64, shift: u32) -> u64 {
     let keep = sig >> shift;
     let rem = sig & ((1u64 << shift) - 1);
     let half = 1u64 << (shift - 1);
-    if rem > half || (rem == half && (keep & 1) == 1) {
-        keep + 1
-    } else {
-        keep
-    }
+    if rem > half || (rem == half && (keep & 1) == 1) { keep + 1 } else { keep }
 }
 
 fn bytes_to_u64(b: &[u8], le: bool) -> u64 {
@@ -270,7 +259,12 @@ pub fn write_element(bytes: &mut [u8], bi: usize, elem: ElementType, num: f64, l
 /// GetValueFromBuffer for the BigInt element types: decode 8 bytes as a signed
 /// (BigInt64) or unsigned (BigUint64) 64-bit integer.
 #[must_use]
-pub fn read_element_big(bytes: &[u8], bi: usize, elem: ElementType, le: bool) -> num_bigint::BigInt {
+pub fn read_element_big(
+    bytes: &[u8],
+    bi: usize,
+    elem: ElementType,
+    le: bool,
+) -> num_bigint::BigInt {
     let v = bytes_to_u64(&bytes[bi..bi + 8], le);
     match elem {
         #[allow(clippy::cast_possible_wrap)]
@@ -297,11 +291,7 @@ pub fn canonical_numeric_index(key: &[u16]) -> Option<f64> {
     }
     let s = units_to_lossy(key);
     let n = to_number_str(&s).ok()?;
-    if js_number_to_string(n) == s {
-        Some(n)
-    } else {
-        None
-    }
+    if js_number_to_string(n) == s { Some(n) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -320,17 +310,9 @@ pub(crate) struct TaFields {
 impl Interp {
     pub(crate) fn ta_fields(&self, oid: ObjId) -> Option<TaFields> {
         match self.obj(oid).kind {
-            ObjKind::TypedArray {
-                buffer,
-                byte_offset,
-                length,
-                elem,
-            } => Some(TaFields {
-                buffer,
-                byte_offset,
-                length,
-                elem,
-            }),
+            ObjKind::TypedArray { buffer, byte_offset, length, elem } => {
+                Some(TaFields { buffer, byte_offset, length, elem })
+            }
             _ => None,
         }
     }
@@ -411,7 +393,12 @@ impl Interp {
     /// IntegerIndexedElementSet: the type-appropriate coercion (ToNumber /
     /// ToBigInt) runs unconditionally (side effects observable); the store
     /// happens only for a valid in-bounds index.
-    pub(crate) fn ta_element_set(&mut self, oid: ObjId, n: f64, value: Value) -> Result<(), Abrupt> {
+    pub(crate) fn ta_element_set(
+        &mut self,
+        oid: ObjId,
+        n: f64,
+        value: Value,
+    ) -> Result<(), Abrupt> {
         let f = self.ta_fields(oid).expect("typed array");
         let coerced = self.ta_coerce_elem(f.elem, &value)?;
         if let Some(i) = self.ta_valid_index(f, n) {
@@ -430,11 +417,7 @@ impl Interp {
 
     /// The current element count (0 if detached/out-of-bounds).
     pub(crate) fn ta_length(&self, f: TaFields) -> usize {
-        if self.ta_out_of_bounds(f) {
-            0
-        } else {
-            f.length
-        }
+        if self.ta_out_of_bounds(f) { 0 } else { f.length }
     }
 
     /// The in-bounds element index strings, "0".."len-1" (empty if
@@ -443,9 +426,7 @@ impl Interp {
         let Some(f) = self.ta_fields(oid) else {
             return Vec::new();
         };
-        (0..self.ta_length(f))
-            .map(|i| units_from_str(&i.to_string()))
-            .collect()
+        (0..self.ta_length(f)).map(|i| units_from_str(&i.to_string())).collect()
     }
 
     /// IntegerIndexedDefineOwnProperty (23.2.3.x): a valid in-bounds data
@@ -503,10 +484,7 @@ impl Interp {
             detached: false,
             max_byte_length: max,
         }));
-        self.alloc(Object::new(
-            ObjKind::ArrayBuffer(data),
-            Some(self.intr.arraybuffer_proto),
-        ))
+        self.alloc(Object::new(ObjKind::ArrayBuffer(data), Some(self.intr.arraybuffer_proto)))
     }
 
     /// Allocate a typed-array object of `elem` over `buffer`.
@@ -519,12 +497,7 @@ impl Interp {
         proto: ObjId,
     ) -> ObjId {
         self.alloc(Object::new(
-            ObjKind::TypedArray {
-                buffer,
-                byte_offset,
-                length,
-                elem,
-            },
+            ObjKind::TypedArray { buffer, byte_offset, length, elem },
             Some(proto),
         ))
     }
@@ -592,9 +565,7 @@ impl Interp {
             }
         }
         if byte_length > MAX_BUFFER_BYTES {
-            return Err(Abrupt::Fatal(
-                "ArrayBuffer allocation beyond modeled cap".to_string(),
-            ));
+            return Err(Abrupt::Fatal("ArrayBuffer allocation beyond modeled cap".to_string()));
         }
         let proto = self.new_target_proto(self.intr.arraybuffer_proto)?;
         let buf = self.alloc_buffer(byte_length, max);
@@ -651,11 +622,7 @@ impl Interp {
         };
         let proto = self.new_target_proto(self.intr.dataview_proto)?;
         let dv = self.alloc(Object::new(
-            ObjKind::DataView {
-                buffer,
-                byte_offset: offset,
-                byte_length,
-            },
+            ObjKind::DataView { buffer, byte_offset: offset, byte_length },
             Some(proto),
         ));
         Ok(Value::Obj(dv))
@@ -678,9 +645,7 @@ impl Interp {
             Value::Obj(src) => {
                 let src = *src;
                 match &self.obj(src).kind {
-                    ObjKind::ArrayBuffer(_) => {
-                        self.ta_from_buffer(elem, src, args, proto)
-                    }
+                    ObjKind::ArrayBuffer(_) => self.ta_from_buffer(elem, src, args, proto),
                     ObjKind::TypedArray { .. } => self.ta_from_typed_array(elem, src, proto),
                     _ => self.ta_from_object(elem, &arg0, proto),
                 }
@@ -695,13 +660,11 @@ impl Interp {
 
     /// AllocateTypedArray with a fresh zero buffer of `len` elements.
     fn ta_allocate(&mut self, elem: ElementType, len: usize, proto: ObjId) -> ERes {
-        let byte_len = len.checked_mul(elem.bytes()).ok_or_else(|| {
-            Abrupt::Fatal("typed-array byte length overflow".to_string())
-        })?;
+        let byte_len = len
+            .checked_mul(elem.bytes())
+            .ok_or_else(|| Abrupt::Fatal("typed-array byte length overflow".to_string()))?;
         if byte_len > MAX_BUFFER_BYTES {
-            return Err(Abrupt::Fatal(
-                "typed-array allocation beyond modeled cap".to_string(),
-            ));
+            return Err(Abrupt::Fatal("typed-array allocation beyond modeled cap".to_string()));
         }
         let buf = self.alloc_buffer(byte_len, None);
         let ta = self.make_typed_array(elem, buf, 0, len, proto);
@@ -1011,11 +974,7 @@ impl Interp {
 
     fn new_array_iterator(&mut self, target: ObjId, kind: crate::value::ArrayIterKind) -> Value {
         let it = self.alloc(Object::new(
-            ObjKind::ArrayIterator {
-                target: Some(target),
-                index: 0,
-                kind,
-            },
+            ObjKind::ArrayIterator { target: Some(target), index: 0, kind },
             Some(self.intr.array_iterator_proto),
         ));
         Value::Obj(it)
@@ -1087,17 +1046,13 @@ impl Interp {
             Builtin::ArrayBufferResize => self.arraybuffer_resize(&this, &arg(0)),
             Builtin::ArrayBufferTransfer | Builtin::ArrayBufferTransferToFixed => {
                 let _ = self.require_array_buffer(&this)?;
-                Err(Abrupt::Fatal(
-                    "ArrayBuffer.prototype.transfer (out of slice)".to_string(),
-                ))
+                Err(Abrupt::Fatal("ArrayBuffer.prototype.transfer (out of slice)".to_string()))
             }
 
             // -- DataView.prototype accessors ------------------------------
             Builtin::DataViewBufferGet => {
                 let dv = self.require_data_view(&this)?;
-                let ObjKind::DataView { buffer, .. } = self.obj(dv).kind else {
-                    unreachable!()
-                };
+                let ObjKind::DataView { buffer, .. } = self.obj(dv).kind else { unreachable!() };
                 Ok(Value::Obj(buffer))
             }
             Builtin::DataViewByteLengthGet => {
@@ -1152,14 +1107,13 @@ impl Interp {
 
     /// DataView bounds witness: (buffer, byteOffset, byteLength), TypeError if
     /// detached or out of bounds (a resizable buffer shrank under the view).
-    fn dataview_bounds(&mut self, this: &Value, _oob_throws: bool) -> Result<(ObjId, usize, usize), Abrupt> {
+    fn dataview_bounds(
+        &mut self,
+        this: &Value,
+        _oob_throws: bool,
+    ) -> Result<(ObjId, usize, usize), Abrupt> {
         let dv = self.require_data_view(this)?;
-        let ObjKind::DataView {
-            buffer,
-            byte_offset,
-            byte_length,
-        } = self.obj(dv).kind
-        else {
+        let ObjKind::DataView { buffer, byte_offset, byte_length } = self.obj(dv).kind else {
             unreachable!()
         };
         let rc = self.buffer_rc(buffer).expect("buffer");
@@ -1181,12 +1135,7 @@ impl Interp {
         let get_index = self.to_index(&arg(0))?;
         let le = self.to_boolean(&arg(1));
         let (buffer, view_offset, view_len) = {
-            let ObjKind::DataView {
-                buffer,
-                byte_offset,
-                byte_length,
-            } = self.obj(dv).kind
-            else {
+            let ObjKind::DataView { buffer, byte_offset, byte_length } = self.obj(dv).kind else {
                 unreachable!()
             };
             (buffer, byte_offset, byte_length)
@@ -1216,12 +1165,7 @@ impl Interp {
         let num = self.to_number(&arg(1))?;
         let le = self.to_boolean(&arg(2));
         let (buffer, view_offset, view_len) = {
-            let ObjKind::DataView {
-                buffer,
-                byte_offset,
-                byte_length,
-            } = self.obj(dv).kind
-            else {
+            let ObjKind::DataView { buffer, byte_offset, byte_length } = self.obj(dv).kind else {
                 unreachable!()
             };
             (buffer, byte_offset, byte_length)
@@ -1280,20 +1224,12 @@ impl Interp {
         #[allow(clippy::cast_precision_loss)]
         let flen = len as f64;
         let rel_start = to_integer_or_infinity(self.to_number(&arg(0))?);
-        let first = if rel_start < 0.0 {
-            (flen + rel_start).max(0.0)
-        } else {
-            rel_start.min(flen)
-        };
+        let first = if rel_start < 0.0 { (flen + rel_start).max(0.0) } else { rel_start.min(flen) };
         let rel_end = match arg(1) {
             Value::Undefined => flen,
             v => to_integer_or_infinity(self.to_number(&v)?),
         };
-        let final_ = if rel_end < 0.0 {
-            (flen + rel_end).max(0.0)
-        } else {
-            rel_end.min(flen)
-        };
+        let final_ = if rel_end < 0.0 { (flen + rel_end).max(0.0) } else { rel_end.min(flen) };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (first, final_) = (first as usize, final_ as usize);
         let new_len = final_.saturating_sub(first);
@@ -1443,21 +1379,24 @@ impl Interp {
                 }
                 Ok(this.clone())
             }
-            TAMethod::Values => Ok(self.new_array_iterator(oid, crate::value::ArrayIterKind::Value)),
+            TAMethod::Values => {
+                Ok(self.new_array_iterator(oid, crate::value::ArrayIterKind::Value))
+            }
             TAMethod::Keys => Ok(self.new_array_iterator(oid, crate::value::ArrayIterKind::Key)),
             TAMethod::Entries => {
                 Ok(self.new_array_iterator(oid, crate::value::ArrayIterKind::Entry))
             }
-            TAMethod::ForEach | TAMethod::Every | TAMethod::Some | TAMethod::Find
+            TAMethod::ForEach
+            | TAMethod::Every
+            | TAMethod::Some
+            | TAMethod::Find
             | TAMethod::FindIndex => self.ta_iterate(m, oid, &arg(0), &arg(1), len),
             TAMethod::Reduce => self.ta_reduce(oid, &arg(0), args.get(1).cloned(), len),
             TAMethod::Set => self.ta_set(oid, &arg(0), &arg(1)),
             TAMethod::Subarray => self.ta_subarray(oid, &arg(0), &arg(1), flen),
             TAMethod::Slice => self.ta_slice(oid, &arg(0), &arg(1), flen),
             // Registered (typeof/name/length exact) but behavior out of slice.
-            _ => Err(Abrupt::Fatal(format!(
-                "%TypedArray%.prototype method {m:?} (out of slice)"
-            ))),
+            _ => Err(Abrupt::Fatal(format!("%TypedArray%.prototype method {m:?} (out of slice)"))),
         }
     }
 
@@ -1483,11 +1422,7 @@ impl Interp {
         if last {
             // from index defaults to len-1; negative counts from end
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let mut k: i64 = if n >= 0.0 {
-                (n.min(flen - 1.0)) as i64
-            } else {
-                (flen + n) as i64
-            };
+            let mut k: i64 = if n >= 0.0 { (n.min(flen - 1.0)) as i64 } else { (flen + n) as i64 };
             while k >= 0 {
                 if vals[k as usize] == target {
                     #[allow(clippy::cast_precision_loss)]
@@ -1654,8 +1589,9 @@ impl Interp {
                 // Array-like source.
                 let src = self.to_object_arg(source)?;
                 let len_v = self.get_from_object(src, &units_from_str("length"))?;
-                let src_len = usize::try_from(crate::builtins::to_length_u64(self.to_number(&len_v)?))
-                    .map_err(|_| Abrupt::Fatal("set source length beyond cap".to_string()))?;
+                let src_len =
+                    usize::try_from(crate::builtins::to_length_u64(self.to_number(&len_v)?))
+                        .map_err(|_| Abrupt::Fatal("set source length beyond cap".to_string()))?;
                 // saturating: offset may be usize::MAX (+Infinity) — never wrap.
                 if offset.saturating_add(src_len) > target_len {
                     return Err(self.throw_native(NativeErrorKind::RangeError));
@@ -1696,9 +1632,7 @@ impl Interp {
         let final_ = self.rel_index(end, flen, flen)?;
         let count = final_.saturating_sub(first);
         let proto = self.intr.ta_proto(elem);
-        let Value::Obj(dest) = self.ta_allocate(elem, count, proto)? else {
-            unreachable!()
-        };
+        let Value::Obj(dest) = self.ta_allocate(elem, count, proto)? else { unreachable!() };
         for i in 0..count {
             #[allow(clippy::cast_precision_loss)]
             let v = self.ta_element_get(oid, (first + i) as f64);

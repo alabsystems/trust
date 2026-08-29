@@ -350,7 +350,12 @@ pub fn try_discharge_vc(vc: &VerificationCondition, env: &IntervalDomain) -> Abs
         }
 
         // Arithmetic overflow: check if the result interval fits within type bounds.
-        VcKind::ArithmeticOverflow { op, operand_tys } => {
+        // `UncheckedArithmeticOverflow` shares this arm deliberately: the two differ in
+        // whether the LANGUAGE keeps a runtime guard (it does not, for the unchecked
+        // family — see `has_runtime_fallback`), never in what the interval domain can
+        // prove about the operands. Omitting it here would be a pure lost recovery.
+        VcKind::ArithmeticOverflow { op, operand_tys }
+        | VcKind::UncheckedArithmeticOverflow { op, operand_tys } => {
             if let Some(result_ok) = check_overflow_discharge(&vc.formula, env, *op, operand_tys)
                 && result_ok
             {
@@ -366,7 +371,10 @@ pub fn try_discharge_vc(vc: &VerificationCondition, env: &IntervalDomain) -> Abs
         }
 
         // Index out of bounds: check if index < length for all values.
-        VcKind::IndexOutOfBounds => {
+        // `UncheckedIndexBounds` (the `get_unchecked` family) shares it for the same
+        // reason as the overflow arm above: no runtime guard exists, but the obligation
+        // is the same `i < len` the interval domain already discharges.
+        VcKind::IndexOutOfBounds | VcKind::UncheckedIndexBounds { .. } => {
             if let Some(safe) = check_bounds_discharge(&vc.formula, env)
                 && safe
             {

@@ -75,16 +75,15 @@ fn az_tuple_return_family_is_six_shape_gaps_with_callees_present() {
     for (i, f) in funcs.iter().enumerate() {
         by_path.entry(f.def_path.as_str()).or_insert(i);
     }
-    let mut seq: Vec<usize> = order.iter().filter_map(|p| by_path.get(p.as_str()).copied()).collect();
+    let mut seq: Vec<usize> =
+        order.iter().filter_map(|p| by_path.get(p.as_str()).copied()).collect();
     for i in 0..funcs.len() {
         if !seq.contains(&i) {
             seq.push(i);
         }
     }
-    let bodies: trust_clean::trustir_fold::DumpBodies = funcs
-        .iter()
-        .map(|f| (f.def_path.clone(), f.clone()))
-        .collect();
+    let bodies: trust_clean::trustir_fold::DumpBodies =
+        funcs.iter().map(|f| (f.def_path.clone(), f.clone())).collect();
 
     let mut certified: BTreeMap<String, trust_clean::mirsem::CalleeFact> = BTreeMap::new();
     let mut diagnosed: BTreeMap<String, trust_clean::FullyFaithfulDiagnosis> = BTreeMap::new();

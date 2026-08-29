@@ -28,10 +28,10 @@ pub const PRED_VOCAB: &[(&str, &[Sort])] = &[
     ("single_component", &[Sort::Int]),
     // --- Reserved for the expansion path (SAFE_API.md §7); one per category ---
     ("path_validated", &[Sort::Int]),
-    ("byte_exact", &[Sort::Int]), // Utf8Reject / ByteLoss
-    ("error_propagated", &[Sort::Int]), // ErrorDiscard
+    ("byte_exact", &[Sort::Int]),          // Utf8Reject / ByteLoss
+    ("error_propagated", &[Sort::Int]),    // ErrorDiscard
     ("perms_creation_safe", &[Sort::Int]), // PermissionCreate / PermissionWindow
-    ("priv_dropped", &[]), // TrustDomain
+    ("priv_dropped", &[]),                 // TrustDomain
     ("domain_entered_before_lookup", &[]), // TrustDomainOrder
 ];
 

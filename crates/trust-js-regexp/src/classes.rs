@@ -4,7 +4,7 @@
 //! Author: Andrew Yates
 //! Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::unicode::{canonicalize, fold_sources, Fold};
+use crate::unicode::{Fold, canonicalize, fold_sources};
 
 /// A CharSet: sorted, merged ranges of code points, plus (v-mode only)
 /// a set of strings (each a code-point sequence of length != 1; length-1
@@ -71,12 +71,7 @@ impl CharSet {
             }
             if b1 < b2 { i += 1 } else { j += 1 }
         }
-        let strings = self
-            .strings
-            .iter()
-            .filter(|s| other.strings.contains(s))
-            .cloned()
-            .collect();
+        let strings = self.strings.iter().filter(|s| other.strings.contains(s)).cloned().collect();
         CharSet { ranges: out, strings }
     }
 
@@ -85,12 +80,7 @@ impl CharSet {
             ranges: complement_ranges(&other.ranges, 0, MAX_CP),
             strings: Vec::new(),
         });
-        out.strings = self
-            .strings
-            .iter()
-            .filter(|s| !other.strings.contains(s))
-            .cloned()
-            .collect();
+        out.strings = self.strings.iter().filter(|s| !other.strings.contains(s)).cloned().collect();
         sort_strings(&mut out.strings);
         out
     }

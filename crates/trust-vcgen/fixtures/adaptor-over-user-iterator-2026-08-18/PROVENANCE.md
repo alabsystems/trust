@@ -152,3 +152,25 @@ bundles fall to 4 and the row total rises 23 → 27, losing four REAL-code grant
 * Rows from `generate_unbounded_allocation_vcs`, the production entry point:
   **exploit 0, control 1** before the 2026-08-18 fix; **1 and 1** after it.
   Pinned by `bounded_source_value_tests::a_sysroot_adaptor_over_an_unauthenticated_source_is_refused`.
+
+## FORWARD NOTE (2026-08-21): the R2 recipe above no longer reproduces
+
+The `#[rustc_diagnostic_item]` forgery that gets this aux past the string side is
+residual R2 of `trust_mir_extract::convert::impersonates_sysroot_crate`. That
+residual has since been confined to the crate under COMPILATION: an EXTERNAL crate
+is authenticated by ARTIFACT RESIDENCY — every `used_crate_source` path sits in
+`sess.target_tlib_path.dir` — never by an attribute it carries. This aux is
+`--extern`-supplied out of an aux-build directory, so a compiler carrying that
+change stamps it and the receiver renders `__trust_crate@…::std::vec::…`, which
+the STRING side refuses first.
+
+DERIVED, NOT RE-MEASURED: no compiler carrying the change has been built (`x.py`
+is out of scope), so the sentence above is the rule applied to this aux's measured
+fact vector (`resident = false`, read from
+`RUSTC_LOG=rustc_metadata::locator=info`), not an observed re-run.
+
+Nothing here is re-minted and no expectation changed. These dumps are still the
+witness they were built to be: the VALUE-side walk must refuse a forged receiver
+on its own, without help from the stamp, and it is fed exactly the unstamped
+bundle a compiler did once produce. Read the section above as history of a
+measurement, not as a recipe.

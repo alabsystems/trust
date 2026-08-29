@@ -3,8 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::BlockId;
-use trust_types::TranslationValidationError;
+use trust_types::{BlockId, TranslationValidationError};
 
 /// Errors from the translation validation pipeline.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -157,8 +156,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod proptest_transval_error {
-        use super::*;
         use proptest::prelude::*;
+
+        use super::*;
 
         fn arb_transval_error() -> impl Strategy<Value = TransvalError> {
             prop_oneof![

@@ -1097,7 +1097,8 @@ fn analyze_function(
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             let Statement::Assign { rvalue, .. } = stmt else { continue };
-            let Rvalue::Aggregate(AggregateKind::Adt { name, variant, active_field, .. }, ops) = rvalue
+            let Rvalue::Aggregate(AggregateKind::Adt { name, variant, active_field, .. }, ops) =
+                rvalue
             else {
                 continue;
             };
@@ -1426,12 +1427,16 @@ mod tests {
     }
 
     fn adt(name: &str, fields: Vec<(&str, Ty)>) -> Ty {
-        Ty::Adt { adt_kind: None, layout: None, 
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: name.into(),
             fields: fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
     }
 
     fn condvar_ty() -> Ty {
@@ -1547,6 +1552,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         }
     }
 

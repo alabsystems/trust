@@ -69,10 +69,8 @@ fn check_corpus(name: &str, min_files: usize) {
                 .map(|err| format!("    {}", err.message))
                 .collect::<Vec<_>>()
                 .join("\n");
-            failures.push(format!(
-                "{} no longer kernel-checks in process\n{messages}",
-                path.display()
-            ));
+            failures
+                .push(format!("{} no longer kernel-checks in process\n{messages}", path.display()));
         }
         registered += outcome.registered.len();
     }

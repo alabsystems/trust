@@ -5,7 +5,7 @@
 //! full Pipeline v2 release validation.
 //!
 //! Steps, in the shell gate's order:
-//! 1. Same-run typed trust-vc / trust-wp / trust-mc ownership evidence.
+//! 1. Same-run typed trust-vc / trust-mc / TY ownership evidence.
 //! 2. MIR-compatibility contract source-recovery fail-closed behavioral
 //!    tests. This is an adapter lane, not frontend authority; Rust and Lean
 //!    frontends produce TrustIR directly.
@@ -54,10 +54,16 @@ use crate::stage2_tools::{
 };
 
 const MAX_THREE_SUITE_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
-const THREE_SUITE_SAMPLE_FILTER: &str = "sample_bundle_records_trust_vc_memory_bridge_debt";
-const TRUST_MC_SAMPLE_OBLIGATION: &str = "sample::trust-mc-arithmetic-safety";
-const TRUST_VC_SAMPLE_OBLIGATION: &str = "sample::trust-vc-ownership";
-const TRUST_WP_SAMPLE_OBLIGATION: &str = "sample::trust-wp-postcondition";
+const THREE_SUITE_SAMPLE_FILTER: &str =
+    "active_three_suite_routes_cover_the_v6_d3_split_fail_closed";
+const THREE_SUITE_SAMPLE_OBLIGATIONS: [(&str, &str); 6] = [
+    ("pre", "trust-mc"),
+    ("post", "trust-mc"),
+    ("loop", "trust-mc"),
+    ("termination", "trust-mc"),
+    ("refinement", "trust-vc"),
+    ("temporal", "ty"),
+];
 
 const CONTRACT_CORPUS_FUNCTIONS: [&str; 5] =
     ["divide_exact", "abs_total", "get_at", "running_total", "midpoint_checked"];
@@ -336,12 +342,10 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
         .context("failed to create three-suite artifact directory")?;
     let manifest_path = scratch.path().join("verification-run-manifest.json");
     let target = scratch.path().join("target");
-    // The manifest-writer test. Its result is intentionally Inconclusive: only
-    // trust-wp supplies same-run native proof in this synthetic sample; trust-mc
-    // and trust-vc are both native-authority debt (the b62 hardening refuses the
-    // sample's serialized trust-mc verdict, and the trust-vc obligation carries
-    // no replay-authorized TrustVc request), so a passing Rust test must not be
-    // confused with a fully-proved run.
+    // The manifest-writer test is intentionally Inconclusive. It exercises the
+    // exact MC/VC/TY ownership split while supplying no proof authority, so all
+    // six obligations must remain artifact-free Unsupported rows. A passing
+    // Rust test is evidence of routing/fail-closed behavior, not a proof claim.
     let test = THREE_SUITE_SAMPLE_FILTER;
     let mut command = std::process::Command::new(&targo);
     scrub_gate_process_environment(&mut command);
@@ -365,7 +369,6 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
         .current_dir(root)
         .env("CARGO_TARGET_DIR", &target)
         .env("CARGO_NET_OFFLINE", "true")
-        .env("TRUST_FULL_VERIFIER_THREE_SUITE_MODE", "required-native-suites")
         .env("TRUST_THREE_SUITE_MANIFEST_OUT", &manifest_path);
     let run = capture(command)?;
     if !run.exited_with(0) {
@@ -399,13 +402,13 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
     validate_three_suite_manifest(&manifest)?;
     let digest = trust_types::digest::stable_sha256_hex(&bytes);
     println!(
-        "Validated one typed fail-closed three-suite manifest: trust-wp accepted (same-run native deductive proof), trust-mc and trust-vc rejected pending live native-bundle CHC/PDR (trust-mc) and kernel-replayed TrustVc (trust-vc) authority (sha256:{digest})"
+        "Validated one typed fail-closed three-suite manifest: TrustMC/TrustVC/TY routing is exact and all six proof-free obligations are rejected without artifacts (sha256:{digest})"
     );
 
     // A positive-only fixture could conceal dispatch fallback. Exercise the
     // paired negative row with one required suite removed and require its
     // fail-closed assertions to pass as well.
-    let negative = "sample_bundle_required_suite_mode_rejects_missing_native_suite";
+    let negative = "required_native_fleet_rejects_a_missing_active_engine";
     let mut command = std::process::Command::new(&targo);
     scrub_gate_process_environment(&mut command);
     pin_targo_sibling_toolchain(&mut command, &targo)?;
@@ -427,8 +430,7 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
         ])
         .current_dir(root)
         .env("CARGO_TARGET_DIR", &target)
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("TRUST_FULL_VERIFIER_THREE_SUITE_MODE", "required-native-suites");
+        .env("CARGO_NET_OFFLINE", "true");
     let run = capture(command)?;
     if !run.exited_with(0) {
         bail!(
@@ -448,33 +450,26 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
 /// Validate the current three-suite integration contract without converting a
 /// passing test process into a counterfeit proof claim.
 ///
-/// After the ratified b62 "reject unreplayed native proof authority" hardening,
-/// only TrustWp supplies same-run, materialized native proof evidence for this
-/// synthetic sample. TrustMc's proof-grade admission now requires a live opaque
-/// native-bundle CHC/PDR authority (the sample carries only a serialized
-/// `FullVerificationVerdict` plus a trivial native formula, which is
-/// diagnostic-only), and TrustVc request planning still refuses to manufacture
-/// evidence without a replay-authorized TrustVc request. The only sound
-/// aggregate is therefore `Inconclusive` with exactly one accepted proof
-/// (trust-wp) and both the trust-mc and trust-vc rows rejected. This is a
-/// weaker-but-honest claim than the former 2/3 shape; do not restore proved=2
-/// without genuine live native trust-mc authority.
+/// The sample deliberately supplies no proof authority. It proves that the
+/// active v6/D3 ownership split is MC/VC/TY and that every lane declines
+/// artifact-free. Historical TrustWP metadata is tested separately and may not
+/// enter either the accepted set or the routed fleet.
 fn validate_three_suite_manifest(manifest: &VerificationRunManifest) -> Result<()> {
     let expected_summary = VerificationRunSummary {
-        requested_obligations: 3,
-        evidence_count: 3,
-        proved: 1,
-        unsupported: 2,
+        requested_obligations: 6,
+        evidence_count: 6,
+        proved: 0,
+        unsupported: 6,
         ..VerificationRunSummary::default()
     };
     if manifest.status != VerificationRunStatus::Inconclusive
         || manifest.summary != expected_summary
-        || manifest.accepted_evidence.len() != 1
-        || manifest.rejected_evidence.len() != 2
+        || !manifest.accepted_evidence.is_empty()
+        || manifest.rejected_evidence.len() != 6
         || !manifest.skipped.is_empty()
     {
         bail!(
-            "native three-suite verifier manifest must be fail-closed: Inconclusive with exactly 1 accepted proof (trust-wp) and 2 unsupported rejections (trust-mc/trust-vc); summary={:?}, accepted={}, rejected={}, skipped={}",
+            "native three-suite verifier manifest must be fail-closed: Inconclusive with zero accepted proofs and six unsupported MC/VC/TY rejections; summary={:?}, accepted={}, rejected={}, skipped={}",
             manifest.summary,
             manifest.accepted_evidence.len(),
             manifest.rejected_evidence.len(),
@@ -485,37 +480,7 @@ fn validate_three_suite_manifest(manifest: &VerificationRunManifest) -> Result<(
         bail!("inconclusive native three-suite manifest must never be release-actionable");
     }
 
-    // trust-wp is the only same-run materialized native proof in this synthetic
-    // sample.
-    let Some(trust_wp) = manifest
-        .accepted_evidence
-        .iter()
-        .find(|decision| decision.obligation_id == TRUST_WP_SAMPLE_OBLIGATION)
-    else {
-        bail!("native three-suite manifest omitted accepted trust-wp evidence");
-    };
-    if trust_wp.engine.name != "trust-full-verifier"
-        || trust_wp.status != EvidenceStatus::Proved
-        || trust_wp.disposition != EvidenceDisposition::AcceptedProof
-        || trust_wp.artifacts.is_empty()
-        || !trust_wp.artifacts.iter().any(|artifact| artifact.materialization.is_some())
-        || !trust_wp.diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("primary owner trust-wp@")
-                && diagnostic.contains("accepted evidence")
-        })
-    {
-        bail!(
-            "native three-suite trust-wp row is not same-run accepted materialized proof evidence"
-        );
-    }
-
-    // trust-mc and trust-vc are both native-authority debt: rejected as
-    // unsupported and artifact-free until a live opaque native-bundle CHC/PDR
-    // authority (trust-mc) and a replay-authorized TrustVc request (trust-vc)
-    // are supplied.
-    let expected_rejected =
-        [(TRUST_MC_SAMPLE_OBLIGATION, "trust-mc"), (TRUST_VC_SAMPLE_OBLIGATION, "trust-vc")];
-    for (obligation_id, suite) in expected_rejected {
+    for (obligation_id, suite) in THREE_SUITE_SAMPLE_OBLIGATIONS {
         let Some(decision) = manifest
             .rejected_evidence
             .iter()
@@ -534,32 +499,13 @@ fn validate_three_suite_manifest(manifest: &VerificationRunManifest) -> Result<(
             })
         {
             bail!(
-                "native three-suite {suite} row must remain unsupported and artifact-free until native proof authority is available"
+                "native three-suite {suite} row {obligation_id} must remain unsupported and artifact-free without proof authority"
             );
         }
     }
 
-    // The trust-vc rejection additionally records the specific missing-request
-    // cause; keep pinning it so a silent dispatch fallback cannot masquerade as
-    // this fail-closed shape.
-    let trust_vc = manifest
-        .rejected_evidence
-        .iter()
-        .find(|decision| decision.obligation_id == TRUST_VC_SAMPLE_OBLIGATION)
-        .context("native three-suite manifest omitted rejected trust-vc evidence")?;
-    if !trust_vc
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.contains("contains no TrustVc requests"))
-    {
-        bail!(
-            "native three-suite trust-vc row must record the no-TrustVc-request cause until kernel-replayed proof authority is available"
-        );
-    }
-
     Ok(())
 }
-
 
 fn require_bootstrap_execution_policy(policy: GatePolicy) -> Result<()> {
     if policy.release {
@@ -758,10 +704,8 @@ fn basic_contracts_smoke(root: &Path, _policy: GatePolicy) -> Result<()> {
     // verification then never runs, the transport is empty, and this gate reads
     // the fail-closed refutation as a missing-JSON setup failure. `scratch`
     // still owns the same directory (same inode) for drop cleanup.
-    let scratch_root = scratch
-        .path()
-        .canonicalize()
-        .context("failed to canonicalize scratch dir")?;
+    let scratch_root =
+        scratch.path().canonicalize().context("failed to canonicalize scratch dir")?;
     // The corpus is exercised from a hermetic scratch copy: cargo resolves and
     // writes a fresh lock there, so the gate neither trips over a stale
     // committed Cargo.lock (the exec-c30dc44143 failure: trust-spec 0.1.0 was
@@ -1225,10 +1169,14 @@ fn validate_contract_verification_gate(
     // entry-assumption partition is non-empty. Only the runtime-checked
     // conditional (forbidden above) remains a hard contradiction.
     if gate.conditional_on_assumption_rows != (counts.assumed > 0) {
-        bail!("native contract report gate assumption-conditional flag is inconsistent with its assumed count");
+        bail!(
+            "native contract report gate assumption-conditional flag is inconsistent with its assumed count"
+        );
     }
     if gate.conditional_on_runtime_checks {
-        bail!("native contract report gate carries a contradictory runtime-checked conditional flag");
+        bail!(
+            "native contract report gate carries a contradictory runtime-checked conditional flag"
+        );
     }
     let has_dependency_assumption =
         raw_report.assumptions.iter().any(|entry| entry.source == "dep-tcb-cargo-unit-inventory");
@@ -2329,12 +2277,8 @@ mod tests {
         let raw_with = |gate: Value| serde_json::json!({ "verification_gate": gate });
 
         // ACCEPT: the sanctioned partition (unknown 10 + assumed 2 == 12).
-        validate_contract_verification_gate(
-            &raw_with(make_gate(10, 2, true)),
-            &report,
-            1,
-        )
-        .expect("the ratified entry-assumption partition must validate");
+        validate_contract_verification_gate(&raw_with(make_gate(10, 2, true)), &report, 1)
+            .expect("the ratified entry-assumption partition must validate");
 
         // REJECT: assumed rows present but the conditional flag denies them
         // (breaks the canonical `conditional == assumed > 0` invariant).

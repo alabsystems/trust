@@ -658,9 +658,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         // below.
         feed.constness(rustc_hir::Constness::Const { always: false });
         feed.const_conditions(ty::ConstConditions { parent: None, predicates: &[] });
-        feed.codegen_fn_attrs(
-            rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs::new(),
-        );
+        feed.codegen_fn_attrs(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs::new());
     }
 
     fn insert_field_idents(&mut self, def_id: LocalDefId, fields: &[ast::FieldDef]) {

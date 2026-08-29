@@ -41,12 +41,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::Module;
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // The kind of int-to-int cast being modeled.
@@ -127,7 +124,13 @@ fn make_bridge_cast_module(kind: CastKind) -> Module {
         name: name.to_string(),
         def_path: "cast::op".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: to_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: to_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -600,9 +603,8 @@ fn bytes_value_equals(
     let out_t = formula_to_term(&mut solver, &out);
     let out_low = solver.try_bvextract(out_t, cmp_bits - 1, 0).expect("extract");
     let mask: i128 = if cmp_bits >= 128 { -1 } else { (1i128 << cmp_bits) - 1 };
-    let exp = solver
-        .try_bv_const_bigint(&BigInt::from(expected & mask), cmp_bits)
-        .expect("bv const");
+    let exp =
+        solver.try_bv_const_bigint(&BigInt::from(expected & mask), cmp_bits).expect("bv const");
     let eq = solver.try_eq(out_low, exp).expect("eq");
     let differ = solver.try_not(eq).expect("not");
     solver.try_assert_term(differ).expect("assert");
@@ -626,8 +628,8 @@ fn cast_lir_shape_carries_right_opcode() {
     ];
     for &(kind, is_cast, label) in cases {
         let module = make_bridge_cast_module(kind);
-        let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
-            .expect("cast lowers");
+        let lir =
+            lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("cast lowers");
         assert!(lir.stack_slots.is_empty(), "cast must materialize NO memory ({kind:?})");
         let mut casts = 0;
         for block in lir.blocks.values() {
@@ -649,21 +651,32 @@ fn cast_mapping_sext_zext_not_swapped() {
     use trust_cg_lower::instructions::Opcode as LO;
     let s = make_bridge_cast_module(CastKind::S32to64);
     let s_lir = lower_trust_ir_function_to_lir(&s, &s.functions[0]).expect("sext lowers");
-    let has_sext =
-        s_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sextend { .. })));
-    let has_uext_in_s =
-        s_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Uextend { .. })));
+    let has_sext = s_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sextend { .. })));
+    let has_uext_in_s = s_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Uextend { .. })));
     assert!(has_sext, "i32 as i64 must be Sextend (sign-extend)");
     assert!(!has_uext_in_s, "i32 as i64 must NOT be Uextend — that zero-extends, wrong for a<0");
 
     let z = make_bridge_cast_module(CastKind::U16to32);
     let z_lir = lower_trust_ir_function_to_lir(&z, &z.functions[0]).expect("zext lowers");
-    let has_uext =
-        z_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Uextend { .. })));
-    let has_sext_in_z =
-        z_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sextend { .. })));
+    let has_uext = z_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Uextend { .. })));
+    let has_sext_in_z = z_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sextend { .. })));
     assert!(has_uext, "u16 as u32 must be Uextend (zero-extend)");
-    assert!(!has_sext_in_z, "u16 as u32 must NOT be Sextend — that sign-extends, wrong for high bit");
+    assert!(
+        !has_sext_in_z,
+        "u16 as u32 must NOT be Sextend — that sign-extends, wrong for high bit"
+    );
 }
 
 // ===========================================================================
@@ -703,7 +716,10 @@ fn cast_emitted_bytes_values_are_correct() {
     // i32 as u8 (truncate): 300 -> 44 (300 & 0xff), 255 -> 255, 256 -> 0, -1 -> 255.
     let (code, base) = emit_text(&make_bridge_cast_module(CastKind::Narrow32to8));
     assert!(bytes_value_equals(CastKind::Narrow32to8, &code, base, 300, 44, 8), "300 as u8 == 44");
-    assert!(bytes_value_equals(CastKind::Narrow32to8, &code, base, 255, 255, 8), "255 as u8 == 255");
+    assert!(
+        bytes_value_equals(CastKind::Narrow32to8, &code, base, 255, 255, 8),
+        "255 as u8 == 255"
+    );
     assert!(bytes_value_equals(CastKind::Narrow32to8, &code, base, 256, 0, 8), "256 as u8 == 0");
     assert!(bytes_value_equals(CastKind::Narrow32to8, &code, base, -1, 255, 8), "-1 as u8 == 255");
 

@@ -163,11 +163,7 @@ pub fn q23_branch_join_two_ops(a: u32, b: u32, c: u32, d: u32) -> u32 {
 
 #[inline(never)]
 pub fn q24_nested_branch_arms_work(a: u32, b: u32, c: u32, d: u32) -> u32 {
-    if a == b {
-        if c == d { a ^ c } else { b ^ d }
-    } else {
-        c ^ d
-    }
+    if a == b { if c == d { a ^ c } else { b ^ d } } else { c ^ d }
 }
 
 // --- E: FIELD READS AS OPERANDS, with traffic after ---------------------------------------

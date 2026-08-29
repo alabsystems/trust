@@ -1,13 +1,7 @@
-use std::env;
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
-use std::io;
-use std::panic;
-use std::path::Path;
-use std::process::{Command, Stdio};
-
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
@@ -18,6 +12,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::{env, io, panic};
 
 use hardened_regression_fixtures::ScratchDir;
 #[cfg(unix)]

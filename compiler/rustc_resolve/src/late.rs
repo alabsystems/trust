@@ -5305,7 +5305,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
                 }
             }
 
-            ExprKind::Loop(ref block, label, _) => {
+            ExprKind::Loop(ref block, label, _, _) => {
                 self.resolve_labeled_block(label, expr.id, block)
             }
 
@@ -5587,11 +5587,35 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         });
 
         if let Some((seg, decl)) = unqualified {
+            let removal_span = path[0].ident.span.until(seg.ident.span);
+            // Trust: an EMPTY removal span is not a suggestion, it is an ICE.
+            //
+            // `Span::until` yields lo..lo when the first segment and the retained
+            // segment start at the same position, which happens for a path whose
+            // segments all carry one synthesized span — e.g. the path inside a
+            // `#[serde(with = "crate::…")]` attribute, reconstructed from a string
+            // literal. The `from_expansion()` guard above does not catch it, because
+            // such a span points into real source rather than into a macro expansion.
+            //
+            // `Diag::span_suggestion` then asserts
+            //   "Span ... must not be empty and have no suggestion"
+            // (rustc_errors/src/diagnostic.rs), so emitting the lint aborts the
+            // compiler. Measured: `--force-warn unused_qualifications` on
+            // clean-kernel ICEd on `Const(Name, #[serde(with = "…")] LevelVec)`,
+            // which is how it was found — clean's kernel_lint_ratchet had been
+            // scoring that aborted build as ZERO warnings, its best possible result.
+            //
+            // Suppressing is correct rather than merely safe: an empty span selects
+            // no text, so there are no path segments to remove and the diagnostic
+            // has nothing to say.
+            if removal_span.is_empty() {
+                return;
+            }
             self.r.potentially_unnecessary_qualifications.push(UnnecessaryQualification {
                 decl,
                 node_id: finalize.node_id,
                 path_span: finalize.path_span,
-                removal_span: path[0].ident.span.until(seg.ident.span),
+                removal_span,
             });
         }
     }

@@ -62,9 +62,7 @@ fn parse_stage0_content(stage0_content: &str) -> Stage0 {
             "nightly_branch" => stage0.config.nightly_branch = value.to_owned(),
             "compiler_dist_channel" => stage0.config.compiler_dist_channel = value.to_owned(),
             "rustfmt_dist_channel" => stage0.config.rustfmt_dist_channel = value.to_owned(),
-            "min_stage0_rustc_version" => {
-                stage0.config.min_stage0_rustc_version = value.to_owned()
-            }
+            "min_stage0_rustc_version" => stage0.config.min_stage0_rustc_version = value.to_owned(),
 
             "compiler_channel_manifest_hash" => {
                 stage0.compiler.channel_manifest_hash = value.to_owned()

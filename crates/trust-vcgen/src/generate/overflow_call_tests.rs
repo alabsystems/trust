@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Sort,
-    SourceSpan, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Sort, SourceSpan,
+    Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::generate_vcs;
@@ -9,7 +8,7 @@ use super::generate_vcs;
 fn overflow_vc_count(func: &VerifiableFunction) -> usize {
     generate_vcs(func)
         .iter()
-        .filter(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { .. }))
+        .filter(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { .. } | VcKind::UncheckedArithmeticOverflow { .. }))
         .count()
 }
 
@@ -48,6 +47,7 @@ fn pow_func(ty: Ty, exp: i128, pre: Vec<Formula>) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -96,6 +96,7 @@ fn unchecked_func(op: &str, ty: Ty, pre: Vec<Formula>) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -197,8 +198,7 @@ fn flags_unchecked_add() {
     let func = unchecked_func("unchecked_add", Ty::u32(), vec![]);
     let vcs = generate_vcs(&func);
     assert!(
-        vcs.iter()
-            .any(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Add, .. })),
+        vcs.iter().any(|vc| matches!(vc.kind, VcKind::UncheckedArithmeticOverflow { op: BinOp::Add, .. })),
         "unguarded `unchecked_add(a, b)` must emit an Add ArithmeticOverflow obligation"
     );
 }
@@ -208,8 +208,7 @@ fn flags_unchecked_sub() {
     let func = unchecked_func("unchecked_sub", Ty::u32(), vec![]);
     let vcs = generate_vcs(&func);
     assert!(
-        vcs.iter()
-            .any(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Sub, .. })),
+        vcs.iter().any(|vc| matches!(vc.kind, VcKind::UncheckedArithmeticOverflow { op: BinOp::Sub, .. })),
         "unguarded `unchecked_sub(a, b)` must emit a Sub ArithmeticOverflow obligation"
     );
 }
@@ -219,8 +218,7 @@ fn flags_unchecked_mul() {
     let func = unchecked_func("unchecked_mul", Ty::u32(), vec![]);
     let vcs = generate_vcs(&func);
     assert!(
-        vcs.iter()
-            .any(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })),
+        vcs.iter().any(|vc| matches!(vc.kind, VcKind::UncheckedArithmeticOverflow { op: BinOp::Mul, .. })),
         "unguarded `unchecked_mul(a, b)` must emit a Mul ArithmeticOverflow obligation"
     );
 }
@@ -240,7 +238,7 @@ fn guarded_unchecked_add_carries_precondition() {
     let vcs = generate_vcs(&func);
     let vc = vcs
         .iter()
-        .find(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Add, .. }))
+        .find(|vc| matches!(vc.kind, VcKind::UncheckedArithmeticOverflow { op: BinOp::Add, .. }))
         .expect("guarded unchecked_add still generates the obligation");
     assert!(
         formula_mentions_var(&vc.formula, "a") && formula_mentions_var(&vc.formula, "b"),

@@ -50,15 +50,14 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::interpret::{InterpretValue, Interpreter};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
 use trust_ir::{Block, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build a trust_ir::Module for `f(a) = { let p; *p = a + k; *p }` (= a + k),
@@ -194,7 +193,11 @@ fn count_single_ldr_str(code: &[u8], base: u64) -> (usize, usize) {
         if let Ok(insn) = decode_aarch64(&bytes, pc) {
             match insn.opcode {
                 Opcode::Str | Opcode::Strb | Opcode::Strh => strs += 1,
-                Opcode::Ldr | Opcode::Ldrb | Opcode::Ldrh | Opcode::Ldrsb | Opcode::Ldrsh
+                Opcode::Ldr
+                | Opcode::Ldrb
+                | Opcode::Ldrh
+                | Opcode::Ldrsb
+                | Opcode::Ldrsh
                 | Opcode::Ldrsw => ldrs += 1,
                 _ => {}
             }
@@ -258,7 +261,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort in machine output for {name}: {other:?}"),
     }
@@ -398,9 +402,8 @@ fn add_const_spec(k: i128) -> Formula {
 fn interpret_mem(module: &Module, a: i128) -> i128 {
     let interp = Interpreter::with_module(module);
     let args = vec![InterpretValue::int(Ty::I32, a).expect("arg a")];
-    let outcome = interp
-        .execute_func(FuncId::new(0), args)
-        .expect("interpreter execute_func failed");
+    let outcome =
+        interp.execute_func(FuncId::new(0), args).expect("interpreter execute_func failed");
     outcome.returns[0].as_int().expect("integer return").as_signed()
 }
 
@@ -413,8 +416,7 @@ fn interpret_mem(module: &Module, a: i128) -> i128 {
 fn module_to_lir_emits_object_with_real_store_and_load() {
     let module = make_mem_inc_module();
     // The converter must allocate exactly one stack slot for the i32 alloca.
-    let lir =
-        lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("lower");
+    let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("lower");
     assert_eq!(lir.stack_slots.len(), 1, "expected exactly one i32 stack slot");
     assert_eq!(lir.stack_slots[0].size, 4, "i32 slot is 4 bytes");
 

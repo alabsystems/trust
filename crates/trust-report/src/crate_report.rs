@@ -69,15 +69,18 @@ pub fn format_crate_verification_summary(
 ///
 /// `tcb_ledger_lines` are the pre-rendered rows produced by
 /// `trust_proof_cert::AssumptionSet::render_tcb_ledger` — one per scoped-out
-/// dependency plus the explicit `core`/`alloc`/`std` hard-skip rows. They are
-/// passed as plain strings so this crate need not depend on `trust-proof-cert`.
-/// An empty slice renders nothing, so the summary is unchanged when no ledger
-/// is available (e.g. single-file mode, or a build with no resolvable deps).
+/// dependency plus the explicit foundational `core`/`alloc`/`std` TCB rows.
+/// A local stdlib subject can produce selected behavioral obligations while
+/// retaining those residual rows, so the heading deliberately does not claim
+/// every entry was scoped out. Rows are passed as plain strings so this crate
+/// need not depend on `trust-proof-cert`. An empty slice renders nothing, so the
+/// summary is unchanged when no ledger is available (e.g. single-file mode, or
+/// a build with no resolvable deps).
 pub fn append_dep_tcb_ledger(summary: &mut String, tcb_ledger_lines: &[String]) {
     if tcb_ledger_lines.is_empty() {
         return;
     }
-    summary.push_str("\n  Dependency trust base (scoped out of verification):");
+    summary.push_str("\n  Dependency and foundational trust base:");
     for line in tcb_ledger_lines {
         let _ = write!(summary, "\n    {line}");
     }

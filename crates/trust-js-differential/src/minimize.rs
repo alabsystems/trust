@@ -13,7 +13,9 @@ use std::time::Duration;
 use trust_js_trace::{explain_divergence, traces_equal};
 
 use crate::cases::prepare_case;
-use crate::heads::{write_driver, AssembledCase, BunHead, EngineHead, HeadResult, NodeHead, RunMode};
+use crate::heads::{
+    AssembledCase, BunHead, EngineHead, HeadResult, NodeHead, RunMode, write_driver,
+};
 
 pub struct MinimizeOpts {
     pub corpus: PathBuf,
@@ -169,9 +171,7 @@ mod tests {
         // Interesting iff both "A" and "B" survive.
         let items: Vec<String> =
             ["x", "A", "y", "z", "B", "w", "v", "u"].iter().map(|s| s.to_string()).collect();
-        let out = ddmin(items, |c| {
-            c.iter().any(|s| s == "A") && c.iter().any(|s| s == "B")
-        });
+        let out = ddmin(items, |c| c.iter().any(|s| s == "A") && c.iter().any(|s| s == "B"));
         assert_eq!(out, ["A", "B"]);
     }
 

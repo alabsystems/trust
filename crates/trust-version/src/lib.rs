@@ -47,6 +47,40 @@ pub const CHANNEL_DEV: &str = "dev";
 /// Default source path for checked-in Trust product version metadata.
 pub const DEFAULT_VERSION_SOURCE_PATH: &str = "release/trust-version.toml";
 
+/// Spell the Rust-compat release string exactly as bootstrap's `release()`
+/// does (`src/bootstrap/src/lib.rs`).
+///
+/// `rust_compat_version` is the number stated by `src/rust-compat-version` —
+/// the Rust release the `-V` protocol reports — and never Trust's own version
+/// from `src/version`. The two are separate files on purpose: a compiler
+/// answering `rustc 0.1.0` stops being drop-in for the crates.io build scripts
+/// that parse that line. Anything measuring what a Trust binary PRINTS for
+/// `--version` therefore has to start from the compat line, so the spelling
+/// lives here once instead of being re-derived at each call site.
+#[must_use]
+pub fn rust_compat_release(rust_compat_version: &str, bootstrap_channel: &str) -> String {
+    match bootstrap_channel {
+        "stable" => rust_compat_version.to_string(),
+        "trust" => format!("{rust_compat_version}-dev"),
+        channel => format!("{rust_compat_version}-{channel}"),
+    }
+}
+
+/// Spell the distribution-archive version exactly as bootstrap's
+/// `rust_package_vers()` does.
+///
+/// Archives, release evidence and the product identity are named from Trust's
+/// OWN version (`src/version`), which is the half of the split that the
+/// `-V` protocol must not see.
+#[must_use]
+pub fn trust_archive_version(trust_product_version: &str, bootstrap_channel: &str) -> String {
+    match bootstrap_channel {
+        "trust" => format!("{trust_product_version}-trust"),
+        "stable" => trust_product_version.to_string(),
+        channel => format!("{trust_product_version}-{channel}"),
+    }
+}
+
 fn default_version_schema() -> String {
     VERSION_SCHEMA.to_string()
 }
@@ -471,8 +505,7 @@ impl TrustVersionIdentity {
         // cannot disagree if only one of them is written down. An unparseable
         // version cannot reach here — `validate` runs first — but if it somehow
         // did, `dev` is unknown, so the honest answer is the non-public one.
-        let channel =
-            source.version().map_or(CHANNEL_DEV, |version| version.channel()).to_string();
+        let channel = source.version().map_or(CHANNEL_DEV, |version| version.channel()).to_string();
 
         let mut schemas = source.schemas;
         schemas.insert("version".to_string(), VERSION_SCHEMA.to_string());

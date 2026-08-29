@@ -3,7 +3,17 @@ use proc_macro::{TokenStream, TokenTree as Tt};
 use std::str::FromStr;
 
 // String containing the current version number of the tip, i.e. "1.41.2"
-static VERSION_NUMBER: &str = include_str!("../../../../../src/version");
+// Trust: this must be the RUSTC-protocol release, because it is compared
+// against `RustcVersion::CURRENT` (`compiler/rustc_ast/src/attr/version.rs`),
+// which bootstrap fills from `CFG_RELEASE` = `src/rust-compat-version`.
+// Trust's own product version in `src/version` is a different numbering
+// entirely (0.1.0 vs 1.99.0), and reading it here builds `cfg(version(..))`
+// gates around the wrong number — `-1` underflows to the unparseable
+// "0.-1.0" and `+1`/`+2` land below the real release, so every relative gate
+// resolves backwards. Same redirect, same reason, as
+// `src/tools/replace-version-placeholder/src/main.rs` and
+// `src/tools/tidy/src/features.rs`.
+static VERSION_NUMBER: &str = include_str!("../../../../../src/rust-compat-version");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Version {

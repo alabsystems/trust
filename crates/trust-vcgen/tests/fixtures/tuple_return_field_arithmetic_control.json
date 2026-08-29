@@ -1,0 +1,451 @@
+{
+  "name": "tup_add",
+  "def_path": "fx4::tup_add",
+  "span": {
+    "file": "fx4.rs",
+    "line_start": 7,
+    "col_start": 0,
+    "line_end": 7,
+    "col_end": 51
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Closure": {
+                    "name": "fx4::tup_add::{closure#0}",
+                    "upvars": [
+                      {
+                        "Int": {
+                          "width": 32,
+                          "signed": false
+                        }
+                      }
+                    ],
+                    "call": {
+                      "kind": "Fn",
+                      "params": [
+                        {
+                          "Ref": {
+                            "mutable": false,
+                            "inner": {
+                              "Tuple": [
+                                {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                },
+                                {
+                                  "Int": {
+                                    "width": 32,
+                                    "signed": false
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      ],
+                      "ret": "Bool"
+                    }
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Closure": {
+                        "name": "fx4::tup_add::{closure#0}",
+                        "upvars": [
+                          {
+                            "Int": {
+                              "width": 32,
+                              "signed": false
+                            }
+                          }
+                        ],
+                        "call": {
+                          "kind": "Fn",
+                          "params": [
+                            {
+                              "Ref": {
+                                "mutable": false,
+                                "inner": {
+                                  "Tuple": [
+                                    {
+                                      "Int": {
+                                        "width": 32,
+                                        "signed": false
+                                      }
+                                    },
+                                    {
+                                      "Int": {
+                                        "width": 32,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          ],
+                          "ret": "Bool"
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 32,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::option::Option<{closure@fx4.rs:6:28: 6:51}>"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "fx4.rs",
+                "line_start": 6,
+                "col_start": 0,
+                "line_end": 6,
+                "col_end": 67
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        1,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "fx4.rs",
+                "line_start": 7,
+                "col_start": 40,
+                "line_end": 7,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 1,
+            "span": {
+              "file": "fx4.rs",
+              "line_start": 7,
+              "col_start": 40,
+              "line_end": 7,
+              "col_end": 45
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 4,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "fx4.rs",
+                "line_start": 7,
+                "col_start": 40,
+                "line_end": 7,
+                "col_end": 45
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 3,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "fx4.rs",
+                "line_start": 7,
+                "col_start": 39,
+                "line_end": 7,
+                "col_end": 49
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Tuple": [
+        {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        }
+      ]
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "fx4.rs",
+        "line_start": 6,
+        "col_start": 0,
+        "line_end": 6,
+        "col_end": 67
+      },
+      "body": "__trust_lowered_compiler_contract__:(result.0) == ((x) + (1))"
+    }
+  ],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0.0",
+            "Int"
+          ]
+        },
+        {
+          "Add": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "(result.0) == ((x) + (1))"
+    ],
+    "invariants": []
+  }
+}

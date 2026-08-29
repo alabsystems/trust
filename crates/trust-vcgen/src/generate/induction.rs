@@ -600,7 +600,9 @@ pub(super) fn build_countdown_trip_facts(func: &VerifiableFunction) -> Vec<Formu
 /// The per-block pre-value companion of [`build_countdown_trip_facts`] —
 /// conjoined onto the decrement blocks' VCs exactly like the converging
 /// two-pointer facts (bare names, versioned at the consuming block).
-pub(super) fn build_countdown_preval_facts(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn build_countdown_preval_facts(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     countdown_trip_analysis(func).per_block
 }
 

@@ -377,10 +377,7 @@ fn same_artifact(left: &Path, right: &Path) -> bool {
     let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) else {
         return false;
     };
-    left.is_file()
-        && right.is_file()
-        && left.dev() == right.dev()
-        && left.ino() == right.ino()
+    left.is_file() && right.is_file() && left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 /// Non-Unix hosts have no stable-Rust inode identity (`MetadataExt::file_index`

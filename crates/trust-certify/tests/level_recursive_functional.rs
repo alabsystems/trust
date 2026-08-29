@@ -150,19 +150,16 @@ fn mirror_id_proof() -> Expr {
     let congr = Expr::apps(
         Expr::const_(Name::from_string("congrArg"), vec![level1(), level1()]),
         [
-            level_ty(),                            // {α}
-            level_ty(),                            // {β}
-            mirror(Expr::bvar(1)),                 // {a₁} = mirror pred
-            Expr::bvar(1),                         // {a₂} = pred
+            level_ty(),                                                // {α}
+            level_ty(),                                                // {β}
+            mirror(Expr::bvar(1)),                                     // {a₁} = mirror pred
+            Expr::bvar(1),                                             // {a₂} = pred
             Expr::const_(Name::from_string("Level.succ"), Vec::new()), // f = Level.succ
-            Expr::bvar(0),                         // h = ih
+            Expr::bvar(0),                                             // h = ih
         ],
     );
-    let succ_case = Expr::lam(
-        BinderInfo::Default,
-        level_ty(),
-        Expr::lam(BinderInfo::Default, ih_ty, congr),
-    );
+    let succ_case =
+        Expr::lam(BinderInfo::Default, level_ty(), Expr::lam(BinderInfo::Default, ih_ty, congr));
     let rec_app = Expr::apps(
         Expr::const_(Name::from_string("Level.rec"), vec![Level::zero()]), // Prop motive => .{0}
         [motive, base, succ_case, Expr::bvar(0)],

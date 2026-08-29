@@ -618,9 +618,7 @@ pub fn s07_wild_then_marked(_: u64, b: u64, c: u64) -> bool {
 // S08 — a nested BLOCK with no statements.
 #[inline(never)]
 pub fn s08_nested_block(a: u64, b: u64) -> bool {
-    {
-        (a & b) == 0
-    }
+    { (a & b) == 0 }
 }
 
 // S09 — a block whose only statement is an ITEM (which the gate deliberately admits).

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rustc_ast::node_id::NodeMap;
+use rustc_span::Span;
 use thin_vec::thin_vec;
 
 use crate::LoweringContext;
@@ -454,6 +455,58 @@ impl<'hir> LoweringContext<'_, 'hir> {
         citation: rustc_ast::TrustCitation,
     ) -> rustc_hir::TrustCitation {
         rustc_hir::TrustCitation { name: citation.name, span: self.lower_span(citation.span) }
+    }
+
+    /// Trust: the SINGLE lowering of first-class loop clauses (two-language
+    /// design E4/E5), shared by every loop surface that has a clause position:
+    /// `while` (`ExprKind::While`), `loop` (`ExprKind::Loop`) and `for`
+    /// (`ExprKind::ForLoop`).
+    ///
+    /// Being one function is the point. The surfaces differ only in where the
+    /// parser found the clauses and which HIR node ends up carrying the
+    /// resulting `hir::ExprKind::Loop`; the clause meaning, the association
+    /// key, and the retained spans are identical by construction, so a second
+    /// loop-clause semantics cannot grow beside the first.
+    ///
+    /// `loop_id` is the HIR id of the `hir::ExprKind::Loop` node this clause
+    /// governs — the authoritative association key that MIR building stamps
+    /// onto the loop's source scope and that natural-backedge provenance later
+    /// re-derives. For `while` and `loop` that node is the lowered expression
+    /// itself; for `for` it is the desugaring's inner `loop`, which already
+    /// carries the `for` expression's own lowered id.
+    ///
+    /// `loop_span` is the whole authored loop expression and `body_lo` the
+    /// start of its body block, so `header_span` covers exactly the authored
+    /// header through the last clause. Spans are diagnostic information only.
+    pub(super) fn collect_trust_loop_clauses(
+        &mut self,
+        loop_id: rustc_hir::HirId,
+        loop_span: Span,
+        body_lo: rustc_span::BytePos,
+        contract: Option<&rustc_ast::LoopContract>,
+    ) {
+        let Some(contract) = contract else { return };
+        let lowered_loop_span = self.lower_span(loop_span);
+        let header_span = self.lower_span(loop_span.with_hi(body_lo));
+        for clause in &contract.clauses {
+            let kind = match clause.kind {
+                rustc_ast::LoopClauseKind::Invariant => rustc_hir::LoopClauseKind::Invariant,
+                rustc_ast::LoopClauseKind::Decreases => rustc_hir::LoopClauseKind::Decreases,
+            };
+            self.trust_loop_clauses.push(rustc_hir::LoopClause {
+                loop_id,
+                loop_span: lowered_loop_span,
+                header_span,
+                keyword_span: self.lower_span(clause.keyword_span),
+                payload_span: self.lower_span(clause.clause.predicate),
+                payload: clause.clause.payload,
+                kind,
+                citation: clause
+                    .clause
+                    .citation
+                    .map(|citation| self.lower_trust_citation(citation)),
+            });
+        }
     }
 
     /// Lowered runtime contract checks are guarded with the `contract_checks` compiler flag,

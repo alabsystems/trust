@@ -41,7 +41,7 @@
 //! carries [`MintRefusal::note`] — what was missing, and what to do about it,
 //! with options. "Unsupported" with no next step is a defect.
 
-use trust_clean_carrier::{Carrier, CarrierRefused};
+use trust_clean_carrier::{Carrier, CarrierRefused, CarrierSignature, CleanOriginPrecondition};
 use trust_symbols::{AxiomClosure, KernelStatus};
 
 /// Permission to mint one `DefId` for a Clean island declaration.
@@ -54,6 +54,7 @@ use trust_symbols::{AxiomClosure, KernelStatus};
 pub struct MintGrant {
     name: String,
     carrier: Carrier,
+    preconditions: Vec<CleanOriginPrecondition>,
 }
 
 impl MintGrant {
@@ -70,6 +71,21 @@ impl MintGrant {
     #[must_use]
     pub fn carrier(&self) -> &Carrier {
         &self.carrier
+    }
+
+    /// The **caller obligations** this `DefId` is minted with — one per erased
+    /// hypothesis binder of the Clean declaration.
+    ///
+    /// A mint site must forward these alongside the `fn_sig`. They are what
+    /// makes the erasure of a proof argument sound: the requirement the proof
+    /// stood for becomes an ordinary Rust obligation discharged at every call
+    /// site, never a `Faithful` token and never a kernel claim.
+    ///
+    /// Empty for every grant from [`decide_mint`], which cannot see a
+    /// hypothesis — see that function's doc.
+    #[must_use]
+    pub fn preconditions(&self) -> &[CleanOriginPrecondition] {
+        &self.preconditions
     }
 }
 
@@ -178,10 +194,21 @@ impl MintRefusal {
                        Rust side as a contract so the obligation is visible to callers."
                 )
             }
+            // `{refusal}` — DISPLAY, not `{refusal:?}`. This was a Debug dump
+            // until 2026-08-27, which silently defeated the whole point of the
+            // field: `CarrierRefused`'s doc says it is "carried verbatim so the
+            // diagnostic can state the true bound rather than a paraphrase",
+            // and every `CarrierRefused` variant's Display carries a v7/D3
+            // `options:` list that Debug throws away. What the user actually
+            // saw was `UnrecognisedHypothesis { binder_index: 2, rendered:
+            // "LT.lt .. .. .. ..", signature: … }` — a struct dump with no next
+            // step, which ruling v7/D3 calls a defect outright. Found by
+            // `control_20`'s note assertion, which is why that assertion greps
+            // for the FORM THAT WORKS rather than for the word "options".
             Self::NoTotalCarrier { name, refusal } => format!(
                 "`{name}` is kernel-checked, but its type has no TOTAL Rust carrier, so \
-                 there is no Rust type that can hold its values without loss: \
-                 {refusal:?}.\n\
+                 there is no Rust type that can hold its values without loss:\n\
+                 {refusal}\n\
                  This is not a limitation of the call syntax. A partial carrier would \
                  make the emitted binary disagree with the declaration on some inputs \
                  — kernel definitional equality does not catch that, which is why the \
@@ -233,6 +260,73 @@ pub fn decide_mint(
     status: &KernelStatus,
     carrier: Result<Carrier, CarrierRefused>,
 ) -> Result<MintGrant, MintRefusal> {
+    require_kernel_and_closure(name, status)?;
+
+    let carrier = match carrier {
+        Ok(carrier) => carrier,
+        Err(refusal) => {
+            return Err(MintRefusal::NoTotalCarrier { name: name.to_owned(), refusal });
+        }
+    };
+
+    // No preconditions, and this door cannot ever drop one: a bare `Carrier` is
+    // a single position's evidence and has no hypothesis binders to lose. A
+    // declaration that DOES carry hypotheses can only be witnessed by a
+    // `CarrierSignature`, and the only producer of a hypothesis-bearing one is
+    // `carrier_signature_with_hypotheses_for`, whose grants come through
+    // [`decide_mint_from_signature`]. So "the caller forgot to forward the
+    // obligations" is not a reachable state — it is a type that does not exist.
+    Ok(MintGrant { name: name.to_owned(), carrier, preconditions: Vec::new() })
+}
+
+/// Decide whether a Clean island declaration may acquire a `DefId`, **and with
+/// what caller obligations**.
+///
+/// The same three preconditions as [`decide_mint`], taken over the WHOLE
+/// signature rather than one carrier — which is what the mint site already
+/// demanded in practice (a declaration whose result carries but whose second
+/// argument does not is not callable). The difference that matters is the
+/// fourth thing it returns: [`MintGrant::preconditions`], the requirements the
+/// declaration's erased hypothesis binders impose on every call site.
+///
+/// # Why this is the door for a hypothesis-carrying declaration
+///
+/// `def safe_rem (a b : UInt64) (h : b ≠ 0) : UInt64` mints a Rust `fn` of
+/// arity 2 — the proof is erased. That erasure is sound only if `b != 0`
+/// travels to the callers, so the grant carries it and the mint site forwards
+/// it alongside the `fn_sig`. `trust-clean-carrier`'s hypothesis lift refuses
+/// any hypothesis it cannot restate, so a grant from here can never describe a
+/// weaker contract than the declaration the kernel checked.
+///
+/// # Errors
+///
+/// Exactly [`decide_mint`]'s refusals. A signature-level carrier refusal —
+/// including [`CarrierRefused::UnrecognisedHypothesis`] — arrives as
+/// [`MintRefusal::NoTotalCarrier`] carrying the inner refusal verbatim, so the
+/// v7/D3 note states the true bound rather than a paraphrase.
+pub fn decide_mint_from_signature(
+    name: &str,
+    status: &KernelStatus,
+    signature: Result<CarrierSignature, CarrierRefused>,
+) -> Result<MintGrant, MintRefusal> {
+    require_kernel_and_closure(name, status)?;
+
+    let signature = match signature {
+        Ok(signature) => signature,
+        Err(refusal) => {
+            return Err(MintRefusal::NoTotalCarrier { name: name.to_owned(), refusal });
+        }
+    };
+
+    Ok(MintGrant {
+        name: name.to_owned(),
+        carrier: signature.result().clone(),
+        preconditions: signature.preconditions(),
+    })
+}
+
+/// Preconditions 1 and 2, shared by both doors so they cannot drift apart.
+fn require_kernel_and_closure(name: &str, status: &KernelStatus) -> Result<(), MintRefusal> {
     // I2's sealed enforcement seam. Fail-closed by construction: every
     // non-`KernelChecked` status refuses, including variants added later, since
     // `KernelStatus` is `#[non_exhaustive]`.
@@ -259,12 +353,5 @@ pub fn decide_mint(
         });
     }
 
-    let carrier = match carrier {
-        Ok(carrier) => carrier,
-        Err(refusal) => {
-            return Err(MintRefusal::NoTotalCarrier { name: name.to_owned(), refusal });
-        }
-    };
-
-    Ok(MintGrant { name: name.to_owned(), carrier })
+    Ok(())
 }

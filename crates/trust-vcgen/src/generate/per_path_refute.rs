@@ -911,6 +911,11 @@ fn edge_condition(
         }
         Terminator::SwitchInt { discr, targets, otherwise, .. } => {
             let kind = modeled_operand_kind(ctx, st, discr)?;
+            // The scrutinee's DECLARED type, needed to decode the raw arm labels
+            // (see [`switch_value_eq`]). `None` drops the path — this lane never
+            // guesses a width.
+            let discr_ty = crate::operand_ty_cow(ctx.func, discr);
+            let discr_ty = discr_ty.as_deref();
             let d = eval_operand(st, discr)?.scalar()?;
             // A value may label several arms; the edge is taken when the
             // discriminant equals ANY of the values labelling it.
@@ -919,7 +924,7 @@ fn edge_condition(
             if !matching.is_empty() {
                 let mut arms = Vec::with_capacity(matching.len());
                 for v in matching {
-                    arms.push(switch_value_eq(&d, &kind, v)?);
+                    arms.push(switch_value_eq(&d, &kind, discr_ty, v)?);
                 }
                 return Some(if arms.len() == 1 {
                     arms.pop().unwrap_or(Formula::Bool(false))
@@ -933,7 +938,7 @@ fn edge_condition(
             // The `otherwise` arm: the discriminant equals none of the labels.
             let mut conj = Vec::with_capacity(targets.len());
             for (v, _) in targets {
-                conj.push(Formula::Not(Box::new(switch_value_eq(&d, &kind, *v)?)));
+                conj.push(Formula::Not(Box::new(switch_value_eq(&d, &kind, discr_ty, *v)?)));
             }
             Some(match conj.len() {
                 0 => Formula::Bool(true),
@@ -957,7 +962,20 @@ fn edge_condition(
 }
 
 /// `discr == value` for a switch arm label, in the discriminant's modeled sort.
-fn switch_value_eq(d: &Formula, kind: &Sort, value: u128) -> Option<Formula> {
+///
+/// `ty` is the scrutinee's DECLARED type. The raw MIR label is a two's-
+/// complement bit pattern at that type's width, so an `Int`-sorted arm must go
+/// through the shared typed decode (`crate::switch_label_to_formula`): reading
+/// it as a magnitude put `d == 4294967295` on an `i32` arm, which cannot be the
+/// arm's real condition. It was NOT a spurious witness: [`entry_state`] pushes
+/// `crate::range::input_range_constraint` for EVERY integer parameter, so
+/// `n == 4294967295` conjoined with `n ∈ [-2^31, 2^31-1]` was UNSAT and this
+/// lane simply DECLINED the path — a completeness loss. Decoding it makes the
+/// path condition the arm's actual meaning.
+///
+/// `None` for a type the decode cannot establish, which drops the path; per this
+/// file's invariant, dropping costs completeness only.
+fn switch_value_eq(d: &Formula, kind: &Sort, ty: Option<&Ty>, value: u128) -> Option<Formula> {
     match kind {
         Sort::Bool => match value {
             0 => Some(Formula::Not(Box::new(d.clone()))),
@@ -968,10 +986,7 @@ fn switch_value_eq(d: &Formula, kind: &Sort, value: u128) -> Option<Formula> {
         },
         Sort::Int => Some(Formula::Eq(
             Box::new(d.clone()),
-            Box::new(match i128::try_from(value) {
-                Ok(v) => Formula::Int(v),
-                Err(_) => Formula::UInt(value),
-            }),
+            Box::new(crate::switch_label_to_formula(ty?, value)?),
         )),
         _ => None,
     }
@@ -1148,6 +1163,13 @@ pub fn generate_per_path_assert_refutation_vcs(func: &VerifiableFunction) -> Vec
     if crate::validate_function(func).is_err() {
         return Vec::new();
     }
+    // A MIR `TailCall` to a panic entry point is the same terminal panic site
+    // as an ordinary call whose continuation immediately returns.  Project it
+    // through the shared semantic view before every path/panic consumer below;
+    // validation intentionally runs on the source form first so malformed wire
+    // input cannot be repaired by the projection.
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let func = tail_call_expanded.as_ref();
     // The same whole-function work gate the bidirectional lane uses; an
     // over-budget function emits no claims at all.
     if super::func_exceeds_vcgen_budget(func) {
@@ -1518,6 +1540,7 @@ mod tests {
                     atomic: None,
                     is_foreign: false,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     unwind: trust_types::UnwindEdge::default(),
                 };
             }
@@ -1541,6 +1564,46 @@ mod tests {
             }
         }
         assert!(generate_per_path_assert_refutation_vcs(&func).is_empty());
+    }
+
+    /// A source MIR `TailCall` to the panic entry point retains the exact source
+    /// span and is refuted just like the equivalent call-plus-return shape.
+    #[test]
+    fn tail_call_panic_is_a_refutable_terminal_site() {
+        let mut func = loop_assert_fn();
+        let panic = func
+            .body
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == BlockId(4))
+            .expect("fixture panic block");
+        let Terminator::Call {
+            func: callee,
+            args,
+            span,
+            atomic,
+            is_foreign,
+            is_unsafe_sig,
+            callee_identity,
+            ..
+        } = panic.terminator.clone()
+        else {
+            panic!("fixture panic block must be a call")
+        };
+        panic.terminator = Terminator::TailCall {
+            func: callee,
+            args,
+            span: span.clone(),
+            atomic,
+            is_foreign,
+            is_unsafe_sig,
+            callee_identity,
+        };
+
+        let vcs = generate_per_path_assert_refutation_vcs(&func);
+        assert!(!vcs.is_empty(), "tail-call panic must remain visible to the refute lane");
+        assert!(vcs.iter().all(|vc| vc.location() == &span));
+        assert!(vcs.into_iter().any(|vc| matches!(refute(vc), RefuteOnlyOutcome::Refuted { .. })));
     }
 
     /// The CONSUMER SHAPE, compiled and executed against the real APIs.

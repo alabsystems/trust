@@ -1,32 +1,25 @@
-// trust-certify: kernel re-check of a compiler-finalized body-bound `ensures`
-// claim (TCB closure plan step 1 — the `BodyBoundNativeReplay` row).
+// trust-certify: standalone compatibility checker for the retired body-bound
+// TrustWP claim envelope.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-//! Re-derive a body-bound postcondition in the Clean kernel instead of
-//! believing trust-wp's answer.
+//! Re-check a historical body-bound postcondition envelope in the Clean kernel.
 //!
 //! # What this lane is for
 //!
-//! `ResultProofAuthority::BodyBoundNativeReplay` passes a row because a private
-//! receipt proves trust-wp's in-process adapter really ran on it. Nothing
-//! re-derives the answer, so the adapter is trusted code. This module removes
-//! the adapter from that row's trusted base the same way
-//! [`crate::certify_vc`] removes `ay` from a QF_LIA row's: it never reads the
-//! verdict, it reconstructs the obligation as a CIC term and lets the kernel
+//! The compiler no longer mints a body-bound TrustWP authority class and no
+//! production route calls this module. It remains a bounded standalone utility
+//! for exact historical `trust_wp.trust-formula.v1` fixtures: it never reads a
+//! verdict, but reconstructs the proposition as a CIC term and lets the kernel
 //! judge.
 //!
 //! # The input is a proposition, not a proof
 //!
-//! trust-wp emits a verdict plus evidence artifacts (bundle/request/proof
-//! digests). There is no proof object and no derivation trace to translate.
-//! What *is* available is the compiler's own `trust_wp.trust-formula.v1` claim
-//! envelope, pinned byte-for-byte into the native proof obligation before
-//! dispatch, and rebuilt-and-compared at the sealing seam. That envelope is the
-//! proposition trust-wp was asked to prove, so it is what the kernel is asked to
-//! prove here. Reconstruction is possible because the envelope is a closed
-//! statement, not because trust-wp said anything about it.
+//! Historical TrustWP records contain no proof object or derivation trace.
+//! Their `trust_wp.trust-formula.v1` claim envelope is a proposition, so this
+//! utility can reconstruct and check that proposition independently. Doing so
+//! does not restore routing or publication authority.
 //!
 //! # The claim shape, and why an unbounded-`Int` reading is the right one
 //!
@@ -61,7 +54,7 @@
 //! 3. **Build a proof term** for that goal here, from the goal alone. The
 //!    prover is deliberately small (reflexivity of `Eq` and of `Int.le`, plus
 //!    the introduction rules of the connectives); anything it cannot close
-//!    fails closed and the row keeps its existing `Trusted` authority.
+//!    fails closed.
 //! 4. **Re-check** with `TypeChecker::check_type` under a zero-trust budget: an
 //!    axiom-closure audit restricts the term's transitive constant closure to
 //!    this claim's own skolems and Clean's foundational axioms, then the
@@ -70,12 +63,9 @@
 //!
 //! # What stays trusted
 //!
-//! The kernel implementation, and the *construction of the goal* — that the
-//! envelope really renders the authored `ensures` of this body. Contract
-//! lowering and the trust-ir body walker that produced the envelope are
-//! upstream of every engine and are not checked by anything here. What leaves
-//! the base is trust-wp: its adapter, its replay, and its verdict are never
-//! consulted on this path.
+//! The kernel implementation and the construction of the goal remain trusted.
+//! This utility does not establish that an envelope came from an authored Rust
+//! `ensures`, and therefore is not a compiler authority minter.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -204,18 +194,19 @@ impl std::fmt::Display for BodyBoundCertifyError {
     }
 }
 
-/// Kernel-certify one compiler-finalized body-bound `ensures` claim.
+/// Check one historical body-bound `ensures` envelope with the Clean kernel.
 ///
-/// `schema`/`payload` are the pinned `trust_ir::ProofFormula` fields of the
-/// native proof obligation; `obligation_identity` is the caller's canonical,
-/// injective identity for the row the certificate will authorize. Both the
-/// canonical claim text and that identity are bound into the lineage digest, so
-/// a certificate minted for one row cannot be replayed against another.
+/// `schema`/`payload` are a caller-supplied historical formula envelope;
+/// `obligation_identity` is caller-supplied lineage identity. Both the
+/// canonical claim text and that identity are bound into the returned evidence
+/// digest, so evidence for one diagnostic row cannot be replayed against
+/// another.
 ///
 /// Returns `Ok` only when the Clean kernel accepted a proof of the reconstructed
 /// goal with a clean axiom closure and the serialized payload re-checked after a
 /// round trip. Every other outcome is an `Err` naming the exact gate that
-/// refused; callers keep their existing, weaker authority.
+/// refused. This standalone compatibility checker does not mint compiler proof
+/// authority, and the compiler does not route body-bound claims through it.
 pub fn certify_body_bound_ensures_claim(
     schema: &str,
     payload: &str,
@@ -237,7 +228,8 @@ pub fn certify_body_bound_ensures_claim(
     let claim =
         decode_body_bound_claim(&value).map_err(BodyBoundCertifyError::ClaimOutsideFragment)?;
 
-    let env = build_claim_env(&claim.variables).ok_or(BodyBoundCertifyError::EnvironmentRejected)?;
+    let env =
+        build_claim_env(&claim.variables).ok_or(BodyBoundCertifyError::EnvironmentRejected)?;
     let goal = prop_to_expr(&claim.body).ok_or(BodyBoundCertifyError::NoProofTerm)?;
     let proof = prove(&claim.body).ok_or(BodyBoundCertifyError::NoProofTerm)?;
 
@@ -566,11 +558,9 @@ fn prove(prop: &ClaimProp) -> Option<Expr> {
         // The hypothesis is discarded: only an unconditionally true consequent
         // is closed here. A conditional postcondition therefore fails closed
         // rather than being weakened into something that happens to check.
-        ClaimProp::Implies(lhs, rhs) => Some(Expr::lam(
-            clean_kernel::BinderInfo::Default,
-            prop_to_expr(lhs)?,
-            prove(rhs)?,
-        )),
+        ClaimProp::Implies(lhs, rhs) => {
+            Some(Expr::lam(clean_kernel::BinderInfo::Default, prop_to_expr(lhs)?, prove(rhs)?))
+        }
         _ => None,
     }
 }
@@ -588,8 +578,8 @@ fn prove(prop: &ClaimProp) -> Option<Expr> {
 /// accept a one-node inhabitant of any goal, so admissibility is decided by the
 /// term's transitive constant closure, not by the environment's contents.
 fn build_claim_env(variables: &[(String, ClaimSort)]) -> Option<Environment> {
-    // Memoized: the lemma environment is identical for every claim, and this
-    // runs inside the compiler's verification pass on each body-bound row.
+    // Memoized: the lemma environment is identical across standalone
+    // compatibility checks of historical body-bound envelopes.
     static BASE: std::sync::OnceLock<Option<Environment>> = std::sync::OnceLock::new();
     let mut env = BASE
         .get_or_init(|| {
@@ -897,10 +887,9 @@ mod tests {
         ));
     }
 
-    /// The honest residue, pinned. `3 <= 7` is TRUE but the prover has no rule
-    /// for a literal order comparison, so the whole claim declines and the row
-    /// keeps its `Trusted` authority. This is the family `BodyBoundNativeReplay`
-    /// still carries, and it must decline rather than be closed by guesswork.
+    /// The honest residue, pinned. `3 <= 7` is TRUE but this standalone
+    /// compatibility checker has no rule for a literal order comparison, so it
+    /// declines. No compiler authority is minted from this result.
     #[test]
     fn a_true_claim_outside_the_rule_set_declines_instead_of_guessing() {
         let payload = envelope(
@@ -947,9 +936,7 @@ mod tests {
             [goal.clone(), Expr::const_(Name::from_string("Bool.true"), Vec::new())],
         );
         assert!(
-            TypeChecker::with_context(&env, LocalContext::new())
-                .check_type(&forged, &goal)
-                .is_ok(),
+            TypeChecker::with_context(&env, LocalContext::new()).check_type(&forged, &goal).is_ok(),
             "the ambient oracle really does type-check, which is why the audit exists"
         );
         assert!(

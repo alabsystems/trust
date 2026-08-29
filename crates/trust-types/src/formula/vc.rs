@@ -252,8 +252,8 @@ mod obligation_field_backward_compat_tests {
         assert!(value.as_object_mut().unwrap().remove("obligation").is_some());
         let legacy = serde_json::to_string(&value).unwrap();
 
-        let back: VerificationCondition =
-            serde_json::from_str(&legacy).expect("legacy VC dump (no obligation key) must deserialize");
+        let back: VerificationCondition = serde_json::from_str(&legacy)
+            .expect("legacy VC dump (no obligation key) must deserialize");
         assert!(back.obligation.is_none(), "missing obligation must default to None, not error");
 
         // Same guarantee for the persistence-boundary twin.
@@ -267,10 +267,8 @@ mod obligation_field_backward_compat_tests {
     // the serde boundary. Falsified by omitting `obligation` from either conversion.
     #[test]
     fn populated_obligation_roundtrips_and_threads_through_conversions() {
-        let body = Formula::Eq(
-            Box::new(Formula::Var("d".into(), Sort::Int)),
-            Box::new(Formula::Int(0)),
-        );
+        let body =
+            Formula::Eq(Box::new(Formula::Var("d".into(), Sort::Int)), Box::new(Formula::Int(0)));
         let vc = VerificationCondition {
             kind: VcKind::DivisionByZero,
             function: crate::Symbol::intern("my_crate::div"),

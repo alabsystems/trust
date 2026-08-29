@@ -141,10 +141,11 @@ pub fn discharge_with_kernel_proof(env: &Environment, goal: &FrontendGoal, proof
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use clean_kernel::name::Name;
     use clean_kernel::{Declaration, Level};
     use trust_types::frontend_firewall::FrontendLanguage;
+
+    use super::*;
 
     /// `Nat` and a `1 = 1` statement over it, in an environment with the
     /// prelude's `Eq`. Any well-formed proposition would do; this one has a
@@ -161,10 +162,7 @@ mod tests {
             Expr::const_(Name::from_string("Eq"), eq_levels.clone()),
             [nat.clone(), one.clone(), one.clone()],
         );
-        let proof = Expr::apps(
-            Expr::const_(Name::from_string("Eq.refl"), eq_levels),
-            [nat, one],
-        );
+        let proof = Expr::apps(Expr::const_(Name::from_string("Eq.refl"), eq_levels), [nat, one]);
         (env, statement, proof)
     }
 

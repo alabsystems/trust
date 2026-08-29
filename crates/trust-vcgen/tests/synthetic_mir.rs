@@ -33,7 +33,13 @@ fn make_func(
         name: name.to_string(),
         def_path: format!("synthetic::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -104,7 +110,8 @@ fn test_synthetic_arithmetic_overflow_add() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Add),
@@ -151,7 +158,8 @@ fn test_synthetic_arithmetic_overflow_sub() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Sub),
@@ -198,7 +206,8 @@ fn test_synthetic_arithmetic_overflow_mul() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),
@@ -285,7 +294,7 @@ fn test_symbolic_divisor_formula_preserved_in_division_vc() {
     let div_vc = vcs
         .iter()
         .find(|vc| matches!(vc.kind, VcKind::DivisionByZero))
-        .expect("symbolic divisor should emit a DivisionByZero VC");
+        .unwrap_or_else(|| panic!("symbolic divisor should emit a DivisionByZero VC: {vcs:#?}"));
     let expected_formula =
         Formula::Eq(Box::new(symbolic_divisor), Box::new(Formula::BitVec { value: 0, width: 64 }));
 
@@ -552,7 +561,8 @@ fn test_stage2_thin_pointer_cast_identity_feeds_downstream_assert() {
                         span: SourceSpan::default(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(3)),
                     expected: true,
                     msg: AssertMessage::Custom("thin pointer cast preserves address".into()),
@@ -620,7 +630,8 @@ fn test_stage2_fn_pointer_identity_cast_feeds_downstream_assert() {
                         span: SourceSpan::default(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(3)),
                     expected: true,
                     msg: AssertMessage::Custom("fn pointer cast preserves identity".into()),
@@ -683,7 +694,8 @@ fn test_stage2_callable_reification_cast_uses_opaque_token() {
                         span: SourceSpan::default(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(2)),
                     expected: true,
                     msg: AssertMessage::Custom("reified fn pointer is reflexive".into()),
@@ -758,7 +770,8 @@ fn test_stage2_fn_def_reification_equal_signature_uses_opaque_token() {
                         span: SourceSpan::default(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(3)),
                     expected: true,
                     msg: AssertMessage::Custom("reified FnDef pointer is reflexive".into()),
@@ -897,7 +910,8 @@ fn test_stage2_unsupported_pointer_to_int_cast_does_not_inject_identity_definiti
                         span: SourceSpan::default(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(3)),
                     expected: false,
                     msg: AssertMessage::Custom("ptr-to-int cast has no identity semantics".into()),
@@ -1084,8 +1098,10 @@ fn test_stage2_concrete_integer_bool_constants_in_switch_and_call_are_modeled() 
             BasicBlock {
                 id: BlockId(1),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "synthetic::callee".to_string(),
                     args: vec![
@@ -1152,7 +1168,7 @@ fn test_stage2_unavailable_integer_bool_constants_fail_closed() {
             BasicBlock {
                 id: BlockId(1),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,  is_unsafe_sig: false, is_foreign: false,
+                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,  is_unsafe_sig: false, callee_identity: None, is_foreign: false,
                     func: "synthetic::callee".to_string(),
                     args: vec![
                         Operand::Constant(ConstValue::Uint(0, 64)),
@@ -1253,7 +1269,8 @@ fn test_synthetic_index_out_of_bounds() {
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(2)),
                     expected: true,
                     msg: AssertMessage::BoundsCheck,
@@ -1297,7 +1314,8 @@ fn assert_fails_closed_for_assert_msg(name: &str, msg: AssertMessage) {
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(1)),
                     expected: true,
                     msg,
@@ -1354,7 +1372,8 @@ fn assert_coroutine_protocol_assert_is_not_a_data_safety_vc(name: &str, msg: Ass
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(1)),
                     expected: true,
                     msg,
@@ -1458,7 +1477,8 @@ fn test_malformed_recognized_overflow_assert_is_unknown() {
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Add),
@@ -1486,7 +1506,8 @@ fn test_malformed_recognized_overflow_neg_assert_is_unknown() {
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(1)),
                     expected: false,
                     msg: AssertMessage::OverflowNeg,
@@ -1514,7 +1535,8 @@ fn test_malformed_recognized_bounds_check_assert_fails_at_structural_admission()
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(1)),
                     expected: true,
                     msg: AssertMessage::BoundsCheck,
@@ -1615,7 +1637,8 @@ fn test_synthetic_assertion() {
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(1)),
                     expected: true,
                     msg: AssertMessage::Custom("invariant violated".to_string()),
@@ -1679,8 +1702,10 @@ fn test_synthetic_native_switchint_assertion_panic_fmt() {
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "std::rt::panic_fmt".to_string(),
                     args: vec![],
@@ -1910,8 +1935,10 @@ fn test_synthetic_native_unreachable_panic_fmt_from_str_nonconst_chain() {
             BasicBlock {
                 id: BlockId(4),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "std::fmt::Arguments::<'a>::from_str_nonconst".to_string(),
                     args: vec![],
@@ -1924,8 +1951,10 @@ fn test_synthetic_native_unreachable_panic_fmt_from_str_nonconst_chain() {
             BasicBlock {
                 id: BlockId(5),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "std::rt::panic_fmt".to_string(),
                     args: vec![],
@@ -1979,8 +2008,10 @@ fn test_synthetic_native_numeric_switch_panic_fmt_stays_assertion_without_noncon
             BasicBlock {
                 id: BlockId(2),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "std::fmt::Arguments::<'a>::from_str".to_string(),
                     args: vec![],
@@ -1993,8 +2024,10 @@ fn test_synthetic_native_numeric_switch_panic_fmt_stays_assertion_without_noncon
             BasicBlock {
                 id: BlockId(3),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "std::rt::panic_fmt".to_string(),
                     args: vec![],
@@ -2108,7 +2141,8 @@ fn test_synthetic_native_slice_bounds_formula() {
                         span: span.clone(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(4)),
                     expected: true,
                     msg: AssertMessage::BoundsCheck,
@@ -2175,8 +2209,10 @@ fn test_synthetic_native_guarded_slice_is_empty_proves_bounds_without_unsafe_vcs
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![],
-                terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Call {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "core::slice::<impl [u32]>::is_empty".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -2221,7 +2257,8 @@ fn test_synthetic_native_guarded_slice_is_empty_proves_bounds_without_unsafe_vcs
                         span: span.clone(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(5)),
                     expected: true,
                     msg: AssertMessage::BoundsCheck,
@@ -2300,7 +2337,8 @@ fn test_synthetic_native_index_bounds_formula() {
                     ),
                     span: span.clone(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(3)),
                     expected: true,
                     msg: AssertMessage::BoundsCheck,
@@ -2367,7 +2405,8 @@ fn test_synthetic_native_shift_overflow_formula() {
                     ),
                     span: span.clone(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(3)),
                     expected: true,
                     msg: AssertMessage::Overflow(BinOp::Shl),
@@ -2414,6 +2453,16 @@ fn test_synthetic_native_shift_overflow_formula() {
 
 #[test]
 fn test_synthetic_checked_shift_assert_generates_shift_overflow() {
+    // The canonical rustc spelling of a checked shift: `CheckedBinaryOp(Shl)`
+    // does NOT exist (admission outlaws it — only Add/Sub/Mul produce the
+    // audited `(value, bool)` carrier, and the extractor never emits checked
+    // shifts). rustc guards a shift with the Lt-condition assert of OPPOSITE
+    // polarity to the flag asserts, then performs the plain shift in the
+    // assert's target block:
+    //
+    //   bb0: _4 = Lt(copy _2, const 64_u32);
+    //        assert(move _4, expected: true, Overflow(Shl)) -> bb1;
+    //   bb1: _3 = Shl(copy _1, copy _2);
     let span = SourceSpan::default();
     let func = make_func(
         "checked_shift_overflow",
@@ -2421,29 +2470,43 @@ fn test_synthetic_checked_shift_assert_generates_shift_overflow() {
             LocalDecl { index: 0, ty: Ty::u64(), name: None },
             LocalDecl { index: 1, ty: Ty::u64(), name: Some("value".into()) },
             LocalDecl { index: 2, ty: Ty::u32(), name: Some("shift".into()) },
-            LocalDecl { index: 3, ty: Ty::Tuple(vec![Ty::u64(), Ty::Bool]), name: None },
+            LocalDecl { index: 3, ty: Ty::u64(), name: None },
+            LocalDecl { index: 4, ty: Ty::Bool, name: Some("shift_ok".into()) },
         ],
         vec![
             BasicBlock {
                 id: BlockId(0),
                 stmts: vec![Statement::Assign {
+                    place: Place::local(4),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Lt,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Uint(64, 32)),
+                    ),
+                    span: span.clone(),
+                }],
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
+                    cond: Operand::Move(Place::local(4)),
+                    expected: true,
+                    msg: AssertMessage::Overflow(BinOp::Shl),
+                    target: BlockId(1),
+                    span: span.clone(),
+                },
+            },
+            BasicBlock {
+                id: BlockId(1),
+                stmts: vec![Statement::Assign {
                     place: Place::local(3),
-                    rvalue: Rvalue::CheckedBinaryOp(
+                    rvalue: Rvalue::BinaryOp(
                         BinOp::Shl,
                         Operand::Copy(Place::local(1)),
                         Operand::Copy(Place::local(2)),
                     ),
                     span: span.clone(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
-                    cond: Operand::Copy(Place::field(3, 1)),
-                    expected: false,
-                    msg: AssertMessage::Overflow(BinOp::Shl),
-                    target: BlockId(1),
-                    span: span.clone(),
-                },
+                terminator: Terminator::Return,
             },
-            BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
         ],
         2,
     );
@@ -2454,10 +2517,30 @@ fn test_synthetic_checked_shift_assert_generates_shift_overflow() {
         |k| matches!(k, VcKind::ShiftOverflow { op: BinOp::Shl, .. }),
         "checked shift overflow",
     );
+    // The canonical shift assert must lower to a REAL shift-overflow VC — the
+    // exact `amount >= 64` UB violation at the shifted value's true width —
+    // never degrade to a RecognizedSafetyAssertProofGap row.
     assert!(
         !vcs.iter().any(|vc| matches!(vc.kind, VcKind::UnsupportedMir { .. })),
         "checked shift overflow should not fall back to UnsupportedMir: {:?}",
         vcs.iter().map(|vc| &vc.kind).collect::<Vec<_>>()
+    );
+    let shift_vc = vcs
+        .iter()
+        .find(|vc| matches!(vc.kind, VcKind::ShiftOverflow { op: BinOp::Shl, .. }))
+        .expect("checked shift assert should generate ShiftOverflow");
+    assert!(
+        formula_contains(&strip_versions(&shift_vc.formula), &|f| {
+            matches!(
+                f,
+                Formula::Ge(lhs, rhs)
+                    if lhs.var_name() == Some("shift")
+                        && matches!(rhs.as_ref(), Formula::Int(64))
+            )
+        }),
+        "checked shift VC must carry the direct `shift >= 64` violation at the \
+         u64 result width, got {:?}",
+        shift_vc.formula
     );
 }
 
@@ -2487,7 +2570,8 @@ fn test_synthetic_native_signed_div_overflow_formula() {
                     ),
                     span: span.clone(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(3)),
                     expected: false,
                     msg: AssertMessage::DivisionByZero,
@@ -2526,7 +2610,8 @@ fn test_synthetic_native_signed_div_overflow_formula() {
                         span: span.clone(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(6)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Div),
@@ -2756,7 +2841,8 @@ fn test_synthetic_native_signed_rem_overflow_formula() {
                     ),
                     span: span.clone(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(3)),
                     expected: false,
                     msg: AssertMessage::RemainderByZero,
@@ -2795,7 +2881,8 @@ fn test_synthetic_native_signed_rem_overflow_formula() {
                         span: span.clone(),
                     },
                 ],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Move(Place::local(6)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Rem),
@@ -2925,7 +3012,8 @@ fn test_synthetic_multiple_vcs() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Add),
@@ -2993,7 +3081,8 @@ fn test_synthetic_vc_proof_levels() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Add),
@@ -3251,7 +3340,8 @@ fn guarded_checked_mul_func() -> VerifiableFunction {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(4, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),
@@ -3315,7 +3405,8 @@ fn unguarded_mul_vc_has_no_bv_guard_bound() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),
@@ -3378,7 +3469,8 @@ fn join_reachable_mul_gets_no_bv_guard_bound() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),
@@ -3466,7 +3558,8 @@ fn signed_guarded_mul_vc_carries_negative_bv_guard_bound() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(5, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),
@@ -3521,7 +3614,8 @@ fn contract_bounded_mul_vc_carries_bv_precondition_bounds() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(3, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),
@@ -3581,7 +3675,8 @@ fn precondition_bounded_const_mul_stays_int_and_carries_bounds() {
                     ),
                     span: SourceSpan::default(),
                 }],
-                terminator: Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable,
+                terminator: Terminator::Assert {
+                    unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::field(2, 1)),
                     expected: false,
                     msg: AssertMessage::Overflow(BinOp::Mul),

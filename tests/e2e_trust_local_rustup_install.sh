@@ -940,7 +940,7 @@ suites = {
     for suite in report.get("verifier_suites", [])
     if isinstance(suite, dict)
 }
-for name in ("trust-mc", "trust-wp", "trust-vc"):
+for name in ("trust-mc", "trust-vc"):
     suite = suites.get(name)
     if not suite:
         raise SystemExit(f"doctor omitted verifier suite {name}")
@@ -948,6 +948,12 @@ for name in ("trust-mc", "trust-wp", "trust-vc"):
         raise SystemExit(f"doctor reports {name} adapter is not compiled: {suite!r}")
     if suite.get("capability_available") is not True:
         raise SystemExit(f"doctor reports {name} capability is unavailable: {suite!r}")
+trust_wp = suites.get("trust-wp")
+if trust_wp is not None:
+    if trust_wp.get("capability_available") is not False:
+        raise SystemExit(f"doctor reports retired trust-wp capability: {trust_wp!r}")
+    if (trust_wp.get("manifest") or {}).get("capabilities") not in ([], None):
+        raise SystemExit(f"doctor reports nonempty retired trust-wp manifest: {trust_wp!r}")
 PY
 
 cp -R "$TRUST_ROOT/tests/fixtures/installed-serde-derive" "$WORKSPACE"
@@ -1212,7 +1218,7 @@ document = {
         "report": doctor,
         "ready": True,
         "daily_driver_ready": True,
-        "required_verifier_suites": ["trust-mc", "trust-wp", "trust-vc"],
+        "required_verifier_suites": ["trust-mc", "trust-vc"],
     },
     "serde_fixture": {
         "path": str(fixture_root),

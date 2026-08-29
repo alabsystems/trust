@@ -1,8 +1,9 @@
 // trust-router/verification_obligation.rs: Pipeline v2 obligation adapter
 //
-// Maps external tool results (trust-mc-lib, trust-wp-lib) back to
-// per-obligation identities so the Trust report pipeline can attribute
-// verification outcomes to specific source spans, VcKinds, and functions.
+// Maps active verifier results back to per-obligation identities so the Trust
+// report pipeline can attribute verification outcomes to specific source
+// spans, VcKinds, and functions. Retained TrustWP strategy labels are
+// compatibility metadata only and cannot carry proof or refutation authority.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -10,10 +11,11 @@
 //! Verification obligation adapter for Pipeline v2.
 //!
 //! The v1 pipeline produces `VerificationCondition` objects (with a `Formula`)
-//! that flow through the `Router`. The v2 pipeline operates at the MIR level,
-//! dispatching whole functions to trust-mc-lib or trust-wp-lib. These external tools
-//! return their own result types (`TrustMcResult`, `TrustWpResult`), which need to
-//! be mapped back to per-obligation identities for the report pipeline.
+//! that flow through the `Router`. The v2 pipeline operates at the MIR level and
+//! dispatches active obligations to their owning verifier (including TrustMC).
+//! The current `MirRouter` producer emits only `Unknown` for its retained
+//! TrustWP compatibility label. This generic result adapter records supplied
+//! results but does not authenticate a solver name or confer authority itself.
 //!
 //! `VerificationObligation` is the bridge: it captures the function identity,
 //! source span, strategy used, and the resulting `VerificationResult` in a

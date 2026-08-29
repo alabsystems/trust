@@ -17,7 +17,7 @@
 // Trust: memoize the clean prelude Environment so it is not rebuilt per-VC.
 // `Environment::with_prelude()` re-typechecks ~50 prelude constants on every
 // call (a profiled compile-time hot path). We build it once and hand out clones.
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use clean_kernel::cert::{CertVerifier, ProofCert};
 use clean_kernel::env::{ConstantKind, Declaration, EnvError, Environment};
@@ -1719,7 +1719,10 @@ pub fn translate_formula(formula: &Formula) -> LeanExpr {
             // Encode as Trust.Formula.int <nat>
             // For negative values, wrap in Trust.Formula.neg
             if *n >= 0 {
-                LeanExpr::app(const_expr("Trust.Formula.int"), LeanExpr::nat_lit_u128(n.unsigned_abs()))
+                LeanExpr::app(
+                    const_expr("Trust.Formula.int"),
+                    LeanExpr::nat_lit_u128(n.unsigned_abs()),
+                )
             } else {
                 LeanExpr::app(
                     const_expr("Trust.Formula.neg"),
@@ -2127,9 +2130,9 @@ fn lean_term_to_proof_cert(
             let fn_cert = lean_term_to_proof_cert(f)?;
             let arg_cert = lean_term_to_proof_cert(a)?;
             Ok(ProofCert::App {
-                fn_cert: Box::new(fn_cert),
+                fn_cert: Arc::new(fn_cert),
                 fn_type: Box::new(LeanExpr::prop()),
-                arg_cert: Box::new(arg_cert),
+                arg_cert: Arc::new(arg_cert),
                 result_type: Box::new(LeanExpr::prop()),
             })
         }
@@ -2138,8 +2141,8 @@ fn lean_term_to_proof_cert(
             let body_cert = lean_term_to_proof_cert(body)?;
             Ok(ProofCert::Lam {
                 binder_info: BinderInfo::Default,
-                arg_type_cert: Box::new(arg_cert),
-                body_cert: Box::new(body_cert),
+                arg_type_cert: Arc::new(arg_cert),
+                body_cert: Arc::new(body_cert),
                 result_type: Box::new(LeanExpr::prop()),
             })
         }
@@ -2165,9 +2168,9 @@ fn lean_term_to_proof_cert(
             let val_cert = lean_term_to_proof_cert(value)?;
             let body_cert = lean_term_to_proof_cert(body)?;
             Ok(ProofCert::Let {
-                type_cert: Box::new(ty_cert),
-                value_cert: Box::new(val_cert),
-                body_cert: Box::new(body_cert),
+                type_cert: Arc::new(ty_cert),
+                value_cert: Arc::new(val_cert),
+                body_cert: Arc::new(body_cert),
                 result_type: Box::new(LeanExpr::prop()),
             })
         }
@@ -2959,8 +2962,8 @@ mod tests {
 
         let cert = ProofCert::Lam {
             binder_info: BinderInfo::Default,
-            arg_type_cert: Box::new(ProofCert::Sort { level: LeanLevel::succ(LeanLevel::zero()) }),
-            body_cert: Box::new(ProofCert::BVar {
+            arg_type_cert: Arc::new(ProofCert::Sort { level: LeanLevel::succ(LeanLevel::zero()) }),
+            body_cert: Arc::new(ProofCert::BVar {
                 idx: 0,
                 expected_type: Box::new(LeanExpr::sort(LeanLevel::zero())),
             }),
@@ -3040,12 +3043,18 @@ mod tests {
     #[test]
     fn translate_formula_encodes_wide_literals_distinctly() {
         // The collisions the old `n as u64` produced.
-        assert_ne!(translate_formula(&Formula::Int(1i128 << 64)), translate_formula(&Formula::Int(0)));
+        assert_ne!(
+            translate_formula(&Formula::Int(1i128 << 64)),
+            translate_formula(&Formula::Int(0))
+        );
         assert_ne!(
             translate_formula(&Formula::Int((1i128 << 64) + 1)),
             translate_formula(&Formula::Int(1))
         );
-        assert_ne!(translate_formula(&Formula::Int(1i128 << 70)), translate_formula(&Formula::Int(0)));
+        assert_ne!(
+            translate_formula(&Formula::Int(1i128 << 70)),
+            translate_formula(&Formula::Int(0))
+        );
         assert_ne!(
             translate_formula(&Formula::Int(i128::MAX)),
             translate_formula(&Formula::Int(i128::from(u64::MAX)))

@@ -1,17 +1,13 @@
-// trust-strengthen/invariant_feedback.rs: Loop invariant feedback from trust_wp
+// trust-strengthen/invariant_feedback.rs: historical TrustWP invariant conversion
 //
-// Pipeline v2 Phase 4 — accepts loop invariants discovered by
-// trust_wp (via trust-wp) and converts them into strengthen spec
-// candidates that can be fed back into the verification pipeline.
-//
-// When the MIR router's `dispatch_bmc_with_invariant_hints` path discovers
-// loop invariants via trust-wp, those invariants are passed here to generate
-// first-class `invariant` clause candidates for the strengthen pass.
+// Standalone compatibility callers may convert TrustWP diagnostic invariant
+// records into inert text candidates. The MIR router does not feed this module
+// into verification, and these values carry no routed proof authority.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-/// A loop invariant hint received from trust_wp via the MIR router.
+/// A loop invariant hint decoded from standalone TrustWP compatibility output.
 ///
 /// This is a simplified representation that does not depend on trust-wp-lib
 /// types directly, enabling the strengthen crate to process invariant hints
@@ -22,13 +18,13 @@ pub struct InvariantHint {
     pub function_name: String,
     /// The invariant expression as a string (trust-wp syntax).
     pub expression: String,
-    /// Confidence level from trust_wp (0.0 = guess, 1.0 = proven).
+    /// Producer-reported confidence (diagnostic only; 1.0 is not proof).
     pub confidence: f64,
     /// Loop identifier (basic block index or source location).
     pub loop_id: String,
 }
 
-/// Convert trust_wp loop invariants into strengthen spec candidates.
+/// Convert historical TrustWP loop-invariant diagnostics into inert candidates.
 ///
 /// Each invariant is formatted as a first-class loop clause with inert
 /// provenance. Applying it still requires an exact loop target; function-level
@@ -37,7 +33,7 @@ pub struct InvariantHint {
 /// # Arguments
 ///
 /// * `function_name` - Fully qualified name of the function containing loops.
-/// * `invariants` - Loop invariants discovered by trust_wp.
+/// * `invariants` - Loop-invariant diagnostics reported by TrustWP.
 ///
 /// # Returns
 ///

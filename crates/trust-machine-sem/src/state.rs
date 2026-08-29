@@ -155,8 +155,7 @@ impl MachineState {
             // reaches a register via the paired RegWrite the semantics also emits.
             Effect::MemRead { .. } => {}
             Effect::FlagUpdate { n, z, c, v } => {
-                self.flags =
-                    Flags { n: n.clone(), z: z.clone(), c: c.clone(), v: v.clone() };
+                self.flags = Flags { n: n.clone(), z: z.clone(), c: c.clone(), v: v.clone() };
             }
             Effect::Branch { target } | Effect::Return { target } => self.pc = target.clone(),
             Effect::PcUpdate { value } => self.pc = value.clone(),
@@ -186,7 +185,12 @@ fn widen_zero(value: Formula, from: u32, to: u32) -> Result<Formula, ApplyEffect
 
 /// Store the low `width_bytes` bytes of `value` into the `memory` array
 /// `Formula` at `address`, little-endian, returning the updated array.
-fn store_bytes_le(memory: Formula, address: &Formula, value: &Formula, width_bytes: u32) -> Formula {
+fn store_bytes_le(
+    memory: Formula,
+    address: &Formula,
+    value: &Formula,
+    width_bytes: u32,
+) -> Formula {
     let mut mem = memory;
     for i in 0..width_bytes {
         let byte =
@@ -259,8 +263,7 @@ mod symbolic_apply_tests {
         let b = st.read_gpr(1, 32);
         let sum32 = Formula::BvAdd(Box::new(a), Box::new(b), 32);
 
-        st.apply_effect(&Effect::RegWrite { index: 0, width: 32, value: sum32.clone() })
-            .unwrap();
+        st.apply_effect(&Effect::RegWrite { index: 0, width: 32, value: sum32.clone() }).unwrap();
         let x30 = st.read_gpr(30, 64);
         st.apply_effect(&Effect::Return { target: x30.clone() }).unwrap();
 

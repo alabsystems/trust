@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
-    VcKind, VerifiableBody, VerifiableFunction,
+    UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use crate::generate_vcs;
@@ -31,6 +30,7 @@ fn func_calling(callee: &str) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -118,9 +118,7 @@ fn elem_bytes_token_rejects_user_spellable_lookalikes() {
     // token (still-generic element / layout error). Under the old loose
     // substring parse it read as stride 1 and shrank the capacity term.
     assert_eq!(
-        super::parse_elem_bytes_token(
-            "alloc::vec::Vec::<__trust_elem_bytes_1>::with_capacity"
-        ),
+        super::parse_elem_bytes_token("alloc::vec::Vec::<__trust_elem_bytes_1>::with_capacity"),
         None
     );
     // The retired underscore spelling never parses, even in trailing position
@@ -139,17 +137,14 @@ fn elem_bytes_token_rejects_user_spellable_lookalikes() {
         Some(4096)
     );
     assert_eq!(
-        super::parse_elem_bytes_token(
-            "std::vec::Vec::<__trust_elem_bytes@4096>::with_capacity"
-        ),
+        super::parse_elem_bytes_token("std::vec::Vec::<__trust_elem_bytes@4096>::with_capacity"),
         None
     );
 }
 
 #[test]
 fn range_family_identity_accepts_defining_and_reexport_paths_only() {
-    const FAMILIES: [&str; 5] =
-        ["Range", "RangeTo", "RangeFrom", "RangeInclusive", "RangeFull"];
+    const FAMILIES: [&str; 5] = ["Range", "RangeTo", "RangeFrom", "RangeInclusive", "RangeFull"];
     for prefix in ["core::ops::", "std::ops::", "core::ops::range::", "std::ops::range::"] {
         for family in FAMILIES {
             assert_eq!(
@@ -170,9 +165,7 @@ fn range_family_identity_accepts_defining_and_reexport_paths_only() {
     assert_eq!(super::range_family_adt_name("core::ops::range2::RangeTo<usize>"), None);
     assert_eq!(super::range_family_adt_name("core::ops::range::RangeToLookalike"), None);
     assert!(super::aggregate_is_exclusive_range("core::ops::range::Range<usize>"));
-    assert!(!super::aggregate_is_exclusive_range(
-        "core::ops::range::RangeInclusive<usize>"
-    ));
+    assert!(!super::aggregate_is_exclusive_range("core::ops::range::RangeInclusive<usize>"));
 }
 
 #[test]
@@ -221,34 +214,20 @@ fn bounds_and_nonnull_fact_callees_require_canonical_owners() {
         assert!(!super::vc_callee_is_std_vec_inherent(callee), "{callee}");
     }
 
-    assert!(super::vc_callee_is_slice_inherent(
-        "core::slice::<impl [u8]>::windows",
-        "windows"
-    ));
-    assert!(!super::vc_callee_is_slice_inherent(
-        "<[T] as mycrate::Trait>::windows",
-        "windows"
-    ));
+    assert!(super::vc_callee_is_slice_inherent("core::slice::<impl [u8]>::windows", "windows"));
+    assert!(!super::vc_callee_is_slice_inherent("<[T] as mycrate::Trait>::windows", "windows"));
 
-    assert!(super::is_slice_to_array_conversion(
-        "core::convert::TryInto::try_into"
-    ));
+    assert!(super::is_slice_to_array_conversion("core::convert::TryInto::try_into"));
     assert!(super::is_slice_to_array_conversion(
         "<&[u8] as core::convert::TryInto<[u8; 8]>>::try_into"
     ));
-    assert!(!super::is_slice_to_array_conversion(
-        "mycrate::core::convert::TryInto::try_into"
-    ));
+    assert!(!super::is_slice_to_array_conversion("mycrate::core::convert::TryInto::try_into"));
     assert!(!super::is_slice_to_array_conversion(
         "<&[u8] as mycrate::convert::TryInto<[u8; 8]>>::try_into"
     ));
 
-    assert!(super::is_std_container_as_ptr(
-        "alloc::vec::Vec::<u8>::as_ptr"
-    ));
-    assert!(!super::is_std_container_as_ptr(
-        "mycrate::core::slice::as_ptr"
-    ));
+    assert!(super::is_std_container_as_ptr("alloc::vec::Vec::<u8>::as_ptr"));
+    assert!(!super::is_std_container_as_ptr("mycrate::core::slice::as_ptr"));
 }
 
 /// The exact shape of the interpreter OOM: `vec![None; size]` lowers to
@@ -283,6 +262,7 @@ fn flags_unbounded_vec_macro_from_elem() {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -335,6 +315,7 @@ fn flags_unbounded_repeat_n_collect() {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -350,6 +331,7 @@ fn flags_unbounded_repeat_n_collect() {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -405,6 +387,7 @@ fn from_elem_multibyte_adds_byte_aware_term() {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -453,6 +436,7 @@ fn func_calling_const_size(callee: &str, n: i128) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -506,10 +490,7 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
                 active_field: None,
                 args: None,
             },
-            vec![
-                Operand::Constant(ConstValue::Int(0)),
-                Operand::Constant(ConstValue::Int(end)),
-            ],
+            vec![Operand::Constant(ConstValue::Int(0)), Operand::Constant(ConstValue::Int(end))],
         ),
         span: SourceSpan::default(),
     };
@@ -522,6 +503,7 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     let blocks = if mapped {
@@ -541,17 +523,14 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             },
             BasicBlock { id: BlockId(1), stmts: vec![], terminator: collect_term(2) },
         ]
     } else {
-        vec![BasicBlock {
-            id: BlockId(0),
-            stmts: vec![range_stmt],
-            terminator: collect_term(1),
-        }]
+        vec![BasicBlock { id: BlockId(0), stmts: vec![range_stmt], terminator: collect_term(1) }]
     };
     VerifiableFunction {
         name: "collect_caller".to_string(),
@@ -636,6 +615,7 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     let produce = |target: Option<BlockId>| Terminator::Call {
@@ -647,6 +627,7 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     let blocks = if cloned {
@@ -664,6 +645,7 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             },
@@ -721,11 +703,7 @@ fn allows_collect_over_vec_iter() {
         false,
     );
     assert_eq!(unbounded_alloc_count(&func), 0, "collect over Vec::iter must not be flagged");
-    assert_eq!(
-        unsupported_mir_count(&func),
-        0,
-        "...nor reported as count-not-derivable Unknown"
-    );
+    assert_eq!(unsupported_mir_count(&func), 0, "...nor reported as count-not-derivable Unknown");
 }
 
 #[test]
@@ -749,8 +727,7 @@ fn flags_collect_over_custom_nonstd_iter() {
     // SOUNDNESS scoping: a custom (non-std) iterator producer is NOT a known
     // bounded collection source, so the collect stays GATED (visible Unknown),
     // never silently skipped — the std-path match must be precise.
-    let func =
-        collection_collect_func("mycrate::Weird::iter", "mycrate::Weird::Iter<'_>", false);
+    let func = collection_collect_func("mycrate::Weird::iter", "mycrate::Weird::Iter<'_>", false);
     assert_eq!(
         unsupported_mir_count(&func),
         1,
@@ -868,6 +845,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     let blocks = vec![
@@ -885,6 +863,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
                 span: SourceSpan::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         },
@@ -900,6 +879,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
                 span: SourceSpan::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         },
@@ -915,6 +895,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
                 span: SourceSpan::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         },
@@ -927,7 +908,8 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
             locals: (0..=7)
                 .map(|i| {
                     // 3, 4: the two `keys()` iterators; 5: their `chain`; 6: `cloned`.
-                    let chained = format!("core::iter::adapters::chain::Chain<{keys_ty}, {keys_ty}>");
+                    let chained =
+                        format!("core::iter::adapters::chain::Chain<{keys_ty}, {keys_ty}>");
                     let ty = match i {
                         // 1, 2: the two RECEIVER collections, typed as the
                         // compiler renders them (was `Ty::u32()`).
@@ -1001,10 +983,7 @@ fn a_user_inherent_fn_named_chain_stays_gated() {
 }
 
 fn unsupported_mir_count(func: &VerifiableFunction) -> usize {
-    generate_vcs(func)
-        .iter()
-        .filter(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { .. }))
-        .count()
+    generate_vcs(func).iter().filter(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { .. })).count()
 }
 
 /// A recognized bulk-alloc call (`with_capacity`) whose size operand was
@@ -1033,6 +1012,7 @@ fn func_calling_no_args(callee: &str) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -1096,6 +1076,7 @@ fn func_calling_single_value(callee: &str, value_ty: Ty) -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -1141,19 +1122,11 @@ fn allows_ordinary_box_new() {
     // flagged (drop-in Rust preserved). A `u64` value is 8 bytes, far below any
     // ceiling.
     let func = func_calling_single_value("alloc::boxed::Box::<u64>::new", Ty::u64());
-    assert_eq!(
-        unbounded_alloc_count(&func),
-        0,
-        "an ordinary small Box::new must not be flagged"
-    );
+    assert_eq!(unbounded_alloc_count(&func), 0, "an ordinary small Box::new must not be flagged");
     // And a `Box::new` of another small primitive (4 bytes) is likewise not
     // flagged — only an oversized value reaching the availability ceiling is.
     let small = func_calling_single_value("alloc::boxed::Box::<u32>::new", Ty::u32());
-    assert_eq!(
-        unbounded_alloc_count(&small),
-        0,
-        "a Box::new of a small value must not be flagged"
-    );
+    assert_eq!(unbounded_alloc_count(&small), 0, "a Box::new of a small value must not be flagged");
 }
 
 #[test]
@@ -1191,17 +1164,11 @@ fn ordinary_new_is_not_a_single_value_alloc() {
     // A user `Foo::new(n)` (or any non-Box/Rc/Arc `::new`) must NOT be treated
     // as a heap single-value allocation — drop-in Rust preserved.
     assert_eq!(super::single_value_alloc_call("mycrate::widget::Widget::new"), None);
-    assert_eq!(
-        super::single_value_alloc_call("alloc::boxed::Box::<u8>::new"),
-        Some("Box::new")
-    );
+    assert_eq!(super::single_value_alloc_call("alloc::boxed::Box::<u8>::new"), Some("Box::new"));
     assert_eq!(super::single_value_alloc_call("alloc::rc::Rc::<u8>::new"), Some("Rc::new"));
     assert_eq!(super::single_value_alloc_call("alloc::sync::Arc::<u8>::new"), Some("Arc::new"));
     // The pinning forms route to the same allocation.
-    assert_eq!(
-        super::single_value_alloc_call("alloc::boxed::Box::<u8>::pin"),
-        Some("Box::new")
-    );
+    assert_eq!(super::single_value_alloc_call("alloc::boxed::Box::<u8>::pin"), Some("Box::new"));
 }
 
 /// SMT of the (single) `UnboundedAllocation` VC `func` emits.
@@ -1239,8 +1206,7 @@ fn var_in_relation(smt: &str, op: &str, lit: &str) -> Option<String> {
         if let Some(sp) = smt[i..].find(' ') {
             let var = &smt[i..i + sp];
             let rest = &smt[i + sp + 1..];
-            if rest.starts_with(lit) && rest[lit.len()..].starts_with(')') && !var.contains('(')
-            {
+            if rest.starts_with(lit) && rest[lit.len()..].starts_with(')') && !var.contains('(') {
                 return Some(var.to_string());
             }
         }
@@ -1283,6 +1249,7 @@ fn grow_after_guard(reassign: bool, cross_block: bool) -> VerifiableFunction {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     let reassign_stmt = || Statement::Assign {
@@ -1497,6 +1464,7 @@ fn reseated_deref_store_drops_alloc_guard() {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },

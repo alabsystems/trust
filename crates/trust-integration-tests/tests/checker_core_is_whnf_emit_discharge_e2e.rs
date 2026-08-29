@@ -58,21 +58,19 @@ fn load_with_is_whnf_ensures(fixture_file: &str) -> VerifiableFunction {
 /// opaque `is_whnf` predicate over the return slot `_0`?
 fn emits_is_whnf_postcondition(func: &VerifiableFunction) -> bool {
     let vcs = generate_vcs(func);
-    vcs.iter()
-        .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
-        .any(|vc| {
-            let mut saw = false;
-            vc.formula.visit(&mut |f| {
-                if let Formula::Pred(name, args) = f
-                    && name.as_str() == "is_whnf"
-                    && args.len() == 1
-                    && args[0].var_name() == Some("_0")
-                {
-                    saw = true;
-                }
-            });
-            saw
-        })
+    vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).any(|vc| {
+        let mut saw = false;
+        vc.formula.visit(&mut |f| {
+            if let Formula::Pred(name, args) = f
+                && name.as_str() == "is_whnf"
+                && args.len() == 1
+                && args[0].var_name() == Some("_0")
+            {
+                saw = true;
+            }
+        });
+        saw
+    })
 }
 
 /// FULL LOOP (WHNF constructor): the REAL MIR of `Expr::prop` (which returns an
@@ -108,10 +106,7 @@ fn real_mir_arrow_emits_and_discharges_is_whnf() {
         "vcgen must EMIT an is_whnf(_0) Postcondition VC for Expr::arrow"
     );
     assert!(
-        matches!(
-            certify_is_whnf_from_mir(&func),
-            Some(trust_ir::ProofEvidence::CleanCic { .. })
-        ),
+        matches!(certify_is_whnf_from_mir(&func), Some(trust_ir::ProofEvidence::CleanCic { .. })),
         "certify_is_whnf_from_mir must DISCHARGE Expr::arrow's Pi head to a CleanCic"
     );
 }

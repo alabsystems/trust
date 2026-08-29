@@ -1,0 +1,8 @@
+error: invalid `decreases` clause: source-contract variable `limit` is not in scope
+  --> $DIR/trust-spec-decreases-desugars-to-native-clause.rs:84:20
+   |
+LL | #[trust::decreases(limit)]
+   |                    ^^^^^
+
+error: aborting due to 1 previous error
+

@@ -29,18 +29,17 @@ pub(crate) mod reconstruction;
 pub(crate) mod refinement;
 pub(crate) mod simulation;
 // Core VC generation — authoritative implementation of generate_refinement_vcs.
-pub(crate) mod vc_core;
 pub(crate) mod ay_validator;
+pub(crate) mod vc_core;
 
 // Re-export primary API types.
+pub use ay_validator::{SmtPropertyResult, SmtValidationResult, TranslationValidator, VcOutcome};
 pub use equivalence::{EquivalenceVcGenerator, VcClassification};
 pub use error::TransvalError;
 pub use optimization::{OptimizationPass, OptimizationPassValidator};
 pub use reconstruction::{ReconstructionOutputValidation, ReconstructionOutputValidator};
 pub use refinement::{RefinementChecker, ValidationResult, ValidationVerdict};
 pub use simulation::SimulationRelationBuilder;
-pub use ay_validator::{SmtPropertyResult, SmtValidationResult, TranslationValidator, VcOutcome};
-
 // Re-export translation validation types from trust-types and core VC
 // generation from vc_core. The vocabulary is defined once in trust-types so
 // trust-vcgen can publish the same record types without depending on this

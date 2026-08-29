@@ -116,6 +116,7 @@ fn adversarial_callback_cannot_replace_trust_critical_providers() {
     assert_extern_query_swap_rejected!(dylib_dependency_formats);
     assert_extern_query_swap_rejected!(exported_generic_symbols);
     assert_extern_query_swap_rejected!(exported_non_generic_symbols);
+    assert_extern_query_swap_rejected!(extern_crate);
     assert_extern_query_swap_rejected!(has_alloc_error_handler);
     assert_extern_query_swap_rejected!(has_global_allocator);
     assert_extern_query_swap_rejected!(has_panic_handler);
@@ -148,10 +149,12 @@ fn adversarial_callback_cannot_replace_upstream_trust_ir_inputs() {
     macro_rules! assert_extern_query_swap_rejected {
         ($field:ident) => {{
             let mut changed = canonical;
-            changed.extern_queries.$field = |_, _| panic!(
-                "adversarial external `{}` provider must never execute in this comparison test",
-                stringify!($field),
-            );
+            changed.extern_queries.$field = |_, _| {
+                panic!(
+                    "adversarial external `{}` provider must never execute in this comparison test",
+                    stringify!($field),
+                )
+            };
             assert_eq!(
                 changed_trust_critical_query_provider(&changed),
                 Some(concat!("extern::", stringify!($field))),

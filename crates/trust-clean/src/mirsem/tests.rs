@@ -1,4 +1,5 @@
 use trust_types::UnwindEdge;
+
 use super::*;
 
 // ===========================================================================
@@ -360,13 +361,13 @@ mod gate_iter_gen_key_discipline_tests {
 // helpers) to avoid colliding with the enclosing `tests` module's many builders.
 // ===========================================================================
 mod record_witness_tests {
-    use crate::mirsem::{SemStructField, sem_struct_return_shape_of};
-    use crate::mirsem::SemOperand;
-    use crate::trustir_anchor::RefinementVerdict;
     use trust_types::{
         AggregateKind, BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
         Statement, Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
     };
+
+    use crate::mirsem::{SemOperand, SemStructField, sem_struct_return_shape_of};
+    use crate::trustir_anchor::RefinementVerdict;
 
     fn int64() -> Ty {
         Ty::Int { width: 64, signed: true }
@@ -501,7 +502,11 @@ mod record_witness_tests {
                 LocalDecl { index: 2, ty: int64(), name: Some("b".into()) },
             ],
             blocks: vec![
-                BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) },
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![assign(0, agg("S::Pair", vec![copy(1), copy(2)]))],
@@ -571,7 +576,10 @@ mod record_witness_tests {
                 stmts: vec![
                     assign(0, agg("S::Pair", vec![copy(1), copy(2)])),
                     Statement::Assign {
-                        place: Place { local: 0, projections: vec![trust_types::Projection::Field(0)] },
+                        place: Place {
+                            local: 0,
+                            projections: vec![trust_types::Projection::Field(0)],
+                        },
                         rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
                         span: Default::default(),
                     },
@@ -608,6 +616,7 @@ mod record_witness_tests {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         unwind: UnwindEdge::default(),
                     },
                 },
@@ -664,10 +673,8 @@ mod record_witness_tests {
     fn gate_legacy_flattened_metadata_declines() {
         // A legacy `__tag`/`__v`-flattened return type (the only `BinderData::new`
         // corpus form) declines the fresh-metadata gate (gate 1).
-        let legacy = Ty::adt(
-            "BinderData",
-            vec![("__tag".into(), int64()), ("__v0_x".into(), int64())],
-        );
+        let legacy =
+            Ty::adt("BinderData", vec![("__tag".into(), int64()), ("__v0_x".into(), int64())]);
         let func = func_of(VerifiableBody {
             locals: vec![
                 LocalDecl { index: 0, ty: legacy.clone(), name: None },
@@ -725,10 +732,7 @@ mod record_witness_tests {
                 id: BlockId(0),
                 stmts: vec![assign(
                     0,
-                    agg(
-                        "S::Three",
-                        vec![copy(1), Operand::Constant(ConstValue::Int(5)), copy(2)],
-                    ),
+                    agg("S::Three", vec![copy(1), Operand::Constant(ConstValue::Int(5)), copy(2)]),
                 )],
                 terminator: Terminator::Return,
             }],
@@ -746,11 +750,7 @@ mod record_witness_tests {
         // with that shape must not turn a Unit operand into a PhantomData witness.
         let forged_ty = Ty::adt(
             "S::Three",
-            vec![
-                ("a".into(), int64()),
-                ("m".into(), Ty::adt("T", vec![])),
-                ("b".into(), int64()),
-            ],
+            vec![("a".into(), int64()), ("m".into(), Ty::adt("T", vec![])), ("b".into(), int64())],
         );
         let func = func_of(VerifiableBody {
             locals: vec![
@@ -762,10 +762,7 @@ mod record_witness_tests {
                 id: BlockId(0),
                 stmts: vec![assign(
                     0,
-                    agg(
-                        "S::Three",
-                        vec![copy(1), Operand::Constant(ConstValue::Unit), copy(2)],
-                    ),
+                    agg("S::Three", vec![copy(1), Operand::Constant(ConstValue::Unit), copy(2)]),
                 )],
                 terminator: Terminator::Return,
             }],
@@ -833,8 +830,8 @@ fn legacy_or_struct_tag_ty(name: &str) -> trust_types::Ty {
 
 fn fieldless_clone_func(ty: trust_types::Ty) -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     VerifiableFunction {
         name: "clone".into(),
@@ -962,9 +959,7 @@ fn fieldless_enum_recognizers_require_explicit_nullary_variants() {
     let ambiguous_eq = fieldless_eq_func(ambiguous);
     assert!(sem_fieldless_enum_clone_shape_of(&ambiguous_clone).is_none());
     assert!(sem_fieldless_enum_eq_shape_of(&ambiguous_eq).is_none());
-    assert!(
-        !crate::prove::diagnose_fully_faithful_gate(&ambiguous_clone, &empty).fully_faithful
-    );
+    assert!(!crate::prove::diagnose_fully_faithful_gate(&ambiguous_clone, &empty).fully_faithful);
     assert!(!crate::prove::diagnose_fully_faithful_gate(&ambiguous_eq, &empty).fully_faithful);
 
     // Explicit enum metadata is still insufficient when any variant has a
@@ -1281,6 +1276,7 @@ fn to_ascii_chain_body(
                     atomic: None,
                     is_foreign: false,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                 },
             },
             BasicBlock {
@@ -1336,13 +1332,11 @@ fn to_ascii_chain_registry() -> std::collections::BTreeMap<String, CalleeFact> {
         "num::<impl u8>::is_ascii_uppercase".to_string(),
         CalleeFact {
             arg_count: 1,
-            param_tys: vec![trust_types::Ty::Ref {
-                mutable: false,
-                inner: Box::new(u8_ty()),
-            }],
+            param_tys: vec![trust_types::Ty::Ref { mutable: false, inner: Box::new(u8_ty()) }],
             return_ty: trust_types::Ty::Bool,
             requires: Some(vec![]),
             param_names: vec![Some("self".into())],
+            ret_model: None,
         },
     );
     m
@@ -1416,6 +1410,7 @@ fn ord_i32_fact() -> CalleeFact {
             int_range_conjunct("other", -2147483648, 2147483647),
         ]),
         param_names: vec![Some("self".into()), Some("other".into())],
+        ret_model: None,
     }
 }
 fn ord_registry() -> std::collections::BTreeMap<String, CalleeFact> {
@@ -1440,6 +1435,7 @@ fn call_term(
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
     }
 }
 /// The `min_max_i32` two-call chain body: `_4 := min(_1,_2); _0 := max(_4,_3);
@@ -1537,8 +1533,7 @@ fn two_call_chain_recognizes_min_max_and_certifies_modulo_3() {
         vec![ChainArg::Intermediate, ChainArg::Modeled(SemOperand::Var(2))]
     );
     assert_eq!(chain.intermediate_bound, (-2147483648, 2147483647));
-    let witness =
-        two_call_chain_adequacy_witness(&chain).expect("adequacy witness must be minted");
+    let witness = two_call_chain_adequacy_witness(&chain).expect("adequacy witness must be minted");
     assert!(witness.is_modulo_3(), "both per-call transports must certify modulo 3");
     // The FULL via-mirsem straight-line witness + requires pillar.
     let ffc = function_fully_faithful_witness_with_callees(&func, &registry)
@@ -1621,8 +1616,8 @@ fn two_call_chain_rejects_unsafe_signature_edges() {
 /// `_0` typed to the projected field (u8 for field 0, bool for field 1).
 fn overflowing_body(field: usize) -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody,
     };
     let ret_ty = if field == 0 { u8_ty() } else { Ty::Bool };
     let body = VerifiableBody {
@@ -1666,10 +1661,7 @@ fn overflowing_body(field: usize) -> trust_types::VerifiableFunction {
         span: trust_types::SourceSpan::default(),
         body,
         contracts: vec![],
-        preconditions: vec![
-            int_range_conjunct("a", 0, 255),
-            int_range_conjunct("b", 0, 255),
-        ],
+        preconditions: vec![int_range_conjunct("a", 0, 255), int_range_conjunct("b", 0, 255)],
         postconditions: vec![],
         spec: trust_types::FunctionSpec::default(),
     }
@@ -1687,6 +1679,7 @@ fn overflowing_registry() -> std::collections::BTreeMap<String, CalleeFact> {
                 int_range_conjunct("rhs", 0, 255),
             ]),
             param_names: vec![Some("self".into()), Some("rhs".into())],
+            ret_model: None,
         },
     );
     m
@@ -1729,8 +1722,7 @@ fn call_then_project_reads_the_true_field_index() {
 #[test]
 fn call_then_project_rejects_unsafe_signature_edge() {
     let mut func = overflowing_body(0);
-    let trust_types::Terminator::Call { is_unsafe_sig, .. } =
-        &mut func.body.blocks[0].terminator
+    let trust_types::Terminator::Call { is_unsafe_sig, .. } = &mut func.body.blocks[0].terminator
     else {
         panic!("overflowing_add fixture begins with a Call")
     };
@@ -1746,10 +1738,7 @@ fn call_then_project_rejects_unsafe_signature_edge() {
 fn call_then_project_dishonest_conclusion_is_kernel_rejected() {
     let func = overflowing_body(0);
     let proj = sem_call_then_project_of_mir(&func, &overflowing_registry()).expect("recognized");
-    assert_eq!(
-        call_then_project_instance_verdict(&proj, None),
-        RefinementVerdict::ProvenModulo3
-    );
+    assert_eq!(call_then_project_instance_verdict(&proj, None), RefinementVerdict::ProvenModulo3);
     let bd = || BinderData::from(BinderInfo::Default);
     let wrong_pred = Expr::lam(bd(), int_ty(), Expr::app(cst("False"), Expr::bvar(0)));
     let verdict = call_then_project_instance_verdict(&proj, Some(&wrong_pred));
@@ -1800,6 +1789,7 @@ fn call_chain_pureop_declines_on_unregistered_callee() {
             return_ty: u8_ty(),
             requires: Some(vec![]),
             param_names: vec![Some("self".into())],
+            ret_model: None,
         },
     );
     assert_eq!(
@@ -1856,10 +1846,7 @@ fn call_chain_pureop_wrong_claimed_conclusion_is_kernel_rejected() {
     let registry = to_ascii_chain_registry();
     let chain = sem_call_chain_pureop_of_mir(&func, &registry).expect("recognized");
     // The HONEST instance is ProvenModulo3.
-    assert_eq!(
-        call_chain_pureop_instance_verdict(&chain, None),
-        RefinementVerdict::ProvenModulo3
-    );
+    assert_eq!(call_chain_pureop_instance_verdict(&chain, None), RefinementVerdict::ProvenModulo3);
     // A WRONG claimed conclusion predicate (`λx. x = 999`, an arbitrary
     // false claim unrelated to the real wrapped value) must be rejected.
     let bd = || BinderData::from(BinderInfo::Default);
@@ -1883,9 +1870,7 @@ fn call_chain_pureop_outer_mul_is_lhs_reflects_real_operand_order() {
     // the LEFT this time (to_ascii_uppercase's XOR order is `self ^ mul`,
     // so build the MIRROR-IMAGE shape to confirm the flag is read off the
     // real AST, not hard-coded).
-    use trust_types::{
-        BasicBlock, BinOp, BlockId, Operand, Place, Rvalue, Statement, Terminator,
-    };
+    use trust_types::{BasicBlock, BinOp, BlockId, Operand, Place, Rvalue, Statement, Terminator};
     let mut func = to_ascii_chain_func(BinOp::BitXor, false);
     let assign = |local: usize, rv: Rvalue| Statement::Assign {
         place: Place { local, projections: vec![] },
@@ -1936,15 +1921,10 @@ fn call_chain_pureop_outer_mul_is_lhs_reflects_real_operand_order() {
 fn no_reassign_body(arg_count: usize) -> trust_types::VerifiableBody {
     use trust_types::{BasicBlock, BlockId, LocalDecl, Terminator, Ty, VerifiableBody};
     let int = || Ty::Int { width: 64, signed: false };
-    let locals =
-        (0..=arg_count).map(|i| LocalDecl { index: i, ty: int(), name: None }).collect();
+    let locals = (0..=arg_count).map(|i| LocalDecl { index: i, ty: int(), name: None }).collect();
     VerifiableBody {
         locals,
-        blocks: vec![BasicBlock {
-            id: BlockId(0),
-            stmts: vec![],
-            terminator: Terminator::Return,
-        }],
+        blocks: vec![BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Return }],
         arg_count,
         return_ty: int(),
         datatype_defs: Default::default(),
@@ -2430,19 +2410,16 @@ fn lemma_1a_rhs_is_the_live_ground_int_output() {
     // to `x_0` — def-eq.
     let env = mirsem_env().expect("env");
     let tc = TypeChecker::new(&env);
-    for op in [
-        SemOperand::Var(0),
-        SemOperand::Const(5),
-        SemOperand::Move(Box::new(SemOperand::Var(0))),
-    ] {
+    for op in
+        [SemOperand::Var(0), SemOperand::Const(5), SemOperand::Move(Box::new(SemOperand::Var(0)))]
+    {
         let mut indices = Vec::new();
         op.var_indices(&mut indices);
         let n = indices.len();
         let grounded = live_ground_int(&op.to_formula(), &indices)
             .expect("the LIVE grounder must ground this operand's reflected formula");
-        let env_e = grounding_env_expr(&indices, &|i| {
-            Expr::bvar(u32::try_from(n - 1 - i).unwrap_or(0))
-        });
+        let env_e =
+            grounding_env_expr(&indices, &|i| Expr::bvar(u32::try_from(n - 1 - i).unwrap_or(0)));
         let eval_term = Expr::apps(cst(MIRSEM_EVAL), [env_e, op.to_operand_expr()]);
         assert!(
             tc.is_def_eq(&eval_term, &grounded),
@@ -2484,9 +2461,8 @@ fn lemma_1b_rhs_is_the_live_ground_int_output() {
         let n = indices.len();
         let grounded = live_ground_int(&rv.to_formula(), &indices)
             .expect("the LIVE grounder must ground this rvalue's reflected formula");
-        let env_e = grounding_env_expr(&indices, &|i| {
-            Expr::bvar(u32::try_from(n - 1 - i).unwrap_or(0))
-        });
+        let env_e =
+            grounding_env_expr(&indices, &|i| Expr::bvar(u32::try_from(n - 1 - i).unwrap_or(0)));
         let eval_term = Expr::apps(cst(MIRSEM_EVAL_RVALUE), [env_e, rv.to_rvalue_expr()]);
         assert!(
             tc.is_def_eq(&eval_term, &grounded),
@@ -2568,11 +2544,9 @@ fn eval_rvalue_type_checks_against_env_to_rvalue_to_int() {
 #[test]
 fn lemma_1b_use_adequacy_proven_modulo_3() {
     // Use op: eval_rvalue e (Use op) = eval e op (= op's denotation).
-    for op in [
-        SemOperand::Var(0),
-        SemOperand::Const(5),
-        SemOperand::Move(Box::new(SemOperand::Var(1))),
-    ] {
+    for op in
+        [SemOperand::Var(0), SemOperand::Const(5), SemOperand::Move(Box::new(SemOperand::Var(1)))]
+    {
         assert_eq!(
             check_rvalue_adequacy(&SemRvalue::Use(op.clone())),
             AdequacyVerdict::ProvenModulo3,
@@ -2723,8 +2697,8 @@ fn div_eval_rvalue_shape_matches_ground_int_emission() {
     // MirSem `denotation` builds exactly that head + arg order, so the adequacy is
     // matched to REALITY, not assumed.
     let e_ref = Expr::bvar(0);
-    let denot = SemRvalue::Bin(SemBinOp::Div, SemOperand::Var(0), SemOperand::Const(2))
-        .denotation(&e_ref);
+    let denot =
+        SemRvalue::Bin(SemBinOp::Div, SemOperand::Var(0), SemOperand::Const(2)).denotation(&e_ref);
     // Expected: Int.div (eval-style denot of Var 0) (denot of Const 2).
     let expected = int_binop_expr(
         &SemBinOp::Div,
@@ -2834,8 +2808,8 @@ fn rem_eval_rvalue_shape_matches_ground_int_emission() {
     // `app2("Int.mod", g(a), g(b))`. Confirm the MirSem `denotation` builds
     // exactly that head + arg order, so the adequacy is matched to REALITY.
     let e_ref = Expr::bvar(0);
-    let denot = SemRvalue::Bin(SemBinOp::Rem, SemOperand::Var(0), SemOperand::Const(2))
-        .denotation(&e_ref);
+    let denot =
+        SemRvalue::Bin(SemBinOp::Rem, SemOperand::Var(0), SemOperand::Const(2)).denotation(&e_ref);
     let expected = int_binop_expr(
         &SemBinOp::Rem,
         SemOperand::Var(0).denotation(&e_ref),
@@ -2871,8 +2845,7 @@ fn wrong_rem_euclidean_adequacy_claim_fails_closed() {
     let x = || Expr::bvar(1);
     let y = || Expr::bvar(0);
     let trunc = int_binop_expr(&SemBinOp::Rem, x(), y());
-    let euclidean =
-        int_binop_expr(&SemBinOp::Rem, Expr::apps(cst("Int.add"), [trunc, y()]), y());
+    let euclidean = int_binop_expr(&SemBinOp::Rem, Expr::apps(cst("Int.add"), [trunc, y()]), y());
     let verdict = check_rvalue_adequacy_inner(
         &SemRvalue::Bin(SemBinOp::Rem, SemOperand::Var(0), SemOperand::Var(1)),
         Some(&euclidean),
@@ -3067,10 +3040,8 @@ fn return_stmt_trace_is_a_well_typed_list_stmt() {
     };
     let trace = r.to_stmts_expr();
     let inferred = tc.infer_type(&trace).expect("the SSA trace has a type");
-    let list_stmt = Expr::app(
-        Expr::const_(Name::from_string("List"), vec![Level::zero()]),
-        cst(MIRSEM_STMT),
-    );
+    let list_stmt =
+        Expr::app(Expr::const_(Name::from_string("List"), vec![Level::zero()]), cst(MIRSEM_STMT));
     assert!(
         tc.is_def_eq(&inferred, &list_stmt),
         "the assignment prefix must be a well-typed List Stmt, got {inferred:?}"
@@ -3086,21 +3057,16 @@ fn set_and_exec_type_check_against_their_signatures() {
     // set : Env → Nat → Int → Env
     let set_inferred = tc.infer_type(&cst(MIRSEM_SET)).expect("set has a type");
     let bd = || BinderData::from(BinderInfo::Default);
-    let set_expected = Expr::pi(
-        bd(),
-        env_ty(),
-        Expr::pi(bd(), cst("Nat"), Expr::pi(bd(), int_ty(), env_ty())),
-    );
+    let set_expected =
+        Expr::pi(bd(), env_ty(), Expr::pi(bd(), cst("Nat"), Expr::pi(bd(), int_ty(), env_ty())));
     assert!(
         tc.is_def_eq(&set_inferred, &set_expected),
         "set should have type Env → Nat → Int → Env, got {set_inferred:?}"
     );
     // exec : Env → List Stmt → Env
     let exec_inferred = tc.infer_type(&cst(MIRSEM_EXEC)).expect("exec has a type");
-    let list_stmt = Expr::app(
-        Expr::const_(Name::from_string("List"), vec![Level::zero()]),
-        cst(MIRSEM_STMT),
-    );
+    let list_stmt =
+        Expr::app(Expr::const_(Name::from_string("List"), vec![Level::zero()]), cst(MIRSEM_STMT));
     let exec_expected = Expr::pi(bd(), env_ty(), Expr::pi(bd(), list_stmt, env_ty()));
     assert!(
         tc.is_def_eq(&exec_inferred, &exec_expected),
@@ -3271,11 +3237,9 @@ fn wrong_index_ssa_temp_return_claim_fails_closed() {
 
 #[test]
 fn operand_adequacy_witness_mints_certificate_for_modeled_operands() {
-    for op in [
-        SemOperand::Const(5),
-        SemOperand::Var(2),
-        SemOperand::Move(Box::new(SemOperand::Var(0))),
-    ] {
+    for op in
+        [SemOperand::Const(5), SemOperand::Var(2), SemOperand::Move(Box::new(SemOperand::Var(0)))]
+    {
         let cert = operand_adequacy_witness(&op).expect("modeled operand gets a certificate");
         assert!(cert.is_modulo_3(), "the certificate must be a modulo-3 proof");
         assert_eq!(cert.operand, op);
@@ -3336,20 +3300,24 @@ fn sem_operand_of_mir_maps_scalar_operands_and_fails_closed_otherwise() {
 #[test]
 fn sem_operand_of_mir_recognizes_deref_self_and_declines_others() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody,
     };
     let u8t = || Ty::Int { width: 8, signed: false };
     let shared_ref = || Ty::Ref { mutable: false, inner: Box::new(u8t()) };
     let mut_ref = || Ty::Ref { mutable: true, inner: Box::new(u8t()) };
     let struct_ref = || Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "S".into(),
             fields: vec![("0".into(), u8t())],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     let body_with = |self_ty: Ty, extra_stmts: Vec<Statement>| VerifiableBody {
         locals: vec![
@@ -3456,8 +3424,8 @@ fn sem_operand_of_mir_recognizes_deref_self_and_declines_others() {
 #[test]
 fn deref_write_exists_follows_shared_ref_copy_alias_chains_cycle_safely() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-        SourceSpan, Statement, Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
+        Statement, Terminator, Ty, VerifiableBody,
     };
 
     let u8_ty = || Ty::Int { width: 8, signed: false };
@@ -3504,12 +3472,8 @@ fn deref_write_exists_follows_shared_ref_copy_alias_chains_cycle_safely() {
     let cycle_without_write =
         body_with(vec![copy(2, 1, false), copy(3, 2, false), copy(2, 3, false)]);
     assert!(!deref_write_exists(&cycle_without_write, 1));
-    let cycle_with_write = body_with(vec![
-        copy(2, 1, false),
-        copy(3, 2, false),
-        copy(2, 3, false),
-        write_through(3),
-    ]);
+    let cycle_with_write =
+        body_with(vec![copy(2, 1, false), copy(3, 2, false), copy(2, 3, false), write_through(3)]);
     assert!(deref_write_exists(&cycle_with_write, 1));
     assert_eq!(sem_operand_of_mir(&cycle_with_write, &read_root, &param_index), None);
 }
@@ -3537,11 +3501,10 @@ fn deref_self_operand_is_certified_end_to_end() {
     };
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
     let op = Operand::Copy(Place { local: 1, projections: vec![Projection::Deref] });
-    let sem =
-        sem_operand_of_mir(&body, &op, &param_index).expect("deref-self operand is modeled");
+    let sem = sem_operand_of_mir(&body, &op, &param_index).expect("deref-self operand is modeled");
     assert_eq!(sem, SemOperand::Var(0));
-    let cert = operand_adequacy_witness(&sem)
-        .expect("the deref-self operand gets a modulo-3 certificate");
+    let cert =
+        operand_adequacy_witness(&sem).expect("the deref-self operand gets a modulo-3 certificate");
     assert!(cert.is_modulo_3());
 }
 
@@ -3824,12 +3787,7 @@ fn cast_before_compare_declines_narrowing_reinterpret_and_forged_source() {
     let int = |w: u32, s: bool| Ty::Int { width: w, signed: s };
     // Builder: `_2 := *self` (or a supplied decoy prefix); `_3 := _2 as
     // {dw/ds}`; caller compares `_3`.
-    let mk = |sw: u32,
-              ss: bool,
-              dw: u32,
-              ds: bool,
-              extra_deref_write: bool|
-     -> VerifiableBody {
+    let mk = |sw: u32, ss: bool, dw: u32, ds: bool, extra_deref_write: bool| -> VerifiableBody {
         let mut stmts = vec![
             Statement::Assign {
                 place: Place { local: 2, projections: vec![] },
@@ -4017,8 +3975,7 @@ fn compare_as_value_declines_a_cyclic_comparison_temp_chain() {
 #[test]
 fn deref_self_declines_a_call_dest_write_through_the_reference() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Terminator, Ty,
-        VerifiableBody,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Terminator, Ty, VerifiableBody,
     };
     let u8t = || Ty::Int { width: 8, signed: false };
     let body = VerifiableBody {
@@ -4045,6 +4002,7 @@ fn deref_self_declines_a_call_dest_write_through_the_reference() {
                     span: trust_types::SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             },
@@ -4433,9 +4391,8 @@ fn u8_range_predicate_join_temp_resolves_deref_mat_and_certifies_modulo_3() {
     let func = u8_range_predicate_join_temp_body(|_| {});
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
 
-    let cfr = sem_cf_return_of_mir(&func, &param_index).expect(
-        "the single-range u8 predicate (deref-mat temp + join-temp) must be recognized",
-    );
+    let cfr = sem_cf_return_of_mir(&func, &param_index)
+        .expect("the single-range u8 predicate (deref-mat temp + join-temp) must be recognized");
     // Every operand resolved to the self param — the deref-mat temp `_3` did NOT
     // leak as a spurious raw local index.
     assert_eq!(
@@ -4479,8 +4436,7 @@ fn u8_range_predicate_deref_mat_forgeries_all_decline() {
 
     // Positive control: the faithful body IS recognized (guards the differential).
     assert!(
-        sem_cf_return_of_mir(&u8_range_predicate_join_temp_body(|_| {}), &param_index)
-            .is_some()
+        sem_cf_return_of_mir(&u8_range_predicate_join_temp_body(|_| {}), &param_index).is_some()
     );
 
     // (1) NON-IDENTITY ARITH — `_3 := Add(Copy(*_1), 1)` is a mutated value, not a
@@ -4916,9 +4872,7 @@ fn signed_shr_rvalue_declines_unsigned_shr_admits() {
             Operand::Constant(ConstValue::Int(44)),
         );
     }
-    let Statement::Assign { rvalue, .. } = &int_amount.blocks[0].stmts[0] else {
-        unreachable!()
-    };
+    let Statement::Assign { rvalue, .. } = &int_amount.blocks[0].stmts[0] else { unreachable!() };
     assert_eq!(
         sem_rvalue_of_mir(&int_amount, rvalue, &param_index),
         None,
@@ -5066,9 +5020,8 @@ fn nested_bitbin_rvalue_is_certified_modulo_3() {
             Box::new(SemRvalue::Use(SemOperand::Var(0))),
             Box::new(SemRvalue::Bin(SemBinOp::Shl, SemOperand::Const(1), SemOperand::Var(1))),
         );
-        let cert = rvalue_adequacy_witness(&rv).unwrap_or_else(|| {
-            panic!("nested BitBin({op:?}, ..) must get a modulo-3 certificate")
-        });
+        let cert = rvalue_adequacy_witness(&rv)
+            .unwrap_or_else(|| panic!("nested BitBin({op:?}, ..) must get a modulo-3 certificate"));
         assert!(cert.is_modulo_3(), "nested BitBin({op:?}, ..)'s certificate must be modulo 3");
     }
 }
@@ -5365,11 +5318,7 @@ fn flat_bitor_shape_certifies_end_to_end() {
     let body = VerifiableBody {
         locals: vec![
             LocalDecl { index: 0, ty: Ty::Bool, name: None },
-            LocalDecl {
-                index: 1,
-                ty: Ty::Int { width: 32, signed: true },
-                name: Some("v".into()),
-            },
+            LocalDecl { index: 1, ty: Ty::Int { width: 32, signed: true }, name: Some("v".into()) },
             LocalDecl { index: 2, ty: Ty::Bool, name: None },
             LocalDecl { index: 3, ty: Ty::Bool, name: None },
         ],
@@ -5586,9 +5535,7 @@ fn sem_guarded_local_value_recognizes_range_conjunction() {
 ///   (d) a non-`Bool`-typed target local — never denote an Int local as a Cond.
 #[test]
 fn sem_guarded_local_value_declines_adversarial_probes() {
-    use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Statement, Terminator, Ty, VerifiableBody,
-    };
+    use trust_types::{BasicBlock, BlockId, LocalDecl, Statement, Terminator, Ty, VerifiableBody};
     let u8t = || Ty::Int { width: 8, signed: false };
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
     let base_locals = || {
@@ -5617,8 +5564,13 @@ fn sem_guarded_local_value_declines_adversarial_probes() {
             }],
             terminator: Terminator::Return,
         });
-        let body =
-            VerifiableBody { locals: base_locals(), blocks, arg_count: 1, return_ty: Ty::Bool, datatype_defs: Default::default() };
+        let body = VerifiableBody {
+            locals: base_locals(),
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
         assert_eq!(
             sem_guarded_local_value(&body, 3, &param_index, None),
             None,
@@ -5644,10 +5596,16 @@ fn sem_guarded_local_value_declines_adversarial_probes() {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
             },
         });
-        let body =
-            VerifiableBody { locals: base_locals(), blocks, arg_count: 1, return_ty: Ty::Bool, datatype_defs: Default::default() };
+        let body = VerifiableBody {
+            locals: base_locals(),
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
         assert_eq!(
             sem_guarded_local_value(&body, 3, &param_index, None),
             None,
@@ -5713,7 +5671,13 @@ fn sem_guarded_local_value_declines_adversarial_probes() {
             terminator: Terminator::Goto(join),
         });
         blocks.push(BasicBlock { id: join, stmts: vec![], terminator: Terminator::Return });
-        let body = VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Bool, datatype_defs: Default::default() };
+        let body = VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
         assert_eq!(
             sem_guarded_local_value(&body, 2, &param_index, None),
             None,
@@ -5728,7 +5692,13 @@ fn sem_guarded_local_value_declines_adversarial_probes() {
         blocks.push(BasicBlock { id: join, stmts: vec![], terminator: Terminator::Return });
         let mut locals = base_locals();
         locals[3] = LocalDecl { index: 3, ty: u8t(), name: None }; // target is now Int-typed.
-        let body = VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Bool, datatype_defs: Default::default() };
+        let body = VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        };
         assert_eq!(
             sem_guarded_local_value(&body, 3, &param_index, None),
             None,
@@ -6226,8 +6196,8 @@ fn wave_d_compact_diamond_and_case_mask_forgery_probes() {
 #[test]
 fn sem_rvalue_of_mir_recognizes_bitor_on_guarded_locals() {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody,
     };
     let u8t = || Ty::Int { width: 8, signed: false };
     // Two non-overlapping range-conjunction groups: the first at block ids
@@ -6241,11 +6211,7 @@ fn sem_rvalue_of_mir_recognizes_bitor_on_guarded_locals() {
     let join_a = BlockId(4);
     let join_b = BlockId(9);
     let mut blocks = range_conjunction_blocks(0, 2, 4, 5, 1, 48, 57, join_a);
-    blocks.push(BasicBlock {
-        id: join_a,
-        stmts: vec![],
-        terminator: Terminator::Goto(BlockId(5)),
-    });
+    blocks.push(BasicBlock { id: join_a, stmts: vec![], terminator: Terminator::Goto(BlockId(5)) });
     blocks.extend(range_conjunction_blocks(5, 3, 6, 7, 1, 65, 90, join_b));
     blocks.push(BasicBlock {
         id: join_b,
@@ -6316,8 +6282,8 @@ fn sem_rvalue_of_mir_recognizes_bitor_on_guarded_locals() {
 #[test]
 fn guarded_local_bitor_shape_certifies_end_to_end() {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let u8t = || Ty::Int { width: 8, signed: false };
     // Contiguous local numbering (no gaps: `body.locals` is indexed BY POSITION,
@@ -6327,11 +6293,7 @@ fn guarded_local_bitor_shape_certifies_end_to_end() {
     let join_a = BlockId(4);
     let join_b = BlockId(9);
     let mut blocks = range_conjunction_blocks(0, 2, 4, 5, 1, 48, 57, join_a);
-    blocks.push(BasicBlock {
-        id: join_a,
-        stmts: vec![],
-        terminator: Terminator::Goto(BlockId(5)),
-    });
+    blocks.push(BasicBlock { id: join_a, stmts: vec![], terminator: Terminator::Goto(BlockId(5)) });
     blocks.extend(range_conjunction_blocks(5, 3, 6, 7, 1, 65, 90, join_b));
     blocks.push(BasicBlock {
         id: join_b,
@@ -6401,9 +6363,8 @@ fn real_ascii_bitor_family_fixtures_are_fully_faithful() {
         "num__<impl u8>__is_ascii_punctuation.json",
     ] {
         let func = read_required_fixture(&dir, name);
-        let cert = function_fully_faithful_witness(&func).unwrap_or_else(|| {
-            panic!("{name} must be fully faithful via the GUARDED-LOCAL layer")
-        });
+        let cert = function_fully_faithful_witness(&func)
+            .unwrap_or_else(|| panic!("{name} must be fully faithful via the GUARDED-LOCAL layer"));
         assert!(cert.is_modulo_3(), "{name}'s certificate must be modulo 3");
         assert!(
             matches!(cert.contract.ret, ReturnCertificate::StraightLine(_)),
@@ -6433,13 +6394,29 @@ fn real_signum_fixtures_certify_via_three_way_sign() {
     for w in ["i8", "i16", "i32", "i64"] {
         let name = format!("num__<impl {w}>__signum.json");
         let func = read_required_fixture(&dir, &name);
-        let cert = function_fully_faithful_witness(&func).unwrap_or_else(|| {
-            panic!("{name} must be fully faithful via the W-CMP-DISCR three-way-sign lane")
+        // MEASURED 2026-08-25 — this lane now certifies CLAUSE (a) only.
+        //
+        // `trust_vcgen` raises a DECLINED row (`UnsupportedMir { kind:
+        // "Rvalue::BinaryOp(Cmp)" }`) for the same `Cmp` rvalue this lane models, and
+        // clause (b) of `function_fully_faithful_witness` refuses a declined row rather
+        // than dropping it from an `is_safety_vc_kind` filter (which is what previously
+        // let a body whose only obligation was a decline pass every safety gate
+        // vacuously — the Channel-2 false proof). The W-CMP-DISCR content this test
+        // exists for is the recovered sign witness below, all of which still holds; the
+        // whole-function tier is HONESTLY DEFERRED until vcgen models `Cmp`.
+        let cert = function_adequacy_witness(&func).unwrap_or_else(|| {
+            panic!("{name} must certify its contract via the W-CMP-DISCR three-way-sign lane")
         });
         assert!(cert.is_modulo_3(), "{name}'s certificate must be modulo 3");
         assert!(
-            matches!(cert.contract.ret, ReturnCertificate::StraightLine(_)),
+            matches!(cert.ret, ReturnCertificate::StraightLine(_)),
             "{name} must certify via the StraightLine (MirSem fallback) return certificate"
+        );
+        assert!(
+            function_fully_faithful_witness(&func).is_none(),
+            "{name} carries a DECLINED Cmp row, so the WHOLE-FUNCTION tier must refuse; \
+             if vcgen learns to model `Rvalue::BinaryOp(Cmp)` this flips and the tier is \
+             recovered — update this assertion then, do not weaken the gate"
         );
         // The recovered return witness must be the SSA-temp sign rvalue
         // `_0 := ArithBin(Sub, Cmp(Gt, self, 0), Cmp(Lt, self, 0))`.
@@ -6510,9 +6487,29 @@ fn signum_forgeries_are_fail_closed() {
         );
     }
     if let Some(ctrl) = load("forgery__G6_signum_valid_control.json") {
-        let cert = function_fully_faithful_witness(&ctrl)
-            .expect("G6 is a genuine i32 signum — the positive control MUST certify");
-        assert!(cert.is_modulo_3(), "G6's certificate must be modulo 3");
+        // THE POSITIVE CONTROL, at the layer that still discriminates.
+        //
+        // MEASURED 2026-08-25: G6 no longer mints a `FullFaithfulnessCertificate`, and
+        // the reason is NOT its shape. `trust_vcgen` raises a DECLINED row
+        // (`UnsupportedMir { kind: "Rvalue::BinaryOp(Cmp)" }`) for the very `Cmp` rvalue
+        // the W-CMP-DISCR lane models, and clause (b) of the whole-function witness now
+        // refuses a declined row instead of silently dropping it (the decline clause in
+        // `function_emits_unmodeled_safety_vc`; before it, a body whose only obligation
+        // was a decline passed every safety gate vacuously). Recovering the tier means
+        // teaching vcgen to model `Rvalue::BinaryOp(Cmp)` — not teaching this gate to
+        // ignore the emitter.
+        //
+        // So the control moves to clause (a), the CONTRACT adequacy, which is what the
+        // forgery panel actually attacks: G1..G5 mutate the sign chain, G6 does not.
+        let cert = function_adequacy_witness(&ctrl)
+            .expect("G6 is a genuine i32 signum — its CONTRACT adequacy must still certify");
+        assert!(cert.is_modulo_3(), "G6's contract certificate must be modulo 3");
+        // ... and the clause-(b) refusal is itself pinned, so a future change that
+        // silently restores the vacuous pass fails here rather than going unnoticed.
+        assert!(
+            crate::mirsem::function_emits_unmodeled_safety_vc_pub(&ctrl),
+            "G6 emits a DECLINED Cmp row; the compensating gate must report it"
+        );
     }
 }
 
@@ -6526,8 +6523,7 @@ fn signum_forgeries_are_fail_closed() {
 /// The `is_ascii_control`-shaped guarded return as a hand-built witness:
 /// `if (0 <= x && x <= 31) || x == 127 { 1 } else { 0 }`.
 fn cf_or_return() -> SemCfReturn {
-    let leaf =
-        |op: SemCmpOp, a: SemOperand, b: SemOperand| SemCondTree::Leaf(SemCond { op, a, b });
+    let leaf = |op: SemCmpOp, a: SemOperand, b: SemOperand| SemCondTree::Leaf(SemCond { op, a, b });
     SemCfReturn {
         cond: SemCondTree::Or(
             Box::new(SemCondTree::And(
@@ -6593,9 +6589,8 @@ fn real_range_disjunction_fixtures_are_fully_faithful() {
         let rel = format!("{dir_rel}/{name}");
         let func = read_required_fixture(&required_corpus_dir(dir_rel), name);
         // The recognizer recovers an Or cond from the real control-flow `||`.
-        let r = sem_cf_return_shape_of(&func).unwrap_or_else(|| {
-            panic!("{rel} must be recognized by the decision-DAG recognizer")
-        });
+        let r = sem_cf_return_shape_of(&func)
+            .unwrap_or_else(|| panic!("{rel} must be recognized by the decision-DAG recognizer"));
         fn has_or(t: &SemCondTree) -> bool {
             match t {
                 SemCondTree::Leaf(_) => false,
@@ -6628,7 +6623,13 @@ fn decision_dag_declines_adversarial_probes() {
         name: "probe".to_string(),
         def_path: "probe".to_string(),
         span: Default::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Bool, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Bool,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -6686,11 +6687,7 @@ fn decision_dag_declines_adversarial_probes() {
         ];
         blocks.push(bool_arm(3, true, BlockId(5)));
         blocks.push(bool_arm(4, false, BlockId(5)));
-        blocks.push(BasicBlock {
-            id: BlockId(5),
-            stmts: vec![],
-            terminator: Terminator::Return,
-        });
+        blocks.push(BasicBlock { id: BlockId(5), stmts: vec![], terminator: Terminator::Return });
         let locals = vec![
             LocalDecl { index: 0, ty: Ty::Bool, name: None },
             LocalDecl { index: 1, ty: u8t(), name: Some("x".into()) },
@@ -6865,8 +6862,8 @@ fn sem_field_read_operand_recognizes_shared_ref_field_and_declines_others() {
 #[test]
 fn capturing_closure_upvar_read_admits_and_declines_forgeries() {
     use trust_types::{
-        ClosureCallKind, ClosureCallSig, LocalDecl, Operand, Place, Projection, Rvalue,
-        SourceSpan, Statement, Ty, VerifiableBody,
+        ClosureCallKind, ClosureCallSig, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
+        Statement, Ty, VerifiableBody,
     };
     let i32t = || Ty::Int { width: 32, signed: true };
     // A closure ENV type: one i32 upvar, given call kind.
@@ -6888,7 +6885,8 @@ fn capturing_closure_upvar_read_admits_and_declines_forgeries() {
         return_ty: i32t(),
         datatype_defs: Default::default(),
     };
-    let param_index = |local: usize| -> Option<u64> { (1..=2).contains(&local).then(|| (local - 1) as u64) };
+    let param_index =
+        |local: usize| -> Option<u64> { (1..=2).contains(&local).then(|| (local - 1) as u64) };
     let field0 = || Operand::Copy(Place { local: 1, projections: vec![Projection::Field(0)] });
 
     // POSITIVE: `_1.0` on a by-value FnOnce Closure env ⇒ `Field(Var 0, 0)`.
@@ -6996,8 +6994,8 @@ fn capturing_closure_upvar_read_admits_and_declines_forgeries() {
 #[test]
 fn sem_call_arg_ref_operand_resolves_immutable_referent_and_declines_forgeries() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-        Statement, Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
+        Terminator, Ty, VerifiableBody,
     };
     let opt = optres_option_i32_enum;
     let shared = |inner: Ty| Ty::Ref { mutable: false, inner: Box::new(inner) };
@@ -7234,11 +7232,7 @@ fn resolve_widening_cast_rvalue_admits_widening_declines_truncating_and_reinterp
             LocalDecl { index: 0, ty: u64t(), name: None },
             LocalDecl { index: 1, ty: src_ty, name: Some("x".into()) },
         ],
-        blocks: vec![BasicBlock {
-            id: BlockId(0),
-            stmts: vec![],
-            terminator: Terminator::Return,
-        }],
+        blocks: vec![BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Return }],
         arg_count: 1,
         return_ty: u64t(),
         datatype_defs: Default::default(),
@@ -7255,10 +7249,7 @@ fn resolve_widening_cast_rvalue_admits_widening_declines_truncating_and_reinterp
 
     // NEGATIVE: u64 -> u32, TRUNCATING — declines (never identity).
     let trunc_body = mk_body(u64t());
-    assert_eq!(
-        resolve_widening_cast_rvalue(&trunc_body, &op, &u32t(), &param_index, None),
-        None
-    );
+    assert_eq!(resolve_widening_cast_rvalue(&trunc_body, &op, &u32t(), &param_index, None), None);
 
     // POSITIVE (GAP-CROSS-SIGN-WIDEN, 2026-07-16): u32 -> i64 is a
     // SIGN-CROSSING *widening* (`W=64 > w=32`), hence VALUE-PRESERVING —
@@ -7295,11 +7286,7 @@ fn resolve_widening_cast_rvalue_signcross_widen_admits_and_fail_closed() {
             LocalDecl { index: 0, ty: ret.clone(), name: None },
             LocalDecl { index: 1, ty: src, name: Some("src".into()) },
         ],
-        blocks: vec![BasicBlock {
-            id: BlockId(0),
-            stmts: vec![],
-            terminator: Terminator::Return,
-        }],
+        blocks: vec![BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Return }],
         arg_count: 1,
         return_ty: ret,
         datatype_defs: Default::default(),
@@ -7434,9 +7421,7 @@ fn cast_assignment_destination_type_mismatch_fails_closed() {
     forged_return_ty.body.locals[0].ty = Ty::Int { width: 16, signed: true };
     assert!(trust_vcgen::validate_function(&forged_return_ty).is_err());
     assert!(function_adequacy_witness_with_callees(&forged_return_ty, &empty).is_none());
-    assert!(
-        !crate::prove::diagnose_fully_faithful_gate(&forged_return_ty, &empty).fully_faithful
-    );
+    assert!(!crate::prove::diagnose_fully_faithful_gate(&forged_return_ty, &empty).fully_faithful);
 }
 
 /// Trust: M6 rung 6 — the SHIFT-NARROWED EXACT cast width fact, both
@@ -7516,8 +7501,8 @@ fn shift_narrowed_cast_width_fact_admits_and_declines() {
 #[test]
 fn by_value_param_field_read_admits_and_declines_when_field_written() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-        Statement, Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
+        Terminator, Ty, VerifiableBody,
     };
     let u64t = || Ty::Int { width: 64, signed: false };
     let meta_ty = || Ty::adt("expr::meta::ExprMeta", vec![("0".into(), u64t())]);
@@ -7733,10 +7718,7 @@ fn sem_guard_cast_temp_operand_widening_is_exact_identity() {
     let u32t = trust_types::Ty::Int { width: 32, signed: false };
     let body = mk_cast_temp_body(u8t, u32t);
     let param_index = |local: usize| -> Option<u64> { (local == 1).then_some(0) };
-    assert_eq!(
-        sem_guard_cast_temp_operand(&body, 2, &param_index, None),
-        Some(SemOperand::Var(0))
-    );
+    assert_eq!(sem_guard_cast_temp_operand(&body, 2, &param_index, None), Some(SemOperand::Var(0)));
 }
 
 /// NEGATIVE (uniqueness gate): a MULTIPLY-assigned cast temp declines
@@ -7865,8 +7847,8 @@ fn nested_cast_source_defined_after_use_declines_at_production_site() {
 #[test]
 fn adt_guard_constant_cast_declines_value_changing_narrowing_and_sign_change() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody,
     };
     let cast_body = |constant: ConstValue, destination: Ty| VerifiableBody {
         locals: vec![
@@ -7910,8 +7892,7 @@ fn adt_guard_constant_cast_declines_value_changing_narrowing_and_sign_change() {
         "255u8 as i8 is -1, never the source constant 255"
     );
 
-    let negative_to_unsigned =
-        cast_body(ConstValue::Int(-1), Ty::Int { width: 8, signed: false });
+    let negative_to_unsigned = cast_body(ConstValue::Int(-1), Ty::Int { width: 8, signed: false });
     assert_eq!(
         sem_adt_guard_operand_of_mir(&negative_to_unsigned, &operand, &param_index, at_return,),
         None,
@@ -8168,8 +8149,8 @@ fn inc_return_func() -> trust_types::VerifiableFunction {
 #[test]
 fn function_adequacy_witness_composes_identity_return_modulo_3() {
     let func = identity_return_func();
-    let cert = function_adequacy_witness(&func)
-        .expect("identity-return function gets a composed witness");
+    let cert =
+        function_adequacy_witness(&func).expect("identity-return function gets a composed witness");
     assert!(cert.is_modulo_3(), "the composed witness must be modulo-3");
     // Every piece is certified: the return operand + its Use operand (1A), and
     // the return witness (1C). No binop here ⇒ 0 rvalue certs.
@@ -8211,18 +8192,22 @@ fn field_read_cast_leaf_func(
     cast_dest: trust_types::Ty,
 ) -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let u32t = || Ty::Int { width: 32, signed: false };
     let self_ty = Ty::Ref {
         mutable: self_mutable,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "test::S".into(),
             fields: vec![("0".into(), u32t())],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     VerifiableFunction {
         name: "len".into(),
@@ -8312,8 +8297,8 @@ fn field_read_cast_leaf_mut_self_declines() {
 /// (grounds to `Int.div`), so this composes its whole-function contract.
 fn div_return_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     VerifiableFunction {
@@ -8473,8 +8458,7 @@ fn cf_index_return() -> SemCfReturn {
 #[test]
 fn index_arm_operand_rvalue_branch_adequacy_proven_modulo_3() {
     // 1A: the `Index` operand and the `Len` operand each prove modulo 3.
-    let index_op =
-        SemOperand::Index(Box::new(SemOperand::Var(0)), Box::new(SemOperand::Var(1)));
+    let index_op = SemOperand::Index(Box::new(SemOperand::Var(0)), Box::new(SemOperand::Var(1)));
     assert_eq!(
         check_operand_adequacy(&index_op),
         AdequacyVerdict::ProvenModulo3,
@@ -8616,8 +8600,7 @@ fn wrong_nested_arm_rhs_fails_closed() {
 /// MirSem; `sign` emits no safety VC, so it is vacuously safe).
 #[test]
 fn real_sign_dump_is_nested_and_fully_faithful_modulo_3() {
-    let dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/real-spec-corpus");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/real-spec-corpus");
     let bytes = match std::fs::read(dir.join("sign.json")) {
         Ok(b) => b,
         Err(_) => return, // fixture not present
@@ -8785,12 +8768,8 @@ fn nested_clamp_declines_leaf_to_leaf_overwrite() {
     use trust_types::{BlockId, Terminator};
 
     let Some(mut function) = load_clamp_func() else { return };
-    let first_leaf = function
-        .body
-        .blocks
-        .iter_mut()
-        .find(|block| block.id == BlockId(2))
-        .expect("clamp bb2");
+    let first_leaf =
+        function.body.blocks.iter_mut().find(|block| block.id == BlockId(2)).expect("clamp bb2");
     // The original bb2 writes the high-bound leaf and goes directly to
     // the inner convergence merge. Route it through bb3, a distinct real
     // leaf that overwrites the same convergence local with `x`.
@@ -8903,6 +8882,7 @@ fn pick_call_func() -> trust_types::VerifiableFunction {
                         span: Default::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -8919,6 +8899,7 @@ fn pick_call_func() -> trust_types::VerifiableFunction {
                         span: Default::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -8948,6 +8929,7 @@ fn identity_callee_fact() -> CalleeFact {
         return_ty: u32_ty,
         requires: Some(vec![]),
         param_names: vec![Some("x".into())],
+        ret_model: None,
     }
 }
 
@@ -9033,12 +9015,8 @@ fn sem_branch_call_shape_declines_assign_arm_overwritten_by_another_arm() {
         // leaf, but execution continues through bb2 and replaces `_0`.
         terminator: Terminator::Goto(BlockId(2)),
     });
-    let entry = function
-        .body
-        .blocks
-        .iter_mut()
-        .find(|block| block.id == BlockId(0))
-        .expect("pick entry");
+    let entry =
+        function.body.blocks.iter_mut().find(|block| block.id == BlockId(0)).expect("pick entry");
     let Terminator::SwitchInt { targets, .. } = &mut entry.terminator else {
         panic!("pick entry must switch")
     };
@@ -9049,6 +9027,187 @@ fn sem_branch_call_shape_declines_assign_arm_overwritten_by_another_arm() {
     assert!(
         sem_branch_call_shape_of(&function, &registry).is_none(),
         "an assign leaf that flows through another assign leaf must decline"
+    );
+}
+
+/// GUARDED DELEGATION (2026-08-24) — a branch whose other arm diverges is a GUARD.
+///
+/// `fn f(x) -> T { if bad { panic!() } else { g(x) } }` is what every bounds-checked
+/// or `unwrap`-carrying delegation compiles to, and it was declined for containing a
+/// `SwitchInt`. Measured on a 3082-body real-code harvest: of the 96 best
+/// divergence-sink candidates, 90 contain a `SwitchInt` — the branch, not the panic,
+/// was the remaining obstacle.
+///
+/// The admitting rule is reachability: walk the RETURNING SUBGRAPH and require each
+/// step to have exactly ONE successor from which `Return` is reachable. The other
+/// arms cannot return, and this certificate is partial correctness over returning
+/// executions.
+///
+/// The boundary assertion here is the one that keeps that from becoming "ignore
+/// branches": a genuine TWO-WAY JOIN, where both arms reach the `Return`, must
+/// still decline.
+#[test]
+fn sem_call_return_of_mir_admits_a_guard_but_not_a_join() {
+    use trust_types::{BasicBlock, BlockId, Operand, Place, Terminator, UnwindEdge};
+
+    // bb0: SwitchInt(_4) { 0 -> bb7 } otherwise -> bb1
+    // bb1: _0 = helper1(_2) -> bb3
+    // bb3: Return
+    // bb7: <the arm under test>
+    let build = |arm: Terminator| {
+        let mut f = pick_call_func();
+        f.body.blocks.retain(|b| b.id != BlockId(2));
+        let entry = f.body.blocks.iter_mut().find(|b| b.id == BlockId(0)).expect("entry");
+        let Terminator::SwitchInt { targets, otherwise, .. } = &mut entry.terminator else {
+            panic!("entry must switch")
+        };
+        targets[0].1 = BlockId(7);
+        *otherwise = BlockId(1);
+        f.body.blocks.push(BasicBlock { id: BlockId(7), stmts: vec![], terminator: arm });
+        f
+    };
+    let mut registry = std::collections::BTreeMap::new();
+    registry.insert("helper1".to_string(), identity_callee_fact());
+
+    // A diverging PANIC arm — the guard shape. ADMITTED.
+    let panic_arm = Terminator::Call {
+        unwind: UnwindEdge::Unreachable,
+        func: "core::panicking::panic".into(),
+        args: vec![Operand::Copy(Place::local(2))],
+        dest: Place::local(4),
+        target: None,
+        span: Default::default(),
+        atomic: None,
+        is_unsafe_sig: false,
+        is_foreign: false,
+        callee_identity: None,
+    };
+    assert!(
+        sem_call_return_of_mir(&build(panic_arm), &registry).is_some(),
+        "a guard whose other arm diverges must be admitted — the arm cannot return"
+    );
+    // An `Unreachable` arm is the same argument.
+    assert!(
+        sem_call_return_of_mir(&build(Terminator::Unreachable), &registry).is_some(),
+        "an Unreachable arm cannot return either"
+    );
+
+    // THE BOUNDARY: an arm that REACHES THE RETURN is a join, not a guard. The
+    // returned value would then depend on which arm ran, which this lane does not
+    // model — it must decline.
+    assert!(
+        sem_call_return_of_mir(&build(Terminator::Goto(BlockId(3))), &registry).is_none(),
+        "a second arm that reaches the Return is a JOIN — the value is no longer just \
+         the call's result, and admitting it would certify a body this lane cannot model"
+    );
+}
+
+/// DIVERGENCE SINKS (2026-08-24) — a call that never returns is not a second call.
+///
+/// A `Terminator::Call` with `target: None` has no successor; rustc emits it only
+/// for a `!`-typed callee, and `core::panicking::*` is the overwhelming instance
+/// (measured: 511 of 511 panic sites in a 3082-body real-code harvest). No
+/// RETURNING execution passes through such a block, and this certificate speaks
+/// only about returning executions.
+///
+/// The lane used to decline any body with a second `Call`, so an ordinary
+/// `fn f(x) -> T { g(x) }` compiled with a bounds check was rejected for a call it
+/// can never return from.
+#[test]
+fn sem_call_return_of_mir_treats_a_diverging_call_as_a_sink() {
+    use trust_types::{BasicBlock, BlockId, Operand, Place, Terminator, UnwindEdge};
+
+    let with_extra_block = |term: Terminator| {
+        let mut f = pick_call_func();
+        // Collapse the branch so the body is the linear sole-call spine, then hang
+        // the extra terminator off a fresh block.
+        let entry = f.body.blocks.iter_mut().find(|b| b.id == BlockId(0)).expect("entry");
+        entry.terminator = Terminator::Goto(BlockId(1));
+        f.body.blocks.retain(|b| b.id != BlockId(2));
+        f.body.blocks.push(BasicBlock { id: BlockId(9), stmts: vec![], terminator: term });
+        f
+    };
+    let diverging = |func: &str| Terminator::Call {
+        unwind: UnwindEdge::Unreachable,
+        func: func.into(),
+        args: vec![Operand::Copy(Place::local(2))],
+        dest: Place::local(4),
+        target: None, // <- never returns
+        span: Default::default(),
+        atomic: None,
+        is_unsafe_sig: false,
+        is_foreign: false,
+        callee_identity: None,
+    };
+
+    let mut registry = std::collections::BTreeMap::new();
+    registry.insert("helper1".to_string(), identity_callee_fact());
+
+    // CONTROL: the linear sole-call spine is recognized.
+    assert!(
+        sem_call_return_of_mir(&with_extra_block(Terminator::Unreachable), &registry).is_some(),
+        "control: the linear sole-call spine with an Unreachable island is recognized"
+    );
+
+    // A DIVERGING call alongside it is a sink, not a second call.
+    assert!(
+        sem_call_return_of_mir(&with_extra_block(diverging("core::panicking::panic")), &registry)
+            .is_some(),
+        "a call with target: None never returns — it must not disqualify the body"
+    );
+
+    // THE BOUNDARY: a second RETURNING call still declines. This is the assertion
+    // that keeps the change from being "ignore extra calls".
+    let mut returning_second = diverging("helper1");
+    if let Terminator::Call { target, .. } = &mut returning_second {
+        *target = Some(BlockId(3));
+    }
+    assert!(
+        sem_call_return_of_mir(&with_extra_block(returning_second), &registry).is_none(),
+        "a second RETURNING call is still not the sole-call shape"
+    );
+}
+
+/// CARRIER GATE (2026-08-23) — the regression cover the gate shipped WITHOUT.
+///
+/// `sem_call_arm_of_mir` requires the branch JOIN local and `_0` to be `Int`/`Bool`
+/// (`return_lift.rs`). It was added by the int→float cast lane after adversarial
+/// review found a real composition: two certified float-returning callees joined on a
+/// FLOAT local and modelled as a `Bool.rec` select on the opaque **Int** carrier.
+///
+/// The gate landed with no test. Measured 2026-08-23 by neutering it to `if false &&
+/// (…)`: the whole trust-clean suite stayed green, 2642 passed / 0 failed. A guard no
+/// test defends is a guard the next refactor deletes, so this pins it — and pins it
+/// the only way that isolates the gate, by holding the SHAPE fixed and moving nothing
+/// but the carrier type.
+#[test]
+fn sem_branch_call_shape_of_declines_a_non_scalar_join_carrier() {
+    let f32ty = || trust_types::Ty::Float { width: 32 };
+
+    // POSITIVE CONTROL — the identical branch-over-two-calls shape on the Int
+    // carrier IS recognized. Without this the negative below would pass for any
+    // reason at all, including the shape being unrecognizable in the first place.
+    let mut registry = std::collections::BTreeMap::new();
+    registry.insert("helper1".to_string(), identity_callee_fact());
+    registry.insert("helper2".to_string(), identity_callee_fact());
+    assert!(
+        sem_branch_call_shape_of(&pick_call_func(), &registry).is_some(),
+        "control: the u32-carrier pick shape must still be recognized"
+    );
+
+    // THE GATE — same blocks, same terminators, same args, same arity. The ONLY
+    // edits are the join local's type and the callees' return type.
+    let mut func = pick_call_func();
+    func.body.locals[0].ty = f32ty();
+    func.body.return_ty = f32ty();
+    let float_returning = || CalleeFact { return_ty: f32ty(), ..identity_callee_fact() };
+    let mut float_registry = std::collections::BTreeMap::new();
+    float_registry.insert("helper1".to_string(), float_returning());
+    float_registry.insert("helper2".to_string(), float_returning());
+    assert!(
+        sem_branch_call_shape_of(&func, &float_registry).is_none(),
+        "a FLOAT join local must never be modelled as a Bool.rec select on the Int \
+         carrier — this is the gate the cast lane's review installed"
     );
 }
 
@@ -9130,8 +9289,8 @@ fn index_extension_rests_on_three_axioms_no_fourth() {
 #[test]
 fn unguarded_index_bounds_vc_not_discharged_fails_closed() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let u32t = || Ty::Int { width: 32, signed: false };
     let usz = || Ty::Int { width: 64, signed: false };
@@ -9194,15 +9353,9 @@ fn lemma_1c_cf_comparison_guarded_arithmetic_return_proven_modulo_3() {
 fn lemma_1c_cf_all_comparison_ops_prove_modulo_3() {
     // Every modeled comparison op (Lt/Le/Eq/Ne/Gt/Ge) yields a modulo-3 adequacy
     // — each grounds to an axiom-free Bool-valued prelude comparison.
-    for op in
-        [SemCmpOp::Lt, SemCmpOp::Le, SemCmpOp::Eq, SemCmpOp::Ne, SemCmpOp::Gt, SemCmpOp::Ge]
-    {
+    for op in [SemCmpOp::Lt, SemCmpOp::Le, SemCmpOp::Eq, SemCmpOp::Ne, SemCmpOp::Gt, SemCmpOp::Ge] {
         let r = SemCfReturn {
-            cond: SemCondTree::Leaf(SemCond {
-                op,
-                a: SemOperand::Var(0),
-                b: SemOperand::Var(1),
-            }),
+            cond: SemCondTree::Leaf(SemCond { op, a: SemOperand::Var(0), b: SemOperand::Var(1) }),
             then_rv: SemRvalue::Use(SemOperand::Var(0)),
             else_rv: SemRvalue::Use(SemOperand::Const(0)),
         };
@@ -9263,8 +9416,7 @@ fn wrong_polarity_cf_return_claim_fails_closed() {
     let r = cf_div_return();
     let bd = || BinderData::from(BinderInfo::Default);
     let e_ref = Expr::bvar(0);
-    let bool_rec =
-        Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
+    let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
     let int_motive = Expr::lam(bd(), cst("Bool"), int_ty());
     let eval_rvalue = cst(MIRSEM_EVAL_RVALUE);
     // SWAPPED: false arm = eval_rvalue e THEN, true arm = eval_rvalue e ELSE.
@@ -9295,11 +9447,8 @@ fn wrong_condition_polarity_cf_return_claim_fails_closed() {
         a: SemOperand::Var(1),
         b: SemOperand::Const(0),
     });
-    let wrong = SemCfReturn {
-        cond: wrong_cond,
-        then_rv: r.then_rv.clone(),
-        else_rv: r.else_rv.clone(),
-    };
+    let wrong =
+        SemCfReturn { cond: wrong_cond, then_rv: r.then_rv.clone(), else_rv: r.else_rv.clone() };
     // The wrong-cond witness denotation differs from the true one; claiming the
     // true (Ne) RHS against the wrong (Eq) eval_ite must be rejected.
     let e_ref = Expr::bvar(0);
@@ -9404,9 +9553,8 @@ fn guarded_control_flow_return_reaches_whole_function_tier_via_branch_refinement
     // note deferred until. So `function_adequacy_witness` mints a `ControlFlow` return
     // certificate, GATED on the genuine refinement proving.
     let func = guarded_div_cf_func();
-    let cert = function_adequacy_witness(&func).expect(
-        "a guarded return WITH a proven branch refinement reaches the whole-function tier",
-    );
+    let cert = function_adequacy_witness(&func)
+        .expect("a guarded return WITH a proven branch refinement reaches the whole-function tier");
     assert!(cert.is_modulo_3(), "the guarded whole-function witness rests on ⊆ 3 axioms");
     assert!(
         matches!(cert.ret, ReturnCertificate::ControlFlow(_)),
@@ -9435,14 +9583,9 @@ fn sem_cf_return_of_mir_recognizes_guarded_div_shape() {
         (1..=arg_count).contains(&local).then(|| (local - 1) as u64)
     };
     let cf = sem_cf_return_of_mir(&func, &param_index).expect("recognized cf shape");
-    let SemCondTree::Leaf(cf_cond) = &cf.cond else {
-        panic!("single-cmp guard must be a Leaf")
-    };
+    let SemCondTree::Leaf(cf_cond) = &cf.cond else { panic!("single-cmp guard must be a Leaf") };
     assert_eq!(cf_cond.op, SemCmpOp::Ne);
-    assert_eq!(
-        cf.then_rv,
-        SemRvalue::Bin(SemBinOp::Div, SemOperand::Var(0), SemOperand::Var(1))
-    );
+    assert_eq!(cf.then_rv, SemRvalue::Bin(SemBinOp::Div, SemOperand::Var(0), SemOperand::Var(1)));
     assert_eq!(cf.else_rv, SemRvalue::Use(SemOperand::Const(0)));
 }
 
@@ -9477,15 +9620,9 @@ fn refinement_b_proven_modulo_3_for_guarded_returns() {
 fn refinement_b_all_comparison_ops_prove_modulo_3() {
     // Every modeled comparison guard (Lt/Le/Eq/Ne/Gt/Ge) yields a modulo-3 branch
     // refinement — each grounds (via ground_bool) to an axiom-free Bool comparison.
-    for op in
-        [SemCmpOp::Lt, SemCmpOp::Le, SemCmpOp::Eq, SemCmpOp::Ne, SemCmpOp::Gt, SemCmpOp::Ge]
-    {
+    for op in [SemCmpOp::Lt, SemCmpOp::Le, SemCmpOp::Eq, SemCmpOp::Ne, SemCmpOp::Gt, SemCmpOp::Ge] {
         let r = SemCfReturn {
-            cond: SemCondTree::Leaf(SemCond {
-                op,
-                a: SemOperand::Var(0),
-                b: SemOperand::Var(1),
-            }),
+            cond: SemCondTree::Leaf(SemCond { op, a: SemOperand::Var(0), b: SemOperand::Var(1) }),
             then_rv: SemRvalue::Use(SemOperand::Var(0)),
             else_rv: SemRvalue::Use(SemOperand::Const(0)),
         };
@@ -9510,17 +9647,11 @@ fn refinement_b_denote_substituted_b_is_the_live_ground_int_ite() {
         let n = indices.len();
         let grounded = live_ground_int(&r.to_formula(), &indices)
             .expect("the LIVE grounder must ground the guarded return's Ite formula");
-        let env_e = grounding_env_expr(&indices, &|i| {
-            Expr::bvar(u32::try_from(n - 1 - i).unwrap_or(0))
-        });
+        let env_e =
+            grounding_env_expr(&indices, &|i| Expr::bvar(u32::try_from(n - 1 - i).unwrap_or(0)));
         let denote = Expr::apps(
             cst(MIRSEM_DENOTE_SUBST_B),
-            [
-                env_e,
-                r.cond.to_cond_expr(),
-                r.then_rv.to_rvalue_expr(),
-                r.else_rv.to_rvalue_expr(),
-            ],
+            [env_e, r.cond.to_cond_expr(), r.then_rv.to_rvalue_expr(), r.else_rv.to_rvalue_expr()],
         );
         assert!(
             tc.is_def_eq(&denote, &grounded),
@@ -9680,8 +9811,8 @@ fn arm_value_rvalue_for_models_neg_arm_and_index_arm() {
         return_ty: trust_types::Ty::Int { width: 32, signed: true },
         datatype_defs: Default::default(),
     };
-    let modeled = arm_value_rvalue_for(&body, &neg_arm, 0, &param_index)
-        .expect("a Neg arm is now modeled");
+    let modeled =
+        arm_value_rvalue_for(&body, &neg_arm, 0, &param_index).expect("a Neg arm is now modeled");
     assert_eq!(
         modeled,
         SemRvalue::Bin(SemBinOp::Sub, SemOperand::Const(0), SemOperand::Var(0)),
@@ -9812,19 +9943,15 @@ fn arm_value_rvalue_for_models_neg_arm_and_index_arm() {
 #[test]
 fn transparent_unwrap_multihop_field_return_certifies() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
-        Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction,
     };
     let u8t = || Ty::Int { width: 8, signed: false };
     let adt = |name: &str, fields: Vec<(String, Ty)>, variants_nonempty: bool| Ty::Adt {
         name: name.into(),
         fields,
         variants: if variants_nonempty {
-            vec![trust_types::VariantDef {
-                name: "V".into(),
-                discriminant: 0,
-                fields: vec![],
-            }]
+            vec![trust_types::VariantDef { name: "V".into(), discriminant: 0, fields: vec![] }]
         } else {
             vec![]
         },
@@ -9894,11 +10021,7 @@ fn transparent_unwrap_multihop_field_return_certifies() {
                     LocalDecl { index: 1, ty: chain(variant), name: Some("self".into()) },
                     LocalDecl { index: 2, ty: chain(variant), name: None },
                 ],
-                blocks: vec![BasicBlock {
-                    id: BlockId(0),
-                    stmts,
-                    terminator: Terminator::Return,
-                }],
+                blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
                 arg_count: 1,
                 return_ty: u8t(),
                 datatype_defs: Default::default(),
@@ -9917,10 +10040,7 @@ fn transparent_unwrap_multihop_field_return_certifies() {
     let r = sem_return_of_mir(&ok, &param_index).expect("the multi-hop chain must lift");
     assert_eq!(
         r.ret,
-        SemOperand::Field(
-            Box::new(SemOperand::Field(Box::new(SemOperand::Var(0)), 0)),
-            0
-        ),
+        SemOperand::Field(Box::new(SemOperand::Field(Box::new(SemOperand::Var(0)), 0)), 0),
         "the nested opaque selector, hop for hop"
     );
     let cert = function_fully_faithful_witness_with_callees(&ok, &Default::default())
@@ -9938,10 +10058,7 @@ fn transparent_unwrap_multihop_field_return_certifies() {
     // both lift and certify — the arm is hop-count- and operand-kind-agnostic.
     for variant in ["three_hop", "move_operand"] {
         let f = build(variant);
-        assert!(
-            sem_return_of_mir(&f, &param_index).is_some(),
-            "{variant} must lift"
-        );
+        assert!(sem_return_of_mir(&f, &param_index).is_some(), "{variant} must lift");
         assert!(
             function_fully_faithful_witness_with_callees(&f, &Default::default())
                 .is_some_and(|c| c.is_modulo_3()),
@@ -9959,10 +10076,7 @@ fn transparent_unwrap_multihop_field_return_certifies() {
         "temp_base",
     ] {
         let f = build(variant);
-        assert!(
-            sem_return_of_mir(&f, &param_index).is_none(),
-            "{variant} must decline"
-        );
+        assert!(sem_return_of_mir(&f, &param_index).is_none(), "{variant} must decline");
     }
     // THE REGENERATED REAL DUMPS (2026-08-18, the regen slice): the committed
     // `NonZero::<u8>::get` now reads `_0 := Copy(_1.0.0)` — the PROVENANCE
@@ -10012,6 +10126,7 @@ fn stable_callee_ids_are_membership_independent() {
         return_ty: trust_types::Ty::Bool,
         requires: Some(vec![]),
         param_names: vec![Some("self".into())],
+        ret_model: None,
     };
     let resolve = super::call_lift::resolve_certified_callee;
     let mut small = std::collections::BTreeMap::new();
@@ -10143,10 +10258,7 @@ fn checked_field_resolution_requires_definition_before_use() {
             id: BlockId(0),
             stmts: vec![body.blocks[0].stmts[0].clone()],
             terminator: Terminator::Assert {
-                cond: Operand::Move(Place {
-                    local: 3,
-                    projections: vec![Projection::Field(1)],
-                }),
+                cond: Operand::Move(Place { local: 3, projections: vec![Projection::Field(1)] }),
                 expected: false,
                 msg: trust_types::AssertMessage::Overflow(BinOp::Add),
                 target: BlockId(1),
@@ -10166,8 +10278,8 @@ fn checked_field_resolution_requires_definition_before_use() {
 #[test]
 fn straight_line_return_definition_rejects_hidden_root_effects() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody,
     };
     let int = || Ty::Int { width: 32, signed: true };
     let assignment = Statement::Assign {
@@ -10239,8 +10351,8 @@ fn straight_line_return_definition_rejects_hidden_root_effects() {
 #[test]
 fn straight_line_return_spine_allows_only_one_returning_switch_successor() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody,
     };
     let int = || Ty::Int { width: 32, signed: true };
     let assign = |value| Statement::Assign {
@@ -10425,10 +10537,7 @@ fn sem_cf_return_of_mir_recognizes_conjunctive_guard() {
         })
     );
     // The then/else arms: a + b (then) and 0 (else).
-    assert_eq!(
-        cf.then_rv,
-        SemRvalue::Bin(SemBinOp::Add, SemOperand::Var(0), SemOperand::Var(1))
-    );
+    assert_eq!(cf.then_rv, SemRvalue::Bin(SemBinOp::Add, SemOperand::Var(0), SemOperand::Var(1)));
     assert_eq!(cf.else_rv, SemRvalue::Use(SemOperand::Const(0)));
     // Its branch refinement proves modulo 3 — the conjunctive guard IS adequate.
     assert_eq!(
@@ -10466,12 +10575,14 @@ fn sem_cf_return_of_mir_recognizes_conjunctive_guard() {
 /// exactly one axis at a time).
 fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-        Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction,
     };
     let either_ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "Either".to_string(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -10492,7 +10603,9 @@ fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
             ],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     VerifiableFunction {
         name: "is_left".into(),
@@ -10523,11 +10636,7 @@ fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
                         span: trust_types::SourceSpan::default(),
                     },
                 },
-                BasicBlock {
-                    id: BlockId(1),
-                    stmts: vec![],
-                    terminator: Terminator::Unreachable,
-                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Unreachable },
                 BasicBlock {
                     id: BlockId(2),
                     stmts: vec![Statement::Assign {
@@ -10620,12 +10729,16 @@ fn discriminant_base_accepts_only_validated_enum_representations() {
         *inner = Box::new(ty);
     };
     let tag = || ("__tag".into(), Ty::Int { width: 64, signed: true });
-    let legacy = |fields| Ty::Adt { adt_kind: None, layout: None,
+    let legacy = |fields| Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "MaybeEnum".into(),
         fields,
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let malformed = [
         ("scalar", Ty::Int { width: 64, signed: true }),
         ("ordinary struct", Ty::adt("S", vec![("value".into(), Ty::Bool)])),
@@ -10782,11 +10895,13 @@ fn either_is_left_inverted_arm_mapping_models_correctly() {
 // K is read from the MIR switch value. tag_true is the value-K arm's bool.
 fn bound_matches_shaped_func(k: u128, tag_true: bool) -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
-        Terminator, Ty, VariantDef, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
+        Ty, VariantDef, VerifiableBody, VerifiableFunction,
     };
     let i32t = Ty::Int { width: 32, signed: true };
-    let bound_ty = Ty::Adt { adt_kind: None, layout: None,
+    let bound_ty = Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "std::ops::Bound".to_string(),
         fields: vec![
             ("__tag".to_string(), Ty::Int { width: 64, signed: true }),
@@ -10804,14 +10919,12 @@ fn bound_matches_shaped_func(k: u128, tag_true: bool) -> trust_types::Verifiable
                 discriminant: 1,
                 fields: vec![("0".to_string(), i32t.clone())],
             },
-            VariantDef {
-                name: "Unbounded".to_string(),
-                discriminant: 2,
-                fields: vec![],
-            },
+            VariantDef { name: "Unbounded".to_string(), discriminant: 2, fields: vec![] },
         ],
         disc_index_safe: true,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     VerifiableFunction {
         name: "w_bound_matches".into(),
         def_path: "w_bound_matches".into(),
@@ -10968,12 +11081,7 @@ fn canonical_trait_method_bridges_from_forwarder_spellings() {
     assert_eq!(q, d, "the two spellings of `u32::from(u8)` must canonicalize equal");
     assert_eq!(
         q,
-        (
-            "std::convert::From".to_string(),
-            "u8".to_string(),
-            "u32".to_string(),
-            "from".to_string()
-        )
+        ("std::convert::From".to_string(), "u8".to_string(), "u32".to_string(), "from".to_string())
     );
     // NEGATIVE: two DIFFERENT From impls must NOT cross-match.
     let other_arg = canonical_trait_method("<u32 as std::convert::From<u16>>::from").unwrap();
@@ -11001,6 +11109,7 @@ fn resolve_certified_callee_bridges_from_impl_spelling_no_cross_match() {
         return_ty: trust_types::Ty::Int { width: 32, signed: false },
         requires: Some(vec![]),
         param_names: vec![Some("x".into())],
+        ret_model: None,
     };
     let mut reg: BTreeMap<String, CalleeFact> = BTreeMap::new();
     reg.insert(
@@ -11009,10 +11118,7 @@ fn resolve_certified_callee_bridges_from_impl_spelling_no_cross_match() {
     );
     let hit = resolve_certified_callee(&reg, "<u32 as std::convert::From<u8>>::from");
     assert!(hit.is_some(), "the From-forwarder call must resolve to the certified impl");
-    assert_eq!(
-        hit.unwrap().0,
-        "std::convert::num::<impl std::convert::From<u8> for u32>::from"
-    );
+    assert_eq!(hit.unwrap().0, "std::convert::num::<impl std::convert::From<u8> for u32>::from");
     // A DIFFERENT From impl (From<u16>) must NOT borrow this certificate.
     assert!(
         resolve_certified_callee(&reg, "<u32 as std::convert::From<u16>>::from").is_none(),
@@ -11035,6 +11141,7 @@ fn resolve_certified_callee_canonical_ambiguity_fails_closed() {
         return_ty: trust_types::Ty::Int { width: 32, signed: false },
         requires: Some(vec![]),
         param_names: vec![Some("x".into())],
+        ret_model: None,
     };
     let mut reg: BTreeMap<String, CalleeFact> = BTreeMap::new();
     reg.insert("a::<impl std::convert::From<u8> for u32>::from".to_string(), fact.clone());
@@ -11050,19 +11157,23 @@ fn resolve_certified_callee_canonical_ambiguity_fails_closed() {
 // width-changing `IntToInt` cast (`buf.cap as u32`, u64 -> u32) feeding a call arg.
 fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let u32t = Ty::Int { width: 32, signed: false };
     let u64t = Ty::Int { width: 64, signed: false };
     let ref_to = |name: &str, field_ty: Ty| Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: name.to_string(),
             fields: vec![("padding".into(), Ty::Unit), ("value".into(), field_ty)],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     let field_read = |base: usize, fld: usize| {
         Rvalue::Use(Operand::Copy(Place {
@@ -11082,11 +11193,7 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
                     ty: ref_to("Config", u32t.clone()),
                     name: Some("self".into()),
                 },
-                LocalDecl {
-                    index: 2,
-                    ty: ref_to("Buf", u64t.clone()),
-                    name: Some("buf".into()),
-                },
+                LocalDecl { index: 2, ty: ref_to("Buf", u64t.clone()), name: Some("buf".into()) },
                 LocalDecl { index: 3, ty: u32t.clone(), name: None },
                 LocalDecl { index: 4, ty: u32t.clone(), name: None },
                 LocalDecl { index: 5, ty: u64t, name: None },
@@ -11113,10 +11220,7 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
                     ],
                     terminator: Terminator::Call {
                         func: "<u32 as std::cmp::Ord>::min".into(),
-                        args: vec![
-                            Operand::Move(Place::local(3)),
-                            Operand::Move(Place::local(4)),
-                        ],
+                        args: vec![Operand::Move(Place::local(3)), Operand::Move(Place::local(4))],
                         dest: Place::local(0),
                         target: Some(BlockId(1)),
                         unwind: trust_types::UnwindEdge::Unreachable,
@@ -11124,6 +11228,7 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -11154,22 +11259,13 @@ fn width_changing_cast_arg_resolves_to_opaque_carrier_not_identity() {
     };
     let arg4 = Operand::Move(Place::local(4));
     assert!(
-        sem_call_arg_samewidth_bitcast_operand(
-            body,
-            &arg4,
-            trust_types::BlockId(0),
-            &pidx,
-        )
-        .is_none(),
+        sem_call_arg_samewidth_bitcast_operand(body, &arg4, trust_types::BlockId(0), &pidx,)
+            .is_none(),
         "a width-changing cast must NOT resolve via the same-width reinterpret lane"
     );
-    let carrier = sem_call_arg_widthchanging_cast_operand(
-        body,
-        &arg4,
-        trust_types::BlockId(0),
-        &pidx,
-    )
-        .expect("the width-changing cast arg must resolve to the opaque carrier");
+    let carrier =
+        sem_call_arg_widthchanging_cast_operand(body, &arg4, trust_types::BlockId(0), &pidx)
+            .expect("the width-changing cast arg must resolve to the opaque carrier");
     match carrier {
         SemOperand::Cast(base, 32, false) => {
             // The carrier wraps the resolved field read — an OPAQUE base, NOT a
@@ -11207,11 +11303,11 @@ fn capped_count_forwarder_certifies_with_min_callee() {
             return_ty: trust_types::Ty::Int { width: 32, signed: false },
             requires: Some(vec![]),
             param_names: vec![Some("self".into()), Some("other".into())],
+            ret_model: None,
         },
     );
     assert!(
-        function_fully_faithful_witness_with_callees(&func, &reg)
-            .is_some_and(|c| c.is_modulo_3()),
+        function_fully_faithful_witness_with_callees(&func, &reg).is_some_and(|c| c.is_modulo_3()),
         "capped_count must certify once its width-changing cast arg resolves"
     );
 }
@@ -11456,12 +11552,14 @@ fn either_is_left_otherwise_not_unreachable_declines() {
 /// `fixtures/either-discriminant-corpus/Either__<L, R>__is_right.json`).
 fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
-        UnOp, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty, UnOp,
+        VerifiableBody, VerifiableFunction,
     };
     let either_ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt { adt_kind: None, layout: None,
+        inner: Box::new(Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "Either".to_string(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -11482,7 +11580,9 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
             ],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }),
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }),
     };
     VerifiableFunction {
         name: "is_right".into(),
@@ -11508,6 +11608,7 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock {
@@ -11549,6 +11650,7 @@ fn either_is_left_callee_registry(
             return_ty,
             requires: Some(vec![]),
             param_names: vec![Some("self".into())],
+            ret_model: None,
         },
     );
     registry
@@ -11910,10 +12012,8 @@ fn ordering_as_raw_wrong_tag_claim_is_kernel_rejected() {
     // literal constant 0 for EVERY `self`. FALSE — `Discriminant`'s
     // denotation is the opaque, uninterpreted `idx_elem(base, -1)` carrier;
     // claiming it collapses to a closed literal must fail to type-check.
-    let r = SemReturn {
-        stmts: vec![],
-        ret: SemOperand::Discriminant(Box::new(SemOperand::Var(0))),
-    };
+    let r =
+        SemReturn { stmts: vec![], ret: SemOperand::Discriminant(Box::new(SemOperand::Var(0))) };
     let wrong_rhs = int_lit(0);
     let verdict = check_return_adequacy_inner(&r, Some(&wrong_rhs));
     assert!(
@@ -11971,7 +12071,10 @@ fn load_fixture(name: &str) -> trust_types::VerifiableFunction {
     );
     let path = dir.join(name);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-        panic!("required fixture {} could not be read: {e} (a rename must FAIL, not skip)", path.display())
+        panic!(
+            "required fixture {} could not be read: {e} (a rename must FAIL, not skip)",
+            path.display()
+        )
     });
     crate::prove::decode_verifiable_function_with_authenticated_legacy_metadata(&bytes)
         .unwrap_or_else(|e| panic!("decode required fixture {}: {e}", path.display()))
@@ -12160,9 +12263,7 @@ fn optres_is_some_discriminant_compare_fully_faithful() {
             *rv,
             SemRvalue::Cmp(
                 SemCmpOp::Eq,
-                Box::new(SemRvalue::Use(SemOperand::Discriminant(Box::new(SemOperand::Var(
-                    0
-                ))))),
+                Box::new(SemRvalue::Use(SemOperand::Discriminant(Box::new(SemOperand::Var(0))))),
                 Box::new(SemRvalue::Use(SemOperand::Const(tag_k))),
             ),
             "the compare is EXACTLY tag(self) == K, K from the MIR (tag_k={tag_k})"
@@ -12190,9 +12291,7 @@ fn optres_is_none_not_of_discriminant_compare_fully_faithful() {
             *rv,
             SemRvalue::Cmp(
                 SemCmpOp::Ne,
-                Box::new(SemRvalue::Use(SemOperand::Discriminant(Box::new(SemOperand::Var(
-                    0
-                ))))),
+                Box::new(SemRvalue::Use(SemOperand::Discriminant(Box::new(SemOperand::Var(0))))),
                 Box::new(SemRvalue::Use(SemOperand::Const(tag_k))),
             ),
             "the negation is EXACTLY tag(self) != K (Bool.not(Int.beq ..)), NOT a dropped Not"
@@ -12336,16 +12435,14 @@ fn discriminant_base_requires_a_concrete_enum_type() {
     let mut func = optres_is_some_shaped_func(1);
     let deref_self = Place { local: 1, projections: vec![Projection::Deref] };
     assert!(
-        sem_discriminant_base_of_mir(&func.body, &deref_self, &optres_param_index, None,)
-            .is_some(),
+        sem_discriminant_base_of_mir(&func.body, &deref_self, &optres_param_index, None,).is_some(),
         "positive Option control must expose its real enum tag"
     );
 
     func.body.locals[1].ty =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Int { width: 64, signed: true }) };
     assert!(
-        sem_discriminant_base_of_mir(&func.body, &deref_self, &optres_param_index, None,)
-            .is_none(),
+        sem_discriminant_base_of_mir(&func.body, &deref_self, &optres_param_index, None,).is_none(),
         "an integer referent has no enum discriminant"
     );
 
@@ -12357,8 +12454,7 @@ fn discriminant_base_requires_a_concrete_enum_type() {
         )),
     };
     assert!(
-        sem_discriminant_base_of_mir(&func.body, &deref_self, &optres_param_index, None,)
-            .is_none(),
+        sem_discriminant_base_of_mir(&func.body, &deref_self, &optres_param_index, None,).is_none(),
         "a struct referent has no enum discriminant"
     );
 
@@ -12447,11 +12543,7 @@ fn optres_unreachable_return_island_declines() {
     func.body.blocks[0].id = BlockId(1);
     func.body.blocks.insert(
         0,
-        BasicBlock {
-            id: BlockId(0),
-            stmts: Vec::new(),
-            terminator: Terminator::Goto(BlockId(0)),
-        },
+        BasicBlock { id: BlockId(0), stmts: Vec::new(), terminator: Terminator::Goto(BlockId(0)) },
     );
     assert!(trust_vcgen::validate_function(&func).is_ok());
     assert!(
@@ -12487,6 +12579,7 @@ fn sem_return_requires_exact_reachable_contract_wrapper() {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
             },
         };
         let ret = BasicBlock {
@@ -12573,6 +12666,7 @@ fn sem_return_requires_exact_reachable_contract_wrapper() {
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
     };
     nested.body.blocks.push(BasicBlock {
         id: BlockId(2),
@@ -12592,10 +12686,7 @@ fn sem_return_requires_exact_reachable_contract_wrapper() {
             Operand::Constant(ConstValue::Int(7)),
             Operand::Constant(ConstValue::Int(8)),
         ],
-        vec![
-            Operand::Constant(ConstValue::Bool(true)),
-            Operand::Constant(ConstValue::Bool(false)),
-        ],
+        vec![Operand::Constant(ConstValue::Bool(true)), Operand::Constant(ConstValue::Bool(false))],
     ] {
         let mut malformed = canonical.clone();
         let Terminator::Call { args, .. } = &mut malformed.body.blocks[0].terminator else {
@@ -12653,10 +12744,7 @@ fn wlen_slice_is_empty_func() -> trust_types::VerifiableFunction {
                 stmts: vec![
                     Statement::Assign {
                         place: Place::local(2),
-                        rvalue: Rvalue::UnaryOp(
-                            UnOp::PtrMetadata,
-                            Operand::Copy(Place::local(1)),
-                        ),
+                        rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::local(1))),
                         span: SourceSpan::default(),
                     },
                     Statement::Assign {
@@ -12687,8 +12775,8 @@ fn wlen_slice_is_empty_func() -> trust_types::VerifiableFunction {
 /// Copy(_2)); return` — a CLOSED `Len` return of `usize`.
 fn wlen_str_len_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, UnOp, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+        Ty, UnOp, VerifiableBody, VerifiableFunction,
     };
     let self_ref = Ty::Ref { mutable: false, inner: Box::new(wlen_u8_slice()) };
     VerifiableFunction {
@@ -12714,10 +12802,7 @@ fn wlen_str_len_func() -> trust_types::VerifiableFunction {
                     },
                     Statement::Assign {
                         place: Place::local(0),
-                        rvalue: Rvalue::UnaryOp(
-                            UnOp::PtrMetadata,
-                            Operand::Copy(Place::local(2)),
-                        ),
+                        rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::local(2))),
                         span: SourceSpan::default(),
                     },
                 ],
@@ -12780,11 +12865,28 @@ fn wlen_str_len_certifies_through_same_fat_pointer_cast() {
     );
     assert!(return_is_closed(&ret), "a Len return is a CLOSED operand return");
     assert_eq!(check_return_adequacy(&ret), AdequacyVerdict::ProvenModulo3);
-    let cert = function_fully_faithful_witness(&func)
-        .expect("str::len must mint a fully-faithful cert through the verified cast");
+    // MEASURED 2026-08-25 — this lane now certifies the RETURN/CONTRACT axis only.
+    //
+    // `trust_vcgen` raises a DECLINED row for the very reinterpret cast this lane
+    // verifies: `UnsupportedMir { kind: "Rvalue::Cast" }`, raised even though source and
+    // destination are STRUCTURALLY EQUAL (`&[u8] -> &[u8]`). Clause (b) of
+    // `function_fully_faithful_witness` now refuses a declined row instead of letting it
+    // fall out of the `is_safety_vc_kind` filter — which is what previously let a body
+    // whose only obligation was a decline pass on an EMPTY filtered set (Channel 2).
+    //
+    // The W-LEN content this test exists for is the recovered `Len` denotation above, all
+    // of which still holds; the whole-function tier is HONESTLY DEFERRED until vcgen
+    // models the identity cast.
+    let cert = function_adequacy_witness(&func)
+        .expect("str::len must certify its contract through the verified cast");
     assert!(cert.is_modulo_3());
-    assert!(cert.safety.is_none());
-    assert!(matches!(cert.contract.ret, ReturnCertificate::StraightLine(_)));
+    assert!(matches!(cert.ret, ReturnCertificate::StraightLine(_)));
+    assert!(
+        function_fully_faithful_witness(&func).is_none(),
+        "str::len carries a DECLINED `Rvalue::Cast` row, so the WHOLE-FUNCTION tier must \
+         refuse; if vcgen learns to model a source==destination cast this flips and the \
+         tier is recovered — update this assertion then, do not weaken the gate"
+    );
 }
 
 #[test]
@@ -12792,10 +12894,15 @@ fn wlen_cast_temp_definition_must_dominate_metadata_read() {
     use trust_types::{BasicBlock, BlockId, ConstValue, Operand, SourceSpan, Terminator};
 
     // PARITY: the genuine order remains accepted before probing the two
-    // hostile serialized-MIR shapes below.
+    // hostile serialized-MIR shapes below. The parity subject is the RECOGNIZER
+    // (`sem_return_of_mir`) and the contract witness it feeds — the whole-function tier
+    // is separately deferred for this body by the DECLINED `Rvalue::Cast` row, see
+    // `wlen_str_len_certifies_through_same_fat_pointer_cast`. Asserting the recognizer
+    // and the contract witness keeps every hostile probe below discriminating: each one
+    // must turn a `Some` into a `None`, which needs a `Some` to start from.
     let baseline = wlen_str_len_func();
     assert!(sem_return_of_mir(&baseline, &wlen_param_index).is_some());
-    assert!(function_fully_faithful_witness(&baseline).is_some());
+    assert!(function_adequacy_witness(&baseline).is_some());
 
     // FORGERY PROBE (a): the cast is the temp's sole assignment, but occurs
     // AFTER `_0 := PtrMetadata(_2)` in the same block. A whole-body scan sees
@@ -12807,6 +12914,10 @@ fn wlen_cast_temp_definition_must_dominate_metadata_read() {
         sem_return_of_mir(&later, &wlen_param_index).is_none(),
         "a later same-block cast must not supply an earlier metadata read",
     );
+    // Discriminating form: the CONTRACT witness must lose its return certificate. (The
+    // whole-function witness is `None` for this body either way — the declined cast row
+    // alone would produce it — so asserting only that would prove nothing here.)
+    assert!(function_adequacy_witness(&later).is_none());
     assert!(function_fully_faithful_witness(&later).is_none());
 
     // FORGERY PROBE (b): both branches are structurally entry-reachable, but
@@ -12828,11 +12939,7 @@ fn wlen_cast_temp_definition_must_dominate_metadata_read() {
                 span: SourceSpan::default(),
             },
         },
-        BasicBlock {
-            id: BlockId(1),
-            stmts: vec![metadata_read],
-            terminator: Terminator::Return,
-        },
+        BasicBlock { id: BlockId(1), stmts: vec![metadata_read], terminator: Terminator::Return },
         BasicBlock { id: BlockId(2), stmts: vec![cast], terminator: Terminator::Unreachable },
     ];
     assert!(trust_vcgen::validate_function(&sibling).is_ok());
@@ -12840,6 +12947,7 @@ fn wlen_cast_temp_definition_must_dominate_metadata_read() {
         sem_return_of_mir(&sibling, &wlen_param_index).is_none(),
         "a sibling-branch cast must not donate a value to the returning branch",
     );
+    assert!(function_adequacy_witness(&sibling).is_none());
     assert!(function_fully_faithful_witness(&sibling).is_none());
 }
 
@@ -12861,8 +12969,7 @@ fn wlen_is_empty_wrong_constant_claim_is_kernel_rejected() {
         ),
         span: trust_types::SourceSpan::default(),
     };
-    let ret =
-        sem_return_of_mir(&func, &wlen_param_index).expect("len==5 is a recognized shape");
+    let ret = sem_return_of_mir(&func, &wlen_param_index).expect("len==5 is a recognized shape");
     // The true denotation (len == 5) proves.
     assert_eq!(check_return_adequacy(&ret), AdequacyVerdict::ProvenModulo3);
     // The wrong-constant claim `len == 0`.
@@ -12886,8 +12993,8 @@ fn wlen_ptr_metadata_of_non_param_temp_declines() {
     // same-fat-pointer Cast) — must decline. Only a param slice, or a param slice
     // behind a verifiable reinterpret cast, resolves to `Len`.
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-        Terminator, Ty, UnOp, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator,
+        Ty, UnOp, VerifiableBody, VerifiableFunction,
     };
     let self_ref = Ty::Ref { mutable: false, inner: Box::new(wlen_i32_slice()) };
     let func = VerifiableFunction {
@@ -12911,10 +13018,7 @@ fn wlen_ptr_metadata_of_non_param_temp_declines() {
                     },
                     Statement::Assign {
                         place: Place::local(0),
-                        rvalue: Rvalue::UnaryOp(
-                            UnOp::PtrMetadata,
-                            Operand::Copy(Place::local(2)),
-                        ),
+                        rvalue: Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::local(2))),
                         span: SourceSpan::default(),
                     },
                 ],
@@ -13025,9 +13129,7 @@ fn real_slice_len_isempty_leaves_are_fully_faithful() {
                 })
                 .path()
         })
-        .filter(|path| {
-            path.extension().and_then(|extension| extension.to_str()) == Some("json")
-        })
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
         .collect();
     fixture_paths.sort();
     assert_eq!(
@@ -13046,8 +13148,7 @@ fn real_slice_len_isempty_leaves_are_fully_faithful() {
         .collect();
     let actual_paths: std::collections::BTreeSet<_> =
         funcs.iter().map(|func| func.def_path.as_str()).collect();
-    let expected_path_set: std::collections::BTreeSet<_> =
-        expected_paths.iter().copied().collect();
+    let expected_path_set: std::collections::BTreeSet<_> = expected_paths.iter().copied().collect();
     assert_eq!(actual_paths, expected_path_set, "the corpus identity must not drift");
 
     for name in expected_paths {
@@ -13055,8 +13156,49 @@ fn real_slice_len_isempty_leaves_are_fully_faithful() {
             .iter()
             .find(|f| f.def_path == name)
             .unwrap_or_else(|| panic!("{name} missing from the slice-len-isempty corpus"));
-        let cert = function_fully_faithful_witness(func)
-            .unwrap_or_else(|| panic!("{name} must be fully faithful (len/is_empty leaf)"));
+        // MEASURED 2026-08-25 — the corpus SPLITS, and the split is exactly the
+        // reinterpret cast. `core::slice::<impl [i32]>::is_empty` reads `PtrMetadata`
+        // off the receiver directly, emits ZERO obligations, and is UNCHANGED. The two
+        // `str` leaves route through `_2 := Cast(&str -> &[u8])`, for which
+        // `trust_vcgen` raises a DECLINED row — measured verbatim:
+        //   UnsupportedMir { kind: "Rvalue::Cast", detail: "bb0 stmt N: unsupported cast
+        //     Ref { .., inner: Slice { elem: u8 } } -> Ref { .., inner: Slice { elem: u8 } }" }
+        // i.e. it declines even when source and destination are STRUCTURALLY EQUAL.
+        //
+        // That row is not an `is_safety_vc_kind` member, so before the decline clause it
+        // fell out of the filter, the filtered set went EMPTY, and clause (b) of the
+        // whole-function witness passed on nothing — the Channel-2 shape. The runtime
+        // oracle says these bodies never panic (`str::len`/`str::is_empty` 0/20 over
+        // `["", "a", "abc", "héllo wörld", "😀"]`), so this is a FAITHFULNESS gap and not
+        // a panic-freedom false proof — but a witness minted from an empty filtered set
+        // is not evidence either way, which is the whole point.
+        //
+        // The deferral is NAMED and one-sided: teach `trust_vcgen` to model a cast whose
+        // source and destination types are equal (`generate/slice_conversion.rs`), and
+        // these two flip back. Do NOT recover them by teaching this gate to ignore the
+        // emitter.
+        let declines = crate::mirsem::function_emits_declined_vc(func);
+        assert_eq!(
+            declines,
+            name.starts_with("core::str::"),
+            "{name}: exactly the two `str` leaves carry the declined reinterpret-cast row"
+        );
+        let witness = function_fully_faithful_witness(func);
+        if declines {
+            assert!(
+                witness.is_none(),
+                "{name} carries a DECLINED `Rvalue::Cast` row, so the whole-function tier \
+                 must refuse"
+            );
+            // The CONTRACT axis is untouched — the reflection is still kernel-adequate.
+            let cert = function_adequacy_witness(func)
+                .unwrap_or_else(|| panic!("{name}'s contract adequacy must still certify"));
+            assert!(cert.is_modulo_3(), "{name}'s contract certificate must be modulo 3");
+            assert!(matches!(cert.ret, ReturnCertificate::StraightLine(_)));
+            continue;
+        }
+        let cert =
+            witness.unwrap_or_else(|| panic!("{name} must be fully faithful (len/is_empty leaf)"));
         assert!(cert.is_modulo_3(), "{name}'s certificate must be modulo 3");
         assert!(cert.safety.is_none(), "{name}: a metadata read + compare raises no safety VC");
         assert!(
@@ -13279,8 +13421,8 @@ fn function_adequacy_witness_fails_closed_on_unmodeled_return_rvalue() {
     // and the SIGNED-Shr shape now carries the fail-closed coverage: it is the
     // exact adversarial boundary of the newest admission.)
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     let func = VerifiableFunction {
@@ -13333,8 +13475,8 @@ fn signed_rem_return_composes_adequacy_but_stays_open() {
     // the HONEST signed-rem residue: adequacy ≠ faithfulness; the unsigned
     // guarded rem (`checked_rem`, rem-corpus) is the shape that certifies.
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     let func = VerifiableFunction {
@@ -13612,8 +13754,8 @@ fn unsigned_var_mul_record_certifies_adequacy_discharge_still_refuses() {
     // discharge gate (corpus lane) independently refuses a genuinely-overflowing
     // product. Mirrors `signed_mul_fails_closed_deferred_gap` exactly.
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VcKind, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VcKind, VerifiableBody, VerifiableFunction,
     };
     let u = || Ty::Int { width: 8, signed: false };
     let func = VerifiableFunction {
@@ -13650,8 +13792,7 @@ fn unsigned_var_mul_record_certifies_adequacy_discharge_still_refuses() {
     };
     let vcs = trust_vcgen::generate_vcs(&func);
     assert!(
-        vcs.iter()
-            .any(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })),
+        vcs.iter().any(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })),
         "an unsigned u8 mul raises an ArithmeticOverflow{{op:Mul}} VC"
     );
     // KIND-modeled now (no longer an unmodeled-VC early-out) …
@@ -13898,8 +14039,8 @@ fn uwidth_from_mir_maps_unsigned_widths_and_fails_closed_otherwise() {
 /// test must drive the form that actually produces the VC.
 fn u32_add_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let u = || Ty::Int { width: 32, signed: false };
     VerifiableFunction {
@@ -13953,8 +14094,8 @@ fn function_safety_vc_faithful_fails_closed_on_signed_add() {
     // `fn sadd(a: i32, b: i32) -> i32 { a + b }` — a SIGNED add is out of the
     // unsigned-overflow fragment, so no overflow-adequacy witness mints.
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     let func = VerifiableFunction {
@@ -14036,9 +14177,7 @@ fn formula_has_uadd_overflow_disjunct(f: &trust_types::Formula, threshold: i128)
         F::Gt(lhs, rhs) => {
             matches!(&**lhs, F::Add(_, _)) && matches!(&**rhs, F::Int(k) if *k == threshold)
         }
-        F::And(v) | F::Or(v) => {
-            v.iter().any(|x| formula_has_uadd_overflow_disjunct(x, threshold))
-        }
+        F::And(v) | F::Or(v) => v.iter().any(|x| formula_has_uadd_overflow_disjunct(x, threshold)),
         F::Not(a) => formula_has_uadd_overflow_disjunct(a, threshold),
         F::Implies(a, b) | F::Eq(a, b) => {
             formula_has_uadd_overflow_disjunct(a, threshold)
@@ -14275,8 +14414,8 @@ fn swidth_from_mir_maps_signed_widths_and_fails_closed_otherwise() {
 /// overflow obligation (the FULL out-of-range disjunction).
 fn i32_add_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     VerifiableFunction {
@@ -14404,8 +14543,8 @@ fn signed_mul_fails_closed_deferred_gap() {
     // and the function STILL FAILS CLOSED (we do not fake a var*var multiply
     // adequacy). The const-multiplier LIA mul IS certified (separate Int-path shape).
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VcKind, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VcKind, VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     let func = VerifiableFunction {
@@ -14443,8 +14582,7 @@ fn signed_mul_fails_closed_deferred_gap() {
     // The emitter DOES raise a signed-mul ArithmeticOverflow VC.
     let vcs = trust_vcgen::generate_vcs(&func);
     assert!(
-        vcs.iter()
-            .any(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })),
+        vcs.iter().any(|vc| matches!(&vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Mul, .. })),
         "a signed i32 mul raises an ArithmeticOverflow{{op:Mul}} VC"
     );
     // The var*var signed-mul VcKind is now KIND-modeled (Lemma 5's MUL spec), so it
@@ -14508,8 +14646,7 @@ fn formula_has_sadd_overflow_disjunct(f: &trust_types::Formula, max: i128) -> bo
         F::And(v) | F::Or(v) => v.iter().any(|x| formula_has_sadd_overflow_disjunct(x, max)),
         F::Not(a) => formula_has_sadd_overflow_disjunct(a, max),
         F::Implies(a, b) | F::Eq(a, b) => {
-            formula_has_sadd_overflow_disjunct(a, max)
-                || formula_has_sadd_overflow_disjunct(b, max)
+            formula_has_sadd_overflow_disjunct(a, max) || formula_has_sadd_overflow_disjunct(b, max)
         }
         _ => false,
     }
@@ -14540,8 +14677,8 @@ fn formula_has_sadd_underflow_disjunct(f: &trust_types::Formula, min: i128) -> b
 /// the emitter raises a `NegationOverflow{ty: iW}` VC (core `Eq(x, MIN)`).
 fn neg_func(width: u32) -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
-        UnOp, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty, UnOp,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width, signed: true };
     VerifiableFunction {
@@ -14716,30 +14853,22 @@ fn negation_vc_modeled_classifies_signed_widths_only() {
     use trust_types::{Ty, VcKind};
     // signed i32 negation ⇒ modeled W32.
     assert_eq!(
-        negation_vc_modeled(&VcKind::NegationOverflow {
-            ty: Ty::Int { width: 32, signed: true }
-        }),
+        negation_vc_modeled(&VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: true } }),
         Some(SWidth::W32)
     );
     // signed i8 negation ⇒ modeled W8.
     assert_eq!(
-        negation_vc_modeled(&VcKind::NegationOverflow {
-            ty: Ty::Int { width: 8, signed: true }
-        }),
+        negation_vc_modeled(&VcKind::NegationOverflow { ty: Ty::Int { width: 8, signed: true } }),
         Some(SWidth::W8)
     );
     // i128 negation ⇒ DEFERRED (None) — bitvector model, not Lemma 6.
     assert_eq!(
-        negation_vc_modeled(&VcKind::NegationOverflow {
-            ty: Ty::Int { width: 128, signed: true }
-        }),
+        negation_vc_modeled(&VcKind::NegationOverflow { ty: Ty::Int { width: 128, signed: true } }),
         None
     );
     // unsigned ⇒ None (negation of unsigned carries no overflow obligation).
     assert_eq!(
-        negation_vc_modeled(&VcKind::NegationOverflow {
-            ty: Ty::Int { width: 32, signed: false }
-        }),
+        negation_vc_modeled(&VcKind::NegationOverflow { ty: Ty::Int { width: 32, signed: false } }),
         None
     );
 }
@@ -14908,10 +15037,7 @@ fn lemma_7_shift_adequacy_i32_unsigned_amount_proven_modulo_3() {
     // THE CRUX: the reflected shift core `Ge(n, Int(32))`, grounded (Ge swaps) as
     // `Int.le (Int.ofNat 32) n`, IS def-eq to `shift_amount_oob_32 n` (= `32 ≤ n`).
     // Proven modulo 3.
-    assert_eq!(
-        check_shift_oob_adequacy(ShiftWidth::W32, false),
-        AdequacyVerdict::ProvenModulo3
-    );
+    assert_eq!(check_shift_oob_adequacy(ShiftWidth::W32, false), AdequacyVerdict::ProvenModulo3);
 }
 
 #[test]
@@ -14940,8 +15066,7 @@ fn shift_core_grounds_exactly_like_ground_prop() {
     let tc = TypeChecker::new(&env);
     let n = Expr::bvar(0);
     let modeled = reflected_shift_oob(&n, ShiftWidth::W32, false);
-    let real =
-        F::Ge(Box::new(F::Var("n".into(), trust_types::Sort::Int)), Box::new(F::Int(32)));
+    let real = F::Ge(Box::new(F::Var("n".into(), trust_types::Sort::Int)), Box::new(F::Int(32)));
     let grounded = live_ground(&real, &["n"]);
     assert!(
         tc.is_def_eq(&modeled, &grounded),
@@ -15027,8 +15152,8 @@ fn dropped_negative_disjunct_signed_shift_claim_fails_closed() {
 fn shift_adequacy_witness_mints_certificate_for_modeled_widths() {
     for w in ShiftWidth::ALL {
         for amount_signed in [false, true] {
-            let cert = shift_adequacy_witness(w, amount_signed)
-                .expect("modeled width gets a certificate");
+            let cert =
+                shift_adequacy_witness(w, amount_signed).expect("modeled width gets a certificate");
             assert!(cert.is_modulo_3(), "the certificate must be a modulo-3 proof");
             assert_eq!(cert.width, w);
             assert_eq!(cert.amount_signed, amount_signed);
@@ -15108,14 +15233,10 @@ fn shift_vc_shape_matches_trust_vcgen_emission() {
 fn formula_has_shift_oob_core(f: &trust_types::Formula, w: i128) -> bool {
     use trust_types::Formula as F;
     match f {
-        F::Ge(lhs, rhs) => {
-            matches!(&**lhs, F::Var(_, _)) && matches!(&**rhs, F::Int(k) if *k == w)
-        }
+        F::Ge(lhs, rhs) => matches!(&**lhs, F::Var(_, _)) && matches!(&**rhs, F::Int(k) if *k == w),
         F::And(v) | F::Or(v) => v.iter().any(|x| formula_has_shift_oob_core(x, w)),
         F::Not(a) => formula_has_shift_oob_core(a, w),
-        F::Implies(a, b) => {
-            formula_has_shift_oob_core(a, w) || formula_has_shift_oob_core(b, w)
-        }
+        F::Implies(a, b) => formula_has_shift_oob_core(a, w) || formula_has_shift_oob_core(b, w),
         _ => false,
     }
 }
@@ -15291,10 +15412,7 @@ fn const_shift_signed_amount_uses_correct_width() {
         certs.shift.iter().map(|c| c.kind.clone()).collect::<Vec<_>>()
     );
     assert!(
-        !certs
-            .shift
-            .iter()
-            .any(|c| matches!(c.kind, SafetyVcKind::ShiftOob(ShiftWidth::W64, _))),
+        !certs.shift.iter().any(|c| matches!(c.kind, SafetyVcKind::ShiftOob(ShiftWidth::W64, _))),
         "NO false W64 cert for the signed-amount const-shift either"
     );
 }
@@ -15314,15 +15432,13 @@ fn formula_aware_bridge_rejects_wrong_width_spec() {
     params.insert("n".to_string(), Expr::bvar(0));
     let cg = CoreGround { core: &real_core, params };
     // WRONG spec: the W64 threshold (the false-cert the desync used to mint).
-    let wrong_spec =
-        Expr::app(cst(&shift_amount_oob_name(ShiftWidth::W64, false)), Expr::bvar(0));
+    let wrong_spec = Expr::app(cst(&shift_amount_oob_name(ShiftWidth::W64, false)), Expr::bvar(0));
     assert!(
         !live_ground_def_eq_spec(&cg, &wrong_spec, 1),
         "the bridge must REJECT grounding `n ≥ 32` against the W64 spec `64 ≤ n`"
     );
     // SANITY: the CORRECT W32 spec IS accepted (the bridge is not vacuously false).
-    let right_spec =
-        Expr::app(cst(&shift_amount_oob_name(ShiftWidth::W32, false)), Expr::bvar(0));
+    let right_spec = Expr::app(cst(&shift_amount_oob_name(ShiftWidth::W32, false)), Expr::bvar(0));
     assert!(
         live_ground_def_eq_spec(&cg, &right_spec, 1),
         "the bridge must ACCEPT grounding `n ≥ 32` against the W32 spec `32 ≤ n`"
@@ -15347,9 +15463,7 @@ fn formula_aware_path_certifies_overflow_family_from_real_emitted_vc() {
         let vcs = trust_vcgen::generate_vcs(&func);
         let vc = vcs
             .iter()
-            .find(|vc| {
-                matches!(vc.kind, K::ArithmeticOverflow { .. } | K::NegationOverflow { .. })
-            })
+            .find(|vc| matches!(vc.kind, K::ArithmeticOverflow { .. } | K::NegationOverflow { .. }))
             .expect("an overflow-family fixture raises an arithmetic/negation VC");
         let (kind, verdict) = safety_vc_is_faithful_formula_aware(&func, vc)
             .expect("the formula-aware path must certify the real emitted overflow-family VC");
@@ -15476,10 +15590,7 @@ fn formula_aware_bridge_rejects_wrong_spec_signed_overflow() {
         let s = Expr::apps(cst("Int.add"), [ops[0].clone(), ops[1].clone()]);
         Expr::apps(cst("Int.lt"), [signed_max_expr(SWidth::W32), s])
     });
-    assert!(
-        !dropped,
-        "dropping the signed UNDERFLOW disjunct MUST be rejected (no false cert)"
-    );
+    assert!(!dropped, "dropping the signed UNDERFLOW disjunct MUST be rejected (no false cert)");
     // SANITY: the correct sadd_overflows_i32 spec IS accepted.
     let right = overflow_family_live_def_eq(&core, &[&a, &b], &|ops| {
         Expr::apps(
@@ -15747,8 +15858,8 @@ fn wrong_direction_div_by_zero_claim_fails_closed() {
 /// index ⇒ no `Lt(i,0)` lower disjunct).
 fn idx_array_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
-        Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Terminator,
+        Ty, VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     let arr_ty = Ty::Array { elem: Box::new(i()), len: 8 };
@@ -15791,8 +15902,8 @@ fn idx_array_func() -> trust_types::VerifiableFunction {
 /// formula is EXACTLY `Eq(Var "b", Int 0)`.
 fn div_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
     VerifiableFunction {
@@ -15905,8 +16016,8 @@ fn formula_has_div_by_zero_eq(f: &trust_types::Formula) -> bool {
 /// form that emits the implicit overflow VC (the checked form routes through Assert).
 fn u32_sub_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let u = || Ty::Int { width: 32, signed: false };
     VerifiableFunction {
@@ -15949,8 +16060,8 @@ fn u32_sub_func() -> trust_types::VerifiableFunction {
 /// for unsigned `%`).
 fn u32_rem_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let u = || Ty::Int { width: 32, signed: false };
     VerifiableFunction {
@@ -16164,9 +16275,7 @@ fn function_safety_vcs_faithful_certifies_u32_sub_underflow() {
         .expect("a u32-sub function's underflow VC is certified adequate");
     assert!(certs.all_modulo_3());
     assert!(!certs.usub.is_empty(), "an unsigned-sub certificate must be present");
-    assert!(
-        certs.usub.iter().any(|c| c.kind == SafetyVcKind::UnsignedSubUnderflow(UWidth::W32))
-    );
+    assert!(certs.usub.iter().any(|c| c.kind == SafetyVcKind::UnsignedSubUnderflow(UWidth::W32)));
     assert!(certs.overflow.is_empty() && certs.div.is_none() && certs.rem.is_none());
 }
 
@@ -16221,8 +16330,8 @@ fn function_safety_vcs_faithful_certifies_pure_division() {
     // signed-div-overflow VC would fail-close). So the REM cert (Lemma 9, its own
     // kind) is present and the function is certified.
     use trust_types::{
-        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator,
-        Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+        VerifiableBody, VerifiableFunction,
     };
     let u = || Ty::Int { width: 32, signed: false };
     let func = VerifiableFunction {
@@ -16381,10 +16490,7 @@ fn fully_faithful_identity_vacuously_safe_no_safety_vc() {
     // unsafe condition to capture, so contract adequacy alone suffices.
     let func = identity_return_func();
     // Sanity: this function genuinely raises no safety VC.
-    assert!(
-        !function_emits_any_safety_vc(&func),
-        "the identity function must raise no safety VC"
-    );
+    assert!(!function_emits_any_safety_vc(&func), "the identity function must raise no safety VC");
     let cert = function_fully_faithful_witness(&func)
         .expect("id(x){x}: contract certified, vacuously safe ⇒ FULLY FAITHFUL");
     assert!(cert.is_modulo_3());
@@ -16672,6 +16778,7 @@ fn no_requires_fact(arg_count: usize) -> CalleeFact {
         return_ty: trust_types::Ty::Int { width: 32, signed: true },
         requires: Some(Vec::new()),
         param_names: vec![None; arg_count],
+        ret_model: None,
     }
 }
 
@@ -16723,8 +16830,7 @@ fn call_family_rejects_mutable_result_alias_and_unsafe_signature() {
     );
 
     let mut unsafe_call = caller;
-    let Terminator::Call { is_unsafe_sig, .. } = &mut unsafe_call.body.blocks[0].terminator
-    else {
+    let Terminator::Call { is_unsafe_sig, .. } = &mut unsafe_call.body.blocks[0].terminator else {
         panic!("caller fixture must begin with Call")
     };
     *is_unsafe_sig = true;
@@ -16755,15 +16861,12 @@ fn call_arg_field_read_definition_must_dominate_call_site() {
 fn call_arg_shared_field_admits_only_exact_u64_newtype() {
     use trust_types::{Ty, VariantDef};
 
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/expr-fold-corpus");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/expr-fold-corpus");
     let load = |name: &str| {
         let bytes = std::fs::read(root.join(format!("{name}.json")))
             .unwrap_or_else(|error| panic!("read authenticated Expr-fold row {name}: {error}"));
         crate::prove::decode_verifiable_function_with_authenticated_legacy_metadata(&bytes)
-            .unwrap_or_else(|error| {
-                panic!("decode authenticated Expr-fold row {name}: {error}")
-            })
+            .unwrap_or_else(|error| panic!("decode authenticated Expr-fold row {name}: {error}"))
     };
     let caller = load("expr__Expr__has_fvar_quick");
     let callee = load("expr__meta__ExprMeta__has_fvar");
@@ -16781,10 +16884,8 @@ fn call_arg_shared_field_admits_only_exact_u64_newtype() {
         };
         fields[1].1 = meta;
     };
-    let mut layout_marked = Ty::adt(
-        "expr::meta::ExprMeta",
-        vec![("0".into(), Ty::Int { width: 64, signed: false })],
-    );
+    let mut layout_marked =
+        Ty::adt("expr::meta::ExprMeta", vec![("0".into(), Ty::Int { width: 64, signed: false })]);
     let Ty::Adt { faithful_enum_repr, .. } = &mut layout_marked else { unreachable!() };
     *faithful_enum_repr = Some(None);
     for (name, meta) in [
@@ -16958,6 +17059,7 @@ fn call_then_pureop_field_definition_must_precede_comparison() {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 BasicBlock {
@@ -16992,6 +17094,7 @@ fn call_then_pureop_field_definition_must_precede_comparison() {
             return_ty: int(),
             requires: Some(Vec::new()),
             param_names: vec![None],
+            ret_model: None,
         },
     );
     assert!(sem_call_then_pureop_of_mir(&func, &registry).is_some(), "sanity");
@@ -17019,8 +17122,7 @@ fn ptr_spine_requires_dominating_safe_prefix_definitions() {
     );
 
     let mut late = count.clone();
-    let add =
-        std::mem::replace(&mut late.body.blocks[1].terminator, Terminator::Goto(BlockId(2)));
+    let add = std::mem::replace(&mut late.body.blocks[1].terminator, Terminator::Goto(BlockId(2)));
     late.body.blocks.push(BasicBlock { id: BlockId(4), stmts: Vec::new(), terminator: add });
     assert!(
         sem_ptr_spine_call_return_of_mir(&late, &registry).is_none(),
@@ -17174,11 +17276,8 @@ fn ptr_offset_binop_count_unresolved_base_declines() {
         "the un-discharged offset must fail the whole function closed"
     );
     let empty_bodies = crate::trustir_fold::DumpBodies::new();
-    let diag = crate::prove::diagnose_fully_faithful_gate_with_bodies(
-        &forged,
-        &registry,
-        &empty_bodies,
-    );
+    let diag =
+        crate::prove::diagnose_fully_faithful_gate_with_bodies(&forged, &registry, &empty_bodies);
     assert!(
         !diag.fully_faithful,
         "a count with an unresolved BinOp `end` must NOT certify ({diag:?})"
@@ -17206,11 +17305,7 @@ fn call_return_witness_mints_for_certified_callee_modulo_3() {
         vec![SemOperand::Var(0), SemOperand::Const(1)],
         "the call's actual args must be the modeled param copy + const"
     );
-    assert_eq!(
-        cert.operands.len(),
-        2,
-        "both actual-arg operands must carry Lemma-1A certificates"
-    );
+    assert_eq!(cert.operands.len(), 2, "both actual-arg operands must carry Lemma-1A certificates");
     // The FULL verdict composes too (vacuously safe: the caller emits no
     // safety VC — the call to a safe callee raises none).
     let full = function_fully_faithful_witness_with_callees(&caller, &helper_registry())
@@ -17343,10 +17438,7 @@ fn call_then_samewidth_result_cast_certifies_and_wrong_claim_fails() {
         other: SemOperand::Const(0),
         call_is_lhs: true,
     };
-    assert_eq!(
-        call_then_pureop_instance_verdict(&shape, None),
-        RefinementVerdict::ProvenModulo3
-    );
+    assert_eq!(call_then_pureop_instance_verdict(&shape, None), RefinementVerdict::ProvenModulo3);
     assert!(matches!(
         call_then_pureop_instance_verdict(&shape, Some(&wrong_int_predicate())),
         RefinementVerdict::KernelRejected(_)
@@ -17394,10 +17486,7 @@ fn call_result_projects_the_callee_return() {
         [Expr::nat_lit(7), Expr::app(cst(MIRSEM_OPERAND_CONST), int_lit(3)), int_lit(42)],
     );
     let lhs = Expr::app(cst(MIRSEM_CALL_RESULT), call);
-    assert!(
-        tc.is_def_eq(&lhs, &int_lit(42)),
-        "call_result (Call.mk _ _ 42) must ι-reduce to 42"
-    );
+    assert!(tc.is_def_eq(&lhs, &int_lit(42)), "call_result (Call.mk _ _ 42) must ι-reduce to 42");
 }
 
 // ---- Step 6T: TOTAL correctness — the termination (ranking) while-rule ----
@@ -17442,9 +17531,8 @@ fn loop_rank_terminates_quantifies_over_the_rank() {
     // ∀-over-rank statement, whose OUTERMOST Π domain is `Env → Nat`.
     let env = mirsem_whole_program_env().expect("env");
     let tc = TypeChecker::new(&env);
-    let inferred = tc
-        .infer_type(&cst(MIRSEM_LOOP_RANK_TERMINATES))
-        .expect("loopRankTerminates has a type");
+    let inferred =
+        tc.infer_type(&cst(MIRSEM_LOOP_RANK_TERMINATES)).expect("loopRankTerminates has a type");
     let expected = loop_rank_terminates_type(None);
     assert!(
         tc.is_def_eq(&inferred, &expected),
@@ -17523,14 +17611,10 @@ fn loop_total_correct_type_is_the_and_of_the_two_conclusions() {
     );
     // The conclusion is genuinely the conjunction of BOTH real conclusions: dropping
     // either conjunct to vacuous `True` is a DIFFERENT (strictly weaker) statement.
-    let and_a_true = loop_total_correct_type_with_concl(Expr::apps(
-        cst("And"),
-        [real_a.clone(), cst("True")],
-    ));
-    let and_true_b = loop_total_correct_type_with_concl(Expr::apps(
-        cst("And"),
-        [cst("True"), real_b.clone()],
-    ));
+    let and_a_true =
+        loop_total_correct_type_with_concl(Expr::apps(cst("And"), [real_a.clone(), cst("True")]));
+    let and_true_b =
+        loop_total_correct_type_with_concl(Expr::apps(cst("And"), [cst("True"), real_b.clone()]));
     assert!(
         !tc.is_def_eq(&inferred, &and_a_true),
         "the TERMINATION conjunct is NOT vacuous `True` — it is a real conclusion"
@@ -17800,8 +17884,7 @@ fn synth_invariant_witness_mints_certificate_modulo_3() {
     // proof handles the assignment).
     let lf = loop_keep_zero_synth_ge0();
     assert!(lf.body_assigns(3), "the synthesized invariant is ABOUT the body-assigned counter");
-    let cert =
-        loop_refinement_witness(&lf).expect("synthesized-invariant loop has a certificate");
+    let cert = loop_refinement_witness(&lf).expect("synthesized-invariant loop has a certificate");
     assert!(cert.is_modulo_3(), "the synthesized-invariant instance must be modulo 3");
 }
 
@@ -18210,8 +18293,7 @@ fn synth_postcondition_fails_closed_on_wrong_bound() {
     // index 1) is rejected — the projected conjunct's type does not match.
     let lf = loop_keep_zero_synth_in_range();
     assert!(
-        loop_postcondition_witness(&lf, LoopPostcondition::RetLeBound { bound_idx: 2 })
-            .is_none(),
+        loop_postcondition_witness(&lf, LoopPostcondition::RetLeBound { bound_idx: 2 }).is_none(),
         "a postcondition against a non-invariant bound must fail closed"
     );
     // And a wrong constant for the lower bound is rejected.
@@ -18250,8 +18332,7 @@ fn synth_postcondition_requires_conjoined_range() {
     // postcondition discharge requires the CONJOINED range carrying both conjuncts.
     let upper_only = loop_keep_zero_synth_le_n();
     assert!(
-        loop_postcondition_witness(&upper_only, LoopPostcondition::ConstLeRet { c: 0 })
-            .is_none(),
+        loop_postcondition_witness(&upper_only, LoopPostcondition::ConstLeRet { c: 0 }).is_none(),
         "a bare upper bound cannot discharge a lower-bound postcondition"
     );
     let lower_only = loop_keep_zero_synth_ge0();
@@ -18277,12 +18358,9 @@ fn synth_in_range_witness_and_total_correctness_modulo_3() {
     let lf = loop_keep_zero_synth_in_range();
     let cert = loop_refinement_witness(&lf).expect("range loop has a partial certificate");
     assert!(cert.is_modulo_3(), "the conjoined-range instance must be modulo 3");
-    let total = loop_total_correct_witness(&lf)
-        .expect("range loop has a total-correctness certificate");
-    assert!(
-        total.is_modulo_3(),
-        "the conjoined-range total-correctness instance must be modulo 3"
-    );
+    let total =
+        loop_total_correct_witness(&lf).expect("range loop has a total-correctness certificate");
+    assert!(total.is_modulo_3(), "the conjoined-range total-correctness instance must be modulo 3");
 }
 
 #[test]
@@ -18344,9 +18422,8 @@ fn mutual_call_contracts_quantifies_over_contracts_and_rank() {
     // contract family `Nat → Int → Prop`.
     let env = mirsem_whole_program_env().expect("env");
     let tc = TypeChecker::new(&env);
-    let inferred = tc
-        .infer_type(&cst(MIRSEM_MUTUAL_CALL_CONTRACTS))
-        .expect("mutualCallContracts has a type");
+    let inferred =
+        tc.infer_type(&cst(MIRSEM_MUTUAL_CALL_CONTRACTS)).expect("mutualCallContracts has a type");
     let expected = mutual_call_contracts_type(None);
     assert!(
         tc.is_def_eq(&inferred, &expected),
@@ -18838,8 +18915,7 @@ fn higher_order_disjunction_is_a_genuine_case_split_not_a_tautology() {
     let _ = bd;
     let no_mem_ty = {
         // ∀ P0 P1 c, P0 res → P1 res → Or (P0 res)(P1 res)  — membership removed.
-        let int_to_prop =
-            Expr::pi(BinderData::from(BinderInfo::Default), int_ty(), Expr::prop());
+        let int_to_prop = Expr::pi(BinderData::from(BinderInfo::Default), int_ty(), Expr::prop());
         let bd = || BinderData::from(BinderInfo::Default);
         // inside ∀P0 ∀P1 ∀c: c=0,P1=1,P0=2
         let h0 = Expr::app(Expr::bvar(2), ho_result_app(Expr::bvar(0)));
@@ -18984,11 +19060,7 @@ fn open_world_call_carries_an_assumed_trait_contract_hypothesis() {
         let hyp = Expr::app(Expr::bvar(1), ho_result_app(Expr::bvar(0)));
         // under hyp →: hyp=0,c=1,TPost=2.
         let concl = Expr::app(Expr::bvar(2), ho_result_app(Expr::bvar(1)));
-        Expr::pi(
-            bd(),
-            tpost_ty,
-            Expr::pi(bd(), cst(MIRSEM_HO_CALL), Expr::pi(bd(), hyp, concl)),
-        )
+        Expr::pi(bd(), tpost_ty, Expr::pi(bd(), cst(MIRSEM_HO_CALL), Expr::pi(bd(), hyp, concl)))
     };
     assert!(
         !tc.is_def_eq(&real, &single_instance),
@@ -19248,10 +19320,7 @@ fn probe_defeqs_for_new_shapes() {
         "Int.sub reduces to Int.add . Int.neg"
     );
     // (B) `Int.add 1 (Int.neg 1) ≡ Int.ofNat 0`.
-    assert!(
-        tc.is_def_eq(&add(int_one(), neg(int_one())), &int_lit(0)),
-        "1 + (-1) reduces to 0"
-    );
+    assert!(tc.is_def_eq(&add(int_one(), neg(int_one())), &int_lit(0)), "1 + (-1) reduces to 0");
     // (C) `Int.neg (Int.ofNat 1) ≡ Int.negSucc 0` (= int_lit(-1)).
     assert!(tc.is_def_eq(&neg(int_one()), &int_lit(-1)), "neg 1 reduces to negSucc 0");
     // (D) `Int.lt 0 i ≡ Int.le (Int.add 0 1) i` and `Int.add 0 1 ≡ 1`.
@@ -19423,9 +19492,8 @@ fn synth_le_in_range_and_postcondition_modulo_3() {
     assert!(total.is_modulo_3());
     // It discharges `ret ≤ n+1` (the `≤`-loop returns `n+1`) by projecting the upper
     // conjunct `i ≤ n+1` at the halting state.
-    let cert =
-        loop_postcondition_witness(&lf, LoopPostcondition::RetLeBoundSucc { bound_idx: 1 })
-            .expect("the Le upper bound discharges `ret ≤ n+1` modulo 3");
+    let cert = loop_postcondition_witness(&lf, LoopPostcondition::RetLeBoundSucc { bound_idx: 1 })
+        .expect("the Le upper bound discharges `ret ≤ n+1` modulo 3");
     assert!(cert.is_modulo_3());
     // And it discharges `0 ≤ ret` via the lower conjunct.
     let cert2 = loop_postcondition_witness(&lf, LoopPostcondition::ConstLeRet { c: 0 })
@@ -19695,10 +19763,7 @@ fn synth_accum_lower_bound_loop_instance_proven_modulo_3() {
     let lf = loop_accum_function();
     assert_eq!(check_loop_refinement_instance(&lf), RefinementVerdict::ProvenModulo3);
     let cert = loop_refinement_witness(&lf).expect("accum loop has a partial certificate");
-    assert!(
-        cert.is_modulo_3(),
-        "the accumulator lower-bound partial instance must be modulo 3"
-    );
+    assert!(cert.is_modulo_3(), "the accumulator lower-bound partial instance must be modulo 3");
 }
 
 #[test]
@@ -19911,8 +19976,7 @@ fn wrong_synth_accum_eq_relation_postcondition_wrong_bound_fails_closed() {
     // halt's `i ≤ n` projected at index 1; demanding `s ≤ (e 2)` cannot be built ⇒ None.
     let lf = loop_accum_eq_function();
     assert!(
-        loop_postcondition_witness(&lf, LoopPostcondition::RetLeBound { bound_idx: 2 })
-            .is_none(),
+        loop_postcondition_witness(&lf, LoopPostcondition::RetLeBound { bound_idx: 2 }).is_none(),
         "the relational invariant MUST NOT discharge `ret ≤ m` for a non-guard bound m"
     );
 }
@@ -19947,10 +20011,8 @@ fn stride_rank_decrease_check_type_modulo_3() {
     let mut env = Environment::with_prelude();
     register_stride_rank_decrease(&mut env).expect("strideRankDecrease registers");
     // Idempotent: a second registration is a no-op (does not re-add / error).
-    register_stride_rank_decrease(&mut env)
-        .expect("strideRankDecrease re-registers (idempotent)");
-    let residue =
-        env.axiom_deps(&Name::from_string(MIRSEM_STRIDE_RANK_DECREASE)).expect("present");
+    register_stride_rank_decrease(&mut env).expect("strideRankDecrease re-registers (idempotent)");
+    let residue = env.axiom_deps(&Name::from_string(MIRSEM_STRIDE_RANK_DECREASE)).expect("present");
     assert!(residue.is_empty(), "strideRankDecrease must be ⊆ 3, got {residue:?}");
 }
 
@@ -19969,10 +20031,7 @@ fn nested_loop_env_builds_modulo_3() {
     // execO / exec_loopO are defs (no axiom closure to audit beyond the kernel's),
     // but confirm they registered.
     assert!(env.get_const(&Name::from_string(MIRSEM_EXEC_O)).is_some(), "execO present");
-    assert!(
-        env.get_const(&Name::from_string(MIRSEM_EXEC_LOOP_O)).is_some(),
-        "exec_loopO present"
-    );
+    assert!(env.get_const(&Name::from_string(MIRSEM_EXEC_LOOP_O)).is_some(), "exec_loopO present");
 }
 
 #[test]
@@ -20196,9 +20255,7 @@ fn break_loop_env_builds_modulo_3() {
     // stepPreservesInvBrk/loopInvariantRuleBrk) registers, and each new theorem rests
     // on ⊆ the 3 axioms.
     let env = break_loop_env().expect("break_loop_env builds");
-    for n in
-        [MIRSEM_AND_LEFT_TRUE, MIRSEM_STEP_PRESERVES_INV_BRK, MIRSEM_LOOP_INVARIANT_RULE_BRK]
-    {
+    for n in [MIRSEM_AND_LEFT_TRUE, MIRSEM_STEP_PRESERVES_INV_BRK, MIRSEM_LOOP_INVARIANT_RULE_BRK] {
         let residue =
             env.axiom_deps(&Name::from_string(n)).unwrap_or_else(|| panic!("{n} present"));
         assert!(residue.is_empty(), "{n} must be ⊆ 3, got {residue:?}");
@@ -20221,8 +20278,7 @@ fn exec_byte_identical_after_break_layer() {
     let base = loop_instance_env().expect("base loop env");
     let brk = break_loop_env().expect("break env");
     for n in [MIRSEM_EXEC_LOOP, MIRSEM_STEP_LOOP, MIRSEM_LOOP_INVARIANT_RULE] {
-        let base_c =
-            base.get_const(&Name::from_string(n)).unwrap_or_else(|| panic!("base {n}"));
+        let base_c = base.get_const(&Name::from_string(n)).unwrap_or_else(|| panic!("base {n}"));
         let brk_c = brk.get_const(&Name::from_string(n)).unwrap_or_else(|| panic!("brk {n}"));
         assert_eq!(
             format!("{:?}", base_c.type_),
@@ -20452,8 +20508,7 @@ fn monotone_nested_loop_instance_proven_modulo_3() {
 #[test]
 fn monotone_nested_loop_witness_mints_certificate_modulo_3() {
     let mlf = sum2d_monotone_function();
-    let cert =
-        monotone_nested_loop_witness(&mlf).expect("sum2d monotone loop has a certificate");
+    let cert = monotone_nested_loop_witness(&mlf).expect("sum2d monotone loop has a certificate");
     assert!(cert.is_modulo_3(), "the per-function monotone-nested instance must be modulo 3");
 }
 
@@ -20553,10 +20608,7 @@ fn wrong_monotone_nested_inner_decrements_kernel_rejected() {
         ..sum2d_monotone_function()
     };
     assert!(
-        matches!(
-            check_monotone_nested_loop_instance(&bad),
-            RefinementVerdict::KernelRejected(_)
-        ),
+        matches!(check_monotone_nested_loop_instance(&bad), RefinementVerdict::KernelRejected(_)),
         "an inner loop that DECREMENTS the outer-invariant var MUST be kernel-rejected"
     );
     assert!(
@@ -20583,8 +20635,7 @@ fn wrong_monotone_nested_counter_is_accumulator_fails_closed() {
 #[test]
 fn param_reassigned_by_stmt_flags_mutable_alias() {
     use trust_types::{
-        BasicBlock, BlockId, LocalDecl, Place, Rvalue, Statement, Terminator, Ty,
-        VerifiableBody,
+        BasicBlock, BlockId, LocalDecl, Place, Rvalue, Statement, Terminator, Ty, VerifiableBody,
     };
     let u64_ty = Ty::Int { width: 64, signed: false };
     let mk = |rv: Rvalue| VerifiableBody {
@@ -20649,6 +20700,7 @@ fn param_reassigned_by_stmt_flags_call_dest_write() {
                 span: Default::default(),
                 atomic: None,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
             },
         }],
@@ -20679,8 +20731,8 @@ fn param_reassigned_by_stmt_flags_call_dest_write() {
 #[test]
 fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-        Statement, Terminator, Ty, VariantDef, VerifiableBody,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
+        Terminator, Ty, VariantDef, VerifiableBody,
     };
 
     let enum_ty = Ty::adt_enum(
@@ -20701,11 +20753,7 @@ fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
                 name: None,
             },
         ],
-        blocks: vec![BasicBlock {
-            id: BlockId(0),
-            stmts: vec![],
-            terminator: Terminator::Return,
-        }],
+        blocks: vec![BasicBlock { id: BlockId(0), stmts: vec![], terminator: Terminator::Return }],
         arg_count: 1,
         return_ty: Ty::Bool,
         datatype_defs: Default::default(),
@@ -20721,12 +20769,16 @@ fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
     for bad_ty in [
         Ty::adt("S", vec![("value".into(), Ty::Bool)]),
         Ty::Unsupported { kind: "opaque".into(), detail: "not an enum".into() },
-        Ty::Adt { adt_kind: None, layout: None,
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "Fake".into(),
             fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+        },
     ] {
         let mut bad = body.clone();
         bad.locals[1].ty = bad_ty;
@@ -20786,6 +20838,7 @@ fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
         span: Default::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     assert_eq!(
@@ -21022,7 +21075,10 @@ fn slice_i32_ref_ty() -> trust_types::Ty {
 }
 
 fn ref_i32_ty() -> trust_types::Ty {
-    trust_types::Ty::Ref { mutable: false, inner: Box::new(trust_types::Ty::Int { width: 32, signed: true }) }
+    trust_types::Ty::Ref {
+        mutable: false,
+        inner: Box::new(trust_types::Ty::Int { width: 32, signed: true }),
+    }
 }
 
 fn usize_ty() -> trust_types::Ty {
@@ -21211,10 +21267,7 @@ fn slice_get_func() -> trust_types::VerifiableFunction {
                                 mutable: false,
                                 place: Place {
                                     local: 2,
-                                    projections: vec![
-                                        Projection::Deref,
-                                        Projection::Index(1),
-                                    ],
+                                    projections: vec![Projection::Deref, Projection::Index(1)],
                                 },
                             },
                             span: Default::default(),
@@ -21412,7 +21465,10 @@ fn sem_adt_return_shape_of_declines_raw_address_of_base() {
         let mut func = slice_first_func();
         func.body.locals.push(LocalDecl {
             index: 5,
-            ty: Ty::RawPtr { mutable: mutability, pointee: Box::new(Ty::Int { width: 32, signed: true }) },
+            ty: Ty::RawPtr {
+                mutable: mutability,
+                pointee: Box::new(Ty::Int { width: 32, signed: true }),
+            },
             name: None,
         });
         func.body.blocks[1].stmts.insert(
@@ -21525,8 +21581,7 @@ fn slice_ref_guard_coherent_from_end_aware_bounds_gate() {
     assert!(!slice_ref_guard_coherent(&ge(1), &wrong_base), "probe (f): base-handle mismatch");
     // A syntactically-foreign but semantically-equivalent guard `Gt(len,0)` is OUTSIDE
     // the gate — honest completeness gap, DECLINES (not a soundness hole).
-    let gt0 =
-        SemCondTree::Leaf(SemCond { op: SemCmpOp::Gt, a: len0(), b: SemOperand::Const(0) });
+    let gt0 = SemCondTree::Leaf(SemCond { op: SemCmpOp::Gt, a: len0(), b: SemOperand::Const(0) });
     assert!(!slice_ref_guard_coherent(&gt0, &ci(0, 1, false)), "Gt(len,0) is outside the gate");
     // Dynamic index `s[k]`: guard MUST be `Lt(k, sliceLen(s))`, SAME handle + operand.
     let lt = SemCondTree::Leaf(SemCond {
@@ -21534,11 +21589,9 @@ fn slice_ref_guard_coherent_from_end_aware_bounds_gate() {
         a: SemOperand::Var(2),
         b: SemOperand::Len(Box::new(SemOperand::Var(0))),
     });
-    let idx_ok =
-        SliceRefProj { base_param: 0, kind: SliceRefProjKind::Index(SemOperand::Var(2)) };
+    let idx_ok = SliceRefProj { base_param: 0, kind: SliceRefProjKind::Index(SemOperand::Var(2)) };
     assert!(slice_ref_guard_coherent(&lt, &idx_ok), "SliceIndex::get: Lt(k, len(s))");
-    let idx_bad =
-        SliceRefProj { base_param: 0, kind: SliceRefProjKind::Index(SemOperand::Var(3)) };
+    let idx_bad = SliceRefProj { base_param: 0, kind: SliceRefProjKind::Index(SemOperand::Var(3)) };
     assert!(!slice_ref_guard_coherent(&lt, &idx_bad), "index-operand mismatch declines");
     let idx_wrong_base =
         SliceRefProj { base_param: 9, kind: SliceRefProjKind::Index(SemOperand::Var(2)) };
@@ -21652,9 +21705,8 @@ fn sem_adt_return_shape_rejects_aggregate_enum_name_drift() {
     use trust_types::{AggregateKind, Rvalue, Statement};
 
     let mut func = half_promotion_func();
-    let Statement::Assign {
-        rvalue: Rvalue::Aggregate(AggregateKind::Adt { name, .. }, _), ..
-    } = &mut func.body.blocks[2].stmts[1]
+    let Statement::Assign { rvalue: Rvalue::Aggregate(AggregateKind::Adt { name, .. }, _), .. } =
+        &mut func.body.blocks[2].stmts[1]
     else {
         panic!("bb2's second statement must be the Result Aggregate")
     };
@@ -21837,10 +21889,7 @@ fn sem_adt_return_opaque_recognizes_abstractor_fold_fvar_opt() {
     assert_eq!(shape.steps.len(), 2, "sentinel guard + ek payload = 2 opaque steps");
     assert!(shape.steps[0].bool_typed, "the sentinel eq result is Bool-typed");
     assert_eq!(shape.cond, SemOpaqueCond::StepBool(0));
-    assert_eq!(
-        shape.then_arm,
-        SemOpaqueArm { variant: 1, payload: Some(SemChainVal::Step(1)) }
-    );
+    assert_eq!(shape.then_arm, SemOpaqueArm { variant: 1, payload: Some(SemChainVal::Step(1)) });
     assert_eq!(shape.else_arm, SemOpaqueArm { variant: 0, payload: None });
     assert_eq!(shape.enum_name, "std::option::Option");
 }
@@ -21862,10 +21911,7 @@ fn sem_adt_return_opaque_recognizes_lifter_fold_bvar_opt() {
         },
         "the REAL Ge guard over (idx, self.start) must be denoted exactly"
     );
-    assert_eq!(
-        shape.then_arm,
-        SemOpaqueArm { variant: 1, payload: Some(SemChainVal::Step(1)) }
-    );
+    assert_eq!(shape.then_arm, SemOpaqueArm { variant: 1, payload: Some(SemChainVal::Step(1)) });
     assert_eq!(shape.else_arm, SemOpaqueArm { variant: 0, payload: None });
 }
 
@@ -21902,10 +21948,7 @@ fn sem_adt_return_opaque_recognizes_fvarsubst_fold_fvar_opt() {
         .expect("the FVarSubst::fold_fvar_opt field-clone shape must be recognized");
     assert_eq!(shape.steps.len(), 2, "sentinel guard + Clone::clone payload = 2 opaque steps");
     assert_eq!(shape.cond, SemOpaqueCond::StepBool(0));
-    assert_eq!(
-        shape.then_arm,
-        SemOpaqueArm { variant: 1, payload: Some(SemChainVal::Step(1)) }
-    );
+    assert_eq!(shape.then_arm, SemOpaqueArm { variant: 1, payload: Some(SemChainVal::Step(1)) });
 }
 
 #[test]
@@ -21945,10 +21988,10 @@ fn sem_adt_return_opaque_declines_nonterminal_field_ref_call() {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         },
     });
-    let trust_types::Statement::Assign { rvalue, .. } = &mut func.body.blocks[3].stmts[0]
-    else {
+    let trust_types::Statement::Assign { rvalue, .. } = &mut func.body.blocks[3].stmts[0] else {
         panic!("bb3 must construct Some")
     };
     let trust_types::Rvalue::Aggregate(_, operands) = rvalue else {
@@ -22171,6 +22214,7 @@ fn sem_adt_return_opaque_declines_non_guard_origin_ref_call() {
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
             },
         },
     );
@@ -22210,9 +22254,7 @@ fn sem_adt_return_opaque_declines_multiply_written_step_temp() {
 /// ADVERSARIAL: a payload local with NO chain definition must decline.
 #[test]
 fn sem_adt_return_opaque_declines_undefined_payload() {
-    use trust_types::{
-        AggregateKind, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
-    };
+    use trust_types::{AggregateKind, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement};
     let mut func = abstractor_fold_fvar_opt_func();
     let non_chain = func.body.locals.len();
     func.body.locals.push(LocalDecl { index: non_chain, ty: expr_ty(), name: None });
@@ -22257,8 +22299,7 @@ fn sem_adt_return_opaque_declines_cross_arm_definition_leak() {
     use trust_types::{AggregateKind, Operand, Place, Rvalue, Statement};
 
     let mut func = abstractor_fold_fvar_opt_func();
-    let Statement::Assign { rvalue: then_rvalue, .. } = &mut func.body.blocks[3].stmts[0]
-    else {
+    let Statement::Assign { rvalue: then_rvalue, .. } = &mut func.body.blocks[3].stmts[0] else {
         panic!("true arm must assign the return")
     };
     *then_rvalue = Rvalue::Aggregate(
@@ -22270,8 +22311,7 @@ fn sem_adt_return_opaque_declines_cross_arm_definition_leak() {
         },
         vec![],
     );
-    let Statement::Assign { rvalue: else_rvalue, .. } = &mut func.body.blocks[4].stmts[0]
-    else {
+    let Statement::Assign { rvalue: else_rvalue, .. } = &mut func.body.blocks[4].stmts[0] else {
         panic!("false arm must assign the return")
     };
     *else_rvalue = Rvalue::Aggregate(
@@ -22603,12 +22643,8 @@ fn sem_adt_return_opaque_declines_same_variant_arms() {
 fn sem_adt_return_opaque_declines_option_discriminant_metadata_drift() {
     let mut func = abstractor_fold_fvar_opt_func();
     let remap = |ty: &mut trust_types::Ty| {
-        let trust_types::Ty::Adt { variants, .. } = ty else {
-            panic!("expected Option enum type")
-        };
-        let [none, some] = variants.as_mut_slice() else {
-            panic!("expected None/Some variants")
-        };
+        let trust_types::Ty::Adt { variants, .. } = ty else { panic!("expected Option enum type") };
+        let [none, some] = variants.as_mut_slice() else { panic!("expected None/Some variants") };
         none.discriminant = 10;
         some.discriminant = 20;
     };
@@ -22782,11 +22818,7 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
-                BasicBlock {
-                    id: BlockId(4),
-                    stmts: vec![],
-                    terminator: Terminator::Unreachable,
-                },
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Unreachable },
             ],
             arg_count: 2,
             return_ty: result_ty(),
@@ -22801,10 +22833,7 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
         .expect("a discriminant-guarded ADT-return must recognize (composition)");
     let SemCondTree::Leaf(cond) = &shape.cond else { panic!("bare discriminant leaf") };
     assert_eq!(cond.op, SemCmpOp::Eq);
-    assert!(
-        matches!(cond.a, SemOperand::Discriminant(_)),
-        "guard must be the discriminant read"
-    );
+    assert!(matches!(cond.a, SemOperand::Discriminant(_)), "guard must be the discriminant read");
     assert_eq!(shape.then_arm.variant, 0); // Ok
     assert_eq!(shape.else_arm.variant, 1); // Err
 }
@@ -22827,8 +22856,8 @@ fn sem_adt_return_shape_of_composes_with_discriminant_guard() {
 
 fn from_signed_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place,
-        Rvalue, Statement, Terminator, Ty, VariantDef, VerifiableBody, VerifiableFunction,
+        AggregateKind, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
+        Statement, Terminator, Ty, VariantDef, VerifiableBody, VerifiableFunction,
     };
     let i16t = || Ty::Int { width: 16, signed: true };
     let i8t = || Ty::Int { width: 8, signed: true };
@@ -22885,10 +22914,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
                     stmts: vec![
                         Statement::Assign {
                             place: Place::local(4),
-                            rvalue: Rvalue::Cast(
-                                Operand::Constant(ConstValue::Int(-128)),
-                                i16t(),
-                            ),
+                            rvalue: Rvalue::Cast(Operand::Constant(ConstValue::Int(-128)), i16t()),
                             span: Default::default(),
                         },
                         Statement::Assign {
@@ -22933,10 +22959,7 @@ fn from_signed_func() -> trust_types::VerifiableFunction {
                     stmts: vec![
                         Statement::Assign {
                             place: Place::local(6),
-                            rvalue: Rvalue::Cast(
-                                Operand::Constant(ConstValue::Int(127)),
-                                i16t(),
-                            ),
+                            rvalue: Rvalue::Cast(Operand::Constant(ConstValue::Int(127)), i16t()),
                             span: Default::default(),
                         },
                         Statement::Assign {
@@ -23158,10 +23181,9 @@ fn sem_adt_return_shape_of_chain_rejects_non_assignment_payload_effects() {
     use trust_types::Statement;
 
     let mut func = from_signed_func();
-    func.body.blocks[1].stmts.push(Statement::SetDiscriminant {
-        place: trust_types::Place::local(2),
-        variant_index: 3,
-    });
+    func.body.blocks[1]
+        .stmts
+        .push(Statement::SetDiscriminant { place: trust_types::Place::local(2), variant_index: 3 });
     assert!(
         sem_adt_return_shape_of_chain(&func).is_none(),
         "a rooted SetDiscriminant effect must not evade the walk-local assignment count"
@@ -23328,11 +23350,8 @@ fn sem_adt_return_shape_of_chain_declines_float_typed_guard_operands() {
     let Statement::Assign { rvalue, .. } = &mut func.body.blocks[0].stmts[1] else {
         panic!("bb0's second stmt must be the `_3 := cmp(..)` guard assignment");
     };
-    *rvalue = Rvalue::BinaryOp(
-        BinOp::Ne,
-        Operand::Copy(Place::local(1)),
-        Operand::Copy(Place::local(1)),
-    );
+    *rvalue =
+        Rvalue::BinaryOp(BinOp::Ne, Operand::Copy(Place::local(1)), Operand::Copy(Place::local(1)));
     assert!(
         sem_adt_return_shape_of_chain(&func).is_none(),
         "a float-typed Var-vs-Var comparison must decline, not misdenote as an Int comparison"
@@ -23414,11 +23433,7 @@ fn reverse_switch3_func() -> trust_types::VerifiableFunction {
                         span: Default::default(),
                     },
                 },
-                BasicBlock {
-                    id: BlockId(1),
-                    stmts: vec![],
-                    terminator: Terminator::Unreachable,
-                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Unreachable },
                 variant_arm(2, 0, 5),
                 variant_arm(3, 1, 5),
                 variant_arm(4, 2, 5),
@@ -23522,7 +23537,12 @@ fn sem_adt_return_shape_of_discriminant_switch3_declines_duplicate_variant_arms(
     func.body.blocks[4].stmts = vec![Statement::Assign {
         place: trust_types::Place::local(0),
         rvalue: Rvalue::Aggregate(
-            AggregateKind::Adt { name: "cmp::Ordering".into(), variant: 1, active_field: None, args: None },
+            AggregateKind::Adt {
+                name: "cmp::Ordering".into(),
+                variant: 1,
+                active_field: None,
+                args: None,
+            },
             vec![],
         ),
         span: Default::default(),
@@ -23866,8 +23886,8 @@ fn sem_cmp_binop_adt_return3_shape_of_wrong_variant_claim_is_kernel_rejected() {
 
 fn is_ascii_whitespace_func() -> trust_types::VerifiableFunction {
     use trust_types::{
-        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue,
-        Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction,
     };
     let u8t = || Ty::Int { width: 8, signed: false };
     VerifiableFunction {
@@ -24056,8 +24076,7 @@ fn load_num_dump(rel: &str) -> trust_types::VerifiableFunction {
 #[test]
 fn pure_total_intrinsic_classify_is_strict() {
     use PureTotalIntrinsic as P;
-    let marked =
-        |path: &str| format!("{}{}", trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX, path);
+    let marked = |path: &str| format!("{}{}", trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX, path);
     assert_eq!(P::classify(&marked("intrinsics::ctpop::<u8>")), Some(P::Ctpop));
     assert_eq!(P::classify(&marked("intrinsics::cttz::<u16>")), Some(P::Cttz));
     assert_eq!(P::classify(&marked("core::intrinsics::ctlz::<u32>")), Some(P::Ctlz));
@@ -24067,10 +24086,7 @@ fn pure_total_intrinsic_classify_is_strict() {
         P::classify(&marked("std::intrinsics::saturating_add::<i32>")),
         Some(P::SaturatingAdd)
     );
-    assert_eq!(
-        P::classify(&marked("intrinsics::saturating_sub::<u8>")),
-        Some(P::SaturatingSub)
-    );
+    assert_eq!(P::classify(&marked("intrinsics::saturating_sub::<u8>")), Some(P::SaturatingSub));
     assert_eq!(
         P::classify(&marked("core::intrinsics::saturating_add::<i64>")),
         Some(P::SaturatingAdd)
@@ -24340,8 +24356,9 @@ fn load_bitmethods_dump(rel: &str) -> trust_types::VerifiableFunction {
 /// admitted here would be admitted with less checking than anywhere else.
 #[test]
 fn pinned_call_arg_translator_refusals() {
-    use crate::mirsem::{SemOperand as S, SemPreOp};
     use trust_types::{LocalDecl, Ty, VerifiableBody};
+
+    use crate::mirsem::{SemOperand as S, SemPreOp};
 
     let body = VerifiableBody {
         locals: vec![
@@ -24444,9 +24461,10 @@ fn pinned_call_arg_translator_refusals() {
 /// not depend on that remaining true.
 #[test]
 fn pinned_call_arg_cast_over_projection_defers() {
+    use trust_types::{LocalDecl, Ty, VerifiableBody};
+
     use crate::mirsem::SemOperand as S;
     use crate::trustir_anchor::IrOperand as I;
-    use trust_types::{LocalDecl, Ty, VerifiableBody};
     let body = VerifiableBody {
         locals: vec![
             LocalDecl { index: 0, ty: Ty::Int { width: 32, signed: false }, name: None },
@@ -24499,8 +24517,11 @@ fn pinned_call_arg_cast_over_projection_defers() {
     );
     // NEGATIVE CONTROL — a bare-param width change still hits G5, not the deferral.
     assert!(
-        crate::prove::sem_call_arg_to_ir_pinned_for_test(&S::Cast(Box::new(S::Var(0)), 8, false), &body)
-            .is_none(),
+        crate::prove::sem_call_arg_to_ir_pinned_for_test(
+            &S::Cast(Box::new(S::Var(0)), 8, false),
+            &body
+        )
+        .is_none(),
         "G5 is untouched for a PARAM base: a width-CHANGING cast of a bare param declines"
     );
     // NEGATIVE CONTROL — a nested cast is not a projection and must not defer.
@@ -24622,7 +24643,9 @@ fn pinned_total_arity_and_ids_are_consistent() {
         assert_eq!(k.arity(), 1, "{callee} is unary");
         assert!(k.synthetic_callee_id() < 8, "ids stay in the tiny kernel-friendly range");
     }
-    for callee in ["std::intrinsics::saturating_add::<i32>", "core::intrinsics::saturating_sub::<i32>"] {
+    for callee in
+        ["std::intrinsics::saturating_add::<i32>", "core::intrinsics::saturating_sub::<i32>"]
+    {
         let k = PinnedTotalCallable::classify(callee).expect("pins");
         assert_eq!(k.arity(), 2, "{callee} is BINARY — Delta-1's arity-1 gate excludes it");
         assert!(k.synthetic_callee_id() < 8);
@@ -24640,11 +24663,7 @@ fn pinned_count_ones_method_classify_is_strict() {
     ] {
         assert_eq!(M::classify(good), Some(M::CountOnes), "must pin {good:?}");
         // The INTRINSIC classifier must NOT recognize a method (disjoint pins).
-        assert_eq!(
-            PureTotalIntrinsic::classify(good),
-            None,
-            "intrinsic pin must decline {good:?}"
-        );
+        assert_eq!(PureTotalIntrinsic::classify(good), None, "intrinsic pin must decline {good:?}");
         assert_eq!(
             PinnedTotalCallable::classify(good),
             Some(PinnedTotalCallable::Method(M::CountOnes)),
@@ -24747,16 +24766,14 @@ fn preop_arg_recognizer_fails_closed_on_forgeries() {
 
     // P1 — WRONG CALLEE: the pinned method replaced by a forged def-path.
     let mut f = genuine.clone();
-    if let trust_types::Terminator::Call { func: callee, .. } = &mut f.body.blocks[0].terminator
-    {
+    if let trust_types::Terminator::Call { func: callee, .. } = &mut f.body.blocks[0].terminator {
         *callee = "evil::count_ones::<u8>".to_string();
     }
     assert!(sem_intrinsic_call_return_of_mir(&f).is_none(), "P1 wrong callee must decline");
 
     // P2 — WRONG CALLEE (wrong method on the genuine receiver).
     let mut f = genuine.clone();
-    if let trust_types::Terminator::Call { func: callee, .. } = &mut f.body.blocks[0].terminator
-    {
+    if let trust_types::Terminator::Call { func: callee, .. } = &mut f.body.blocks[0].terminator {
         *callee = "num::<impl u8>::trailing_zeros".to_string();
     }
     assert!(sem_intrinsic_call_return_of_mir(&f).is_none(), "P2 wrong method must decline");
@@ -24817,10 +24834,8 @@ fn preop_arg_recognizer_fails_closed_on_forgeries() {
 
 /// Load the committed dump whose `def_path` equals `def_path` exactly.
 fn load_payload_dump(def_path: &str) -> trust_types::VerifiableFunction {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/fixtures/optres-payload-extract-2026-07-17/dumps"
-    );
+    let dir =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/optres-payload-extract-2026-07-17/dumps");
     for entry in std::fs::read_dir(dir).expect("dumps dir readable") {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -25017,8 +25032,7 @@ fn payload_extract_declines_unreachable_decoy_switch() {
 fn payload_extract_declines_opaque_post_arm_tail_with_dead_return() {
     use trust_types::{BlockId, Terminator};
     let mut f = load_payload_dump("std::option::Option::<i32>::unwrap_or");
-    let mut dead_return =
-        f.body.blocks.iter().find(|b| b.id == BlockId(4)).expect("join").clone();
+    let mut dead_return = f.body.blocks.iter().find(|b| b.id == BlockId(4)).expect("join").clone();
     dead_return.id = BlockId(5);
     let join = f.body.blocks.iter_mut().find(|b| b.id == BlockId(4)).expect("join");
     join.terminator = Terminator::Opaque {
@@ -25051,10 +25065,8 @@ fn payload_extract_diverging_recognizes_the_four_corpus_bodies() {
         ("std::result::Result::<i32, u8>::unwrap", 0),
     ] {
         let f = load_payload_dump(dp);
-        let s =
-            sem_adt_payload_extract_diverging_of_discriminant_switch(&f).unwrap_or_else(|| {
-                panic!("{dp}: divergence-guarded extraction must be recognized")
-            });
+        let s = sem_adt_payload_extract_diverging_of_discriminant_switch(&f)
+            .unwrap_or_else(|| panic!("{dp}: divergence-guarded extraction must be recognized"));
         assert_eq!(s.extract_variant, want_variant, "{dp}: payload variant");
         assert_eq!(s.extract_field_idx, 0, "{dp}: field 0");
     }
@@ -25252,5 +25264,785 @@ fn payload_extract_diverging_declines_non_exhaustive() {
     assert!(
         sem_adt_payload_extract_diverging_of_discriminant_switch(&f).is_none(),
         "a non-exhaustive switch must decline"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust: W20 VALUE-TIER `&self` DOWNCAST DISPATCH (2026-08-26) — the probe suite.
+//
+// The widening lets `downcast_expected_variants` and `downcast_field_payload` look
+// through ONE immutable `&` on the `self` parameter, so
+// `fn get(&self) -> Option<i64> { match self { E::A(x) => Some(*x), E::B(_) => None } }`
+// is recognized. Everything the by-value lane pinned must STILL be pinned through the
+// reference — the tag↔downcast provenance above all — and `&mut` must NEVER look
+// through, because it can be written through between the tag read and the payload read.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `enum E { A(i64), B(i64) }`, flattened, discriminant-index-safe.
+fn ref_self_probe_enum_ty() -> trust_types::Ty {
+    use trust_types::{Ty, VariantDef};
+    let i64t = Ty::Int { width: 64, signed: true };
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "E".to_string(),
+        fields: vec![
+            ("__tag".into(), i64t.clone()),
+            ("__v0_0".into(), i64t.clone()),
+            ("__v1_0".into(), i64t.clone()),
+        ],
+        variants: vec![
+            VariantDef { name: "A".into(), discriminant: 0, fields: vec![("0".into(), i64t.clone())] },
+            VariantDef { name: "B".into(), discriminant: 1, fields: vec![("0".into(), i64t.clone())] },
+        ],
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+/// `Option<i64>`, flattened, discriminant-index-safe.
+fn ref_self_probe_option_ty() -> trust_types::Ty {
+    use trust_types::{Ty, VariantDef};
+    let i64t = Ty::Int { width: 64, signed: true };
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "Option".to_string(),
+        fields: vec![("__tag".into(), i64t.clone()), ("__v1_0".into(), i64t.clone())],
+        variants: vec![
+            VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+            VariantDef { name: "Some".into(), discriminant: 1, fields: vec![("0".into(), i64t)] },
+        ],
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+/// `fn get(&self) -> Option<i64> { match self { E::A(x) => Some(*x), E::B(_) => None } }`
+///
+/// `mutable` selects `&self` vs `&mut self` — the sole axis the mutability probe perturbs.
+fn ref_self_downcast_func(mutable: bool) -> trust_types::VerifiableFunction {
+    use trust_types::{
+        AggregateKind, BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue,
+        Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+    };
+    let i64t = Ty::Int { width: 64, signed: true };
+    let self_ty = Ty::Ref { mutable, inner: Box::new(ref_self_probe_enum_ty()) };
+    let deref_self = |projs: Vec<Projection>| Place { local: 1, projections: projs };
+    VerifiableFunction {
+        name: "get".into(),
+        def_path: "probe::E::get".into(),
+        span: trust_types::SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, name: Some("_0".into()), ty: ref_self_probe_option_ty() },
+                LocalDecl { index: 1, name: Some("_1".into()), ty: self_ty },
+                LocalDecl { index: 2, name: Some("_2".into()), ty: i64t.clone() },
+                LocalDecl { index: 3, name: Some("_3".into()), ty: i64t },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::Discriminant(deref_self(vec![Projection::Deref])),
+                        span: Default::default(),
+                    }],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Move(Place::local(2)),
+                        targets: vec![(0, BlockId(1)), (1, BlockId(2))],
+                        otherwise: BlockId(4),
+                        exhaustive_enum_unreachable: true,
+                        span: Default::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(3),
+                            rvalue: Rvalue::Use(Operand::Copy(deref_self(vec![
+                                Projection::Deref,
+                                Projection::Downcast(0),
+                                Projection::Field(0),
+                            ]))),
+                            span: Default::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Aggregate(
+                                AggregateKind::Adt {
+                                    name: "Option".into(),
+                                    variant: 1,
+                                    active_field: None,
+                                    args: None,
+                                },
+                                vec![Operand::Move(Place::local(3))],
+                            ),
+                            span: Default::default(),
+                        },
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Aggregate(
+                            AggregateKind::Adt {
+                                name: "Option".into(),
+                                variant: 0,
+                                active_field: None,
+                                args: None,
+                            },
+                            vec![],
+                        ),
+                        span: Default::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Unreachable },
+            ],
+            arg_count: 1,
+            return_ty: ref_self_probe_option_ty(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// NON-VACUITY: the `&self` shape IS recognized, and the payload names the right
+/// parameter, the right variant, and the VARIANT-DISJOINT flattened key.
+#[test]
+fn ref_self_downcast_dispatch_is_recognized_through_the_reference() {
+    let f = ref_self_downcast_func(false);
+    let shape = sem_adt_return_shape_of(&f)
+        .expect("a `&self` downcast dispatch must be recognized through the reference");
+    let payload_arm = if shape.then_arm.payload.is_some() { &shape.then_arm } else { &shape.else_arm };
+    match payload_arm.payload.as_ref().expect("the payload arm carries a payload") {
+        SemAdtPayload::DowncastField { base_param, flat_key, downcast_variant } => {
+            assert_eq!(*base_param, 0, "the payload must name the `self` PARAMETER");
+            assert_eq!(*downcast_variant, 0, "the pinned variant is A (tag 0)");
+            assert_eq!(*flat_key, 1, "`__v0_0` is flattened slot 1 — never the within-variant 0");
+        }
+        other => panic!("expected a DowncastField payload through `&self`, got {other:?}"),
+    }
+}
+
+/// ADVERSARIAL (mutability): `&mut self` must NEVER look through. A `&mut` can be
+/// written through between the tag read and the payload read, so the tag no longer
+/// pins the payload's variant. This is the SOLE axis perturbed against the test above.
+#[test]
+fn ref_self_downcast_declines_through_a_mutable_reference() {
+    let f = ref_self_downcast_func(true);
+    assert!(
+        sem_adt_return_shape_of(&f).is_none(),
+        "a `&mut self` downcast dispatch MUST decline — the referent can be written \
+         through between the discriminant read and the payload read"
+    );
+}
+
+/// ADVERSARIAL (write-through): an immutable base with a write reaching through it is
+/// malformed/adversarial and must decline, the same defense
+/// `sem_discriminant_base_of_mir` applies at the same seam.
+#[test]
+fn ref_self_downcast_declines_when_a_write_reaches_through_the_reference() {
+    use trust_types::{BlockId, ConstValue, Operand, Place, Projection, Rvalue, Statement};
+    let mut f = ref_self_downcast_func(false);
+    // Write through `*_1` in the payload arm, BEFORE the payload read.
+    let bb1 = f.body.blocks.iter_mut().find(|b| b.id == BlockId(1)).expect("bb1");
+    bb1.stmts.insert(
+        0,
+        Statement::Assign {
+            place: Place {
+                local: 1,
+                projections: vec![Projection::Deref, Projection::Downcast(0), Projection::Field(0)],
+            },
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
+            span: Default::default(),
+        },
+    );
+    assert!(
+        sem_adt_return_shape_of(&f).is_none(),
+        "a write reaching THROUGH the immutable reference must decline"
+    );
+}
+
+/// ADVERSARIAL (tag↔downcast provenance, through the reference): the widening must not
+/// weaken gate D. The payload arm reads `Downcast(1)` while its switch tag is 0.
+#[test]
+fn ref_self_downcast_declines_wrong_variant_through_the_reference() {
+    use trust_types::{BlockId, Operand, Place, Projection, Rvalue, Statement};
+    let mut f = ref_self_downcast_func(false);
+    let bb1 = f.body.blocks.iter_mut().find(|b| b.id == BlockId(1)).expect("bb1");
+    let Statement::Assign { rvalue, .. } = &mut bb1.stmts[0] else { panic!("payload read") };
+    *rvalue = Rvalue::Use(Operand::Copy(Place {
+        local: 1,
+        projections: vec![Projection::Deref, Projection::Downcast(1), Projection::Field(0)],
+    }));
+    assert!(
+        sem_adt_return_shape_of(&f).is_none(),
+        "a Downcast index != the routing tag must decline THROUGH the reference too — \
+         the widening must not weaken the TAG↔DOWNCAST provenance gate"
+    );
+}
+
+/// THE COVERAGE QUESTION, not the recognition question. A recognized shape that the
+/// kernel then refuses is worth zero; this asserts the `&self` downcast return actually
+/// CERTIFIES modulo 3, and — the non-tautology half — that a WRONG-VARIANT claim over the
+/// very same recognized shape is kernel-REJECTED.
+#[test]
+fn ref_self_downcast_return_certifies_and_a_forged_variant_does_not() {
+    let f = ref_self_downcast_func(false);
+    let shape = sem_adt_return_shape_of(&f).expect("recognized");
+    assert_eq!(
+        crate::trustir_adt::check_adt_return_refinement(&shape),
+        crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+        "the `&self` downcast return must CERTIFY — recognition alone is not coverage"
+    );
+    // NON-TAUTOLOGY. Swapping the arms' variants in the shape itself proves NOTHING —
+    // the witness rebuilds BOTH the model and the claim from that same swapped data, so
+    // it certifies "the model equals the model". The real probe overrides the CLAIM
+    // alone: the then-arm genuinely builds `Option.Some <payload>`, and we claim the
+    // nullary `Option.None` for it. Distinct constructors of an inductive are never
+    // definitionally equal, so the kernel must refuse.
+    let carrier =
+        crate::reflect::reflect_struct(&ref_self_probe_option_ty()).expect("Option reflects");
+    let mut env = crate::trustir_anchor::trustir_env().expect("env");
+    let registry =
+        crate::clean_ground::register_adt_carriers(&mut env, std::slice::from_ref(&carrier));
+    let confirmed = registry.get(&carrier.name).expect("Option registers");
+    let none_ctor = confirmed.constructors.first().expect("variant None is registered").name.clone();
+    let forged = clean_kernel::Expr::const_(
+        clean_kernel::Name::from_string(&none_ctor),
+        clean_kernel::LevelVec::new(),
+    );
+    assert!(
+        matches!(
+            crate::trustir_adt::check_adt_return_refinement_claimed(&shape, Some(&forged)),
+            crate::trustir_anchor::RefinementVerdict::KernelRejected(_)
+        ),
+        "claiming `Option.None` for the arm that really builds `Option.Some x` must be \
+         KERNEL-REJECTED — otherwise the `&self` lane does not pin the constructor"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — the probe suite.
+//
+// `Some(Inner(x))`: a nested constructor WITH operands as an ADT-return arm payload.
+// Measured on a frozen 56,328-body corpus this is the WHOLE of the largest in-fragment
+// gap in this lane (all 67 such bodies, and nothing else). The witness must apply the
+// INNER constructor to the INNER field denotations, so the probes below pin exactly that:
+// which inner constructor, and which value in which slot.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `struct Inner(i64, i64)`, flattened.
+fn nested_probe_inner_ty() -> trust_types::Ty {
+    let i64t = trust_types::Ty::Int { width: 64, signed: true };
+    trust_types::Ty::adt("Inner", vec![("0".into(), i64t.clone()), ("1".into(), i64t)])
+}
+
+/// `Option<Inner>`, flattened, discriminant-index-safe.
+fn nested_probe_option_ty() -> trust_types::Ty {
+    use trust_types::{Ty, VariantDef};
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "OptionInner".to_string(),
+        fields: vec![
+            ("__tag".into(), Ty::Int { width: 64, signed: true }),
+            ("__v1_0".into(), nested_probe_inner_ty()),
+        ],
+        variants: vec![
+            VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+            VariantDef {
+                name: "Some".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), nested_probe_inner_ty())],
+            },
+        ],
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
+}
+
+/// `fn f(a: i64, b: i64, flag: bool) -> OptionInner {
+///      if flag { OptionInner::Some(Inner(a, b)) } else { OptionInner::None } }`
+///
+/// `first`/`second` select which parameter feeds which inner slot — the axis the
+/// slot-order probe perturbs.
+fn nested_ctor_arm_func(first: usize, second: usize) -> trust_types::VerifiableFunction {
+    use trust_types::{
+        AggregateKind, BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction,
+    };
+    let i64t = Ty::Int { width: 64, signed: true };
+    VerifiableFunction {
+        name: "f".into(),
+        def_path: "probe::f".into(),
+        span: trust_types::SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, name: None, ty: nested_probe_option_ty() },
+                LocalDecl { index: 1, name: Some("a".into()), ty: i64t.clone() },
+                LocalDecl { index: 2, name: Some("b".into()), ty: i64t.clone() },
+                LocalDecl { index: 3, name: None, ty: Ty::Bool },
+                LocalDecl { index: 4, name: None, ty: nested_probe_inner_ty() },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    // `_3 = a < b` — a real comparison guard. A bare `bool` PARAMETER has
+                    // no defining rvalue, so `switch_leaf` cannot read a condition from it
+                    // and the dispatch declines; this is the shape real MIR produces.
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::BinaryOp(
+                            trust_types::BinOp::Lt,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: trust_types::SourceSpan::default(),
+                    }],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(3)),
+                        targets: vec![(0, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: trust_types::SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        // `_4 = Inner(<first>, <second>)`
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::Aggregate(
+                                AggregateKind::Adt {
+                                    name: "Inner".into(),
+                                    variant: 0,
+                                    active_field: None,
+                                    args: None,
+                                },
+                                vec![
+                                    Operand::Copy(Place::local(first)),
+                                    Operand::Copy(Place::local(second)),
+                                ],
+                            ),
+                            span: trust_types::SourceSpan::default(),
+                        },
+                        // `_0 = OptionInner::Some(move _4)`
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Aggregate(
+                                AggregateKind::Adt {
+                                    name: "OptionInner".into(),
+                                    variant: 1,
+                                    active_field: None,
+                                    args: None,
+                                },
+                                vec![Operand::Move(Place::local(4))],
+                            ),
+                            span: trust_types::SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Aggregate(
+                            AggregateKind::Adt {
+                                name: "OptionInner".into(),
+                                variant: 0,
+                                active_field: None,
+                                args: None,
+                            },
+                            vec![],
+                        ),
+                        span: trust_types::SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 2,
+            return_ty: nested_probe_option_ty(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// NON-VACUITY: the nested-constructor arm payload is recognized as EXACT STRUCTURE —
+/// the inner type, the inner constructor, and both inner field values.
+#[test]
+fn nested_ctor_arm_payload_is_recognized_as_exact_structure() {
+    let f = nested_ctor_arm_func(1, 2);
+    let shape = sem_adt_return_shape_of(&f).unwrap_or_else(|| {
+        panic!(
+            "`Some(Inner(a, b))` must be recognized as a nested-ctor arm payload; the \
+             recognizer's own gate says: {}",
+            sem_adt_return_decline_reason(&f)
+        )
+    });
+    let arm = if shape.then_arm.payload.is_some() { &shape.then_arm } else { &shape.else_arm };
+    match arm.payload.as_ref().expect("the payload arm carries a payload") {
+        SemAdtPayload::NestedCtor { ty, variant, fields } => {
+            assert_eq!(ty, &nested_probe_inner_ty(), "the inner type is carried verbatim");
+            assert_eq!(*variant, None, "Inner is a struct, not an enum variant");
+            assert_eq!(
+                fields,
+                &vec![
+                    SemStructField::Scalar(SemOperand::Var(0)),
+                    SemStructField::Scalar(SemOperand::Var(1)),
+                ],
+                "both inner slots resolve to their OWN parameters, in MIR order"
+            );
+        }
+        other => panic!("expected a NestedCtor payload, got {other:?}"),
+    }
+}
+
+/// THE COVERAGE QUESTION. A recognized shape the kernel then refuses is worth zero.
+#[test]
+fn nested_ctor_arm_payload_certifies_modulo_3() {
+    let f = nested_ctor_arm_func(1, 2);
+    let shape = sem_adt_return_shape_of(&f).expect("recognized");
+    assert_eq!(
+        crate::trustir_adt::check_adt_return_refinement(&shape),
+        crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+        "the nested-constructor arm payload must CERTIFY — recognition is not coverage"
+    );
+}
+
+/// NON-TAUTOLOGY: `Inner(a, b)` and `Inner(b, a)` must be DIFFERENT theorems. If the
+/// witness were dropping the inner slot order (an opaque stand-in for "some Inner"), both
+/// bodies would prove the same thing and the lane would certify a transposed constructor.
+#[test]
+fn nested_ctor_arm_payload_distinguishes_inner_slot_order() {
+    let ab = sem_adt_return_shape_of(&nested_ctor_arm_func(1, 2)).expect("ab recognized");
+    let ba = sem_adt_return_shape_of(&nested_ctor_arm_func(2, 1)).expect("ba recognized");
+    // Both certify — non-vacuity on both sides.
+    for s in [&ab, &ba] {
+        assert_eq!(
+            crate::trustir_adt::check_adt_return_refinement(s),
+            crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+        );
+    }
+    let arm = |s: &crate::mirsem::SemAdtReturn| {
+        let a = if s.then_arm.payload.is_some() { &s.then_arm } else { &s.else_arm };
+        a.payload.clone()
+    };
+    assert_ne!(
+        arm(&ab),
+        arm(&ba),
+        "`Inner(a, b)` and `Inner(b, a)` must be DIFFERENT payloads — otherwise the inner \
+         slot order is not claimed and a transposed constructor would certify"
+    );
+}
+
+/// ADVERSARIAL (scope): a nested ctor whose field is an OPAQUE PARAM has no binder to
+/// denote it in this lane's `(o, e)` layout. It must DECLINE, not invent one.
+#[test]
+fn nested_ctor_arm_payload_declines_an_opaque_param_field() {
+    use trust_types::{BlockId, LocalDecl, Ty, VariantDef};
+    let mut f = nested_ctor_arm_func(1, 2);
+    // Retype parameter `a` (local 1) and Inner's slot 0 to a NON-scalar ADT, which the
+    // resolver reads as an `OpaqueParam` rather than a `Scalar`.
+    let opaque = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        name: "Opaque".to_string(),
+        fields: vec![("0".into(), Ty::Int { width: 64, signed: true })],
+        variants: vec![VariantDef {
+            name: "Opaque".into(),
+            discriminant: 0,
+            fields: vec![("0".into(), Ty::Int { width: 64, signed: true })],
+        }],
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
+    f.body.locals[1] = LocalDecl { index: 1, name: Some("a".into()), ty: opaque.clone() };
+    let inner = Ty::adt(
+        "Inner",
+        vec![("0".into(), opaque), ("1".into(), Ty::Int { width: 64, signed: true })],
+    );
+    f.body.locals[4] = LocalDecl { index: 4, name: None, ty: inner };
+    let _ = BlockId(0);
+    assert!(
+        sem_adt_return_shape_of(&f).is_none(),
+        "a nested-ctor payload with an OPAQUE-PARAM field must DECLINE — its denotation \
+         needs a binder this lane does not bind, and inventing one is what fail-closed forbids"
+    );
+}
+
+/// CONTROL for the nested-ctor probes: the SAME body shape with a plain SCALAR payload.
+/// If this fails, the fixture is wrong; if it passes while the nested one fails, the
+/// nested lane is wrong. Isolating that is cheaper than reading a de Bruijn trace.
+#[test]
+fn nested_ctor_arm_control_scalar_payload_certifies() {
+    use trust_types::{AggregateKind, BlockId, Operand, Place, Rvalue, Statement};
+    let mut f = nested_ctor_arm_func(1, 2);
+    let bb1 = f.body.blocks.iter_mut().find(|b| b.id == BlockId(1)).expect("bb1");
+    bb1.stmts = vec![Statement::Assign {
+        place: Place::local(0),
+        rvalue: Rvalue::Aggregate(
+            AggregateKind::Adt {
+                name: "OptionInner".into(),
+                variant: 1,
+                active_field: None,
+                args: None,
+            },
+            vec![Operand::Copy(Place::local(1))],
+        ),
+        span: Default::default(),
+    }];
+    // Retype the Some payload slot to a scalar so the aggregate type-checks.
+    let i64t = trust_types::Ty::Int { width: 64, signed: true };
+    if let trust_types::Ty::Adt { variants, fields, .. } = &mut f.body.locals[0].ty {
+        variants[1].fields = vec![("0".into(), i64t.clone())];
+        fields[1] = ("__v1_0".into(), i64t.clone());
+    }
+    let rt = f.body.locals[0].ty.clone();
+    f.body.return_ty = rt;
+    let shape = sem_adt_return_shape_of(&f).unwrap_or_else(|| {
+        panic!("scalar control must be recognized; gate: {}", sem_adt_return_decline_reason(&f))
+    });
+    assert_eq!(
+        crate::trustir_adt::check_adt_return_refinement(&shape),
+        crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+        "the SCALAR control must certify — if it does not, the fixture is at fault"
+    );
+}
+
+
+
+/// THE FORGERY PROBE, and the one that actually bites. `..._distinguishes_inner_slot_order`
+/// compares PAYLOADS; that is a statement about the recognizer, not about what the kernel
+/// is asked. Here the honest body builds `Some(Inner(a, b))` and the CLAIM is overridden
+/// with `Some(Inner(b, a))` — the same constructor, the same arity, the arguments
+/// transposed. `e 0` and `e 1` are distinct env reads and never definitionally equal, so
+/// a lane that really applies the inner constructor to ORDERED arguments must refuse.
+#[test]
+fn a_transposed_inner_ctor_claim_is_kernel_rejected() {
+    let honest = sem_adt_return_shape_of(&nested_ctor_arm_func(1, 2)).expect("ab recognized");
+    let transposed = sem_adt_return_shape_of(&nested_ctor_arm_func(2, 1)).expect("ba recognized");
+    // Build the FORGED claim from the transposed shape, then assert it against the honest
+    // one. `honest_adt_then_value_for_test` builds exactly the RHS the then-obligation states.
+    let forged = crate::trustir_adt::honest_adt_then_value_for_test(&transposed)
+        .expect("the transposed claim builds");
+    assert!(
+        matches!(
+            crate::trustir_adt::check_adt_return_refinement_claimed(&honest, Some(&forged)),
+            crate::trustir_anchor::RefinementVerdict::KernelRejected(_)
+        ),
+        "claiming `Inner(b, a)` for the body that really builds `Inner(a, b)` must be \
+         KERNEL-REJECTED — otherwise the nested lane does not claim argument ORDER"
+    );
+    // META, non-tautology: the honest claim over the honest shape still certifies.
+    assert_eq!(
+        crate::trustir_adt::check_adt_return_refinement(&honest),
+        crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust: VALUE-TRANSPARENT ARM DROP (2026-08-27) — the probe suite.
+//
+// An arm may now reach the join through `Drop(x) -> join` instead of a bare `Goto`.
+// Measured motivation: of 2,640 uncovered TWO-ARM bodies, 648 stop on exactly this and
+// ZERO stop on a `Call`. The soundness argument is that the drop is value-transparent FOR
+// `_0`; these probes pin both halves of that — it works for a non-`_0` drop, and it must
+// still refuse when `_0` itself is dropped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rewrite the `then` arm of a recognized `&self` downcast body so it reaches the join
+/// through `Drop(local) -> join` rather than `Goto(join)`.
+fn arm_drop_variant(drop_local: usize) -> trust_types::VerifiableFunction {
+    use trust_types::{BlockId, Place, Terminator};
+    let mut f = ref_self_downcast_func(false);
+    let bb1 = f.body.blocks.iter_mut().find(|b| b.id == BlockId(1)).expect("bb1");
+    bb1.terminator = Terminator::Drop {
+        place: Place::local(drop_local),
+        target: BlockId(3),
+        span: Default::default(),
+        unwind: Default::default(),
+    };
+    f
+}
+
+/// NON-VACUITY: an arm that drops a NON-`_0` local on its way to the join is still
+/// recognized, and still CERTIFIES — the drop changes nothing about the returned value.
+#[test]
+fn an_arm_reaching_the_join_through_a_non_return_drop_is_recognized_and_certifies() {
+    let f = arm_drop_variant(1);
+    let shape = sem_adt_return_shape_of(&f).unwrap_or_else(|| {
+        panic!("a value-transparent arm drop must be recognized; gate: {}",
+            sem_adt_return_decline_reason(&f))
+    });
+    assert_eq!(
+        crate::trustir_adt::check_adt_return_refinement(&shape),
+        crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+        "the drop is value-transparent for `_0`, so the same theorem must still certify"
+    );
+    // And it is the SAME theorem the bare-Goto body proves — the drop adds no content.
+    let plain = sem_adt_return_shape_of(&ref_self_downcast_func(false)).expect("plain");
+    assert_eq!(
+        shape.then_arm, plain.then_arm,
+        "a value-transparent drop must not change the recognized arm value"
+    );
+}
+
+/// ADVERSARIAL: dropping `_0` ITSELF must still decline. This is the whole soundness
+/// argument — the widening is sound only because the dropped place is not the return
+/// local, and `local_has_only_guarded_writes` independently refuses a `Drop` of `_0`.
+/// If either check regressed, a body whose return value is dropped before the return
+/// would certify.
+#[test]
+fn an_arm_that_drops_the_return_local_still_declines() {
+    let f = arm_drop_variant(0);
+    assert!(
+        sem_adt_return_shape_of(&f).is_none(),
+        "an arm that DROPS `_0` must decline — the returned value does not survive it"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trust: SCALAR TEMP CHASE (2026-08-27) — the probe suite.
+//
+// The constructor lanes now resolve a scalar field operand through
+// `resolve_cast_source_operand`, which traces a non-parameter temp's SOLE static
+// assignment. Motivation: 138 of the 156 bodies that pass every independent gate and stop
+// on this operand are exactly that shape. The gates that make it sound are the helper's own
+// call-dest / multiple-assignment / mutable-alias refusals; these probes pin them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `struct P { a: i64 }`, `fn f(x: i64) -> P { let t = x; P { a: t } }` — the field operand
+/// is a TEMP whose sole assignment reads a parameter. `extra` appends statements used by
+/// the adversarial variants below.
+fn scalar_temp_chase_func(extra: Vec<trust_types::Statement>) -> trust_types::VerifiableFunction {
+    use trust_types::{
+        AggregateKind, BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement,
+        Terminator, Ty, VerifiableBody, VerifiableFunction,
+    };
+    let i64t = Ty::Int { width: 64, signed: true };
+    let p_ty = Ty::adt("P", vec![("a".into(), i64t.clone())]);
+    let mut stmts = vec![
+        Statement::Assign {
+            place: Place::local(2),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+            span: Default::default(),
+        },
+        Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Aggregate(
+                AggregateKind::Adt {
+                    name: "P".into(),
+                    variant: 0,
+                    active_field: None,
+                    args: None,
+                },
+                vec![Operand::Move(Place::local(2))],
+            ),
+            span: Default::default(),
+        },
+    ];
+    stmts.splice(1..1, extra);
+    VerifiableFunction {
+        name: "f".into(),
+        def_path: "probe::f".into(),
+        span: Default::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, name: None, ty: p_ty.clone() },
+                LocalDecl { index: 1, name: Some("x".into()), ty: i64t.clone() },
+                LocalDecl { index: 2, name: None, ty: i64t },
+            ],
+            blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
+            arg_count: 1,
+            return_ty: p_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// NON-VACUITY: the temp resolves to its parameter source, and the witness CERTIFIES.
+#[test]
+fn a_scalar_field_operand_that_is_a_temp_is_chased_and_certifies() {
+    let f = scalar_temp_chase_func(vec![]);
+    let shape = sem_struct_return_shape_of(&f).unwrap_or_else(|| {
+        panic!(
+            "a temp-sourced scalar field must resolve; gate: {:?}",
+            crate::mirsem::sem_struct_return_shape_reasoned(&f).err()
+        )
+    });
+    assert_eq!(
+        shape.fields,
+        vec![SemStructField::Scalar(SemOperand::Var(0))],
+        "the temp must resolve to the PARAMETER it reads, not to an opaque stand-in"
+    );
+    assert_eq!(
+        crate::trustir_adt::check_struct_return_refinement(&shape),
+        crate::trustir_anchor::RefinementVerdict::ProvenModulo3,
+    );
+}
+
+/// ADVERSARIAL: a temp assigned TWICE must decline — the second write could be the live one,
+/// so tracing "the" assignment would pick a value the body may never construct from.
+#[test]
+fn a_multiply_assigned_scalar_temp_still_declines() {
+    use trust_types::{ConstValue, Operand, Place, Rvalue, Statement};
+    let f = scalar_temp_chase_func(vec![Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
+        span: Default::default(),
+    }]);
+    assert!(
+        sem_struct_return_shape_of(&f).is_none(),
+        "a MULTIPLY-assigned scalar temp must decline — the chase must not pick one write"
+    );
+}
+
+/// ADVERSARIAL: a temp that is MUTABLY BORROWED must decline — a write through the alias is
+/// invisible to a statement scan, so its value at the aggregate is not pinned.
+#[test]
+fn a_mutably_aliased_scalar_temp_still_declines() {
+    use trust_types::{Place, Rvalue, Statement};
+    let f = scalar_temp_chase_func(vec![Statement::Assign {
+        place: Place::local(3),
+        rvalue: Rvalue::Ref { mutable: true, place: Place::local(2) },
+        span: Default::default(),
+    }]);
+    let mut f = f;
+    f.body.locals.push(trust_types::LocalDecl {
+        index: 3,
+        name: None,
+        ty: trust_types::Ty::Ref {
+            mutable: true,
+            inner: Box::new(trust_types::Ty::Int { width: 64, signed: true }),
+        },
+    });
+    assert!(
+        sem_struct_return_shape_of(&f).is_none(),
+        "a MUTABLY-ALIASED scalar temp must decline — a write through the alias is unseen"
     );
 }

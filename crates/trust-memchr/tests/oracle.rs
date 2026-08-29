@@ -18,11 +18,10 @@
 //! it cannot live here, because depending on upstream memchr is exactly what
 //! this crate exists to stop doing.
 
+use memchr::arch::all::{is_equal, is_prefix, is_suffix};
 use memchr::{
-    arch::all::{is_equal, is_prefix, is_suffix},
-    memchr, memchr2, memchr2_iter, memchr3, memchr3_iter, memchr_iter, memmem,
-    memrchr, memrchr2, memrchr2_iter, memrchr3, memrchr3_iter, memrchr_iter,
-    Memchr, Memchr2, Memchr3,
+    Memchr, Memchr2, Memchr3, memchr, memchr_iter, memchr2, memchr2_iter, memchr3, memchr3_iter,
+    memmem, memrchr, memrchr_iter, memrchr2, memrchr2_iter, memrchr3, memrchr3_iter,
 };
 
 // ---------------------------------------------------------------- oracle ---

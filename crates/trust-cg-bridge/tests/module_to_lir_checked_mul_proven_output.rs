@@ -46,12 +46,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::Module;
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Source the REAL bridge Module from a trust-types VerifiableFunction whose body
@@ -191,8 +188,10 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
         let off = (pc - base) as usize;
         let bytes: [u8; 4] = code[off..off + 4].try_into().unwrap();
         if let Ok(insn) = decode_aarch64(&bytes, pc) {
-            if matches!(insn.opcode, Opcode::BCond | Opcode::Cbz | Opcode::Cbnz | Opcode::Tbz | Opcode::Tbnz)
-            {
+            if matches!(
+                insn.opcode,
+                Opcode::BCond | Opcode::Cbz | Opcode::Cbnz | Opcode::Tbz | Opcode::Tbnz
+            ) {
                 return true;
             }
         }
@@ -341,9 +340,7 @@ impl<'a> Executor<'a> {
         fall: Result<Formula, ExecError>,
     ) -> Result<Formula, ExecError> {
         match (taken, fall) {
-            (Ok(t), Ok(f)) => {
-                Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f)))
-            }
+            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
             (Err(ExecError::Trapped), Ok(f)) => {
                 self.precondition.push(Formula::Not(Box::new(path_cond)));
                 Ok(f)
@@ -520,11 +517,7 @@ fn mask_to_width(v: i128, width: u32) -> i128 {
 /// Interpret the low `width` bits of `v` as a 2's-complement signed value.
 fn as_signed(v: i128, width: u32) -> i128 {
     let v = mask_to_width(v, width);
-    if width < 128 && (v & (1i128 << (width - 1))) != 0 {
-        v - (1i128 << width)
-    } else {
-        v
-    }
+    if width < 128 && (v & (1i128 << (width - 1))) != 0 { v - (1i128 << width) } else { v }
 }
 
 fn fold_consts(f: &Formula) -> Formula {
@@ -563,9 +556,15 @@ fn fold_consts(f: &Formula) -> Formula {
                 Formula::BvSignExt(Box::new(a), *bits)
             }
         }
-        Formula::BvOr(a, b, w) => fold_bin(a, b, *w, |x, y| x | y, |a, b, w| Formula::BvOr(a, b, w)),
-        Formula::BvAnd(a, b, w) => fold_bin(a, b, *w, |x, y| x & y, |a, b, w| Formula::BvAnd(a, b, w)),
-        Formula::BvXor(a, b, w) => fold_bin(a, b, *w, |x, y| x ^ y, |a, b, w| Formula::BvXor(a, b, w)),
+        Formula::BvOr(a, b, w) => {
+            fold_bin(a, b, *w, |x, y| x | y, |a, b, w| Formula::BvOr(a, b, w))
+        }
+        Formula::BvAnd(a, b, w) => {
+            fold_bin(a, b, *w, |x, y| x & y, |a, b, w| Formula::BvAnd(a, b, w))
+        }
+        Formula::BvXor(a, b, w) => {
+            fold_bin(a, b, *w, |x, y| x ^ y, |a, b, w| Formula::BvXor(a, b, w))
+        }
         Formula::BvAdd(a, b, w) => {
             fold_bin(a, b, *w, |x, y| x.wrapping_add(y), |a, b, w| Formula::BvAdd(a, b, w))
         }
@@ -952,4 +951,3 @@ fn full_symbolic_mul_proof_is_multiplier_equivalence_bound() {
     let proven = discharge_equal_under(&precondition, &machine_out, &mul_spec());
     assert!(proven, "full-symbolic a*b proof (expected to be capacity-bound in QF_BV)");
 }
-

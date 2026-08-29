@@ -175,6 +175,7 @@ fn erebuild_func(post: Formula) -> VerifiableFunction {
                 ],
                 terminator: Terminator::Call {
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "erebuild".to_string(),
                     args: vec![Operand::Move(Place::local(5))],
@@ -201,6 +202,7 @@ fn erebuild_func(post: Formula) -> VerifiableFunction {
                 ],
                 terminator: Terminator::Call {
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "erebuild".to_string(),
                     args: vec![Operand::Move(Place::local(8))],

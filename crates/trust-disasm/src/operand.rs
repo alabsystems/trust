@@ -321,12 +321,7 @@ pub enum MemoryOperand {
     /// AArch64 never produces this variant; its register-offset form is
     /// [`MemoryOperand::BaseRegister`], which has no displacement because
     /// AArch64 has no such addressing mode.
-    BaseIndexOffset {
-        base: Option<Register>,
-        index: Register,
-        scale_shift: u8,
-        displacement: i64,
-    },
+    BaseIndexOffset { base: Option<Register>, index: Register, scale_shift: u8, displacement: i64 },
 
     /// **x86-64 decoder-internal; INVALID outside `x86_64::decoder`.**
     ///

@@ -75,6 +75,9 @@ use trust_vcgen::mutual_recursive_datatype_functional::mutual_recursive_datatype
 
 // ── The extracted full-Level cluster (loaded literal extractor output) ────────
 
+const FUEL_DEF_PATH: &str = "clean_kernel::expr::kind::ExprKind";
+const LEVEL_DEF_PATH: &str = "clean_kernel::level::Level";
+
 /// The model=reference postcondition `m fuel e = r(fuel, e)`.
 fn ref_post(r: &str, fuel_sort: &Sort, level_sort: &Sort) -> Formula {
     Formula::Eq(
@@ -104,23 +107,51 @@ fn model_vs_reference_funcs(use_wrong_gm: bool) -> Vec<VerifiableFunction> {
 
     // Sanity: the artifact really is the extracted full-Level shape this lane
     // expects (the full pin is the extract-side drift gate).
-    let fm = &functions["fm"];
-    let Ty::Datatype { name, variants } = &fm.body.return_ty else {
-        panic!("cluster members return the modeled Level, got {:?}", fm.body.return_ty);
+    let (level_sort, fuel_sort) = {
+        let fm = &functions["fm"];
+        // Authenticated artifacts use markers everywhere and carry their full
+        // definitions in `datatype_defs`; validate and consume that table.
+        let Ty::Datatype { name: marker_name, variants: marker_variants } = &fm.body.return_ty
+        else {
+            panic!("cluster return must carry a datatype marker, got {:?}", fm.body.return_ty);
+        };
+        assert_eq!(marker_name, LEVEL_DEF_PATH);
+        assert!(marker_variants.is_empty(), "the authenticated root is a bare marker");
+        let level = fm.body.resolved_datatype(&fm.body.return_ty);
+        let Ty::Datatype { name, variants } = level.as_ref() else {
+            panic!("cluster members return the modeled Level, got {:?}", fm.body.return_ty);
+        };
+        assert_eq!(name, LEVEL_DEF_PATH);
+        assert_eq!(
+            variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
+            vec![("Zero", 0), ("Succ", 1), ("Max", 2), ("IMax", 2), ("Param", 1)],
+            "the payload is the FULL Level slice"
+        );
+        let fuel_param_ty = &fm.body.locals.iter().find(|d| d.index == 1).expect("param _1").ty;
+        let Ty::Ref { inner: fuel_dt, .. } = fuel_param_ty else {
+            panic!("fuel param must be a reference, got {fuel_param_ty:?}");
+        };
+        assert!(
+            matches!(fuel_dt.as_ref(), Ty::Datatype { name, variants } if name == FUEL_DEF_PATH && variants.is_empty()),
+            "authenticated fuel position must carry the canonical bare marker, got {fuel_dt:?}"
+        );
+        let fuel = fm.body.resolved_datatype(fuel_dt);
+        let Ty::Datatype { name: fuel_name, variants: fuel_variants } = fuel.as_ref() else {
+            panic!("fuel param must reference a datatype, got {fuel_dt:?}");
+        };
+        assert_eq!(fuel_name, FUEL_DEF_PATH);
+        assert_eq!(
+            fuel_variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
+            vec![("Z", 0), ("S", 1)],
+        );
+        (Sort::from_ty(level.as_ref()), Sort::from_ty(fuel.as_ref()))
     };
-    assert_eq!(name, "level::Level");
-    assert_eq!(
-        variants.iter().map(|(c, fs)| (c.as_str(), fs.len())).collect::<Vec<_>>(),
-        vec![("Zero", 0), ("Succ", 1), ("Max", 2), ("IMax", 2), ("Param", 1)],
-        "the payload is the FULL Level slice"
-    );
-    let level_sort = Sort::from_ty(&fm.body.return_ty);
-    let fuel_param_ty = &fm.body.locals.iter().find(|d| d.index == 1).expect("param _1").ty;
-    let Ty::Ref { inner: fuel_dt, .. } = fuel_param_ty else {
-        panic!("fuel param must be a reference, got {fuel_param_ty:?}");
-    };
-    let fuel_sort = Sort::from_ty(fuel_dt);
 
+    // When seating the negative body, preserve the authenticated positive
+    // member's full identity string. Calls in current extractor output use the
+    // canonical def-path (`clean_kernel::gm`), not the old short name.
+    let canonical_gm_name = functions["gm"].name.clone();
+    let canonical_gm_def_path = functions["gm"].def_path.clone();
     let gm_key = if use_wrong_gm { "gm_wrong" } else { "gm" };
     let mut fm = functions.remove("fm").expect("fm");
     let mut gm = functions.remove(gm_key).expect(gm_key);
@@ -135,8 +166,8 @@ fn model_vs_reference_funcs(use_wrong_gm: bool) -> Vec<VerifiableFunction> {
     if use_wrong_gm {
         // Seat the extracted negative body as `gm` so fm's cluster edge
         // resolves to it. Name-level only — the MIR body stays literal.
-        gm.name = "gm".to_string();
-        gm.def_path = "gm".to_string();
+        gm.name = canonical_gm_name;
+        gm.def_path = canonical_gm_def_path;
     }
     fm.postconditions = vec![ref_post("fr", &fuel_sort, &level_sort)];
     gm.postconditions = vec![ref_post("gr", &fuel_sort, &level_sort)];
@@ -162,8 +193,8 @@ fn full_level_model_vs_reference_end_to_end() {
         })
         .collect();
     assert_eq!(
-        props,
-        vec![
+        props[..32],
+        [
             "mutual_recursive_datatype_functional_base::fm::Zero",
             "mutual_recursive_datatype_functional_base::fm::Succ",
             "mutual_recursive_datatype_functional_base::fm::Max",
@@ -196,10 +227,15 @@ fn full_level_model_vs_reference_end_to_end() {
             "mutual_recursive_datatype_functional_refstep::gr::Max[calls=fr,fr]",
             "mutual_recursive_datatype_functional_refstep::gr::IMax[calls=fr,fr]",
             "mutual_recursive_datatype_functional_refstep::gr::Param[calls=]",
-            "mutual_recursive_datatype_functional_conclusion[mutual-induction:\
-             fuel=expr::kind::ExprKind:Z|S;data=level::Level;members=fm,gm;\
-             bases=10;cases=10;refs=fr,gr;refbases=2;refcases=10]",
         ],
+    );
+    assert_eq!(
+        props[32],
+        format!(
+            "mutual_recursive_datatype_functional_conclusion[mutual-induction:\
+             fuel={FUEL_DEF_PATH}:Z|S;data={LEVEL_DEF_PATH};members=fm,gm;\
+             bases=10;cases=10;refs=fr,gr;refbases=2;refcases=10]"
+        ),
         "bundle: {vcs:#?}"
     );
 

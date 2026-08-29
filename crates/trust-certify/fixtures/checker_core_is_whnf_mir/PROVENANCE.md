@@ -87,6 +87,39 @@ statically-dischargeable WHNF head beyond Sort/Lam/Pi (the `is_whnf` model's
 `neutral` case needs an `is_neutral` proof, which this lane does not construct;
 neutral-headed variants therefore correctly fail closed).
 
+## 2026-08-22 addition — SPEC-BEARING sealed variants (derived, not re-extracted)
+
+| File | derived from | delta |
+|---|---|---|
+| `clean_kernel.expr.Expr.prop.ensures_is_whnf.json` | `clean_kernel.expr.Expr.prop.json` | `spec.ensures: [] -> ["is_whnf(result)"]` |
+| `clean_kernel.expr.Expr.arrow.ensures_is_whnf.json` | `clean_kernel.expr.Expr.arrow.json` | `spec.ensures: [] -> ["is_whnf(result)"]` |
+
+The certificate mint is SEALED (`sealed_constructor_material`,
+2026-07-15 `45b6415f53`): only byte-exact build-embedded corpus material may
+mint. The end-to-end EMIT->DISCHARGE pin
+(`trust-integration-tests/tests/checker_core_is_whnf_emit_discharge_e2e.rs`)
+needs the presented function to CARRY the `is_whnf(result)` ensures (that is
+what vcgen's postcondition lane emits from), so the corpus carries these two
+spec-bearing variants of the audited positives.
+
+Provenance: each file is byte-for-byte its base fixture — the fork-extracted
+MIR (`body`, `def_path`, `span`, everything) is VERBATIM, no instruction or
+field re-authored — except the single JSON substring
+`"ensures":[]` -> `"ensures":["is_whnf(result)"]`. They are NOT re-extractions:
+the clean-kernel source carries no Trust contract on these constructors, so the
+extraction pipeline necessarily records an empty `spec`; the ensures clause is
+the contract representation the vcgen EMIT lane consumes, stating exactly the
+proposition the sealed discharge already proves about the same audited body.
+
+The seal does NOT take these files on faith: `sealed_constructor_material`
+admits a variant only after re-deriving it in code from the embedded audited
+base (base + that exact single ensures, bincode-equal), so an edited variant
+file fails closed and can never widen authority beyond the audited MIR + the
+one discharged contract string. `Expr::sort` deliberately has no spec-bearing
+variant; presenting it with an ensures refuses (see the
+`sealed_corpus_admits_spec_bearing_variants_and_refuses_all_other_drift` seal
+controls in `checker_core_is_whnf.rs`).
+
 ## The LITERAL-`whnf` identity fixture (first property about the reducer)
 
 | File | fn | role |

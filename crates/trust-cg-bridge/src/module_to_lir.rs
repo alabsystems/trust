@@ -131,9 +131,10 @@ pub enum ModuleLirError {
 
     /// A `BinOp`/`ICmp` sub-op outside the integer scalar core: an i128 shift
     /// (multi-register, outside the proven single-instruction shift envelope), an
-    /// i128 div/rem (libcall-routed, outside the proven-bytes envelope), or any
-    /// float op. The i8..i64 shifts (`Shl`/`LShr`/`AShr`) ARE mapped — see
-    /// [`map_int_binop`].
+    /// i128 div/rem (libcall-routed, outside the proven-bytes envelope), a
+    /// Bool-only connective (`BAnd`/`BOr`/`BXor`) presented to this integer
+    /// lane, or any float op. The i8..i64 shifts (`Shl`/`LShr`/`AShr`) ARE
+    /// mapped — see [`map_int_binop`].
     #[error(
         "unsupported binary op `{op}` in `{name}` (scalar slice maps Add/Sub/Mul/And/Or/Xor/Shl/LShr/AShr + i8..i64 Div/Rem)"
     )]
@@ -524,20 +525,6 @@ fn map_int_binop(op: BinOp, ty: &Ty, name: &str) -> Result<Opcode, ModuleLirErro
                 op: binop_name(op),
             });
         }
-        // Trust (#53): the BOOLEAN connectives (trust-ir 4b06918). This converter is
-        // `map_INT_binop` and its caller has already established an INTEGER type, so
-        // reaching here means a Bool-only opcode arrived on an integer operand --
-        // ill-typed IR that trust-ir's own validator rejects. Fail closed with the
-        // same UnsupportedBinOp the float ops take, rather than silently lowering to
-        // Band/Bor/Bxor: the bitwise instruction would be the RIGHT answer on the
-        // 0/1 Bool carrier and the WRONG one on the integer operand actually present,
-        // and this arm only sees the latter.
-        BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
-            return Err(ModuleLirError::UnsupportedBinOp {
-                name: name.to_string(),
-                op: binop_name(op),
-            });
-        }
     };
     Ok(opcode)
 }
@@ -567,12 +554,6 @@ fn binop_name(op: BinOp) -> &'static str {
         BinOp::Shl => "shl",
         BinOp::LShr => "lshr",
         BinOp::AShr => "ashr",
-        // Trust: named so the refusal diagnostic distinguishes the logical
-        // connective from its bitwise namesake — `band` vs `and` is the whole
-        // point of the split.
-        BinOp::BAnd => "band",
-        BinOp::BOr => "bor",
-        BinOp::BXor => "bxor",
     }
 }
 
@@ -3238,9 +3219,7 @@ fn lower_value_inst(
                             if fieldless_enum_has_discriminant(module, ty, d)) =>
                 {
                     let Constant::Int(d) = fields[0] else {
-                        return Err(ModuleLirError::UnsupportedConstant {
-                            name: name.to_string(),
-                        });
+                        return Err(ModuleLirError::UnsupportedConstant { name: name.to_string() });
                     };
                     i128_to_i64(d, name)?
                 }
@@ -3963,9 +3942,21 @@ fn map_scalar_mem_ty(ty: &Ty, name: &str, context: &str) -> Result<LirType, Modu
         // Trust (v25 B1): Isize/Usize (64-bit on the pinned target) and Char
         // (32-bit unsigned carrier) are fixed-width scalars in memory too —
         // map_scalar_int_ty assigns them the I64/I32 LIR widths.
-        Ty::I8 | Ty::U8 | Ty::I16 | Ty::U16 | Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64
-        | Ty::Isize | Ty::Usize | Ty::Char
-        | Ty::I128 | Ty::U128 | Ty::Bool | Ty::Ptr => map_scalar_int_ty(ty, context),
+        Ty::I8
+        | Ty::U8
+        | Ty::I16
+        | Ty::U16
+        | Ty::I32
+        | Ty::U32
+        | Ty::I64
+        | Ty::U64
+        | Ty::Isize
+        | Ty::Usize
+        | Ty::Char
+        | Ty::I128
+        | Ty::U128
+        | Ty::Bool
+        | Ty::Ptr => map_scalar_int_ty(ty, context),
         other => Err(ModuleLirError::UnsupportedMemory {
             name: name.to_string(),
             detail: format!("non-scalar {context} type {other:?}"),
@@ -5459,6 +5450,24 @@ mod tests {
         let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("u32 urem maps");
         let block = lir.blocks.get(&Block(0)).expect("entry block");
         assert!(matches!(block.instructions[0].opcode, Opcode::Urem));
+    }
+
+    #[test]
+    fn boolean_connectives_fail_closed_on_integer_lane_with_distinct_diagnostics() {
+        // These are Bool-only trust-ir operations. `map_int_binop` must neither
+        // accept them as the similarly named integer bitwise operations nor
+        // collapse their diagnostics onto And/Or/Xor.
+        for (op, diagnostic) in [(BinOp::BAnd, "band"), (BinOp::BOr, "bor"), (BinOp::BXor, "bxor")]
+        {
+            assert_eq!(
+                map_int_binop(op, &Ty::I32, "logical-on-int"),
+                Err(ModuleLirError::UnsupportedBinOp {
+                    name: "logical-on-int".to_string(),
+                    op: diagnostic,
+                }),
+                "{op:?} must fail closed with its logical-connective diagnostic"
+            );
+        }
     }
 
     #[test]

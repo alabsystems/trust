@@ -1077,8 +1077,7 @@ pub fn replay_certified_envelope(
     let (_, _, _, ctx) = build_lia_two_bound_proof(lo, hi, /* complete */ true);
 
     // (2) Take ONLY the term bytes, and only if they match their claimed digest.
-    let Some(artifact) =
-        envelope.artifacts.iter().find(|a| a.kind == CLEAN_KERNEL_TERM_ARTIFACT)
+    let Some(artifact) = envelope.artifacts.iter().find(|a| a.kind == CLEAN_KERNEL_TERM_ARTIFACT)
     else {
         return ReplayOutcome::ArtifactUnusable;
     };
@@ -1090,11 +1089,8 @@ pub fn replay_certified_envelope(
     };
 
     // (3) OUR kernel check, in OUR context, against `False`.
-    let mut checker = TypeChecker::with_context_and_caches(
-        &env,
-        ctx,
-        clean_kernel::tc::TcCaches::default(),
-    );
+    let checker =
+        TypeChecker::with_context_and_caches(&env, ctx, clean_kernel::tc::TcCaches::default());
     if checker.check_type(&term, &false_prop()).is_err() {
         return ReplayOutcome::KernelRejected;
     }
@@ -1384,7 +1380,10 @@ mod tests {
         let victim = two_bound(20, 7);
         // Both are independently certifiable, so a rejection below is the
         // BINDING talking, not one side being uncertifiable.
-        assert_eq!(replay_certified_envelope(&donor, &envelope_for(&donor)), ReplayOutcome::Replayed);
+        assert_eq!(
+            replay_certified_envelope(&donor, &envelope_for(&donor)),
+            ReplayOutcome::Replayed
+        );
         assert_eq!(
             replay_certified_envelope(&victim, &envelope_for(&victim)),
             ReplayOutcome::Replayed
@@ -1402,8 +1401,10 @@ mod tests {
     /// every other VC's certificate, and accepts only its own.
     #[test]
     fn envelope_binding_is_exact_across_a_vc_grid() {
-        let vcs: Vec<Formula> =
-            [(10i128, 5i128), (20, 7), (30, 1), (9, 0), (100, 42)].iter().map(|&(lo, hi)| two_bound(lo, hi)).collect();
+        let vcs: Vec<Formula> = [(10i128, 5i128), (20, 7), (30, 1), (9, 0), (100, 42)]
+            .iter()
+            .map(|&(lo, hi)| two_bound(lo, hi))
+            .collect();
         let envelopes: Vec<_> = vcs.iter().map(envelope_for).collect();
 
         let mut accepted = 0usize;
@@ -1412,7 +1413,11 @@ mod tests {
             for (j, env) in envelopes.iter().enumerate() {
                 let outcome = replay_certified_envelope(vc, env);
                 if i == j {
-                    assert_eq!(outcome, ReplayOutcome::Replayed, "VC {i} must accept its OWN certificate");
+                    assert_eq!(
+                        outcome,
+                        ReplayOutcome::Replayed,
+                        "VC {i} must accept its OWN certificate"
+                    );
                     accepted += 1;
                 } else {
                     assert_eq!(
@@ -1483,10 +1488,7 @@ mod tests {
                 artifact.bytes.push(0x00); // digest now stale
             }
         }
-        assert_eq!(
-            replay_certified_envelope(&formula, &tampered),
-            ReplayOutcome::ArtifactUnusable
-        );
+        assert_eq!(replay_certified_envelope(&formula, &tampered), ReplayOutcome::ArtifactUnusable);
     }
 
     /// D.9: single-byte corruption of the TERM, with the digest recomputed so
@@ -1543,7 +1545,10 @@ mod tests {
 
         let mut wrong_schema = envelope_for(&formula);
         wrong_schema.schema = "trust.native-proof-envelope.v99".to_string();
-        assert_eq!(replay_certified_envelope(&formula, &wrong_schema), ReplayOutcome::NotReplayable);
+        assert_eq!(
+            replay_certified_envelope(&formula, &wrong_schema),
+            ReplayOutcome::NotReplayable
+        );
 
         let mut no_term = envelope_for(&formula);
         no_term.artifacts.retain(|a| a.kind != CLEAN_KERNEL_TERM_ARTIFACT);
@@ -1559,10 +1564,7 @@ mod tests {
 
         let single_bound =
             Formula::Gt(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(10)));
-        assert_eq!(
-            replay_certified_envelope(&single_bound, &envelope),
-            ReplayOutcome::NoFragment
-        );
+        assert_eq!(replay_certified_envelope(&single_bound, &envelope), ReplayOutcome::NoFragment);
 
         // `x > 2 ∧ x < 9` is SAT — there is nothing to refute.
         assert_eq!(

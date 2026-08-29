@@ -7,9 +7,9 @@
 //! are pinned structurally below.
 
 use trust_types::{
-    AggregateKind, BasicBlock, BlockId, ConstValue, Contract, ContractKind, Formula,
-    LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty, VariantDef,
-    VcKind, VerifiableBody, VerifiableFunction,
+    AggregateKind, BasicBlock, BlockId, ConstValue, Contract, ContractKind, Formula, LocalDecl,
+    Operand, Place, Rvalue, SourceSpan, Statement, Terminator, Ty, VariantDef, VcKind,
+    VerifiableBody, VerifiableFunction,
 };
 
 use super::{enum_return_grounded_model_vars, generate_v2_contract_vcs_impl};
@@ -20,18 +20,24 @@ fn i64_ty() -> Ty {
 
 /// An opaque non-integer payload (the ny-cert `Rat` handle shape).
 fn opaque_payload_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "ny::Rat".into(),
         fields: vec![("0".into(), i64_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 /// `core::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1 — mirrors the `std_result_ty` fixtures).
 fn std_result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
@@ -39,29 +45,53 @@ fn std_result_ty(ok_payload: Ty) -> Ty {
             ("__v1_0".into(), i64_ty()),
         ],
         variants: vec![
-            VariantDef { name: "Ok".into(), discriminant: 0, fields: vec![("0".into(), ok_payload)] },
-            VariantDef { name: "Err".into(), discriminant: 1, fields: vec![("0".into(), i64_ty())] },
+            VariantDef {
+                name: "Ok".into(),
+                discriminant: 0,
+                fields: vec![("0".into(), ok_payload)],
+            },
+            VariantDef {
+                name: "Err".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), i64_ty())],
+            },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 /// `core::option::Option<i64>` (machine tags: None = 0, Some = 1).
 fn std_option_ty() -> Ty {
-    Ty::Adt { adt_kind: None, layout: None, 
+    Ty::Adt {
+        adt_kind: None,
+        layout: None,
         name: "core::option::Option".into(),
         fields: vec![("__tag".into(), i64_ty()), ("__v1_0".into(), i64_ty())],
         variants: vec![
             VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
-            VariantDef { name: "Some".into(), discriminant: 1, fields: vec![("0".into(), i64_ty())] },
+            VariantDef {
+                name: "Some".into(),
+                discriminant: 1,
+                fields: vec![("0".into(), i64_ty())],
+            },
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+    }
 }
 
 /// A fn whose single return path constructs `ret_ty`'s `variant` in-body:
 /// `fn f() -> Result<..> { _0 = <enum>::<variant>(payload); return }`.
-fn enum_return_fn(ret_ty: Ty, enum_name: &str, variant: usize, payload: Operand, ensures: &str) -> VerifiableFunction {
+fn enum_return_fn(
+    ret_ty: Ty,
+    enum_name: &str,
+    variant: usize,
+    payload: Operand,
+    ensures: &str,
+) -> VerifiableFunction {
     VerifiableFunction {
         name: "enum_ret".to_string(),
         def_path: "test::enum_ret".to_string(),

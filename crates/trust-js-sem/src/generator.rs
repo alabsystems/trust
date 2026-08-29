@@ -33,16 +33,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::ast::{
-    BindTarget, DeclKind, Expr, ForInOfLeft, ForInit, FuncLit, Stmt,
-};
+use std::rc::Rc;
+
+use crate::ast::{BindTarget, DeclKind, Expr, ForInOfLeft, ForInit, FuncLit, Stmt};
 use crate::interp::{Abrupt, Ctx, ERes, Interp};
 use crate::pattern::SliceIter;
 use crate::promise::NativeClosure;
 use crate::value::{
-    units_from_str, EnvId, GenId, NativeErrorKind, ObjId, ObjKind, Object, Prop, Value,
+    EnvId, GenId, NativeErrorKind, ObjId, ObjKind, Object, Prop, Value, units_from_str,
 };
-use std::rc::Rc;
 
 /// How a suspended generator is resumed.
 #[derive(Debug, Clone)]
@@ -124,18 +123,9 @@ enum Frame {
     /// `do body while (test)`.
     DoWhile { body: Rc<Stmt>, test: Rc<Expr>, started: bool },
     /// `for (init; test; update) body` (init already run).
-    For {
-        test: Option<Rc<Expr>>,
-        update: Option<Rc<Expr>>,
-        body: Rc<Stmt>,
-        started: bool,
-    },
+    For { test: Option<Rc<Expr>>, update: Option<Rc<Expr>>, body: Rc<Stmt>, started: bool },
     /// `for (left of iter) body` over a slice iterator.
-    ForOf {
-        iter: SliceIter,
-        left: ForInOfLeft,
-        body: Rc<Stmt>,
-    },
+    ForOf { iter: SliceIter, left: ForInOfLeft, body: Rc<Stmt> },
     /// A yield in progress: consumes the resumption on resume.
     PostYield(PostAction),
     /// A `yield*` delegation in progress over a slice iterator: forwards
@@ -143,10 +133,7 @@ enum Frame {
     YieldStar { iter: SliceIter, dest: PostAction },
     /// A `try` body guarded by a catch clause (finally is desugared to an
     /// enclosing TryFinally). Intercepts a Throw completion once.
-    TryCatch {
-        param: Option<BindTarget>,
-        body: Rc<Vec<Stmt>>,
-    },
+    TryCatch { param: Option<BindTarget>, body: Rc<Vec<Stmt>> },
     /// A `try`/`finally` guard. On ANY completion crossing it, the finally
     /// body runs; a normal finally resumes the saved completion, an abrupt
     /// finally overrides.
@@ -311,9 +298,9 @@ fn stmt_has_yield(s: &Stmt) -> bool {
         }
         Stmt::Expr(e) | Stmt::Throw(e) => expr_has_yield(e),
         Stmt::Return(e) => e.as_ref().is_some_and(expr_has_yield),
-        Stmt::VarDecl { decls, .. } => decls
-            .iter()
-            .any(|(_, init)| init.as_ref().is_some_and(expr_has_yield)),
+        Stmt::VarDecl { decls, .. } => {
+            decls.iter().any(|(_, init)| init.as_ref().is_some_and(expr_has_yield))
+        }
         Stmt::Block(b) => b.iter().any(stmt_has_yield),
         Stmt::If { test, cons, alt } => {
             expr_has_yield(test)
@@ -322,12 +309,7 @@ fn stmt_has_yield(s: &Stmt) -> bool {
         }
         Stmt::While { test, body } => expr_has_yield(test) || stmt_has_yield(body),
         Stmt::DoWhile { body, test } => stmt_has_yield(body) || expr_has_yield(test),
-        Stmt::For {
-            init,
-            test,
-            update,
-            body,
-        } => {
+        Stmt::For { init, test, update, body } => {
             init.as_ref().is_some_and(forinit_has_yield)
                 || test.as_ref().is_some_and(expr_has_yield)
                 || update.as_ref().is_some_and(expr_has_yield)
@@ -335,29 +317,25 @@ fn stmt_has_yield(s: &Stmt) -> bool {
         }
         Stmt::ForIn { obj, body, .. } => expr_has_yield(obj) || stmt_has_yield(body),
         Stmt::ForOf { expr, body, .. } => expr_has_yield(expr) || stmt_has_yield(body),
-        Stmt::Try {
-            block,
-            catch,
-            finally,
-        } => {
+        Stmt::Try { block, catch, finally } => {
             block.iter().any(stmt_has_yield)
                 || catch.as_ref().is_some_and(|(_, b)| b.iter().any(stmt_has_yield))
                 || finally.as_ref().is_some_and(|b| b.iter().any(stmt_has_yield))
         }
         Stmt::Switch { disc, cases } => {
             expr_has_yield(disc)
-                || cases
-                    .iter()
-                    .any(|(t, b)| t.as_ref().is_some_and(expr_has_yield) || b.iter().any(stmt_has_yield))
+                || cases.iter().any(|(t, b)| {
+                    t.as_ref().is_some_and(expr_has_yield) || b.iter().any(stmt_has_yield)
+                })
         }
     }
 }
 
 fn forinit_has_yield(f: &ForInit) -> bool {
     match f {
-        ForInit::Var(decls) | ForInit::Lex { decls, .. } => decls
-            .iter()
-            .any(|(_, init)| init.as_ref().is_some_and(expr_has_yield)),
+        ForInit::Var(decls) | ForInit::Lex { decls, .. } => {
+            decls.iter().any(|(_, init)| init.as_ref().is_some_and(expr_has_yield))
+        }
         ForInit::Expr(e) => expr_has_yield(e),
     }
 }
@@ -433,11 +411,7 @@ impl Interp {
     /// The own `prototype` data-slot value of a function object (None if
     /// absent or an accessor).
     fn gen_prototype_slot(&self, fid: ObjId) -> Option<Value> {
-        self.obj(fid)
-            .props
-            .get(&units_from_str("prototype"))
-            .and_then(Prop::data_value)
-            .cloned()
+        self.obj(fid).props.get(&units_from_str("prototype")).and_then(Prop::data_value).cloned()
     }
 
     /// The generator id behind a value, if it is a generator instance.
@@ -480,10 +454,7 @@ impl Interp {
                             &mut self.generators[gid.0 as usize],
                             GenState::placeholder(),
                         );
-                        local.frames.push(Frame::Seq {
-                            stmts: Rc::new(body.body.clone()),
-                            idx: 0,
-                        });
+                        local.frames.push(Frame::Seq { stmts: Rc::new(body.body.clone()), idx: 0 });
                         self.run_generator(gid, local)
                     }
                 }
@@ -525,7 +496,7 @@ impl Interp {
                 Step::Await(_) => {
                     break Err(Abrupt::Fatal(
                         "await in a generator body (async generator out of slice)".into(),
-                    ))
+                    ));
                 }
                 Step::Return(v) => {
                     local.exec = GenExec::Completed;
@@ -630,7 +601,7 @@ impl Interp {
                 Step::Yield(_) => {
                     break Err(Abrupt::Fatal(
                         "yield in an async function (async generator out of slice)".into(),
-                    ))
+                    ));
                 }
                 Step::Fatal(s) => break Err(Abrupt::Fatal(s)),
             }
@@ -647,10 +618,7 @@ impl Interp {
                         "await: PromiseResolve did not yield a promise".into(),
                     ));
                 };
-                let on_f = self.alloc_native(NativeClosure::AsyncResume {
-                    gid,
-                    is_throw: false,
-                });
+                let on_f = self.alloc_native(NativeClosure::AsyncResume { gid, is_throw: false });
                 let on_r = self.alloc_native(NativeClosure::AsyncResume { gid, is_throw: true });
                 self.perform_promise_then(pid, on_f, on_r, None);
                 Ok(())
@@ -682,12 +650,8 @@ impl Interp {
     /// both enumerable/writable/configurable, proto %Object.prototype%.
     pub(crate) fn iter_result(&mut self, value: Value, done: bool) -> Value {
         let oid = self.alloc(Object::new(ObjKind::Plain, Some(self.intr.object_proto)));
-        self.obj_mut(oid)
-            .props
-            .insert(units_from_str("value"), Prop::data(value));
-        self.obj_mut(oid)
-            .props
-            .insert(units_from_str("done"), Prop::data(Value::Bool(done)));
+        self.obj_mut(oid).props.insert(units_from_str("value"), Prop::data(value));
+        self.obj_mut(oid).props.insert(units_from_str("done"), Prop::data(Value::Bool(done)));
         Value::Obj(oid)
     }
 
@@ -980,12 +944,14 @@ impl Interp {
                 let res = self.generator_resume(gid, Resumption::Normal(v))?;
                 self.ys_read_result(res)
             }
-            SliceIter::ArrayLike(..) | SliceIter::Str(..) | SliceIter::IterObj(..) | SliceIter::StringIterObj(..) | SliceIter::RegExpStringIter(..) => {
-                match self.slice_iter_next(iter)? {
-                    Some(val) => Ok(YsOutcome::Yielded(val)),
-                    None => Ok(YsOutcome::Done(Value::Undefined)),
-                }
-            }
+            SliceIter::ArrayLike(..)
+            | SliceIter::Str(..)
+            | SliceIter::IterObj(..)
+            | SliceIter::StringIterObj(..)
+            | SliceIter::RegExpStringIter(..) => match self.slice_iter_next(iter)? {
+                Some(val) => Ok(YsOutcome::Yielded(val)),
+                None => Ok(YsOutcome::Done(Value::Undefined)),
+            },
             // `yield*` delegation to a general user iterable needs the full
             // next/throw/return forwarding protocol (14.4.14) over user methods
             // — out of the current slice; refuse soundly.
@@ -1007,7 +973,11 @@ impl Interp {
             }
             // The array/string iterators have no `throw` method: IteratorClose
             // (a no-op) then throw a TypeError.
-            SliceIter::ArrayLike(..) | SliceIter::Str(..) | SliceIter::IterObj(..) | SliceIter::StringIterObj(..) | SliceIter::RegExpStringIter(..) => {
+            SliceIter::ArrayLike(..)
+            | SliceIter::Str(..)
+            | SliceIter::IterObj(..)
+            | SliceIter::StringIterObj(..)
+            | SliceIter::RegExpStringIter(..) => {
                 self.slice_iterator_close(iter)?;
                 Err(self.throw_native(NativeErrorKind::TypeError))
             }
@@ -1026,30 +996,24 @@ impl Interp {
                 // On the inner iterator's return: if done, the delegation
                 // returns its value; otherwise keep yielding.
                 let (done, value) = self.read_iter_result(res)?;
-                if done {
-                    Ok(YsOutcome::ReturnOut(value))
-                } else {
-                    Ok(YsOutcome::Yielded(value))
-                }
+                if done { Ok(YsOutcome::ReturnOut(value)) } else { Ok(YsOutcome::Yielded(value)) }
             }
             SliceIter::General { .. } => Err(Abrupt::Fatal(
                 "yield* return over a general (non-intrinsic) iterable (out of slice)".to_string(),
             )),
             // No `return` method: the return propagates unchanged.
-            SliceIter::ArrayLike(..) | SliceIter::Str(..) | SliceIter::IterObj(..) | SliceIter::StringIterObj(..) | SliceIter::RegExpStringIter(..) => {
-                Ok(YsOutcome::ReturnOut(v))
-            }
+            SliceIter::ArrayLike(..)
+            | SliceIter::Str(..)
+            | SliceIter::IterObj(..)
+            | SliceIter::StringIterObj(..)
+            | SliceIter::RegExpStringIter(..) => Ok(YsOutcome::ReturnOut(v)),
         }
     }
 
     /// Interpret a generator iter-result object as a normal next/throw outcome.
     fn ys_read_result(&mut self, res: Value) -> Result<YsOutcome, Abrupt> {
         let (done, value) = self.read_iter_result(res)?;
-        if done {
-            Ok(YsOutcome::Done(value))
-        } else {
-            Ok(YsOutcome::Yielded(value))
-        }
+        if done { Ok(YsOutcome::Done(value)) } else { Ok(YsOutcome::Yielded(value)) }
     }
 
     /// Read `{done, value}` off an iterator-result object.
@@ -1103,11 +1067,15 @@ impl Interp {
         decls: &[(BindTarget, Option<Expr>)],
     ) -> Step {
         if decls.len() != 1 {
-            return Step::Fatal("gen: yield in a multi-declarator declaration (out of slice)".into());
+            return Step::Fatal(
+                "gen: yield in a multi-declarator declaration (out of slice)".into(),
+            );
         }
         let (target, init) = &decls[0];
         let BindTarget::Name(name) = target else {
-            return Step::Fatal("gen: yield initializer for a pattern binding (out of slice)".into());
+            return Step::Fatal(
+                "gen: yield initializer for a pattern binding (out of slice)".into(),
+            );
         };
         let Some(init) = init else {
             return Step::Fatal("gen: declaration yield/await without initializer".into());
@@ -1117,10 +1085,7 @@ impl Interp {
                 "gen: yield/await nested in a declaration initializer (out of slice)".into(),
             );
         }
-        let action = PostAction::BindName {
-            name: name.clone(),
-            init: kind != DeclKind::Var,
-        };
+        let action = PostAction::BindName { name: name.clone(), init: kind != DeclKind::Var };
         self.enter_suspend_expr(g, init, action)
     }
 
@@ -1128,7 +1093,9 @@ impl Interp {
         // A yield-bearing block with function declarations would need hoisted
         // instantiation we do not perform here — refuse.
         if body.iter().any(|s| matches!(s, Stmt::FuncDecl(_))) {
-            return Step::Fatal("gen: function declaration in a yield-bearing block (out of slice)".into());
+            return Step::Fatal(
+                "gen: function declaration in a yield-bearing block (out of slice)".into(),
+            );
         }
         let parent = g.ctx.env;
         let env = self.alloc_env(Some(parent));
@@ -1137,10 +1104,7 @@ impl Interp {
         }
         g.ctx.env = env;
         g.frames.push(Frame::RestoreEnv(parent));
-        g.frames.push(Frame::Seq {
-            stmts: body,
-            idx: 0,
-        });
+        g.frames.push(Frame::Seq { stmts: body, idx: 0 });
         Step::Continue
     }
 
@@ -1171,14 +1135,18 @@ impl Interp {
                     },
                 };
                 if stmt_has_yield(&s) {
-                    return Step::Fatal("gen: yield in a for-loop initializer (out of slice)".into());
+                    return Step::Fatal(
+                        "gen: yield in a for-loop initializer (out of slice)".into(),
+                    );
                 }
                 if let Err(a) = self.eval_stmt_public(&s, &g.ctx) {
                     return self.abrupt_to_step(g, a);
                 }
             }
             Some(ForInit::Lex { .. }) => {
-                return Step::Fatal("gen: lexical for-loop head with yield body (out of slice)".into());
+                return Step::Fatal(
+                    "gen: lexical for-loop head with yield body (out of slice)".into(),
+                );
             }
         }
         g.frames.push(Frame::For {
@@ -1236,17 +1204,9 @@ impl Interp {
 
     fn step_for(&mut self, g: &mut GenState) -> Step {
         let (test, update, body, started) = match g.frames.last() {
-            Some(Frame::For {
-                test,
-                update,
-                body,
-                started,
-            }) => (
-                test.clone(),
-                update.clone(),
-                Rc::clone(body),
-                *started,
-            ),
+            Some(Frame::For { test, update, body, started }) => {
+                (test.clone(), update.clone(), Rc::clone(body), *started)
+            }
             _ => return Step::Fatal("gen: for frame vanished".into()),
         };
         if started {
@@ -1340,7 +1300,8 @@ impl Interp {
                     Prop2::Break => {
                         // IteratorClose on early exit.
                         if let Some(Frame::ForOf { iter, .. }) = g.frames.last_mut() {
-                            let mut it = std::mem::replace(iter, SliceIter::Str(Rc::new(Vec::new()), 0));
+                            let mut it =
+                                std::mem::replace(iter, SliceIter::Str(Rc::new(Vec::new()), 0));
                             g.frames.pop();
                             if let Err(a) = self.slice_iterator_close(&mut it) {
                                 return self.abrupt_to_step(g, a);
@@ -1352,7 +1313,8 @@ impl Interp {
                     _ => {
                         // return/throw: close the iterator, then keep unwinding.
                         if let Some(Frame::ForOf { iter, .. }) = g.frames.last_mut() {
-                            let mut it = std::mem::replace(iter, SliceIter::Str(Rc::new(Vec::new()), 0));
+                            let mut it =
+                                std::mem::replace(iter, SliceIter::Str(Rc::new(Vec::new()), 0));
                             g.frames.pop();
                             if let Err(a) = self.slice_iterator_close(&mut it) {
                                 return self.abrupt_to_step(g, a);
@@ -1405,7 +1367,9 @@ impl Interp {
                     .insert(p.clone(), crate::value::Binding::var(exc));
             }
             Some(BindTarget::Pattern(_)) => {
-                return Step::Fatal("gen: destructuring catch parameter with yield (out of slice)".into());
+                return Step::Fatal(
+                    "gen: destructuring catch parameter with yield (out of slice)".into(),
+                );
             }
         }
         if let Err(a) = self.declare_lexical_public(env, &body) {
@@ -1423,7 +1387,9 @@ impl Interp {
         saved: Option<Prop2>,
     ) -> Step {
         if body.iter().any(|s| matches!(s, Stmt::FuncDecl(_))) {
-            return Step::Fatal("gen: function declaration in a finally block (out of slice)".into());
+            return Step::Fatal(
+                "gen: function declaration in a finally block (out of slice)".into(),
+            );
         }
         let parent = g.ctx.env;
         let env = self.alloc_env(Some(parent));
@@ -1448,15 +1414,10 @@ impl Interp {
         // frame guards exactly one concern.
         let block = Rc::new(block.to_vec());
         if let Some(fin) = finally {
-            g.frames.push(Frame::TryFinally {
-                body: Rc::new(fin.clone()),
-            });
+            g.frames.push(Frame::TryFinally { body: Rc::new(fin.clone()) });
         }
         if let Some((param, cbody)) = catch {
-            g.frames.push(Frame::TryCatch {
-                param: param.clone(),
-                body: Rc::new(cbody.clone()),
-            });
+            g.frames.push(Frame::TryCatch { param: param.clone(), body: Rc::new(cbody.clone()) });
         }
         // Enter the try body inside its own lexical scope.
         self.enter_block(g, block)
@@ -1488,11 +1449,7 @@ impl Interp {
             Ok(it) => it,
             Err(a) => return self.abrupt_to_step(g, a),
         };
-        g.frames.push(Frame::ForOf {
-            iter,
-            left: left.clone(),
-            body: Rc::new(body.clone()),
-        });
+        g.frames.push(Frame::ForOf { iter, left: left.clone(), body: Rc::new(body.clone()) });
         Step::Continue
     }
 
@@ -1518,11 +1475,7 @@ impl Interp {
             }
             Ok(Some(el)) => {
                 let (left, body) = match g.frames.last_mut() {
-                    Some(Frame::ForOf {
-                        iter: slot,
-                        left,
-                        body,
-                    }) => {
+                    Some(Frame::ForOf { iter: slot, left, body }) => {
                         *slot = iter;
                         (left.clone(), Rc::clone(body))
                     }

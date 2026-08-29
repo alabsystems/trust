@@ -1,0 +1,94 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-toml — the Trust-owned TOML v1.0.0 reader.
+#
+# WHY THIS CRATE EXISTS.
+# `toml 0.8` is the single largest package-count win available to `crates/`:
+# measured on the 251-unit shipping closure (NORMAL dep-kind edges only,
+# platform-filtered aarch64-apple-darwin), replacing it takes the third-party
+# unit count from 121 to 115 by retiring `toml`, `toml_edit`, `toml_datetime`,
+# `toml_write`, `serde_spanned` and `winnow` in one move. Every one of the five
+# in-closure parents of `toml` is a `crates/` workspace member, so unlike the
+# `serde` stack the kill is fully earned in THIS repository — nothing is
+# deferred behind a `first-party/*` sibling.
+#
+# THE DEPENDENCY LIST IS ONE LINE, AND THAT LINE IS DELIBERATE.
+# `serde` is here as a TRAIT ABI, not as a data format. This crate implements
+# `serde::Deserializer` so that every consumer keeps its existing
+# `#[derive(Deserialize)]` and compiles verbatim under a `package = ` rename.
+# Replacing `serde` itself is a separate, LARGER phase that is atomic across
+# `crates/` and at least six `first-party/*` repositories (see the phase-2
+# resequencing decision); pulling it forward into this crate would make a
+# six-package win depend on a six-repository change. Note what is NOT here:
+# no parser-combinator crate. `winnow` is one of the six units being retired,
+# so depending on a replacement for it would defeat the entire slice.
+#
+# WHAT IS IMPLEMENTED — READ THIS BEFORE WIRING A CONSUMER.
+# BOTH halves are present and the rename is WIRED. Read path: `from_str`,
+# `Value`, `Table`, `Datetime`, `de::Error`. Write path (slice 2, landed
+# `ebcb4698d5`): `to_string` / `to_string_pretty`, in `src/ser.rs`.
+#
+# Byte-identity with the incumbent's emitter (values-before-tables ordering,
+# `[[table]]` rendering, string escaping) is the write path's acceptance gate,
+# and it is enforced two ways: a generated-document differential in
+# `tests/serialize_differential.rs` (floor 1.0 — measured exactly 100%), and a
+# hard byte-equality assertion over the seven committed `tests/js262/*.toml`
+# ledgers that `trust-js-differential` rewrites in place. A ledger that
+# reformats is the exact failure this crate exists to prevent: never rebless it.
+#
+# HISTORICAL NOTE, kept because it read as authoritative for two slices: this
+# header used to say "there is deliberately no `to_string` / `to_string_pretty`"
+# and "a consumer that calls `toml::to_string` must NOT be renamed onto this
+# crate yet". Both were true for slice 1 and are now FALSE. A wiring decision
+# made from the stale text would have refused a swap that was already unblocked.
+
+[package]
+name = "trust-toml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned TOML v1.0.0 reader with a serde Deserializer. No third-party dependencies beyond the serde trait ABI."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The serde TRAIT ABI, and nothing else. See the header: this is the whole
+# point of the design — consumers keep `#[derive(Deserialize)]` and this crate
+# supplies the `Deserializer` those derives drive. `derive` is NOT enabled:
+# trust-toml derives nothing itself, so it does not pull `serde_derive`/`syn`
+# into its own subtree.
+serde = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# TEST-ONLY, and the reason the acceptance gate is real.
+#
+# Spelled with an explicit version and a RENAME, never `workspace = true` and
+# never through `[patch.crates-io]`. Both of those are graph-wide: they would
+# capture this very dev-dependency, so `tests/differential_corpus.rs` would
+# compare `trust-toml` to ITSELF and report green. That failure mode has
+# already been measured once in this repository, on the `sha2` swap — see the
+# commented-out `[patch.crates-io] sha2` block in `crates/Cargo.toml`.
+#
+# Delete this line on the day the last consumer is renamed and the incumbent
+# leaves the graph.
+incumbent-toml = { package = "toml", version = "0.8.23" }
+# `serde` again, this time WITH `derive`, and only here.
+#
+# `tests/rejection.rs` drives a `#[derive(Deserialize)]` struct through both
+# implementations, because the whole integration mechanism is "consumers keep
+# their derives" and a gate that never exercises a derive would not be testing
+# it. The shipping dependency above deliberately keeps `default-features =
+# false` and no `derive`, so `serde_derive`/`syn` stay out of trust-toml's own
+# shipping subtree; Cargo's v2+ resolver does not unify dev-dependency features
+# into a normal build, so this line cannot leak into one.
+serde = { version = "1", features = ["derive"] }
+#
+# There is deliberately NOTHING else here. An earlier draft dev-depended on
+# `trust-sha2` to digest each corpus file; that design was measured and dropped
+# — see the header of `tests/corpus_manifest.txt` for what the first run of it
+# actually did and why pinning the path SET is the property that was wanted.
+

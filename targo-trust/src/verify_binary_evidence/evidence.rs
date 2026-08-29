@@ -15,8 +15,6 @@ use trust_proof_cert::{
 };
 use trust_types::{ReplayStatus, SolverDispatchRecord, VerificationResult};
 
-use crate::external_checker::prepare_external_checker;
-
 use super::{
     CheckedCertificateArtifactImportRecord, CheckedCertificateImportReport,
     CheckedCertificateLoadedMetadata, CheckedCertificateProductionCandidate,
@@ -37,6 +35,7 @@ use super::{
     push_dispatch_blocker, raw_solver_proof_byte_evidence,
     validate_checked_certificate_required_vc_production_inventory,
 };
+use crate::external_checker::prepare_external_checker;
 
 impl PartialEq for VerifyBinaryEvidence {
     fn eq(&self, other: &Self) -> bool {

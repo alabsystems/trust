@@ -13,12 +13,12 @@ mod parse;
 mod trace;
 
 pub use diff::{explain_divergence, traces_equal};
-pub use driver::{trace_driver_sha256, TRACE_DRIVER_SOURCE};
-pub use parse::{extract_trace, TraceParseError};
+pub use driver::{TRACE_DRIVER_SOURCE, trace_driver_sha256};
+pub use parse::{TraceParseError, extract_trace};
 pub use trace::{
-    normalize_async_completion_markers, Completion, HostEvent, ObservableTrace, ProjectedValue,
-    ProjectionCaps, PropKey, ThrownProjection, ASYNC_FAILURE_MARKER_PREFIX, SCHEMA_VERSION,
-    TRACE_SENTINEL,
+    ASYNC_FAILURE_MARKER_PREFIX, Completion, HostEvent, ObservableTrace, ProjectedValue,
+    ProjectionCaps, PropKey, SCHEMA_VERSION, TRACE_SENTINEL, ThrownProjection,
+    normalize_async_completion_markers,
 };
 
 /// Lowercase-hex SHA-256, used to pin the driver bytes and harness payloads

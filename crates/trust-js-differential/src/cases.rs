@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::frontmatter::{parse_frontmatter, Frontmatter};
+use crate::frontmatter::{Frontmatter, parse_frontmatter};
 use crate::heads::{AssembledCase, RunMode};
 
 /// A corpus case with its mandated modes, ready to be assembled per mode.
@@ -83,16 +83,20 @@ pub fn assemble_includes(corpus: &Path, fm: &Frontmatter) -> Vec<PathBuf> {
 /// frontmatter (fail-closed at the caller).
 pub fn prepare_case(corpus: &Path, rel_path: &str) -> Result<PreparedCase, String> {
     let abs_path = corpus.join(rel_path);
-    let body = std::fs::read_to_string(&abs_path)
-        .map_err(|e| format!("{rel_path}: unreadable: {e}"))?;
+    let body =
+        std::fs::read_to_string(&abs_path).map_err(|e| format!("{rel_path}: unreadable: {e}"))?;
     let frontmatter = parse_frontmatter(&body).map_err(|e| format!("{rel_path}: {e}"))?;
     let modes = mandated_modes(&frontmatter);
-    let includes = if modes == [RunMode::Raw] {
-        vec![]
-    } else {
-        assemble_includes(corpus, &frontmatter)
-    };
-    Ok(PreparedCase { rel_path: rel_path.to_string(), abs_path, body, frontmatter, includes, modes })
+    let includes =
+        if modes == [RunMode::Raw] { vec![] } else { assemble_includes(corpus, &frontmatter) };
+    Ok(PreparedCase {
+        rel_path: rel_path.to_string(),
+        abs_path,
+        body,
+        frontmatter,
+        includes,
+        modes,
+    })
 }
 
 impl PreparedCase {
@@ -187,11 +191,12 @@ mod tests {
     #[test]
     fn include_assembly_dedups_after_defaults() {
         let corpus = Path::new("/c");
-        let incs = assemble_includes(corpus, &fm(&[], &["propertyHelper.js", "sta.js", "propertyHelper.js"]));
-        let names: Vec<String> = incs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let incs = assemble_includes(
+            corpus,
+            &fm(&[], &["propertyHelper.js", "sta.js", "propertyHelper.js"]),
+        );
+        let names: Vec<String> =
+            incs.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["assert.js", "sta.js", "propertyHelper.js"]);
         assert!(incs[0].starts_with("/c/harness"));
     }
@@ -202,35 +207,27 @@ mod tests {
         // No frontmatter includes: doneprintHandle.js is auto-added after the
         // defaults (this is the only $DONE provider such a case gets).
         let incs = assemble_includes(corpus, &fm(&["async"], &[]));
-        let names: Vec<String> = incs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> =
+            incs.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["assert.js", "sta.js", "doneprintHandle.js"]);
 
         // asyncHelpers.js flows through the frontmatter includes, after the
         // auto-added doneprintHandle.js; dedup is order-stable.
         let incs = assemble_includes(corpus, &fm(&["async"], &["asyncHelpers.js"]));
-        let names: Vec<String> = incs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> =
+            incs.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["assert.js", "sta.js", "doneprintHandle.js", "asyncHelpers.js"]);
 
         // A sync case gets no doneprintHandle.js.
         let incs = assemble_includes(corpus, &fm(&[], &["compareArray.js"]));
-        let names: Vec<String> = incs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> =
+            incs.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["assert.js", "sta.js", "compareArray.js"]);
 
         // If a case ever declared doneprintHandle.js itself, dedup keeps one.
         let incs = assemble_includes(corpus, &fm(&["async"], &["doneprintHandle.js"]));
-        let names: Vec<String> = incs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> =
+            incs.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["assert.js", "sta.js", "doneprintHandle.js"]);
     }
 

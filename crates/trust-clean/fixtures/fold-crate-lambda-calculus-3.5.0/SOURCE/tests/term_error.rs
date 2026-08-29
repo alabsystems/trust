@@ -1,7 +1,8 @@
 extern crate lambda_calculus as lambda;
 
-use lambda::term::Term;
 use std::error::Error;
+
+use lambda::term::Term;
 
 #[test]
 fn term_error_question_mark_operator() {

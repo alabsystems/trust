@@ -87,15 +87,33 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, BinOp, Body, CallSource, ClearCrossCrate, Local, LocalDecl,
-    MirPhase, MirSource, Operand, Place, Rvalue, RuntimePhase, SourceInfo, SourceScopeData,
-    Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnwindAction, WithRetag,
+    BasicBlock, BasicBlockData, BinOp, Body, BorrowKind, CallSource, ClearCrossCrate, Local,
+    LocalDecl, MirPhase, MirSource, Operand, Place, RuntimePhase, Rvalue, SourceInfo,
+    SourceScopeData, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
+    UnwindAction, WithRetag,
 };
 use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::{GenericArg, Ty, TyCtxt, UintTy};
-use rustc_span::{Span, Spanned, sym};
-use trust_clean_origin::{CleanOriginPlan, CleanOriginShape, EmitRefusal};
-use trust_types::admissible_body::{ArithBinOp, ArithExpr, ArithOperand, SelectCmp};
+// Trust (§6f landing 1): `sym` is gone from this import because the callee
+// method name now comes from the ONE authenticated identity
+// (`PrimitiveCallee::rust_method_name`) rather than from a preinterned symbol
+// chosen here. That also keeps this file off `symbols!`, which the frozen-std
+// symbol-index ABI note (`docs/FROZEN_STD_SYMBOL_INDEX_ABI.md`) makes a
+// measurement hazard.
+use rustc_span::{Span, Spanned, Symbol};
+// Trust (§6f landing 4): the shape vocabulary is GONE from this import.
+// `ArithBinOp`/`ArithExpr`/`ArithOperand`/`RecBodyExpr`/`CleanOriginShape` were
+// here because nine hand-written builders destructured a planned shape; the one
+// materializer below destructures no shape at all, and reading a plan is
+// `trust_clean_origin::materialize`'s job. What remains is the ONE authenticated
+// callee identity, the comparison vocabulary the diamond's `BinaryOp` needs, and
+// the template types the emitter interprets.
+use trust_clean_origin::materialize::{
+    BodyTemplate, TemplateCallee, TemplateOperand, TemplateRvalue, TemplateTerminator, TemplateTy,
+    TemplateUnwind,
+};
+use trust_clean_origin::{CleanOriginPlan, EmitRefusal};
+use trust_types::admissible_body::{PrimitiveCallee, RawBinOpKind, SelectCmp};
 
 /// Everything needed to originate a body for one Clean declaration.
 ///
@@ -232,11 +250,19 @@ pub(crate) fn clean_crate_environment(
 /// with the normal pipeline. It NEVER means "the gate declined": a gate refusal
 /// is fatal and does not return.
 ///
-/// Called at the very TOP of `inner_optimized_mir` and `inner_mir_for_ctfe`,
-/// before `is_constructor` and before `hir_body_const_context` — the latter
-/// matters because a Clean-origin def has no HIR and
-/// `hir_body_const_context`'s `None` arm in the CTFE provider is a hard
-/// `bug!`.
+/// Called at the very TOP of `inner_optimized_mir`, `inner_mir_for_ctfe` and
+/// `mir_drops_elaborated_and_const_checked`, before `is_constructor` and before
+/// `hir_body_const_context` — the latter matters because a Clean-origin def has
+/// no HIR and `hir_body_const_context`'s `None` arm in the CTFE provider is a
+/// hard `bug!`.
+///
+/// The third of those is the ANALYSIS-PHASE arm, added 2026-08-19 after both
+/// island fixtures were measured ICEing at `rustc_hir_typeck/src/lib.rs:191`.
+/// A def in `mir_keys` obliges every provider on the analysis chain
+/// (`mir_drops_elaborated_and_const_checked` -> `mir_borrowck` ->
+/// `mir_promoted` -> `mir_built` -> `check_match` -> `typeck_root`) to answer,
+/// not only the codegen and CTFE arms; the Trust verification lane's own
+/// `mir_keys` loops ask for the elaborated body directly.
 pub(crate) fn clean_origin_mir<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Option<Body<'tcx>> {
     let (name, span) = clean_origin_registry_entry(tcx, def)?;
 
@@ -264,9 +290,9 @@ pub(crate) fn clean_origin_mir<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Opti
 /// Clean declaration; every other outcome is a fatal diagnostic.
 ///
 /// Split out from [`clean_origin_mir`] so it is a total function of an explicit
-/// `CleanOriginDecl` rather than of the registry lookup — the emission and the
-/// gate can then be reasoned about (and, once the mint lands, driven from a
-/// test) without depending on how a def came to be Clean-origin.
+/// `CleanOriginDecl` rather than of the registry lookup — the live emission and
+/// gate can be driven directly by unit controls without depending on how the
+/// production mint registered a def as Clean-origin.
 fn build_gated_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
@@ -298,29 +324,116 @@ fn build_gated_body<'tcx>(
     // agreement is CHECKED here, not reviewed, and a disagreement is fatal.
     check_signature_agrees(tcx, def, &plan, decl);
 
-    // ── the emission ───────────────────────────────────────────────────────
-//
-    // One arm per `CleanOriginShape` variant, exhaustively — the enum is
-    // deliberately NOT `#[non_exhaustive]` so a new shape is a compile error
-    // here, never a fall-through into the wrong emitter.
-    let mut body = match plan.shape() {
-        CleanOriginShape::Projection { projected } => {
-            build_projection_body(tcx, def, &plan, *projected, decl.span)
-        }
-        CleanOriginShape::WrappingBinOp { op, left, right } => {
-            build_wrapping_binop_body(tcx, def, &plan, *op, *left, *right, decl.span)
-        }
-        CleanOriginShape::Composed { expr } => {
-            build_composed_body(tcx, def, &plan, expr, decl.span)
-        }
-        // Trust (R2/C5a): the parameter select.
-        CleanOriginShape::Select { cmp, cmp_left, cmp_right, then_param, else_param } => {
-            build_select_body(
-                tcx, def, &plan, *cmp, *cmp_left, *cmp_right, *then_param, *else_param,
-                decl.span,
-            )
-        }
+    // ── side C: the TRUSTIR spelling of the same plan ──────────────────────
+    //
+    // Trust: the two authoritative languages are supposed to meet in TrustIR,
+    // and until `trust-clean-ir` existed only Rust produced it -- Clean stopped
+    // at the MIR below. This derives the TrustIR function for the SAME sealed
+    // plan, at the same point, so there is no second planning step and
+    // therefore no second place a signature or a width can disagree.
+    //
+    // It is used here for a THIRD, independent spelling of the signature. The
+    // MIR arity comes from `carrier_to_rustc_ty` via the template; the fed
+    // `fn_sig` came from `trust_clean_mint::rustc_ty`; this one comes from
+    // `trust_clean_ir::trust_ir_func_ty` reading the carriers directly. Three
+    // spellings that must agree is the same discipline
+    // `check_signature_agrees` already applies to the first two, extended to
+    // the third rather than left as an unchecked parallel lane.
+    //
+    // A REFUSAL IS NOT FATAL, deliberately. `trust-clean-ir` does not spell
+    // every shape the MIR lane emits -- the two recursion shapes compute at the
+    // unbounded bignum `Nat`, which TrustIR has no type for -- and a
+    // capability gap in a lane that produces no binary must never fail a
+    // compilation the MIR lane can complete. What IS fatal is a TrustIR
+    // signature that disagrees with the plan's arity: that is the two lanes
+    // reading one carrier signature differently, which is the wrong-binary
+    // shape this whole file exists to prevent.
+    if let Ok(func_ty) = trust_clean_ir::trust_ir_func_ty(plan.signature())
+        && (func_ty.params.len() != plan.signature().arity() || func_ty.returns.len() != 1)
+    {
+        tcx.dcx().span_fatal(
+            decl.span,
+            format!(
+                "internal: the TrustIR and MIR spellings of Clean declaration `{}` disagree \
+                 about its signature — TrustIR derived {} parameter(s) and {} result(s) from \
+                 the same sealed carrier signature the MIR lane reads as arity {}. These are \
+                 two independent readings of ONE plan, so a disagreement means one of them is \
+                 building against a signature the other does not have. Please report it.",
+                decl.name,
+                func_ty.params.len(),
+                func_ty.returns.len(),
+                plan.signature().arity(),
+            ),
+        );
+    }
+
+    // ── the ROW PREFLIGHT and the TEMPLATE (Trust, §6f landings 1 and 4) ───
+    //
+    // The ladder is an OPTIMIZATION LADDER, never a capability boundary: every
+    // `CleanOriginShape` rung selects a row of the instruction-selection table,
+    // and the row DECLARES the MIR realization to build. Landing 1 put the row
+    // preflight here and left six hand-written builders behind it; landing 4
+    // deleted the builders. What replaces them is ONE description —
+    // `trust_clean_origin::materialize::body_template` — which decides every
+    // block, local, operand, `Copy`-vs-`Move` and unwind edge on the FAST LANE,
+    // and one `materialize` below that translates a description into
+    // `mir::Body` with no shape knowledge at all.
+    //
+    // Three fail-closed properties come out of that, and all three are the
+    // landing's point rather than decoration:
+    //
+    //   * a realization nobody wrote a skeleton for is a COMPILE ERROR, in
+    //     `body_template`'s wildcard-free match over `MirShape` — which is
+    //     `cargo check -p trust-clean-origin`, two seconds into the edit,
+    //     rather than an hour into a bootstrap. The emitter keeps its own
+    //     exhaustiveness at the layer it still owns: `TemplateTerminator`,
+    //     `TemplateRvalue`, `TemplateOperand`, `TemplateTy` and
+    //     `TemplateCallee` are equally closed, and `materialize` matches each
+    //     with no `_ =>` arm, so a new realization PRIMITIVE is a compile error
+    //     here.
+    //
+    //   * a row whose declared realization DISAGREES with the planned shape is
+    //     fatal, before anything is emitted. That is the emitter-side half of
+    //     the shape-drift hazard a general emitter opens: the fast lane's
+    //     `h_c_shared_mir_realizations_are_declared_and_separated` proves no
+    //     two rows are realized indistinguishably, and this proves the row a
+    //     plan selected is the one that gets built.
+    //
+    //   * the emitted UNWIND EDGE is taken FROM the row, not hand-written
+    //     alongside it. H-G's hazard is an emitted edge nobody declared, and
+    //     until this landing the fact lived in two places.
+    //
+    // BYTE IDENTITY, and where it is established: every template is compared
+    // against the body the SHIPPED builder was measured to emit, in
+    // `crates/trust-clean-origin/tests/control_11_materializer_byte_identity.rs`
+    // — block order, local numbering including the two dead arm temps R1/R2
+    // leave declared, `Copy`-vs-`Move`, `SwitchInt` polarity, the per-call
+    // unwind edge, `WithRetag`, `LocalDecl::immutable()` and the callee paths
+    // the extractor renders — and then put through the real `admit_lowering`.
+    let Some(row) = trust_clean_origin::table::ladder_row(plan.shape()) else {
+        tcx.dcx().span_fatal(
+            decl.span,
+            format!(
+                "internal: the plan for Clean declaration `{}` has a shape that selects no \
+                 row of the instruction-selection table, so there is no declared MIR \
+                 realization to emit and NOTHING WAS EMITTED. This is a compiler defect — a \
+                 ladder rung was added without its row. Please report it.",
+                decl.name,
+            ),
+        );
     };
+    let template = match trust_clean_origin::materialize::body_template(row, &plan) {
+        Ok(template) => template,
+        Err(refusal) => tcx.dcx().span_fatal(decl.span, refusal.note(decl.name, row, plan.shape())),
+    };
+
+    // ── the emission ───────────────────────────────────────────────────────
+    //
+    // ONE materializer, driven by the description above. It branches on no
+    // shape, resolves no vocabulary and makes no choice a wrong binary could
+    // hide in — see its own doc comment for the three `TyCtxt` facts that are
+    // genuinely its to decide.
+    let mut body = materialize(tcx, def, &plan, &template, decl.span);
 
     // Trust (#65, C3): the TEST-ONLY divergence knob. Perturbs SIDE A's output —
     // the emitted body, after the plan, before side B reads it — so the gate's
@@ -362,9 +475,9 @@ fn build_gated_body<'tcx>(
     // stays the one the verifier uses for ordinary Rust functions; the mint
     // site pays the `feed_hir()` cost.
     //
-    // UNVERIFIED, and flagged as such: it cannot be exercised until a def is
-    // minted, so this is a reading of the call chain, not a measurement of a
-    // run.
+    // This is exercised by the live mint/provider UI lane and its cross-crate
+    // recursive-Nat control; the synthetic unit controls keep the same
+    // extractor boundary independently measurable.
     let extracted = trust_mir_extract::extract_function(tcx, &body);
     match trust_clean_origin::admit_lowering(decl.env, &plan, &extracted) {
         // The `Faithful` token is the permission. It is deliberately dropped
@@ -392,11 +505,8 @@ fn check_signature_agrees<'tcx>(
     decl: &CleanOriginDecl<'_>,
 ) {
     let fed = tcx.fn_sig(def.to_def_id()).instantiate_identity().skip_binder();
-    let expected_inputs: Vec<Ty<'tcx>> = plan
-        .param_tys()
-        .iter()
-        .map(|ty| carrier_to_rustc_ty(tcx, ty, decl.span))
-        .collect();
+    let expected_inputs: Vec<Ty<'tcx>> =
+        plan.param_tys().iter().map(|ty| carrier_to_rustc_ty(tcx, ty, decl.span)).collect();
     let expected_output = carrier_to_rustc_ty(tcx, plan.return_ty(), decl.span);
 
     if fed.inputs() != expected_inputs.as_slice() || fed.output() != expected_output {
@@ -427,16 +537,16 @@ fn check_signature_agrees<'tcx>(
 /// must not exist in this compilation at all.
 ///
 /// Ruling v7/D3 governs the wording: a capability refusal names the fragment
-/// boundary and the ways around it, and a correctness refusal says plainly that
-/// the compiler mistranslated its own declaration and that nothing the user
-/// writes will change it. Telling a user to add an annotation because the
-/// compiler emitted the wrong body would send them to fix something they did
-/// not break.
+/// boundary and the ways around it. A correctness refusal says the compiler
+/// could not establish that its own emitted body agrees; it does not overclaim
+/// a semantic counter-proof when bounded proof search merely found no proof.
+/// Telling a user to add an annotation here would send them to fix something
+/// they did not break.
 fn refuse(tcx: TyCtxt<'_>, decl: &CleanOriginDecl<'_>, refusal: &EmitRefusal) -> ! {
     let headline = if refusal.is_compiler_defect() {
         format!(
             "internal: refusing to emit code for Clean declaration `{}` — the emitted body \
-             does not agree with the declaration",
+             could not be established to agree with the declaration",
             decl.name
         )
     } else {
@@ -452,10 +562,26 @@ fn refuse(tcx: TyCtxt<'_>, decl: &CleanOriginDecl<'_>, refusal: &EmitRefusal) ->
 ///   assignment to a DIFFERENT argument, so the emission denotes the wrong
 ///   projection. On an arity-1 body there is no other argument to swap to;
 ///   the fixture pins an arity-2 declaration.
-/// * select (R2/C5a): swap the `SwitchInt` targets — the exact
-///   polarity-inversion bug `SwitchTargets::static_if`'s argument order
-///   invites, which silently emits max where the island wrote min. The gate,
-///   not this comment, is what makes that bug impossible to ship.
+/// * select (R2/C5a) AND select-vs-literal (R2/C9 — both shapes emit the
+///   same diamond, so one mutation covers both): swap the `SwitchInt`
+///   targets — the exact polarity-inversion bug `SwitchTargets::static_if`'s
+///   argument order invites, which silently emits max where the island wrote
+///   min. The gate, not this comment, is what makes that bug impossible to
+///   ship.
+/// * constant (§6f landing 2): **NOT COVERED, stated rather than implied.**
+///   The constant body has no `SwitchInt` and its return assignment is an
+///   `Operand::Constant`, not a `Move`, so both mutations below fall through
+///   and this knob is a NO-OP on it — a ui divergence fixture pointed at a
+///   constant declaration would therefore pass for the wrong reason. Mutating
+///   a scalar here would mean rebuilding a `ConstOperand` without a `TyCtxt`,
+///   which this function does not have. The constant shape's emitter
+///   mutations are covered instead on the FAST lane, by
+///   `tests/control_9_constant_emitter_mutation.rs`, which injects the wrong
+///   value, the wrong arity (both directions), a width-skewed scalar, a
+///   non-constant body and the wrong POSITION of the numeral row directly into
+///   the extracted body — strictly more direct than this knob, which exists
+///   only because the projection and select fixtures needed an end-to-end
+///   route through a real compilation.
 fn mutate_emitted_body_for_gate_test(body: &mut Body<'_>) {
     let arg_count = body.arg_count;
     for block in body.basic_blocks_mut() {
@@ -484,77 +610,283 @@ fn mutate_emitted_body_for_gate_test(body: &mut Body<'_>) {
     }
 }
 
-/// Emit the d01 Projection shape: one block, `_0 = move _{i+1}`, `return`.
+/// **THE ONE MATERIALIZER** (Trust, §6f landing 4): turn a
+/// [`BodyTemplate`] into the `mir::Body` this crate emits.
 ///
-/// It is the shape `tests/e6-fragment-probe/probes/d01_projection_u64.rs`
-/// measures — no external `DefId`, no call terminator, no lang item, no
-/// promoted — chosen because it is what the kernel demonstrably admits under
-/// definitional equality against its reflected lowering. See
-/// `trust_clean_origin::emit` for the fragment statement.
+/// It replaces `build_projection_body`, `build_constant_body`,
+/// `build_wrapping_binop_body`, `build_composed_body`, `build_select_body`,
+/// `build_select_literal_body`, `build_select_operands_body`,
+/// `build_structural_rec_body` and `build_nat_zero_test_rec_body`. §6f's
+/// ruling: `CleanOriginShape` is an optimization ladder, never a capability
+/// boundary — so adding a row adds a TABLE ENTRY plus, at most, a skeleton in
+/// `trust_clean_origin::materialize`, and never an emitter.
 ///
-/// `projected` is passed explicitly rather than re-destructured from the plan
-/// so that calling this from any arm but `Projection`'s is structurally
-/// impossible to do by accident.
+/// # It decides NOTHING about the shape, deliberately
 ///
-/// The types come from the plan's `CarrierSignature`, which cannot exist unless
-/// EVERY position — arguments and result — has a discharged total carrier. So
-/// the local types here are I4's decision, not a convenience mapping.
-fn build_projection_body<'tcx>(
+/// Every choice a wrong binary could hide in — which block, which local, which
+/// operand, `Copy` versus `Move`, the `SwitchInt` polarity, the unwind edge —
+/// was made in `body_template`, which `cargo test -p trust-clean-origin` runs
+/// in two seconds and which `control_11` compares BYTE FOR BYTE against the
+/// bodies the deleted builders were measured to emit. This function branches on
+/// no shape and no ladder rung. What is left to it is exactly three `TyCtxt`
+/// facts, each of which is genuinely a compiler question:
+///
+///  1. **the carrier types.** [`TemplateTy`] names a POSITION (the result
+///     carrier, parameter `i`, `bool`, `&result`); `carrier_to_rustc_ty` is
+///     I4's decision and stays the only carrier -> rustc mapping in this file,
+///     so `check_signature_agrees` still guards the one duplication I5 could
+///     not avoid.
+///  2. **the callee `DefId`s.** The template carries the ONE authenticated
+///     identity and never a path — see [`resolve_template_callee`].
+///  3. **`Body::new` and the phase/table discipline**, once instead of nine
+///     times.
+///
+/// # WHY BOTH SIDE TABLES ARE EMPTY, and why the phase is `Optimized`
+///
+/// `mentioned_items` stays empty SOUNDLY: the mono collector collects every
+/// callee (the core primitives, the bignum runtime AND the self-call) as a
+/// **used** item by walking this very body — used and mentioned are collected
+/// independently and there is no `used ⊆ mentioned` assertion — and no
+/// optimization ever runs on this body to delete a call.
+/// `required_consts` is honestly empty: every constant here is an inline
+/// evaluated scalar, so nothing needs evaluation and nothing can promote.
+/// Both are filled EXPLICITLY because the passes that would otherwise populate
+/// them do not run: `optimized_mir`/`mir_for_ctfe` return this body directly,
+/// deliberately skipping `run_optimization_passes`, because a pass that rewrote
+/// it after the gate ran would put un-gated code in the binary.
+///
+/// `MirPhase::Runtime(RuntimePhase::Optimized)` is the honest phase and not a
+/// label chosen to satisfy an assertion. MEASURED 2026-08-19: `Body::new`
+/// starts at `MirPhase::Built` and `TyCtxt::instance_mir` asserts
+/// `Runtime(_)` — the assertion fires the moment a Clean-origin function is
+/// actually CALLED at runtime (the const fixture missed it, because a `const`
+/// goes through `mir_for_ctfe` and is never a mono item). This body is emitted
+/// in its final form and no pass will ever run on it, so there is no earlier
+/// phase it is ever in, and `docs/TCB.md`'s trusted-after-gate surface stays
+/// caller-side inlining, codegen and the backend.
+///
+/// A self-recursive body at `Runtime(Optimized)` is ordinary MIR for codegen;
+/// the INLINER's cycle machinery (`mir_callgraph_cyclic`) on a HIR-less def is
+/// UNMEASURED until the run-pass fixture compiles — if it bites, the fallback
+/// is excluding Clean-origin defs from inlining candidacy, a performance cost
+/// and never a correctness one. Recorded in
+/// `tests/ui/trust/clean_origin_structural_rec.rs`.
+#[allow(rustc::usage_of_qualified_ty)]
+fn materialize<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
     plan: &CleanOriginPlan,
-    projected: usize,
+    template: &BodyTemplate,
     span: Span,
 ) -> Body<'tcx> {
     let return_ty = carrier_to_rustc_ty(tcx, plan.return_ty(), span);
-    let param_tys: Vec<_> =
+    let param_tys: Vec<Ty<'tcx>> =
         plan.param_tys().iter().map(|ty| carrier_to_rustc_ty(tcx, ty, span)).collect();
-    let arg_count = param_tys.len();
-
-    // `_0` is the return place; `_1 ..= _n` are the parameters, immutable
-    // exactly as `local_decls_for_sig` makes them for a shim.
-    let local_decls: IndexVec<Local, LocalDecl<'tcx>> =
-        std::iter::once(LocalDecl::new(return_ty, span))
-            .chain(param_tys.into_iter().map(|ty| LocalDecl::new(ty, span).immutable()))
-            .collect();
-
     let source_info = SourceInfo::outermost(span);
 
-    // `_0 = move _{projected+1}`.
-    //
-    // The `+1` is the return place occupying local 0. `projected` is the
-    // 0-based SOURCE parameter, already inverted out of its de Bruijn index by
-    // `plan_clean_origin_body` — and an inversion mistake here is exactly the
-    // one-construct mistranslation `control_3`'s `half_2` injects and requires
-    // the gate to catch.
-    let statement = Statement::new(
-        source_info,
-        StatementKind::Assign(Box::new((
-            Place::return_place(),
-            // `WithRetag::Yes` is what `rustc_mir_build` emits for every
-            // ordinary `Rvalue::Use`, so the body is spelled the way a
-            // hand-written `fn fst(x, y) -> u64 { x }` is spelled. This is not
-            // cosmetic: side B is produced by reading this MIR back, and the
-            // fewer respects in which a Clean-origin body differs from an
-            // ordinary one, the fewer places a reader can behave differently on
-            // it than on the bodies it was written for.
-            Rvalue::Use(Operand::Move(Place::from(Local::arg(projected))), WithRetag::Yes),
-        ))),
-    );
+    // `LocalDecl::immutable()` on parameters only, exactly as
+    // `local_decls_for_sig` makes them for a shim — carried by the template
+    // because the extractor cannot see it, so `control_11`'s half_8 is what
+    // pins it rather than a round trip.
+    let local_decls: IndexVec<Local, LocalDecl<'tcx>> = template
+        .locals
+        .iter()
+        .map(|local| {
+            let ty = match local.ty {
+                TemplateTy::Result => return_ty,
+                TemplateTy::Param { index } => param_tys[index],
+                TemplateTy::Bool => tcx.types.bool,
+                TemplateTy::ResultRef => Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, return_ty),
+            };
+            let decl = LocalDecl::new(ty, span);
+            if local.immutable { decl.immutable() } else { decl }
+        })
+        .collect();
 
-    let start_block = BasicBlockData::new_stmts(
-        vec![statement],
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::Return,
-            attributes: ThinVec::new(),
-        }),
-        false,
-    );
+    let operand = |source: TemplateOperand| -> Operand<'tcx> {
+        match source {
+            TemplateOperand::Copy(local) => Operand::Copy(Place::from(Local::from_usize(local))),
+            TemplateOperand::Move(local) => Operand::Move(Place::from(Local::from_usize(local))),
+            TemplateOperand::ResultScalar { value, width } => Operand::const_from_scalar(
+                tcx,
+                return_ty,
+                Scalar::from_uint(value, Size::from_bits(u64::from(width))),
+                span,
+            ),
+            TemplateOperand::U64Scalar(value) => Operand::const_from_scalar(
+                tcx,
+                tcx.types.u64,
+                Scalar::from_uint(value, Size::from_bits(64)),
+                span,
+            ),
+            // Trust (§6f landing 6): the `bool` constant. It is a NEW
+            // realization primitive, and landing 4 made a new primitive a
+            // compile error in this wildcard-free match DELIBERATELY — landing
+            // 5 measured the demand for it and declined to add it, because a
+            // lane that cannot run x.py must not break the compiler's closed
+            // match mid-type-check. This is that cost paid, with the constraint
+            // lifted.
+            //
+            // It is a `TyCtxt` question in exactly the way `carrier_to_rustc_ty`
+            // is: neither existing scalar could spell it, because
+            // `ResultScalar` is at the result carrier and `U64Scalar` at `u64`,
+            // and comparing a `bool` local against either is ill-typed MIR.
+            // `Scalar::from_bool` rather than a hand-rolled `from_uint(1, 8)`:
+            // the encoding of `bool` is rustc's to state, not this file's, and
+            // the extractor reads it back through `try_to_bool` into
+            // `trust_types::ConstValue::Bool` — so side B sees a boolean, never
+            // a one-byte integer it would have to interpret.
+            TemplateOperand::BoolScalar(value) => {
+                Operand::const_from_scalar(tcx, tcx.types.bool, Scalar::from_bool(value), span)
+            }
+        }
+    };
+
+    let blocks: Vec<BasicBlockData<'tcx>> = template
+        .blocks
+        .iter()
+        .map(|block| {
+            let stmts: Vec<Statement<'tcx>> = block
+                .stmts
+                .iter()
+                .map(|stmt| {
+                    let rvalue = match stmt.rvalue {
+                        TemplateRvalue::Use(value) => Rvalue::Use(operand(value), WithRetag::Yes),
+                        TemplateRvalue::Compare { cmp, left, right } => Rvalue::BinaryOp(
+                            match cmp {
+                                SelectCmp::Lt => BinOp::Lt,
+                                SelectCmp::Le => BinOp::Le,
+                                SelectCmp::Eq => BinOp::Eq,
+                            },
+                            Box::new((operand(left), operand(right))),
+                        ),
+                        // Trust (§6f landing 7): the RAW BINARY OPERATOR at the
+                        // result carrier — `&`, `|`, `/`, `%`. A NEW
+                        // realization primitive, and landing 4 made a new
+                        // primitive a compile error in this wildcard-free match
+                        // DELIBERATELY; this is that cost paid, exactly as
+                        // `TemplateOperand::BoolScalar` paid it in landing 6.
+                        //
+                        // NO `Assert`, and that is the load-bearing line in
+                        // this arm. `BinOp::Div`'s own documentation in
+                        // `rustc_middle::mir::syntax` states the obligation:
+                        // *"For integer types, division by zero is UB, as is
+                        // `MIN / -1` for signed. The compiler should have
+                        // inserted checks prior to this."* Both halves are
+                        // discharged, and neither by a check:
+                        //
+                        //  * DIVISION BY ZERO — `trust_clean_origin`'s planner
+                        //    refuses a `Div`/`Rem` plan whose right operand is
+                        //    not a STRICTLY POSITIVE numeral, so the divisor is
+                        //    a nonzero constant here by construction. That rule
+                        //    exists for a semantic reason and not for this one:
+                        //    Clean's `UInt{N}.div`/`.mod` are TOTAL
+                        //    (`x / 0 = 0`, `x % 0 = x`) while Rust's `/`/`%`
+                        //    panic, so a variable or zero divisor would emit a
+                        //    body computing a DIFFERENT function from the
+                        //    declaration — a wrong binary, which is the failure
+                        //    this whole lane is organised around. The UB is
+                        //    excluded as a corollary.
+                        //  * `MIN / -1` — the carrier is an UNSIGNED machine
+                        //    width in every position (`CarrierSignature` cannot
+                        //    exist otherwise), so the signed case is
+                        //    unrepresentable.
+                        //
+                        // Source-level `/` and `%` acquire a div-by-zero
+                        // `Assert` during MIR BUILDING; a Clean-origin body is
+                        // not built from source, so there is no assertion to
+                        // emit and `TemplateTerminator` has no `Assert` variant
+                        // to add.
+                        //
+                        // The match is over `RawBinOpKind` and is CLOSED with
+                        // no wildcard, exactly as the `SelectCmp` arm above is,
+                        // and for the same reason: a fifth operator must be a
+                        // compile error here rather than a fall-through into
+                        // the wrong instruction. Side B reads the emitted body
+                        // back through `RawBinOpKind::from_mir_binop`, whose
+                        // match is closed over the same four values — so a new
+                        // variant breaks BOTH directions at once, which is the
+                        // property that keeps them from drifting.
+                        TemplateRvalue::RawBin { op, left, right } => Rvalue::BinaryOp(
+                            match op {
+                                RawBinOpKind::BitAnd => BinOp::BitAnd,
+                                RawBinOpKind::BitOr => BinOp::BitOr,
+                                RawBinOpKind::Div => BinOp::Div,
+                                RawBinOpKind::Rem => BinOp::Rem,
+                            },
+                            Box::new((operand(left), operand(right))),
+                        ),
+                        TemplateRvalue::SharedRef(of) => Rvalue::Ref(
+                            tcx.lifetimes.re_erased,
+                            BorrowKind::Shared,
+                            Place::from(Local::from_usize(of)),
+                        ),
+                    };
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(Local::from_usize(stmt.place)),
+                            rvalue,
+                        ))),
+                    )
+                })
+                .collect();
+            let kind = match &block.terminator {
+                TemplateTerminator::Return => TerminatorKind::Return,
+                TemplateTerminator::Goto(target) => {
+                    TerminatorKind::Goto { target: BasicBlock::from_usize(*target) }
+                }
+                // `SwitchTargets::static_if(v, v_target, otherwise)` puts `v`'s
+                // target FIRST — the polarity trap the template's own
+                // `SwitchIntZero` names, and the exact mutation the divergence
+                // knob below injects.
+                TemplateTerminator::SwitchIntZero { discr, zero, otherwise } => {
+                    TerminatorKind::SwitchInt {
+                        discr: operand(*discr),
+                        targets: SwitchTargets::static_if(
+                            0,
+                            BasicBlock::from_usize(*zero),
+                            BasicBlock::from_usize(*otherwise),
+                        ),
+                    }
+                }
+                TemplateTerminator::Call { callee, args, dest, target, unwind } => {
+                    TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            resolve_template_callee(tcx, def, *callee, span),
+                            // No generics on an inherent uint or `Nat` method,
+                            // and none on the self-call.
+                            std::iter::empty::<GenericArg<'tcx>>(),
+                            span,
+                        ),
+                        args: args
+                            .iter()
+                            .map(|arg| Spanned { node: operand(*arg), span })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                        destination: Place::from(Local::from_usize(*dest)),
+                        target: Some(BasicBlock::from_usize(*target)),
+                        unwind: match unwind {
+                            TemplateUnwind::Unreachable => UnwindAction::Unreachable,
+                            TemplateUnwind::Continue => UnwindAction::Continue,
+                        },
+                        call_source: CallSource::Misc,
+                        fn_span: span,
+                    }
+                }
+            };
+            BasicBlockData::new_stmts(
+                stmts,
+                Some(Terminator { source_info, kind, attributes: ThinVec::new() }),
+                false,
+            )
+        })
+        .collect();
 
     let mut body = Body::new(
         MirSource::item(def.to_def_id()),
-        IndexVec::from_elem_n(start_block, 1),
+        IndexVec::from_raw(blocks),
         IndexVec::from_elem_n(
             SourceScopeData {
                 span,
@@ -567,32 +899,45 @@ fn build_projection_body<'tcx>(
         ),
         local_decls,
         IndexVec::new(),
-        arg_count,
+        template.arg_count,
         vec![],
         span,
         None,
         None,
     );
-    // A projection mentions no other item and reads no constant. Both tables
-    // are filled explicitly because the optimization passes that would
-    // otherwise populate them do not run on this body: running them would let
-    // a pass rewrite the very thing the gate is about to check.
     body.set_mentioned_items(Vec::new());
     body.set_required_consts(Vec::new());
-    // MEASURED (2026-08-19): `Body::new` starts at `MirPhase::Built`, and
-    // `TyCtxt::instance_mir` asserts the phase is `Runtime(_)` — the assertion
-    // fires the moment a Clean-origin function is actually CALLED at runtime
-    // (the const fixture missed it because a `const` goes through
-    // `mir_for_ctfe` and is never a mono item).
-    //
-    // `Optimized` is the honest phase, not a label chosen to satisfy the
-    // assertion: this body is emitted in its final form and no pass will ever
-    // run on it — `optimized_mir` returns it directly, deliberately skipping
-    // `run_optimization_passes`, because a pass that rewrote it after the gate
-    // ran would put un-gated code in the binary. There is no earlier phase this
-    // body is ever in.
     body.phase = MirPhase::Runtime(RuntimePhase::Optimized);
     body
+}
+
+/// The `DefId` a template callee denotes.
+///
+/// THE SELF-CALL is `def.to_def_id()` ITSELF — the def being built; resolution
+/// against its own `DefId`, no lookup. It is not a primitive and has no
+/// authenticated identity: the recognizer matches it against `func.def_path`
+/// and the kernel re-decides the argument.
+///
+/// A primitive splits on `machine_width()`, which is the identity's own
+/// classification and not a second table: the three wrapping ops carry a width
+/// and resolve on `core`'s inherent uint impls; the four bignum methods carry
+/// none and resolve on the ONE `trust_bignum::Nat` `DefId` of record. Both
+/// resolvers AUTHENTICATE their candidate from `TyCtxt` facts and both are
+/// fatal on a non-unique result — see their own docs for why a resolution
+/// mistake still cannot emit a wrong binary.
+fn resolve_template_callee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    callee: TemplateCallee,
+    span: Span,
+) -> DefId {
+    match callee {
+        TemplateCallee::SelfDef => def.to_def_id(),
+        TemplateCallee::Primitive(identity) if identity.machine_width().is_some() => {
+            resolve_core_wrapping_method(tcx, identity, span)
+        }
+        TemplateCallee::Primitive(identity) => resolve_bignum_method(tcx, identity, span),
+    }
 }
 
 /// The `DefId` of core's inherent `u{width}::wrapping_{op}`, resolved from
@@ -615,12 +960,32 @@ fn build_projection_body<'tcx>(
 /// `LoweringUnrecognised`, and `refuse` is fatal. This function's uniqueness
 /// check only upgrades that failure's diagnostics from an internal refusal to
 /// a named resolution error.
+///
+/// Trust (§6f landing 1): the callee is named by the ONE authenticated identity
+/// [`PrimitiveCallee`], which is also what `trust_types::admissible_body`'s
+/// reader classifies the extracted path through. A selection row carries one of
+/// these, not an `emit:` field and a separate `side_b:` field — two adjacent
+/// independently-authored fields are one edit, not two authorships, and the
+/// review of the general-reflector design named exactly that as the way a table
+/// manufactures a wrong binary. Note what is still NOT shared: this function
+/// resolves by METHOD NAME and authenticates the candidate from `TyCtxt` facts,
+/// while side B classifies a path the extractor re-renders independently. The
+/// identity fixes WHICH primitive; neither side is told what the other will
+/// see.
 fn resolve_core_wrapping_method<'tcx>(
     tcx: TyCtxt<'tcx>,
-    op: ArithBinOp,
-    width_bits: u32,
+    callee_identity: PrimitiveCallee,
     span: Span,
 ) -> DefId {
+    let width_bits = match callee_identity.machine_width() {
+        Some(width) => width,
+        None => tcx.dcx().span_fatal(
+            span,
+            "internal: a WrappingBinOp plan reached the emitter with a callee identity that \
+             is not a machine-width core primitive. This is a compiler defect. Please \
+             report it.",
+        ),
+    };
     let (uint, self_ty) = match width_bits {
         8 => (UintTy::U8, tcx.types.u8),
         16 => (UintTy::U16, tcx.types.u16),
@@ -635,22 +1000,20 @@ fn resolve_core_wrapping_method<'tcx>(
             ),
         ),
     };
-    let method = match op {
-        ArithBinOp::Add => sym::wrapping_add,
-        ArithBinOp::Sub => sym::wrapping_sub,
-        ArithBinOp::Mul => sym::wrapping_mul,
-    };
+    let method = Symbol::intern(callee_identity.rust_method_name());
 
     let candidates: Vec<DefId> = tcx
         .incoherent_impls(SimplifiedType::Uint(uint))
         .iter()
-        .filter(|&&impl_did| tcx.type_of(impl_did).instantiate_identity().skip_norm_wip() == self_ty)
-        .flat_map(|&impl_did| {
-            tcx.associated_items(impl_did)
-                .filter_by_name_unhygienic(method)
-                .map(|item| item.def_id)
+        .filter(|&&impl_did| {
+            tcx.type_of(impl_did).instantiate_identity().skip_norm_wip() == self_ty
         })
-        .filter(|&did| trust_mir_extract::tcx_is_authenticated_core_integer_wrapping_method(tcx, did))
+        .flat_map(|&impl_did| {
+            tcx.associated_items(impl_did).filter_by_name_unhygienic(method).map(|item| item.def_id)
+        })
+        .filter(|&did| {
+            trust_mir_extract::tcx_is_authenticated_core_integer_wrapping_method(tcx, did)
+        })
         .collect();
 
     match candidates[..] {
@@ -671,486 +1034,80 @@ fn resolve_core_wrapping_method<'tcx>(
     }
 }
 
-/// Emit the WrappingBinOp shape:
-/// `bb0: _0 = Call(u{w}::wrapping_{op}, [l, r]) -> bb1; bb1: Return` — the
-/// exact two-block form `recognize_arithmetic` was written for, and the form
-/// the fast-lane probes hand-build (`fragment_widening_probes::emitted_binop`).
+/// The `DefId` of `trust_bignum::Nat`'s inherent method `method_name`,
+/// resolved from the ONE `Nat` DefId of record
+/// (`ResolverGlobalCtxt::trust_bignum_nat` — loaded and
+/// sysroot-residency-checked by the creader at the mint seam) and REQUIRED
+/// UNIQUE. Fatal on zero or multiple candidates.
 ///
-/// Locals exactly as the projection emitter: `_0` at the result carrier,
-/// `_1..=_n` immutable at the argument carriers, all through the one
-/// `carrier_to_rustc_ty` mapping — deliberately no second mapping, so
-/// `check_signature_agrees` still guards the only carrier→rustc duplication.
-fn build_wrapping_binop_body<'tcx>(
+/// Mirrors `resolve_core_wrapping_method`'s discipline for the same reason:
+/// the emitter never writes the recognizer's callee string — the extractor
+/// re-renders it at read-back from `TyCtxt` facts (`safe_def_path_str`),
+/// independently of this resolution — so a wrong `DefId` here yields a callee
+/// path the recognizer refuses, `admit_lowering` returns
+/// `LoweringUnrecognised`, and `refuse` is fatal. The RUNTIME-SEMANTICS claim
+/// (that the resolved methods realise kernel `Nat`'s constructor analysis and
+/// arithmetic) is the `trust_bignum` TCB row (differential-tested), never a
+/// kernel statement — see the Clean-origin recursive-body row in
+/// `docs/TCB.md`.
+///
+/// MEASURED 2026-08-21, and the reason the first R1 fixture run refused at the
+/// gate: the path the extractor re-renders for a resolved method depends on
+/// WHICH MODULE THE `impl` BLOCK IS TYPED IN, not on the method. rustc's
+/// inherent-impl printer emits `Type::method` when the `impl` sits in the
+/// type's own module and `module::<impl Type>::method` when it does not, so
+/// this resolution yields `trust_bignum::Nat::is_zero` (root impl) but
+/// `trust_bignum::arith::<impl trust_bignum::Nat>::sub` (`mod arith`). This
+/// emitter can neither see nor influence that — it hands over a `DefId` — so
+/// side B's `bignum_callee` is where the fact is recorded, and moving a
+/// trust-bignum `impl` block between modules refuses this lane fail-closed
+/// until that table is re-measured. Do NOT mirror side B's table here: side A
+/// asserting what side B will accept is exactly the independence the gate
+/// exists to have.
+///
+/// Trust (§6f landing 1): the method is named by the ONE authenticated identity
+/// [`PrimitiveCallee`] — the same value a selection row carries and the same
+/// value side B's classifier returns — so there is no second spelling for an
+/// emit/read disagreement to live in. The paragraph above is UNCHANGED by that
+/// and is the reason the identity hands over a METHOD NAME rather than a path:
+/// the path is the extractor's to render and side B's to classify, and side A
+/// must not assert what side B will accept.
+fn resolve_bignum_method<'tcx>(
     tcx: TyCtxt<'tcx>,
-    def: LocalDefId,
-    plan: &CleanOriginPlan,
-    op: ArithBinOp,
-    left: ArithOperand,
-    right: ArithOperand,
+    callee_identity: PrimitiveCallee,
     span: Span,
-) -> Body<'tcx> {
-    let return_ty = carrier_to_rustc_ty(tcx, plan.return_ty(), span);
-    let param_tys: Vec<_> =
-        plan.param_tys().iter().map(|ty| carrier_to_rustc_ty(tcx, ty, span)).collect();
-    let arg_count = param_tys.len();
-
-    // The width comes from the plan's RESULT carrier; plan-time checks
-    // guarantee every argument position shares it.
-    let trust_types::Ty::Int { width: width_bits, signed: false } = *plan.return_ty() else {
+) -> DefId {
+    let Some(nat) = tcx.resolutions(()).trust_bignum_nat else {
         tcx.dcx().span_fatal(
             span,
-            format!(
-                "internal: a WrappingBinOp plan carries result carrier `{:?}`, which \
-                 `plan_clean_origin_body` is required to refuse. This is a compiler \
-                 defect. Please report it.",
-                plan.return_ty()
-            ),
+            "internal: a StructuralNatRec plan reached the emitter but no \
+             `trust_bignum::Nat` DefId is on record from the resolve-time carrier load. \
+             This is a compiler defect. Please report it.",
         );
     };
-    let callee = resolve_core_wrapping_method(tcx, op, width_bits, span);
-
-    // `Copy`, not `Move`: `a + a` names one local twice. A numeral is an
-    // inline `Const::Val` scalar — nothing needs evaluation, so
-    // `required_consts` below stays honestly empty, and nothing can promote.
-    let operand = |o: ArithOperand| -> Operand<'tcx> {
-        match o {
-            ArithOperand::Param(i) => Operand::Copy(Place::from(Local::arg(i))),
-            ArithOperand::Const(value) => Operand::const_from_scalar(
-                tcx,
-                return_ty,
-                Scalar::from_uint(value, Size::from_bits(u64::from(width_bits))),
-                span,
-            ),
-        }
-    };
-
-    let local_decls: IndexVec<Local, LocalDecl<'tcx>> =
-        std::iter::once(LocalDecl::new(return_ty, span))
-            .chain(param_tys.into_iter().map(|ty| LocalDecl::new(ty, span).immutable()))
-            .collect();
-
-    let source_info = SourceInfo::outermost(span);
-
-    let call_block = BasicBlockData::new_stmts(
-        Vec::new(),
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::Call {
-                // No generics on an inherent uint method.
-                func: Operand::function_handle(
-                    tcx,
-                    callee,
-                    std::iter::empty::<GenericArg<'tcx>>(),
-                    span,
-                ),
-                args: Box::new([
-                    Spanned { node: operand(left), span },
-                    Spanned { node: operand(right), span },
-                ]),
-                destination: Place::return_place(),
-                target: Some(BasicBlock::from_u32(1)),
-                // The primitive cannot unwind; this extracts to the
-                // `UnwindEdge::Unreachable` the probes' recognized shape
-                // carries.
-                unwind: UnwindAction::Unreachable,
-                call_source: CallSource::Misc,
-                fn_span: span,
-            },
-            attributes: ThinVec::new(),
-        }),
-        false,
-    );
-    let return_block = BasicBlockData::new_stmts(
-        Vec::new(),
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::Return,
-            attributes: ThinVec::new(),
-        }),
-        false,
-    );
-
-    let mut body = Body::new(
-        MirSource::item(def.to_def_id()),
-        IndexVec::from_raw(vec![call_block, return_block]),
-        IndexVec::from_elem_n(
-            SourceScopeData {
-                span,
-                parent_scope: None,
-                inlined: None,
-                inlined_parent_scope: None,
-                local_data: ClearCrossCrate::Clear,
-            },
-            1,
-        ),
-        local_decls,
-        IndexVec::new(),
-        arg_count,
-        vec![],
-        span,
-        None,
-        None,
-    );
-    // `mentioned_items` stays empty SOUNDLY: the mono collector collects the
-    // callee as a **used** item by walking this very body (used and mentioned
-    // are collected independently; there is no used ⊆ mentioned assertion),
-    // and no optimization ever runs on this body to delete the call —
-    // `optimized_mir` returns it directly. `required_consts` is honestly
-    // empty: the only constant is an inline evaluated scalar.
-    body.set_mentioned_items(Vec::new());
-    body.set_required_consts(Vec::new());
-    // Same phase argument as the projection emitter: this body is emitted in
-    // its final form, no pass ever runs on it, and `instance_mir` asserts
-    // `Runtime(_)` the moment the function is called at runtime.
-    body.phase = MirPhase::Runtime(RuntimePhase::Optimized);
-    body
-}
-
-/// Emit the Composed shape: the linear wrapping-call chain
-/// `recognize_call_chain` was written for — one `Call` per tree node in
-/// POST-ORDER (left subtree, right subtree, then the node), each non-root
-/// node writing a fresh temporary, the root writing `_0`, then `Return`.
-/// For `fun a b => (a + b) * a`:
-///
-/// ```text
-/// bb0: _3 = Call(u64::wrapping_add, [copy _1, copy _2]) -> bb1
-/// bb1: _0 = Call(u64::wrapping_mul, [copy _3, copy _1]) -> bb2
-/// bb2: Return
-/// ```
-///
-/// This is EXACTLY the shape the recognizer's chain arm accepts — strictly
-/// consecutive call blocks, each targeting the next, each destination a bare
-/// fresh temporary except the last, which is the bare return place — and the
-/// shape the fast-lane probes hand-build (`fragment_widening_probes::
-/// emitted_nested`, and the e6 corpus's f21, which discharges it end-to-end).
-/// Post-order also makes the read-back exact: each temporary is written once
-/// and consumed once, so the recognizer's substitution through its
-/// environment reconstructs precisely the tree that was flattened here, and
-/// the structural comparison in `admit_lowering` is then direct equality.
-///
-/// Locals exactly as the other emitters: `_0` at the result carrier,
-/// `_1..=_n` immutable at the argument carriers, then one temporary per
-/// NON-ROOT node at the result carrier (the plan's checks guarantee every
-/// position shares the one width) — all through the one `carrier_to_rustc_ty`
-/// mapping, so `check_signature_agrees` still guards the only carrier→rustc
-/// duplication. Every callee is resolved per node through
-/// `resolve_core_wrapping_method`; operands are `Copy` (a parameter or a
-/// temporary may be named more than once in principle, and the probes'
-/// recognized shape carries `Copy`) or inline `Const::Val` scalars at the
-/// carrier width, so `required_consts` stays honestly empty.
-fn build_composed_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def: LocalDefId,
-    plan: &CleanOriginPlan,
-    expr: &ArithExpr,
-    span: Span,
-) -> Body<'tcx> {
-    let return_ty = carrier_to_rustc_ty(tcx, plan.return_ty(), span);
-    let param_tys: Vec<_> =
-        plan.param_tys().iter().map(|ty| carrier_to_rustc_ty(tcx, ty, span)).collect();
-    let arg_count = param_tys.len();
-
-    // The width comes from the plan's RESULT carrier; plan-time checks
-    // guarantee every argument position shares it.
-    let trust_types::Ty::Int { width: width_bits, signed: false } = *plan.return_ty() else {
-        tcx.dcx().span_fatal(
+    let method_name = callee_identity.rust_method_name();
+    let method = Symbol::intern(method_name);
+    let candidates: Vec<DefId> = tcx
+        .inherent_impls(nat)
+        .iter()
+        .flat_map(|&impl_did| {
+            tcx.associated_items(impl_did).filter_by_name_unhygienic(method).map(|item| item.def_id)
+        })
+        .collect();
+    match candidates[..] {
+        [callee] => callee,
+        ref found => tcx.dcx().span_fatal(
             span,
             format!(
-                "internal: a Composed plan carries result carrier `{:?}`, which \
-                 `plan_clean_origin_body` is required to refuse. This is a compiler \
-                 defect. Please report it.",
-                plan.return_ty()
+                "internal: resolution of `trust_bignum::Nat::{method_name}` was {} \
+                 ({} candidate(s): {found:?}); the compiler will not guess which \
+                 function to emit a call to. This is a compiler defect — please report \
+                 it.",
+                if found.is_empty() { "absent" } else { "ambiguous" },
+                found.len(),
             ),
-        );
-    };
-
-    // ── flatten the tree, post-order ───────────────────────────────────────
-    //
-    // One step per binop node; a step's operand is a source parameter, an
-    // in-range literal, or the RESULT OF AN EARLIER STEP — the `Step` index —
-    // which is what makes a dangling intermediate unrepresentable here too.
-    enum StepOperand {
-        Param(usize),
-        Const(u128),
-        Step(usize),
-    }
-    struct Step {
-        op: ArithBinOp,
-        left: StepOperand,
-        right: StepOperand,
-    }
-    fn flatten(expr: &ArithExpr, steps: &mut Vec<Step>) -> StepOperand {
-        match expr {
-            ArithExpr::Operand(ArithOperand::Param(i)) => StepOperand::Param(*i),
-            ArithExpr::Operand(ArithOperand::Const(v)) => StepOperand::Const(*v),
-            ArithExpr::Bin { op, left, right } => {
-                let left = flatten(left, steps);
-                let right = flatten(right, steps);
-                steps.push(Step { op: *op, left, right });
-                StepOperand::Step(steps.len() - 1)
-            }
-        }
-    }
-    let mut steps = Vec::new();
-    let root = flatten(expr, &mut steps);
-    let n_steps = steps.len();
-    // The plan is required to carry 2..=COMPOSED_MAX_OPS nodes; a degenerate
-    // tree reaching the emitter is a defect, and emitting a fallback body for
-    // it is the wrong-binary outcome. (The root being the LAST step is
-    // post-order by construction; it is asserted anyway because `_0`'s writer
-    // depends on it.)
-    if n_steps < 2 || !matches!(root, StepOperand::Step(index) if index == n_steps - 1) {
-        tcx.dcx().span_fatal(
-            span,
-            format!(
-                "internal: a Composed plan flattened to {n_steps} call step(s), which \
-                 `plan_clean_origin_body` is required to refuse. This is a compiler \
-                 defect. Please report it."
-            ),
-        );
-    }
-
-    // Temporary for NON-ROOT step `k`: local `arg_count + 1 + k`. The root
-    // (step `n_steps - 1`) writes the return place and gets no temporary.
-    let temp_local = |step: usize| Local::from_usize(arg_count + 1 + step);
-
-    let local_decls: IndexVec<Local, LocalDecl<'tcx>> =
-        std::iter::once(LocalDecl::new(return_ty, span))
-            .chain(param_tys.into_iter().map(|ty| LocalDecl::new(ty, span).immutable()))
-            .chain((0..n_steps - 1).map(|_| LocalDecl::new(return_ty, span)))
-            .collect();
-
-    let source_info = SourceInfo::outermost(span);
-
-    let operand = |o: &StepOperand| -> Operand<'tcx> {
-        match o {
-            StepOperand::Param(i) => Operand::Copy(Place::from(Local::arg(*i))),
-            StepOperand::Const(value) => Operand::const_from_scalar(
-                tcx,
-                return_ty,
-                Scalar::from_uint(*value, Size::from_bits(u64::from(width_bits))),
-                span,
-            ),
-            StepOperand::Step(k) => Operand::Copy(Place::from(temp_local(*k))),
-        }
-    };
-
-    let mut blocks: Vec<BasicBlockData<'tcx>> = Vec::with_capacity(n_steps + 1);
-    for (k, step) in steps.iter().enumerate() {
-        let is_root = k == n_steps - 1;
-        let callee = resolve_core_wrapping_method(tcx, step.op, width_bits, span);
-        blocks.push(BasicBlockData::new_stmts(
-            Vec::new(),
-            Some(Terminator {
-                source_info,
-                kind: TerminatorKind::Call {
-                    // No generics on an inherent uint method.
-                    func: Operand::function_handle(
-                        tcx,
-                        callee,
-                        std::iter::empty::<GenericArg<'tcx>>(),
-                        span,
-                    ),
-                    args: Box::new([
-                        Spanned { node: operand(&step.left), span },
-                        Spanned { node: operand(&step.right), span },
-                    ]),
-                    destination: if is_root {
-                        Place::return_place()
-                    } else {
-                        Place::from(temp_local(k))
-                    },
-                    target: Some(BasicBlock::from_usize(k + 1)),
-                    // The primitive cannot unwind; this extracts to the
-                    // `UnwindEdge::Unreachable` the probes' recognized shape
-                    // carries.
-                    unwind: UnwindAction::Unreachable,
-                    call_source: CallSource::Misc,
-                    fn_span: span,
-                },
-                attributes: ThinVec::new(),
-            }),
-            false,
-        ));
-    }
-    blocks.push(BasicBlockData::new_stmts(
-        Vec::new(),
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::Return,
-            attributes: ThinVec::new(),
-        }),
-        false,
-    ));
-
-    let mut body = Body::new(
-        MirSource::item(def.to_def_id()),
-        IndexVec::from_raw(blocks),
-        IndexVec::from_elem_n(
-            SourceScopeData {
-                span,
-                parent_scope: None,
-                inlined: None,
-                inlined_parent_scope: None,
-                local_data: ClearCrossCrate::Clear,
-            },
-            1,
         ),
-        local_decls,
-        IndexVec::new(),
-        arg_count,
-        vec![],
-        span,
-        None,
-        None,
-    );
-    // Same table and phase arguments as the WrappingBinOp emitter: the mono
-    // collector collects every callee as a **used** item by walking this very
-    // body, no optimization ever runs on it (`optimized_mir` returns it
-    // directly), and the only constants are inline evaluated scalars.
-    body.set_mentioned_items(Vec::new());
-    body.set_required_consts(Vec::new());
-    body.phase = MirPhase::Runtime(RuntimePhase::Optimized);
-    body
-}
-
-/// Emit the R2/C5a Select shape: the four-block O0 diamond `recognize_select`
-/// was written for, years before this lane —
-///
-/// ```text
-/// bb0: _{n+2} = Cmp(copy _{cl+1}, copy _{cr+1}); switchInt(_{n+2}) -> [0: bb2, otherwise: bb1]
-/// bb1: _{n+1} = copy _{then+1}; goto bb3        // otherwise == the TRUE arm
-/// bb2: _{n+1} = copy _{else+1}; goto bb3        // 0 == the FALSE arm
-/// bb3: _0 = copy _{n+1}; return
-/// ```
-///
-/// THE POLARITY TRAP, named where the code is: `SwitchTargets::static_if(v,
-/// then_, else_)` puts `v`'s target FIRST and `otherwise` LAST — so the call
-/// below is `static_if(0, bb_ELSE, bb_THEN)`: the `0` (comparison FALSE)
-/// value routes to the else arm, `otherwise` to the then arm. Getting the
-/// argument order wrong silently emits max where the island wrote min — it
-/// is the exact mutation the divergence knob injects, and the faithfulness
-/// gate is what makes it unshippable rather than this comment.
-#[allow(clippy::too_many_arguments)]
-fn build_select_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def: LocalDefId,
-    plan: &CleanOriginPlan,
-    cmp: SelectCmp,
-    cmp_left: usize,
-    cmp_right: usize,
-    then_param: usize,
-    else_param: usize,
-    span: Span,
-) -> Body<'tcx> {
-    let return_ty = carrier_to_rustc_ty(tcx, plan.return_ty(), span);
-    let param_tys: Vec<_> =
-        plan.param_tys().iter().map(|ty| carrier_to_rustc_ty(tcx, ty, span)).collect();
-    let arg_count = param_tys.len();
-
-    // `_0` ret, `_1..=_n` params, `_{n+1}` the select temp at the result
-    // carrier, `_{n+2}` the bool the comparison writes.
-    let select_temp = Local::from_usize(arg_count + 1);
-    let cmp_local = Local::from_usize(arg_count + 2);
-    let local_decls: IndexVec<Local, LocalDecl<'tcx>> =
-        std::iter::once(LocalDecl::new(return_ty, span))
-            .chain(param_tys.into_iter().map(|ty| LocalDecl::new(ty, span).immutable()))
-            .chain([LocalDecl::new(return_ty, span), LocalDecl::new(tcx.types.bool, span)])
-            .collect();
-
-    let source_info = SourceInfo::outermost(span);
-    let bin_op = match cmp {
-        SelectCmp::Lt => BinOp::Lt,
-        SelectCmp::Le => BinOp::Le,
-        SelectCmp::Eq => BinOp::Eq,
-    };
-    let assign = |place: Place<'tcx>, rvalue: Rvalue<'tcx>| {
-        Statement::new(source_info, StatementKind::Assign(Box::new((place, rvalue))))
-    };
-    let copy_param = |i: usize| Operand::Copy(Place::from(Local::arg(i)));
-    let goto_join = Some(Terminator {
-        source_info,
-        kind: TerminatorKind::Goto { target: BasicBlock::from_u32(3) },
-        attributes: ThinVec::new(),
-    });
-
-    let entry = BasicBlockData::new_stmts(
-        vec![assign(
-            Place::from(cmp_local),
-            Rvalue::BinaryOp(bin_op, Box::new((copy_param(cmp_left), copy_param(cmp_right)))),
-        )],
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::SwitchInt {
-                discr: Operand::Copy(Place::from(cmp_local)),
-                // See the header: 0 (FALSE) -> bb2 (else), otherwise -> bb1 (then).
-                targets: SwitchTargets::static_if(
-                    0,
-                    BasicBlock::from_u32(2),
-                    BasicBlock::from_u32(1),
-                ),
-            },
-            attributes: ThinVec::new(),
-        }),
-        false,
-    );
-    let then_arm = BasicBlockData::new_stmts(
-        vec![assign(
-            Place::from(select_temp),
-            Rvalue::Use(copy_param(then_param), WithRetag::Yes),
-        )],
-        goto_join.clone(),
-        false,
-    );
-    let else_arm = BasicBlockData::new_stmts(
-        vec![assign(
-            Place::from(select_temp),
-            Rvalue::Use(copy_param(else_param), WithRetag::Yes),
-        )],
-        goto_join,
-        false,
-    );
-    let join = BasicBlockData::new_stmts(
-        vec![assign(
-            Place::return_place(),
-            Rvalue::Use(Operand::Copy(Place::from(select_temp)), WithRetag::Yes),
-        )],
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::Return,
-            attributes: ThinVec::new(),
-        }),
-        false,
-    );
-
-    let mut body = Body::new(
-        MirSource::item(def.to_def_id()),
-        IndexVec::from_raw(vec![entry, then_arm, else_arm, join]),
-        IndexVec::from_elem_n(
-            SourceScopeData {
-                span,
-                parent_scope: None,
-                inlined: None,
-                inlined_parent_scope: None,
-                local_data: ClearCrossCrate::Clear,
-            },
-            1,
-        ),
-        local_decls,
-        IndexVec::new(),
-        arg_count,
-        vec![],
-        span,
-        None,
-        None,
-    );
-    // A select mentions no other item and its only rvalues are comparisons
-    // and copies of locals — both tables are honestly empty, same argument as
-    // the sibling emitters.
-    body.set_mentioned_items(Vec::new());
-    body.set_required_consts(Vec::new());
-    body.phase = MirPhase::Runtime(RuntimePhase::Optimized);
-    body
+    }
 }
 
 /// The rustc type a discharged I4 carrier denotes.
@@ -1180,9 +1137,21 @@ pub(crate) fn carrier_to_rustc_ty<'tcx>(
             // (`CStore::trust_load_bignum_carrier`) at the mint seam, recorded
             // into `ResolverGlobalCtxt::trust_bignum_nat`, and used to feed
             // this def's `fn_sig`; `check_signature_agrees` already makes any
-            // divergence between the two readings fatal. Absence here is a
-            // post-mint impossibility: a Nat grant that survived demotion has
-            // the DefId on record.
+            // divergence between the two readings fatal.
+            //
+            // MEASURED, and the reason the claim that used to stand here is
+            // gone: "absence is a post-mint impossibility" was true of the
+            // LOCAL lane only. The IMPORT lane reaches this function for a
+            // grant minted in another crate, and the resolve-time load used to
+            // fire only for a crate's own grants — so an import-only crate hit
+            // this fatal on a well-formed program (fixture
+            // `clean_origin_recursive_nat_cross_crate.rs`). The import trigger
+            // (`Resolver::trust_resolve_imported_carrier_crates`) closes that
+            // case. The fatal STAYS: it is now the honest report of a carrier
+            // that is genuinely absent — a `trust_bignum` the loader refused
+            // (no sysroot copy, `-Zbuild-std`), or an imported Nat carrier
+            // reached by a route the resolver could not see. Refusing to guess
+            // a carrier type is the only safe answer either way.
             let Some(nat) = tcx.resolutions(()).trust_bignum_nat else {
                 tcx.dcx().span_fatal(
                     span,

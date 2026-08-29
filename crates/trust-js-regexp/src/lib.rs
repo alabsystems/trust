@@ -148,14 +148,14 @@ pub struct MatchResult {
 /// Pattern flags (parsed, validated).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Flags {
-    pub has_indices: bool, // d
-    pub global: bool,      // g
-    pub ignore_case: bool, // i
-    pub multiline: bool,   // m
-    pub dot_all: bool,     // s
-    pub unicode: bool,     // u
+    pub has_indices: bool,  // d
+    pub global: bool,       // g
+    pub ignore_case: bool,  // i
+    pub multiline: bool,    // m
+    pub dot_all: bool,      // s
+    pub unicode: bool,      // u
     pub unicode_sets: bool, // v
-    pub sticky: bool,      // y
+    pub sticky: bool,       // y
 }
 
 impl Flags {
@@ -191,14 +191,30 @@ impl Flags {
 
     pub fn to_flags_string(&self) -> String {
         let mut s = String::new();
-        if self.has_indices { s.push('d'); }
-        if self.global { s.push('g'); }
-        if self.ignore_case { s.push('i'); }
-        if self.multiline { s.push('m'); }
-        if self.dot_all { s.push('s'); }
-        if self.unicode { s.push('u'); }
-        if self.unicode_sets { s.push('v'); }
-        if self.sticky { s.push('y'); }
+        if self.has_indices {
+            s.push('d');
+        }
+        if self.global {
+            s.push('g');
+        }
+        if self.ignore_case {
+            s.push('i');
+        }
+        if self.multiline {
+            s.push('m');
+        }
+        if self.dot_all {
+            s.push('s');
+        }
+        if self.unicode {
+            s.push('u');
+        }
+        if self.unicode_sets {
+            s.push('v');
+        }
+        if self.sticky {
+            s.push('y');
+        }
         s
     }
 }
@@ -220,19 +236,10 @@ pub fn compile(source_units: &[u16], flags: &str) -> Result<Pattern, CompileErro
     let flags = Flags::parse(flags)?;
     let ast = parser::parse(source_units, flags)?;
     let prog = compile::compile(&ast, flags)?;
-    let mut names: Vec<(String, u32)> = ast
-        .group_names
-        .iter()
-        .map(|g| (g.name.clone(), g.index))
-        .collect();
+    let mut names: Vec<(String, u32)> =
+        ast.group_names.iter().map(|g| (g.name.clone(), g.index)).collect();
     names.sort_by_key(|(_, i)| *i);
-    Ok(Pattern {
-        flags,
-        source: source_units.to_vec(),
-        prog,
-        n_groups: ast.n_groups,
-        names,
-    })
+    Ok(Pattern { flags, source: source_units.to_vec(), prog, n_groups: ast.n_groups, names })
 }
 
 impl Pattern {
@@ -300,11 +307,7 @@ impl Pattern {
                     index: pos,
                     end: caps[1],
                     captures,
-                    named: self
-                        .names
-                        .iter()
-                        .map(|(n, i)| (n.clone(), *i as usize))
-                        .collect(),
+                    named: self.names.iter().map(|(n, i)| (n.clone(), *i as usize)).collect(),
                 }));
             }
             if sticky || pos >= input.len() {

@@ -28,11 +28,7 @@ pub fn explain_divergence(a: &ObservableTrace, b: &ObservableTrace) -> Option<St
     }
     for (i, (ea, eb)) in a.events.iter().zip(b.events.iter()).enumerate() {
         if ea != eb {
-            return Some(format!(
-                "event[{i}]: {} vs {}",
-                summarize_event(ea),
-                summarize_event(eb)
-            ));
+            return Some(format!("event[{i}]: {} vs {}", summarize_event(ea), summarize_event(eb)));
         }
     }
     if a.events.len() != b.events.len() {

@@ -317,7 +317,11 @@ fn hardened_lab_json_reports_every_hardened_category_claim() {
         assert!(
             // `targo` (post tcargo->targo rename, d1ee06b315) — the old
             // `contains("cargo")` only matched the tcargo-era binary name.
+            // `--unverified` is part of the command hardened-lab actually
+            // spawns (333042c50a), so the recorded transcript must name it too
+            // or the evidence is not rerunnable.
             walkthrough["command"].as_str().is_some_and(|command| command.contains("targo")
+                && command.contains("--unverified")
                 && command.contains("build")
                 && command.contains("--bin")),
             "walkthrough record should include the Trust Cargo build command: {walkthrough}"
@@ -520,10 +524,19 @@ fn standalone_check_no_hardened_opts_out_of_default_profile() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // The standalone lane is a SOURCE AUDIT, and 06c732cdd9 settled what its
+    // exit means: `total_audit_rows > 0 && failed == 0`. `Unknown` rows there
+    // are inventory OBSERVATIONS (`UnspecifiedPublicApi`, `UnsafeFunction`)
+    // that a `proof_authority: "none"` audit reports but cannot adjudicate, so
+    // requiring `unknown == 0` made every crate with an unspecified public fn
+    // exit 1 — which the basic-contracts e2e pins as wrong. Exit 0 here is
+    // therefore "inventory complete, no failed checks", never proof; the
+    // envelope assertion below is what keeps it from being read as proof, and
+    // the observations must still be present and counted.
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "--no-hardened opts out of hardened findings, but baseline unknown obligations still fail closed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(0),
+        "--no-hardened opts out of hardened findings, so the source audit completes with no failed rows\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         !stderr.contains("hardened profile"),
@@ -535,13 +548,21 @@ fn standalone_check_no_hardened_opts_out_of_default_profile() {
     });
     assert_source_audit_envelope(&json);
     assert_eq!(
+        json["audit_passed"], true,
+        "a source audit with no failed rows passes, and says so in the same envelope that denies proof authority\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
         json["failed"].as_u64(),
         Some(0),
         "--no-hardened should leave only non-failing baseline standalone obligations\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         json["unknown"].as_u64().is_some_and(|unknown| unknown > 0),
-        "baseline standalone unknown obligations must be reported and fail closed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "baseline standalone unknown observations must still be reported, not dropped, when the audit passes\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        json["total_audit_rows"].as_u64().is_some_and(|rows| rows > 0),
+        "a passing source audit must have audited something: an empty summary is the impersonation 06c732cdd9 kept fail-closed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let vcs = json["audit_rows"]
@@ -997,11 +1018,31 @@ fn hardened_lab_command(targo_root: &Path) -> Command {
     command
 }
 
+#[cfg(unix)]
+const TEST_TARGO_SHIM: &str = r#"#!/bin/sh
+if [ "$1" != "--unverified" ]; then
+    echo "test targo: expected the explicit --unverified lane first, got: $*" >&2
+    exit 2
+fi
+shift
+exec "$TRUST_TEST_HOST_CARGO" "$@"
+"#;
+
+/// Install a stand-in for the Trust Cargo frontend that hardened-lab drives.
+///
+/// The real `targo` takes `--unverified` as a TOP-LEVEL lane flag and consumes
+/// it before dispatching the cargo command; stock cargo rejects it outright.
+/// Hardened-lab has spelled that lane explicitly since 333042c50a, because a
+/// bare `targo build` refuses rather than create an implicitly unverified
+/// artifact — so the stand-in must consume the lane the same way. It fails
+/// closed rather than silently tolerating its absence: if the walkthrough
+/// runner ever stops naming the lane, that is a product change these tests must
+/// report, not absorb.
 fn install_test_targo(targo_root: &Path) -> PathBuf {
     let path = targo_root.join(format!("targo{}", std::env::consts::EXE_SUFFIX));
     #[cfg(unix)]
     {
-        fs::write(&path, "#!/bin/sh\nexec \"$TRUST_TEST_HOST_CARGO\" \"$@\"\n")
+        fs::write(&path, TEST_TARGO_SHIM)
             .unwrap_or_else(|error| panic!("write test targo {}: {error}", path.display()));
         let mut permissions = fs::metadata(&path).expect("test targo metadata").permissions();
         permissions.set_mode(0o755);

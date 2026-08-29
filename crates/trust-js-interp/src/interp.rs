@@ -12,11 +12,12 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use trust_js_parse::ast::{DeclKind, Expr, ForHead, ForInit, Func, Pat, Stmt, SwitchCase};
+
 use trust_js_parse::Program;
+use trust_js_parse::ast::{DeclKind, Expr, ForHead, ForInit, Func, Pat, Stmt, SwitchCase};
 use trust_js_trace::HostEvent;
 use trust_js_value::{
-    create_realm, Binding, EnvFrame, EnvId, Heap, Intrinsics, JsValue, ObjId, Property,
+    Binding, EnvFrame, EnvId, Heap, Intrinsics, JsValue, ObjId, Property, create_realm,
 };
 
 pub const MAX_CALL_DEPTH: u32 = 256;
@@ -80,8 +81,7 @@ pub struct Interp {
     /// each RegExp instance (ObjKind::Regex), keyed by ObjId. `Err(reason)`
     /// records an admitted-but-unsupported pattern (Annex-B / resource-extreme)
     /// — every match attempt on it refuses (NoCoverage), never a wrong result.
-    pub(crate) regex_patterns:
-        HashMap<ObjId, Result<Rc<trust_js_regexp::Pattern>, String>>,
+    pub(crate) regex_patterns: HashMap<ObjId, Result<Rc<trust_js_regexp::Pattern>, String>>,
     /// PrivateEnvironment arena (class private-name scopes).
     pub(crate) priv_envs: Vec<crate::private::PrivEnvData>,
     /// A class declarative environment → its PrivateEnvironment. Private-name
@@ -90,7 +90,8 @@ pub struct Interp {
     /// [[PrivateElements]] side table, keyed by object. Private elements live
     /// OUTSIDE `obj.props`, so they never surface to enumeration, reflection,
     /// or the trace projection.
-    pub(crate) priv_elements: HashMap<ObjId, Vec<(crate::private::PrivName, crate::private::PrivElem)>>,
+    pub(crate) priv_elements:
+        HashMap<ObjId, Vec<(crate::private::PrivName, crate::private::PrivElem)>>,
     /// Fresh private-name identity counter.
     pub(crate) next_priv_name: crate::private::PrivName,
     /// Generator suspension state (frame stack + [[GeneratorState]]), keyed by
@@ -286,10 +287,7 @@ impl Interp {
         let env = self.alloc_env(Some(root));
         // Lexical declarations first (TDZ before function instantiation).
         for (name, mutable) in hoist::lexical_decls(&prog.body).map_err(Abrupt::Fatal)? {
-            self.heap
-                .env_mut(env)
-                .bindings
-                .insert(name, Binding::tdz(mutable));
+            self.heap.env_mut(env).bindings.insert(name, Binding::tdz(mutable));
         }
         if prog.strict {
             for f in &analysis.funcs {
@@ -323,10 +321,7 @@ impl Interp {
                 }
             }
         }
-        let ctx = Ctx {
-            env,
-            strict: prog.strict,
-        };
+        let ctx = Ctx { env, strict: prog.strict };
         let mut v: Option<JsValue> = None;
         self.eval_stmt_list(&prog.body, &ctx, &mut v)?;
         Ok(v.unwrap_or(JsValue::Undefined))
@@ -334,7 +329,11 @@ impl Interp {
 
     /// CreateGlobalFunctionBinding (sloppy indirect eval): {w,e,c:true} when
     /// definable; TypeError against a non-configurable unsuitable slot.
-    pub(crate) fn create_global_function_binding(&mut self, name: &str, fobj: ObjId) -> Result<(), Abrupt> {
+    pub(crate) fn create_global_function_binding(
+        &mut self,
+        name: &str,
+        fobj: ObjId,
+    ) -> Result<(), Abrupt> {
         let key = trust_js_value::PropKey::from_str(name);
         let existing = self.heap.obj(self.global).props.get(&key);
         match existing {
@@ -411,9 +410,9 @@ impl Interp {
             // Module `import`/`export` declarations never reach the script
             // interpreter (parse_script does not produce them); the module goal
             // is out of the interpreter's slice.
-            Stmt::Import(_) | Stmt::Export(_) => Err(Abrupt::Fatal(
-                "module import/export declaration (out of slice)".to_string(),
-            )),
+            Stmt::Import(_) | Stmt::Export(_) => {
+                Err(Abrupt::Fatal("module import/export declaration (out of slice)".to_string()))
+            }
             Stmt::Expr(e) => Ok(Some(self.eval_expr(e, ctx)?)),
             Stmt::Decl { kind, decls } => self.eval_decl(*kind, decls, ctx),
             Stmt::Block(body) => self.eval_block(body, ctx),
@@ -422,16 +421,14 @@ impl Interp {
                 let r = if self.to_boolean(&t) {
                     if matches!(cons.as_ref(), Stmt::FuncDecl(_)) {
                         return Err(Abrupt::Fatal(
-                            "function declaration as if-branch (Annex B, out of slice)"
-                                .to_string(),
+                            "function declaration as if-branch (Annex B, out of slice)".to_string(),
                         ));
                     }
                     self.eval_stmt(cons, ctx)
                 } else if let Some(a) = alt {
                     if matches!(a.as_ref(), Stmt::FuncDecl(_)) {
                         return Err(Abrupt::Fatal(
-                            "function declaration as if-branch (Annex B, out of slice)"
-                                .to_string(),
+                            "function declaration as if-branch (Annex B, out of slice)".to_string(),
                         ));
                     }
                     self.eval_stmt(a, ctx)
@@ -442,19 +439,11 @@ impl Interp {
             }
             Stmt::While { test, body } => self.eval_while(test, body, ctx, labels),
             Stmt::DoWhile { body, test } => self.eval_do_while(body, test, ctx, labels),
-            Stmt::For {
-                init,
-                test,
-                update,
-                body,
-            } => self.eval_for(init.as_ref(), test.as_ref(), update.as_ref(), body, ctx, labels),
+            Stmt::For { init, test, update, body } => {
+                self.eval_for(init.as_ref(), test.as_ref(), update.as_ref(), body, ctx, labels)
+            }
             Stmt::ForIn { left, right, body } => self.eval_for_in(left, right, body, ctx, labels),
-            Stmt::ForOf {
-                left,
-                right,
-                body,
-                is_await,
-            } => {
+            Stmt::ForOf { left, right, body, is_await } => {
                 if *is_await {
                     return Err(Abrupt::Fatal("for-await-of (async, M2)".to_string()));
                 }
@@ -471,14 +460,8 @@ impl Interp {
                 let v = self.eval_expr(e, ctx)?;
                 Err(Abrupt::Throw(v))
             }
-            Stmt::Break(l) => Err(Abrupt::Break {
-                label: l.clone(),
-                value: None,
-            }),
-            Stmt::Continue(l) => Err(Abrupt::Continue {
-                label: l.clone(),
-                value: None,
-            }),
+            Stmt::Break(l) => Err(Abrupt::Break { label: l.clone(), value: None }),
+            Stmt::Continue(l) => Err(Abrupt::Continue { label: l.clone(), value: None }),
             Stmt::Labeled { label, body } => {
                 if matches!(body.as_ref(), Stmt::FuncDecl(_)) {
                     return Err(Abrupt::Fatal(
@@ -488,19 +471,14 @@ impl Interp {
                 let mut ls = labels.to_vec();
                 ls.push(label.clone());
                 match self.eval_stmt_labeled(body, ctx, &ls) {
-                    Err(Abrupt::Break {
-                        label: Some(l),
-                        value,
-                    }) if l == *label => Ok(value),
+                    Err(Abrupt::Break { label: Some(l), value }) if l == *label => Ok(value),
                     other => other,
                 }
             }
             Stmt::Switch { disc, cases } => self.eval_switch(disc, cases, ctx),
-            Stmt::Try {
-                block,
-                catch,
-                finally,
-            } => self.eval_try(block, catch.as_ref(), finally.as_ref(), ctx),
+            Stmt::Try { block, catch, finally } => {
+                self.eval_try(block, catch.as_ref(), finally.as_ref(), ctx)
+            }
             Stmt::With { .. } => Err(Abrupt::Fatal("with statement (out of slice)".to_string())),
             Stmt::ClassDecl(c) => {
                 // BindingClassDeclarationEvaluation: evaluate, then
@@ -518,7 +496,12 @@ impl Interp {
 
     // -- declarations --------------------------------------------------------
 
-    pub(crate) fn eval_decl(&mut self, kind: DeclKind, decls: &[(Pat, Option<Expr>)], ctx: &Ctx) -> Compl {
+    pub(crate) fn eval_decl(
+        &mut self,
+        kind: DeclKind,
+        decls: &[(Pat, Option<Expr>)],
+        ctx: &Ctx,
+    ) -> Compl {
         match kind {
             DeclKind::Var => {
                 for (pat, init) in decls {
@@ -535,7 +518,7 @@ impl Interp {
                         (_, None) => {
                             return Err(Abrupt::Fatal(
                                 "var pattern without initializer (parser bug?)".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -558,7 +541,7 @@ impl Interp {
                         (_, None) => {
                             return Err(Abrupt::Fatal(
                                 "lexical pattern without initializer (parser bug?)".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -587,7 +570,9 @@ impl Interp {
                         ));
                     };
                     let e = init.as_ref().ok_or_else(|| {
-                        Abrupt::Fatal("using declaration without initializer (parser bug?)".to_string())
+                        Abrupt::Fatal(
+                            "using declaration without initializer (parser bug?)".to_string(),
+                        )
                     })?;
                     // BindingEvaluation: evaluate initializer, InitializeReferencedBinding,
                     // then AddDisposableResource (sync-dispose). A bad @@dispose
@@ -639,10 +624,7 @@ impl Interp {
     pub(crate) fn enter_block_scope(&mut self, body: &[Stmt], ctx: &Ctx) -> Result<Ctx, Abrupt> {
         let env = self.alloc_env(Some(ctx.env));
         for (name, mutable) in hoist::lexical_decls(body).map_err(Abrupt::Fatal)? {
-            self.heap
-                .env_mut(env)
-                .bindings
-                .insert(name, Binding::tdz(mutable));
+            self.heap.env_mut(env).bindings.insert(name, Binding::tdz(mutable));
         }
         if ctx.strict {
             for f in hoist::direct_func_decls(body) {
@@ -653,10 +635,7 @@ impl Interp {
                 );
             }
         }
-        Ok(Ctx {
-            env,
-            strict: ctx.strict,
-        })
+        Ok(Ctx { env, strict: ctx.strict })
     }
 
     // -- loops ---------------------------------------------------------------
@@ -715,22 +694,16 @@ impl Interp {
                     hoist::pat_bound_names(pat, &mut names);
                 }
                 for n in &names {
-                    self.heap
-                        .env_mut(env)
-                        .bindings
-                        .insert(n.clone(), Binding::tdz(mutable));
+                    self.heap.env_mut(env).bindings.insert(n.clone(), Binding::tdz(mutable));
                 }
-                cur = Ctx {
-                    env,
-                    strict: ctx.strict,
-                };
+                cur = Ctx { env, strict: ctx.strict };
                 self.eval_decl(*kind, decls, &cur)?;
                 if mutable {
                     per_iter = names;
                 }
             }
             Some(ForInit::Decl(DeclKind::Using | DeclKind::AwaitUsing, _)) => {
-                return Err(Abrupt::Fatal("using declaration (out of slice)".to_string()))
+                return Err(Abrupt::Fatal("using declaration (out of slice)".to_string()));
             }
             Some(ForInit::Expr(e)) => {
                 self.eval_expr(e, &cur)?;
@@ -775,15 +748,9 @@ impl Interp {
             let b = self
                 .lookup_binding_value(cur.env, n)
                 .ok_or_else(|| Abrupt::Fatal(format!("per-iteration binding `{n}` missing")))?;
-            self.heap
-                .env_mut(fresh)
-                .bindings
-                .insert(n.clone(), Binding::var(b));
+            self.heap.env_mut(fresh).bindings.insert(n.clone(), Binding::var(b));
         }
-        Ok(Ctx {
-            env: fresh,
-            strict: cur.strict,
-        })
+        Ok(Ctx { env: fresh, strict: cur.strict })
     }
 
     fn lookup_binding_value(&self, env: EnvId, name: &str) -> Option<JsValue> {
@@ -846,15 +813,9 @@ impl Interp {
             for n in names {
                 // Spec: CreateMutableBinding for BOTH let and const here
                 // (never initialized; only the TDZ state is observable).
-                self.heap
-                    .env_mut(env)
-                    .bindings
-                    .insert(n, Binding::tdz(true));
+                self.heap.env_mut(env).bindings.insert(n, Binding::tdz(true));
             }
-            Ctx {
-                env,
-                strict: ctx.strict,
-            }
+            Ctx { env, strict: ctx.strict }
         } else {
             ctx.clone()
         }
@@ -934,7 +895,12 @@ impl Interp {
 
     /// Bind one iteration value to a for-in/for-of head, returning the body
     /// context (fresh per-iteration env for lexical heads).
-    pub(crate) fn bind_for_head(&mut self, left: &ForHead, v: JsValue, ctx: &Ctx) -> Result<Ctx, Abrupt> {
+    pub(crate) fn bind_for_head(
+        &mut self,
+        left: &ForHead,
+        v: JsValue,
+        ctx: &Ctx,
+    ) -> Result<Ctx, Abrupt> {
         match left {
             ForHead::Decl(DeclKind::Var, pat) => {
                 self.bind_pattern(pat, v, None, ctx)?;
@@ -950,10 +916,7 @@ impl Interp {
                         .bindings
                         .insert(n.clone(), Binding::tdz(*kind == DeclKind::Let));
                 }
-                let inner = Ctx {
-                    env,
-                    strict: ctx.strict,
-                };
+                let inner = Ctx { env, strict: ctx.strict };
                 self.bind_pattern(pat, v, Some(env), &inner)?;
                 Ok(inner)
             }
@@ -977,10 +940,7 @@ impl Interp {
         let env = self.alloc_env(Some(ctx.env));
         for case in cases {
             for (name, mutable) in hoist::lexical_decls(&case.body).map_err(Abrupt::Fatal)? {
-                self.heap
-                    .env_mut(env)
-                    .bindings
-                    .insert(name, Binding::tdz(mutable));
+                self.heap.env_mut(env).bindings.insert(name, Binding::tdz(mutable));
             }
         }
         if ctx.strict {
@@ -994,10 +954,7 @@ impl Interp {
                 }
             }
         }
-        let inner = Ctx {
-            env,
-            strict: ctx.strict,
-        };
+        let inner = Ctx { env, strict: ctx.strict };
         let mut start: Option<usize> = None;
         for (i, case) in cases.iter().enumerate() {
             if let Some(t) = &case.test {
@@ -1072,26 +1029,14 @@ impl Interp {
         update_empty(result, JsValue::Undefined)
     }
 
-    fn eval_catch(
-        &mut self,
-        param: Option<&Pat>,
-        body: &[Stmt],
-        exc: JsValue,
-        ctx: &Ctx,
-    ) -> Compl {
+    fn eval_catch(&mut self, param: Option<&Pat>, body: &[Stmt], exc: JsValue, ctx: &Ctx) -> Compl {
         let cenv = self.alloc_env(Some(ctx.env));
-        let cctx = Ctx {
-            env: cenv,
-            strict: ctx.strict,
-        };
+        let cctx = Ctx { env: cenv, strict: ctx.strict };
         if let Some(pat) = param {
             let mut names = Vec::new();
             hoist::pat_bound_names(pat, &mut names);
             for n in &names {
-                self.heap
-                    .env_mut(cenv)
-                    .bindings
-                    .insert(n.clone(), Binding::tdz(true));
+                self.heap.env_mut(cenv).bindings.insert(n.clone(), Binding::tdz(true));
             }
             self.bind_pattern(pat, exc, Some(cenv), &cctx)?;
         }
@@ -1115,9 +1060,7 @@ impl Interp {
             }
             cur = self.heap.env(e).parent;
         }
-        Err(Abrupt::Fatal(format!(
-            "lexical binding `{name}` not pre-declared (interpreter bug)"
-        )))
+        Err(Abrupt::Fatal(format!("lexical binding `{name}` not pre-declared (interpreter bug)")))
     }
 
     // -- module bodies (multi-module linking, increment 2b-part-3) ----------
@@ -1168,10 +1111,7 @@ impl Interp {
                     "module lexical `{name}` collides with an import (out of slice)"
                 )));
             }
-            self.heap
-                .env_mut(env)
-                .bindings
-                .insert(name, Binding::tdz(mutable));
+            self.heap.env_mut(env).bindings.insert(name, Binding::tdz(mutable));
         }
         // Function declarations (strict: into the module env).
         for f in &analysis.funcs {
@@ -1182,10 +1122,7 @@ impl Interp {
                 )));
             }
             let fobj = self.instantiate_hoisted_function(f, env)?;
-            self.heap
-                .env_mut(env)
-                .bindings
-                .insert(name, Binding::var(JsValue::Obj(fobj)));
+            self.heap.env_mut(env).bindings.insert(name, Binding::var(JsValue::Obj(fobj)));
         }
         // Var declarations (strict: into the module env).
         for v in &analysis.vars {
@@ -1195,10 +1132,7 @@ impl Interp {
                 )));
             }
             if !self.heap.env(env).bindings.contains_key(v) {
-                self.heap
-                    .env_mut(env)
-                    .bindings
-                    .insert(v.clone(), Binding::var(JsValue::Undefined));
+                self.heap.env_mut(env).bindings.insert(v.clone(), Binding::var(JsValue::Undefined));
             }
         }
 
@@ -1212,12 +1146,7 @@ impl Interp {
     /// environment (export capture). `None` if the binding is absent or still
     /// uninitialized (TDZ) — the caller refuses rather than fabricate a value.
     pub fn module_export_value(&self, env: EnvId, local: &str) -> Option<JsValue> {
-        self.heap
-            .env(env)
-            .bindings
-            .get(local)
-            .filter(|b| b.initialized)
-            .map(|b| b.value.clone())
+        self.heap.env(env).bindings.get(local).filter(|b| b.initialized).map(|b| b.value.clone())
     }
 
     /// Build a Module Namespace Exotic Object (§10.4.6) from a dependency's
@@ -1239,7 +1168,7 @@ impl Interp {
         &mut self,
         exports: &[(String, JsValue)],
     ) -> Result<ObjId, Abrupt> {
-        use trust_js_value::{units_from_str, JsObject, ObjKind, PropKey, SymId, WkSym};
+        use trust_js_value::{JsObject, ObjKind, PropKey, SymId, WkSym, units_from_str};
         let mut sorted: Vec<&(String, JsValue)> = exports.iter().collect();
         // Sort by UTF-16 code units (the spec's SortStringList order), not UTF-8
         // bytes — they differ for astral characters.
@@ -1281,14 +1210,10 @@ enum LoopFlow {
 fn update_empty(r: Compl, v: JsValue) -> Compl {
     match r {
         Ok(None) => Ok(Some(v)),
-        Err(Abrupt::Break { label, value: None }) => Err(Abrupt::Break {
-            label,
-            value: Some(v),
-        }),
-        Err(Abrupt::Continue { label, value: None }) => Err(Abrupt::Continue {
-            label,
-            value: Some(v),
-        }),
+        Err(Abrupt::Break { label, value: None }) => Err(Abrupt::Break { label, value: Some(v) }),
+        Err(Abrupt::Continue { label, value: None }) => {
+            Err(Abrupt::Continue { label, value: Some(v) })
+        }
         other => other,
     }
 }
@@ -1297,14 +1222,12 @@ fn update_empty(r: Compl, v: JsValue) -> Compl {
 /// completion value, when one exists.
 fn patch_empty(a: Abrupt, v: &Option<JsValue>) -> Abrupt {
     match (a, v) {
-        (Abrupt::Break { label, value: None }, Some(val)) => Abrupt::Break {
-            label,
-            value: Some(val.clone()),
-        },
-        (Abrupt::Continue { label, value: None }, Some(val)) => Abrupt::Continue {
-            label,
-            value: Some(val.clone()),
-        },
+        (Abrupt::Break { label, value: None }, Some(val)) => {
+            Abrupt::Break { label, value: Some(val.clone()) }
+        }
+        (Abrupt::Continue { label, value: None }, Some(val)) => {
+            Abrupt::Continue { label, value: Some(val.clone()) }
+        }
         (other, _) => other,
     }
 }
@@ -1341,9 +1264,7 @@ pub(crate) mod hoist {
         let mut funcs: Vec<&Func> = Vec::new();
         for (i, f) in funcs_raw.iter().enumerate() {
             let name = f.name.as_deref().ok_or("unnamed function declaration")?;
-            let later = funcs_raw[i + 1..]
-                .iter()
-                .any(|g| g.name.as_deref() == Some(name));
+            let later = funcs_raw[i + 1..].iter().any(|g| g.name.as_deref() == Some(name));
             if !later {
                 funcs.push(f);
             }
@@ -1362,10 +1283,7 @@ pub(crate) mod hoist {
                     }
                     // `using` / `await using` are LEXICAL declarations (they
                     // contribute no var-scoped names), exactly like let/const.
-                    DeclKind::Let
-                    | DeclKind::Const
-                    | DeclKind::Using
-                    | DeclKind::AwaitUsing => {}
+                    DeclKind::Let | DeclKind::Const | DeclKind::Using | DeclKind::AwaitUsing => {}
                 }
                 Ok(())
             }
@@ -1392,9 +1310,7 @@ pub(crate) mod hoist {
             }
             Stmt::Labeled { body, .. } => {
                 if matches!(body.as_ref(), Stmt::FuncDecl(_)) {
-                    return Err(
-                        "labelled function declaration (Annex B, out of slice)".to_string()
-                    );
+                    return Err("labelled function declaration (Annex B, out of slice)".to_string());
                 }
                 collect_stmt(body, strict, vars)
             }
@@ -1418,11 +1334,7 @@ pub(crate) mod hoist {
                 }
                 Ok(())
             }
-            Stmt::Try {
-                block,
-                catch,
-                finally,
-            } => {
+            Stmt::Try { block, catch, finally } => {
                 collect_list(block, strict, vars)?;
                 if let Some((_, cbody)) = catch {
                     collect_list(cbody, strict, vars)?;
@@ -1485,15 +1397,7 @@ pub(crate) mod hoist {
     /// DisposeResources on exit. `await using` is not counted here — it refuses
     /// at evaluation (the async disposal surface is out of slice).
     pub fn has_top_level_sync_using(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| {
-            matches!(
-                s,
-                Stmt::Decl {
-                    kind: DeclKind::Using,
-                    ..
-                }
-            )
-        })
+        stmts.iter().any(|s| matches!(s, Stmt::Decl { kind: DeclKind::Using, .. }))
     }
 
     /// Direct function declarations of a statement list (strict block-level

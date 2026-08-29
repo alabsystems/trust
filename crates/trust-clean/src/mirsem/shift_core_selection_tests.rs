@@ -26,8 +26,9 @@
 // certified WIDTH is the body's own, and that a hypothesis can never supply it.
 // Both FAIL on the pre-fix tree (nothing is minted at all / `ShiftOob(W32)` is).
 
-use super::*;
 use trust_types::{Formula, Sort, VerifiableFunction};
+
+use super::*;
 
 /// The committed re-frozen ladder's `bit_field` 0.10.2 corpus.
 const BIT_FIELD_DIR: &str = "fixtures/census-rung2-2026-07-07/bit_field";
@@ -110,7 +111,10 @@ fn a_precondition_can_never_supply_the_certified_shift_width() {
     for (tag, pre) in [
         (
             "Ge(bit,64) — the right variable, the wrong width",
-            Formula::Ge(Box::new(Formula::Var("bit".into(), Sort::Int)), Box::new(Formula::Int(64))),
+            Formula::Ge(
+                Box::new(Formula::Var("bit".into(), Sort::Int)),
+                Box::new(Formula::Int(64)),
+            ),
         ),
         (
             "Ge(other,32) — a variable the body never shifts by",
@@ -182,11 +186,7 @@ fn shift_vc(formula: Formula) -> VerificationCondition {
         width: None,
     });
     VerificationCondition {
-        kind: VcKind::ShiftOverflow {
-            op: BinOp::Shl,
-            operand_ty: u32_ty(),
-            shift_ty: u32_ty(),
-        },
+        kind: VcKind::ShiftOverflow { op: BinOp::Shl, operand_ty: u32_ty(), shift_ty: u32_ty() },
         function: "crate::probe".into(),
         location: SourceSpan::default(),
         formula,
@@ -262,8 +262,7 @@ fn a_shift_hypothesis_conjunct_can_never_supply_the_certified_core() {
         // because a wrapped tree is not a bare shift-violation shape. The HONEST CONTROL below
         // (the bare core recorded with the range demoted to a fact) certifies, so the decline
         // is the wrapper being rejected, not an empty-record trivial decline.
-        if let Some((k, _)) =
-            safety_vc_is_faithful_formula_aware(&probe_func(), &shift_vc(formula))
+        if let Some((k, _)) = safety_vc_is_faithful_formula_aware(&probe_func(), &shift_vc(formula))
         {
             forged.push(format!("{tag} -> {k:?}"));
         }

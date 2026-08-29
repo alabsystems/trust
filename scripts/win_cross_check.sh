@@ -7,7 +7,7 @@
 # scripts/win-genesis/README.md).
 #
 # SCOPE — pure Rust only. The native-backend features (ay-backend, trust-mc-backend,
-# trust-wp-backend, trust-build, carcara-crosscheck) pull C deps (stacker/cc, GMP
+# trust-build, carcara-crosscheck) pull C deps (stacker/cc, GMP
 # via rug) that need a Windows C cross-toolchain, and the trust-mc/ay-chc issue is a
 # *link* failure `check` cannot see — those must be verified on a real Windows box.
 # This gate covers everything that does NOT require that.

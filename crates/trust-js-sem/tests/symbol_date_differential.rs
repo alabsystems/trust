@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -98,128 +99,295 @@ fn cases() -> Vec<Case> {
 
     // ---- Symbol values, coercions, registry ------------------------------
     c("sym-typeof", false, C, "console.log(typeof Symbol(), typeof Symbol.iterator);");
-    c("sym-description", false, C,
-      "console.log(Symbol('x').description, Symbol().description, Symbol(123).description);");
-    c("sym-tostring", false, C,
-      "console.log(Symbol('z').toString(), String(Symbol('y')), String(Symbol()));");
-    c("sym-valueof", false, C,
-      "var s = Symbol('v'); console.log(s.valueOf() === s, Object(s).valueOf() === s);");
-    c("sym-for-keyfor", false, C,
-      "console.log(Symbol.for('k') === Symbol.for('k'), Symbol.keyFor(Symbol.for('m')), Symbol.keyFor(Symbol('z')));");
-    c("sym-wellknown-identity", false, C,
-      "console.log(Symbol.iterator === Symbol.iterator, typeof Symbol.asyncIterator, Symbol.hasInstance === Symbol.hasInstance);");
+    c(
+        "sym-description",
+        false,
+        C,
+        "console.log(Symbol('x').description, Symbol().description, Symbol(123).description);",
+    );
+    c(
+        "sym-tostring",
+        false,
+        C,
+        "console.log(Symbol('z').toString(), String(Symbol('y')), String(Symbol()));",
+    );
+    c(
+        "sym-valueof",
+        false,
+        C,
+        "var s = Symbol('v'); console.log(s.valueOf() === s, Object(s).valueOf() === s);",
+    );
+    c(
+        "sym-for-keyfor",
+        false,
+        C,
+        "console.log(Symbol.for('k') === Symbol.for('k'), Symbol.keyFor(Symbol.for('m')), Symbol.keyFor(Symbol('z')));",
+    );
+    c(
+        "sym-wellknown-identity",
+        false,
+        C,
+        "console.log(Symbol.iterator === Symbol.iterator, typeof Symbol.asyncIterator, Symbol.hasInstance === Symbol.hasInstance);",
+    );
     c("sym-project-value", false, C, "console.log(Symbol('desc'), Symbol.iterator, Symbol());");
-    c("sym-equality", false, C,
-      "var a = Symbol(); var b = Symbol(); console.log(a === a, a === b, a == a, Object(a) == a);");
+    c(
+        "sym-equality",
+        false,
+        C,
+        "var a = Symbol(); var b = Symbol(); console.log(a === a, a === b, a == a, Object(a) == a);",
+    );
     c("sym-boolean", false, C, "console.log(!!Symbol(), Symbol() ? 'y' : 'n');");
-    c("sym-typeof-object-wrap", false, C, "console.log(typeof Object(Symbol()), Object(Symbol()) instanceof Symbol);");
-    c("sym-ctor-props", false, C, "console.log(Symbol.name, Symbol.length, typeof Symbol.prototype);");
-    c("sym-to-number-throws", false, C,
-      "var t = false; try { Symbol() + 1; } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("sym-to-string-throws", false, C,
-      "var t = false; try { `${Symbol()}`; } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("sym-new-throws", false, C,
-      "var t = false; try { new Symbol(); } catch (e) { t = e instanceof TypeError; } console.log(t);");
-    c("sym-desc-getter-this", false, C,
-      "var t = false; try { Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get.call(5); } catch (e) { t = e instanceof TypeError; } console.log(t);");
+    c(
+        "sym-typeof-object-wrap",
+        false,
+        C,
+        "console.log(typeof Object(Symbol()), Object(Symbol()) instanceof Symbol);",
+    );
+    c(
+        "sym-ctor-props",
+        false,
+        C,
+        "console.log(Symbol.name, Symbol.length, typeof Symbol.prototype);",
+    );
+    c(
+        "sym-to-number-throws",
+        false,
+        C,
+        "var t = false; try { Symbol() + 1; } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "sym-to-string-throws",
+        false,
+        C,
+        "var t = false; try { `${Symbol()}`; } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "sym-new-throws",
+        false,
+        C,
+        "var t = false; try { new Symbol(); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "sym-desc-getter-this",
+        false,
+        C,
+        "var t = false; try { Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get.call(5); } catch (e) { t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- Symbol-keyed properties -----------------------------------------
-    c("sym-keyed-get-set", false, C,
-      "var s = Symbol('k'); var o = {}; o[s] = 42; console.log(o[s], s in o, o[Symbol()]);");
-    c("sym-keyed-literal", false, C,
-      "var s = Symbol(); var o = { [s]: 7, a: 1 }; console.log(o[s], o.a, Object.getOwnPropertySymbols(o).length);");
-    c("sym-keyed-projection", false, C,
-      "var s = Symbol('d'); var o = { a: 1 }; o[s] = 9; console.log(o);");
-    c("sym-keyed-delete", false, C,
-      "var s = Symbol(); var o = {}; o[s] = 1; var d = delete o[s]; console.log(d, s in o);");
-    c("sym-keyed-defineproperty", false, C,
-      "var s = Symbol('p'); var o = {}; Object.defineProperty(o, s, { value: 5, enumerable: false });\n\
+    c(
+        "sym-keyed-get-set",
+        false,
+        C,
+        "var s = Symbol('k'); var o = {}; o[s] = 42; console.log(o[s], s in o, o[Symbol()]);",
+    );
+    c(
+        "sym-keyed-literal",
+        false,
+        C,
+        "var s = Symbol(); var o = { [s]: 7, a: 1 }; console.log(o[s], o.a, Object.getOwnPropertySymbols(o).length);",
+    );
+    c(
+        "sym-keyed-projection",
+        false,
+        C,
+        "var s = Symbol('d'); var o = { a: 1 }; o[s] = 9; console.log(o);",
+    );
+    c(
+        "sym-keyed-delete",
+        false,
+        C,
+        "var s = Symbol(); var o = {}; o[s] = 1; var d = delete o[s]; console.log(d, s in o);",
+    );
+    c(
+        "sym-keyed-defineproperty",
+        false,
+        C,
+        "var s = Symbol('p'); var o = {}; Object.defineProperty(o, s, { value: 5, enumerable: false });\n\
        var desc = Object.getOwnPropertyDescriptor(o, s);\n\
-       console.log(o[s], desc.enumerable, desc.writable, Object.keys(o).length);");
-    c("sym-getownpropertysymbols-order", false, C,
-      "var a = Symbol('a'); var b = Symbol('b'); var o = {}; o[a] = 1; o[b] = 2;\n\
-       var syms = Object.getOwnPropertySymbols(o); console.log(syms.length, syms[0] === a, syms[1] === b);");
-    c("sym-not-in-keys", false, C,
-      "var s = Symbol(); var o = { x: 1 }; o[s] = 2; var ks = []; for (var k in o) ks.push(k);\n\
-       console.log(ks, Object.keys(o), Object.getOwnPropertyNames(o));");
+       console.log(o[s], desc.enumerable, desc.writable, Object.keys(o).length);",
+    );
+    c(
+        "sym-getownpropertysymbols-order",
+        false,
+        C,
+        "var a = Symbol('a'); var b = Symbol('b'); var o = {}; o[a] = 1; o[b] = 2;\n\
+       var syms = Object.getOwnPropertySymbols(o); console.log(syms.length, syms[0] === a, syms[1] === b);",
+    );
+    c(
+        "sym-not-in-keys",
+        false,
+        C,
+        "var s = Symbol(); var o = { x: 1 }; o[s] = 2; var ks = []; for (var k in o) ks.push(k);\n\
+       console.log(ks, Object.keys(o), Object.getOwnPropertyNames(o));",
+    );
 
     // ---- @@-protocol dispatch --------------------------------------------
-    c("sym-toprimitive", false, C,
-      "var o = { [Symbol.toPrimitive](h) { return h === 'number' ? 42 : h; } };\n\
-       console.log(+o, `${o}`, o + '');");
-    c("sym-hasinstance-override", false, C,
-      "function F() {} F[Symbol.hasInstance] = function () { return true; };\n\
-       console.log({} instanceof F, 5 instanceof F);");
-    c("sym-hasinstance-default", false, C,
-      "function F() {} var f = new F(); console.log(f instanceof F, ({}) instanceof F);");
-    c("sym-array-iterator-identity", false, C,
-      "console.log(typeof [][Symbol.iterator], [][Symbol.iterator] === Array.prototype.values);");
-    c("sym-object-tostring-tag", false, C,
-      "var o = {}; console.log(Object.prototype.toString.call(o));");
+    c(
+        "sym-toprimitive",
+        false,
+        C,
+        "var o = { [Symbol.toPrimitive](h) { return h === 'number' ? 42 : h; } };\n\
+       console.log(+o, `${o}`, o + '');",
+    );
+    c(
+        "sym-hasinstance-override",
+        false,
+        C,
+        "function F() {} F[Symbol.hasInstance] = function () { return true; };\n\
+       console.log({} instanceof F, 5 instanceof F);",
+    );
+    c(
+        "sym-hasinstance-default",
+        false,
+        C,
+        "function F() {} var f = new F(); console.log(f instanceof F, ({}) instanceof F);",
+    );
+    c(
+        "sym-array-iterator-identity",
+        false,
+        C,
+        "console.log(typeof [][Symbol.iterator], [][Symbol.iterator] === Array.prototype.values);",
+    );
+    c(
+        "sym-object-tostring-tag",
+        false,
+        C,
+        "var o = {}; console.log(Object.prototype.toString.call(o));",
+    );
 
     // String.prototype[@@iterator] (22.1.3.35) is modeled: a code-point
     // iterator method. (Its identity/behavior is exercised in
     // iterator_corpus_sweep; here just pin typeof + name.)
-    c("sym-string-iterator-modeled", false, C,
-      "var f = ''[Symbol.iterator]; console.log(typeof f, f.name, f.length);");
+    c(
+        "sym-string-iterator-modeled",
+        false,
+        C,
+        "var f = ''[Symbol.iterator]; console.log(typeof f, f.name, f.length);",
+    );
 
     // ---- Symbol refusals --------------------------------------------------
     c("sym-dispose-refuses", false, R, "Symbol.dispose;");
-    c("sym-user-iterator-refuses", false, R,
-      "var o = { [Symbol.iterator]() { return { next() { return { done: true }; } }; } };\n\
-       for (var x of o) {} console.log('never');");
+    c(
+        "sym-user-iterator-refuses",
+        false,
+        R,
+        "var o = { [Symbol.iterator]() { return { next() { return { done: true }; } }; } };\n\
+       for (var x of o) {} console.log('never');",
+    );
     c("sym-class-key-refuses", false, R, "class A { [Symbol.iterator]() {} }");
 
     // ---- Date construction + fields --------------------------------------
-    c("date-utc-fields", false, C,
-      "var d = new Date(Date.UTC(2023, 10, 15, 12, 30, 45, 123));\n\
+    c(
+        "date-utc-fields",
+        false,
+        C,
+        "var d = new Date(Date.UTC(2023, 10, 15, 12, 30, 45, 123));\n\
        console.log(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCDay(),\n\
-       d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds());");
-    c("date-local-equals-utc", false, C,
-      "var d = new Date(2023, 10, 15, 12, 30, 45, 123);\n\
-       console.log(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds(), d.getTimezoneOffset());");
-    c("date-valueof", false, C,
-      "var d = new Date(Date.UTC(2023, 10, 15, 12, 30, 45, 123));\n\
-       console.log(d.valueOf(), d.getTime(), +d);");
-    c("date-iso", false, C,
-      "console.log(new Date(Date.UTC(2023, 10, 15, 12, 30, 45, 123)).toISOString(), new Date(0).toISOString());");
-    c("date-iso-negyear", false, C,
-      "console.log(new Date(Date.UTC(-1, 0, 1)).toISOString());");
-    c("date-rollover", false, C,
-      "console.log(new Date(2023, 12, 1).toISOString(), new Date(2023, 0, 32).toISOString());");
+       d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds());",
+    );
+    c(
+        "date-local-equals-utc",
+        false,
+        C,
+        "var d = new Date(2023, 10, 15, 12, 30, 45, 123);\n\
+       console.log(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds(), d.getTimezoneOffset());",
+    );
+    c(
+        "date-valueof",
+        false,
+        C,
+        "var d = new Date(Date.UTC(2023, 10, 15, 12, 30, 45, 123));\n\
+       console.log(d.valueOf(), d.getTime(), +d);",
+    );
+    c(
+        "date-iso",
+        false,
+        C,
+        "console.log(new Date(Date.UTC(2023, 10, 15, 12, 30, 45, 123)).toISOString(), new Date(0).toISOString());",
+    );
+    c("date-iso-negyear", false, C, "console.log(new Date(Date.UTC(-1, 0, 1)).toISOString());");
+    c(
+        "date-rollover",
+        false,
+        C,
+        "console.log(new Date(2023, 12, 1).toISOString(), new Date(2023, 0, 32).toISOString());",
+    );
     c("date-two-arg", false, C, "console.log(new Date(2023, 0).toISOString());");
     c("date-onearg-num", false, C, "console.log(new Date(1700000000000).toISOString());");
     c("date-onearg-str", false, C, "console.log(new Date('2023-11-15').toISOString());");
-    c("date-copy", false, C,
-      "var a = new Date(Date.UTC(2020, 5, 1)); var b = new Date(a); console.log(a.getTime() === b.getTime());");
-    c("date-utc-static", false, C,
-      "console.log(Date.UTC(2023, 10, 15, 12, 30, 45, 123), Date.UTC(2023), Date.UTC(2023, 0, 1));");
-    c("date-parse-iso", false, C,
-      "console.log(Date.parse('2023-11-15T12:30:45.123Z'), Date.parse('2023-11-15'), Date.parse('2023'), Date.parse('2023-11'));");
-    c("date-parse-tz", false, C,
-      "console.log(Date.parse('2023-11-15T12:30:45+05:00'), Date.parse('2023-11-15T12:30'));");
-    c("date-nan", false, C,
-      "console.log(new Date(NaN).getTime(), new Date(NaN).getUTCFullYear());");
-    c("date-tojson", false, C,
-      "console.log(new Date(Date.UTC(2023, 5, 15, 10, 20, 30, 40)).toJSON());");
-    c("date-setters", false, C,
-      "var d = new Date(Date.UTC(2020, 0, 1));\n\
+    c(
+        "date-copy",
+        false,
+        C,
+        "var a = new Date(Date.UTC(2020, 5, 1)); var b = new Date(a); console.log(a.getTime() === b.getTime());",
+    );
+    c(
+        "date-utc-static",
+        false,
+        C,
+        "console.log(Date.UTC(2023, 10, 15, 12, 30, 45, 123), Date.UTC(2023), Date.UTC(2023, 0, 1));",
+    );
+    c(
+        "date-parse-iso",
+        false,
+        C,
+        "console.log(Date.parse('2023-11-15T12:30:45.123Z'), Date.parse('2023-11-15'), Date.parse('2023'), Date.parse('2023-11'));",
+    );
+    c(
+        "date-parse-tz",
+        false,
+        C,
+        "console.log(Date.parse('2023-11-15T12:30:45+05:00'), Date.parse('2023-11-15T12:30'));",
+    );
+    c(
+        "date-nan",
+        false,
+        C,
+        "console.log(new Date(NaN).getTime(), new Date(NaN).getUTCFullYear());",
+    );
+    c(
+        "date-tojson",
+        false,
+        C,
+        "console.log(new Date(Date.UTC(2023, 5, 15, 10, 20, 30, 40)).toJSON());",
+    );
+    c(
+        "date-setters",
+        false,
+        C,
+        "var d = new Date(Date.UTC(2020, 0, 1));\n\
        d.setUTCFullYear(2021); console.log(d.toISOString());\n\
        d.setUTCMonth(5); console.log(d.toISOString());\n\
-       d.setUTCHours(13, 14, 15, 16); console.log(d.toISOString());");
-    c("date-settime", false, C,
-      "var d = new Date(0); d.setTime(Date.UTC(2000, 0, 1)); console.log(d.toISOString());");
-    c("date-toprimitive-number", false, C,
-      "var d = new Date(Date.UTC(2000, 0, 1)); console.log(d[Symbol.toPrimitive]('number'));");
-    c("date-tostring-tag", false, C,
-      "console.log(Object.prototype.toString.call(new Date(0)));");
-    c("date-clock-ticks", false, C,
-      "console.log(Date.now(), Date.now(), new Date().getTime());");
+       d.setUTCHours(13, 14, 15, 16); console.log(d.toISOString());",
+    );
+    c(
+        "date-settime",
+        false,
+        C,
+        "var d = new Date(0); d.setTime(Date.UTC(2000, 0, 1)); console.log(d.toISOString());",
+    );
+    c(
+        "date-toprimitive-number",
+        false,
+        C,
+        "var d = new Date(Date.UTC(2000, 0, 1)); console.log(d[Symbol.toPrimitive]('number'));",
+    );
+    c("date-tostring-tag", false, C, "console.log(Object.prototype.toString.call(new Date(0)));");
+    c("date-clock-ticks", false, C, "console.log(Date.now(), Date.now(), new Date().getTime());");
     c("date-typeof-now", false, C, "console.log(typeof Date.now(), typeof new Date());");
-    c("date-instanceof", false, C,
-      "console.log(new Date(0) instanceof Date, new Date(0) instanceof Object);");
-    c("date-iso-rangeerror", false, C,
-      "var t = false; try { new Date(NaN).toISOString(); } catch (e) { t = e instanceof RangeError; } console.log(t);");
+    c(
+        "date-instanceof",
+        false,
+        C,
+        "console.log(new Date(0) instanceof Date, new Date(0) instanceof Object);",
+    );
+    c(
+        "date-iso-rangeerror",
+        false,
+        C,
+        "var t = false; try { new Date(NaN).toISOString(); } catch (e) { t = e instanceof RangeError; } console.log(t);",
+    );
 
     // ---- Date refusals ----------------------------------------------------
     c("date-tostring-refuses", false, R, "new Date(0).toString();");
@@ -413,11 +581,14 @@ fn collect_js_files(dir: &Path, cap: usize) -> Vec<PathBuf> {
 #[allow(clippy::too_many_lines)]
 fn symbol_date_corpus_vs_node() {
     let Some(node) = node_bin() else {
-        eprintln!("SKIP symbol_date_corpus_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS) to run");
+        eprintln!(
+            "SKIP symbol_date_corpus_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS) to run"
+        );
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     assert!(
         corpus.join("harness/assert.js").is_file(),
         "corpus harness not found under {}",
@@ -447,11 +618,8 @@ fn symbol_date_corpus_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".into(), "sta.js".into()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
             include_names.extend(fm.includes.iter().cloned());
             let mut include_srcs: Vec<String> = Vec::new();
             let mut include_paths: Vec<String> = Vec::new();
@@ -474,7 +642,8 @@ fn symbol_date_corpus_vs_node() {
             let rel = path.strip_prefix(&corpus).unwrap_or(&path).display().to_string();
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let inc_refs: Vec<&str> = include_srcs.iter().map(String::as_str).collect();
                 let sem_trace = match evaluate_case_opts(&inc_refs, &sem_body, false) {
                     SemOutcome::Trace(t) => t,
@@ -488,11 +657,21 @@ fn symbol_date_corpus_vs_node() {
                 covered += 1;
                 per_dir.entry(dir).or_default().0 += 1;
                 let node_trace = match node_trace_of(
-                    &node, &driver, tmp.path(), &format!("case-{case_no}"), &body, &include_paths, strict, false,
+                    &node,
+                    &driver,
+                    tmp.path(),
+                    &format!("case-{case_no}"),
+                    &body,
+                    &include_paths,
+                    strict,
+                    false,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        failures.push(format!("{rel} [{}]: {e}", if strict { "strict" } else { "bare" }));
+                        failures.push(format!(
+                            "{rel} [{}]: {e}",
+                            if strict { "strict" } else { "bare" }
+                        ));
                         continue;
                     }
                 };
@@ -502,7 +681,8 @@ fn symbol_date_corpus_vs_node() {
                     failures.push(format!(
                         "{rel} [{}]: WRONG TRACE: {}",
                         if strict { "strict" } else { "bare" },
-                        explain_divergence(&sem_trace, &node_trace).unwrap_or_else(|| "unlocalized".into())
+                        explain_divergence(&sem_trace, &node_trace)
+                            .unwrap_or_else(|| "unlocalized".into())
                     ));
                 }
             }

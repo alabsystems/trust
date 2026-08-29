@@ -15,7 +15,6 @@ pub(crate) use bundle_evidence::{
 pub(crate) use index::{
     NativeTrustIrEvidenceIndex, NativeTrustIrObligationIdentity, native_trust_ir_artifact_match,
 };
-
 use trust_ir_bridge::NativeVerificationBundle;
 use trust_verifier_api::{EvidenceArtifact, TrustObligation};
 

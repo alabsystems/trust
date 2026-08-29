@@ -62,9 +62,9 @@ fn main() {
     println!("search([], 1) = {:?}", binary_search(&[], 1));
 
     // Edge cases for confidence
-    println!("search([1..15], 1) = {:?}", binary_search(&arr, 1));   // first element
+    println!("search([1..15], 1) = {:?}", binary_search(&arr, 1)); // first element
     println!("search([1..15], 15) = {:?}", binary_search(&arr, 15)); // last element
-    println!("search([1..15], 4) = {:?}", binary_search(&arr, 4));   // between elements
-    println!("search([42], 42) = {:?}", binary_search(&[42], 42));   // single-element found
-    println!("search([42], 0) = {:?}", binary_search(&[42], 0));     // single-element not found
+    println!("search([1..15], 4) = {:?}", binary_search(&arr, 4)); // between elements
+    println!("search([42], 42) = {:?}", binary_search(&[42], 42)); // single-element found
+    println!("search([42], 0) = {:?}", binary_search(&[42], 0)); // single-element not found
 }

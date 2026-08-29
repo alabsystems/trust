@@ -1,10 +1,14 @@
 //! Loader for COMMITTED extracted-MIR artifacts (`fixtures/extracted/*.json`).
 //!
-//! These artifacts are the LITERAL output of trust-mir-extract's in-process
-//! fixture extraction runs, serialized as pretty JSON maps of
-//! `name -> VerifiableFunction`. This crate cannot run the in-process rustc,
-//! so the lane e2e tests consume the extractor's output through these files
-//! instead of hand-transcribing the extracted shapes.
+//! These artifacts are trust-mir-extract's in-process fixture extraction runs,
+//! serialized as pretty JSON maps of `name -> VerifiableFunction`. This crate
+//! cannot run the in-process rustc, so the lane e2e tests consume the
+//! extractor's output through these files instead of hand-transcribing the
+//! extracted shapes. Every semantic field is literal. The sole transport
+//! canonicalization is the compiler-version salt in the single synthetic
+//! crate's `CalleeIdentity::stable_crate_id`; identity presence, `def_index`,
+//! and `substs_digest` remain exact, and the extract-side gate refuses to
+//! collapse multiple crate identities.
 //!
 //! TRUSTWORTHINESS — the drift gate: the artifacts are REGENERATED, never
 //! hand-edited. trust-mir-extract's `extracted_*_artifact_matches_committed`
@@ -36,8 +40,7 @@ use trust_types::VerifiableFunction;
 /// must surface loudly rather than skip.
 #[must_use]
 pub fn load_extracted_functions(artifact: &str) -> BTreeMap<String, VerifiableFunction> {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extracted").join(artifact);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/extracted").join(artifact);
     let json = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "missing committed extracted artifact {} ({e}); regenerate via \
@@ -46,7 +49,6 @@ pub fn load_extracted_functions(artifact: &str) -> BTreeMap<String, VerifiableFu
             path.display()
         )
     });
-    serde_json::from_str(&json).unwrap_or_else(|e| {
-        panic!("corrupt extracted artifact {}: {e}", path.display())
-    })
+    serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("corrupt extracted artifact {}: {e}", path.display()))
 }

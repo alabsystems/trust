@@ -8,33 +8,55 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{Abrupt, Ctx, Interp};
 use std::rc::Rc;
+
 use trust_js_parse::ast::{Expr, Pat};
 use trust_js_value::{
-    to_length_u64, units_from_str, EnvId, JsValue, ObjKind, PropKey, PropValue, Property, SymId,
-    Units, WkSym,
+    EnvId, JsValue, ObjKind, PropKey, PropValue, Property, SymId, Units, WkSym, to_length_u64,
+    units_from_str,
 };
+
+use crate::interp::{Abrupt, Ctx, Interp};
 
 /// An internal fast iterator (array-values semantics / string code points /
 /// live Map-entries / live Set-values), or a general USER iterator driven
 /// through the spec iterator protocol (GetIterator/IteratorStep/
 /// IteratorValue/IteratorClose).
 pub(crate) enum FastIter {
-    Arr { oid: trust_js_value::ObjId, i: u64, done: bool },
-    Str { units: Rc<Units>, i: usize },
+    Arr {
+        oid: trust_js_value::ObjId,
+        i: u64,
+        done: bool,
+    },
+    Str {
+        units: Rc<Units>,
+        i: usize,
+    },
     /// %MapIteratorPrototype% entries semantics over the live [[MapData]]
     /// (tombstones skipped, appended entries visited).
-    MapIter { oid: trust_js_value::ObjId, i: usize },
+    MapIter {
+        oid: trust_js_value::ObjId,
+        i: usize,
+    },
     /// %SetIteratorPrototype% values semantics over the live [[SetData]].
-    SetIter { oid: trust_js_value::ObjId, i: usize },
+    SetIter {
+        oid: trust_js_value::ObjId,
+        i: usize,
+    },
     /// %TypedArray%.prototype.values semantics: a buffer-witness re-read each
     /// step (a detached/out-of-bounds source throws TypeError mid-iteration).
-    TypedArrayIter { oid: trust_js_value::ObjId, i: usize },
+    TypedArrayIter {
+        oid: trust_js_value::ObjId,
+        i: usize,
+    },
     /// A user-defined iterator: the iterator object and its `next` method
     /// (captured at GetIterator time), driven step-by-step. `done` records
     /// IteratorComplete so IteratorClose is only issued while still open.
-    User { iter: trust_js_value::ObjId, next: JsValue, done: bool },
+    User {
+        iter: trust_js_value::ObjId,
+        next: JsValue,
+        done: bool,
+    },
 }
 
 impl Interp {
@@ -55,10 +77,7 @@ impl Interp {
                         self.intr.string_iterator_next_fn,
                     ) =>
             {
-                Ok(FastIter::Str {
-                    units: Rc::clone(s),
-                    i: 0,
-                })
+                Ok(FastIter::Str { units: Rc::clone(s), i: 0 })
             }
             JsValue::Obj(oid) => {
                 let obj = self.heap.obj(*oid);
@@ -183,7 +202,12 @@ impl Interp {
 
     /// Does `proto`'s own `key` slot still hold the given intrinsic function
     /// identity as an untampered data property?
-    fn proto_slot_is(&self, proto: trust_js_value::ObjId, key: &PropKey, f: trust_js_value::ObjId) -> bool {
+    fn proto_slot_is(
+        &self,
+        proto: trust_js_value::ObjId,
+        key: &PropKey,
+        f: trust_js_value::ObjId,
+    ) -> bool {
         matches!(
             self.heap.obj(proto).props.get(key),
             Some(Property {
@@ -215,12 +239,9 @@ impl Interp {
                 let JsValue::Obj(io) = iterator else {
                     return Err(self.throw_type_error());
                 };
-                let next = self.get_from_object(io, &PropKey::from_str("next"), iterator.clone())?;
-                Ok(FastIter::User {
-                    iter: io,
-                    next,
-                    done: false,
-                })
+                let next =
+                    self.get_from_object(io, &PropKey::from_str("next"), iterator.clone())?;
+                Ok(FastIter::User { iter: io, next, done: false })
             }
         }
     }
@@ -330,14 +351,14 @@ impl Interp {
                     if let Some((k, v)) = entry {
                         // CreateArrayFromList(«key, value»): a fresh pair.
                         let arr = self.new_array(2)?;
-                        self.heap.obj_mut(arr).props.insert(
-                            PropKey::Str(units_from_str("0")),
-                            Property::data(k),
-                        );
-                        self.heap.obj_mut(arr).props.insert(
-                            PropKey::Str(units_from_str("1")),
-                            Property::data(v),
-                        );
+                        self.heap
+                            .obj_mut(arr)
+                            .props
+                            .insert(PropKey::Str(units_from_str("0")), Property::data(k));
+                        self.heap
+                            .obj_mut(arr)
+                            .props
+                            .insert(PropKey::Str(units_from_str("1")), Property::data(v));
                         // new_array pre-set length; reinsert to keep spec
                         // own-key order (indices sort first anyway).
                         return Ok(Some(JsValue::Obj(arr)));
@@ -345,26 +366,24 @@ impl Interp {
                     self.charge_loop()?;
                 }
             }
-            FastIter::SetIter { oid, i } => {
-                loop {
-                    let entry = {
-                        let ObjKind::SetObj(d) = &self.heap.obj(*oid).kind else {
-                            return Err(Abrupt::Fatal(
-                                "set iterator over a non-set (interpreter bug)".to_string(),
-                            ));
-                        };
-                        if *i >= d.entries.len() {
-                            return Ok(None);
-                        }
-                        d.entries[*i].clone()
+            FastIter::SetIter { oid, i } => loop {
+                let entry = {
+                    let ObjKind::SetObj(d) = &self.heap.obj(*oid).kind else {
+                        return Err(Abrupt::Fatal(
+                            "set iterator over a non-set (interpreter bug)".to_string(),
+                        ));
                     };
-                    *i += 1;
-                    if let Some(v) = entry {
-                        return Ok(Some(v));
+                    if *i >= d.entries.len() {
+                        return Ok(None);
                     }
-                    self.charge_loop()?;
+                    d.entries[*i].clone()
+                };
+                *i += 1;
+                if let Some(v) = entry {
+                    return Ok(Some(v));
                 }
-            }
+                self.charge_loop()?;
+            },
             FastIter::TypedArrayIter { oid, i } => {
                 let oid = *oid;
                 if self.ta_out_of_bounds(oid) {
@@ -405,9 +424,7 @@ impl Interp {
                 }
                 let c0 = units[*i];
                 let take_pair = (0xd800..=0xdbff).contains(&c0)
-                    && units
-                        .get(*i + 1)
-                        .is_some_and(|c1| (0xdc00..=0xdfff).contains(c1));
+                    && units.get(*i + 1).is_some_and(|c1| (0xdc00..=0xdfff).contains(c1));
                 let s: Units = if take_pair {
                     let s = vec![c0, units[*i + 1]];
                     *i += 2;
@@ -451,8 +468,12 @@ impl Interp {
                 };
                 self.bind_pattern(inner, v, env, ctx)
             }
-            Pat::Array { elems, rest } => self.bind_array_pattern(elems, rest.as_deref(), v, env, ctx),
-            Pat::Object { props, rest } => self.bind_object_pattern(props, rest.as_deref(), v, env, ctx),
+            Pat::Array { elems, rest } => {
+                self.bind_array_pattern(elems, rest.as_deref(), v, env, ctx)
+            }
+            Pat::Object { props, rest } => {
+                self.bind_object_pattern(props, rest.as_deref(), v, env, ctx)
+            }
             Pat::Rest(_) => Err(Abrupt::Fatal(
                 "rest pattern outside positional context (parser bug?)".to_string(),
             )),
@@ -522,11 +543,8 @@ impl Interp {
                     // Assignment-form member targets evaluate their
                     // reference BEFORE the iterator step (spec order).
                     let (target, dflt) = split_default(p);
-                    let pre_ref = if let Pat::Expr(m) = target {
-                        Some(self.expr_ref(m, ctx)?)
-                    } else {
-                        None
-                    };
+                    let pre_ref =
+                        if let Pat::Expr(m) = target { Some(self.expr_ref(m, ctx)?) } else { None };
                     let mut nv = self.iter_step_marking_done(it)?.unwrap_or(JsValue::Undefined);
                     if let (JsValue::Undefined, Some(d)) = (&nv, dflt) {
                         nv = self.eval_default(target, d, ctx)?;
@@ -539,19 +557,15 @@ impl Interp {
             }
         }
         if let Some(r) = rest {
-            let pre_ref = if let Pat::Expr(m) = r {
-                Some(self.expr_ref(m, ctx)?)
-            } else {
-                None
-            };
+            let pre_ref = if let Pat::Expr(m) = r { Some(self.expr_ref(m, ctx)?) } else { None };
             let arr = self.new_array(0)?;
             let mut n: u32 = 0;
             while let Some(nv) = self.iter_step_marking_done(it)? {
                 self.charge_loop()?;
-                self.heap.obj_mut(arr).props.insert(
-                    PropKey::Str(units_from_str(&n.to_string())),
-                    Property::data(nv),
-                );
+                self.heap
+                    .obj_mut(arr)
+                    .props
+                    .insert(PropKey::Str(units_from_str(&n.to_string())), Property::data(nv));
                 n = n
                     .checked_add(1)
                     .ok_or_else(|| Abrupt::Fatal("rest element count overflow".to_string()))?;
@@ -597,11 +611,8 @@ impl Interp {
             let (key, _, _) = self.eval_prop_key(&p.key, ctx)?;
             seen.push(key.clone());
             let (target, dflt) = split_default(&p.value);
-            let pre_ref = if let Pat::Expr(m) = target {
-                Some(self.expr_ref(m, ctx)?)
-            } else {
-                None
-            };
+            let pre_ref =
+                if let Pat::Expr(m) = target { Some(self.expr_ref(m, ctx)?) } else { None };
             let mut pv = self.get_prop(&v, &key)?;
             if let (JsValue::Undefined, Some(d)) = (&pv, dflt) {
                 pv = self.eval_default(target, d, ctx)?;

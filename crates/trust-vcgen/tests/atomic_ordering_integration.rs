@@ -29,7 +29,11 @@ fn make_atomic_func(name: &str, atomic_ops: Vec<AtomicOperation>) -> VerifiableF
         blocks.push(BasicBlock {
             id: BlockId(i),
             stmts: vec![],
-            terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,  is_unsafe_sig: false, is_foreign: false,
+            terminator: Terminator::Call {
+                unwind: trust_types::UnwindEdge::Unreachable,
+                is_unsafe_sig: false,
+                callee_identity: None,
+                is_foreign: false,
                 func: format!("core::intrinsics::atomic_{}", op.op_kind),
                 args: vec![Operand::Copy(Place::local(1))],
                 dest: Place::local(2),

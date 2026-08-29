@@ -13,12 +13,16 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::{Sanitizer, SinkKind, TaintLabel, TaintPolicy, TaintSink, TaintSource};
-use trust_types::*;
+use trust_types::{Sanitizer, SinkKind, TaintLabel, TaintPolicy, TaintSink, TaintSource, *};
 use trust_vcgen::infoflow::{generate_infoflow_vcs_with_policy, untrusted_verdict_policy};
 
 fn span(line: usize) -> SourceSpan {
-    SourceSpan { file: "infoflow_test.rs".into(), line_start: line as u32, col_start: 1, ..SourceSpan::default() }
+    SourceSpan {
+        file: "infoflow_test.rs".into(),
+        line_start: line as u32,
+        col_start: 1,
+        ..SourceSpan::default()
+    }
 }
 
 fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> VerifiableFunction {
@@ -26,7 +30,13 @@ fn make_func(name: &str, locals: Vec<LocalDecl>, blocks: Vec<BasicBlock>) -> Ver
         name: name.to_string(),
         def_path: format!("synthetic::{name}"),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Unit, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -44,6 +54,7 @@ fn call(func: &str, args: Vec<Operand>, dest: usize, at: usize, next: Option<usi
         span: span(at),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     }
 }
@@ -53,7 +64,9 @@ fn block(id: usize, terminator: Terminator) -> BasicBlock {
 }
 
 fn locals(n: usize) -> Vec<LocalDecl> {
-    (0..n).map(|i| LocalDecl { index: i, ty: Ty::Int { width: 64, signed: true }, name: None }).collect()
+    (0..n)
+        .map(|i| LocalDecl { index: i, ty: Ty::Int { width: 64, signed: true }, name: None })
+        .collect()
 }
 
 /// The policy under test: `parse_cert` produces untrusted data; `accept` is the
@@ -109,7 +122,10 @@ fn rederived_value_reaching_verdict_is_clean() {
         locals(3),
         vec![
             block(0, call("parse_cert", vec![Operand::Copy(Place::local(0))], 1, 10, Some(1))),
-            block(1, call("rederive_from_subject", vec![Operand::Copy(Place::local(0))], 2, 15, Some(2))),
+            block(
+                1,
+                call("rederive_from_subject", vec![Operand::Copy(Place::local(0))], 2, 15, Some(2)),
+            ),
             block(2, call("accept", vec![Operand::Copy(Place::local(2))], 0, 20, Some(3))),
             block(3, Terminator::Return),
         ],
@@ -141,9 +157,15 @@ fn empty_policy_emits_nothing() {
     // Sanity: the label/sink/sanitizer types compose as expected (guards against
     // an API drift in trust_types::taint).
     let _p = TaintPolicy {
-        sources: vec![TaintSource { label: TaintLabel::Custom("untrusted".into()), pattern: "p".into() }],
+        sources: vec![TaintSource {
+            label: TaintLabel::Custom("untrusted".into()),
+            pattern: "p".into(),
+        }],
         sinks: vec![TaintSink { label: SinkKind::Custom("verdict".into()), pattern: "a".into() }],
-        sanitizers: vec![Sanitizer { removes: TaintLabel::Custom("untrusted".into()), pattern: "d".into() }],
+        sanitizers: vec![Sanitizer {
+            removes: TaintLabel::Custom("untrusted".into()),
+            pattern: "d".into(),
+        }],
     };
 }
 

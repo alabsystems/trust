@@ -200,9 +200,9 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
     match f {
         Formula::Var(name, sort) => var_term(solver, name, sort),
         Formula::Bool(v) => solver.bool_const(*v),
-        Formula::BitVec { value, width } => solver
-            .try_bv_const_bigint(&BigInt::from(*value), *width)
-            .expect("bv const"),
+        Formula::BitVec { value, width } => {
+            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
+        }
         Formula::BvAdd(a, c, _) => bin2(solver, a, c, Solver::try_bvadd),
         Formula::BvSub(a, c, _) => bin2(solver, a, c, Solver::try_bvsub),
         Formula::BvMul(a, c, _) => bin2(solver, a, c, Solver::try_bvmul),

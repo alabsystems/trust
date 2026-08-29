@@ -32,7 +32,6 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use ay::{
@@ -50,21 +49,34 @@ use trust_types::{
 
 // Trust: scoped suppression of solver-internal tracing diagnostics (see ay_log.rs).
 use crate::ay_log::with_ay_diagnostics_policy;
-use crate::ay_symbol_namespace;
 use crate::backend_trait::unsupported_mir_unknown;
-use crate::{BackendRole, VerificationBackend, smt2_export};
+use crate::{BackendRole, VerificationBackend, ay_symbol_namespace, smt2_export};
 
 /// Stable solver name reported in every `VerificationResult` this backend emits.
 const SOLVER_NAME: &str = "ay-in-process";
 
-/// Process-global lock serializing in-process ay executions. The `ay-dpll`
-/// direct-execution path carries shared/non-reentrant state, so concurrent
-/// `execute_incremental` calls (e.g. parallel test threads, or a rayon-parallel
-/// router dispatch) can race and produce nondeterministic verdicts. Routing the
-/// refinement-validation VC class to this backend increased that concurrency and
-/// surfaced the latent flakiness; serializing the actual solve keeps every verdict
-/// deterministic. The lock is held only across the solve, not VC construction.
-static AY_EXEC_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes in-process ay executions. The `ay-dpll` direct-execution path
+/// carries shared/non-reentrant state, so concurrent `execute_incremental`
+/// calls (e.g. parallel test threads, or a rayon-parallel router dispatch) can
+/// race and produce nondeterministic verdicts. Routing the refinement-validation
+/// VC class to this backend increased that concurrency and surfaced the latent
+/// flakiness; serializing the actual solve keeps every verdict deterministic.
+/// The lock is held only across the solve, not VC construction.
+///
+/// This MUST be `trust_types::ay_exec_lock()` — the ONE process-global point —
+/// and not a lock private to this crate. `ay_exec_lock`'s own contract names
+/// both required holders ("trust-router's `InProcessAyBackend` and
+/// trust-certify's `AyProofBackend`"), because a private mutex here excludes
+/// only this crate's solves: a trust-certify solve holding the shared lock and
+/// a router solve holding a private one would enter ay's non-reentrant path
+/// CONCURRENTLY, which is the nondeterministic-verdict (false-`Certified`)
+/// race both comments describe. That is exactly what happened between
+/// `9ff8ca4c54` (added the private lock here) and `62e79476cf` (made the
+/// frontend parallel by default, introduced the shared lock, and migrated only
+/// trust-certify).
+fn ay_exec_lock() -> &'static std::sync::Mutex<()> {
+    trust_types::ay_exec_lock()
+}
 
 /// In-process ay-dpll SMT backend for L0 safety verification conditions.
 ///
@@ -141,9 +153,8 @@ fn flatten_conjunction_spine(formula: &Formula) -> Formula {
 
 #[must_use]
 pub fn problem_smt2(formula: &Formula) -> String {
-    let formula = &flatten_conjunction_spine(&ay_symbol_namespace::escape_formula_user_symbols(
-        formula,
-    ));
+    let formula =
+        &flatten_conjunction_spine(&ay_symbol_namespace::escape_formula_user_symbols(formula));
     let mut out = String::new();
     out.push_str(&format!("(set-logic {})\n", smt2_export::detect_logic(formula)));
     for decl in smt2_export::emit_declarations(formula) {
@@ -287,9 +298,8 @@ impl InProcessAyBackend {
         // Kept in lockstep with `problem_smt2`: same escape, same conjunction-
         // spine flatten (see `flatten_conjunction_spine` for why), so the
         // transcript and the executed program stay byte-equivalent.
-        let formula = &flatten_conjunction_spine(
-            &ay_symbol_namespace::escape_formula_user_symbols(formula),
-        );
+        let formula =
+            &flatten_conjunction_spine(&ay_symbol_namespace::escape_formula_user_symbols(formula));
         let mut program = AYProgram::new();
 
         // Enable proof production. Without this option the executor produces no
@@ -817,9 +827,7 @@ impl InProcessAyBackend {
         // Free-variable NAME sets, from the same walker the program declares from.
         let var_sets: Vec<BTreeSet<String>> = conjuncts
             .iter()
-            .map(|c| {
-                smt2_export::collect_free_vars(c).into_iter().map(|(name, _)| name).collect()
-            })
+            .map(|c| smt2_export::collect_free_vars(c).into_iter().map(|(name, _)| name).collect())
             .collect();
         // Union-find: conjuncts sharing any variable land in one component.
         let mut parent: Vec<usize> = (0..conjuncts.len()).collect();
@@ -906,7 +914,9 @@ impl InProcessAyBackend {
         // change the verdict of LATER obligations, which is exactly the
         // neutrality this lane claims. So the WHOLE retry gets one budget: the
         // original timeout, split evenly across the components.
-        let bounded = Self { timeout_ms: Self::retry_component_timeout_ms(self.timeout_ms, components.len()) };
+        let bounded = Self {
+            timeout_ms: Self::retry_component_timeout_ms(self.timeout_ms, components.len()),
+        };
         let mut assignments: Vec<(String, trust_types::CounterexampleValue)> = Vec::new();
         let mut time_ms = elapsed_ms;
         for component in &components {
@@ -942,7 +952,7 @@ impl InProcessAyBackend {
         // assertion — must NOT unwind into (and abort) the embedding compiler.
         // Contain it and fail closed to Unknown: no proof, no refutation, so
         // soundness is unaffected. The panic message is preserved in the reason
-        // for diagnosis. (`AY_EXEC_LOCK` is unwind-tolerant: acquisition
+        // for diagnosis. (`ay_exec_lock()` is unwind-tolerant: acquisition
         // recovers a poisoned lock via `into_inner`.)
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_ay_diagnostics_policy(|| {
@@ -1100,17 +1110,27 @@ impl InProcessAyBackend {
         // (execute_all / execute drop it), so it is the correct entry point for
         // capturing ay's in-process refutation proof.
         // Serialize the solve: ay-dpll's direct path is not reentrant (see
-        // AY_EXEC_LOCK). Recover from a poisoned lock — a panic in another solve
+        // ay_exec_lock). Recover from a poisoned lock — a panic in another solve
         // must not wedge every subsequent obligation.
-        let _ay_guard = AY_EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let outcomes = match execute_direct::execute_incremental(&program) {
-            Ok(outcomes) => outcomes,
-            Err(err) => {
-                return VerificationResult::Unknown {
-                    solver: SOLVER_NAME.into(),
-                    time_ms: start.elapsed().as_millis() as u64,
-                    reason: format!("in-process ay execution error: {err}"),
-                };
+        //
+        // The guard is scoped to the RAW SOLVE ONLY. `ay_exec_lock`'s contract
+        // requires exactly that — "held ACROSS THE RAW SOLVE ONLY, and never
+        // across pure clean-kernel reconstruction — so that the dominant
+        // clean-kernel certification work runs unlocked and parallelizes across
+        // verification threads". Everything below (`unsat_to_result`, and on an
+        // `ay-certify` build the kernel certify/replay inside
+        // `promote_to_certified`) is reconstruction, so it must run unlocked.
+        let outcomes = {
+            let _ay_guard = ay_exec_lock().lock().unwrap_or_else(|e| e.into_inner());
+            match execute_direct::execute_incremental(&program) {
+                Ok(outcomes) => outcomes,
+                Err(err) => {
+                    return VerificationResult::Unknown {
+                        solver: SOLVER_NAME.into(),
+                        time_ms: start.elapsed().as_millis() as u64,
+                        reason: format!("in-process ay execution error: {err}"),
+                    };
+                }
             }
         };
 
@@ -1301,7 +1321,29 @@ impl VerificationBackend for InProcessAyBackend {
                 // conflict: `promote` fires only on a propositionally-UNSAT formula, on
                 // which ay cannot return SAT.
                 | VcKind::Unreachable
-        );
+        )
+            // Trust (checked-flag alias clobber, fail-closed): the hardened MIR
+            // panic-boundary TWINS of the L0 safety kinds above. trust-vcgen's
+            // hardened lane emits, for each MIR `Assert` terminator, a
+            // `HardenedBoundary { PanicBoundary, callee: "mir_assert::<msg>" }`
+            // VC whose `formula` is the SAME violation goal as the sibling
+            // per-statement arithmetic/bounds/divisor VC — squarely the QF_LIA /
+            // QF_BV fragment this backend decides. The recognizer is SHARED with
+            // `IntervalBackend` (`hardened_mir_assert_goal`), which already
+            // routes exactly this population and whose comments describe these
+            // rows as "falling through to the SMT lane" — an arm this backend
+            // never had, so an interval-undischargeable twin (e.g. an
+            // alias-forged overflow flag) stayed permanently Unknown instead of
+            // being REFUTED. Every other PanicBoundary callee (`unwrap`/`expect`/
+            // policy `Custom(..)`) and every other hardened category returns
+            // `None` and is still declined. SOUNDNESS: `verify` is kind-agnostic
+            // (`run(&vc.formula)`) and mints `Proved` ONLY on a strict-checked
+            // UNSAT proof of the violation goal (the boundary provably cannot
+            // fire — the same discharge `IntervalBackend` already mints for
+            // these rows, upgraded to `SmtBacked` with an ay proof artifact);
+            // SAT yields `Failed` with a concrete witness (fail-closed: the
+            // boundary is not statically excluded), never a rubber-stamp.
+            || crate::interval_backend::hardened_mir_assert_goal(vc).is_some();
         kind_ok && execute_direct::is_available()
     }
 
@@ -1330,9 +1372,7 @@ fn counterexample_from_ay_model(cex: &ExecuteCounterexample) -> Counterexample {
     let src = if cex.model.is_empty() { &cex.values } else { &cex.model };
     let mut assignments: Vec<(String, CounterexampleValue)> = src
         .iter()
-        .map(|(name, v)| {
-            (ay_symbol_namespace::unescape_user_symbol(name), model_value_to_cex(v))
-        })
+        .map(|(name, v)| (ay_symbol_namespace::unescape_user_symbol(name), model_value_to_cex(v)))
         .collect();
     assignments.sort_by(|a, b| a.0.cmp(&b.0));
     Counterexample::new(assignments)
@@ -2000,9 +2040,7 @@ mod tests {
             Formula::Gt(Box::new(w), Box::new(Formula::Int(2))),
         ]);
         assert_eq!(
-            InProcessAyBackend::disjoint_conjunctive_components(&disjoint)
-                .expect("splits")
-                .len(),
+            InProcessAyBackend::disjoint_conjunctive_components(&disjoint).expect("splits").len(),
             2
         );
     }
@@ -2030,13 +2068,13 @@ mod tests {
             2
         );
         let backend = InProcessAyBackend::new().with_timeout(20_000);
-        let result = backend
-            .try_disjoint_component_refutation(&mixed, true, 0)
-            .unwrap_or(VerificationResult::Unknown {
+        let result = backend.try_disjoint_component_refutation(&mixed, true, 0).unwrap_or(
+            VerificationResult::Unknown {
                 solver: SOLVER_NAME.into(),
                 time_ms: 0,
                 reason: "no component verdict".into(),
-            });
+            },
+        );
         assert!(
             !matches!(result, VerificationResult::Proved { .. }),
             "the decomposition lane must never produce Proved; got {result:?}"
@@ -2070,7 +2108,6 @@ mod tests {
         );
     }
 
-
     /// Trust: DISJOINT-COMPONENT REFUTATION — the capability proof. Rebuild the
     /// RETRACTED mixed formula (BV violation ∧ Int out-of-range core, over
     /// disjoint variable sets) and show the split refutes what the whole-query
@@ -2099,8 +2136,7 @@ mod tests {
         match backend.verify(&mixed_vc) {
             VerificationResult::Failed { counterexample, .. } => {
                 let cex = counterexample.expect("the composed witness");
-                let names: Vec<&str> =
-                    cex.assignments.iter().map(|(n, _)| n.as_str()).collect();
+                let names: Vec<&str> = cex.assignments.iter().map(|(n, _)| n.as_str()).collect();
                 assert!(
                     names.iter().any(|n| n.starts_with("__trust_ovf_bv_")),
                     "the witness must carry the BV component's model: {names:?}"
@@ -2116,7 +2152,6 @@ mod tests {
             ),
         }
     }
-
 
     /// Trust: THE UMUL-RECORD RETRACTION EVIDENCE (2026-08-20) — the two pins that
     /// measured the cost of restating a BV-encoded obligation in Int, and that now
@@ -2252,11 +2287,7 @@ mod tests {
                     LocalDecl { index: 3, ty: u32_ty(), name: None },
                     LocalDecl { index: 4, ty: Ty::Bool, name: None },
                     LocalDecl { index: 5, ty: u32_ty(), name: None },
-                    LocalDecl {
-                        index: 6,
-                        ty: Ty::Tuple(vec![u32_ty(), Ty::Bool]),
-                        name: None,
-                    },
+                    LocalDecl { index: 6, ty: Ty::Tuple(vec![u32_ty(), Ty::Bool]), name: None },
                 ],
                 blocks: vec![
                     BasicBlock {
@@ -2608,10 +2639,7 @@ mod tests {
                     assert_eq!(
                         crate::ay_certify::replay_certified_envelope(
                             &safety_vc(Formula::And(vec![
-                                Formula::Gt(
-                                    Box::new(int_var("x")),
-                                    Box::new(Formula::Int(10))
-                                ),
+                                Formula::Gt(Box::new(int_var("x")), Box::new(Formula::Int(10))),
                                 Formula::Lt(Box::new(int_var("x")), Box::new(Formula::Int(5))),
                             ]))
                             .formula,
@@ -2659,7 +2687,7 @@ mod tests {
         )));
 
         let program = backend.build_program(&violation);
-        let _ay_guard = AY_EXEC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _ay_guard = ay_exec_lock().lock().unwrap_or_else(|error| error.into_inner());
         let outcomes = execute_direct::execute_incremental(&program)
             .expect("the exact array read-after-write query must execute in-process");
         let outcome = outcomes.last().expect("the program contains one check-sat");
@@ -3174,7 +3202,9 @@ mod tests {
                     "the witness must name the source variable `fp`, got {names:?}"
                 );
                 assert!(
-                    !names.iter().any(|name| name.starts_with(ay_symbol_namespace::AY_USER_SYMBOL_PREFIX)),
+                    !names
+                        .iter()
+                        .any(|name| name.starts_with(ay_symbol_namespace::AY_USER_SYMBOL_PREFIX)),
                     "no namespaced spelling may leak into a counterexample: {names:?}"
                 );
             }
@@ -3523,7 +3553,11 @@ mod certification_transport_gate_tests {
         let formula = x_gt10_lt5();
         let out = InProcessAyBackend::promote_to_certified(strict_proved(), &formula, 99);
         let VerificationResult::Proved {
-            strength, proof_certificate, native_proof_envelope, time_ms, ..
+            strength,
+            proof_certificate,
+            native_proof_envelope,
+            time_ms,
+            ..
         } = out
         else {
             panic!("promotion must stay Proved");

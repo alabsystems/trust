@@ -13,10 +13,10 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use std::fmt;
-use trust_types::fx::FxHashSet;
+
+use trust_types::fx::{FxHashMap, FxHashSet};
 
 use crate::{StateId, StateMachine, Trace};
-use trust_types::fx::FxHashMap;
 
 // ---------------------------------------------------------------------------
 // Types

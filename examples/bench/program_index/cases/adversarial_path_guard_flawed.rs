@@ -4,11 +4,7 @@
 // callers with tag == 7 and den == 0.
 
 fn divide_for_tag(num: u32, den: u32, tag: u8) -> u32 {
-    if tag == 7 || den != 0 {
-        num / den
-    } else {
-        0
-    }
+    if tag == 7 || den != 0 { num / den } else { 0 }
 }
 
 fn main() {

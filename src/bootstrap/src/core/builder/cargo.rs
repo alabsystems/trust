@@ -140,7 +140,36 @@ fn is_trust_verifier_unstable_option(option: &str) -> bool {
 /// [`bootstrap_disables_default_trust_verification`]).
 fn trust_verifier_controls(rustflags: &str) -> Vec<&str> {
     let mut controls = Vec::new();
-    let mut tokens = rustflags.split_whitespace().peekable();
+    // Trust: split on the UNIT SEPARATOR as well as whitespace.
+    //
+    // `Rustflags::arg` joins with `\x1f` (it asserts no argument contains one,
+    // precisely because that byte is the separator). `split_whitespace` does NOT
+    // treat `\x1f` as whitespace — U+001F is not in Unicode's White_Space set —
+    // so splitting a `Rustflags` value on whitespace yielded ONE token,
+    // `"-Zannotate-moves\x1f--check-cfg=…\x1f-Ztrust-verify=off"`, whose
+    // `strip_prefix("-Z")` matches no known option. Every caller therefore saw
+    // an EMPTY control list regardless of what was actually in the flags.
+    //
+    // Two consequences, both measured 2026-08-25 by instrumenting the decision:
+    //
+    //  * `bootstrap_disables_default_trust_verification` could not see a
+    //    `-Ztrust-verify=off` that was already present, so it added a SECOND
+    //    copy — observed as `stage=1 present=1 add=true`. A repeated rustflag
+    //    forks the cargo unit (rustflags feed `unit_id`, not `c_metadata`),
+    //    which built a `std` the sysroot did not contain and killed ~31 of
+    //    std's integration tests with `dyld: Library not loaded`, plus the
+    //    `core` StableCrateId collision behind `std_detect`.
+    //
+    //  * `rustflags_request_bootstrap_verification` — the SELF-PROOF REFUSAL —
+    //    was equally blind. It exists to refuse a verifier control in
+    //    bootstrap's own rustflags, and it could not observe one. Whitespace
+    //    input (an env-provided `RUSTFLAGS`) still parsed, which is why this
+    //    survived: the tests exercise the whitespace form.
+    //
+    // Both separators are accepted because both forms genuinely occur: `\x1f`
+    // from `Rustflags` itself, spaces from an inherited environment variable.
+    let mut tokens =
+        rustflags.split(['\u{1f}', ' ', '\t', '\n']).filter(|t| !t.is_empty()).peekable();
 
     while let Some(token) = tokens.next() {
         let option = match token.strip_prefix("-Z") {
@@ -492,6 +521,35 @@ impl Cargo {
 
     pub fn rustflag(&mut self, arg: &str) -> &mut Cargo {
         self.rustflags.arg(arg);
+        self
+    }
+
+    /// Trust: add a rustflag only if it is not already present.
+    ///
+    /// WHY THIS EXISTS, because a duplicate flag looks harmless and is not.
+    /// Cargo hashes rustflags into a unit's `unit_id` — the `-Cextra-filename`
+    /// and the `build/<pkg>/<hash>/` directory — but DELIBERATELY NOT into
+    /// `c_metadata`, which becomes `-Cmetadata`. So repeating a flag forks the
+    /// unit: a second `std` with the SAME `-Cmetadata` and a different filename
+    /// hash.
+    ///
+    /// Measured 2026-08-25: the release gate's child runs
+    /// `bootstrap test --stage 2 --trust-vanilla`, and `--trust-vanilla` pushed
+    /// `-Ztrust-verify=off` on top of the copy
+    /// `apply_bootstrap_trust_verification_default` already adds for every
+    /// stage != 0. The resulting `std` unit hashed to
+    /// `libstd-32483c54e2ddf828` while the sysroot held
+    /// `libstd-4899ad891801794d` — identical features, profile and target, the
+    /// flag list differing by ONE repeated entry — and 28 of std's integration
+    /// tests died at `dyld: Library not loaded`, SIGABRT.
+    ///
+    /// The same repetition also collides `core`, because `StableCrateId` is
+    /// hash(name, -Cmetadata, is_exe, cfg_version) and `extra_filename` is not
+    /// an input: two `core`s, one id.
+    pub fn rustflag_once(&mut self, arg: &str) -> &mut Cargo {
+        if !self.rustflags.0.split('\u{1f}').any(|existing| existing == arg) {
+            self.rustflags.arg(arg);
+        }
         self
     }
 
@@ -871,6 +929,47 @@ impl From<Cargo> for BootstrapCommand {
             &mut cargo.rustflags,
             cargo.build_compiler_stage,
         );
+
+        // Trust: the HOST half of the same decision. `rustflags` reaches only the
+        // TARGET units — bootstrap always passes `--target`, which is exactly why
+        // `apply_bootstrap_trust_verification_default`'s doc says host
+        // build-script/proc-macro units "keep going through the shim's
+        // `TRUST_BOOTSTRAP_SHIM_NO_VERIFY` lane". That lane was set in ONE place:
+        // `test.rs`'s `CargoTest` step. So a host unit compiled by a stage>=1
+        // trustc during any OTHER step got neither switch and was verified by
+        // default.
+        //
+        // Measured 2026-08-23: this is what made `targo trust domination
+        // upstream-tests --release --execute` return 15 tool build failures —
+        // `object`/`proc-macro2`/`libc` build scripts and the `memchr`/`autocfg`
+        // host libs, failing on unproved coverage inside "Building stage2 compiler
+        // artifacts". `memchr` identifies the mechanism: CLAUDE.md's "Why targo,
+        // not stock cargo?" describes precisely this — third-party code entering
+        // verification scope and dying in memchr's SIMD paths.
+        //
+        // Setting the MARKER rather than pushing `-Ztrust-verify=off` into
+        // hostflags is deliberate: the marker is capability-checked downstream by
+        // `trust_bootstrap_no_verify_applies`, which consults
+        // `no_target_driver_supports_no_verify` before the flag is added, so a
+        // stage0 snapshot rustc that rejects `-Z` never receives it. A raw
+        // hostflag would bypass that check.
+        //
+        // Scope is deliberately identical to the target-side default, including
+        // the `stage != 0` guard, so the two halves cannot drift: bootstrap's own
+        // units are not self-proving in either lane. The per-unit `library/`
+        // opt-in above is unaffected — it rides
+        // `TRUST_BOOTSTRAP_SHIM_VERIFY_UNITS_ENV`, which
+        // `trust_bootstrap_verify_unit_applies` consults FIRST and which wins
+        // over this off-switch.
+        // The guard is the `stage != 0` half of
+        // `bootstrap_disables_default_trust_verification` and NOT its
+        // rustflags half: that half exists only to avoid duplicating a flag
+        // already present in rustflags, and rustflags do not reach host units,
+        // so a host unit needs the marker whether or not the target lane
+        // already carries the switch.
+        if cargo.build_compiler_stage != 0 {
+            cargo.command.env("TRUST_BOOTSTRAP_SHIM_NO_VERIFY", "1");
+        }
 
         if !cargo.rustflags.0.is_empty() {
             let (var, value) =
@@ -1405,7 +1504,20 @@ impl Builder<'_> {
         //
         // Only clear out the directory if we're compiling std; otherwise, we
         // should let Cargo take care of things for us (via depdep info)
-        if !self.config.dry_run() && mode == Mode::Std && cmd_kind == Kind::Build {
+        // Trust: `Kind::Test` must clear too. The reasoning above justifies only the `Mode::Std`
+        // half -- cargo cannot see that the real rustc changed, because it thinks rustc is
+        // bootstrap/debug/rustc. Restricting the clear to `Kind::Build` leaves
+        // `build/<host>/stage2-std` NEVER cleared: stage-2 std is UPLIFTED from stage 1
+        // (`Std::should_be_uplifted_from_stage_1`), so no `Mode::Std` + `Kind::Build` cargo is
+        // ever constructed for that directory -- while `x.py test --stage 2` DOES build units
+        // into it. Trust feels this far harder than upstream because CFG_VERSION embeds the git
+        // short sha, so every commit changes compiler identity and invalidates those artifacts.
+        //
+        // Measured 2026-08-24: `stage1-std/.stamp` exists, `stage2-std/.stamp` did not exist at
+        // all, and the release gate's log carried 16x `E0514: found crate 'core' compiled by an
+        // incompatible version of rustc` with `cannot resolve a prelude import` on the next line
+        // -- which was the entire "missing prelude" symptom.
+        if !self.config.dry_run() && std_out_dir_needs_clear(mode, cmd_kind) {
             build_stamp::clear_if_dirty(self, &out_dir, &self.rustc(compiler));
         }
 
@@ -2034,6 +2146,20 @@ pub fn cargo_profile_var(name: &str, config: &Config, mode: Mode) -> String {
         (_, false) => "DEV",
     };
     format!("CARGO_PROFILE_{profile}_{name}")
+}
+
+/// Trust: does a `<mode>` + `<cmd_kind>` cargo invocation have to clear the std output
+/// directory before it runs?
+///
+/// Extracted from the call site so the answer can be taken over every `Kind` in a unit test.
+/// Cargo cannot detect that the real rustc changed -- it thinks rustc is `bootstrap/debug/rustc`
+/// -- so bootstrap has to clear on its behalf, and the set of kinds that WRITE into a std out
+/// dir is what decides the answer. `Kind::Build` is upstream's; `Kind::Test` is Trust's addition,
+/// because stage-2 std is uplifted from stage 1 (`Std::should_be_uplifted_from_stage_1`) and so
+/// no `Mode::Std` + `Kind::Build` cargo is ever constructed for `build/<host>/stage2-std`, while
+/// `x.py test --stage 2` does build units into it.
+fn std_out_dir_needs_clear(mode: Mode, cmd_kind: Kind) -> bool {
+    mode == Mode::Std && matches!(cmd_kind, Kind::Build | Kind::Test)
 }
 
 #[cfg(test)]

@@ -1499,7 +1499,12 @@ pub(super) fn combined_brk_guard(e_ref: &Expr, cond_ref: &Expr, brk_ref: &Expr) 
 }
 
 /// `stepLoopBrk`'s body = `Bool.rec (λ_.Env) e (exec e body) <combined_brk_guard>`.
-pub(super) fn step_loop_brk_body(e_ref: &Expr, cond_ref: &Expr, brk_ref: &Expr, body_ref: &Expr) -> Expr {
+pub(super) fn step_loop_brk_body(
+    e_ref: &Expr,
+    cond_ref: &Expr,
+    brk_ref: &Expr,
+    body_ref: &Expr,
+) -> Expr {
     let bd = || BinderData::from(BinderInfo::Default);
     let bool_rec = Expr::const_(Name::from_string("Bool.rec"), vec![Level::succ(Level::zero())]);
     let env_motive = Expr::lam(bd(), cst("Bool"), env_ty());
@@ -1510,7 +1515,12 @@ pub(super) fn step_loop_brk_body(e_ref: &Expr, cond_ref: &Expr, brk_ref: &Expr, 
 
 /// `stepLoopBrk e cond brk body` applied as a CONSTANT (signature `Env → Cond → Cond →
 /// List Stmt → Env`).
-pub(super) fn step_loop_brk_app(e_ref: Expr, cond_ref: Expr, brk_ref: Expr, body_ref: Expr) -> Expr {
+pub(super) fn step_loop_brk_app(
+    e_ref: Expr,
+    cond_ref: Expr,
+    brk_ref: Expr,
+    body_ref: Expr,
+) -> Expr {
     Expr::apps(cst(MIRSEM_STEP_LOOP_BRK), [e_ref, cond_ref, brk_ref, body_ref])
 }
 
@@ -2731,7 +2741,9 @@ pub(super) fn register_loop_rank_terminates(env: &mut Environment) -> Result<(),
 /// hook). Returns `(R_e, A, B)` where `R_e = (R e)`, `A = I (exec_loop e cond body (R e))`
 /// (invariant at the halting state), `B = eval_cond (exec_loop e cond body (R e)) cond
 /// = false` (the loop halted). Both conjuncts are built at the SAME fuel `R e`.
-pub(super) fn loop_total_correct_conjuncts(claimed_concl_rank: Option<&Expr>) -> (Expr, Expr, Expr) {
+pub(super) fn loop_total_correct_conjuncts(
+    claimed_concl_rank: Option<&Expr>,
+) -> (Expr, Expr, Expr) {
     // R e : Nat  (R=6, e=1 at this depth; an overridden rank is supplied at OUTSIDE
     // depth — lift it past I,R,cond,body,pres,decrease,e,hI = 8 binders).
     let rank = claimed_concl_rank.cloned().map(|p| p.lift(8)).unwrap_or_else(|| Expr::bvar(6)); // the real R

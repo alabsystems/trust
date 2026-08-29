@@ -1,0 +1,28 @@
+TRUST_R1_TRACE: init: incomplete=0 address_taken=0 callers_keys=3 recursive=0 hidden=0
+TRUST_R1_TRACE: W::<N>::inner: GENERIC per-mono harvest — 1 distinct mono(s), 1 site(s)
+TRUST_R1_TRACE: W::<N>::inner: mono [N/#0] proposed P = Lt(Var("i", Int), Int(4))
+TRUST_R1_TRACE: W::<N>::inner: ADMITTED GENERIC FLIP over 1 mono(s) at 43:8
+TRUST_R1_TRACE: stored flip key='t_c3::W::<N>::inner' kind='index out of bounds' loc=43:8 file=Some("generic_mono_caller_closure_is_live.rs")
+TRUST_R1_TRACE: mid: GENERIC per-mono harvest — 1 distinct mono(s), 1 site(s)
+TRUST_R1_TRACE: mid: mono [4_usize] has no Failed VC (0 obligation(s)) — reject to stay sound
+TRUST_R1_TRACE: h: no Failed VC among 0 obligation(s)
+TRUST_R1_TRACE: main: not Total (is_public=true address_taken=false scan_incomplete=0)
+TRUST_R1_TRACE: init: generic-mono covered=1 caller-closure=3
+TRUST_R1_TRACE: apply_r1_flips: def_path='t_c3::W::<N>::inner' has 1 flip(s); 1 result VC(s):
+TRUST_R1_TRACE:   result kind='index out of bounds' loc=43:8 file=Some("generic_mono_caller_closure_is_live.rs") proved=false
+TRUST_R1_TRACE:     native key kind='index out of bounds' loc=43:8 file=Some("generic_mono_caller_closure_is_live.rs")
+TRUST_R1_TRACE:   FLIP kind='index out of bounds' loc=43:8 file=Some("generic_mono_caller_closure_is_live.rs")
+
+=== Trust Verification Report (t_c3) ===
+
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/generic_mono_caller_closure_is_live.rs:42:5
+   |
+LL | /     fn inner(a: &[u8; 4], i: usize) -> u8 {
+LL | |         a[i]
+LL | |     }
+   | |_____^
+
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t_c3::mid'; stored keys=["t_c3::W::<N>::inner"]
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t_c3::h'; stored keys=["t_c3::W::<N>::inner"]
+TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t_c3::main'; stored keys=["t_c3::W::<N>::inner"]

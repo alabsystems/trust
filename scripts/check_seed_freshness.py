@@ -15,6 +15,26 @@ stock-Rust genesis path.
 Exit 0 = seed is fresh (or intentionally staircase-covered). Exit 1 = re-mint
 the seed BEFORE landing the version bump.
 
+Beyond the version window, the gate now runs a REAL CONTRACT PROBE whenever a
+materialized stage0 binary exists under ``build/<host>/stage0/bin/rustc``:
+
+* identity — ``rustc -vV``'s commit-hash / commit-date / release line must
+  match the ``src/stage0`` pin (previously the binary was never executed, so
+  the gate passed on any binary whose *pinned metadata* looked fresh);
+* flag contract — the seed must accept a real compile under the exact flags
+  bootstrap hands stage0 (``--cfg bootstrap -Zno-trust-verify``). Measured
+  miss this closes: a seed whose trust-flag surface broke (retired or
+  re-spelled ``-Zno-trust-verify``) passed this gate on version minors alone.
+
+KNOWN RESIDUAL, filed precisely rather than papered over: when no stage0 is
+materialized (fresh CI checkout), the contract probe SKIPS — there is no
+binary to execute, and the version window is all this gate can check. And the
+probe checks flag ACCEPTANCE, not flag POLARITY: a seed that accepts
+``-Zno-trust-verify`` but inverts its meaning (the f24fdb2fdb BUG-C alias
+class) still passes; detecting inversion needs a compile whose verdict
+differs under verify-on vs verify-off, which is a compiler-fixture concern,
+not a freshness-gate concern.
+
 Usage:
   python3 scripts/check_seed_freshness.py            # gate
   python3 scripts/check_seed_freshness.py --require-payloads   # also require materialized payloads (release CI)
@@ -274,6 +294,120 @@ def validate_materialized_payloads(stage0: dict[str, str]) -> list[str]:
     return errors
 
 
+def probe_materialized_stage0(stage0: dict[str, str]) -> tuple[list[str], list[str]]:
+    """Execute every materialized stage0 seed binary against the pin.
+
+    Returns ``(errors, notes)``. A missing binary is a note, never an error —
+    a fresh CI checkout has no materialized seed and must not fail here. A
+    PRESENT binary that misreports its identity or rejects the bootstrap flag
+    contract is an error: either the pin is stale or the binary is, and both
+    mean the next driver build fails later with a worse message.
+    """
+    import subprocess
+    import tempfile
+
+    errors: list[str] = []
+    notes: list[str] = []
+    binaries = sorted(ROOT.glob("build/*/stage0/bin/rustc"))
+    if not binaries:
+        notes.append(
+            "stage0 not materialized under build/<host>/stage0/bin/rustc — "
+            "contract probe skipped (version-window check only)"
+        )
+        return errors, notes
+
+    pinned_hash = stage0.get("compiler_git_commit_hash", "")
+    pinned_date = stage0.get("compiler_date", "")
+    pinned_version = parse_version(stage0.get("compiler_version", ""))
+
+    for binary in binaries:
+        label = binary.relative_to(ROOT)
+        identity_matches = True
+        # --- identity: the binary must BE the pinned seed --------------------
+        try:
+            result = subprocess.run(
+                [str(binary), "-vV"], capture_output=True, text=True, timeout=60
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            errors.append(f"{label}: cannot execute for -vV: {error}")
+            continue
+        if result.returncode != 0:
+            errors.append(f"{label}: -vV exited {result.returncode}")
+            continue
+        fields = {}
+        for line in result.stdout.splitlines():
+            key, sep, value = line.partition(": ")
+            if sep:
+                fields[key.strip()] = value.strip()
+        observed_hash = fields.get("commit-hash", "")
+        if observed_hash != pinned_hash:
+            identity_matches = False
+            errors.append(
+                f"{label}: commit-hash {observed_hash!r} does not match pinned "
+                f"compiler_git_commit_hash {pinned_hash!r}"
+            )
+        observed_date = fields.get("commit-date", "")
+        if observed_date != pinned_date:
+            identity_matches = False
+            errors.append(
+                f"{label}: commit-date {observed_date!r} does not match pinned "
+                f"compiler_date {pinned_date!r}"
+            )
+        observed_version = parse_version(fields.get("release", ""))
+        if pinned_version is not None and observed_version != pinned_version:
+            identity_matches = False
+            errors.append(
+                f"{label}: release {fields.get('release', '')!r} is not at the pinned "
+                f"seed's major.minor {pinned_version[0]}.{pinned_version[1]}"
+            )
+        # --- flag contract: the exact flags bootstrap hands stage0 -----------
+        # RUSTFLAGS="--cfg bootstrap -Zno-trust-verify" is what every stage1
+        # build exports (scripts and bootstrap alike). A seed that rejects
+        # either flag strands stage1 at its first crate with a flag error.
+        with tempfile.TemporaryDirectory() as scratch:
+            probe = Path(scratch) / "probe.rs"
+            probe.write_text("pub fn probe() {}\n", encoding="utf-8")
+            out = Path(scratch) / "probe.rmeta"
+            try:
+                result = subprocess.run(
+                    [
+                        str(binary),
+                        "--edition",
+                        "2021",
+                        "--crate-type",
+                        "lib",
+                        "--emit=metadata",
+                        "--cfg",
+                        "bootstrap",
+                        "-Zno-trust-verify",
+                        "-o",
+                        str(out),
+                        str(probe),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=scratch,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                errors.append(f"{label}: flag-contract probe did not run: {error}")
+                continue
+            if result.returncode != 0 or not out.is_file():
+                first = (result.stderr or result.stdout).strip().splitlines()
+                errors.append(
+                    f"{label}: rejected the bootstrap flag contract "
+                    f"(--cfg bootstrap -Zno-trust-verify): rc={result.returncode}"
+                    + (f"; first error: {first[0][:160]}" if first else "")
+                )
+                continue
+        if identity_matches:
+            notes.append(
+                f"{label}: identity matches the pin ({observed_hash[:10]}, {observed_date}) "
+                "and the bootstrap flag contract compiles"
+            )
+    return errors, notes
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -321,6 +455,13 @@ def main() -> int:
             f"valid seed. Re-mint when the stage0->stage1 hop starts costing more than it saves "
             f"(OFF_STOCK_RUST_PLAN.md Phase 1)."
         )
+
+    probe_errors, probe_notes = probe_materialized_stage0(stage0)
+    for note in probe_notes:
+        print(f"note: {note}")
+    for error in probe_errors:
+        print(f"FAIL: stage0 contract probe: {error}")
+        ok = False
 
     if args.require_payloads:
         payload_errors = validate_materialized_payloads(stage0)

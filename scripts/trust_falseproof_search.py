@@ -16,6 +16,13 @@
 #                 the independent oracle for the class where nearly every kernel-certified P0
 #                 false proof has lived (the i128 abstract-interp TOP, range-contains &mut
 #                 staleness, Option/Result payload-read aliasing, …).
+#   STATIC-CERT : the SAME function under `-Z trust-policy=certify` — THE SHIPPING RELEASE
+#                 LANE (`targo trust certify`), which demands FULL static discharge and fails
+#                 on every unproved obligation, including ones strict mode would let rustc
+#                 runtime-check. Neither lane above drove it, so every certify-only defect was
+#                 invisible here; the 2026-08-26 P0 (`x == x + 100` self-assign wrapping model
+#                 poisoning a block hypothesis) proved CLEAN under certify while the binary
+#                 died "index out of bounds: the len is 8 but the index is 101".
 #   RUNTIME     : the SAME function compiled WITHOUT the verifier, with overflow-checks +
 #                 debug-assertions ON, driven on WORST-CASE inputs (T::MAX elements, full
 #                 trip count) behind `black_box` so nothing const-folds. A panic (exit != 0)
@@ -26,21 +33,23 @@
 #   SOUND_PROOF      static fully-proved  AND runtime safe       <-- superiority win
 #   CORRECT_REJECT   static not-proved    AND runtime overflows  <-- sound + useful
 #   COMPLETENESS_GAP static not-proved    AND runtime safe       <-- a proving frontier
-# plus the strict pass adds, independently:
-#   FALSE_PROOF_FULL strict fully-proved (exit 0) AND runtime overflows  <-- SOUNDNESS BUG
+# plus the strict and certify passes add, independently:
+#   FALSE_PROOF_FULL    strict  fully-proved (exit 0) AND runtime overflows  <-- SOUNDNESS BUG
+#   FALSE_PROOF_CERTIFY certify fully-proved (exit 0) AND runtime overflows  <-- SOUNDNESS BUG
 #
 # Generator families cover the default arithmetic/bounds/alloc surface PLUS (E3): float
 # value obligations (FpAdd/Sub/Mul/Div/FpNeg, exercised via a float result cast to an array
 # index), and opaque-path stubs (dyn-dispatch / async / atomic) that must stay Unknown and
 # never be vacuously proved.
 #
-# A FALSE_PROOF, a FALSE_PROOF_FULL, or an opaque-path over-claim are the only failures that
-# matter; the tool exits non-zero if any is found. COMPLETENESS_GAPs are reported as the
-# prioritized frontier for new proving capability.
+# A FALSE_PROOF, a FALSE_PROOF_FULL, a FALSE_PROOF_CERTIFY, a broken certify lane, or an
+# opaque-path over-claim are the only failures that matter; the tool exits non-zero if any is
+# found. COMPLETENESS_GAPs are reported as the prioritized frontier for new proving capability.
 #
 # Env knobs (all additive; defaults preserve historical behavior):
 #   TRUST_FP_LIMIT=N   run at most N variants total (a tiny smoke subset).
 #   TRUST_FP_FULL=0    skip the strict static pass (D4); default runs it.
+#   TRUST_FP_CERTIFY=0 skip the certify (release-lane) static pass; default runs it.
 #
 # Author: Andrew Yates. Copyright 2026 Andrew Yates.
 import os
@@ -142,6 +151,45 @@ def static_fully_proved_full(code, workdir):
     # (exit != 0) on any failure, so a disagreement means fail-closed.
     fully = note_all_proved and r.returncode == 0
     return (fully, f"[full]{proved}p/{failed}f/{unknown}u/{rtc}rtc of {total}")
+
+
+def static_fully_proved_certify(code, workdir):
+    """Run `-Z trust-policy=certify`; return (fully_proved, summary, tool_error).
+
+    Certify is the SHIPPING RELEASE LANE (`targo trust certify`): it demands full static
+    discharge and fails on every unproved obligation, including the runtime-checkable ones
+    strict mode only reports. It is therefore the compiler's strongest claim, and a certify
+    build that exits 0 while the program faults is the loudest possible false proof — the
+    2026-08-26 `i += 100` bounds P0 lived exactly here and in neither lane above.
+
+    Same fail-closed pairing as `static_fully_proved_full`: fully proved only when the build
+    EXITED 0 *and* the verdict note agrees every obligation is proved.
+    """
+    src = os.path.join(workdir, "lib_certify.rs")
+    with open(src, "w") as f:
+        f.write("#![crate_type = \"lib\"]\n" + code)
+    out = os.path.join(workdir, "lib_certify.rlib")
+    r = subprocess.run(
+        [TRUSTC, "--edition", "2021", "--crate-type", "lib",
+         "-Z", "trust-policy=certify", src, "-o", out],
+        env=ENV, capture_output=True, text=True, timeout=300,
+    )
+    text = r.stdout + r.stderr
+    # This lane PASSES a `-Z` flag, so flag drift silently downgrades it to "nothing proved"
+    # and the whole release-lane oracle reports green forever. Third return value makes that
+    # a hard failure instead of an invisible not-proved.
+    if re.search(r"unknown unstable option|unrecognized option|"
+                 r"only accepted on the nightly|requires -Z ?unstable-options", text):
+        return (False, "CERTIFY-TOOL-ERROR(flag-drift?)", True)
+    m = VERDICT_RE.search(text)
+    if not m:
+        # Certify aborts the build on any unproved obligation; no note means it fail-closed.
+        return (False, "certify-no-summary" + ("/err" if r.returncode != 0 else ""), False)
+    proved, failed, unknown, timed, rtc, total = map(int, m.groups())
+    note_all_proved = (failed == 0 and unknown == 0 and timed == 0 and rtc == 0
+                       and total > 0 and proved == total)
+    fully = note_all_proved and r.returncode == 0
+    return (fully, f"[cert]{proved}p/{failed}f/{unknown}u/{rtc}rtc of {total}", False)
 
 
 def runtime_overflows(code, driver_main, workdir):
@@ -1541,24 +1589,46 @@ def families():
 OPAQUE_STUB_PREFIX = "opaque_"
 
 
+USAGE = """usage: trust_falseproof_search.py [FAMILY-NAME-PREFIX]
+
+The lone positional is a family-name PREFIX FILTER (e.g. `sr_scaledidx_selfadd_oob`),
+not a flag; with no argument every variant runs.
+
+env:
+  TRUST_FP_LIMIT=N    run at most N variants total (a tiny smoke subset)
+  TRUST_FP_FULL=0     skip the strict static pass        (default: run)
+  TRUST_FP_CERTIFY=0  skip the certify release-lane pass (default: run)
+  TRUSTC=<path>       trustc to drive
+"""
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
+    # A bare `--help` used to match zero families and exit 0 — indistinguishable from a clean
+    # run. No family name starts with '-', so this cannot shadow a real filter.
+    if only in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return 0
     # E3/D4 knobs (additive; defaults preserve the historical advisory-lane behavior).
-    #   TRUST_FP_LIMIT=N   run at most N variants total (a tiny smoke subset).
-    #   TRUST_FP_FULL=0    skip the batteries-on strict static pass (D4).
-    #   TRUST_FP_FULL=1    (default) also run the strict pass and classify FALSE_PROOF_FULL.
+    #   TRUST_FP_LIMIT=N    run at most N variants total (a tiny smoke subset).
+    #   TRUST_FP_FULL=0     skip the batteries-on strict static pass (D4).
+    #   TRUST_FP_CERTIFY=0  skip the certify (release-lane) static pass.
     try:
         limit = int(os.environ.get("TRUST_FP_LIMIT", "0"))
     except ValueError:
         limit = 0
     run_full = os.environ.get("TRUST_FP_FULL", "1") != "0"
+    run_certify = os.environ.get("TRUST_FP_CERTIFY", "1") != "0"
 
-    false_proofs = []       # advisory-lane false proofs (the historical class)
-    false_proofs_full = []  # D4: strict false proofs (proved-exit0 + overflow)
-    opaque_overclaims = []  # E3: an opaque-path stub that became (vacuously) proved
+    false_proofs = []          # advisory-lane false proofs (the historical class)
+    false_proofs_full = []     # D4: strict false proofs (proved-exit0 + overflow)
+    false_proofs_certify = []  # certify/release-lane false proofs (proved-exit0 + overflow)
+    certify_tool_errors = []   # certify lane could not run at all (flag drift)
+    opaque_overclaims = []     # E3: an opaque-path stub that became (vacuously) proved
     gaps = []
-    counts = {"FALSE_PROOF": 0, "FALSE_PROOF_FULL": 0, "SOUND_PROOF": 0,
-              "CORRECT_REJECT": 0, "COMPLETENESS_GAP": 0, "INCONCLUSIVE": 0}
+    counts = {"FALSE_PROOF": 0, "FALSE_PROOF_FULL": 0, "FALSE_PROOF_CERTIFY": 0,
+              "SOUND_PROOF": 0, "CORRECT_REJECT": 0, "COMPLETENESS_GAP": 0,
+              "INCONCLUSIVE": 0}
     n = 0
     for name, code, drv in families():
         if only and not name.startswith(only):
@@ -1570,6 +1640,8 @@ def main():
         with tempfile.TemporaryDirectory() as wd:
             sp, ssum = static_fully_proved(code, wd)
             spf, sfsum = (static_fully_proved_full(code, wd) if run_full else (False, "[full]skipped"))
+            spc, scsum, cerr = (static_fully_proved_certify(code, wd) if run_certify
+                                else (False, "[cert]skipped", False))
             ov, odet = runtime_overflows(code, drv, wd)
 
         # Default-mode classification (UNCHANGED — the historical pass is intact).
@@ -1595,13 +1667,23 @@ def main():
             counts["FALSE_PROOF_FULL"] += 1
             false_proofs_full.append((name, code, sfsum, odet))
 
-        # E3: an opaque-path stub must stay Unknown/runtime-checked. If EITHER mode
+        # Certify is a THIRD independent oracle and the one that actually ships. A certify
+        # build that exits 0 while the program faults is a release-lane false proof — strictly
+        # additive, it never relaxes the verdicts above.
+        certify_fp = run_certify and spc and (ov is True)
+        if certify_fp:
+            counts["FALSE_PROOF_CERTIFY"] += 1
+            false_proofs_certify.append((name, code, scsum, odet))
+        if cerr:
+            certify_tool_errors.append((name, scsum))
+
+        # E3: an opaque-path stub must stay Unknown/runtime-checked. If ANY mode
         # fully proved it, the opacity invariant broke — record it. (When it also
-        # overflows it is already a FALSE_PROOF[_FULL] above; the extra record makes the
-        # specific "vacuously proved an opaque value" regression unmissable in triage.)
-        opaque_overclaim = is_opaque_stub and (sp or spf)
+        # overflows it is already a FALSE_PROOF[_FULL|_CERTIFY] above; the extra record makes
+        # the specific "vacuously proved an opaque value" regression unmissable in triage.)
+        opaque_overclaim = is_opaque_stub and (sp or spf or spc)
         if opaque_overclaim:
-            opaque_overclaims.append((name, ssum, sfsum, odet))
+            opaque_overclaims.append((name, ssum, sfsum, scsum, odet))
 
         counts[cls] += 1
         tags = []
@@ -1609,10 +1691,15 @@ def main():
             tags.append("<<<<< SOUNDNESS BUG (default)")
         if full_fp:
             tags.append("<<<<< SOUNDNESS BUG (strict)")
+        if certify_fp:
+            tags.append("<<<<< SOUNDNESS BUG (certify/RELEASE LANE)")
+        if cerr:
+            tags.append("<<<<< CERTIFY LANE BROKEN")
         if opaque_overclaim:
             tags.append("<<<<< OPAQUE PATH VACUOUSLY PROVED")
         tag = ("  " + " ".join(tags)) if tags else ""
-        print(f"[{cls:16}] {name:30} static={ssum:18} {sfsum:20} runtime={odet}{tag}")
+        print(f"[{cls:16}] {name:30} static={ssum:18} {sfsum:20} {scsum:20} "
+              f"runtime={odet}{tag}")
 
     print(f"\n=== {n} variants: " + ", ".join(f"{k}={v}" for k, v in counts.items()) + " ===")
     if gaps:
@@ -1632,20 +1719,35 @@ def main():
         for name, code, sfsum, odet in false_proofs_full:
             print(f"\n  {name}: static={sfsum} runtime={odet}\n    {code}")
         failed = True
+    if false_proofs_certify:
+        print("\n!!!! FALSE PROOFS — CERTIFY (-Z trust-policy=certify, THE SHIPPING RELEASE "
+              "LANE) (fully proved + exit 0, runtime faulted) !!!!")
+        for name, code, scsum, odet in false_proofs_certify:
+            print(f"\n  {name}: static={scsum} runtime={odet}\n    {code}")
+        failed = True
+    if certify_tool_errors:
+        # A certify lane that cannot run reports green forever — the orphan-lane failure this
+        # oracle exists to prevent. Fail rather than silently drop the release-lane oracle.
+        print("\n!!!! CERTIFY LANE BROKEN (-Z trust-policy=certify rejected; the release-lane "
+              "oracle ran on NOTHING) !!!!")
+        for name, scsum in certify_tool_errors:
+            print(f"  {name}: {scsum}")
+        failed = True
     if opaque_overclaims:
         # An opaque-path over-claim is a soundness regression even if (for these inputs)
         # the runtime did not trip — a value that cannot be seen through must never be
         # proved. Fail loudly so it cannot rot into a silent vacuous proof.
         print("\n!!!! OPAQUE PATH VACUOUSLY PROVED "
               "(dyn/async/atomic value must stay Unknown, never proved) !!!!")
-        for name, ssum, sfsum, odet in opaque_overclaims:
-            print(f"  {name}: default={ssum} full={sfsum} runtime={odet}")
+        for name, ssum, sfsum, scsum, odet in opaque_overclaims:
+            print(f"  {name}: default={ssum} full={sfsum} certify={scsum} runtime={odet}")
         failed = True
 
     if failed:
         return 1
-    print("\nNO FALSE PROOFS FOUND — every advisory-lane AND strict `-full` proof in this "
-          "neighborhood is sound, and every opaque path stayed Unknown.")
+    print("\nNO FALSE PROOFS FOUND — every advisory-lane, strict `-full` AND certify "
+          "release-lane proof in this neighborhood is sound, and every opaque path stayed "
+          "Unknown.")
     return 0
 
 

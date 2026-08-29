@@ -13,8 +13,8 @@ fn dummy_backend_is_resolved_without_external_loading() {
 #[test]
 fn sequential_sessions_resolve_each_requested_builtin_backend() {
     let names = ["llvm", "trust-cg", "llvm", "trust_cg"].map(|requested| {
-        builtin_codegen_backend(requested)
-            .unwrap_or_else(|| panic!("missing builtin {requested}"))()
+        builtin_codegen_backend(requested).unwrap_or_else(|| panic!("missing builtin {requested}"))(
+        )
         .name()
     });
     assert_eq!(names, ["llvm", "trust-cg", "llvm", "trust-cg"]);

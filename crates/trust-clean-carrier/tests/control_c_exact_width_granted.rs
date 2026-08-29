@@ -7,7 +7,7 @@
 //! it is the ONLY thing that reaches `CarrierEvidence::Total`.
 
 use clean_kernel::{Expr, Name};
-use trust_clean_carrier::{carrier_at, carrier_for, CleanType};
+use trust_clean_carrier::{CleanType, carrier_at, carrier_for};
 use trust_symbols::CarrierEvidence;
 use trust_types::Ty;
 

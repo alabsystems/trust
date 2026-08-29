@@ -205,9 +205,7 @@ pub fn producible(f: &str) -> &'static [Opcode] {
         "decode_hint" => &[O::Nop, O::Yield, O::Wfe, O::Wfi, O::Sev, O::Sevl],
         "decode_barrier" => &[O::Clrex, O::Dsb, O::Dmb, O::Isb],
         "decode_load_literal" => &[O::LdrLiteral, O::Ldrsw, O::Prfm],
-        "decode_load_store_exclusive" => {
-            &[O::Ldar, O::Stlr, O::Ldxr, O::Stxr, O::Ldaxr, O::Stlxr]
-        }
+        "decode_load_store_exclusive" => &[O::Ldar, O::Stlr, O::Ldxr, O::Stxr, O::Ldaxr, O::Stlxr],
         "decode_load_store_pair" => &[O::Ldp, O::Stp, O::Ldpsw],
         "decode_load_store_reg" => &[
             O::Strb,
@@ -233,19 +231,10 @@ pub fn producible(f: &str) -> &'static [Opcode] {
         "decode_cond_select" => &[O::Csel, O::Csinc, O::Csinv, O::Csneg],
         "decode_dp_2source" => &[O::Udiv, O::Sdiv, O::Lslv, O::Lsrv, O::Asrv, O::Rorv],
         "decode_dp_1source" => &[O::Rbit, O::Rev16, O::Rev32, O::Rev, O::Clz, O::Cls],
-        "decode_dp_3source" => &[
-            O::Madd,
-            O::Msub,
-            O::Smaddl,
-            O::Smsubl,
-            O::Smulh,
-            O::Umaddl,
-            O::Umsubl,
-            O::Umulh,
-        ],
-        "decode_fp_int_conv" => {
-            &[O::FmovReg, O::Fcvtzs, O::Fcvtzu, O::Scvtf, O::Ucvtf]
+        "decode_dp_3source" => {
+            &[O::Madd, O::Msub, O::Smaddl, O::Smsubl, O::Smulh, O::Umaddl, O::Umsubl, O::Umulh]
         }
+        "decode_fp_int_conv" => &[O::FmovReg, O::Fcvtzs, O::Fcvtzu, O::Scvtf, O::Ucvtf],
         "decode_fp_dp_2source" => &[O::Fmul, O::Fdiv, O::Fadd, O::Fsub],
         "decode_fp_dp_1source" => &[O::FmovReg, O::Fabs, O::Fneg, O::Fsqrt, O::Fcvt],
         "decode_fp_compare" => &[O::Fcmp],

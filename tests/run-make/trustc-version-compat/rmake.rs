@@ -45,9 +45,7 @@ fn main() {
     let expected_binary = std::env::var(TRUST_VANILLA_REAL_RUSTC_ENV)
         .ok()
         .and_then(|real| {
-            PathBuf::from(real)
-                .file_stem()
-                .and_then(|name| name.to_str().map(str::to_string))
+            PathBuf::from(real).file_stem().and_then(|name| name.to_str().map(str::to_string))
         })
         .unwrap_or_else(|| "trustc".to_string());
     assert_contains(&verbose, &format!("\nbinary: {expected_binary}\n"));

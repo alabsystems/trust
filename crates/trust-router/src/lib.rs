@@ -45,32 +45,6 @@ pub use verifier_result::{
 };
 
 pub(crate) mod error;
-pub use error::SolverProcessError;
-pub use full_verification::{
-    DEFAULT_PER_OBLIGATION_TIMEOUT_MS, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
-    FullVerificationEngine, FullVerificationPolicy, FullVerificationRunWithFreshReceipts,
-    LiveVerificationReceiptBatch, NativeTrustMcTrustIrEngine, NativeTyEngine,
-    required_native_engines, required_native_engines_with_timeout_ms,
-};
-// Incremental AY session re-exports.
-pub use incremental_ay::{
-    CommonAssertion, IncrementalAYSession, IncrementalAYStats, alloc_over_ceiling_forced,
-    violation_is_forced, violation_is_modeling_gap_failclose,
-};
-// In-process ay-dpll SMT backend re-export.
-#[cfg(feature = "ay-backend")]
-pub use in_process_ay_backend::{InProcessAyBackend, formula_is_ground};
-// trust_cg codegen backend re-exports.
-#[cfg(feature = "trust-cg-backend")]
-pub use trust_cg_backend::{
-    CodegenVerdict, TrustCgBackend as TrustCgCodegenBackend, TrustCgBackendConfig,
-    TrustCgBackendError,
-};
-// Memory guard re-exports for solver memory limit enforcement.
-pub use memory_guard::{MemoryGuard, MemoryGuardError, MemorySnapshot};
-pub use memory_jobserver::{
-    MemoryJobserverError, MemoryReservation, acquire as acquire_memory_reservation,
-};
 // Trust: coordinator client — the SINGLE seam the in-process backend (now) and a
 // future trustc edit (later) use to request admission from the selected
 // coordinator domain. Participating workers are serialized against that
@@ -78,6 +52,32 @@ pub use memory_jobserver::{
 pub use coordinator::{
     DaemonStatus, Reservation as MemoryCoordinatorReservation, ReservationError,
     reserve as reserve_memory, status as coordinator_status,
+};
+pub use error::SolverProcessError;
+pub use full_verification::{
+    DEFAULT_PER_OBLIGATION_TIMEOUT_MS, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
+    FullVerificationEngine, FullVerificationPolicy, FullVerificationRunWithFreshReceipts,
+    LiveVerificationReceiptBatch, NativeTrustMcTrustIrEngine, NativeTyEngine,
+    required_native_engines, required_native_engines_with_timeout_ms,
+};
+// In-process ay-dpll SMT backend re-export.
+#[cfg(feature = "ay-backend")]
+pub use in_process_ay_backend::{InProcessAyBackend, formula_is_ground};
+// Incremental AY session re-exports.
+pub use incremental_ay::{
+    CommonAssertion, IncrementalAYSession, IncrementalAYStats, alloc_over_ceiling_forced,
+    violation_is_forced, violation_is_modeling_gap_failclose,
+};
+// Memory guard re-exports for solver memory limit enforcement.
+pub use memory_guard::{MemoryGuard, MemoryGuardError, MemorySnapshot};
+pub use memory_jobserver::{
+    MemoryJobserverError, MemoryReservation, acquire as acquire_memory_reservation,
+};
+// trust_cg codegen backend re-exports.
+#[cfg(feature = "trust-cg-backend")]
+pub use trust_cg_backend::{
+    CodegenVerdict, TrustCgBackend as TrustCgCodegenBackend, TrustCgBackendConfig,
+    TrustCgBackendError,
 };
 pub use trust_verifier_api::{VerificationRunResult, VerifierExecutionContext};
 
@@ -92,8 +92,8 @@ pub mod strengthen_whole_program;
 // There is no trust-vc / trust-mc / clean module here, and that is not an
 // absence of those engines: they are reached as full-verification primary
 // engines over typed obligations, not as per-VC `VerificationBackend`s.
-pub mod full_verification;
 pub mod constant_folder;
+pub mod full_verification;
 // Trust: cheap in-process interval/range backend — discharges bounded
 // arithmetic-overflow VCs before ay (which times out / unknowns / false-fails
 // on them in normal mode). Raises the normal-mode proof floor.
@@ -147,6 +147,11 @@ pub mod carcara_cross_check;
 pub(crate) mod ay_certify;
 // Termination dispatch — PDR/k-induction prove safety, not termination.
 pub(crate) mod termination_dispatch;
+// Trust-wp per-VC backend (R4 flip: NATIVE-BACKED through trust-wp's typed
+// in-process engine; never spawns the `trust_wp` subprocess or reads
+// TRUST_WP_PATH). TrustWP advertises zero full-verification obligation kinds,
+// so beyond canonical constant folding this lane fail-closes to Unknown; it
+// grants no verdict authority to TrustWP or to historical TrustWP records.
 pub mod trust_wp_backend;
 pub mod ty_backend;
 // Process memory monitoring for solver memory limit enforcement.

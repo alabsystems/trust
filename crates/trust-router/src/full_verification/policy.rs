@@ -31,9 +31,9 @@ pub struct FullVerificationPolicy {
     /// Require accepted proof-grade evidence to carry replay/check artifacts or
     /// solver-backed transcript artifacts.
     pub require_proof_artifacts: bool,
-    /// Require native trust-wp, trust-vc, trust-mc, and TY lanes to be present in the
-    /// engine set. The default adapters are fail-closed placeholders until
-    /// those repos expose real native APIs.
+    /// Require the active native trust-vc, trust-mc, and TY lanes to be present
+    /// in the engine set. Historical TrustWP wire evidence stays readable, but
+    /// TrustWP is not required while it advertises zero routed capabilities.
     pub require_all_required_engines: bool,
 }
 

@@ -24,17 +24,26 @@ pub struct FailureAnalysis {
 /// Classified failure patterns that map to spec proposals.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FailurePattern {
-    ArithmeticOverflow { op: BinOp },
+    ArithmeticOverflow {
+        op: BinOp,
+    },
     DivisionByZero,
     IndexOutOfBounds,
     /// A bulk allocation whose element count may reach the unbounded-allocation
     /// ceiling. `count` is the SMT-lib rendering of the size expression.
-    UnboundedAllocation { callee: String, count: String },
+    UnboundedAllocation {
+        callee: String,
+        count: String,
+    },
     CastOverflow,
     NegationOverflow,
     ShiftOverflow,
-    AssertionFailure { message: String },
-    PreconditionViolation { callee: String },
+    AssertionFailure {
+        message: String,
+    },
+    PreconditionViolation {
+        callee: String,
+    },
     PostconditionViolation,
     UnreachableReached,
     Temporal,

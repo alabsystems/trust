@@ -6,12 +6,11 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
-
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use crate::bounded_process;
 
@@ -1082,11 +1081,11 @@ fn is_canonical_commit(value: &str) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use super::*;
 
     fn fixture_repo(prefix: &str) -> tempfile::TempDir {
         let directory = tempfile::Builder::new().prefix(prefix).tempdir().expect("temp repo");

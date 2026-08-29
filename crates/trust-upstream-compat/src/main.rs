@@ -260,6 +260,20 @@ impl CliError {
     }
 }
 
+/// Decorates an `io::Error` with the op verb and the path (or spawned program)
+/// it failed on before wrapping it in `CliError::Output`. Keeps the variant,
+/// exit code, and "failed to write output:" prefix unchanged while making the
+/// rendered error actionable (v7/D3) — a bare "os error 2" names nothing.
+fn output_at(op: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> CliError {
+    let path = path.into();
+    move |source| {
+        CliError::Output(io::Error::new(
+            source.kind(),
+            format!("{op} {}: {source}", path.display()),
+        ))
+    }
+}
+
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
@@ -896,7 +910,7 @@ fn execute_run(options: RunOptions) -> Result<CommandOutcome, CliError> {
     })
     .map_err(CliError::BundleValidation)?;
 
-    fs::create_dir_all(&options.out_dir).map_err(CliError::Output)?;
+    fs::create_dir_all(&options.out_dir).map_err(output_at("create dir", &options.out_dir))?;
     let upstream_log = options.out_dir.join("upstream-rust-compat.log");
     let trust_log = options.out_dir.join("trust-added.log");
 
@@ -925,7 +939,7 @@ fn execute_run(options: RunOptions) -> Result<CommandOutcome, CliError> {
         })
         .collect::<Vec<_>>();
 
-    fs::write(&trust_log, "").map_err(CliError::Output)?;
+    fs::write(&trust_log, "").map_err(output_at("write", &trust_log))?;
     for command in &trust_tests.commands {
         for test_id in &command.covers {
             inventory_tests.push(TestInventoryEntry {
@@ -1105,24 +1119,24 @@ fn parse_trust_added_tests_file(path: &Path) -> Result<TrustAddedTestManifest, C
 
 fn write_proof_summary(path: &Path, totals: TestProofTotals) -> Result<(), CliError> {
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(CliError::Output)?;
+        fs::create_dir_all(parent).map_err(output_at("create dir", parent))?;
     }
     let mut output = serde_json::to_string_pretty(&totals).map_err(|err| {
         CliError::Output(io::Error::other(format!("failed to serialize proof summary: {err}")))
     })?;
     output.push('\n');
-    fs::write(path, output).map_err(CliError::Output)
+    fs::write(path, output).map_err(output_at("write", path))
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(CliError::Output)?;
+        fs::create_dir_all(parent).map_err(output_at("create dir", parent))?;
     }
     let mut output = serde_json::to_string_pretty(value).map_err(|err| {
         CliError::Output(io::Error::other(format!("failed to serialize JSON: {err}")))
     })?;
     output.push('\n');
-    fs::write(path, output).map_err(CliError::Output)
+    fs::write(path, output).map_err(output_at("write", path))
 }
 
 fn upstream_suite_command(release: bool) -> String {
@@ -1167,7 +1181,7 @@ fn run_shell_command_logged(
     mode: LogMode,
 ) -> Result<ExitStatus, CliError> {
     if let Some(parent) = log_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(CliError::Output)?;
+        fs::create_dir_all(parent).map_err(output_at("create dir", parent))?;
     }
 
     let mut options = OpenOptions::new();
@@ -1181,12 +1195,12 @@ fn run_shell_command_logged(
         }
     }
 
-    let mut log = options.open(log_path).map_err(CliError::Output)?;
-    writeln!(log, "$ {command}").map_err(CliError::Output)?;
-    log.flush().map_err(CliError::Output)?;
+    let mut log = options.open(log_path).map_err(output_at("open", log_path))?;
+    writeln!(log, "$ {command}").map_err(output_at("write", log_path))?;
+    log.flush().map_err(output_at("write", log_path))?;
 
-    let stdout = log.try_clone().map_err(CliError::Output)?;
-    let stderr = log.try_clone().map_err(CliError::Output)?;
+    let stdout = log.try_clone().map_err(output_at("clone", log_path))?;
+    let stderr = log.try_clone().map_err(output_at("clone", log_path))?;
     let mut process = if cfg!(windows) {
         let mut process = ProcessCommand::new("cmd");
         process.arg("/C").arg(command);
@@ -1204,7 +1218,7 @@ fn run_shell_command_logged(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .status()
-        .map_err(CliError::Output)
+        .map_err(output_at("spawn", if cfg!(windows) { "cmd" } else { "sh" }))
 }
 
 fn upstream_inventory_from_git(
@@ -1227,7 +1241,7 @@ fn upstream_inventory_from_git(
             "library",
         ])
         .output()
-        .map_err(CliError::Output)?;
+        .map_err(output_at("spawn", "git"))?;
 
     if !output.status.success() {
         return Err(CliError::BundleValidation(vec![ValidationFinding {

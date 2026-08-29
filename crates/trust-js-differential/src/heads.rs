@@ -19,10 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use trust_js_trace::{
-    extract_trace, Completion, ObservableTrace, ThrownProjection, SCHEMA_VERSION,
-    TRACE_SENTINEL,
+    Completion, ObservableTrace, SCHEMA_VERSION, TRACE_SENTINEL, ThrownProjection, extract_trace,
 };
-
 
 pub const STDOUT_CAP: usize = 512 * 1024 * 1024;
 pub const STDERR_CAP: usize = 8 * 1024 * 1024;
@@ -137,7 +135,11 @@ fn drain_reader<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
 /// Spawn `program args...` with the contract env (TZ=UTC LANG=C LC_ALL=C),
 /// piped stdio, full stdout capture (512 MiB cap), and a try_wait + 5 ms
 /// poll-loop timeout (kill on expiry).
-pub fn spawn_engine(program: &Path, args: &[&Path], timeout: Duration) -> Result<SpawnOutput, String> {
+pub fn spawn_engine(
+    program: &Path,
+    args: &[&Path],
+    timeout: Duration,
+) -> Result<SpawnOutput, String> {
     let mut cmd = Command::new(program);
     for a in args {
         cmd.arg(a);
@@ -194,12 +196,7 @@ pub fn raw_projection(out: &SpawnOutput) -> ObservableTrace {
             phase: None,
         }
     };
-    ObservableTrace {
-        schema: SCHEMA_VERSION.to_string(),
-        caps: None,
-        events: vec![],
-        completion,
-    }
+    ObservableTrace { schema: SCHEMA_VERSION.to_string(), caps: None, events: vec![], completion }
 }
 
 /// The LAST sentinel line of captured stdout, verbatim (selftest determinism
@@ -556,9 +553,7 @@ impl EngineHead for TrustJsHead {
         let strict = case.mode == RunMode::Strict;
         match trust_js_interp::evaluate_case(&includes, &case.body, strict) {
             trust_js_interp::InterpOutcome::Trace(t) => HeadResult::Trace(t),
-            trust_js_interp::InterpOutcome::NoCoverage { reason } => {
-                HeadResult::NoCoverage(reason)
-            }
+            trust_js_interp::InterpOutcome::NoCoverage { reason } => HeadResult::NoCoverage(reason),
         }
     }
 }
@@ -679,9 +674,7 @@ impl EngineHead for TrustTsHead {
         // judged under the module goal exactly like TrustJsHead's module path.
         match trust_js_interp::evaluate_module(&includes, &js) {
             trust_js_interp::InterpOutcome::Trace(t) => HeadResult::Trace(t),
-            trust_js_interp::InterpOutcome::NoCoverage { reason } => {
-                HeadResult::NoCoverage(reason)
-            }
+            trust_js_interp::InterpOutcome::NoCoverage { reason } => HeadResult::NoCoverage(reason),
         }
     }
 }
@@ -725,11 +718,9 @@ mod tests {
 
     #[test]
     fn sentinel_line_extraction() {
-        let stdout = b"noise\n__TRUST_JS_TRACE_V1__{\"a\":1}\nmore\n  __TRUST_JS_TRACE_V1__{\"b\":2}\n";
-        assert_eq!(
-            last_sentinel_line(stdout).as_deref(),
-            Some("  __TRUST_JS_TRACE_V1__{\"b\":2}")
-        );
+        let stdout =
+            b"noise\n__TRUST_JS_TRACE_V1__{\"a\":1}\nmore\n  __TRUST_JS_TRACE_V1__{\"b\":2}\n";
+        assert_eq!(last_sentinel_line(stdout).as_deref(), Some("  __TRUST_JS_TRACE_V1__{\"b\":2}"));
         assert_eq!(last_sentinel_line(b"nothing here"), None);
     }
 
@@ -791,7 +782,9 @@ mod tests {
         }
         // trustjs: a module PARSE / early error is covered with the SyntaxError
         // throw an engine raises when import()-ing it (matching Node).
-        match TrustJsHead::new(Arc::new(HashMap::new())).run(&mk("export const x = 1; export const x = 2;")) {
+        match TrustJsHead::new(Arc::new(HashMap::new()))
+            .run(&mk("export const x = 1; export const x = 2;"))
+        {
             HeadResult::Trace(t) => match t.completion {
                 Completion::Throw { v: ThrownProjection::Error { ref name, .. }, .. } => {
                     assert_eq!(name.as_deref(), Some("SyntaxError"))
@@ -843,20 +836,16 @@ mod tests {
         // strict-only early error becomes an exact SyntaxError trace.
         match head.run(&trustjs_case("var eval = 1;", RunMode::Strict)) {
             HeadResult::Trace(t) => match t.completion {
-                Completion::Throw {
-                    v: ThrownProjection::Error { name: Some(n), .. },
-                    ..
-                } => assert_eq!(n, "SyntaxError"),
+                Completion::Throw { v: ThrownProjection::Error { name: Some(n), .. }, .. } => {
+                    assert_eq!(n, "SyntaxError")
+                }
                 other => panic!("expected SyntaxError throw, got {other:?}"),
             },
             other => panic!("expected Trace, got {other:?}"),
         }
         // Async generators (§27.6) are covered: creating one yields a trace
         // (its body runs on `.next()`).
-        match head.run(&trustjs_case(
-            "async function* g() { yield 1; } g();",
-            RunMode::Bare,
-        )) {
+        match head.run(&trustjs_case("async function* g() { yield 1; } g();", RunMode::Bare)) {
             HeadResult::Trace(t) => {
                 assert!(matches!(t.completion, Completion::Normal { .. }));
             }

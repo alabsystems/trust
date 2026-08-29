@@ -81,6 +81,18 @@ members = [
   "crates/trust-decompile",
   "crates/trust-deps",
   "crates/trust-disasm",
+  # trust: PHASE 1 SUPPLY-CHAIN REPLACEMENT — the Trust-owned crypto primitives.
+  # These are members of BOTH workspaces on purpose. `crates/Cargo.toml` renamed
+  # `sha2`/`hmac`/`ed25519-dalek` onto them first, but the ROOT workspace is the
+  # one the compiler builds from (rustc-main -> rustc_interface ->
+  # rustc_mir_transform -> trust-router -> trust-proof-cert), so a rename that
+  # lands only in `crates/` leaves the shipped `trustc` linking crates.io.
+  # That is not red — it is worse: the same 15 packages get built twice from the
+  # same source against two different hash implementations, and a green
+  # `targo test` in `crates/` becomes evidence about a crate the compiler does
+  # not link. Membership here is what makes the rename below reach the artifact.
+  "crates/trust-ed25519",
+  "crates/trust-hmac",
   "crates/trust-integration-tests",
   "crates/trust-ir-bridge",
   "crates/trust-lift",
@@ -95,15 +107,27 @@ members = [
   "crates/trust-mir-extract",
   "crates/trust-os",
   "crates/trust-proof-cert",
+  "crates/trust-rand",
+  "crates/trust-ratio",
   "crates/trust-release",
   "crates/trust-report",
   "crates/trust-router",
+  "crates/trust-sha2",
+  # trust: package name is `sha2` v0.10.100 (see its manifest) — the Track B
+  # `[patch.crates-io]` shim. Membership only means it is BUILT and TESTED here;
+  # nothing patches it in yet, and the patch line stays commented out at
+  # `crates/Cargo.toml:89`. Root additionally captures `rustc_span`, `rustdoc`,
+  # `build-manifest`, `bump-stage0` and six `first-party/*` submodules, and
+  # root's `clean-elab`/`clean-kernel` pull `sha2 0.11.0`, which a `0.10.100`
+  # patch is semver-incompatible with and cannot reach. Do not batch that here.
+  "crates/trust-sha2-compat",
   "crates/trust-spec",
   "crates/trust-strengthen",
   "crates/trust-certify",
   "crates/trust-symex",
   "crates/trust-temporal",
   "crates/trust-thir-lower",
+  "crates/trust-toml",
   "crates/trust-transval",
   "crates/trust-types",
   "crates/trust-vc-bridge",
@@ -209,6 +233,7 @@ rustc_version = { path = "vendor/rustc_version_0_4_1" }
 [patch."https://github.com/alabsystems/trust-ir"]
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
 
 # HTTPS *with* .git — the exact source `first-party/ty` and `first-party/trust-cg`
 # declare. Without this entry their trust-ir escapes the patch and re-resolves to
@@ -217,14 +242,17 @@ trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
 [patch."https://github.com/alabsystems/trust-ir.git"]
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
 
 [patch."ssh://git@github.com/alabsystems/trust-ir.git"]
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
 
 [patch."ssh://git@github.com:22/alabsystems/trust-ir.git"]
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir" }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }
 
 # trust-ir(-build) declare their clean-kernel dep as a git dependency on
 # clean.git (pinned rev) so they stay consumable as plain cargo git
@@ -326,7 +354,7 @@ warnings = "warn"
 
 # trust: workspace-level package metadata for verification pipeline crates
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alabsystems/trust"
@@ -352,8 +380,21 @@ trust-spec-elab = { path = "crates/trust-spec-elab" }
 # whose `clean_origin_mir.rs` is the sole constructor of a Clean-origin `Body`
 # and cannot return one without a `trust_clean_origin::Faithful`.
 trust-clean-origin = { path = "crates/trust-clean-origin" }
+# The Clean -> TrustIR producer. Consumes the same sealed `CleanOriginPlan`
+# `clean_origin_mir` does, and emits `trust_ir::Function` instead of `Body`.
+trust-clean-ir = { path = "crates/trust-clean-ir" }
 trust-clean-carrier = { path = "crates/trust-clean-carrier" }
 clean-kernel = { path = "first-party/clean/crates/clean-kernel", features = ["math-overlays"] }
+# Trust (kernel-tv, docs/design/2026-08-27-two-language-direct-to-trust-ir.md §4):
+# the PRODUCING denotation map for the Clean-origin TV tier. Its trust-ir git
+# dep is captured by the [patch."…trust-ir.git"] tables above; its clean-kernel
+# workspace dep resolves against first-party/clean's own workspace.
+clean-reflect = { path = "first-party/clean/crates/clean-reflect" }
+# Trust (totality campaign, general Clean lane): the GENERAL Clean -> trust-ir
+# compiler (kernel Expr -> L5CNF -> L5IR -> trust_ir::Module). Its trust-ir /
+# trust-ir-build / trust-ir-conformance git deps are captured by the [patch]
+# tables below; clean-kernel resolves via first-party/clean's own workspace.
+clean-compiler = { path = "first-party/clean/crates/clean-compiler", features = ["trust-ir-backend"] }
 clean-auto = { path = "first-party/clean/crates/clean-auto" }
 clean-verify = { path = "first-party/clean/crates/clean-verify" }
 clean-parser = { path = "first-party/clean/crates/clean-parser" }
@@ -386,6 +427,25 @@ trust-wp = { path = "crates/trust-wp" }
 trust-vc-bridge = { path = "crates/trust-vc-bridge" }
 trust-loop = { path = "crates/trust-loop" }
 trust-transval = { path = "crates/trust-transval" }
+# trust: PHASE 1 SUPPLY-CHAIN REPLACEMENT — the Trust-owned crypto primitives,
+# mirroring `crates/Cargo.toml:372-379`.
+#
+# `trust-sha2` is MANDATORY here, not cosmetic: `crates/trust-hmac/Cargo.toml`
+# and `crates/trust-ed25519/Cargo.toml` both write `trust-sha2 = { workspace =
+# true }`, and a workspace member that inherits a name this table does not
+# define is a manifest-LOAD failure — "`dependency.trust-sha2` was not found in
+# `workspace.dependencies`" — raised while loading the WORKSPACE, so it reds
+# every root cargo/x.py command, not just those two members. That is why the
+# `members` additions above, these four lines, and the `sha2`/`hmac`/
+# `ed25519-dalek` rewrites below are ONE change: any prefix of them fails to
+# load.
+trust-sha2 = { path = "crates/trust-sha2" }
+trust-hmac = { path = "crates/trust-hmac" }
+trust-ed25519 = { path = "crates/trust-ed25519" }
+# The one production consumer is `trust-proof-cert`, which names this directly
+# rather than through a `rand` alias — see the retired `rand` entry below.
+trust-rand = { path = "crates/trust-rand" }
+trust-ratio = { path = "crates/trust-ratio" }
 fs2 = "0.4"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
@@ -394,18 +454,74 @@ rayon = "1.10"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+# trust: PHASE 1a. The name resolves to the Trust-owned crate through Cargo's
+# dependency RENAMING. Every member writing `sha2 = { workspace = true }` and
+# `use sha2::{Digest, Sha256}` compiles verbatim; the crate behind the name is
+# ours. This is the ROOT half of the rename that `crates/Cargo.toml` already
+# carries — and the half that reaches the shipped compiler, since rustc-main ->
+# rustc_interface -> rustc_mir_transform -> trust-router -> trust-proof-cert.
+#
+# The acceptance gates stay REAL: `crates/trust-sha2` and `crates/trust-hmac`
+# dev-depend on the incumbents by EXPLICIT VERSION (`sha2 = "0.10"`, `hmac =
+# "0.12"`), not through this table, so `tests/differential_sha2.rs` and
+# `tests/differential_hmac.rs` keep comparing against crates.io rather than
+# against themselves.
+sha2 = { package = "trust-sha2", path = "crates/trust-sha2" }
 tempfile = "3"
 # trust #837: Deterministic hashing for compilation reproducibility
 rustc-hash = "2.0.0"
 indexmap = "2.7"
-hmac = "0.12"
-toml = "0.8"
+# trust: PHASE 1a, same rename mechanism as `sha2` above. `trust-hmac` depends
+# only on `trust-sha2` — HMAC is defined over a hash — so this edge adds no
+# third-party closure.
+hmac = { package = "trust-hmac", path = "crates/trust-hmac" }
+# trust: PHASE 1e, same rename mechanism as `sha2` above — and, like `sha2`,
+# this is the ROOT half. `trust-deps`, `trust-version`, `trust-bmc` and
+# `trust-router` are members of BOTH workspaces; without this line the same four
+# crates would compile against `trust-toml` under `crates/` and against the
+# incumbent `toml` under the root, i.e. two different TOML implementations
+# depending on which workspace built them.
+#
+# The acceptance gate stays REAL for the same reason it does in
+# `crates/Cargo.toml`: `crates/trust-toml` dev-depends on `toml 0.8.23` by
+# explicit version, not through this table.
+toml = { package = "trust-toml", path = "crates/trust-toml" }
 num-bigint = "0.4"
 bincode = "1.3"
 proptest = "1.11"
-ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
-rand = "0.8"
+# trust: PHASE 1d, same rename mechanism. Retires the incumbent's 34-package
+# closure — `curve25519-dalek(+derive)`, `fiat-crypto`, `ed25519`, `signature`,
+# `subtle`, `zeroize`, `rand_core` — from the compiler's own runtime graph.
+#
+# BOTH FEATURES ARE GONE, AND THAT IS NOT AN OVERSIGHT. `trust-ed25519`
+# declares no `[features]` at all, and Cargo hard-errors on a feature a renamed
+# dependency does not have ("... depends on X with feature `serde` but X does
+# not have that feature"), so a stale list here is a build stopper rather than
+# a silent no-op.
+#   * `rand_core` existed only to reach `SigningKey::generate`, whose bound is
+#     the third-party `rand_core::CryptoRngCore`. `trust-ed25519` deliberately
+#     omits that constructor; `trust-proof-cert::CertSigningKey::generate` now
+#     seeds `from_bytes` with `trust_rand::secret_seed_32()`, and the two
+#     spellings are proved equal by
+#     `crates/trust-rand/tests/ed25519_equivalence.rs`.
+#   * `serde` was UNUSED, verified rather than assumed: `trust-proof-cert` is
+#     the sole reverse-dependency of this entry in the root graph, no dalek
+#     type appears in any `#[derive(Serialize)]`/`Deserialize` there, and
+#     `CertificateSignature` stores the signature and public key as `Vec<u8>`
+#     it encodes itself.
+ed25519-dalek = { package = "trust-ed25519", path = "crates/trust-ed25519" }
+# `rand` IS GONE from this table. It had exactly one reverse-dependency here —
+# `trust-proof-cert`, for one 32-byte keygen draw — and that call site now uses
+# `trust-rand` directly. No rustc crate inherits `rand` from the workspace:
+# `rustc_incremental`, `rustc_interface`, `rustc_abi` and `rustc_thread_pool`
+# each pin `rand = "0.9.x"` explicitly, so `rand` remains in the lockfile for
+# them and this deletion cannot affect their build.
+#
+# Deliberately NOT replaced by `rand = { package = "trust-rand", ... }`:
+# sha2/hmac/ed25519-dalek are drop-ins, so renaming their names is a
+# zero-source-edit swap, but `rand`'s surface is enormous and `trust-rand`
+# implements the one function this tree called. An alias would make every other
+# `rand::` path resolve to nothing and report the error at the CONSUMER.
 reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
 libc = "0.2"
 # Trust: inherited by crates/trust-router (`tracing.workspace = true`, optional,
@@ -457,3 +573,4 @@ trust-wasm-bridge = { path = "crates/trust-wasm-bridge" }
 # NativeProofAuthority).
 trust-ir = { path = "first-party/trust-ir/crates/trust-ir", features = ["clean-expr"] }
 trust-ir-build = { path = "first-party/trust-ir/crates/trust-ir-build" }
+trust-ir-conformance = { path = "first-party/trust-ir/crates/trust-ir-conformance" }

@@ -24,22 +24,50 @@
 #![allow(clippy::all)]
 
 // ---- A. intent wrappers (resolve to the generic core cmp bodies) ----
-pub fn w_ord_min_i32(a: i32, b: i32) -> i32 { core::cmp::Ord::min(a, b) }
-pub fn w_ord_max_i32(a: i32, b: i32) -> i32 { core::cmp::Ord::max(a, b) }
-pub fn w_cmp_min_i32(a: i32, b: i32) -> i32 { core::cmp::min(a, b) }
-pub fn w_cmp_max_i32(a: i32, b: i32) -> i32 { core::cmp::max(a, b) }
-pub fn w_clamp_i32(x: i32, lo: i32, hi: i32) -> i32 { x.clamp(lo, hi) }
-pub fn w_min_u8(a: u8, b: u8) -> u8 { a.min(b) }
-pub fn w_max_u8(a: u8, b: u8) -> u8 { a.max(b) }
+pub fn w_ord_min_i32(a: i32, b: i32) -> i32 {
+    core::cmp::Ord::min(a, b)
+}
+pub fn w_ord_max_i32(a: i32, b: i32) -> i32 {
+    core::cmp::Ord::max(a, b)
+}
+pub fn w_cmp_min_i32(a: i32, b: i32) -> i32 {
+    core::cmp::min(a, b)
+}
+pub fn w_cmp_max_i32(a: i32, b: i32) -> i32 {
+    core::cmp::max(a, b)
+}
+pub fn w_clamp_i32(x: i32, lo: i32, hi: i32) -> i32 {
+    x.clamp(lo, hi)
+}
+pub fn w_min_u8(a: u8, b: u8) -> u8 {
+    a.min(b)
+}
+pub fn w_max_u8(a: u8, b: u8) -> u8 {
+    a.max(b)
+}
 
 // ---- B. select-lane-reach controls (concrete-int, primitive `Lt`/`Gt`) ----
 // min: mirror `Ord::min(self=a, other=b) = if other < self { other } else { self }`
-pub fn ctl_min_i32(a: i32, b: i32) -> i32 { if b < a { b } else { a } }
+pub fn ctl_min_i32(a: i32, b: i32) -> i32 {
+    if b < a { b } else { a }
+}
 // max: mirror `Ord::max(self=a, other=b) = if other < self { self } else { other }`
-pub fn ctl_max_i32(a: i32, b: i32) -> i32 { if b < a { a } else { b } }
+pub fn ctl_max_i32(a: i32, b: i32) -> i32 {
+    if b < a { a } else { b }
+}
 // clamp: mirror concrete `clamp` (minus the min<=max assert): two nested selects
 pub fn ctl_clamp_i32(x: i32, lo: i32, hi: i32) -> i32 {
-    if x < lo { lo } else if x > hi { hi } else { x }
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
 }
-pub fn ctl_min_u8(a: u8, b: u8) -> u8 { if b < a { b } else { a } }
-pub fn ctl_max_u8(a: u8, b: u8) -> u8 { if b < a { a } else { b } }
+pub fn ctl_min_u8(a: u8, b: u8) -> u8 {
+    if b < a { b } else { a }
+}
+pub fn ctl_max_u8(a: u8, b: u8) -> u8 {
+    if b < a { a } else { b }
+}

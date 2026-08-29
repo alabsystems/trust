@@ -36,8 +36,9 @@
 //! it is a rare own-effect/panic/nondet source with no legitimate coverage cost,
 //! whereas here it is common benign scaffolding.)
 
-use crate::{BasicBlock, BlockId, Terminator, VerifiableFunction};
 use std::collections::HashMap;
+
+use crate::{BasicBlock, BlockId, Terminator, VerifiableFunction};
 
 /// The successor blocks a terminator may branch to (empty for the leaves
 /// `Return`, `Unreachable`, `Resume`, and a `Call` with no return target).
@@ -54,7 +55,10 @@ pub fn terminator_successors(t: &Terminator) -> Vec<BlockId> {
         Terminator::Assert { target, .. } => vec![*target],
         Terminator::Drop { target, .. } => vec![*target],
         Terminator::Opaque { targets, .. } => targets.clone(),
-        Terminator::Return | Terminator::Unreachable | Terminator::Resume => Vec::new(),
+        Terminator::Return
+        | Terminator::TailCall { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => Vec::new(),
     }
 }
 
@@ -117,8 +121,7 @@ mod tests {
     #[test]
     fn straight_line_is_loop_free() {
         // bb0 → bb1 → return.
-        let blocks =
-            vec![block(0, Terminator::Goto(BlockId(1))), block(1, Terminator::Return)];
+        let blocks = vec![block(0, Terminator::Goto(BlockId(1))), block(1, Terminator::Return)];
         assert!(is_loop_free(&blocks));
     }
 

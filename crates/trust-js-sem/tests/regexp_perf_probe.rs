@@ -8,9 +8,10 @@
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
 use trust_js_sem::evaluate_case_opts;
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -47,7 +48,10 @@ fn frontmatter(body: &str) -> (Vec<String>, Vec<String>) {
             let rest = rest.trim();
             if let Some(inner) = rest.strip_prefix('[') {
                 includes.extend(
-                    inner.trim_end_matches(']').split(',').map(|s| s.trim().to_string())
+                    inner
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
                 );
             } else {
@@ -63,7 +67,10 @@ fn frontmatter(body: &str) -> (Vec<String>, Vec<String>) {
         } else if let Some(rest) = t.strip_prefix("flags:") {
             if let Some(inner) = rest.trim().strip_prefix('[') {
                 flags.extend(
-                    inner.trim_end_matches(']').split(',').map(|s| s.trim().to_string())
+                    inner
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
                 );
             }
@@ -101,16 +108,21 @@ fn regexp_perf_probe_sem_only() {
     }
     let corpus = std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string());
     let corpus = PathBuf::from(corpus);
-    let harness = |n: &str| std::fs::read_to_string(corpus.join("harness").join(n)).unwrap_or_default();
+    let harness =
+        |n: &str| std::fs::read_to_string(corpus.join("harness").join(n)).unwrap_or_default();
     let assert_js = harness("assert.js");
     let sta_js = harness("sta.js");
-    let threshold_ms: u128 = std::env::var("TRUST_JS_RE_PERF_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let threshold_ms: u128 =
+        std::env::var("TRUST_JS_RE_PERF_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
 
     let progress_path = std::env::var("TRUST_JS_RE_PERF_PROGRESS")
         .unwrap_or_else(|_| "/tmp/re_perf_progress.txt".to_string());
 
     let only = std::env::var("TRUST_JS_RE_PERF_ONLY").ok(); // substring filter
-    let cap: usize = std::env::var("TRUST_JS_RE_PERF_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let cap: usize = std::env::var("TRUST_JS_RE_PERF_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     let mut slow: Vec<(u128, String)> = Vec::new();
     let mut panicked: Vec<String> = Vec::new();
@@ -133,16 +145,27 @@ fn regexp_perf_probe_sem_only() {
                 continue;
             }
             let raw = flags.iter().any(|f| f == "raw");
-            let mut inc_src: Vec<String> = if raw { Vec::new() } else { vec![assert_js.clone(), sta_js.clone()] };
+            let mut inc_src: Vec<String> =
+                if raw { Vec::new() } else { vec![assert_js.clone(), sta_js.clone()] };
             let mut ok = true;
             for name in &incs {
                 let p = corpus.join("harness").join(name);
-                if !p.is_file() { ok = false; break; }
+                if !p.is_file() {
+                    ok = false;
+                    break;
+                }
                 inc_src.push(std::fs::read_to_string(&p).unwrap_or_default());
             }
-            if !ok { continue; }
-            let modes: &[bool] = if flags.iter().any(|f| f == "onlyStrict") { &[true] }
-                else if raw || flags.iter().any(|f| f == "noStrict") { &[false] } else { &[false, true] };
+            if !ok {
+                continue;
+            }
+            let modes: &[bool] = if flags.iter().any(|f| f == "onlyStrict") {
+                &[true]
+            } else if raw || flags.iter().any(|f| f == "noStrict") {
+                &[false]
+            } else {
+                &[false, true]
+            };
             let rel = path.strip_prefix(&corpus).unwrap_or(&path).display().to_string();
             for &strict in modes {
                 let body2 = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
@@ -166,7 +189,11 @@ fn regexp_perf_probe_sem_only() {
             }
         }
     }
-    eprintln!("\n== perf probe: {n} evals; {} slow (>= {threshold_ms}ms); {} panics ==", slow.len(), panicked.len());
+    eprintln!(
+        "\n== perf probe: {n} evals; {} slow (>= {threshold_ms}ms); {} panics ==",
+        slow.len(),
+        panicked.len()
+    );
     slow.sort_by(|a, b| b.0.cmp(&a.0));
     for (ms, name) in slow.iter().take(40) {
         eprintln!("  {ms}ms  {name}");

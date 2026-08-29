@@ -3,7 +3,7 @@ use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, Toke
 use rustc_errors::ErrorGuaranteed;
 use rustc_expand::base::{AttrProcMacro, ExtCtxt};
 use rustc_span::Span;
-use rustc_span::symbol::{Ident, Symbol, kw};
+use rustc_span::symbol::{Ident, Symbol, kw, sym};
 
 pub(crate) struct ExpandRequires;
 
@@ -66,6 +66,141 @@ impl AttrProcMacro for ExpandTrustEnsures {
         annotated: TokenStream,
     ) -> Result<TokenStream, ErrorGuaranteed> {
         expand_contract_clause_tts(ecx, span, annotation, annotated, kw::TrustContractEnsures)
+    }
+}
+
+/// Trust (D4, "one implementation, two surfaces"): the compat desugaring for a
+/// first-class clause that has NO second implementation to desugar into.
+///
+/// `ExpandTrustRequires` / `ExpandTrustEnsures` inject a dedicated Trust clause
+/// KEYWORD plus a braced payload, which the parser then routes to its own
+/// `TrustContractClause` code path — a second implementation that has already
+/// drifted from the native one it is supposed to mirror. This expander instead
+/// injects the NATIVE CLAUSE SPELLING VERBATIM: the contextual clause ident
+/// followed by the author's own payload tokens, unwrapped. The token stream
+/// handed to the parser is then byte-for-byte the stream the author would have
+/// produced by writing the first-class clause directly, so
+///
+///     #[trust::decreases(e)]  fn f(..) -> T { .. }
+///     fn f(..) -> T decreases e { .. }
+///
+/// cannot diverge: there is nothing to diverge, only one parse and one lane.
+/// That is design-of-record v3's "attribute spellings = compat desugaring only"
+/// made literal rather than asserted.
+///
+/// The payload is deliberately NOT brace-wrapped. Braces would reintroduce a
+/// distinguishable attribute-origin form and hand the parser a token shape no
+/// author can write, which is exactly how the requires/ensures lanes drifted.
+/// An empty payload therefore reaches the native clause parser as a missing
+/// predicate and is refused there ("expected a predicate expression after the
+/// contract clause keyword") rather than being silently dropped here.
+fn expand_trust_native_clause_tts(
+    ecx: &mut ExtCtxt<'_>,
+    attr_span: Span,
+    annotation: TokenStream,
+    annotated: TokenStream,
+    clause_ident: Symbol,
+) -> Result<TokenStream, ErrorGuaranteed> {
+    // Def-site context for the injected clause ident only. The payload tokens
+    // keep the author's own spans and hygiene: they are verifier vocabulary
+    // that the native lane never name-resolves, and their spans are what the
+    // clause diagnostics point at.
+    let ident_span = ecx.with_def_site_ctxt(attr_span);
+    expand_contract_clause(ecx, attr_span, annotated, |new_tts| {
+        new_tts.push_tree(TokenTree::Token(
+            token::Token::from_ast_ident(Ident::new(clause_ident, ident_span)),
+            Spacing::Alone,
+        ));
+        for tt in annotation.iter() {
+            new_tts.push_tree(tt.clone());
+        }
+        Ok(())
+    })
+}
+
+pub(crate) struct ExpandTrustDecreases;
+
+impl AttrProcMacro for ExpandTrustDecreases {
+    fn expand<'cx>(
+        &self,
+        ecx: &'cx mut ExtCtxt<'_>,
+        span: Span,
+        annotation: TokenStream,
+        annotated: TokenStream,
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        expand_trust_native_clause_tts(ecx, span, annotation, annotated, sym::decreases)
+    }
+}
+
+/// Trust: the refusal expander for `#[trust::invariant(..)]`.
+///
+/// This is deliberately NOT a lowering, and it must never become one.
+///
+/// WHAT IT REPLACES. `trust-spec` exports an `invariant` passthrough proc
+/// macro, and until this expander existed the resolver had no mapping for it,
+/// so the proc macro RAN and returned the item unchanged. MEASURED on
+/// `trust-e26541e3`: a file carrying `#[trust::invariant(false)]` and the same
+/// file with the attribute deleted produce a BIT-IDENTICAL obligation set, and
+/// `#[trust::invariant(this is not even an expression ~~~)]` compiles clean with
+/// exit 0. The attribute looked like a specification and contributed nothing —
+/// a reader, and a ratchet, would both count it as a guarantee.
+///
+/// WHY REFUSE RATHER THAN LOWER. There is no defined semantics for a
+/// function-position `invariant`:
+///
+/// * The real loop-invariant machinery is keyed to a loop.
+///   `rustc_hir::LoopClause::loop_id` is documented as "the authoritative
+///   in-crate association key" for the `while` expression the clause belongs
+///   to. An attribute on a function has no loop to bind to.
+/// * The one existing non-loop target, `trust_types::VcKind::ContractInvariant`,
+///   carries only the clause text and no program point: `trust-vcgen` refutes it
+///   as a bare `Not(predicate)`. MEASURED via the `register_tool` lane, that
+///   makes the obligation PROVED exactly when the predicate is a TAUTOLOGY —
+///   `#[trust::invariant(1 == 1)]` reports `outcome=proved` while the same
+///   function's real `overflow:add` obligation stays `failed`. Routing this
+///   attribute there would not merely fail to help; it would MANUFACTURE a
+///   proved row that constrains nothing and inflate the verified count.
+///
+/// So the fragment is not widened by approximation. The construct is named and
+/// refused, and the diagnostic carries the fixes that do have exact semantics.
+pub(crate) struct ExpandTrustInvariant;
+
+impl AttrProcMacro for ExpandTrustInvariant {
+    fn expand<'cx>(
+        &self,
+        ecx: &'cx mut ExtCtxt<'_>,
+        span: Span,
+        _annotation: TokenStream,
+        _annotated: TokenStream,
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        // Fail closed and fail LOUD. Returning `Err` aborts expansion of this
+        // item, so no silently-unverified code can reach codegen.
+        Err(ecx
+            .sess
+            .dcx()
+            .struct_span_err(span, "`trust::invariant` is not a verified contract surface")
+            .with_note(
+                "this attribute used to be accepted and silently discarded: it produced no \
+                 obligation and no diagnostic, so it stated a guarantee that was never checked",
+            )
+            .with_note(
+                "an `invariant` must name the program point it constrains; an attribute on an \
+                 item has no loop to bind to, so it has no exact meaning to lower",
+            )
+            .with_help(
+                "for a loop invariant, use the first-class loop clause: \
+                 `while <cond> invariant <predicate> { ... }` or \
+                 `loop invariant <predicate> { ... }`",
+            )
+            .with_help(
+                "for a condition that must hold on entry, use `#[trust::requires(<predicate>)]`",
+            )
+            .with_help(
+                "for a condition that must hold on return, use \
+                 `#[trust::ensures(move |r: &T| <predicate>)]`",
+            )
+            .with_help("otherwise delete the attribute: leaving it in place states nothing")
+            .emit())
     }
 }
 

@@ -7,17 +7,19 @@
 // `trust_clean_extern_readmission` query for every def its exporting crate
 // lists in `trust_clean_origin_exports`, BEFORE serving the decoded body.
 // This provider either RETURNS — the digest decoded whole, the exporter's
-// island sources re-elaborated under the LOCAL kernel, `readmit` accepted
-// every field, and every decodable body row re-passed the faithfulness gate
-// locally — or FATALS with the refusal's v7/D3 note. There is no third
-// outcome, and there is no partial acceptance.
+// island sources re-elaborated under the LOCAL kernel, every decodable body
+// row re-passed the faithfulness gate locally, and `readmit` accepted every
+// field INCLUDING the locally observed proof method — or FATALS with the
+// refusal's v7/D3 note. There is no third outcome and no partial acceptance.
 //
 // THE ACCEPTANCE CONTROL, verbatim from the design: "an imported certificate
 // minted under a different kernel version must be re-checked or refused,
-// never accepted on a matching source hash." This wave REFUSES on skew:
-// `readmit` puts the kernel-version comparison first, and the local
-// re-check-and-mint lane stays the seam `trust-clean-origin/src/admission.rs`
-// documents (module docs, "The re-check seam") — deliberately not built here.
+// never accepted on a matching source hash." This provider REFUSES on skew
+// before constructing an environment. On a matching version it still treats
+// the digest only as a claim: cheap wire/environment/carrier preflight runs
+// first, then every available imported MIR row earns sealed local gate evidence
+// and `readmit` binds that evidence to the preflight. Wire metadata never
+// supplies proof authority.
 //
 // Not behind `verification_enabled`, `-Ztrust-verify=off`, or `TRUST_NO_VERIFY`
 // — the same rule as the sole local constructor (clean_origin_mir.rs). An
@@ -25,17 +27,18 @@
 // with the declaration it was minted from.
 //
 // COST, stated: one `CleanIslandSession::check_all` (a full kernel
-// elaboration of the exporting crate's islands) plus one `admit_lowering`
-// kernel run per decodable MIR row, per imported Clean-origin def actually
-// used, per session. None of it is incrementally cached (design doc §8 — a
-// defeq verdict is not incrementally cacheable), and folding these runs into
-// the exporter's would trade independence for compile time; do not.
+// elaboration of the exporting crate's islands), one bounded planning pass
+// (which may run the declaration-wide structural-induction search), and one
+// `admit_lowering` kernel run per decodable MIR row, per imported Clean-origin
+// def actually used, per session. None of it is incrementally cached (design
+// doc §8 — a faithfulness verdict is not incrementally cacheable), and folding
+// these runs into the exporter's would trade independence for compile time;
+// do not.
 
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::bug;
 use rustc_middle::mir::Body;
 use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_span::Span;
 use trust_clean_origin::VerdictDigest;
 
 use crate::clean_origin_mir;
@@ -111,7 +114,29 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
             .emit(),
     };
 
-    // ── 3. rebuild the EXPORTER's Clean environment LOCALLY, under the
+    // ── 3. reject stale-kernel and assumption-bearing CALL rows BEFORE
+    //       rebuilding the exporter environment or starting any proof search.
+    //       The sealed result is bound to that environment below. ──────────
+    let wire_preflight = match trust_clean_origin::preflight_wire(
+        &digest,
+        trust_clean_origin::local_kernel_version(),
+    ) {
+        Ok(preflight) => preflight,
+        Err(refusal) => tcx
+            .dcx()
+            .struct_span_fatal(
+                span,
+                format!(
+                    "cannot import the Clean-origin certificate for `{decl}` from \
+                     `{krate}`",
+                    decl = refusal.decl(),
+                ),
+            )
+            .with_note(refusal.note())
+            .emit(),
+    };
+
+    // ── 4. rebuild the EXPORTER's Clean environment LOCALLY, under the
     //       IMPORTER's kernel — the sources are transport, never authority ──
     let sources = tcx.trust_clean_island_sources(def.krate);
     let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
@@ -162,17 +187,11 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
         );
     };
 
-    // ── 4. readmit: every digest field against the LOCAL kernel version and
-    //       the LOCALLY recomputed content. KernelVersionSkew refuses FIRST —
-    //       the acceptance control — and `LocalCarrierWidthUnencodable` is
-    //       `readmit`'s own fail-closed arm for a local carrier decision
-    //       outside wire format v1's exact fixed widths (unbounded carriers):
-    //       consumed here via the ordinary refusal surface, not duplicated. ──
-    match trust_clean_origin::readmit(&digest, trust_clean_origin::local_kernel_version(), env) {
-        // `Readmitted` is crate-side sealed evidence; it is deliberately
-        // dropped here. This query RUNNING TO COMPLETION is the compiler-side
-        // fact the chokepoint consumes.
-        Ok(_readmitted) => {}
+    // Bind the remaining cheap claims (environment, closure, carriers) before
+    // planning or running induction. A corrupt digest therefore cannot buy
+    // proof-search work merely by decoding successfully.
+    let preflight = match trust_clean_origin::bind_readmission(&wire_preflight, env) {
+        Ok(preflight) => preflight,
         Err(refusal) => tcx
             .dcx()
             .struct_span_fatal(
@@ -185,6 +204,38 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
             )
             .with_note(refusal.note())
             .emit(),
+    };
+
+    // The signature every call in THIS crate was type-checked against is the
+    // exporter's ENCODED `fn_sig`. Compare it with the already-bound local
+    // carrier decision BEFORE planning (which may use induction).
+    let fed = tcx.fn_sig(def).instantiate_identity().skip_binder();
+    let expected_inputs: Vec<Ty<'_>> = preflight
+        .signature()
+        .arguments()
+        .iter()
+        .map(|carrier| clean_origin_mir::carrier_to_rustc_ty(tcx, carrier.rust(), span))
+        .collect();
+    let expected_output =
+        clean_origin_mir::carrier_to_rustc_ty(tcx, preflight.signature().result().rust(), span);
+    if fed.inputs() != expected_inputs.as_slice() || fed.output() != expected_output {
+        tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: refusing to import Clean-origin `{decl}` from `{krate}` — \
+                 the Rust signature its metadata declares (`fn({:?}) -> {:?}`) is not \
+                 the one its discharged carriers denote here (`fn({:?}) -> {:?}`). \
+                 Every call in this crate was type-checked against the first and the \
+                 re-gated body computes at the second, which no kernel check can \
+                 catch. This is a compiler defect and nothing you write will change \
+                 it. Please report it.",
+                fed.inputs(),
+                fed.output(),
+                expected_inputs,
+                expected_output,
+                decl = digest.decl(),
+            ),
+        );
     }
 
     // ── 5. the LOCAL re-gate — the closure of I7 risk R4: a version string is
@@ -222,33 +273,14 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
             .with_note(refusal.note())
             .emit(),
     };
-
-    // The signature every call in THIS crate was type-checked against is the
-    // exporter's ENCODED `fn_sig`; a divergence from the plan's carriers is
-    // the wrong binary no kernel check sees (the cross-crate mirror of the
-    // sole constructor's `check_signature_agrees`).
-    let fed = tcx.fn_sig(def).instantiate_identity().skip_binder();
-    let expected_inputs: Vec<Ty<'_>> = plan
-        .param_tys()
-        .iter()
-        .map(|ty| clean_origin_mir::carrier_to_rustc_ty(tcx, ty, span))
-        .collect();
-    let expected_output = clean_origin_mir::carrier_to_rustc_ty(tcx, plan.return_ty(), span);
-    if fed.inputs() != expected_inputs.as_slice() || fed.output() != expected_output {
+    if plan.signature() != preflight.signature() {
         tcx.dcx().span_fatal(
             span,
             format!(
                 "internal: refusing to import Clean-origin `{decl}` from `{krate}` — \
-                 the Rust signature its metadata declares (`fn({:?}) -> {:?}`) is not \
-                 the one its discharged carriers denote here (`fn({:?}) -> {:?}`). \
-                 Every call in this crate was type-checked against the first and the \
-                 re-gated body computes at the second, which no kernel check can \
-                 catch. This is a compiler defect and nothing you write will change \
-                 it. Please report it.",
-                fed.inputs(),
-                fed.output(),
-                expected_inputs,
-                expected_output,
+                 the emission plan recomputed after ABI preflight has a different \
+                 carrier signature from the one preflight bound. No body gate ran. \
+                 This is a compiler planning defect; please report it.",
                 decl = digest.decl(),
             ),
         );
@@ -258,17 +290,17 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
     // that flips the CTFE table choice must not route around the gate). The
     // raw `_unreadmitted_` queries exist precisely so this does not re-enter
     // the guarded arms' ensure (I7 risk R3).
+    let mut observed_method = None;
     for (lane, body) in [
         ("optimized_mir", tcx.trust_clean_extern_unreadmitted_optimized_mir(def)),
         ("mir_for_ctfe", tcx.trust_clean_extern_unreadmitted_mir_for_ctfe(def)),
     ] {
         let Some(body) = body else { continue };
         let extracted = trust_mir_extract::extract_function(tcx, body);
-        match trust_clean_origin::admit_lowering(env, &plan, &extracted) {
-            // Same discipline as the sole constructor: the `Faithful` is the
-            // permission, and it is dropped so that reaching the next line is
-            // impossible without the gate having run.
-            Ok(_faithful) => {}
+        let local = match trust_clean_origin::locally_recheck_imported_body(
+            &preflight, &plan, &extracted,
+        ) {
+            Ok(local) => local,
             Err(refusal) => tcx
                 .dcx()
                 .struct_span_fatal(
@@ -276,8 +308,8 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                     if refusal.is_compiler_defect() {
                         format!(
                             "internal: the imported `{lane}` body of Clean-origin \
-                             `{decl}` from `{krate}` does not agree with its \
-                             declaration under this compiler's kernel",
+                             `{decl}` from `{krate}` could not be established to agree \
+                             with its declaration under this compiler's kernel",
                             decl = digest.decl(),
                         )
                     } else {
@@ -290,8 +322,55 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
                 )
                 .with_note(refusal.note())
                 .emit(),
+        };
+        let readmitted = match trust_clean_origin::readmit(&preflight, &local) {
+            Ok(readmitted) => readmitted,
+            Err(refusal) => tcx
+                .dcx()
+                .struct_span_fatal(
+                    span,
+                    format!(
+                        "cannot import the Clean-origin certificate for `{decl}` from \
+                         `{krate}`",
+                        decl = refusal.decl(),
+                    ),
+                )
+                .with_note(refusal.note())
+                .emit(),
+        };
+        match observed_method {
+            None => observed_method = Some(readmitted.method()),
+            Some(previous) if previous == readmitted.method() => {}
+            Some(previous) => tcx.dcx().span_fatal(
+                span,
+                format!(
+                    "internal: the imported MIR rows for Clean-origin `{decl}` from \
+                     `{krate}` re-check by different proof methods ({previous:?} \
+                     versus {current:?}). One certificate cannot authorize two \
+                     different local derivations. Please report it.",
+                    decl = digest.decl(),
+                    current = readmitted.method(),
+                ),
+            ),
         }
     }
+
+    if observed_method.is_none() {
+        tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: Clean-origin `{decl}` from `{krate}` is listed for \
+                 re-admission, but neither optimized MIR nor CTFE MIR was decodable. \
+                 Refusing a certificate with no locally checked body. Please report it.",
+                decl = digest.decl(),
+            ),
+        );
+    }
+
+    // Reaching here means every available body row independently produced a
+    // sealed local check, matched the preflighted wire, and agreed on method.
+    // Completing this query is the compiler-side authority consumed by the
+    // metadata chokepoints; no transferable token or wire claim escapes it.
 }
 
 /// LOCAL arm of `trust_clean_extern_unreadmitted_optimized_mir` — a bug, on

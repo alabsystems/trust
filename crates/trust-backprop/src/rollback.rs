@@ -10,11 +10,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use trust_types::fx::FxHashMap;
 
 use serde::{Deserialize, Serialize};
-use trust_types::stable_sha256_hex;
 use thiserror::Error;
+use trust_types::fx::FxHashMap;
+use trust_types::stable_sha256_hex;
 
 /// Errors from checkpoint and rollback operations.
 #[derive(Debug, Error)]
@@ -425,8 +425,9 @@ fn generate_checkpoint_id(snapshots: &[FileSnapshot]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
+    use super::*;
 
     /// Create a unique, isolated temp directory for a test.
     /// Returns a `TempDir` that auto-cleans on drop -- no manual cleanup needed.
@@ -569,9 +570,10 @@ mod tests {
         let f1 = write_test_file(dir.path(), "a.rs", "fn original() {}\n");
         let ckpt = create_checkpoint(std::slice::from_ref(&f1)).unwrap();
         fs::write(&f1, "fn external() {}\n").unwrap();
-        let expected = [(f1.canonicalize().unwrap(), stable_sha256_hex(b"fn transaction_owned() {}\n"))]
-            .into_iter()
-            .collect();
+        let expected =
+            [(f1.canonicalize().unwrap(), stable_sha256_hex(b"fn transaction_owned() {}\n"))]
+                .into_iter()
+                .collect();
 
         assert!(matches!(
             rollback_if_unchanged(&ckpt, &expected),

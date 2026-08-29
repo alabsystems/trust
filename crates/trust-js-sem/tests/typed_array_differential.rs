@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -99,122 +100,317 @@ fn cases() -> Vec<Case> {
     };
 
     // ---- globals / typeof / harness population ---------------------------
-    c("ta-typeof", C,
-      "console.log(typeof Int8Array, typeof Float64Array, typeof Uint8ClampedArray, typeof Float16Array, typeof BigInt64Array, typeof ArrayBuffer, typeof DataView);");
-    c("ta-typedarray-intrinsic", C,
-      "console.log(Object.getPrototypeOf(Int8Array) === Object.getPrototypeOf(Float64Array), Object.getPrototypeOf(Int8Array).name);");
-    c("ta-bpe", C,
-      "console.log(Int8Array.BYTES_PER_ELEMENT, Float64Array.BYTES_PER_ELEMENT, Uint16Array.BYTES_PER_ELEMENT, Int8Array.prototype.BYTES_PER_ELEMENT);");
-    c("ta-names", C,
-      "console.log(Int8Array.name, Uint8ClampedArray.name, Float32Array.name, Int8Array.length);");
+    c(
+        "ta-typeof",
+        C,
+        "console.log(typeof Int8Array, typeof Float64Array, typeof Uint8ClampedArray, typeof Float16Array, typeof BigInt64Array, typeof ArrayBuffer, typeof DataView);",
+    );
+    c(
+        "ta-typedarray-intrinsic",
+        C,
+        "console.log(Object.getPrototypeOf(Int8Array) === Object.getPrototypeOf(Float64Array), Object.getPrototypeOf(Int8Array).name);",
+    );
+    c(
+        "ta-bpe",
+        C,
+        "console.log(Int8Array.BYTES_PER_ELEMENT, Float64Array.BYTES_PER_ELEMENT, Uint16Array.BYTES_PER_ELEMENT, Int8Array.prototype.BYTES_PER_ELEMENT);",
+    );
+    c(
+        "ta-names",
+        C,
+        "console.log(Int8Array.name, Uint8ClampedArray.name, Float32Array.name, Int8Array.length);",
+    );
 
     // ---- ArrayBuffer ------------------------------------------------------
-    c("ab-basic", C,
-      "var b = new ArrayBuffer(8); console.log(b.byteLength, b.maxByteLength, b.resizable, b.detached, b);");
-    c("ab-isview", C,
-      "console.log(ArrayBuffer.isView(new Int8Array(1)), ArrayBuffer.isView(new DataView(new ArrayBuffer(1))), ArrayBuffer.isView({}), ArrayBuffer.isView([]));");
-    c("ab-slice", C,
-      "var b = new ArrayBuffer(8); var u = new Uint8Array(b); u[0]=1;u[1]=2;u[2]=3;u[3]=4;\n\
-       var s = b.slice(1,3); var v = new Uint8Array(s); console.log(s.byteLength, v[0], v[1]);");
+    c(
+        "ab-basic",
+        C,
+        "var b = new ArrayBuffer(8); console.log(b.byteLength, b.maxByteLength, b.resizable, b.detached, b);",
+    );
+    c(
+        "ab-isview",
+        C,
+        "console.log(ArrayBuffer.isView(new Int8Array(1)), ArrayBuffer.isView(new DataView(new ArrayBuffer(1))), ArrayBuffer.isView({}), ArrayBuffer.isView([]));",
+    );
+    c(
+        "ab-slice",
+        C,
+        "var b = new ArrayBuffer(8); var u = new Uint8Array(b); u[0]=1;u[1]=2;u[2]=3;u[3]=4;\n\
+       var s = b.slice(1,3); var v = new Uint8Array(s); console.log(s.byteLength, v[0], v[1]);",
+    );
     c("ab-tostring-tag", C, "console.log(Object.prototype.toString.call(new ArrayBuffer(1)));");
     c("ab-species", C, "console.log(ArrayBuffer[Symbol.species] === ArrayBuffer);");
-    c("ab-toindex-rangeerror", C,
-      "var t=false; try { new ArrayBuffer(-1); } catch(e){ t = e instanceof RangeError; } console.log(t);");
-    c("ab-resizable", C,
-      "var b = new ArrayBuffer(4, {maxByteLength: 8}); console.log(b.byteLength, b.maxByteLength, b.resizable);\n\
-       b.resize(6); console.log(b.byteLength);");
-    c("ab-ctor-no-new", C,
-      "var t=false; try { ArrayBuffer(8); } catch(e){ t = e instanceof TypeError; } console.log(t);");
+    c(
+        "ab-toindex-rangeerror",
+        C,
+        "var t=false; try { new ArrayBuffer(-1); } catch(e){ t = e instanceof RangeError; } console.log(t);",
+    );
+    c(
+        "ab-resizable",
+        C,
+        "var b = new ArrayBuffer(4, {maxByteLength: 8}); console.log(b.byteLength, b.maxByteLength, b.resizable);\n\
+       b.resize(6); console.log(b.byteLength);",
+    );
+    c(
+        "ab-ctor-no-new",
+        C,
+        "var t=false; try { ArrayBuffer(8); } catch(e){ t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- typed array construction ----------------------------------------
-    c("ta-from-length", C, "var a = new Int8Array(3); console.log(a.length, a.byteLength, a.byteOffset, a[0], a);");
+    c(
+        "ta-from-length",
+        C,
+        "var a = new Int8Array(3); console.log(a.length, a.byteLength, a.byteOffset, a[0], a);",
+    );
     c("ta-from-array", C, "console.log(new Int16Array([10,20,30]));");
     c("ta-from-arraylike", C, "console.log(new Uint8Array({length:2, 0:5, 1:6}));");
     // Iterable path via an iterator OBJECT source: the array iterator is
     // driven through the (now modeled) %IteratorPrototype% self-return + the
     // intrinsic step, so `new Int8Array([...].values())` is exact.
     c("ta-from-iterator-object", C, "console.log(new Int8Array([1,2,3].values()));");
-    c("ta-from-typedarray", C, "var s = new Int32Array([1,2,3]); console.log(new Float64Array(s));");
-    c("ta-from-buffer", C,
-      "var b = new ArrayBuffer(8); var a = new Int8Array(b, 2, 3); console.log(a.length, a.byteOffset, a.byteLength, a.buffer === b);");
-    c("ta-from-buffer-auto", C,
-      "var b = new ArrayBuffer(8); var a = new Int16Array(b); console.log(a.length, a.byteOffset, a.byteLength);");
-    c("ta-from-buffer-badoffset", C,
-      "var b = new ArrayBuffer(8); var t=false; try { new Int32Array(b, 3); } catch(e){ t = e instanceof RangeError; } console.log(t);");
-    c("ta-string-len", C, "console.log(new Int8Array('3').length, new Int8Array(true).length, new Int8Array(null).length);");
-    c("ta-no-new", C,
-      "var t=false; try { Int8Array(3); } catch(e){ t = e instanceof TypeError; } console.log(t);");
-    c("ta-abstract-throws", C,
-      "var TA = Object.getPrototypeOf(Int8Array); var t=false; try { new TA(); } catch(e){ t = e instanceof TypeError; } console.log(t);");
+    c(
+        "ta-from-typedarray",
+        C,
+        "var s = new Int32Array([1,2,3]); console.log(new Float64Array(s));",
+    );
+    c(
+        "ta-from-buffer",
+        C,
+        "var b = new ArrayBuffer(8); var a = new Int8Array(b, 2, 3); console.log(a.length, a.byteOffset, a.byteLength, a.buffer === b);",
+    );
+    c(
+        "ta-from-buffer-auto",
+        C,
+        "var b = new ArrayBuffer(8); var a = new Int16Array(b); console.log(a.length, a.byteOffset, a.byteLength);",
+    );
+    c(
+        "ta-from-buffer-badoffset",
+        C,
+        "var b = new ArrayBuffer(8); var t=false; try { new Int32Array(b, 3); } catch(e){ t = e instanceof RangeError; } console.log(t);",
+    );
+    c(
+        "ta-string-len",
+        C,
+        "console.log(new Int8Array('3').length, new Int8Array(true).length, new Int8Array(null).length);",
+    );
+    c(
+        "ta-no-new",
+        C,
+        "var t=false; try { Int8Array(3); } catch(e){ t = e instanceof TypeError; } console.log(t);",
+    );
+    c(
+        "ta-abstract-throws",
+        C,
+        "var TA = Object.getPrototypeOf(Int8Array); var t=false; try { new TA(); } catch(e){ t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- element coercion -------------------------------------------------
-    c("ta-int8-wrap", C, "console.log(new Int8Array([300, -1, 128, 127])[0], new Int8Array([300])[0], new Uint8Array([300, -1])[0], new Uint8Array([-1])[0]);");
+    c(
+        "ta-int8-wrap",
+        C,
+        "console.log(new Int8Array([300, -1, 128, 127])[0], new Int8Array([300])[0], new Uint8Array([300, -1])[0], new Uint8Array([-1])[0]);",
+    );
     c("ta-clamp", C, "console.log(new Uint8ClampedArray([300,-5,1.5,2.5,3.5,0.5]).join(','));");
-    c("ta-int-nan-inf", C, "console.log(new Int32Array([NaN, Infinity, -Infinity, 1.9, -1.9]).join(','));");
-    c("ta-int16-32", C, "console.log(new Int16Array([70000])[0], new Uint32Array([-1])[0], new Uint16Array([-1])[0]);");
+    c(
+        "ta-int-nan-inf",
+        C,
+        "console.log(new Int32Array([NaN, Infinity, -Infinity, 1.9, -1.9]).join(','));",
+    );
+    c(
+        "ta-int16-32",
+        C,
+        "console.log(new Int16Array([70000])[0], new Uint32Array([-1])[0], new Uint16Array([-1])[0]);",
+    );
     c("ta-f32", C, "console.log(new Float32Array([0.1])[0], new Float32Array([1/3])[0]);");
-    c("ta-f16", C, "console.log(new Float16Array([1.1])[0], new Float16Array([0.1])[0], new Float16Array([65520])[0], new Float16Array([1/3])[0]);");
-    c("ta-f16-more", C, "console.log(new Float16Array([2.5, -2.5, 100000, 0.0001, NaN])[0], new Float16Array([100000])[0]);");
+    c(
+        "ta-f16",
+        C,
+        "console.log(new Float16Array([1.1])[0], new Float16Array([0.1])[0], new Float16Array([65520])[0], new Float16Array([1/3])[0]);",
+    );
+    c(
+        "ta-f16-more",
+        C,
+        "console.log(new Float16Array([2.5, -2.5, 100000, 0.0001, NaN])[0], new Float16Array([100000])[0]);",
+    );
     c("ta-f64", C, "console.log(new Float64Array([0.1])[0], new Float64Array([1/3])[0]);");
 
     // ---- integer-indexed exotic ------------------------------------------
-    c("ta-index-set", C, "var a = new Int8Array(3); a[0]=10; a[1]=20; a[2]=300; console.log(a[0],a[1],a[2],a);");
-    c("ta-oob", C, "var a = new Int8Array(3); a[5]=9; a[-1]=9; console.log(a[5], a[-1], a[3], a.length, a);");
-    c("ta-canonical-noncanonical", C, "var a = new Int8Array(3); a['1.5']=9; a['foo']=7; console.log(a['1.5'], a.foo, a[1], Object.keys(a).join(','));");
-    c("ta-in-has", C, "var a = new Int8Array(3); console.log(0 in a, 2 in a, 3 in a, 'length' in a);");
+    c(
+        "ta-index-set",
+        C,
+        "var a = new Int8Array(3); a[0]=10; a[1]=20; a[2]=300; console.log(a[0],a[1],a[2],a);",
+    );
+    c(
+        "ta-oob",
+        C,
+        "var a = new Int8Array(3); a[5]=9; a[-1]=9; console.log(a[5], a[-1], a[3], a.length, a);",
+    );
+    c(
+        "ta-canonical-noncanonical",
+        C,
+        "var a = new Int8Array(3); a['1.5']=9; a['foo']=7; console.log(a['1.5'], a.foo, a[1], Object.keys(a).join(','));",
+    );
+    c(
+        "ta-in-has",
+        C,
+        "var a = new Int8Array(3); console.log(0 in a, 2 in a, 3 in a, 'length' in a);",
+    );
     c("ta-delete", C, "var a = new Int8Array(3); console.log(delete a[0], delete a[5], a[0]);");
-    c("ta-keys-names", C, "var a = new Int8Array([7,8]); console.log(Object.keys(a).join(','), Object.getOwnPropertyNames(a).join(','));");
-    c("ta-getdesc", C, "var a = new Int8Array([5]); var d = Object.getOwnPropertyDescriptor(a, '0'); console.log(d.value, d.writable, d.enumerable, d.configurable);");
-    c("ta-hasown", C, "var a = new Int8Array([5]); console.log(a.hasOwnProperty('0'), a.hasOwnProperty('1'), a.hasOwnProperty('length'));");
+    c(
+        "ta-keys-names",
+        C,
+        "var a = new Int8Array([7,8]); console.log(Object.keys(a).join(','), Object.getOwnPropertyNames(a).join(','));",
+    );
+    c(
+        "ta-getdesc",
+        C,
+        "var a = new Int8Array([5]); var d = Object.getOwnPropertyDescriptor(a, '0'); console.log(d.value, d.writable, d.enumerable, d.configurable);",
+    );
+    c(
+        "ta-hasown",
+        C,
+        "var a = new Int8Array([5]); console.log(a.hasOwnProperty('0'), a.hasOwnProperty('1'), a.hasOwnProperty('length'));",
+    );
 
     // ---- accessors + tag --------------------------------------------------
-    c("ta-accessors", C, "var b = new ArrayBuffer(16); var a = new Int32Array(b, 4, 2); console.log(a.buffer===b, a.byteLength, a.byteOffset, a.length);");
-    c("ta-tostring-tag", C, "console.log(Object.prototype.toString.call(new Int8Array(1)), Object.prototype.toString.call(new Float64Array(1)));");
-    c("ta-tostring-tag-getter", C, "console.log(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array).prototype, Symbol.toStringTag).get.call({}));");
+    c(
+        "ta-accessors",
+        C,
+        "var b = new ArrayBuffer(16); var a = new Int32Array(b, 4, 2); console.log(a.buffer===b, a.byteLength, a.byteOffset, a.length);",
+    );
+    c(
+        "ta-tostring-tag",
+        C,
+        "console.log(Object.prototype.toString.call(new Int8Array(1)), Object.prototype.toString.call(new Float64Array(1)));",
+    );
+    c(
+        "ta-tostring-tag-getter",
+        C,
+        "console.log(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array).prototype, Symbol.toStringTag).get.call({}));",
+    );
 
     // ---- DataView ---------------------------------------------------------
-    c("dv-basic", C, "var b = new ArrayBuffer(8); var d = new DataView(b, 2, 4); console.log(d.byteLength, d.byteOffset, d.buffer===b, d);");
-    c("dv-byteorder", C,
-      "var b = new ArrayBuffer(8); var d = new DataView(b); d.setInt16(0, 0x1234, true);\n\
-       var u = new Uint8Array(b); console.log(u[0], u[1], d.getInt16(0,false).toString(16), d.getInt16(0,true).toString(16));");
-    c("dv-int-types", C,
-      "var d = new DataView(new ArrayBuffer(8));\n\
+    c(
+        "dv-basic",
+        C,
+        "var b = new ArrayBuffer(8); var d = new DataView(b, 2, 4); console.log(d.byteLength, d.byteOffset, d.buffer===b, d);",
+    );
+    c(
+        "dv-byteorder",
+        C,
+        "var b = new ArrayBuffer(8); var d = new DataView(b); d.setInt16(0, 0x1234, true);\n\
+       var u = new Uint8Array(b); console.log(u[0], u[1], d.getInt16(0,false).toString(16), d.getInt16(0,true).toString(16));",
+    );
+    c(
+        "dv-int-types",
+        C,
+        "var d = new DataView(new ArrayBuffer(8));\n\
        d.setInt8(0,-1); d.setUint8(1,200); d.setInt32(2,-70000,true);\n\
-       console.log(d.getInt8(0), d.getUint8(1), d.getInt32(2,true), d.getUint8(0));");
-    c("dv-float", C,
-      "var d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, 1.5, true); console.log(d.getFloat64(0,true), d.getFloat64(0,false)===1.5);");
-    c("dv-f32-f16", C,
-      "var d = new DataView(new ArrayBuffer(8)); d.setFloat32(0, 0.1, true); d.setFloat16(4, 1.1, true); console.log(d.getFloat32(0,true), d.getFloat16(4,true));");
-    c("dv-oob-range", C,
-      "var d = new DataView(new ArrayBuffer(4)); var t=false; try { d.getInt32(2); } catch(e){ t = e instanceof RangeError; } console.log(t);");
-    c("dv-tostring-tag", C, "console.log(Object.prototype.toString.call(new DataView(new ArrayBuffer(1))));");
-    c("dv-not-buffer", C,
-      "var t=false; try { new DataView({}); } catch(e){ t = e instanceof TypeError; } console.log(t);");
+       console.log(d.getInt8(0), d.getUint8(1), d.getInt32(2,true), d.getUint8(0));",
+    );
+    c(
+        "dv-float",
+        C,
+        "var d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, 1.5, true); console.log(d.getFloat64(0,true), d.getFloat64(0,false)===1.5);",
+    );
+    c(
+        "dv-f32-f16",
+        C,
+        "var d = new DataView(new ArrayBuffer(8)); d.setFloat32(0, 0.1, true); d.setFloat16(4, 1.1, true); console.log(d.getFloat32(0,true), d.getFloat16(4,true));",
+    );
+    c(
+        "dv-oob-range",
+        C,
+        "var d = new DataView(new ArrayBuffer(4)); var t=false; try { d.getInt32(2); } catch(e){ t = e instanceof RangeError; } console.log(t);",
+    );
+    c(
+        "dv-tostring-tag",
+        C,
+        "console.log(Object.prototype.toString.call(new DataView(new ArrayBuffer(1))));",
+    );
+    c(
+        "dv-not-buffer",
+        C,
+        "var t=false; try { new DataView({}); } catch(e){ t = e instanceof TypeError; } console.log(t);",
+    );
 
     // ---- methods ----------------------------------------------------------
     c("ta-fill", C, "console.log(new Int8Array([1,2,3,4]).fill(9,1,3));");
     c("ta-join", C, "console.log(new Int8Array([1,2,3]).join('-'), new Float64Array([]).join());");
-    c("ta-indexof", C, "var a = new Int8Array([5,6,5]); console.log(a.indexOf(5), a.indexOf(5,1), a.lastIndexOf(5), a.indexOf(9), a.includes(6), a.includes(9));");
+    c(
+        "ta-indexof",
+        C,
+        "var a = new Int8Array([5,6,5]); console.log(a.indexOf(5), a.indexOf(5,1), a.lastIndexOf(5), a.indexOf(9), a.includes(6), a.includes(9));",
+    );
     c("ta-at", C, "var a = new Int8Array([10,20,30]); console.log(a.at(0), a.at(-1), a.at(5));");
     c("ta-reverse", C, "console.log(new Int8Array([1,2,3]).reverse());");
-    c("ta-subarray", C, "var a = new Int8Array([1,2,3,4]); var s = a.subarray(1,3); s[0]=9; console.log(s.length, s[0], a[1]);");
-    c("ta-slice", C, "var a = new Int8Array([1,2,3,4]); var s = a.slice(1,3); s[0]=9; console.log(s.length, s[0], a[1]);");
+    c(
+        "ta-subarray",
+        C,
+        "var a = new Int8Array([1,2,3,4]); var s = a.subarray(1,3); s[0]=9; console.log(s.length, s[0], a[1]);",
+    );
+    c(
+        "ta-slice",
+        C,
+        "var a = new Int8Array([1,2,3,4]); var s = a.slice(1,3); s[0]=9; console.log(s.length, s[0], a[1]);",
+    );
     c("ta-set-array", C, "var a = new Int8Array(4); a.set([10,20], 1); console.log(a.join(','));");
-    c("ta-set-ta", C, "var a = new Int8Array(4); a.set(new Int8Array([10,20]), 2); console.log(a.join(','));");
-    c("ta-set-range", C, "var a = new Int8Array(2); var t=false; try { a.set([1,2,3]); } catch(e){ t = e instanceof RangeError; } console.log(t);");
-    c("ta-foreach", C, "var out=[]; new Int8Array([1,2,3]).forEach(function(v,i){ out.push(v*i); }); console.log(out.join(','));");
-    c("ta-reduce", C, "console.log(new Int8Array([1,2,3,4]).reduce(function(a,b){ return a+b; }), new Int8Array([1,2,3]).reduce(function(a,b){ return a+b; }, 10));");
-    c("ta-every-some", C, "var a = new Int8Array([2,4,6]); console.log(a.every(function(x){return x%2===0;}), a.some(function(x){return x>5;}));");
-    c("ta-for-of", C, "var out=[]; for (var x of new Int8Array([7,8,9])) out.push(x); console.log(out.join(','));");
-    c("ta-iterator-values", C, "var it = new Int8Array([5,6]).values(); console.log(it.next().value, it.next().value, it.next().done);");
+    c(
+        "ta-set-ta",
+        C,
+        "var a = new Int8Array(4); a.set(new Int8Array([10,20]), 2); console.log(a.join(','));",
+    );
+    c(
+        "ta-set-range",
+        C,
+        "var a = new Int8Array(2); var t=false; try { a.set([1,2,3]); } catch(e){ t = e instanceof RangeError; } console.log(t);",
+    );
+    c(
+        "ta-foreach",
+        C,
+        "var out=[]; new Int8Array([1,2,3]).forEach(function(v,i){ out.push(v*i); }); console.log(out.join(','));",
+    );
+    c(
+        "ta-reduce",
+        C,
+        "console.log(new Int8Array([1,2,3,4]).reduce(function(a,b){ return a+b; }), new Int8Array([1,2,3]).reduce(function(a,b){ return a+b; }, 10));",
+    );
+    c(
+        "ta-every-some",
+        C,
+        "var a = new Int8Array([2,4,6]); console.log(a.every(function(x){return x%2===0;}), a.some(function(x){return x>5;}));",
+    );
+    c(
+        "ta-for-of",
+        C,
+        "var out=[]; for (var x of new Int8Array([7,8,9])) out.push(x); console.log(out.join(','));",
+    );
+    c(
+        "ta-iterator-values",
+        C,
+        "var it = new Int8Array([5,6]).values(); console.log(it.next().value, it.next().value, it.next().done);",
+    );
 
     // ---- BigInt refusals (globals exist; construction/ops refuse) ---------
-    c("bigint-typeof", C, "console.log(typeof BigInt64Array, typeof BigUint64Array, BigInt64Array.name, BigInt64Array.BYTES_PER_ELEMENT);");
+    c(
+        "bigint-typeof",
+        C,
+        "console.log(typeof BigInt64Array, typeof BigUint64Array, BigInt64Array.name, BigInt64Array.BYTES_PER_ELEMENT);",
+    );
     // BigInt typed arrays are now modeled (construction, ToBigInt element
     // coercion, 64-bit wrap); a self-checking body keeps the witness free of a
     // projected bigint (which the driver's Number.prototype.toString throws on).
-    c("bigint-construct", C, "var a = new BigInt64Array([1n, 2n]); a[0] = (2n ** 63n); if (a[0] !== -(2n ** 63n) || a[1] !== 2n) throw 0;");
-    c("bigint-set-num-throws", C, "var a = new BigUint64Array(1); try { a[0] = 5; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }");
+    c(
+        "bigint-construct",
+        C,
+        "var a = new BigInt64Array([1n, 2n]); a[0] = (2n ** 63n); if (a[0] !== -(2n ** 63n) || a[1] !== 2n) throw 0;",
+    );
+    c(
+        "bigint-set-num-throws",
+        C,
+        "var a = new BigUint64Array(1); try { a[0] = 5; throw 1; } catch (e) { if (!(e instanceof TypeError)) throw 2; }",
+    );
     // DataView BigInt64/BigUint64 access is still out of slice (sound refusal).
     c("bigint-dv-refuses", R, "new DataView(new ArrayBuffer(8)).getBigInt64(0);");
 
@@ -387,11 +583,14 @@ fn collect_js_files(dir: &Path, cap: usize) -> Vec<PathBuf> {
 #[allow(clippy::too_many_lines)]
 fn typed_array_corpus_vs_node() {
     let Some(node) = node_bin() else {
-        eprintln!("SKIP typed_array_corpus_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS) to run");
+        eprintln!(
+            "SKIP typed_array_corpus_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS) to run"
+        );
         return;
     };
-    let corpus =
-        PathBuf::from(std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()));
+    let corpus = PathBuf::from(
+        std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.into()),
+    );
     assert!(
         corpus.join("harness/assert.js").is_file(),
         "corpus harness not found under {}",
@@ -431,11 +630,8 @@ fn typed_array_corpus_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".into(), "sta.js".into()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".into(), "sta.js".into()] };
             include_names.extend(fm.includes.iter().cloned());
             let mut include_srcs: Vec<String> = Vec::new();
             let mut include_paths: Vec<String> = Vec::new();
@@ -458,7 +654,8 @@ fn typed_array_corpus_vs_node() {
             let rel = path.strip_prefix(&corpus).unwrap_or(&path).display().to_string();
             for &strict in modes {
                 case_no += 1;
-                let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
+                let sem_body =
+                    if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
                 let inc_refs: Vec<&str> = include_srcs.iter().map(String::as_str).collect();
                 let sem_trace = match evaluate_case_opts(&inc_refs, &sem_body, false) {
                     SemOutcome::Trace(t) => t,
@@ -472,11 +669,21 @@ fn typed_array_corpus_vs_node() {
                 covered += 1;
                 per_dir.entry(dir).or_default().0 += 1;
                 let node_trace = match node_trace_of(
-                    &node, &driver, tmp.path(), &format!("case-{case_no}"), &body, &include_paths, strict, false,
+                    &node,
+                    &driver,
+                    tmp.path(),
+                    &format!("case-{case_no}"),
+                    &body,
+                    &include_paths,
+                    strict,
+                    false,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        failures.push(format!("{rel} [{}]: {e}", if strict { "strict" } else { "bare" }));
+                        failures.push(format!(
+                            "{rel} [{}]: {e}",
+                            if strict { "strict" } else { "bare" }
+                        ));
                         continue;
                     }
                 };
@@ -486,7 +693,8 @@ fn typed_array_corpus_vs_node() {
                     failures.push(format!(
                         "{rel} [{}]: WRONG TRACE: {}",
                         if strict { "strict" } else { "bare" },
-                        explain_divergence(&sem_trace, &node_trace).unwrap_or_else(|| "unlocalized".into())
+                        explain_divergence(&sem_trace, &node_trace)
+                            .unwrap_or_else(|| "unlocalized".into())
                     ));
                 }
             }

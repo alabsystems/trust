@@ -43,12 +43,16 @@ fn recursive_u32_function() -> VerifiableFunction {
             blocks: vec![
                 BasicBlock {
                     id: BlockId(0),
+                    // Trust: 2026-08 admission audit — an unsigned literal must carry
+                    // the compared local's own width (real MIR spells `n == 0u32` as
+                    // `Uint(0, 32)`); the old `Uint(_, 64)` spelling collapses the
+                    // whole function to MalformedTrustIr.
                     stmts: vec![Statement::Assign {
                         place: Place::local(2),
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Eq,
                             Operand::Copy(Place::local(1)),
-                            Operand::Constant(ConstValue::Uint(0, 64)),
+                            Operand::Constant(ConstValue::Uint(0, 32)),
                         ),
                         span: SourceSpan::default(),
                     }],
@@ -64,7 +68,7 @@ fn recursive_u32_function() -> VerifiableFunction {
                     id: BlockId(1),
                     stmts: vec![Statement::Assign {
                         place: Place::local(0),
-                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(1, 64))),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(1, 32))),
                         span: SourceSpan::default(),
                     }],
                     terminator: Terminator::Return,
@@ -76,12 +80,13 @@ fn recursive_u32_function() -> VerifiableFunction {
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Sub,
                             Operand::Copy(Place::local(1)),
-                            Operand::Constant(ConstValue::Uint(1, 64)),
+                            Operand::Constant(ConstValue::Uint(1, 32)),
                         ),
                         span: SourceSpan::default(),
                     }],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "test::factorial".to_string(),
                         args: vec![Operand::Copy(Place::local(3))],
@@ -133,6 +138,21 @@ fn recursive_i32_constant_function() -> VerifiableFunction {
         func.body.locals[idx].ty = Ty::i32();
     }
     func.body.return_ty = Ty::i32();
+    // Trust: 2026-08 admission audit — a signed comparison/use carries the widthless
+    // `ConstValue::Int` spelling in real MIR; keeping the base fixture's `Uint(_, 32)`
+    // against the retyped i32 locals collapses the function to MalformedTrustIr.
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, cmp_rhs), .. } =
+        &mut func.body.blocks[0].stmts[0]
+    else {
+        panic!("fixture guard block must open with the comparison");
+    };
+    *cmp_rhs = Operand::Constant(ConstValue::Int(0));
+    let Statement::Assign { rvalue: Rvalue::Use(base_case), .. } =
+        &mut func.body.blocks[1].stmts[0]
+    else {
+        panic!("fixture base case must be the constant return");
+    };
+    *base_case = Operand::Constant(ConstValue::Int(1));
     func.body.blocks[2].stmts.clear();
     let Terminator::Call { func: callee, args, .. } = &mut func.body.blocks[2].terminator else {
         panic!("fixture call block must end in Call");
@@ -182,6 +202,7 @@ fn recursive_same_arg_function() -> VerifiableFunction {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "test::spin_same".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -316,6 +337,7 @@ fn recursive_checked_sub_function() -> VerifiableFunction {
                     }],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "test::rec_cs".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -452,6 +474,22 @@ fn countdown_loop_i32_function() -> VerifiableFunction {
     func.name = "countdown_i".to_string();
     func.def_path = "test::countdown_i".to_string();
     func.body.locals[1].ty = Ty::i32();
+    // Trust: 2026-08 admission audit — the retyped i32 operands need the signed
+    // widthless `ConstValue::Int` literal spelling real MIR carries; the inherited
+    // `Uint(_, 32)` literals would collapse the function to MalformedTrustIr and make
+    // the consuming test pass vacuously.
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, guard_rhs), .. } =
+        &mut func.body.blocks[0].stmts[0]
+    else {
+        panic!("countdown guard block must open with the comparison");
+    };
+    *guard_rhs = Operand::Constant(ConstValue::Int(0));
+    let Statement::Assign { rvalue: Rvalue::BinaryOp(_, _, step_rhs), .. } =
+        &mut func.body.blocks[1].stmts[0]
+    else {
+        panic!("countdown step block must open with the decrement");
+    };
+    *step_rhs = Operand::Constant(ConstValue::Int(1));
     func
 }
 

@@ -25,6 +25,7 @@ fn caller() -> VerifiableFunction {
                     stmts: Vec::new(),
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "parse".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],

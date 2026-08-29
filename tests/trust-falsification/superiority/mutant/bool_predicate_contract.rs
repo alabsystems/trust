@@ -6,4 +6,6 @@
 // discharge the postcondition — it stays unproved (sound: the re-sort fix
 // connects the names, it does not make a wrong implementation verify).
 #[core::contracts::ensures(move |r: &bool| *r == (x > 0))]
-pub fn is_positive(x: i32) -> bool { x >= 0 }
+pub fn is_positive(x: i32) -> bool {
+    x >= 0
+}

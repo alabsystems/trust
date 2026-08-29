@@ -23,8 +23,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 bincode = { workspace = true }
+# PHASE 1d: the name `ed25519-dalek` resolves to the Trust-owned `trust-ed25519`
+# through Cargo's dependency renaming (see the workspace entry). `use
+# ed25519_dalek::{...}` in `signing.rs` compiles verbatim; the crate behind the
+# name is ours.
 ed25519-dalek = { workspace = true }
-rand = { workspace = true }
+# PHASE 1b: OS entropy for `CertSigningKey::generate`. Named directly rather
+# than aliased over `rand` — `rand`'s surface is enormous and `trust-rand`
+# implements only the one function this crate calls, so an alias would make
+# every other `rand::` path resolve to nothing at the CONSUMER instead of here.
+trust-rand = { workspace = true }
 
 # trust #879: ay-proof-common shared types for proof checker integration
 ay-proof-common = { workspace = true }

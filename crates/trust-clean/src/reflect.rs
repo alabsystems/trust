@@ -2198,15 +2198,28 @@ fn ty_mentions_param_id(t: &Ty, id: &str) -> bool {
 /// behavior, with NO regression and NO unsound inductive.
 #[must_use]
 pub fn reflect_struct(ty: &Ty) -> Option<AdtCarrier> {
+    reflect_struct_reasoned(ty).ok()
+}
+
+/// [`reflect_struct`] with the decline REASON — ONE implementation, two callers, the
+/// seventh application of the discipline recorded on
+/// [`crate::mirsem::adt_shapes::sem_adt_return_dispatch_of`].
+///
+/// WHY THIS LANE. "The return type does NOT REFLECT to a carrier" accounts for 340 of the
+/// 6,523 single-`Aggregate` constructor bodies no extractor recognizes — and as one
+/// number it says nothing about which of six unrelated reasons applies. Several of these
+/// are deliberate floors ("keep it on the Prod floor, sound, deferred") rather than gaps,
+/// so splitting them is what distinguishes a capability limit from a correct refusal.
+pub fn reflect_struct_reasoned(ty: &Ty) -> Result<AdtCarrier, &'static str> {
     let Ty::Adt { name, fields, variants, .. } = ty else {
-        return None;
+        return Err("not an ADT");
     };
     // PHASE 4 — an ENUM (`variants` non-empty) reflects to a REAL multi-constructor
     // inductive via `reflect_enum`, NOT the single-`.mk` struct shape. Dispatch
     // here so every existing caller (`reachable_adt_carriers`, `vc_refute`,
     // `prove`) picks up enums with no change.
     if !variants.is_empty() {
-        return reflect_enum(ty);
+        return reflect_enum(ty).ok_or("an ENUM — reflect_enum owns it, and it declined");
     }
     // GOAL-ITEM #2 — a KNOWN std container (`Vec`/`Box`/`Rc`/`Arc`/`String`/…) must
     // NOT register as a named struct inductive over its type-erased INTERNAL layout
@@ -2216,7 +2229,7 @@ pub fn reflect_struct(ty: &Ty) -> Option<AdtCarrier> {
     // the `reflect_ty` carrier (`carrier_binding_type`'s `El`/opaque path), not an
     // anonymous product of its private fields.
     if reflect_known_container(ty).is_some() {
-        return None;
+        return Err("a KNOWN CONTAINER (binds through reflect_ty, not an internal-layout inductive)");
     }
     // REAL-CODE COVERAGE (collections) — a KNOWN map/set container must NOT register
     // as a named struct inductive over its type-erased hashbrown/btree INTERNAL
@@ -2224,7 +2237,7 @@ pub fn reflect_struct(ty: &Ty) -> Option<AdtCarrier> {
     // return `None` here (no spurious internal-layout inductive; the value binds
     // through the `reflect_ty` carrier).
     if reflect_known_map(ty).is_some() {
-        return None;
+        return Err("a KNOWN MAP (models as Slice (Prod K V), not an internal-layout inductive)");
     }
     // REAL-CODE COVERAGE (iterator combinators) — a KNOWN stdlib iterator adapter
     // registers as its REAL RECORD carrier (`Trust.Adt.<Adapter>` over the recovered
@@ -2235,12 +2248,12 @@ pub fn reflect_struct(ty: &Ty) -> Option<AdtCarrier> {
     // `reflect_iter_adapter_record` is `None`), so it falls through to the source's
     // own carrier with no spurious inductive.
     if let Some(record) = reflect_iter_adapter_record(ty) {
-        return Some(record);
+        return Ok(record);
     }
     // A field-less struct (`struct Unit;`) has no Int content to reason about and
     // an empty constructor; keep it on the `Prod`/`Unit` floor (still sound).
     if fields.is_empty() {
-        return None;
+        return Err("a FIELD-LESS struct — stays on the Prod/Unit floor");
     }
     let inductive_name = adt_inductive_name(name);
     let mut reflected_fields = Vec::with_capacity(fields.len());
@@ -2268,7 +2281,7 @@ pub fn reflect_struct(ty: &Ty) -> Option<AdtCarrier> {
             // non-`Param` opaque carrier (none today) keeps the struct on the Prod
             // floor (sound; deferred).
             let Some(id) = var.strip_prefix(PARAM_PREFIX) else {
-                return None;
+                return Err("a non-Param OPAQUE carrier field — stays on the Prod floor");
             };
             let id = id.to_string();
             if !type_params.contains(&id) {
@@ -2305,13 +2318,13 @@ pub fn reflect_struct(ty: &Ty) -> Option<AdtCarrier> {
         // a param/dyn const after the recursive case declined (e.g. a `(dyn, T)` tuple
         // whose `dyn` component is non-carriable) has no faithful `Trust.SortTy`
         // carrier, so the whole struct falls back to Prod (sound, deferred).
-        let carrier = reflect_ty(fty).ok()?;
+        let carrier = reflect_ty(fty).map_err(|_| "a field TYPE has no carrier at all")?;
         if carrier_mentions_param(&carrier) {
-            return None;
+            return Err("a field carrier MENTIONS A TYPE PARAM (no faithful SortTy) — Prod floor");
         }
         reflected_fields.push((fname.clone(), carrier));
     }
-    Some(AdtCarrier {
+    Ok(AdtCarrier {
         ctor_name: adt_ctor_name(&inductive_name),
         name: inductive_name,
         fields: reflected_fields,
@@ -3229,7 +3242,7 @@ fn enum_union_fields(constructors: &[EnumCtor]) -> Vec<(String, ProofTerm)> {
 /// Whether a reflected type carrier mentions a generic-param / trait-object
 /// opaque const (`Trust.Param.*` / `Trust.Dyn.*`) anywhere — i.e. the type is
 /// generic and must not register as a NON-generic struct inductive.
-fn carrier_mentions_param(term: &ProofTerm) -> bool {
+pub(crate) fn carrier_mentions_param(term: &ProofTerm) -> bool {
     match term {
         ProofTerm::Const(n) => n.starts_with(PARAM_PREFIX) || n.starts_with(DYN_PREFIX),
         ProofTerm::App(f, a) => carrier_mentions_param(f) || carrier_mentions_param(a),

@@ -1,0 +1,78 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-rand — Trust-owned operating-system entropy.
+#
+# WHY THIS CRATE EXISTS.
+# Phase 1b of the third-party replacement program. `crates/` reaches a
+# random-number generator from exactly ONE production line —
+# `trust-proof-cert/src/signing.rs:40`, `rand::thread_rng()` feeding
+# `ed25519_dalek::SigningKey::generate` — and `targo-trust` reaches one from
+# four (`getrandom::fill`, for nonces and session ids). Both packages report as
+# `dependency-policy-excluded` in the verified lane, so every proof that names
+# a signed certificate or a verification session is conditional on units Trust
+# does not own. Retiring `rand` also retires `rand_chacha`, `rand_core` and
+# `getrandom` (and `wasi`) once `ed25519-dalek`'s `rand_core` feature comes off.
+#
+# THE EMPTY DEPENDENCY LIST IS THE POINT — same rule as trust-sha2/trust-hmac.
+# A dependency here is another excluded unit and defeats the purpose. There is
+# no `[features]` table that could add one.
+#
+# WHY THIS IS *NOT* A `package = ` RENAME OF `rand`.
+# trust-sha2/trust-hmac are drop-ins: `use sha2::{Digest, Sha256}` compiles
+# verbatim against the Trust-owned crate because the surface was matched. `rand`
+# cannot be swapped that way — its surface is enormous and this crate
+# deliberately implements one function of it. The single call site changes
+# instead. Do not add `rand = { package = "trust-rand", ... }`; it would
+# resolve `rand::thread_rng` to nothing and the error would be reported at the
+# consumer rather than here.
+#
+# NOT `no_std`, unlike trust-sha2. The Unix fallback arm needs `std::fs`, and
+# errno is read through `std::io::Error::last_os_error()` — which is precisely
+# how this crate avoids a `libc` dependency.
+#
+# WINDOWS IS SUPPORTED, AND NEEDS NO DEPENDENCY EITHER. `trust-proof-cert` is
+# reachable from `compiler/rustc_mir_transform`, so a Unix-only entropy crate
+# would mean the COMPILER does not build on Windows — a drop-in-compatibility
+# defect, since the `rand`/`getrandom` stack this crate retires built there.
+# The Windows arms declare `ProcessPrng` (bcryptprimitives.dll) and
+# `BCryptGenRandom` (bcrypt.dll) with bare `extern "system"` blocks and
+# `kind = "raw-dylib"`, so neither `windows-sys` nor an import library from the
+# Windows SDK is required. Adding `windows-sys` here would re-introduce exactly
+# the class of excluded unit this crate exists to remove.
+#
+# The Windows path is COMPILE-VERIFIED ONLY — see the header of src/windows.rs,
+# which says so in its first line and lists the targets it was checked against.
+
+[package]
+name = "trust-rand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned OS entropy, fail-closed: getentropy(2) + /dev/urandom on Unix, ProcessPrng + BCryptGenRandom on Windows. Zero dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]
+# NONE, by design. Read the header before adding one.
+
+[dev-dependencies]
+# TEST-ONLY, and both lines exist for ONE test file:
+# `tests/ed25519_equivalence.rs`. That test is the acceptance gate for the
+# call-site rewrite this crate enables — it proves
+#     SigningKey::generate(&mut fixed_rng(seed)) == SigningKey::from_bytes(&seed)
+# so that replacing the former with the latter is behaviour-preserving rather
+# than merely plausible. It cannot be written without the incumbent RNG trait.
+#
+# NOT `workspace = true` for `ed25519-dalek`: the workspace entry carries
+# `features = ["rand_core"]` today, and that feature is scheduled for deletion
+# by the very swap this test gates. Naming the feature here keeps the test
+# compiling on the day the workspace entry loses it, and keeps the reason
+# local to the test that needs it.
+#
+# Delete both lines when `SigningKey::generate` leaves the tree.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = "0.6"

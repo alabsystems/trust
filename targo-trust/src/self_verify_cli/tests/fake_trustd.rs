@@ -37,8 +37,6 @@
 //! binds its `IDENTITY` to the SHA-256 of the installed file the launcher
 //! independently hashes.
 
-use std::path::Path;
-
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
@@ -53,6 +51,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::io::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
@@ -623,8 +622,9 @@ fn respond(state: &Arc<Mutex<State>>, identity: &DaemonIdentity, request: &str) 
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
     use std::time::Instant;
+
+    use super::*;
 
     /// Drive the endpoint with the exact client `validate_stage2_toolchain` uses,
     /// without going through `exec`.

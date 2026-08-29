@@ -850,6 +850,30 @@ pub(super) fn sem_call_arm_of_mir(
     if blk.stmts.iter().any(|s| stmt_writes_local(s, join_local)) {
         return None; // the call must be the SOLE writer of `join_local` in this arm.
     }
+    // Trust: FLOAT-CAST leaf (2026-08-22) — the CARRIER GATE this lane was missing.
+    // Every sibling registry consumer already gates its call destination on
+    // `Int|Bool` (`call_lift`'s `local_is_int_or_bool` at the call-return, then-pureop
+    // and chain-pureop lanes; the ptr-spine and call-instance lanes likewise); this
+    // one gated only the WRITER, not the TYPE. That was inert while nothing with a
+    // non-scalar return could be certified — but the int→float cast lane makes a
+    // `Ty::Float`-returning function fully faithful for the first time, so it enters
+    // the certified-callee registry and a branch over two such calls
+    // (`if c { conv(x) } else { conv(y) }` at `f32`) would converge here on a FLOAT
+    // join local and be modelled as a `Bool.rec` select on the Int carrier.
+    //
+    // That is not an Int-arithmetic claim, but it is the float carrier escaping the
+    // cast-then-return shape its own soundness argument is scoped to — so gate it at
+    // the type, matching the siblings. Found by adversarial review with a measured
+    // end-to-end construction, not by inspection.
+    let scalar_local = |local: usize| {
+        matches!(
+            func.body.locals.get(local).map(|l| &l.ty),
+            Some(trust_types::Ty::Int { .. } | trust_types::Ty::Bool)
+        )
+    };
+    if !scalar_local(join_local) || !scalar_local(0) {
+        return None;
+    }
     let (resolved, fact, callee_id) = resolve_certified_callee(callees, callee_str)?;
     if resolved == func.def_path || *callee_str == func.def_path {
         return None; // self-recursion fails closed.
@@ -948,9 +972,13 @@ pub(super) fn guarded_return_bitor_join(
                 }
                 join = Some((pa.local, pb.local));
             }
-            Statement::StorageLive(_) | Statement::StorageDead(_)
-            | Statement::PlaceMention(_) | Statement::Retag { .. }
-            | Statement::Coverage | Statement::ConstEvalCounter | Statement::Nop => {}
+            Statement::StorageLive(_)
+            | Statement::StorageDead(_)
+            | Statement::PlaceMention(_)
+            | Statement::Retag { .. }
+            | Statement::Coverage
+            | Statement::ConstEvalCounter
+            | Statement::Nop => {}
             _ => return None,
         }
     }
@@ -1016,6 +1044,26 @@ pub(super) fn local_has_only_guarded_writes(
     expected_assignments: usize,
     expected_calls: usize,
 ) -> bool {
+    local_has_only_guarded_writes_reasoned(body, local, expected_assignments, expected_calls).is_ok()
+}
+
+/// [`local_has_only_guarded_writes`] with the decline REASON — ONE implementation, two
+/// callers, the eighth application of the discipline on
+/// [`crate::mirsem::adt_shapes::sem_adt_return_dispatch_of`].
+///
+/// WHY THIS GATE. Measured on a frozen 57,803-body corpus, this single check refuses
+/// **14,071 of the 19,989** uncovered non-generic ADT-returning bodies — **70.4%**, and by
+/// a wide margin the largest gate in the whole investigation. As one boolean it conflates
+/// at least four unrelated situations: a MULTI-ARM constructor dispatch (a capability gap,
+/// and the N-arm generalization of the existing 2-arm lane), FIELD-BY-FIELD construction
+/// through projections, a CALL destination (interprocedural), and a mutable alias or
+/// `Drop`. Those want completely different work, so the number is useless until it is split.
+pub(crate) fn local_has_only_guarded_writes_reasoned(
+    body: &trust_types::VerifiableBody,
+    local: usize,
+    expected_assignments: usize,
+    expected_calls: usize,
+) -> Result<(), &'static str> {
     use trust_types::{Rvalue, Statement, Terminator};
 
     let mut assignments = 0usize;
@@ -1030,21 +1078,20 @@ pub(super) fn local_has_only_guarded_writes(
                         | Rvalue::AddressOf(true, place)
                         if place.local == local)
                 {
-                    return false;
+                    return Err("the local is MUTABLY ALIASED");
                 }
                 if place.local == local {
                     if !place.projections.is_empty() {
-                        return false;
+                        return Err("FIELD-BY-FIELD construction (a projected write)");
                     }
                     assignments += 1;
                 }
             }
-            Statement::SetDiscriminant { place, .. }
-            | Statement::Deinit { place }
-            | Statement::Retag { place }
-                if place.local == local =>
-            {
-                return false;
+            Statement::SetDiscriminant { place, .. } if place.local == local => {
+                return Err("SET-DISCRIMINANT construction (enum built in place)");
+            }
+            Statement::Deinit { place } | Statement::Retag { place } if place.local == local => {
+                return Err("a Deinit/Retag on the local");
             }
             _ => {}
         }
@@ -1055,15 +1102,26 @@ pub(super) fn local_has_only_guarded_writes(
             && dest.local == local
         {
             if !dest.projections.is_empty() {
-                return false;
+                return Err("a PROJECTED call destination");
             }
             calls += 1;
         }
         if matches!(&block.terminator, Terminator::Drop { place, .. } if place.local == local) {
-            return false;
+            return Err("the local is DROPPED");
         }
     }
-    assignments == expected_assignments && calls == expected_calls
+    if calls != expected_calls {
+        return Err("the local is a CALL DESTINATION (interprocedural)");
+    }
+    if assignments > expected_assignments {
+        // The headline sub-case: several bare writes to the return local is a MULTI-ARM
+        // constructor dispatch, which is a capability gap rather than a refusal.
+        return Err("MULTI-ARM: more bare writes to the local than the lane admits");
+    }
+    if assignments < expected_assignments {
+        return Err("FEWER bare writes to the local than the lane admits");
+    }
+    Ok(())
 }
 
 /// Whether every entry-to-`node` path passes through `candidate`. Reachability
@@ -2385,10 +2443,20 @@ fn sem_or_region_tree(
                 }
                 let leaf = switch_leaf(discr, 0)?;
                 let then_tree = sem_or_region_tree(
-                    body, region, param_index, switch_leaf, *otherwise, fuel - 1,
+                    body,
+                    region,
+                    param_index,
+                    switch_leaf,
+                    *otherwise,
+                    fuel - 1,
                 )?;
                 let else_tree = sem_or_region_tree(
-                    body, region, param_index, switch_leaf, *false_target, fuel - 1,
+                    body,
+                    region,
+                    param_index,
+                    switch_leaf,
+                    *false_target,
+                    fuel - 1,
                 )?;
                 return Some(SemBranchTree::Node(
                     SemCondTree::Leaf(leaf),
@@ -2433,7 +2501,12 @@ pub(super) fn sem_or_chain_of_mir(
     let mut folded: Option<SemBranchTree> = None;
     for region in &regions {
         let tree = sem_or_region_tree(
-            body, region, param_index, &switch_leaf, region.entry, body.blocks.len() + 1,
+            body,
+            region,
+            param_index,
+            &switch_leaf,
+            region.entry,
+            body.blocks.len() + 1,
         )?;
         // A region with no decision is not a guarded return — same rule the
         // single-join lane applies to the whole body, applied per region.
@@ -2449,8 +2522,6 @@ pub(super) fn sem_or_chain_of_mir(
     }
     folded
 }
-
-
 
 /// Trust (#53): the OR-chain region walk's switch-discriminant resolver, factored
 /// out of `sem_or_chain_of_mir`'s closure so the bool-join lane below shares ONE
@@ -2595,8 +2666,7 @@ fn bool_join_tail_of_return(
     // which the bare parameter resolver declines. The guard resolver is the one
     // every other temp-chase in this file uses, and it is given the REAL use site
     // so its dominance check is exact.
-    let value =
-        sem_guard_operand_of_mir(body, va, param_index, Some((ret.id, Some(*ret_index))))?;
+    let value = sem_guard_operand_of_mir(body, va, param_index, Some((ret.id, Some(*ret_index))))?;
 
     Some(BoolJoinTail { join_local: jp.local, value, op, scale })
 }
@@ -2653,8 +2723,9 @@ pub(super) fn sem_bool_join_tail_of_mir(
         value_local: tail.join_local,
         arms,
     };
-    let switch_leaf =
-        |discr: &Operand, tag: u128| -> Option<SemCond> { or_switch_cond(body, param_index, discr, tag) };
+    let switch_leaf = |discr: &Operand, tag: u128| -> Option<SemCond> {
+        or_switch_cond(body, param_index, discr, tag)
+    };
     let flag_tree = sem_or_region_tree(
         body,
         &region,
@@ -2699,8 +2770,6 @@ fn bool_join_fold_leaves(
         SemBranchTree::CallLeaf(_) => None,
     }
 }
-
-
 
 /// Trust (#53, 2026-08-15): a fold tail at a given position — the generalization
 /// of [`bool_join_tail_of_return`] that does NOT require the fold to write `_0`.
@@ -2840,12 +2909,17 @@ pub(super) fn sem_bool_join_chain_of_mir(
         return None;
     }
 
-    let region1 =
-        OrRegion { entry: trust_types::BlockId(0), join: entry2, value_local: tail1.join_local, arms: arms1 };
+    let region1 = OrRegion {
+        entry: trust_types::BlockId(0),
+        join: entry2,
+        value_local: tail1.join_local,
+        arms: arms1,
+    };
     let region2 =
         OrRegion { entry: entry2, join: ret.id, value_local: tail2.join_local, arms: arms2 };
-    let switch_leaf =
-        |discr: &Operand, tag: u128| -> Option<SemCond> { or_switch_cond(body, param_index, discr, tag) };
+    let switch_leaf = |discr: &Operand, tag: u128| -> Option<SemCond> {
+        or_switch_cond(body, param_index, discr, tag)
+    };
     let fuel = body.blocks.len() + 1;
     let tree1 = sem_or_region_tree(body, &region1, param_index, &switch_leaf, region1.entry, fuel)?;
     let tree2 = sem_or_region_tree(body, &region2, param_index, &switch_leaf, region2.entry, fuel)?;
@@ -2943,4 +3017,3 @@ fn bool_join_compare_leaves(
         SemBranchTree::CallLeaf(_) => None,
     }
 }
-

@@ -313,11 +313,9 @@ pub fn commit<'tcx>(
         }
         // Mint under the effective key: the whole-SVH `witness_key` by default, or
         // the edit-loop `precise_witness_key` under the shadow-mint measurement flag.
-        let Some(key) = (if precise {
-            precise_witness_key(tcx, root, tr)
-        } else {
-            witness_key(tcx, root)
-        }) else {
+        let Some(key) =
+            (if precise { precise_witness_key(tcx, root, tr) } else { witness_key(tcx, root) })
+        else {
             continue;
         };
         let Some(bytes) = encode_root(tcx, tr) else { continue };

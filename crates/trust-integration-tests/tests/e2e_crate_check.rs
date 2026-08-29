@@ -20,8 +20,8 @@
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
 use std::path::{Path, PathBuf};
-use trust_types::fx::FxHashMap;
 
+use trust_types::fx::FxHashMap;
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, Contract, ContractKind, LocalDecl, Operand, Place,
     Projection, Rvalue, SourceSpan, Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
@@ -439,7 +439,13 @@ fn to_verifiable_function(parsed: &ParsedFunction) -> VerifiableFunction {
         name: parsed.name.clone(),
         def_path,
         span,
-        body: VerifiableBody { locals, blocks, arg_count, return_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty,
+            datatype_defs: Default::default(),
+        },
         contracts,
         preconditions: Vec::new(),
         postconditions: Vec::new(),

@@ -6,20 +6,19 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-use rustc_session::config;
 use rustc_session::config::{LEGACY_TRUST_SEMANTIC_ENV_VARS, TrustFrontendAuthoritySnapshot};
-use rustc_session::getopts;
+use rustc_session::{config, getopts};
 
 use super::{
-    FrontendTrustPolicy, apply_trust_verify_override,
-    authenticated_pre_analysis_exit_message, authenticated_pre_session_early_exit,
-    canonicalize_trust_options, compiler_arguments, direct_ir_pre_typed_options_early_exit,
-    frontend_forbidden_option, no_trust_evidence_callback_backend_error,
-    trust_verify_override_requested, raw_outer_direct_ir_publication_identity,
+    FrontendTrustPolicy, apply_trust_verify_override, authenticated_pre_analysis_exit_message,
+    authenticated_pre_session_early_exit, canonicalize_trust_options, compiler_arguments,
+    direct_ir_pre_typed_options_early_exit, frontend_forbidden_option,
+    no_trust_evidence_callback_backend_error, raw_outer_direct_ir_publication_identity,
     should_preflight_direct_ir_publication, trust_callback_changed_contract_checks,
     trust_dump_domain_error, trust_ir_lower_is_active, trust_option_domain_error,
     trust_semantics_are_active, trust_strict_policy_is_active, trust_strict_policy_option_error,
     trust_targo_test_monitor_domain_error, trust_targo_test_monitor_sysroot_error,
+    trust_verify_override_requested,
 };
 
 #[test]
@@ -230,13 +229,9 @@ fn semantic_separator_hides_direct_ir_publication_controls() {
 
 #[test]
 fn publication_preflight_is_scoped_to_evidence_capable_response_file_expansion() {
-    let args = [
-        "trustc",
-        "-Ztrust-dump=ir:publication",
-        "--crate-name=publication_probe",
-        "@arguments",
-    ]
-    .map(str::to_string);
+    let args =
+        ["trustc", "-Ztrust-dump=ir:publication", "--crate-name=publication_probe", "@arguments"]
+            .map(str::to_string);
     assert!(should_preflight_direct_ir_publication(
         FrontendTrustPolicy::CanonicalTrustc,
         true,
@@ -528,9 +523,8 @@ fn authenticated_coverage_session_rejects_compiler_early_exits() {
     );
 
     let mut pretty = opts.clone();
-    pretty.pretty = Some(rustc_session::config::PpMode::Source(
-        rustc_session::config::PpSourceMode::Normal,
-    ));
+    pretty.pretty =
+        Some(rustc_session::config::PpMode::Source(rustc_session::config::PpSourceMode::Normal));
     assert!(trust_option_domain_error(&pretty).is_some());
 
     let mut lint_help = opts.clone();
@@ -600,8 +594,8 @@ fn already_expanded_arguments_do_not_expand_a_literal_nested_argfile() {
 fn no_verify_deauthorization_never_rewrites_compiler_arguments() {
     let early_dcx =
         rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
-    let raw = ["trustc", "--crate-name", "--", "-Ztrust-verify=on", "--print=cfg"]
-        .map(str::to_string);
+    let raw =
+        ["trustc", "--crate-name", "--", "-Ztrust-verify=on", "--print=cfg"].map(str::to_string);
     let snapshot = compiler_arguments(&early_dcx, &raw, false);
     assert_eq!(
         snapshot,
@@ -609,8 +603,7 @@ fn no_verify_deauthorization_never_rewrites_compiler_arguments() {
         "a literal `--` consumed as `--crate-name`'s value must not be mistaken for a semantic separator"
     );
 
-    let (_, matches) =
-        parsed_matches(&["--crate-name", "--", "-Ztrust-verify=on", "--print=cfg"]);
+    let (_, matches) = parsed_matches(&["--crate-name", "--", "-Ztrust-verify=on", "--print=cfg"]);
     let mut typed_dcx =
         rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
     let mut options = rustc_session::config::build_session_options(&mut typed_dcx, &matches);
@@ -657,29 +650,22 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
         "trust-cg-output-gate=off",
     ] {
         let (_, matches) = parsed_matches(&["-Z", option]);
-        for policy in [
-            FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
-            FrontendTrustPolicy::EvidenceInert,
-        ] {
+        for policy in
+            [FrontendTrustPolicy::EmbeddedNoOfficialEvidence, FrontendTrustPolicy::EvidenceInert]
+        {
             assert!(
                 frontend_forbidden_option(policy, &matches).is_some(),
                 "{} accepted -Z{option}",
                 policy.diagnostic_name(),
             );
         }
-        assert_eq!(
-            frontend_forbidden_option(FrontendTrustPolicy::CanonicalTrustc, &matches),
-            None,
-        );
+        assert_eq!(frontend_forbidden_option(FrontendTrustPolicy::CanonicalTrustc, &matches), None,);
     }
 
     for option in ["codegen-backend=trust-cg", "codegen_backend=llvm"] {
         let (_, matches) = parsed_matches(&["-Z", option]);
         assert_eq!(
-            frontend_forbidden_option(
-                FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
-                &matches,
-            ),
+            frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &matches,),
             None,
             "embedded tools retain custom-backend compatibility",
         );
@@ -699,10 +685,9 @@ fn deauthorized_frontends_reject_trust_controls_but_only_tippy_rejects_backends(
         ("-C", "llvm_args=-load=/tmp/plugin", "-Cllvm-args"),
     ] {
         let (_, matches) = parsed_matches(&[switch, option]);
-        for compatible_policy in [
-            FrontendTrustPolicy::CanonicalTrustc,
-            FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
-        ] {
+        for compatible_policy in
+            [FrontendTrustPolicy::CanonicalTrustc, FrontendTrustPolicy::EmbeddedNoOfficialEvidence]
+        {
             assert_eq!(
                 frontend_forbidden_option(compatible_policy, &matches),
                 None,
@@ -773,10 +758,7 @@ fn deauthorized_frontends_accept_only_exact_redundant_trust_verify_off() {
             "the evidence-inert frontend rejected redundant {args:?}",
         );
         assert_eq!(
-            frontend_forbidden_option(
-                FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
-                &matches,
-            ),
+            frontend_forbidden_option(FrontendTrustPolicy::EmbeddedNoOfficialEvidence, &matches,),
             None,
             "an embedded deauthorized frontend rejected redundant {args:?}",
         );
@@ -786,24 +768,9 @@ fn deauthorized_frontends_accept_only_exact_redundant_trust_verify_off() {
         &["-Ztrust-verify=on", "--crate-type=lib", "input.rs"][..],
         &["-Ztrust-verify", "--crate-type=lib", "input.rs"][..],
         &["-Ztrust-verify=invalid", "--crate-type=lib", "input.rs"][..],
-        &[
-            "-Ztrust-verify=off",
-            "-Ztrust-verify=on",
-            "--crate-type=lib",
-            "input.rs",
-        ][..],
-        &[
-            "-Ztrust-verify=on",
-            "-Ztrust-verify=off",
-            "--crate-type=lib",
-            "input.rs",
-        ][..],
-        &[
-            "-Ztrust-verify=off",
-            "-Ztrust-ir-lower",
-            "--crate-type=lib",
-            "input.rs",
-        ][..],
+        &["-Ztrust-verify=off", "-Ztrust-verify=on", "--crate-type=lib", "input.rs"][..],
+        &["-Ztrust-verify=on", "-Ztrust-verify=off", "--crate-type=lib", "input.rs"][..],
+        &["-Ztrust-verify=off", "-Ztrust-ir-lower", "--crate-type=lib", "input.rs"][..],
     ] {
         let (_, matches) = parsed_matches(args);
         let expected = Some(if args.contains(&"-Ztrust-ir-lower") {
@@ -811,10 +778,9 @@ fn deauthorized_frontends_accept_only_exact_redundant_trust_verify_off() {
         } else {
             "-Ztrust-verify"
         });
-        for policy in [
-            FrontendTrustPolicy::EmbeddedNoOfficialEvidence,
-            FrontendTrustPolicy::EvidenceInert,
-        ] {
+        for policy in
+            [FrontendTrustPolicy::EmbeddedNoOfficialEvidence, FrontendTrustPolicy::EvidenceInert]
+        {
             assert_eq!(
                 frontend_forbidden_option(policy, &matches).as_deref(),
                 expected,
@@ -956,9 +922,7 @@ fn every_direct_frontend_lane_resolves_to_its_pinned_value() {
 #[allow(rustc::bad_opt_access)]
 fn ir_dump_is_accepted_exactly_where_the_direct_frontend_produces_one() {
     for verify in [config::TrustVerify::On, config::TrustVerify::Off] {
-        for requested in
-            [None, Some(config::TrustIrLower::On), Some(config::TrustIrLower::Off)]
-        {
+        for requested in [None, Some(config::TrustIrLower::On), Some(config::TrustIrLower::Off)] {
             let mut opts = rustc_session::config::Options::default();
             opts.unstable_opts.trust_verify = verify;
             opts.unstable_opts.trust_ir_lower = requested;
@@ -1051,6 +1015,20 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
         "payload-tramp",
         "dr-tramp",
         "dr-retire",
+        "mc-plan",
+        "cf-lit-order",
+        "chain-ret-order",
+        "cf-field-drop",
+        "cf-unit-late",
+        "cf-pair-order",
+        "cf-ret-late",
+        "cf-post-late",
+        "sw-tramp",
+        "swr-tramp",
+        "g25-hoist",
+        "seq-unit-late",
+        "g21-ret-order",
+        "uc-unit-late",
     ] {
         let mut valid_class = burn_in.clone();
         valid_class.unstable_opts.trust_sat_perturb = Some(class.to_string());
@@ -1065,7 +1043,9 @@ fn sat_perturbation_requires_an_exact_class_and_the_direct_ir_burn_in_lane() {
             "invalid -Ztrust-sat-perturb value: expected enum-reshape, \
              enum-case-value, enum-ctor, enum-disc-index, switch-map, enum-payload, \
              marker-order, marker-drop, agg-field-order, marker-arm, payload-tramp, \
-             dr-tramp, or dr-retire"
+             dr-tramp, dr-retire, mc-plan, cf-lit-order, chain-ret-order, cf-field-drop, \
+             cf-unit-late, cf-pair-order, cf-ret-late, cf-post-late, sw-tramp, \
+             swr-tramp, g25-hoist, seq-unit-late, g21-ret-order, or uc-unit-late"
         )
     );
 }
@@ -1143,9 +1123,7 @@ fn legacy_semantic_env_denylist_covers_verdict_and_codegen_inputs() {
 
 #[test]
 fn diagnostic_only_env_remains_available() {
-    for diagnostic in
-        ["TRUST_ASSERT_DEBUG", "TRUST_NATIVE_DEBUG", "TRUST_VERIFY_TRACE_CERTIFIED"]
-    {
+    for diagnostic in ["TRUST_ASSERT_DEBUG", "TRUST_NATIVE_DEBUG", "TRUST_VERIFY_TRACE_CERTIFIED"] {
         assert!(!LEGACY_TRUST_SEMANTIC_ENV_VARS.contains(&diagnostic));
     }
 }

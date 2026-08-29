@@ -26,7 +26,49 @@ ignore = [
     "/tests/ui/",                     # Some have syntax errors, some are whitespace-sensitive.
     "/tests/ui-fulldeps/",            # Some are whitespace-sensitive (e.g. `// ~ERROR` comments).
 
+    # Trust: these fixtures are written in the TRUST spec grammar — signature
+    # `decreases`, `requires`/`ensures` clauses — which is exactly the surface
+    # the two-language design adds. The formatter bootstrap runs is
+    # `build.rustfmt` from bootstrap.toml, which MUST point outside the
+    # bootstrap-managed stage tree (`x.py test` clears stage2 before running
+    # `fmt check`, so a stage2-relative formatter is deleted by the very command
+    # that needs it). That leaves stage0's trustfmt, which predates the grammar
+    # and cannot parse it:
+    #     error: expected one of `->`, `where`, or `{`, found `decreases`
+    #       --> tests/two-language-battery/lane-a-rust/a4_gcd_decreases.rs:22:5
+    # An unparseable file makes `fmt check` fail, which fails `x.py test`, which
+    # is what `targo trust domination upstream-tests --execute` runs — so this
+    # blocked the release gate outright. Same disposition as `/tests/crashes/`
+    # and `/tests/run-make/export` above: not-formattable fixtures are ignored,
+    # not made to parse. Measured 2026-08-23; `decreases` itself compiles fine
+    # under `trustc` in both signature forms.
+    #
+    # ALL the Trust-grammar fixture trees are listed, not just the one that
+    # happened to fail: `x.py fmt` checks only files MODIFIED against the base,
+    # so which of these trips the gate depends on what a given branch touched.
+    # Enumerated by scanning for signature-position clauses
+    # (`decreases`/`requires`/`ensures`/`invariant`) across `tests/`.
+    "/tests/two-language-battery/",
+    "/tests/e6-fragment-probe/probes/",
+    "/tests/run-make/trust-certified-loop-monitors/",
+    "/tests/run-make/trust-certified-tailcall-monitor/",
+    "/tests/trust-provability/directions/",
+
     # Do not format submodules.
+    # Trust: first-party siblings own their own formatting — each is a separate
+    # repo with its own toolchain expectations, and ty's vendored tla-async-trait
+    # legitimately uses `gen` (pre-2024 edition), which the 2024-edition trustfmt
+    # refuses to parse. The pins gate their content; fmt must not cross gitlinks.
+    "/first-party/",
+    # Trust: FROZEN files (scripts/frozen-files.txt pins their blobs BYTE-IDENTICAL;
+    # the freeze gate blocks any movement, including whitespace) and the frozen
+    # R functor. A formatter pass is a blob move like any other.
+    "crates/trust-clean/src/reflect.rs",
+    "crates/trust-clean/src/source_reflect.rs",
+    "crates/trust-thir-lower/src/mir_differential.rs",
+    "crates/trust-thir-lower/src/flip_registry.rs",
+    "crates/trust-thir-lower/src/crate_module.rs",
+    "crates/trust-thir-lower/src/differential.rs",
     "library/backtrace",
     "library/compiler-builtins",
     "library/portable-simd",

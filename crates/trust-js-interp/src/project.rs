@@ -11,13 +11,15 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::Interp;
 use std::collections::HashMap;
+
 use trust_js_trace::{ProjectedValue, PropKey as TraceKey, ThrownProjection};
 use trust_js_value::{
-    ordered_own_keys, projection_number_repr, JsValue, ObjId, ObjKind, PropKey, PropValue,
-    Property, SymId,
+    JsValue, ObjId, ObjKind, PropKey, PropValue, Property, SymId, ordered_own_keys,
+    projection_number_repr,
 };
+
+use crate::interp::Interp;
 
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_KEYS: usize = 64;
@@ -26,14 +28,8 @@ pub const MAX_STRING: usize = 4096;
 
 /// Engine-incidental own properties on Error-class objects, filtered by the
 /// driver (calibration ruling recorded there).
-const ERROR_INCIDENTAL_KEYS: [&str; 6] = [
-    "stack",
-    "line",
-    "column",
-    "sourceURL",
-    "originalLine",
-    "originalColumn",
-];
+const ERROR_INCIDENTAL_KEYS: [&str; 6] =
+    ["stack", "line", "column", "sourceURL", "originalLine", "originalColumn"];
 
 type P<T> = Result<T, String>;
 
@@ -69,30 +65,18 @@ pub fn escape_units(u: &[u16]) -> String {
 /// Project one top-level value with fresh id-state (one console.log
 /// argument, or a thrown primitive).
 pub fn project(it: &Interp, v: &JsValue) -> P<ProjectedValue> {
-    let mut st = ProjState {
-        seen: HashMap::new(),
-        next_id: 0,
-        depth: 0,
-        nodes: 0,
-    };
+    let mut st = ProjState { seen: HashMap::new(), next_id: 0, depth: 0, nodes: 0 };
     project_value(it, v, &mut st)
 }
 
 #[allow(clippy::unnecessary_wraps)]
 fn project_sym(it: &Interp, sym: SymId) -> P<ProjectedValue> {
     match sym {
-        SymId::WellKnown(wk) => Ok(ProjectedValue::Sym {
-            wk: Some(wk.projection_name().to_string()),
-            v: None,
-        }),
+        SymId::WellKnown(wk) => {
+            Ok(ProjectedValue::Sym { wk: Some(wk.projection_name().to_string()), v: None })
+        }
         SymId::User(i) => {
-            let desc = it
-                .heap
-                .symbols
-                .get(i as usize)
-                .cloned()
-                .flatten()
-                .map(|d| escape_units(&d));
+            let desc = it.heap.symbols.get(i as usize).cloned().flatten().map(|d| escape_units(&d));
             Ok(ProjectedValue::Sym { wk: None, v: desc })
         }
     }
@@ -107,14 +91,12 @@ fn project_value(it: &Interp, v: &JsValue, st: &mut ProjState) -> P<ProjectedVal
         JsValue::Undefined => Ok(ProjectedValue::Undefined),
         JsValue::Null => Ok(ProjectedValue::Null),
         JsValue::Bool(b) => Ok(ProjectedValue::Bool { v: *b }),
-        JsValue::Num(n) => Ok(ProjectedValue::Num {
-            v: projection_number_repr(*n),
-        }),
+        JsValue::Num(n) => Ok(ProjectedValue::Num { v: projection_number_repr(*n) }),
         JsValue::Str(s) => Ok(ProjectedValue::Str { v: escape_units(s) }),
         JsValue::Sym(sym) => project_sym(it, *sym),
-        JsValue::BigInt(b) => Ok(ProjectedValue::Bigint {
-            v: trust_js_value::bigint_to_decimal(b),
-        }),
+        JsValue::BigInt(b) => {
+            Ok(ProjectedValue::Bigint { v: trust_js_value::bigint_to_decimal(b) })
+        }
         JsValue::Obj(oid) => {
             let obj = it.heap.obj(*oid);
             match &obj.kind {
@@ -250,9 +232,7 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
     for key in keys.into_iter().take(n) {
         let key_repr = match &key {
             PropKey::Str(u) => TraceKey::Str(escape_units(u)),
-            PropKey::Sym(s) => TraceKey::Sym {
-                sym: Box::new(project_sym(it, *s)?),
-            },
+            PropKey::Sym(s) => TraceKey::Sym { sym: Box::new(project_sym(it, *s)?) },
         };
         // own_prop merges the arguments parameter map, mirroring the
         // driver's getOwnPropertyDescriptor view.
@@ -266,20 +246,14 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
                     return Err("projection of engine-specific synthetic text".to_string());
                 }
                 let pv = project_value(it, value, st)?;
-                let entry = if p.enumerable {
-                    pv
-                } else {
-                    ProjectedValue::Nonenum { v: Box::new(pv) }
-                };
+                let entry =
+                    if p.enumerable { pv } else { ProjectedValue::Nonenum { v: Box::new(pv) } };
                 props.push((key_repr, entry));
             }
             PropValue::Accessor { get, set } => {
                 props.push((
                     key_repr,
-                    ProjectedValue::Accessor {
-                        get: get.is_some(),
-                        set: set.is_some(),
-                    },
+                    ProjectedValue::Accessor { get: get.is_some(), set: set.is_some() },
                 ));
             }
         }
@@ -290,11 +264,7 @@ fn project_object(it: &Interp, oid: ObjId, st: &mut ProjState) -> P<ProjectedVal
         cls,
         props: Some(props),
         unintrospectable: None,
-        keycap: if total > MAX_KEYS {
-            Some(total as u64)
-        } else {
-            None
-        },
+        keycap: if total > MAX_KEYS { Some(total as u64) } else { None },
     })
 }
 
@@ -367,17 +337,14 @@ pub fn project_thrown(it: &Interp, v: &JsValue) -> P<ThrownProjection> {
             }
         }
     }
-    Ok(ThrownProjection::Error {
-        ctor,
-        name,
-        ctor_name,
-    })
+    Ok(ThrownProjection::Error { ctor, name, ctor_name })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_value::units_from_str;
+
+    use super::*;
 
     #[test]
     fn escape_vectors() {

@@ -407,12 +407,8 @@ impl TrustCgCodegenBackend {
                 sess.opts.target_triple,
             ));
         }
-        let module_object = run_module_output_preservation_gate(
-            bridge,
-            bridge_module,
-            sess,
-            gate_mode,
-        );
+        let module_object =
+            run_module_output_preservation_gate(bridge, bridge_module, sess, gate_mode);
 
         // The bytes written below are, per function, the exact bytes the gate
         // verified: `emit_module_object_verified_reported_with_backend` refuses
@@ -642,9 +638,7 @@ impl TrustCgCodegenBackend {
                     "trust-cg internal error: trust-ir module `{}` position {index} ships LIR \
                      for `{}` but carries a specification for `{}`; refusing to verify one \
                      function and emit another",
-                    bridge_module.name,
-                    bridge_module.lir_functions[index].name,
-                    source.symbol
+                    bridge_module.name, bridge_module.lir_functions[index].name, source.symbol
                 ));
             }
         }
@@ -1042,10 +1036,7 @@ enum EnumAbi {
     Refuse,
 }
 
-fn scalar_register_abi_ty_supported<'tcx>(
-    arg: &ArgAbi<'tcx, Ty<'tcx>>,
-    enum_abi: EnumAbi,
-) -> bool {
+fn scalar_register_abi_ty_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>, enum_abi: EnumAbi) -> bool {
     let PassMode::Direct(attrs) = &arg.mode else {
         return false;
     };
@@ -1231,12 +1222,10 @@ fn supported_canonical_abi(extern_abi: ExternAbi) -> Option<CanonAbi> {
 /// represented and checked end to end.
 fn scalar_register_argument_limit(target_triple: &str) -> Option<usize> {
     match target_triple {
-        "aarch64-apple-darwin"
-        | "aarch64-unknown-linux-gnu"
-        | "aarch64-unknown-linux-musl" => Some(8),
-        "x86_64-apple-darwin"
-        | "x86_64-unknown-linux-gnu"
-        | "x86_64-unknown-linux-musl" => Some(6),
+        "aarch64-apple-darwin" | "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux-musl" => {
+            Some(8)
+        }
+        "x86_64-apple-darwin" | "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" => Some(6),
         "x86_64-pc-windows-msvc" | "x86_64-pc-windows-gnu" => Some(4),
         _ => None,
     }
@@ -1412,10 +1401,7 @@ fn apply_direct_call_name_overrides(
 // substitutions, collides distinct instantiations, and ignores statics/global
 // assembly. The adapter therefore materializes each concrete instance and
 // rejects every reachable item it cannot faithfully emit.
-fn production_function_symbol_contract_supported(
-    linkage: Linkage,
-    visibility: Visibility,
-) -> bool {
+fn production_function_symbol_contract_supported(linkage: Linkage, visibility: Visibility) -> bool {
     // LINKAGE. `External` and `Internal` are the two definitions the object
     // emitters can now express: the function-symbol path carries a per-function
     // `FunctionSymbolBinding` (Mach-O `N_EXT` / ELF `STB_GLOBAL` vs a local
@@ -1519,10 +1505,8 @@ fn collect_production_mono_instances<'tcx>(
         for (item, data) in cgu.items() {
             match *item {
                 MonoItem::Fn(instance) => {
-                    if !production_function_symbol_contract_supported(
-                        data.linkage,
-                        data.visibility,
-                    ) {
+                    if !production_function_symbol_contract_supported(data.linkage, data.visibility)
+                    {
                         return Err(format!(
                             "reachable function `{}` requires unsupported {:?} linkage / {:?} visibility",
                             tcx.symbol_name(instance).name,
@@ -1571,8 +1555,7 @@ fn build_production_mono_functions<'tcx>(
     let instances = collect_production_mono_instances(tcx)?;
     // The linkage vector is built in the SAME order as the function vector and
     // returned beside it; the two are consumed strictly index-aligned.
-    let linkage =
-        instances.iter().map(|(_, _, linkage)| *linkage).collect::<Vec<_>>();
+    let linkage = instances.iter().map(|(_, _, linkage)| *linkage).collect::<Vec<_>>();
     let functions = instances
         .into_iter()
         .map(|(_, instance, _)| extract_mono_verifiable_function(tcx, instance))

@@ -708,7 +708,11 @@ fn make_proved() -> VerificationResult {
 }
 
 fn make_failed() -> VerificationResult {
-    VerificationResult::Failed { solver: "constant-folder".into(), counterexample: None, time_ms: 1 }
+    VerificationResult::Failed {
+        solver: "constant-folder".into(),
+        counterexample: None,
+        time_ms: 1,
+    }
 }
 
 // Trust: VerifyContext implementation for trust-loop integration tests.

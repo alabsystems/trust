@@ -790,9 +790,12 @@ fn to_control_flow(expr: &ast::Expr, expr_type: ExprType) -> Option<ControlFlow<
         } => Some(ControlFlow::new_for(
             pat, iter, body, label, expr.span, kind,
         )),
-        ast::ExprKind::Loop(ref block, label, _) => {
-            Some(ControlFlow::new_loop(block, label, expr.span))
-        }
+        ast::ExprKind::Loop(ref block, label, _, ref contract) => Some(ControlFlow::new_loop(
+            block,
+            label,
+            contract.as_deref(),
+            expr.span,
+        )),
         ast::ExprKind::While(ref cond, ref block, label, ref contract) => {
             let (pat, cond) = extract_pats_and_cond(cond);
             Some(ControlFlow::new_while(
@@ -862,7 +865,12 @@ impl<'a> ControlFlow<'a> {
         }
     }
 
-    fn new_loop(block: &'a ast::Block, label: Option<ast::Label>, span: Span) -> ControlFlow<'a> {
+    fn new_loop(
+        block: &'a ast::Block,
+        label: Option<ast::Label>,
+        loop_contract: Option<&'a ast::LoopContract>,
+        span: Span,
+    ) -> ControlFlow<'a> {
         ControlFlow {
             cond: None,
             block,
@@ -875,7 +883,7 @@ impl<'a> ControlFlow<'a> {
             allow_single_line: false,
             nested_if: false,
             is_loop: true,
-            loop_contract: None,
+            loop_contract,
             span,
         }
     }

@@ -142,10 +142,7 @@ fn scalar_out_param_false_twin_stays_sat() {
 
 fn field_out_param(clause_value: i128) -> VerifiableFunction {
     out_param_fn(
-        vec![
-            unit_ret(),
-            mut_ref_param(struct_ty("S", vec![("n".into(), Ty::u64())]), "self"),
-        ],
+        vec![unit_ret(), mut_ref_param(struct_ty("S", vec![("n".into(), Ty::u64())]), "self")],
         vec![assign(
             Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] },
             u64_const(0),
@@ -234,8 +231,7 @@ fn only_the_reaching_definition_is_pinned() {
     let formula = postcondition_formula(&f);
     assert!(!formula.contains("Int(7)"), "the OVERWRITTEN value must never be pinned: {formula}");
     assert_eq!(
-        formula,
-        r#"And([Eq(Var("x*#s0_1", Int), Int(0)), Not(Eq(Var("x*#s0_1", Int), Int(0)))])"#,
+        formula, r#"And([Eq(Var("x*#s0_1", Int), Int(0)), Not(Eq(Var("x*#s0_1", Int), Int(0)))])"#,
         "only the reaching definition (statement 1) may pin, under statement 1's token"
     );
 }
@@ -310,10 +306,7 @@ fn by_value_param_is_never_pinned() {
 #[test]
 fn unwritten_out_param_place_gets_no_pin() {
     let f = out_param_fn(
-        vec![
-            unit_ret(),
-            mut_ref_param(struct_ty("S", vec![("n".into(), Ty::u64())]), "self"),
-        ],
+        vec![unit_ret(), mut_ref_param(struct_ty("S", vec![("n".into(), Ty::u64())]), "self")],
         vec![],
         vec![ensures_eq("self*.0", 0)],
     );

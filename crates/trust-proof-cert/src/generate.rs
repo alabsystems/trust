@@ -123,10 +123,13 @@ impl GeneratedCertificateRecord {
         // from_legacy image, `is_certified()` holds exactly for
         // `AssuranceLevel::Certified` (pinned by
         // named_constructor_projects_to_its_legacy_level in trust-types).
-        let evidence_is_non_authoritative =
-            self.certificate.solver.evidence.as_ref().is_none_or(|evidence| {
-                !evidence.grade().is_certified()
-            }) && self.vc_entries.iter().all(|entry| {
+        let evidence_is_non_authoritative = self
+            .certificate
+            .solver
+            .evidence
+            .as_ref()
+            .is_none_or(|evidence| !evidence.grade().is_certified())
+            && self.vc_entries.iter().all(|entry| {
                 entry.evidence.as_ref().is_none_or(|evidence| !evidence.grade().is_certified())
             });
         let primary_entry_present = self.vc_entries.iter().any(|entry| {
@@ -465,8 +468,7 @@ mod tests {
             AssuranceLevel::SmtBacked,
             AssuranceLevel::Certified,
         ];
-        let reasonings =
-            [ReasoningKind::Smt, ReasoningKind::BoundedModelCheck { depth: 3 }];
+        let reasonings = [ReasoningKind::Smt, ReasoningKind::BoundedModelCheck { depth: 3 }];
         for reasoning in &reasonings {
             for level in &levels {
                 let strength =
@@ -1145,9 +1147,8 @@ mod tests {
         // elsewhere in the record, so assert on the ROW's own keys, not on the
         // whole document.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let row = value["vc_entries"][0]
-            .as_object()
-            .expect("vc_entries[0] must serialize as an object");
+        let row =
+            value["vc_entries"][0].as_object().expect("vc_entries[0] must serialize as an object");
         assert!(
             !row.contains_key("grade"),
             "a None grade must serialize to NOTHING — byte-identical to the old wire; got {row:?}"

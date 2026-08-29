@@ -691,11 +691,8 @@ pub fn check_assert_discharge_instance(
     let guard_prop = eq_bool_true(eval_cond_app(Expr::bvar(1), guard_expr.clone().lift(2)));
     //   under `∀ e, ∀ hI, ∀ hg`: e = bvar(2); the assert GOAL prop.
     let assert_prop = eq_bool_true(eval_cond_app(Expr::bvar(2), assert_expr.lift(3)));
-    let concl_ty = Expr::pi(
-        bd(),
-        env_ty(),
-        Expr::pi(bd(), i_e, Expr::pi(bd(), guard_prop, assert_prop)),
-    );
+    let concl_ty =
+        Expr::pi(bd(), env_ty(), Expr::pi(bd(), i_e, Expr::pi(bd(), guard_prop, assert_prop)));
 
     // PROOF: λ (e:Env) λ (_hI : I e) λ (hg : guard=true). hg.
     let i_e_dom = Expr::app(i_expr.lift(1), Expr::bvar(0));
@@ -709,7 +706,9 @@ pub fn check_assert_discharge_instance(
     {
         let tc = TypeChecker::new(&env);
         if let Err(e) = tc.check_type(&proof, &concl_ty) {
-            return RefinementVerdict::KernelRejected(format!("assert discharge check_type: {e:?}"));
+            return RefinementVerdict::KernelRejected(format!(
+                "assert discharge check_type: {e:?}"
+            ));
         }
     }
     let name = Name::from_string("Trust.MirSem.sliceIndexLoop.assertDischarge");
@@ -787,11 +786,7 @@ pub fn check_counter_overflow_discharge_instance(
     let concl_ty = Expr::pi(
         bd(),
         env_ty(),
-        Expr::pi(
-            bd(),
-            i_e,
-            Expr::pi(bd(), guard_prop, Expr::pi(bd(), bound_prop, goal_prop)),
-        ),
+        Expr::pi(bd(), i_e, Expr::pi(bd(), guard_prop, Expr::pi(bd(), bound_prop, goal_prop))),
     );
 
     // PROOF: λ e λ _hI λ hg λ hbound. Int.le_trans (i+1) (e n) MAX_counter <i+1≤n> hbound.
@@ -846,9 +841,9 @@ pub fn check_counter_overflow_discharge_instance(
                 "counter overflow discharge axiom residue: {names:?}"
             ))
         }
-        None => {
-            RefinementVerdict::KernelRejected("counter overflow discharge decl not found".to_string())
-        }
+        None => RefinementVerdict::KernelRejected(
+            "counter overflow discharge decl not found".to_string(),
+        ),
     }
 }
 

@@ -152,7 +152,11 @@ pub(super) fn local_mutation_blocks(func: &VerifiableFunction, local: usize) -> 
 /// `Len(X)`, or a `PtrMetadata(&X)`), traced through whole-local `Use`-copies to the
 /// defining site. `None` if not found. Used to bound "the snapshot point" for the
 /// row-stability check.
-pub(super) fn len_def_block(func: &VerifiableFunction, len_op: &Operand, fuel: u32) -> Option<usize> {
+pub(super) fn len_def_block(
+    func: &VerifiableFunction,
+    len_op: &Operand,
+    fuel: u32,
+) -> Option<usize> {
     let root = operand_root_local(func, len_op, fuel)?;
     for block in &func.body.blocks {
         if let Terminator::Call { func: callee, dest, .. } = &block.terminator
@@ -377,7 +381,9 @@ pub(super) fn local_peeled_is_vec(func: &VerifiableFunction, local: usize) -> bo
 
 /// Per-block push-guarded element-length facts (`coll_len(m[k]) > n`). See the
 /// section banner for the recognizer, the fact shape, and every soundness gate.
-pub(super) fn build_push_guard_elem_len_map(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn build_push_guard_elem_len_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     const FUEL: u32 = 16;
     let mut map: FxHashMap<BlockId, Vec<Formula>> = FxHashMap::default();
 
@@ -482,7 +488,10 @@ pub(super) fn build_push_guard_elem_len_map(func: &VerifiableFunction) -> FxHash
 /// `_local = &PLACE` / `&mut PLACE` / `&raw [const|mut] PLACE`, return
 /// `(PLACE, mutable_of_the_borrow)`. None when `local` has no unique whole def or
 /// its def is not a borrow.
-pub(super) fn ref_target_of_local(func: &VerifiableFunction, local: usize) -> Option<(Place, bool)> {
+pub(super) fn ref_target_of_local(
+    func: &VerifiableFunction,
+    local: usize,
+) -> Option<(Place, bool)> {
     match crate::unique_whole_local_def(func, local)? {
         Rvalue::Ref { mutable, place } => Some((place.clone(), *mutable)),
         Rvalue::AddressOf(mutable, place) => Some((place.clone(), *mutable)),
@@ -496,7 +505,11 @@ pub(super) fn ref_target_of_local(func: &VerifiableFunction, local: usize) -> Op
 ///   (b) a `Len(place)` / `PtrMetadata(&place)` rvalue.
 /// Matches by the borrowed PLACE (not a base local), so it recognizes a projected
 /// field's length where `operand_is_len_of_base` (base-local keyed) cannot.
-pub(super) fn operand_is_len_of_place(func: &VerifiableFunction, op: &Operand, place: &Place) -> bool {
+pub(super) fn operand_is_len_of_place(
+    func: &VerifiableFunction,
+    op: &Operand,
+    place: &Place,
+) -> bool {
     let (Operand::Copy(p) | Operand::Move(p)) = op else { return false };
     if !p.projections.is_empty() || guards::whole_local_def_count(func, p.local) != 1 {
         return false;
@@ -569,7 +582,9 @@ pub(super) fn len_guard_lower_bound_edge(cmp: BinOp, len_on_left: bool) -> Optio
 /// Per-block dominating length-guard facts (`coll_len(_recv) >= C`) for a projected
 /// (struct-field) Vec scalar index. See the section banner for the recognizer, the
 /// fact shape, and every soundness gate.
-pub(super) fn build_len_guard_field_map(func: &VerifiableFunction) -> FxHashMap<BlockId, Vec<Formula>> {
+pub(super) fn build_len_guard_field_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<BlockId, Vec<Formula>> {
     const FUEL: u32 = 16;
     let mut map: FxHashMap<BlockId, Vec<Formula>> = FxHashMap::default();
 
@@ -884,8 +899,7 @@ pub(super) fn ffi_nonnull_locals(func: &VerifiableFunction) -> std::collections:
                         let deref_of_ref = src.projections.as_slice()
                             == [trust_types::Projection::Deref]
                             && func.body.locals.iter().any(|l| {
-                                l.index == src.local
-                                    && matches!(l.ty, trust_types::Ty::Ref { .. })
+                                l.index == src.local && matches!(l.ty, trust_types::Ty::Ref { .. })
                             });
                         no_deref || deref_of_ref
                     }

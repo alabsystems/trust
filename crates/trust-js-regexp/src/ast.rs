@@ -80,9 +80,15 @@ pub enum Node {
 /// A `\d \D \s \S \w \W \p \P` class escape (top-level or in-class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscClass {
-    Digit { negate: bool },
-    Space { negate: bool },
-    Word { negate: bool },
+    Digit {
+        negate: bool,
+    },
+    Space {
+        negate: bool,
+    },
+    Word {
+        negate: bool,
+    },
     Property {
         negate: bool,
         chars: &'static [(u32, u32)],
@@ -120,7 +126,10 @@ pub enum VOperand {
     Char(u32),
     Range(u32, u32),
     Esc(EscClass),
-    Nested { negate: bool, expr: Box<VExpr> },
+    Nested {
+        negate: bool,
+        expr: Box<VExpr>,
+    },
     /// `\q{…|…}` string disjunction (each string as code points; any
     /// length, including 0; length-1 entries are still "chars" per spec).
     Strings(Vec<Vec<u32>>),

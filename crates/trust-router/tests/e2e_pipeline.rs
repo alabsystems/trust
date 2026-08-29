@@ -379,8 +379,11 @@ fn selected_function_filtering() {
         vec![contract(ContractKind::Requires, "x > 0")],
     );
 
-    let crate_result =
-        selected_crate_result("selection-filtering", &allowlist, &[target.clone(), skipped.clone()]);
+    let crate_result = selected_crate_result(
+        "selection-filtering",
+        &allowlist,
+        &[target.clone(), skipped.clone()],
+    );
     assert_eq!(crate_result.function_count(), 1, "only the allowlisted function should run");
     assert_eq!(crate_result.functions[0].function_path, target.def_path);
     assert_eq!(crate_result.total_obligations(), 1);

@@ -28,6 +28,7 @@ fn len_call(callee: &str, receiver_ty: Ty) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         atomic: None,
                     },

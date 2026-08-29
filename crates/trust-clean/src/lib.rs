@@ -637,6 +637,10 @@ pub use whole_program::{
 };
 // Trust: SMT→CIC reconstruction of safety VCs (guarded-check refutation, modulo 3)
 pub mod vc_refute;
+// DECLINE IS NOT DISCHARGE — the regression pins for the two decline-handling
+// false-proof channels (see the module banner).
+#[cfg(test)]
+mod decline_gate_tests;
 // Trust: AY proof bridge — translates ay proof certificates to SolverProof
 pub use ay_proof_bridge::translate_ay_proof;
 // Trust: v1 clean proof reuse — indexes and matches v1 theorems

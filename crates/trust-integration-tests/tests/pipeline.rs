@@ -9,14 +9,13 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
+use trust_integration_tests::ay_test_support::require_ay;
 use trust_integration_tests::{
     array_access_function, contract_function, division_function, midpoint_function, noop_function,
-    ay_test_support::require_ay,
 };
-
 use trust_types::{
-    BinOp, Counterexample, CounterexampleValue, Formula, FunctionVerdict,
-    ProofLevel, ProofStrength, Sort, SourceSpan, VcKind, VerificationCondition, VerificationResult,
+    BinOp, Counterexample, CounterexampleValue, Formula, FunctionVerdict, ProofLevel,
+    ProofStrength, Sort, SourceSpan, VcKind, VerificationCondition, VerificationResult,
 };
 
 // A router pinned to the deterministic `ConstantFolderBackend` only. These
@@ -299,10 +298,7 @@ fn test_cache_with_full_pipeline() {
 
     // Second pass: all hits
     for func in &funcs {
-        assert!(matches!(
-            cache.lookup_function(func, ""),
-            trust_cache::CacheLookup::Hit(_)
-        ));
+        assert!(matches!(cache.lookup_function(func, ""), trust_cache::CacheLookup::Hit(_)));
     }
 
     assert_eq!(cache.hits(), 3);

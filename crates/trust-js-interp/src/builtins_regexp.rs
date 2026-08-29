@@ -17,21 +17,19 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 use std::collections::HashSet;
 use std::rc::Rc;
-use trust_js_regexp::{compile, CompileError, MatchResult, Pattern};
+
+use trust_js_regexp::{CompileError, MatchResult, Pattern, compile};
 use trust_js_value::{
-    to_integer_or_infinity, to_length_u64, to_uint32, units_from_str, ErrKind, JsObject, JsValue,
-    NativeFn, ObjId, ObjKind, PropKey, Property, RegexData, RegexFlagKind, RegexFlags, SymId, Units,
-    WkSym,
+    ErrKind, JsObject, JsValue, NativeFn, ObjId, ObjKind, PropKey, Property, RegexData,
+    RegexFlagKind, RegexFlags, SymId, Units, WkSym, to_integer_or_infinity, to_length_u64,
+    to_uint32, units_from_str,
 };
+
+use crate::interp::{Abrupt, ERes, Interp, MAX_STRING_UNITS};
 
 const DOLLAR: u16 = 0x24;
 
@@ -48,10 +46,7 @@ impl Interp {
             )));
         };
         let source_units = units_from_str(pattern);
-        let data = RegexData {
-            source: Rc::new(source_units.clone()),
-            flags: rf,
-        };
+        let data = RegexData { source: Rc::new(source_units.clone()), flags: rf };
         let proto = self.intr.regexp_proto;
         let oid = self.alloc_obj(JsObject::new(ObjKind::Regex(data), Some(proto)))?;
         self.heap.obj_mut(oid).props.insert(
@@ -98,9 +93,9 @@ impl Interp {
     fn regex_pattern(&self, oid: ObjId) -> Result<Rc<Pattern>, Abrupt> {
         match self.regex_patterns.get(&oid) {
             Some(Ok(p)) => Ok(Rc::clone(p)),
-            Some(Err(reason)) => Err(Abrupt::Fatal(format!(
-                "regexp matcher unsupported (S1d refusal): {reason}"
-            ))),
+            Some(Err(reason)) => {
+                Err(Abrupt::Fatal(format!("regexp matcher unsupported (S1d refusal): {reason}")))
+            }
             None => Err(Abrupt::Fatal(
                 "regexp instance without a compiled matcher (interpreter bug)".to_string(),
             )),
@@ -115,10 +110,7 @@ impl Interp {
     /// by RegExpInitialize before the object escapes.
     fn regexp_alloc(&mut self, nt: &JsValue) -> Result<ObjId, Abrupt> {
         let proto = self.get_prototype_from_constructor(nt, self.intr.regexp_proto)?;
-        let data = RegexData {
-            source: Rc::new(Vec::new()),
-            flags: RegexFlags::default(),
-        };
+        let data = RegexData { source: Rc::new(Vec::new()), flags: RegexFlags::default() };
         let oid = self.alloc_obj(JsObject::new(ObjKind::Regex(data), Some(proto)))?;
         self.heap.obj_mut(oid).props.insert(
             PropKey::from_str("lastIndex"),
@@ -183,7 +175,11 @@ impl Interp {
 
     /// RegExpCreate(P, F): RegExpAlloc(%RegExp%) then RegExpInitialize (with the
     /// standard ToString of P/F; undefined → empty).
-    pub(crate) fn regexp_create(&mut self, pattern: &JsValue, flags: &JsValue) -> Result<ObjId, Abrupt> {
+    pub(crate) fn regexp_create(
+        &mut self,
+        pattern: &JsValue,
+        flags: &JsValue,
+    ) -> Result<ObjId, Abrupt> {
         let nt = JsValue::Obj(self.intr.regexp_ctor);
         let oid = self.regexp_alloc(&nt)?;
         let p = if matches!(pattern, JsValue::Undefined) {
@@ -356,9 +352,7 @@ impl Interp {
                     "unrouted RegExp.prototype method `{other}` (interpreter bug)"
                 ))),
             },
-            _ => Err(Abrupt::Fatal(
-                "unrouted regexp native (interpreter bug)".to_string(),
-            )),
+            _ => Err(Abrupt::Fatal("unrouted regexp native (interpreter bug)".to_string())),
         }
     }
 
@@ -465,17 +459,13 @@ impl Interp {
         let start_u = if global || sticky { last_index } else { 0 };
         let start = usize::try_from(start_u).unwrap_or(usize::MAX);
 
-        let res = if sticky {
-            pattern.exec_sticky_at(s, start)
-        } else {
-            pattern.exec_at(s, start)
-        };
+        let res = if sticky { pattern.exec_sticky_at(s, start) } else { pattern.exec_at(s, start) };
         let m = match res {
             Err(_) => {
                 return Err(Abrupt::Fatal(
                     "regexp match unsupported/budget (S1d refusal, never a wrong result)"
                         .to_string(),
-                ))
+                ));
             }
             Ok(None) => {
                 if global || sticky {
@@ -493,12 +483,7 @@ impl Interp {
 
         let e = m.end;
         if global || sticky {
-            self.set_prop(
-                &this_v,
-                &PropKey::from_str("lastIndex"),
-                JsValue::Num(e as f64),
-                true,
-            )?;
+            self.set_prop(&this_v, &PropKey::from_str("lastIndex"), JsValue::Num(e as f64), true)?;
         }
 
         let n = pattern.n_captures();
@@ -508,11 +493,7 @@ impl Interp {
         let a = self.new_array(0)?;
         self.create_data_property_or_throw(a, "index", JsValue::Num(m.index as f64))?;
         self.create_data_property_or_throw(a, "input", JsValue::Str(Rc::new(s.to_vec())))?;
-        self.create_data_property_or_throw(
-            a,
-            "0",
-            JsValue::Str(Rc::new(s[m.index..e].to_vec())),
-        )?;
+        self.create_data_property_or_throw(a, "0", JsValue::Str(Rc::new(s[m.index..e].to_vec())))?;
         let groups_oid = if has_groups {
             Some(self.alloc_obj(JsObject::new(ObjKind::Plain, None))?)
         } else {
@@ -561,11 +542,7 @@ impl Interp {
         self.create_data_property_or_throw(arr, "groups", groups_val)?;
         let mut cap_pairs: Vec<JsValue> = Vec::with_capacity(n);
         for i in 0..=n {
-            let pair = if i == 0 {
-                Some((m.index, m.end))
-            } else {
-                m.captures[i - 1]
-            };
+            let pair = if i == 0 { Some((m.index, m.end)) } else { m.captures[i - 1] };
             let pair_val = match pair {
                 Some((ps, pe)) => {
                     let p = self.new_array(0)?;
@@ -633,11 +610,7 @@ impl Interp {
             self.charge_loop()?;
             let result = self.regexp_exec(this, &s)?;
             if matches!(result, JsValue::Null) {
-                return if n == 0 {
-                    Ok(JsValue::Null)
-                } else {
-                    Ok(JsValue::Obj(a))
-                };
+                return if n == 0 { Ok(JsValue::Null) } else { Ok(JsValue::Obj(a)) };
             }
             let JsValue::Obj(res) = result else {
                 return Err(self.throw_type_error());
@@ -703,11 +676,8 @@ impl Interp {
         let length_s = s.len();
         let functional =
             matches!(replace_value, JsValue::Obj(o) if self.heap.obj(*o).is_callable());
-        let repl_units: Option<Units> = if functional {
-            None
-        } else {
-            Some(self.to_string_units(replace_value)?)
-        };
+        let repl_units: Option<Units> =
+            if functional { None } else { Some(self.to_string_units(replace_value)?) };
         let flags_v = self.get_prop(this, &PropKey::from_str("flags"))?;
         let flags = self.to_string_units(&flags_v)?;
         let global = flags.contains(&u16::from(b'g'));
@@ -747,16 +717,21 @@ impl Interp {
             self.charge_loop()?;
             let result_len = self.length_of_array_like(res)?;
             let n_captures = result_len.saturating_sub(1);
-            let matched_v = self.get_from_object(res, &PropKey::from_str("0"), JsValue::Obj(res))?;
+            let matched_v =
+                self.get_from_object(res, &PropKey::from_str("0"), JsValue::Obj(res))?;
             let matched = self.to_string_units(&matched_v)?;
-            let pos_v = self.get_from_object(res, &PropKey::from_str("index"), JsValue::Obj(res))?;
+            let pos_v =
+                self.get_from_object(res, &PropKey::from_str("index"), JsValue::Obj(res))?;
             let pos_f = to_integer_or_infinity(self.to_number(&pos_v)?);
             let position = clamp_index(pos_f, length_s);
             let mut captures: Vec<Option<Units>> = Vec::new();
             let mut i: u64 = 1;
             while i <= n_captures {
-                let cap =
-                    self.get_from_object(res, &PropKey::Str(units_from_str(&i.to_string())), JsValue::Obj(res))?;
+                let cap = self.get_from_object(
+                    res,
+                    &PropKey::Str(units_from_str(&i.to_string())),
+                    JsValue::Obj(res),
+                )?;
                 if matches!(cap, JsValue::Undefined) {
                     captures.push(None);
                 } else {
@@ -764,7 +739,8 @@ impl Interp {
                 }
                 i += 1;
             }
-            let named = self.get_from_object(res, &PropKey::from_str("groups"), JsValue::Obj(res))?;
+            let named =
+                self.get_from_object(res, &PropKey::from_str("groups"), JsValue::Obj(res))?;
             let replacement: Units = if functional {
                 let mut fargs: Vec<JsValue> = Vec::with_capacity(captures.len() + 3);
                 fargs.push(JsValue::Str(Rc::new(matched.clone())));
@@ -846,7 +822,8 @@ impl Interp {
                 }
                 0x30..=0x39 => {
                     let d1 = (next - 0x30) as usize;
-                    let two = if i + 2 < template.len() && (0x30..=0x39).contains(&template[i + 2]) {
+                    let two = if i + 2 < template.len() && (0x30..=0x39).contains(&template[i + 2])
+                    {
                         Some(d1 * 10 + (template[i + 2] - 0x30) as usize)
                     } else {
                         None
@@ -870,36 +847,34 @@ impl Interp {
                         i += 1;
                     }
                 }
-                0x3C => {
-                    match named_obj {
-                        None => {
+                0x3C => match named_obj {
+                    None => {
+                        out.push(DOLLAR);
+                        i += 1;
+                    }
+                    Some(nobj) => {
+                        let mut j = i + 2;
+                        while j < template.len() && template[j] != 0x3E {
+                            j += 1;
+                        }
+                        if j >= template.len() {
                             out.push(DOLLAR);
                             i += 1;
-                        }
-                        Some(nobj) => {
-                            let mut j = i + 2;
-                            while j < template.len() && template[j] != 0x3E {
-                                j += 1;
+                        } else {
+                            let name = template[i + 2..j].to_vec();
+                            let ref_v = self.get_from_object(
+                                nobj,
+                                &PropKey::Str(name),
+                                JsValue::Obj(nobj),
+                            )?;
+                            if !matches!(ref_v, JsValue::Undefined) {
+                                let ru = self.to_string_units(&ref_v)?;
+                                out.extend_from_slice(&ru);
                             }
-                            if j >= template.len() {
-                                out.push(DOLLAR);
-                                i += 1;
-                            } else {
-                                let name = template[i + 2..j].to_vec();
-                                let ref_v = self.get_from_object(
-                                    nobj,
-                                    &PropKey::Str(name),
-                                    JsValue::Obj(nobj),
-                                )?;
-                                if !matches!(ref_v, JsValue::Undefined) {
-                                    let ru = self.to_string_units(&ref_v)?;
-                                    out.extend_from_slice(&ru);
-                                }
-                                i = j + 1;
-                            }
+                            i = j + 1;
                         }
                     }
-                }
+                },
                 _ => {
                     out.push(DOLLAR);
                     i += 1;
@@ -924,11 +899,8 @@ impl Interp {
         if !flags.contains(&u16::from(b'y')) {
             new_flags.push(u16::from(b'y'));
         }
-        let splitter = self.construct(
-            &c,
-            vec![this.clone(), JsValue::Str(Rc::new(new_flags))],
-            None,
-        )?;
+        let splitter =
+            self.construct(&c, vec![this.clone(), JsValue::Str(Rc::new(new_flags))], None)?;
         let a = self.new_array(0)?;
         let mut length_a: u64 = 0;
         let lim: u64 = if matches!(limit, JsValue::Undefined) {
@@ -1019,11 +991,8 @@ impl Interp {
         let c = self.species_constructor(this, self.intr.regexp_ctor)?;
         let flags_v = self.get_prop(this, &PropKey::from_str("flags"))?;
         let flags = self.to_string_units(&flags_v)?;
-        let matcher = self.construct(
-            &c,
-            vec![this.clone(), JsValue::Str(Rc::new(flags.clone()))],
-            None,
-        )?;
+        let matcher =
+            self.construct(&c, vec![this.clone(), JsValue::Str(Rc::new(flags.clone()))], None)?;
         let JsValue::Obj(m_oid) = matcher else {
             return Err(self.throw_type_error());
         };
@@ -1064,12 +1033,7 @@ impl Interp {
 fn group_names_by_index(pattern: &Pattern, n: usize) -> Vec<Option<String>> {
     let names = pattern.group_names();
     (1..=n as u32)
-        .map(|g| {
-            names
-                .iter()
-                .find(|(_, gi)| *gi == g)
-                .map(|(name, _)| name.clone())
-        })
+        .map(|g| names.iter().find(|(_, gi)| *gi == g).map(|(name, _)| name.clone()))
         .collect()
 }
 
@@ -1088,11 +1052,7 @@ pub(crate) fn advance_string_index(s: &[u16], index: u64, unicode: bool) -> u64 
         return index + 1;
     }
     let second = s[i + 1];
-    if (0xDC00..=0xDFFF).contains(&second) {
-        index + 2
-    } else {
-        index + 1
-    }
+    if (0xDC00..=0xDFFF).contains(&second) { index + 2 } else { index + 1 }
 }
 
 /// max(min(pos, len), 0) for a ToIntegerOrInfinity result.

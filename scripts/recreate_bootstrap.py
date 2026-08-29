@@ -2542,16 +2542,65 @@ def write_config(
         prefix=str(root / "install"),
         stage0_block=stage0_block,
     )
+    target_lines: list[str] = []
     if llvm_config:
         # Link an external LLVM instead of building it in-tree (no cmake/ninja,
         # ~26 min saved). The major version must match what rustc_llvm expects.
-        content += (
-            f'\n[target.{host}]\n'
-            f'llvm-config = "{llvm_config}"\n'
-        )
+        target_lines.append(f'llvm-config = "{llvm_config}"')
+    if platform.system().lower() == "linux":
+        # The OS toolchain is the native build authority on Linux — the same
+        # doctrine as the root-owned fixed git. A PATH `cc` can be any shim
+        # (a zig-cc shim's bundled glibc stubs broke the LLVM host link, its
+        # PATH probe poisoned CMAKE_ASM_FLAGS, and its -lstdc++ mapped to
+        # libc++, all on the first Linux host), so pin compile and link to
+        # the distro compiler when it exists; ambient CC/CXX stay refused.
+        gcc = Path("/usr/bin/gcc")
+        gxx = Path("/usr/bin/g++")
+        if gcc.is_file() and gxx.is_file():
+            target_lines.append(f'cc = "{gcc}"')
+            target_lines.append(f'cxx = "{gxx}"')
+            target_lines.append(f'linker = "{gcc}"')
+    if target_lines:
+        content += f'\n[target.{host}]\n' + "\n".join(target_lines) + "\n"
     target.write_text(content, encoding="utf-8")
     print(f"  wrote {target}")
     return target
+
+
+def ay_bcp_cargo_features(ay_dir: Path) -> str:
+    """`--features` for an ay bootstrap build, per the spelling ay declares.
+
+    Mirrors `ay_bootstrap_cargo_args_for_manifest` in
+    src/bootstrap/src/core/build_steps/tool.rs, deliberately including its
+    fail-safe, so this fallback rebuild and x.py's own cannot select different
+    capabilities from the same pin. The bcp feature has been renamed in BOTH
+    directions (raw-pointer-bcp <-> unsafe-bcp); hardcoding either spelling
+    breaks every checkout whose ay pin sits on the other side of the rename.
+    Measured 2026-08-23: the pinned ay declares `raw-pointer-bcp` only, so the
+    hardcoded `cli,unsafe-bcp` this function used to pass made the rebuild fail
+    with "none of the selected packages contains these features" — and
+    `install_ay_solver` then reports that verification will answer `unknown`.
+    """
+    try:
+        manifest = (ay_dir / "crates" / "ay" / "Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        manifest = ""
+
+    def declares(feature: str) -> bool:
+        in_features = False
+        for line in manifest.splitlines():
+            trimmed = line.split("#", 1)[0].strip()
+            if trimmed.startswith("["):
+                in_features = trimmed == "[features]"
+                continue
+            if in_features and trimmed.startswith(feature):
+                if trimmed[len(feature):].lstrip().startswith("="):
+                    return True
+        return False
+
+    if declares("unsafe-bcp") or not declares("raw-pointer-bcp"):
+        return "cli,unsafe-bcp"
+    return "cli,raw-pointer-bcp"
 
 
 def install_ay_solver(root: Path, host: str, stage: int) -> bool:
@@ -2562,7 +2611,8 @@ def install_ay_solver(root: Path, host: str, stage: int) -> bool:
     obligation degrades to `unknown`/`runtime_checked` and verification proves
     nothing — i.e. the toolchain is not "batteries on". `./x.py build` already
     builds `ay` as an in-tree tool (`--no-default-features --features
-    cli,unsafe-bcp`; `ensure_default_verifier_tool_bins` in
+    cli,<bcp>`, the spelling probed from ay's manifest — see
+    `ay_bcp_cargo_features`; `ensure_default_verifier_tool_bins` in
     src/bootstrap/src/core/build_steps/tool.rs) and installs it in the sysroot,
     so the job here is only to restore that artifact if anything displaced it.
     Rebuilding with a PATH `cargo` — what this function once did — silently
@@ -2610,7 +2660,8 @@ def install_ay_solver(root: Path, host: str, stage: int) -> bool:
         )
         return False
     ay_dir = root / "first-party" / "ay"
-    print("\n  building ay with the just-built toolchain (release, cli,unsafe-bcp) ...")
+    features = ay_bcp_cargo_features(ay_dir)
+    print(f"\n  building ay with the just-built toolchain (release, {features}) ...")
     env = os.environ.copy()
     env.pop("RUSTC_BOOTSTRAP", None)
     env["RUSTC"] = str(trustc)
@@ -2619,7 +2670,7 @@ def install_ay_solver(root: Path, host: str, stage: int) -> bool:
     rc = subprocess.run(
         [
             str(targo), "--unverified", "build", "--locked", "--release", "--bin", "ay",
-            "--no-default-features", "--features", "cli,unsafe-bcp",
+            "--no-default-features", "--features", features,
         ],
         cwd=str(ay_dir),
         env=env,

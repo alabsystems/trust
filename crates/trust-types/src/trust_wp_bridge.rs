@@ -1,8 +1,9 @@
 // trust-types/trust_wp_bridge.rs: Conversion bridge between trust_types::Formula and trust_wp_core PureExpr
 //
-// Phase 1 of trust_wp native integration. Converts trust-types
-// Formula (SMT-oriented) to trust-wp-core PureExpr (Rust-oriented) for use
-// by the TrustWpNativeBackend in trust-router.
+// Retained standalone/historical compatibility conversion from trust-types
+// Formula (SMT-oriented) to trust-wp-core PureExpr (Rust-oriented). This module
+// does not provide a compiler or full-verifier route and cannot mint proof
+// authority.
 //
 // Design: designs/2026-04-13-trust-wp-integration-design.md
 //
@@ -114,8 +115,12 @@ pub fn formula_to_pure_expr(formula: &Formula) -> Option<PureExpr> {
         Formula::Add(a, b) => bin_op(a, SBinOp::Add, b),
         Formula::Sub(a, b) => bin_op(a, SBinOp::Sub, b),
         Formula::Mul(a, b) => bin_op(a, SBinOp::Mul, b),
-        Formula::Div(a, b) => bin_op(a, SBinOp::Div, b),
-        Formula::Rem(a, b) => bin_op(a, SBinOp::Mod, b),
+        // Formula integer `/` and `%` denote Rust machine arithmetic.  The
+        // trust-wp vocabulary deliberately separates that from mathematical
+        // Euclidean `Div`/`Mod`; preserve the distinction even in this
+        // non-authoritative compatibility bridge.
+        Formula::Div(a, b) => bin_op(a, SBinOp::DivTrunc, b),
+        Formula::Rem(a, b) => bin_op(a, SBinOp::RemTrunc, b),
         Formula::Neg(a) => {
             let inner = formula_to_pure_expr(a)?;
             Some(PureExpr::UnOp(SUnOp::Neg, Arc::new(inner)))
@@ -210,14 +215,15 @@ fn bin_op(lhs: &Formula, op: SBinOp, rhs: &Formula) -> Option<PureExpr> {
 
 /// Batch-convert a slice of trust-types `Formula`s to trust-wp-core `PureExpr`s.
 ///
-/// Used by the trust_wp backend to translate structured contract IR
-/// (preconditions/postconditions) into PureExpr slices for
+/// Available to standalone compatibility consumers that translate structured
+/// contract IR (preconditions/postconditions) into `PureExpr` slices for
 /// `SmtGenerator::generate_vc(requires, ensures)`.
 ///
 /// Returns `None` if ANY formula in the slice fails to translate. This is
-/// intentional: a partially-translated contract is unsound (missing a
-/// precondition weakens the proof obligation). The caller should fall back
-/// to the monolithic approach.
+/// intentional: a partially translated contract is unsound as proof input
+/// because dropping a precondition weakens the proof obligation. This API
+/// returns no partial result, selects no verification route, and confers no
+/// authority.
 #[must_use]
 pub fn translate_formulas(formulas: &[Formula]) -> Option<Vec<PureExpr>> {
     formulas.iter().map(formula_to_pure_expr).collect()
@@ -225,9 +231,9 @@ pub fn translate_formulas(formulas: &[Formula]) -> Option<Vec<PureExpr>> {
 
 /// Cheap check: does this formula contain any bitvector operations or types?
 ///
-/// Used by the trust_wp router to quickly reject formulas that cannot be translated
-/// to `PureExpr` without a full translation attempt. Delegates to
-/// `Formula::has_bitvectors()` which performs a recursive visit.
+/// Available to compatibility consumers that need to identify formulas which
+/// cannot be translated to `PureExpr` without a full translation attempt.
+/// Delegates to `Formula::has_bitvectors()`, which performs a recursive visit.
 #[must_use]
 pub fn has_bv_ops(formula: &Formula) -> bool {
     formula.has_bitvectors()
@@ -235,7 +241,8 @@ pub fn has_bv_ops(formula: &Formula) -> bool {
 
 /// Cheap check: does this formula contain array theory operations (Select/Store)?
 ///
-/// trust_wp has no array theory, so formulas with array ops must be routed elsewhere.
+/// trust_wp has no array theory, so standalone compatibility conversion rejects
+/// formulas with array operations. This predicate does not route obligations.
 #[must_use]
 pub fn has_array_ops(formula: &Formula) -> bool {
     let mut found = false;
@@ -476,6 +483,18 @@ mod tests {
         let f = Formula::Exists(vec![("x".into(), Sort::Int)], Box::new(Formula::Bool(true)));
         let result = formula_to_pure_expr(&f).unwrap();
         assert!(matches!(result, PureExpr::Exists { var, .. } if var == "x"));
+    }
+
+    #[test]
+    fn test_formula_div_rem_preserve_rust_truncating_semantics() {
+        let lhs = || Box::new(Formula::Var("x".into(), Sort::Int));
+        let rhs = || Box::new(Formula::Int(2));
+
+        let div = formula_to_pure_expr(&Formula::Div(lhs(), rhs())).unwrap();
+        assert!(matches!(div, PureExpr::BinOp(_, SBinOp::DivTrunc, _)));
+
+        let rem = formula_to_pure_expr(&Formula::Rem(lhs(), rhs())).unwrap();
+        assert!(matches!(rem, PureExpr::BinOp(_, SBinOp::RemTrunc, _)));
     }
 
     #[test]

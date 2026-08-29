@@ -16,8 +16,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_types::fx::FxHashMap;
 
+use trust_types::fx::FxHashMap;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, Contract, ContractKind, Formula, LocalDecl, Operand,
     Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VerifiableBody,

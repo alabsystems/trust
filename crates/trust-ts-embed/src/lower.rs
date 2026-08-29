@@ -138,17 +138,15 @@ impl Lowerer {
             TsExpr::Index { .. }
             | TsExpr::IndexVar { .. }
             | TsExpr::Field { .. }
-            | TsExpr::IndexExpr { .. } => {
-                Err(FragmentEscape::new(
-                    &self.symbol,
-                    UnsupportedTsConstruct::UnknownConstruct {
-                        detail: "array/record access is admitted via the denotational path \
+            | TsExpr::IndexExpr { .. } => Err(FragmentEscape::new(
+                &self.symbol,
+                UnsupportedTsConstruct::UnknownConstruct {
+                    detail: "array/record access is admitted via the denotational path \
                                  (Sort::Array + Select / field vars), not the VerifiableFunction \
                                  deriver"
-                            .to_string(),
-                    },
-                ))
-            }
+                        .to_string(),
+                },
+            )),
             TsExpr::Call { func, .. } => Err(FragmentEscape::new(
                 &self.symbol,
                 UnsupportedTsConstruct::UnmodeledCall { callee: func.clone() },
@@ -209,7 +207,10 @@ pub fn lower_function(f: &TsFunction) -> Result<VerifiableFunction, FragmentEsca
         return Err(FragmentEscape::new(
             &f.name,
             UnsupportedTsConstruct::UnknownConstruct {
-                detail: format!("array-typed parameter `{}` lowers via the denotational path", p.name),
+                detail: format!(
+                    "array-typed parameter `{}` lowers via the denotational path",
+                    p.name
+                ),
             },
         ));
     }
@@ -274,7 +275,10 @@ mod tests {
         assert!(lower_function(&arr).is_err(), "array function must fail closed");
 
         // Record field access.
-        assert!(lower_function(&ret(TsExpr::field("s", "x", 16))).is_err(), "record must fail closed");
+        assert!(
+            lower_function(&ret(TsExpr::field("s", "x", 16))).is_err(),
+            "record must fail closed"
+        );
 
         // Bounded loop.
         let loopy = TsFunction {
@@ -284,8 +288,7 @@ mod tests {
         assert!(lower_function(&loopy).is_err(), "loop must fail closed");
 
         // No return.
-        let noret =
-            TsFunction { body: vec![], ..ret(TsExpr::Int(0, u)) };
+        let noret = TsFunction { body: vec![], ..ret(TsExpr::Int(0, u)) };
         assert!(lower_function(&noret).is_err(), "missing return must fail closed");
 
         // Scalar functions still lower fine (the fragment is non-empty).

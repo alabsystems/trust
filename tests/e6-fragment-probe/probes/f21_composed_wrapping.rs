@@ -9,4 +9,6 @@
 clean { def composed_isl (x : UInt64) : UInt64 := (x + 1) * 2 }
 pub fn composed(x: u64) -> u64
     ensures result == composed_isl(x)
-{ x.wrapping_add(1).wrapping_mul(2) }
+{
+    x.wrapping_add(1).wrapping_mul(2)
+}

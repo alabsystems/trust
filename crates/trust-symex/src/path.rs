@@ -4,8 +4,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use serde::{Deserialize, Serialize};
-use trust_types::BinOp;
-use trust_types::{Formula, Sort};
+use trust_types::{BinOp, Formula, Sort};
 
 use crate::state::SymbolicValue;
 

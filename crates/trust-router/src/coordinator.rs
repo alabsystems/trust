@@ -3204,10 +3204,8 @@ mod tests {
             std::fs::create_dir_all(&base).expect("create file-lane test root");
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
                 .expect("make file-lane test root private");
-            let directory = base.join(format!(
-                "{label}-{}-{nonce:x}-{sequence}",
-                std::process::id()
-            ));
+            let directory =
+                base.join(format!("{label}-{}-{nonce:x}-{sequence}", std::process::id()));
             std::fs::create_dir(&directory).expect("create private file-lane fixture");
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
                 .expect("make file-lane fixture private");

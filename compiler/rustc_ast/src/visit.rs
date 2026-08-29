@@ -1038,8 +1038,8 @@ macro_rules! common_visitor_and_walkers {
                     visit_visitable!($($mut)? vis, subexpression, block, opt_label, contract),
                 ExprKind::ForLoop { pat, iter, body, label, kind } =>
                     visit_visitable!($($mut)? vis, pat, iter, body, label, kind),
-                ExprKind::Loop(block, opt_label, span) =>
-                    visit_visitable!($($mut)? vis, block, opt_label, span),
+                ExprKind::Loop(block, opt_label, span, contract) =>
+                    visit_visitable!($($mut)? vis, block, opt_label, span, contract),
                 ExprKind::Match(subexpression, arms, kind) =>
                     visit_visitable!($($mut)? vis, subexpression, arms, kind),
                 ExprKind::Closure(Closure {

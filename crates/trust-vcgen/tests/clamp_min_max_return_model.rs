@@ -57,7 +57,8 @@ fn clamp_ret_fn(precond: bool) -> VerifiableFunction {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+                    terminator: Terminator::Call {
+                        unwind: trust_types::UnwindEdge::Unreachable,
                         func: "core::cmp::Ord::clamp".into(),
                         args: vec![
                             Operand::Copy(Place::local(3)),
@@ -69,6 +70,7 @@ fn clamp_ret_fn(precond: bool) -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -98,7 +100,8 @@ fn clamp_ret_fn(precond: bool) -> VerifiableFunction {
 /// A clamp with CONSTANT `lo`/`hi` bounds and an arbitrary postcondition.
 fn clamp_const_ret_fn(lo: i128, hi: i128, post: Formula) -> VerifiableFunction {
     let mut f = clamp_ret_fn(false);
-    f.body.blocks[0].terminator = Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+    f.body.blocks[0].terminator = Terminator::Call {
+        unwind: trust_types::UnwindEdge::Unreachable,
         func: "core::cmp::Ord::clamp".into(),
         args: vec![
             Operand::Copy(Place::local(3)),
@@ -110,6 +113,7 @@ fn clamp_const_ret_fn(lo: i128, hi: i128, post: Formula) -> VerifiableFunction {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     f.postconditions = vec![post];
@@ -121,7 +125,8 @@ fn ord2_ret_fn(method: &str, post: Formula) -> VerifiableFunction {
     let mut f = clamp_ret_fn(false);
     f.body.locals[1].name = Some("a".into());
     f.body.locals[2].name = Some("b".into());
-    f.body.blocks[0].terminator = Terminator::Call { unwind: trust_types::UnwindEdge::Unreachable,
+    f.body.blocks[0].terminator = Terminator::Call {
+        unwind: trust_types::UnwindEdge::Unreachable,
         func: format!("core::cmp::Ord::{method}"),
         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
         dest: Place::local(0),
@@ -129,6 +134,7 @@ fn ord2_ret_fn(method: &str, post: Formula) -> VerifiableFunction {
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     f.postconditions = vec![post];
@@ -199,10 +205,7 @@ fn clamp_const_lo_gt_hi_is_guarded_never_unconditional() {
     let dbg = postcondition_dbg(&clamp_const_ret_fn(
         5,
         2,
-        Formula::Le(
-            Box::new(Formula::Var("_0".into(), Sort::Int)),
-            Box::new(Formula::Int(10)),
-        ),
+        Formula::Le(Box::new(Formula::Var("_0".into(), Sort::Int)), Box::new(Formula::Int(10))),
     ));
     // The guard `Gt(5, 2)` proves the GUARDED arm was chosen (not the unconditional
     // bound). ay does not fold the constant comparison, so the disjunct stays

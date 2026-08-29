@@ -13,9 +13,10 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::cmp::Ordering;
+
 pub use num_bigint::BigInt as JsBigInt;
 use num_bigint::Sign;
-use std::cmp::Ordering;
 
 /// A BigInt binary operator (the arithmetic/bitwise/shift dispatch key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,20 +101,15 @@ pub fn bigint_to_radix(b: &JsBigInt, radix: u32) -> String {
 fn is_js_ws(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\u{b}'
-            | '\u{c}'
-            | ' '
-            | '\u{a0}'
-            | '\u{feff}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\n'
-            | '\r'
-            | '\u{2028}'
-            | '\u{2029}'
+        '\t' | '\u{b}' | '\u{c}' | ' ' | '\u{a0}' | '\u{feff}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\n'
+                | '\r'
+                | '\u{2028}'
+                | '\u{2029}'
     )
 }
 
@@ -126,16 +122,19 @@ fn is_js_ws(c: char) -> bool {
 pub fn parse_bigint_literal(raw: &str) -> Option<JsBigInt> {
     let body = raw.strip_suffix('n').unwrap_or(raw);
     let cleaned: String = body.chars().filter(|c| *c != '_').collect();
+    // Every branch goes through the capped parser: a source literal is the
+    // most exposed materialization path in this module (one token, unbounded
+    // digits), so it must not be the one place `BIT_CAP` is not enforced.
     if let Some(rest) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
-        return JsBigInt::parse_bytes(rest.as_bytes(), 16);
+        return parse_radix_no_sign_with_cap(rest, 16, BIT_CAP);
     }
     if let Some(rest) = cleaned.strip_prefix("0o").or_else(|| cleaned.strip_prefix("0O")) {
-        return JsBigInt::parse_bytes(rest.as_bytes(), 8);
+        return parse_radix_no_sign_with_cap(rest, 8, BIT_CAP);
     }
     if let Some(rest) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
-        return JsBigInt::parse_bytes(rest.as_bytes(), 2);
+        return parse_radix_no_sign_with_cap(rest, 2, BIT_CAP);
     }
-    JsBigInt::parse_bytes(cleaned.as_bytes(), 10)
+    parse_radix_no_sign_with_cap(&cleaned, 10, BIT_CAP)
 }
 
 /// StringToBigInt (7.1.14) over WTF-16 code units. Empty / whitespace-only →
@@ -165,43 +164,123 @@ pub fn string_to_bigint(units: &[u16]) -> Option<JsBigInt> {
     if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let v = JsBigInt::parse_bytes(body.as_bytes(), 10)?;
+    let v = parse_radix_no_sign_with_cap(body, 10, BIT_CAP)?;
     Some(if neg { -v } else { v })
 }
 
 fn parse_radix_no_sign(digits: &str, radix: u32) -> Option<JsBigInt> {
+    parse_radix_no_sign_with_cap(digits, radix, BIT_CAP)
+}
+
+/// Parse `digits` in `radix`, refusing anything whose value cannot fit in
+/// `bit_cap` bits — BEFORE allocating it.
+///
+/// `BIT_CAP` used to guard only the two ops that blow up multiplicatively
+/// (pow, shift). The PARSE side was uncapped, so a single source literal was
+/// an unbounded allocation: `JsBigInt::parse_bytes` on N digits materializes
+/// ~N*log2(radix) bits with nothing to stop it, and every literal in an
+/// analyzed program reaches this path.
+///
+/// The screen is a LOWER bound on the result's bit length derived from the
+/// significant digit count, so it can only reject values that are certainly
+/// over the cap — the exact `value.bits()` check afterwards handles the
+/// boundary. Leading zeros are stripped first so `0000...1` is not refused for
+/// its length. The decimal bound uses 10^28 > 2^93 (i.e. >= 93/28 bits per
+/// digit); binary/octal/hex are exact.
+fn parse_radix_no_sign_with_cap(digits: &str, radix: u32, bit_cap: u64) -> Option<JsBigInt> {
     if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
         return None;
     }
-    JsBigInt::parse_bytes(digits.as_bytes(), radix)
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Some(JsBigInt::from(0));
+    }
+    let digit_count = u64::try_from(significant.len()).ok()?;
+    let minimum_bits = match radix {
+        2 => digit_count,
+        8 => digit_count.saturating_sub(1).saturating_mul(3).saturating_add(1),
+        10 => digit_count
+            .saturating_sub(1)
+            .saturating_mul(93)
+            .checked_div(28)?
+            .saturating_add(1),
+        16 => digit_count.saturating_sub(1).saturating_mul(4).saturating_add(1),
+        _ => return None,
+    };
+    if minimum_bits > bit_cap {
+        return None;
+    }
+    let value = JsBigInt::parse_bytes(significant.as_bytes(), radix)?;
+    (value.bits() <= bit_cap).then_some(value)
 }
 
-/// A BigInt::* binary operation. `TooLarge` guards shift/exponent blowups.
+/// Refuse an OPERAND already larger than the cap.
+fn ensure_operand_within_cap(value: &JsBigInt, bit_cap: u64) -> Result<(), BigErr> {
+    if value.bits() > bit_cap {
+        Err(BigErr::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+/// Refuse a RESULT larger than the cap, after materializing it.
+fn checked_materialized(value: JsBigInt, bit_cap: u64) -> Result<JsBigInt, BigErr> {
+    ensure_operand_within_cap(&value, bit_cap)?;
+    Ok(value)
+}
+
+/// Multiply, refusing before allocating when the product certainly overflows
+/// the cap: for nonzero magnitudes of m and n bits the product has at least
+/// m + n - 1 bits.
+fn checked_mul(x: &JsBigInt, y: &JsBigInt, bit_cap: u64) -> Result<JsBigInt, BigErr> {
+    if bigint_is_zero(x) || bigint_is_zero(y) {
+        return Ok(JsBigInt::from(0));
+    }
+    let minimum_bits = x.bits().saturating_add(y.bits()).saturating_sub(1);
+    if minimum_bits > bit_cap {
+        return Err(BigErr::TooLarge);
+    }
+    checked_materialized(x * y, bit_cap)
+}
+
+/// A BigInt::* binary operation. EVERY materializing path enforces `BIT_CAP`,
+/// not just the shift/exponent blowups.
 pub fn bigint_binary(op: BigOp, x: &JsBigInt, y: &JsBigInt) -> Result<JsBigInt, BigErr> {
+    bigint_binary_with_cap(op, x, y, BIT_CAP)
+}
+
+fn bigint_binary_with_cap(
+    op: BigOp,
+    x: &JsBigInt,
+    y: &JsBigInt,
+    bit_cap: u64,
+) -> Result<JsBigInt, BigErr> {
+    ensure_operand_within_cap(x, bit_cap)?;
+    ensure_operand_within_cap(y, bit_cap)?;
     match op {
-        BigOp::Add => Ok(x + y),
-        BigOp::Sub => Ok(x - y),
-        BigOp::Mul => Ok(x * y),
+        BigOp::Add => checked_materialized(x + y, bit_cap),
+        BigOp::Sub => checked_materialized(x - y, bit_cap),
+        BigOp::Mul => checked_mul(x, y, bit_cap),
         BigOp::Div => {
             if bigint_is_zero(y) {
                 Err(BigErr::DivZero)
             } else {
-                Ok(x / y)
+                checked_materialized(x / y, bit_cap)
             }
         }
         BigOp::Rem => {
             if bigint_is_zero(y) {
                 Err(BigErr::DivZero)
             } else {
-                Ok(x % y)
+                checked_materialized(x % y, bit_cap)
             }
         }
-        BigOp::Pow => bigint_pow(x, y),
-        BigOp::And => Ok(x & y),
-        BigOp::Or => Ok(x | y),
-        BigOp::Xor => Ok(x ^ y),
-        BigOp::Shl => bigint_shift(x, y, true),
-        BigOp::Shr => bigint_shift(x, y, false),
+        BigOp::Pow => bigint_pow_with_cap(x, y, bit_cap),
+        BigOp::And => checked_materialized(x & y, bit_cap),
+        BigOp::Or => checked_materialized(x | y, bit_cap),
+        BigOp::Xor => checked_materialized(x ^ y, bit_cap),
+        BigOp::Shl => bigint_shift_with_cap(x, y, true, bit_cap),
+        BigOp::Shr => bigint_shift_with_cap(x, y, false, bit_cap),
     }
 }
 
@@ -209,12 +288,28 @@ pub fn bigint_binary(op: BigOp, x: &JsBigInt, y: &JsBigInt) -> Result<JsBigInt, 
 /// negative exponent with `RangeError`). Exponentiation by squaring, bounded
 /// by an estimated result-size cap.
 fn bigint_pow(base: &JsBigInt, exp: &JsBigInt) -> Result<JsBigInt, BigErr> {
+    bigint_pow_with_cap(base, exp, BIT_CAP)
+}
+
+fn bigint_pow_with_cap(base: &JsBigInt, exp: &JsBigInt, bit_cap: u64) -> Result<JsBigInt, BigErr> {
     if exp.sign() == Sign::Minus {
         return Err(BigErr::NegExponent);
     }
-    let e = u64::try_from(exp).map_err(|_| BigErr::TooLarge)?;
+    // `|base| <= 1` never grows, so an exponent too large to fit in a u64 is
+    // still answerable for 0/1/-1 and must not be refused as TooLarge.
     let base_bits = base.bits();
-    if base_bits > 0 && base_bits.saturating_mul(e) > BIT_CAP {
+    if base_bits <= 1 {
+        let odd = exp.bit(0);
+        return Ok(if bigint_is_zero(base) {
+            if bigint_is_zero(exp) { JsBigInt::from(1) } else { JsBigInt::from(0) }
+        } else if base.sign() == Sign::Minus && odd {
+            JsBigInt::from(-1)
+        } else {
+            JsBigInt::from(1)
+        });
+    }
+    let e = u64::try_from(exp).map_err(|_| BigErr::TooLarge)?;
+    if base_bits > 0 && base_bits.saturating_mul(e) > bit_cap {
         return Err(BigErr::TooLarge);
     }
     let mut result = JsBigInt::from(1);
@@ -235,19 +330,24 @@ fn bigint_pow(base: &JsBigInt, exp: &JsBigInt) -> Result<JsBigInt, BigErr> {
 /// BigInt::leftShift / signedRightShift. A negative distance flips direction;
 /// the right shift is arithmetic (floor division by 2^n).
 fn bigint_shift(x: &JsBigInt, y: &JsBigInt, left: bool) -> Result<JsBigInt, BigErr> {
+    bigint_shift_with_cap(x, y, left, BIT_CAP)
+}
+
+fn bigint_shift_with_cap(
+    x: &JsBigInt,
+    y: &JsBigInt,
+    left: bool,
+    bit_cap: u64,
+) -> Result<JsBigInt, BigErr> {
     // Determine the effective direction and non-negative magnitude.
-    let (grow, mag) = if y.sign() == Sign::Minus {
-        (!left, -y)
-    } else {
-        (left, y.clone())
-    };
+    let (grow, mag) = if y.sign() == Sign::Minus { (!left, -y) } else { (left, y.clone()) };
     if grow {
         // A growing shift beyond the size cap is refused (never a wrong value).
         if mag.bits() > 40 {
             return Err(BigErr::TooLarge);
         }
         let n = usize::try_from(&mag).map_err(|_| BigErr::TooLarge)?;
-        if (x.bits().saturating_add(n as u64)) > BIT_CAP {
+        if (x.bits().saturating_add(n as u64)) > bit_cap {
             return Err(BigErr::TooLarge);
         }
         Ok(x.clone() << n)
@@ -274,11 +374,8 @@ fn f64_to_int_scale(y: f64) -> (JsBigInt, i32) {
     let sign = if bits >> 63 == 1 { -1i8 } else { 1i8 };
     let exp = ((bits >> 52) & 0x7ff) as i64;
     let mant = bits & 0x000f_ffff_ffff_ffff;
-    let (mantissa, e) = if exp == 0 {
-        (mant, -1074_i64)
-    } else {
-        (mant | (1u64 << 52), exp - 1075)
-    };
+    let (mantissa, e) =
+        if exp == 0 { (mant, -1074_i64) } else { (mant | (1u64 << 52), exp - 1075) };
     let m = JsBigInt::from(mantissa) * sign;
     #[allow(clippy::cast_possible_truncation)]
     (m, e as i32)
@@ -298,11 +395,7 @@ pub fn f64_to_bigint_exact(y: f64) -> Option<JsBigInt> {
     let (m, e) = f64_to_int_scale(y);
     // y = m * 2^e is an integer, so e ≥ 0 or m is divisible by 2^(-e).
     #[allow(clippy::cast_sign_loss)]
-    if e >= 0 {
-        Some(m << (e as usize))
-    } else {
-        Some(m >> ((-e) as usize))
-    }
+    if e >= 0 { Some(m << (e as usize)) } else { Some(m >> ((-e) as usize)) }
 }
 
 /// Exact ordering between a BigInt and a Number (IsLessThan's mixed rule).
@@ -456,15 +549,12 @@ mod tests {
         let na = JsBigInt::from(-10);
         assert_eq!(bigint_binary(BigOp::Div, &na, &b).unwrap(), JsBigInt::from(-3));
         assert_eq!(bigint_binary(BigOp::Rem, &na, &b).unwrap(), JsBigInt::from(-1));
-        assert_eq!(bigint_binary(BigOp::Pow, &a, &JsBigInt::from(3)).unwrap(), JsBigInt::from(1000));
         assert_eq!(
-            bigint_binary(BigOp::Div, &a, &JsBigInt::from(0)),
-            Err(BigErr::DivZero)
+            bigint_binary(BigOp::Pow, &a, &JsBigInt::from(3)).unwrap(),
+            JsBigInt::from(1000)
         );
-        assert_eq!(
-            bigint_binary(BigOp::Pow, &a, &JsBigInt::from(-1)),
-            Err(BigErr::NegExponent)
-        );
+        assert_eq!(bigint_binary(BigOp::Div, &a, &JsBigInt::from(0)), Err(BigErr::DivZero));
+        assert_eq!(bigint_binary(BigOp::Pow, &a, &JsBigInt::from(-1)), Err(BigErr::NegExponent));
     }
 
     #[test]
@@ -509,5 +599,108 @@ mod tests {
         assert!(bigint_eq_f64(&JsBigInt::from(2), 2.0));
         assert!(!bigint_eq_f64(&JsBigInt::from(2), 2.5));
         assert!(!bigint_eq_f64(&JsBigInt::from(0), f64::INFINITY));
+    }
+
+    /// #bigint-materialization-cap: `BIT_CAP` used to guard only pow and
+    /// shift. Every other materializing op — and, worse, the PARSE path —
+    /// allocated without a bound, so a single source literal or one `*` was
+    /// an unbounded allocation.
+    #[test]
+    fn materialization_cap_covers_every_binary_op() {
+        const TEST_CAP: u64 = 64;
+        let edge = JsBigInt::from(1_u8) << 63;
+        let negative_edge = -&edge;
+
+        // Add/Sub carry past the cap.
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Add, &edge, &edge, TEST_CAP),
+            Err(BigErr::TooLarge)
+        );
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Sub, &edge, &negative_edge, TEST_CAP),
+            Err(BigErr::TooLarge)
+        );
+
+        // Mul is refused from the m+n-1 lower bound, before allocating.
+        let square_base = JsBigInt::from(1_u8) << 32;
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Mul, &square_base, &square_base, TEST_CAP),
+            Err(BigErr::TooLarge)
+        );
+
+        // An OPERAND already over the cap is refused whatever the op — even
+        // when the result would be small.
+        let oversized = JsBigInt::from(1_u8) << 64;
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Mul, &oversized, &JsBigInt::from(0), TEST_CAP),
+            Err(BigErr::TooLarge)
+        );
+
+        // Pow and shift keep their existing behaviour under the threaded cap.
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Pow, &JsBigInt::from(3), &JsBigInt::from(41), TEST_CAP),
+            Err(BigErr::TooLarge)
+        );
+        // main's pow screen is the conservative `base_bits * exponent`, so the
+        // accepted boundary for base 3 (2 bits) at a 64-bit cap is e = 32, not
+        // the ~63 the exact bit length would allow. Asserting the conservative
+        // boundary keeps this test about the CAP rather than about the
+        // estimator's tightness.
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Pow, &JsBigInt::from(3), &JsBigInt::from(32), TEST_CAP),
+            Ok(JsBigInt::from(1_853_020_188_851_841_u64))
+        );
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Shl, &JsBigInt::from(1), &JsBigInt::from(65), TEST_CAP),
+            Err(BigErr::TooLarge)
+        );
+
+        // Under the cap everything still computes.
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Mul, &JsBigInt::from(6), &JsBigInt::from(7), TEST_CAP),
+            Ok(JsBigInt::from(42))
+        );
+    }
+
+    /// `|base| <= 1` never grows, so an exponent too large for a u64 must
+    /// still answer rather than refuse.
+    #[test]
+    fn unit_bases_answer_for_exponents_beyond_u64() {
+        let huge_odd = (JsBigInt::from(1_u8) << 64) + 1;
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Pow, &JsBigInt::from(-1), &huge_odd, 128),
+            Ok(JsBigInt::from(-1))
+        );
+        assert_eq!(
+            bigint_binary_with_cap(BigOp::Pow, &JsBigInt::from(1), &huge_odd, 128),
+            Ok(JsBigInt::from(1))
+        );
+    }
+
+    /// The parse path is the most exposed materialization in this module: one
+    /// token, unbounded digits. It must refuse before allocating.
+    #[test]
+    fn parsers_refuse_values_beyond_the_materialization_cap() {
+        // 2^24 bits is the cap; a binary literal of 2^24 + 1 digits is over it.
+        let over = "1".repeat((BIT_CAP + 1) as usize);
+        assert_eq!(parse_bigint_literal(&format!("0b{over}n")), None);
+        assert_eq!(parse_radix_no_sign_with_cap(&over, 2, BIT_CAP), None);
+
+        // Leading zeros are not significant and must not cause a refusal.
+        let padded = format!("{}{}", "0".repeat(4096), "1");
+        assert_eq!(parse_radix_no_sign_with_cap(&padded, 2, BIT_CAP), Some(JsBigInt::from(1)));
+
+        // All-zero input is zero, not an error.
+        assert_eq!(parse_radix_no_sign_with_cap("0000", 10, BIT_CAP), Some(JsBigInt::from(0)));
+
+        // Ordinary literals are unaffected, in every radix.
+        assert_eq!(parse_bigint_literal("255n"), Some(JsBigInt::from(255)));
+        assert_eq!(parse_bigint_literal("0xffn"), Some(JsBigInt::from(255)));
+        assert_eq!(parse_bigint_literal("0o377n"), Some(JsBigInt::from(255)));
+        assert_eq!(parse_bigint_literal("0b1111_1111n"), Some(JsBigInt::from(255)));
+
+        // A small cap rejects a value that the default cap accepts.
+        assert_eq!(parse_radix_no_sign_with_cap("1000000", 10, 8), None);
+        assert_eq!(parse_radix_no_sign_with_cap("200", 10, 8), Some(JsBigInt::from(200)));
     }
 }

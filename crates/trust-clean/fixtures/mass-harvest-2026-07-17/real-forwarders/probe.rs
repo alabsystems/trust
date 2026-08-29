@@ -77,18 +77,9 @@ fn main() {
     // Derive inputs from argc so nothing const-folds away.
     let n = std::env::args().count();
 
-    let cfg = Config {
-        name: if n > 1 { Some(n as i32) } else { None },
-        count: n as u32,
-    };
-    let buf = Buf {
-        data_len: n,
-        cap: n + 4,
-    };
-    let st = State {
-        mode: if n % 2 == 0 { Some(n as u8) } else { None },
-        retries: n as u8,
-    };
+    let cfg = Config { name: if n > 1 { Some(n as i32) } else { None }, count: n as u32 };
+    let buf = Buf { data_len: n, cap: n + 4 };
+    let st = State { mode: if n % 2 == 0 { Some(n as u8) } else { None }, retries: n as u8 };
 
     let mut acc: u64 = 0;
     acc += cfg.has_name() as u64;

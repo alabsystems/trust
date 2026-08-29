@@ -21,10 +21,11 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use trust_js_value::{JsObject, JsValue, ObjId, ObjKind, PropKey, SymId, WkSym};
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::ops::same_value;
 use crate::props::PartialDesc;
-use trust_js_value::{JsObject, JsValue, ObjId, ObjKind, PropKey, SymId, WkSym};
 
 /// CanBeHeldWeakly (7.3.4-adjacent): objects, and symbols not registered in the
 /// GlobalSymbolRegistry (well-known symbols and unregistered user symbols
@@ -125,10 +126,7 @@ impl Interp {
         };
         // The cell's target/held are unobservable (no cleanup runs); only the
         // token is retained (what `unregister` observes).
-        self.finreg_cells
-            .get_mut(oid)
-            .expect("brand-checked above")
-            .push(token_slot);
+        self.finreg_cells.get_mut(oid).expect("brand-checked above").push(token_slot);
         Ok(JsValue::Undefined)
     }
 

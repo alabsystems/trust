@@ -35,9 +35,7 @@ fn value_fact_callees_require_std_origin() {
     assert!(is_bool_from_call("<usize as From<bool>>::from"));
     assert!(!is_bool_from_call("mycrate::convert::From::from"));
     assert!(!is_bool_from_call("mycrate::core::convert::Into::into"));
-    assert!(!is_bool_from_call(
-        "<usize as mycrate::convert::From<bool>>::from"
-    ));
+    assert!(!is_bool_from_call("<usize as mycrate::convert::From<bool>>::from"));
 
     assert!(is_std_num_intrinsic("core::num::<impl u32>::count_ones"));
     assert!(!is_std_num_intrinsic("mycrate::core::num::count_ones"));

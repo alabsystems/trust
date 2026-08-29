@@ -61,6 +61,15 @@ use crate::sep_engine::{detect_backing_struct, detect_backing_structs, establish
 /// access. See the module docs for the soundness contract on `functions`.
 #[must_use]
 pub fn certify_backing_invariants(functions: &[VerifiableFunction]) -> FxHashSet<String> {
+    // Constructor/mutator certification is authority-bearing.  Present every
+    // TailCall through the canonical call-plus-return projection so the
+    // separation engine and write-set scanners cannot silently skip it.
+    let expanded_functions = functions
+        .iter()
+        .map(|func| func.with_tail_calls_expanded().into_owned())
+        .collect::<Vec<_>>();
+    let functions = expanded_functions.as_slice();
+
     // Universe of backing structs referenced anywhere, as name -> (ptr, len).
     let mut shapes: std::collections::BTreeMap<String, (usize, usize)> =
         std::collections::BTreeMap::new();
@@ -280,10 +289,9 @@ fn var_name_to_local(name: &str, func: &VerifiableFunction) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
-        VerifiableBody, VerifiableFunction,
+        UnwindEdge, VerifiableBody, VerifiableFunction,
     };
 
     use super::*;
@@ -293,7 +301,9 @@ mod tests {
     }
 
     fn buf_ty() -> Ty {
-        Ty::Adt { adt_kind: None, layout: None, 
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "Buf".into(),
             fields: vec![
@@ -301,7 +311,9 @@ mod tests {
                 ("len".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
     }
 
     fn func(
@@ -314,7 +326,13 @@ mod tests {
             name: name.into(),
             def_path: name.into(),
             span: span(),
-            body: VerifiableBody { return_ty: Ty::Unit, locals, blocks, arg_count, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                return_ty: Ty::Unit,
+                locals,
+                blocks,
+                arg_count,
+                datatype_defs: Default::default(),
+            },
             contracts: Vec::new(),
             preconditions: Vec::new(),
             postconditions: Vec::new(),
@@ -349,6 +367,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: true,
                         func: "libc::mmap".into(),
                         args: vec![
@@ -435,6 +454,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::slice::from_raw_parts".into(),
                         args: vec![Operand::Move(Place::local(2)), Operand::Move(Place::local(3))],
@@ -496,6 +516,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: true,
                         func: "libc::mmap".into(),
                         args: vec![
@@ -580,6 +601,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: true,
                         func: "libc::mmap".into(),
                         args: vec![
@@ -603,6 +625,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::ptr::mut_ptr::<impl *mut T>::cast".into(),
                         args: vec![Operand::Move(Place::local(2))],
@@ -690,7 +713,12 @@ mod tests {
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
                     rvalue: Rvalue::Aggregate(
-                        AggregateKind::Adt { name: "Buf".into(), variant: 0, active_field: None, args: None },
+                        AggregateKind::Adt {
+                            name: "Buf".into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
                         vec![Operand::Move(Place::local(1)), Operand::Move(Place::local(2))],
                     ),
                     span: span(),

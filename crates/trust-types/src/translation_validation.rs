@@ -10,13 +10,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::FxHashMap;
-
-use crate::{
-    BlockId, Formula, Sort, SortFromTy, SourceSpan, Ty, VcKind, VerifiableBody,
-    VerifiableFunction, VerificationCondition,
-};
-
 // The translation-validation *data records* (CheckKind, TranslationCheck,
 // RefinementVc) live in trust-ir-contract (shared cross-repo vocabulary).
 // Re-exported so `trust_types::translation_validation::*` is unchanged. The
@@ -24,6 +17,12 @@ use crate::{
 // `RefinementVc::to_vc` below) stays here — it needs the full MIR/VC layer and
 // is not part of the cross-repo contract.
 pub use trust_ir_contract::translation_validation::{CheckKind, RefinementVc, TranslationCheck};
+
+use crate::fx::FxHashMap;
+use crate::{
+    BlockId, Formula, Sort, SortFromTy, SourceSpan, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    VerificationCondition,
+};
 
 /// Error type for translation validation operations.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -256,7 +255,9 @@ pub fn block_successors_list(term: &crate::Terminator) -> Vec<BlockId> {
             succs.push(*otherwise);
             succs
         }
-        crate::Terminator::Return | crate::Terminator::Unreachable => vec![],
+        crate::Terminator::Return
+        | crate::Terminator::TailCall { .. }
+        | crate::Terminator::Unreachable => vec![],
         crate::Terminator::Call { target, .. } => target.iter().copied().collect(),
         crate::Terminator::Assert { target, .. } => vec![*target],
         crate::Terminator::Drop { target, .. } => vec![*target],

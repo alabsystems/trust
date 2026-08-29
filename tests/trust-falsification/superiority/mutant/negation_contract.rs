@@ -7,4 +7,6 @@
 // does not make a wrong spec verify).
 #[core::contracts::requires(x > 0)]
 #[core::contracts::ensures(move |r: &i32| *r > 0)]
-pub fn negate(x: i32) -> i32 { -x }
+pub fn negate(x: i32) -> i32 {
+    -x
+}

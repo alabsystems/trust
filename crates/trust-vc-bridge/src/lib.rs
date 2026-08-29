@@ -181,6 +181,7 @@ pub fn trust_vc_native_trust_ir_kind_for_public_obligation(
     match kind {
         ObligationKind::Precondition => Some(trust_ir::ObligationKind::Precondition),
         ObligationKind::Postcondition => Some(trust_ir::ObligationKind::Postcondition),
+        ObligationKind::Refinement => Some(trust_ir::ObligationKind::RefinementType),
         ObligationKind::MemorySafety | ObligationKind::Ownership | ObligationKind::BoundsCheck => {
             Some(trust_ir::ObligationKind::MemorySafety)
         }
@@ -1400,10 +1401,11 @@ fn trust_vc_owned_support_level() -> SupportLevel {
 
 /// Obligation kinds owned by the trust_vc adapter.
 #[must_use]
-pub fn trust_vc_owned_obligation_kinds() -> [ObligationKind; 6] {
+pub fn trust_vc_owned_obligation_kinds() -> [ObligationKind; 7] {
     [
         ObligationKind::Precondition,
         ObligationKind::Postcondition,
+        ObligationKind::Refinement,
         ObligationKind::MemorySafety,
         ObligationKind::Ownership,
         ObligationKind::BoundsCheck,
@@ -1425,6 +1427,7 @@ pub fn is_trust_vc_owned_obligation_kind(kind: &ObligationKind) -> bool {
         kind,
         ObligationKind::Precondition
             | ObligationKind::Postcondition
+            | ObligationKind::Refinement
             | ObligationKind::MemorySafety
             | ObligationKind::Ownership
             | ObligationKind::BoundsCheck
@@ -1435,7 +1438,10 @@ pub fn is_trust_vc_owned_obligation_kind(kind: &ObligationKind) -> bool {
 /// lowering rather than ownership/borrow context.
 #[must_use]
 pub fn requires_trust_vc_contract_frame(kind: &ObligationKind) -> bool {
-    matches!(kind, ObligationKind::Precondition | ObligationKind::Postcondition)
+    matches!(
+        kind,
+        ObligationKind::Precondition | ObligationKind::Postcondition | ObligationKind::Refinement
+    )
 }
 
 /// Returns true when trust_vc postcondition evidence must carry a typed `result`
@@ -4849,6 +4855,7 @@ fn validate_kernel_contract_formula_binding(
     let expected_contract_kind = match obligation.kind {
         ObligationKind::Precondition => ContractKind::Requires,
         ObligationKind::Postcondition => ContractKind::Ensures,
+        ObligationKind::Refinement => ContractKind::Refinement,
         _ => return Ok(()),
     };
     let contract_id = obligation.contract_id.as_deref().ok_or_else(|| {
@@ -9209,10 +9216,8 @@ mod tests {
             ("trust.vc", "unbounded_allocation"),
             ("trust.vc.hardened", "unbounded_allocation"),
         ] {
-            let forged = ObligationKind::Custom {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-            };
+            let forged =
+                ObligationKind::Custom { namespace: namespace.to_string(), name: name.to_string() };
             assert!(!is_trust_vc_unbounded_allocation_obligation_kind(&forged), "{namespace}");
             assert!(!is_trust_vc_owned_obligation_kind(&forged), "{namespace}");
             assert_eq!(

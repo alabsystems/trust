@@ -729,7 +729,9 @@ impl SemOperand {
             // lane), so this arm is a FAIL-CLOSED POISON: a reference to an undeclared
             // constant that the kernel would reject (`UnknownConst`) rather than mint a
             // false Operand syntax value.
-            SemOperand::IterRegion(_) => cst("Trust.MirSem.Operand.__iter_region_trustir_witness_only"),
+            SemOperand::IterRegion(_) => {
+                cst("Trust.MirSem.Operand.__iter_region_trustir_witness_only")
+            }
         }
     }
 
@@ -793,7 +795,9 @@ impl SemOperand {
             // entry-time handle is denoted ONLY on the trust-ir side (`Trust.MirSem.
             // iter_region (e p)`); here it is a FAIL-CLOSED POISON const so any accidental
             // MirSem-anchor use is `UnknownConst`-rejected, never a false Int denotation.
-            SemOperand::IterRegion(_) => cst("Trust.MirSem.Operand.__iter_region_trustir_witness_only"),
+            SemOperand::IterRegion(_) => {
+                cst("Trust.MirSem.Operand.__iter_region_trustir_witness_only")
+            }
         }
     }
 
@@ -3059,6 +3063,31 @@ pub struct CalleeFact {
     /// referenced by name in a requires clause, and the establishment's
     /// free-variable check fails closed on any variable left unmapped.
     pub param_names: Vec<Option<String>>,
+    /// Trust: POSTCONDITION TRANSPORT (2026-08-27) — the callee's certified
+    /// RETURN MODEL, when it has one that may cross a call boundary.
+    ///
+    /// THE VALUE AXIS. Every other field here transports the callee's IDENTITY,
+    /// SIGNATURE or PRECONDITION; none says anything about what the callee
+    /// RETURNS. That is why every call result the Clean kernel sees is a ∀-bound
+    /// stand-in: `callResult (Call.mk id arg ret)` with `ret` Π-bound, asserting
+    /// nothing. Measured consequence on a 57,803-body crates.io corpus: 74.7% of
+    /// bodies contain a call, and the coverage of the whole corpus is 10.12%.
+    ///
+    /// `Some(ir)` carries an `IrBody` over the callee's own parameter space that
+    /// a caller may INLINE by substituting its actuals — sound because
+    /// `callResult (Call.mk _ _ X)` ι-reduces to `X` for any `X`, so no new
+    /// lemma, constant or axiom is involved. `None` is today's behaviour (an
+    /// opaque result), never a decline.
+    ///
+    /// MINTING IS DELIBERATELY NARROW and is NOT "the callee is in the registry":
+    /// registry membership means only that some lane certified the body earlier,
+    /// which per CLAUDE.md's recorded hazard "never [means] that the callee is
+    /// pure, deterministic, or side-effect-free". See
+    /// [`crate::prove::pure_scalar_ret_model`] for the gates that make a model
+    /// transportable, and in particular why an all-SCALAR signature is what keeps
+    /// the untimed-`idx_elem` hazard out: with no handle crossing the boundary, a
+    /// call on this lane cannot mutate a pointee the caller also reads.
+    pub ret_model: Option<crate::trustir_anchor::IrBody>,
 }
 
 impl CalleeFact {
@@ -3139,7 +3168,25 @@ impl CalleeFact {
             return_ty: func.body.return_ty.clone(),
             requires,
             param_names,
+            // Trust: POSTCONDITION TRANSPORT — `of_certified` has only the
+            // `VerifiableFunction`, and deliberately does NOT mint a model here.
+            // A model must carry its own fresh kernel evidence rather than ride on
+            // registry membership (which establishes nothing about the return
+            // value), so it is minted separately by
+            // `crate::prove::pure_scalar_ret_model` and attached at the registry
+            // insert points. `None` is exactly today's behaviour.
+            ret_model: None,
         }
+    }
+
+    /// Trust: POSTCONDITION TRANSPORT (2026-08-27) — attach a transportable return
+    /// model, keeping [`CalleeFact::of_certified`]'s own evidence discipline: the
+    /// model is supplied by a caller that has independently kernel-checked it, and
+    /// this constructor makes no judgement about it.
+    #[must_use]
+    pub fn with_ret_model(mut self, ret_model: Option<crate::trustir_anchor::IrBody>) -> Self {
+        self.ret_model = ret_model;
+        self
     }
 }
 
@@ -3898,6 +3945,33 @@ pub enum SemAdtPayload {
     /// guarded cast is the identity.  This distinction is load-bearing for
     /// narrowing and same-width sign-changing fallible-cast implementations.
     IntCast { source: SemOperand, width: u32, signed: bool },
+    /// Trust: NESTED-CTOR ARM PAYLOAD (2026-08-26) — a nested constructor WITH operands:
+    /// `Some(Inner(x))`, `Ok(Wrapper { a, b })`.
+    ///
+    /// Measured on a frozen 56,328-body corpus, this is the WHOLE of the largest
+    /// in-fragment gap in the ADT-return lane: all 67 bodies whose payload temp fell
+    /// outside `{Cast, Use, nullary Aggregate, Ref}` are an `Aggregate` with operands, and
+    /// nothing else. The sibling [`SemAdtPayload::NullaryNested`] covers only the
+    /// ZERO-operand case.
+    ///
+    /// EXACT STRUCTURE, not an opaque binder — the witness applies the inner constructor
+    /// to the inner field denotations, so the kernel checks `Some (Inner.mk ⟦x⟧)`. Every
+    /// field is [`SemStructField`], reusing the struct lane's own resolver and denotation.
+    ///
+    /// SCOPE, and it is a real fail-closed limit rather than an oversight: a field that is
+    /// an [`SemStructField::OpaqueParam`] is REFUSED here. Its denotation is a ∀-bound
+    /// binder whose index depends on the whole binder layout, and the ADT-return witness's
+    /// layout `(o, e)` has no per-type opaque binder to index into. Admitting it would mean
+    /// inventing a binder — so this declines instead, exactly as
+    /// [`struct_field_expr`](crate::trustir_adt) declines the same field for the same reason.
+    NestedCtor {
+        /// The inner ADT's type, carried verbatim so its carrier reflects identically.
+        ty: trust_types::Ty,
+        /// `None` for a single-`.mk` struct, `Some(v)` for the v-th enum variant.
+        variant: Option<usize>,
+        /// The inner constructor's own fields, in MIR order.
+        fields: Vec<SemStructField>,
+    },
     /// A NESTED fieldless-variant construction (`Error::Underflow`-class).
     NullaryNested {
         /// The nested enum's `Ty::Adt` name (e.g. `"Error"`).
@@ -3921,6 +3995,39 @@ pub enum SemAdtPayload {
     /// theorem builder is UNCHANGED — this denotes through the EXISTING
     /// `sem_operand_to_expr` `Field`-as-`idxElem` path (denotation extension, not a recipe
     /// change).
+    /// Trust: NON-SCALAR DOWNCAST PAYLOAD (2026-08-26) — the sibling of
+    /// [`Self::DowncastField`] for a payload whose type is NOT scalar: `Some(inner)`
+    /// where `inner : SomeAdt`.
+    ///
+    /// Measured gate-based across three corpora: 410 bodies match every other structural
+    /// requirement of the 2-arm lane and are stopped by the payload gate alone
+    /// (`how_many_bodies_fail_only_the_payload_gate`) — the largest measured target
+    /// remaining, worth up to +10% of everything certified.
+    ///
+    /// It cannot denote at the `idxElem` key [`Self::DowncastField`] uses: that key is
+    /// `Int`-sorted, and a constructor expecting the payload's own carrier rejects it.
+    /// Measured directly by relaxing the gate with the old denotation in place — it
+    /// gained 3 bodies, the rest kernel-REJECTED, which is what established that a
+    /// carrier-typed denotation is required rather than assumed.
+    ///
+    /// So it denotes `oᵀ base_param flat_key` against a ∀-bound OPAQUE ENVIRONMENT of
+    /// the payload's own carrier — the same construction
+    /// [`SemStructField::OpaqueParam`] uses, keyed by `(base_param, flat_key)` instead
+    /// of `(param, part)`. The `DOWNCAST-KEY-DISJOINTNESS` argument carries over
+    /// UNCHANGED: the flattened key is what makes two variants' payloads distinct, and
+    /// it is computed here exactly as the scalar sibling computes it.
+    DowncastOpaque {
+        /// The 0-based parameter index of the downcast base.
+        base_param: u64,
+        /// The VARIANT-DISJOINT flattened field key, computed identically to
+        /// [`Self::DowncastField`]'s.
+        flat_key: u64,
+        /// The downcast variant index, pinned equal to the dispatch tag by the caller.
+        downcast_variant: usize,
+        /// The payload's declared type, carried so the witness can reflect and register
+        /// its carrier and type the opaque environment binder.
+        payload_ty: trust_types::Ty,
+    },
     DowncastField {
         /// The 0-based parameter index of the downcast base (the dispatched `self`).
         base_param: u64,
@@ -4354,6 +4461,83 @@ struct DropLadderEpilogue {
     self_local: usize,
 }
 
+/// Trust: PASSTHROUGH-RETURN increment (2026-08-25) — a recognized identity return:
+/// a straight-line body whose SOLE `_0` write is `_0 = <parameter>` (or one field of
+/// one), followed by `Return`. The `fn f(x: T) -> T { x }` shape —
+/// `IntoIterator::into_iter` on a slice iterator, `From<Error> for Error`.
+///
+/// Measured across two fresh corpora: 107 + 183 = 290 single-block bodies of exactly
+/// this shape, none of which any lane recognized, because both constructor lanes
+/// require an `Rvalue::Aggregate`.
+///
+/// WHY THIS IS WORTH A LANE, when the `Unit` no-ops earlier in this report explicitly
+/// were not. A unit no-op asserts nothing: no return value, no modelled effect, so
+/// certifying it is a metric gain of zero user value. A passthrough asserts something
+/// DISTINGUISHING — `f(x, y) = x` and `f(x, y) = y` must be different theorems, and the
+/// probe pins that. It is also a BASE CASE: composition is the measured bottleneck and
+/// is gated on a dense callee registry, so 290 cheap, sound registry entries are worth
+/// more than their own row count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Trust: CONST-RETURN (2026-08-28) — a body whose entire content is returning a fixed
+/// string literal, `fn display() -> &'static str { "`|`" }`.
+///
+/// 264 uncovered authored no-call bodies are exactly this (6.28% of them — larger than
+/// any other candidate sized in this campaign), because `syn` defines the shape once per
+/// token and every `Token::display` is one.
+pub struct SemConstReturn {
+    /// The returned type, carried verbatim so the witness reflects the same carrier.
+    pub return_ty: trust_types::Ty,
+    /// The literal's bytes. The witness names them, which is the whole content of the
+    /// claim: a different literal yields a different theorem.
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemPassthroughReturn {
+    /// The returned type, carried verbatim so the witness reflects the same carrier.
+    ///
+    /// An immutable `Ty::Ref` to an ADT is admitted alongside a bare `Ty::Adt`: the
+    /// witness reflects the REFERENT, which is the W20 value-tier reading.
+    pub return_ty: trust_types::Ty,
+    /// The 0-based parameter index whose value is returned.
+    pub param: u64,
+    /// Which part of it: `0` the parameter itself, `n + 1` its field `n` — the same
+    /// encoding [`SemStructField::OpaqueParam`] uses, for the same reason.
+    pub part: u64,
+}
+
+/// Trust: BARE-ENUM-CTOR increment (2026-08-25) — a recognized straight-line ENUM
+/// constructor return: a body whose SOLE `_0` write is
+/// `_0 = Aggregate(AggregateKind::Adt { <enum>, variant: v, active_field: None }, ops)`
+/// immediately followed by `Return`. The `Cow::from(s)` / `ControlFlow::Continue(x)` /
+/// `Err(e)` shape — a bare variant construction with no guard and no control flow.
+///
+/// The sibling of [`SemStructReturn`], and deliberately NOT a degenerate
+/// [`SemAdtReturn`]: that one is a two-arm GUARDED shape, and forcing a guard-free body
+/// into it would fabricate a condition the body does not have.
+///
+/// Measured demand (2026-08-25): of the 26 real bare single-statement enum
+/// constructors, 22 already have a carrier that REGISTERS modulo 3 — the machinery was
+/// present and only the lane was missing.
+///
+/// The kernel witness ([`crate::trustir_adt::check_enum_ctor_return_refinement`]) shares
+/// [`crate::trustir_adt`]'s constructor-refinement builder with the struct lane, so the
+/// `Sort 1` type binders, the parameter-keyed opaque environments and the
+/// `claimed`-override probe seam are identical; only the constructor selected differs.
+/// GUARD-FREE MODEL-ONLY, so 100% of the soundness burden sits on this recognizer's
+/// gates, exactly as for the struct lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemEnumCtorReturn {
+    /// The ENUM return type (`Ty::Adt` with non-empty `variants`), carried verbatim so
+    /// the witness reflects the SAME carrier this recognizer cross-checked.
+    pub enum_ty: trust_types::Ty,
+    /// The constructed variant's index, cross-checked against both the declared
+    /// `variants` list and the registered carrier's constructor list.
+    pub variant: usize,
+    /// Per-field values in MIR / constructor order, over THAT VARIANT's fields.
+    pub fields: Vec<SemStructField>,
+}
+
 /// Trust: RECORD-WITNESS (single-variant struct-constructor, increment 1, 2026-07-22)
 /// — one field's value in a recognized straight-line struct-CONSTRUCTOR return. A
 /// [`Scalar`](Self::Scalar) field denotes through the witness's `sem_operand_to_expr`
@@ -4409,6 +4593,64 @@ pub enum SemStructField {
         /// pointer type; the pointee sort is cross-checked to equal the count slice's
         /// element sort, so the offset units and the length units agree).
         elem_size: u64,
+    },
+    /// Trust: OPAQUE-CTOR-FIELD increment (2026-08-25) — a field that has NO
+    /// `Int`-sorted denotation and whose Aggregate operand is a bare, entry-time read
+    /// of function parameter `param`. Two kinds qualify, for the SAME reason:
+    ///
+    ///   * the field reflects to a BOUND TYPE PARAMETER of the carrier
+    ///     (`Trust.Param.<id>`) — all 41 real bare generic constructors have one;
+    ///   * the field is a CONCRETE nested `Ty::Adt` — 22 more real bare constructors
+    ///     (`Enumerate { iter, count }`, `Quoter { inner }`, …).
+    ///
+    /// Pointer-ish fields (`Ty::Ref`/`Ty::RawPtr`) are deliberately NOT admitted here:
+    /// the folded increment-3 recognizer models those precisely as `sliceStart` /
+    /// `ptrOffset`, and admitting them as opaque binders in this earlier-tried lane
+    /// would PREEMPT that with a strictly weaker model at the same census count.
+    ///
+    /// It denotes the ∀-BOUND VALUE BINDER of parameter `param`, not an `Env`
+    /// lookup: `Env` is `Int`-sorted and cannot inhabit a bound `Sort 1` variable.
+    /// The binder is keyed by the SOURCE PARAMETER, never by field position — that
+    /// is what keeps the witness non-tautological. Were the binder per-FIELD, the
+    /// bodies `S { x }` and `S { y }` over two same-typed parameters would both
+    /// state `∀ v, S.mk v = S.mk v` and become indistinguishable; keyed by
+    /// parameter they state `∀ vx vy, S.mk vx = …` and `∀ vx vy, S.mk vy = …`, so
+    /// the claimed-override probe still bites.
+    /// Trust: NESTED-CTOR increment (2026-08-25) — a field whose value is itself a
+    /// CONSTRUCTOR: `Outer { inner: Inner { a, b }, n }`.
+    ///
+    /// MIR builds the inner value into a temporary first, so the field operand is a
+    /// local whose unique whole-local definition is an `Rvalue::Aggregate`. Measured
+    /// across two fresh corpora: 424 call-free multi-statement constructors have at
+    /// least one such field — the largest uncovered constructor class remaining.
+    ///
+    /// This is EXACT structure, not an opaque binder: the witness applies the inner
+    /// constructor to the inner field denotations, so `Outer.mk (Inner.mk a b) n` is
+    /// what the kernel checks. Recursion is bounded and every level re-applies the same
+    /// admission gates.
+    NestedCtor {
+        /// The inner ADT's type, carried verbatim so its carrier reflects identically.
+        ty: trust_types::Ty,
+        /// `None` for a single-`.mk` struct, `Some(v)` for the v-th enum variant.
+        variant: Option<usize>,
+        /// The inner constructor's own fields, in MIR order.
+        fields: Vec<SemStructField>,
+    },
+    OpaqueParam {
+        /// The 0-based function parameter index supplying this field.
+        param: u64,
+        /// Trust: PROJECTED SOURCE (2026-08-25) — which part of that parameter.
+        ///
+        /// `0` is the parameter itself; `n + 1` is its field `n`. Measured on a
+        /// 12,880-body corpus: 35 of the 46 bare constructors whose field TYPES are all
+        /// admissible decline only because the operand is a PROJECTED place
+        /// (`Wrapper { inner: other.field }`), not a bare read.
+        ///
+        /// The pair `(param, part)` is the binder key, so two fields drawn from
+        /// DIFFERENT parts of the same parameter stay distinguishable — the same
+        /// property that makes the parameter-keyed binder non-tautological in the first
+        /// place, extended one level down.
+        part: u64,
     },
 }
 
@@ -4657,8 +4899,20 @@ pub const INSTANTIATOR_ORD_LEAF_DEF_PATH: &str =
 // The failure mode `12307d51d1` correctly identified still ends: `adt_shapes.rs`
 // gates the `sem_adt_return_opaque_ord_shape_of` recognizer on this constant, so a
 // stale hash silently KILLS that recognizer rather than merely failing a test.
+//
+// RAW-TAG DECODE RE-PIN (2026-08-26), `b278bfb4…` -> `c689afa3…`. This one IS a
+// content change, not a hash-domain artifact, so the C1 precedent above does not
+// apply: the audited dump recorded `cmp::Ordering::Less` as the RAW
+// two's-complement `255`, the extraction boundary now decodes it, and
+// `scripts/regen_raw_enum_tag_fixtures.py` re-decoded the committed bytes. A
+// discriminant's value must stay hash-visible — a decode that the identity could
+// not see is exactly the confusion the boundary fix removes — so there is no
+// "canonicalize the domain" repair available here. The audit is unchanged in
+// substance: the ONLY fields that moved in that file are the `Less` variant's
+// discriminant and the `_d in {tags}` precondition constant it derives, and the
+// recognizer re-checks the full block/type/tag/immutability shape regardless.
 pub const INSTANTIATOR_ORD_LEAF_CONTENT_HASH: &str =
-    "b278bfb4d47462acaacc8863d4262cf43b536dd3881b74c69f5a8944c08c1c10";
+    "c689afa3064f438eb7060e1a98e54bcfa0f86167b88c9d695c48084520d4853b";
 
 /// Kernel-witness input for the exact ordering-dispatch leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7876,51 +8130,51 @@ impl CallThenProjectAdequacyCertificate {
 // fields and private consts without any visibility change. Each family is
 // re-exported flat, so `mirsem::<name>` resolves exactly as it did when this
 // module was a single file.
-mod semantics_env;
 mod adequacy;
-mod lift_mir;
-mod safety_overflow;
-mod safety_bounds_div;
-mod safety_signed;
-mod vc_faithful;
-mod call_lift;
-mod ptr_spine;
-mod return_lift;
-mod adt_shapes;
 mod adt_compose;
-mod function_witness;
-mod refinement;
-mod loops;
-mod loop_instances;
-mod termination;
-mod loop_postconditions;
+mod adt_shapes;
 mod call_contracts;
-mod cfg_semantics;
-mod open_world;
 mod call_instances;
+mod call_lift;
+mod cfg_semantics;
+mod function_witness;
+mod lift_mir;
+mod loop_instances;
+mod loop_postconditions;
+mod loops;
+mod open_world;
+mod ptr_spine;
+mod refinement;
+mod return_lift;
+mod safety_bounds_div;
+mod safety_overflow;
+mod safety_signed;
+mod semantics_env;
+mod termination;
+mod vc_faithful;
 
-pub use semantics_env::*;
 pub use adequacy::*;
-pub use lift_mir::*;
-pub use safety_overflow::*;
-pub use safety_bounds_div::*;
-pub use safety_signed::*;
-pub use vc_faithful::*;
-pub(crate) use call_lift::*;
-pub(crate) use ptr_spine::*;
-pub(crate) use return_lift::*;
-pub use adt_shapes::*;
 pub use adt_compose::*;
-pub use function_witness::*;
-pub use refinement::*;
-pub use loops::*;
-pub use loop_instances::*;
-pub use termination::*;
-pub use loop_postconditions::*;
+pub use adt_shapes::*;
 use call_contracts::*;
-use cfg_semantics::*;
-pub use open_world::*;
 pub use call_instances::*;
+pub(crate) use call_lift::*;
+use cfg_semantics::*;
+pub use function_witness::*;
+pub use lift_mir::*;
+pub use loop_instances::*;
+pub use loop_postconditions::*;
+pub use loops::*;
+pub use open_world::*;
+pub(crate) use ptr_spine::*;
+pub use refinement::*;
+pub(crate) use return_lift::*;
+pub use safety_bounds_div::*;
+pub use safety_overflow::*;
+pub use safety_signed::*;
+pub use semantics_env::*;
+pub use termination::*;
+pub use vc_faithful::*;
 
 /// Trust: OPAQUE-CHAIN ADT-RETURN reduced test fixtures. These preserve the
 /// audited control/data-flow shapes with internally coherent simplified type

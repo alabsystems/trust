@@ -196,6 +196,13 @@ refs/
 /config.toml
 targo-trust/tests/fixtures/fabric/target/
 
+# Build-tree mutual exclusion lock (scripts/trust_build_lock.sh) and the advisory
+# measurement sentinel it backs. Runtime state about THIS machine's tree, never
+# content: a committed lock would refuse builds in every clone that pulled it.
+/.trust-build-lock/
+/.trust-build-lock.*
+/.trust-measurement-in-flight
+
 # Recurring build/temp/session cruft (audit 2026-07-08)
 /tcargo-trust/
 /src/tools/cargo/

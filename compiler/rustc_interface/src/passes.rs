@@ -60,8 +60,9 @@ pub fn parse<'a>(sess: &'a Session) -> ast::Crate {
         // custom-driver fallback. Normal crate-name validation later requires
         // source and injected attributes to agree.
         let Some(crate_name) = sess.opts.crate_name.as_deref() else {
-            sess.dcx()
-                .fatal("-Ztrust-dump=ir:<dir> with -Ztrust-ir-lower requires an explicit --crate-name");
+            sess.dcx().fatal(
+                "-Ztrust-dump=ir:<dir> with -Ztrust-ir-lower requires an explicit --crate-name",
+            );
         };
         rustc_session::output::validate_crate_name(sess, Symbol::intern(crate_name), None);
         rustc_mir_build::trust_ir_prepare_artifact_publication(sess, crate_name);
@@ -1045,6 +1046,20 @@ fn changed_trust_critical_query_provider(providers: &Providers) -> Option<&'stat
     reject_changed_extern_query!(dylib_dependency_formats);
     reject_changed_extern_query!(exported_generic_symbols);
     reject_changed_extern_query!(exported_non_generic_symbols);
+    // The loader's record of HOW a crate entered the graph — which `--extern`
+    // item or injected `extern crate` named it, and where. Trust's sysroot
+    // identity rule does NOT read it: identity is artifact residency
+    // (`used_crate_source`, listed below) plus a command-line flag, deliberately,
+    // because a 2026-08-21 rule that DID read this record was refuted the same
+    // day — the injected item resolves through the adversary-controlled
+    // `--extern` map, so the record says which crate landed in the slot, not that
+    // the compiler chose it (`trust_mir_extract::convert::
+    // impersonates_sysroot_crate` carries the measurement). It stays on this list
+    // anyway: the list is the set of loader/provenance records a driver callback
+    // must not be able to fabricate, and this is one of them. MEASURED: zero
+    // call sites under `crates/` read it today (one prose mention, no call) —
+    // grep before assuming otherwise.
+    reject_changed_extern_query!(extern_crate);
     reject_changed_extern_query!(has_alloc_error_handler);
     reject_changed_extern_query!(has_global_allocator);
     reject_changed_extern_query!(has_panic_handler);
@@ -1533,7 +1548,19 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) {
                  borrow-checked.",
             );
         }
-        rustc_mir_build::trust_ir_crate_finalize(tcx);
+        // Trust (IR-1, docs/design/2026-08-27-two-language-direct-to-trust-ir.md
+        // §3): collect the Clean-origin trust-ir spellings — ONLY under
+        // verification, where the eager body demand is deliberate fail-closed
+        // tightening; verification-off artifact lanes make no demand and the
+        // coverage sidecar records the absence instead. This crate performs the
+        // hand-off because rustc_mir_build (the finalizer's home) cannot depend
+        // on rustc_mir_transform (the collection's home).
+        let trust_clean_origin_ir = if tcx.sess.trust_verification_enabled() {
+            Some(rustc_mir_transform::clean_origin_ir::collect_clean_origin_ir(tcx))
+        } else {
+            None
+        };
+        rustc_mir_build::trust_ir_crate_finalize(tcx, trust_clean_origin_ir);
     }
 
     // Trust (lane CTFE, `-Ztrust-ctfe-trivial-probe`, default OFF): MEASUREMENT
@@ -1692,6 +1719,15 @@ pub(crate) fn start_codegen<'tcx>(
     });
 
     info!("Post-codegen\n{:?}", tcx.debug_stats());
+    // Trust (wall A, instance-flip probe — MEASUREMENT ONLY): after `codegen_crate`
+    // the mono partition is computed and every flip decision has fired; report, per
+    // stashed generic `agreed` body, the concrete instances codegen actually
+    // demanded. No-op unless `-Ztrust-instance-flip-probe` is set.
+    rustc_mir_build::trust_instance_probe_finalize(tcx);
+    // Trust (wall A, the INSTANCE flip seam): the production census — one row per recorded
+    // generic body with its offered/flipped/refused instance counts, measured by the seam itself.
+    // No-op unless the instance lane is enabled.
+    rustc_mir_transform::trust_instance_flip_census(tcx);
 
     // This must run after monomorphization so that all generic types
     // have been instantiated.

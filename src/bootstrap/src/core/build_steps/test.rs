@@ -3755,7 +3755,12 @@ fn prepare_cargo_test(
 ) -> BootstrapCommand {
     let compiler = cargo.compiler();
     if builder.config.cmd.trust_vanilla() {
-        cargo.rustflag("-Ztrust-verify=off");
+        // Trust: `rustflag_once`. `apply_bootstrap_trust_verification_default`
+        // already adds this flag for every stage != 0, so pushing it again here
+        // repeated it — and a repeated rustflag forks the cargo unit, because
+        // rustflags feed `unit_id` but not `c_metadata`. That is what made the
+        // gate's `--trust-vanilla` child build a `std` the sysroot did not have.
+        cargo.rustflag_once("-Ztrust-verify=off");
         cargo.rustdocflag("-Ztrust-verify=off");
     }
     let mut cargo: BootstrapCommand = cargo.into();
@@ -3849,8 +3854,28 @@ impl Step for Crate {
 
     fn make_run(run: RunConfig<'_>) {
         let builder = run.builder;
-        let host = run.build_triple();
-        let build_compiler = builder.compiler(builder.top_stage, host);
+        // Trust: `compiler_for_std`, not `compiler` — the same helper the `Mode::Std`
+        // steps in dist.rs and doc.rs already use. This step was the outlier.
+        //
+        // Stage-2 std is UPLIFTED from stage 1 (`Std::should_be_uplifted_from_stage_1`),
+        // so the stage-2 SYSROOT holds stage 1's artifacts — measured here as
+        // `libstd-4899ad891801794d.dylib`, built in `stage1-std`. Asking for a stage-2
+        // `Mode::Std` test cargo anyway builds a SECOND std into `stage2-std`
+        // (`libstd-32483c54e2ddf828.dylib`), and the test binaries link THAT one by
+        // rpath while the loader searches the sysroot, which has the other. 28 of
+        // std's integration tests died as `dyld: Library not loaded:
+        // @rpath/libstd-32483c54e2ddf828.dylib`, SIGABRT, with the dylib sitting
+        // unreferenced in `stage2-std/.../build/std/32483c.../out/`.
+        //
+        // Clamping to stage 1 when the uplift is in effect tests exactly the
+        // artifacts the sysroot actually contains — they ARE stage 1's — with the
+        // compiler that built them, and builds no second copy for the loader to miss.
+        //
+        // NOTE for anyone re-treading this: an earlier attempt at this same clamp was
+        // reverted because the `std_detect` StableCrateId collision survived it. That
+        // was a DIFFERENT symptom of stale build state, and a clean rebuild cleared it
+        // on its own. The dyld mismatch is the one this clamp actually answers.
+        let build_compiler = builder.compiler_for_std(builder.top_stage);
         let crates = run
             .paths
             .iter()
@@ -3953,6 +3978,13 @@ impl Step for Crate {
                         .arg(builder.src.join("library/sysroot/Cargo.toml"));
                 } else {
                     compile::std_cargo(builder, target, &mut cargo, &[]);
+                    // Trust: the SAME flag the build lane applies. Both lanes write
+                    // into one target dir, and cargo hashes rustflags into
+                    // `unit_id` but not into `c_metadata` — so a flag on one lane
+                    // only forks `core` into two units with the SAME `-Cmetadata`,
+                    // whose StableCrateIds then collide. See
+                    // `compile::apply_trust_std_encode_mir` for the full account.
+                    compile::apply_trust_std_encode_mir(&mut cargo);
                 }
             }
             Mode::Rustc => {

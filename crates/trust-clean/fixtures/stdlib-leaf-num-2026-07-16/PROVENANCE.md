@@ -68,11 +68,15 @@ oracle covers the original F panel, bit-intrinsic B panel, and signum G panel.
     lowers to `Cmp(self,0)` followed by an `Ordering` discriminant read; the
     i16/i32/i64 dumps then cast that tag, while the i8 dump writes the
     discriminant directly to `_0`. The body is **fully present** (no opaque
-    callee), but a future normalization must not assume the dump metadata is
-    already the mathematical `-1/0/1`: the recorded i8 `Less` metadata is raw
-    `255`, and the serialized type does not carry the faithful integer repr.
-    The lane therefore remained fail-closed until it could signed-decode against
-    an explicit destination representation.
+    callee), but at harvest time the dump metadata was NOT the mathematical
+    `-1/0/1`: the recorded i8 `Less` metadata was the raw two's-complement `255`,
+    and the serialized type does not carry the faithful integer repr. The lane
+    therefore remained fail-closed until it could signed-decode against an
+    explicit destination representation.
+    **Superseded 2026-08-26**: the extraction boundary now decodes the tag, so
+    these dumps record `Less = -1` and the `_d in {tags}` precondition records
+    `Int(-1)`. `scripts/regen_raw_enum_tag_fixtures.py` performed exactly that
+    re-decode on the committed bytes and nothing else.
 
 ### Original sub-family split
 
@@ -265,8 +269,10 @@ semantics — **not** a shape-only promotion).
   value-preserving sign-extend `_0 := Cast(_d:i8, iN)`. Both shapes certify.
 - **Soundness — the vendored Ordering/Cmp check.** The recognizer VERIFIES the
   vendored `cmp::Ordering` representation from the dump: EXACTLY three variants
-  `Less`/`Equal`/`Greater` whose discriminants, interpreted as signed at the
-  sign-carrier width (`255`→`-1`, `0`→`0`, `1`→`1` at i8), ARE the sign encoding.
+  `Less`/`Equal`/`Greater` whose discriminants, read as signed at the
+  sign-carrier width (`-1`, `0`, `1`), ARE the sign encoding. Those dumps spelled
+  `Less` as the raw `255` until the extraction boundary began decoding the tag
+  (2026-08-26); the recognizer reads the decoded value.
   Given `Cmp(self, 0)` yields `Less`/`Equal`/`Greater` per `self<0`/`=0`/`>0`,
   the tag read + sign-extend recovers `signum(self) = (self>0) - (self<0)`.
 

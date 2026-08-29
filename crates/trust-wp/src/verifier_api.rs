@@ -5,64 +5,65 @@
 
 //! Fail-closed `trust-verifier-api` adapter for trust_wp.
 //!
-//! trust_wp owns deductive precondition, postcondition, loop-invariant,
-//! refinement, and termination obligations at the full-verification boundary.
-//! The proof-strength boundary is trust-wp's aggregate native replay gate added in
-//! commit `5ac5fe6c848d491da99b6298cfdd4ef632cfc9d9`: a
-//! `TrustWpNativePureReplayV1` proof is not reportable until it has been
-//! replayed through trust-wp's `VerifyBundleResult` aggregation.
-//!
-//! Default builds have not wired that aggregate verifier into the adapter. They
-//! may decode typed `TrustWpPureExprV1` predicates for diagnostics and local
-//! refutation, but successful local replay is not treated as
-//! `ProofStrength::deductive`. With `trust-build`, typed `TrustWpPureExprV1`
-//! claims are sent directly to trust-wp's committed `NativeTrustWpBundleVerifier`;
-//! only an aggregate `VerifyBundleResult::Verified` with proof-grade
-//! `TrustWpNativePureReplayV1` evidence and concrete proof transport artifacts is
-//! reportable as proof. If the vendored `first-party/trust-wp` checkout is stale
-//! and lacks trust-wp's artifact transport API, trust-build fails closed instead
-//! of accepting hash-only/text-only evidence. The adapter never shells out to
-//! the compatibility CLI path and never treats source strings, contract
-//! presence, metadata, summaries, inferred facts, solver success, or
-//! lowered-but-not-aggregate-replayed predicates as proof evidence.
+//! trust_wp currently advertises no full-verification obligation kinds. The
+//! body-aware contract kinds belong to trust-mc and refinement belongs to
+//! trust-vc. TrustIR's formula-less `&mut` give-back record is not a
+//! dischargeable proof obligation; treating its structural candidate (or a
+//! synthetic Boolean) as proof would be vacuous.
+//! Historical typed replay and evidence-decoding helpers remain so old wire
+//! artifacts can be inspected and rejected precisely. They are not reachable
+//! as proof authority through [`TrustWpVerificationEngine`]: its manifest is
+//! empty and every request returns `Unsupported`, including under
+//! `trust-build`. Every refusal carries its rerouting options (v7/D3). The
+//! adapter never shells out to the compatibility CLI path
+//! and never treats source strings, contract presence, metadata, summaries,
+//! inferred facts, solver success, structural candidates, or replayed claims
+//! without a genuine owned obligation as proof evidence.
 
+#[cfg(feature = "trust-build")]
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use serde::{Deserialize, Serialize};
-use trust_verifier_api::{
-    API_VERSION, ArtifactHash, ContractKind, ContractPredicate, Counterexample, EngineCapability,
-    EngineKind, EngineManifest, EvidenceArtifact, EvidenceArtifactKind,
-    EvidencePublicationMetadata, EvidenceStatus, ObligationEvidence, ObligationKind, ProofStrength,
-    ReasoningKind, SummaryFact, SupportLevel, TRUST_SPEC_PREDICATE_SCHEMA_VERSION, TrustContract,
-    TrustContractBundle, TrustObligation, TrustSpecBinaryOp, TrustSpecExpr, TrustSpecExprKind,
-    TrustSpecPredicate, TrustSpecSort, TrustSpecUnaryOp, ValidatedVerificationRequest,
-    VerificationEngine,
-};
 #[cfg(feature = "trust-build")]
-use trust_verifier_api::{EvidenceArtifactMaterialization, EvidenceArtifactReference};
+use serde::{Deserialize, Serialize};
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
+use trust_verifier_api::ReasoningKind;
+use trust_verifier_api::{
+    API_VERSION, ArtifactHash, EngineKind, EngineManifest, EvidencePublicationMetadata,
+    EvidenceStatus, ObligationEvidence, ObligationKind, SupportLevel, TrustContractBundle,
+    TrustObligation, ValidatedVerificationRequest, VerificationEngine,
+};
+#[cfg(all(test, feature = "trust-build"))]
+use trust_verifier_api::{
+    ContractKind, ContractPredicate, Counterexample, EvidenceArtifact, EvidenceArtifactKind,
+    EvidenceArtifactMaterialization, EvidenceArtifactReference, ProofStrength, SummaryFact,
+    TRUST_SPEC_PREDICATE_SCHEMA_VERSION, TrustContract, TrustSpecBinaryOp, TrustSpecExpr,
+    TrustSpecExprKind, TrustSpecPredicate, TrustSpecSort, TrustSpecUnaryOp,
+};
 
 /// Public trust_wp engine name used in manifests and evidence IDs.
 pub const TRUST_WP_ENGINE_NAME: &str = "trust-wp";
 
-/// Fail-closed reason used until native trust_wp bundle lowering and proof exist.
+/// Historical fail-closed reason retained for compatibility diagnostics.
 pub const TRUST_WP_NATIVE_NOT_WIRED: &str =
-    "trust-wp native TrustContractBundle proof-evidence adapter is not wired";
+    "trust-wp owns no current full-verification TrustContractBundle proof claim";
 
 /// trust_wp commit that introduced aggregate native replay evidence checking.
+#[cfg(all(test, feature = "trust-build"))]
 pub(crate) const TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT: &str =
     "5ac5fe6c848d491da99b6298cfdd4ef632cfc9d9";
 
-/// Fail-closed reason used while Trust does not call trust-wp's aggregate gate.
-#[cfg(not(feature = "trust-build"))]
-pub(crate) const TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_NOT_WIRED: &str =
-    "trust-wp aggregate native replay evidence gate is not wired in Trust";
-
 /// Audit schema label for trust-wp's aggregate native replay gate.
+#[cfg(all(test, feature = "trust-build"))]
 pub(crate) const TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION: &str =
     "trust_wp.verify-bundle.aggregate-native-replay-gate.v1";
 
-/// trust_wp proof evidence schema required before this adapter can claim proof.
+/// Historical trust_wp proof-evidence schema retained for wire decoding.
 pub(crate) const TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION: &str = "trust_wp.proof-evidence.v1";
 
 /// trust_wp replay schema required for the first native pure-predicate fragment.
@@ -110,17 +111,23 @@ pub const TRUST_TRUST_WP_NATIVE_REPLAY_REQUIRED_METADATA_KEYS: [&str; 6] = [
 /// Wire-format value: must stay byte-identical to trust-wp-core's canonical
 /// `TRUST_WP_VERIFY_BUNDLE_AGGREGATE_SCHEMA_VERSION` (`trust-wp.` spelling) or
 /// every aggregate `checked_by`/format comparison rejects valid core evidence.
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 pub(crate) const TRUST_WP_VERIFY_BUNDLE_AGGREGATE_SCHEMA_VERSION: &str =
     "trust-wp.verify-bundle-aggregate.v1";
 
 /// Diagnostic marker for stale vendored trust_wp checkouts.
-#[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
+#[cfg(all(test, feature = "trust-build", not(trust_wp_proof_transport_api)))]
 pub(crate) const TRUST_WP_PROOF_TRANSPORT_API_MISSING: &str =
     "vendored trust_wp proof transport artifact API is missing";
 
 /// Diagnostic marker for trust_wp checkouts without typed native artifact context.
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     not(trust_wp_structured_context_api)
@@ -130,6 +137,7 @@ pub(crate) const TRUST_WP_STRUCTURED_CONTEXT_API_MISSING: &str =
 
 /// Diagnostic marker for trust_wp checkouts without the aggregate replay helper.
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -139,26 +147,35 @@ pub(crate) const TRUST_WP_REPLAY_HELPER_API_MISSING: &str =
     "vendored trust_wp aggregate proof replay helper API is missing";
 
 /// Typed trust_wp pure-expression claim schema accepted by the replay adapter.
+#[cfg(feature = "trust-build")]
 pub(crate) const TRUST_WP_PURE_EXPR_SCHEMA_VERSION: &str = "TrustWpPureExprV1";
 
 /// Structured trust_wp TrustFormulaV1 claim schema accepted only through
 /// trust-wp's committed native bundle verifier.
+#[cfg(feature = "trust-build")]
 pub(crate) const TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION: &str = "trust_wp.trust-formula.v1";
 
 /// Symbolic `trust-types::Formula` claim schema. Predicates delivered with this
 /// schema carry a serde-serialized `trust_types::Formula`; this adapter lowers
 /// them into the `trust_wp.trust-formula.v1` envelope before native replay.
+#[cfg(feature = "trust-build")]
 pub(crate) const TRUST_TYPES_FORMULA_SCHEMA_VERSION: &str = "trust-types.Formula@1";
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 mod trust_wp_metadata_keys {
+    #[cfg(all(trust_wp_metadata_constants_api, not(trust_wp_typed_metadata_helper_api)))]
+    pub(crate) use trust_wp_core::verify_bundle::TRUST_WP_CLAIM_DIGEST_METADATA_KEY;
     #[cfg(trust_wp_metadata_constants_api)]
     pub(crate) use trust_wp_core::verify_bundle::{
-        TRUST_WP_CLAIM_DIGEST_METADATA_KEY, TRUST_WP_NATIVE_ORIGIN_METADATA_KEY,
-        TRUST_WP_NATIVE_REPLAY_METADATA_KEY, TRUST_WP_NATIVE_SOLVER_METADATA_KEY,
-        TRUST_WP_NATIVE_SUMMARY_FACT_METADATA_KEY, TRUST_WP_NATIVE_VERIFIER_METADATA_KEY,
-        TRUST_WP_PROOF_CONTEXT_METADATA_KEY, TRUST_WP_TMIR_OBLIGATION_SOURCE_METADATA_KEY,
-        TRUST_WP_TMIR_SOURCE_SPAN_METADATA_KEY,
+        TRUST_WP_NATIVE_ORIGIN_METADATA_KEY, TRUST_WP_NATIVE_REPLAY_METADATA_KEY,
+        TRUST_WP_NATIVE_SOLVER_METADATA_KEY, TRUST_WP_NATIVE_SUMMARY_FACT_METADATA_KEY,
+        TRUST_WP_NATIVE_VERIFIER_METADATA_KEY, TRUST_WP_PROOF_CONTEXT_METADATA_KEY,
+        TRUST_WP_TMIR_OBLIGATION_SOURCE_METADATA_KEY, TRUST_WP_TMIR_SOURCE_SPAN_METADATA_KEY,
     };
 
     // Fallback wire-format keys used only when the vendored trust_wp does not
@@ -167,7 +184,7 @@ mod trust_wp_metadata_keys {
     #[cfg(not(trust_wp_metadata_constants_api))]
     /// Optional JSON metadata key carrying typed native trust_wp origin information.
     pub(crate) const TRUST_WP_NATIVE_ORIGIN_METADATA_KEY: &str = "trust.trust-wp.native-origin.v1";
-    #[cfg(not(trust_wp_metadata_constants_api))]
+    #[cfg(all(not(trust_wp_metadata_constants_api), not(trust_wp_typed_metadata_helper_api)))]
     /// Optional JSON metadata key carrying a trust_wp `BundleClaim` digest.
     pub(crate) const TRUST_WP_CLAIM_DIGEST_METADATA_KEY: &str = "trust.trust-wp.claim-digest.v1";
     #[cfg(not(trust_wp_metadata_constants_api))]
@@ -198,27 +215,35 @@ mod trust_wp_metadata_keys {
 }
 
 #[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api,
+    not(trust_wp_typed_metadata_helper_api)
+))]
+pub(crate) use trust_wp_metadata_keys::TRUST_WP_CLAIM_DIGEST_METADATA_KEY;
+#[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api
 ))]
-#[allow(unused_imports)]
 pub(crate) use trust_wp_metadata_keys::{
-    TRUST_WP_CLAIM_DIGEST_METADATA_KEY, TRUST_WP_NATIVE_ORIGIN_METADATA_KEY,
-    TRUST_WP_NATIVE_REPLAY_METADATA_KEY, TRUST_WP_NATIVE_SOLVER_METADATA_KEY,
-    TRUST_WP_NATIVE_SUMMARY_FACT_METADATA_KEY, TRUST_WP_NATIVE_VERIFIER_METADATA_KEY,
-    TRUST_WP_PROOF_CONTEXT_METADATA_KEY, TRUST_WP_TMIR_OBLIGATION_SOURCE_METADATA_KEY,
-    TRUST_WP_TMIR_SOURCE_SPAN_METADATA_KEY,
+    TRUST_WP_NATIVE_ORIGIN_METADATA_KEY, TRUST_WP_NATIVE_REPLAY_METADATA_KEY,
+    TRUST_WP_NATIVE_SOLVER_METADATA_KEY, TRUST_WP_NATIVE_SUMMARY_FACT_METADATA_KEY,
+    TRUST_WP_NATIVE_VERIFIER_METADATA_KEY, TRUST_WP_PROOF_CONTEXT_METADATA_KEY,
+    TRUST_WP_TMIR_OBLIGATION_SOURCE_METADATA_KEY, TRUST_WP_TMIR_SOURCE_SPAN_METADATA_KEY,
 };
 
 /// Artifact kinds required by trust_wp native pure replay evidence.
 pub(crate) const TRUST_WP_NATIVE_PURE_REPLAY_REQUIRED_ARTIFACTS: [&str; 2] =
     ["normalized-obligation", "replay-log"];
 
-/// `trust-verifier-api` engine adapter for trust-wp's native full-verification lane.
+/// Zero-capability `trust-verifier-api` adapter plus historical wire decoder.
 #[derive(Debug, Clone)]
 pub struct TrustWpVerificationEngine {
     manifest: EngineManifest,
+    #[cfg(all(test, feature = "trust-build"))]
     native_replay_evidence: Vec<ObligationEvidence>,
 }
 
@@ -233,23 +258,21 @@ impl TrustWpVerificationEngine {
         );
         manifest.repository = Some("trust-wp".to_string());
         manifest.api_version = API_VERSION.to_string();
-        manifest.capabilities = trust_wp_owned_obligation_kinds()
-            .into_iter()
-            .map(|obligation_kind| EngineCapability {
-                support: trust_wp_support_for_obligation_kind(&obligation_kind),
-                obligation_kind,
-            })
-            .collect();
-        manifest.proof_modes = vec![ReasoningKind::Deductive, ReasoningKind::Inductive];
+        manifest.capabilities = Vec::new();
+        manifest.proof_modes = Vec::new();
 
-        Self { manifest, native_replay_evidence: Vec::new() }
+        Self {
+            manifest,
+            #[cfg(all(test, feature = "trust-build"))]
+            native_replay_evidence: Vec::new(),
+        }
     }
 
-    /// Attach native trust_wp replay evidence produced by trust-wp-owned proof replay.
+    /// Attach historical native trust_wp replay evidence for diagnostic decoding.
     ///
-    /// The adapter still validates every evidence item against the requested
-    /// obligation and its typed `TrustWpPureExprV1` predicate before returning
-    /// `Proved`.
+    /// The current zero-capability manifest always returns `Unsupported` before
+    /// consuming it; attachment cannot revive proof authority.
+    #[cfg(all(test, feature = "trust-build"))]
     #[must_use]
     pub fn with_native_replay_evidence(
         mut self,
@@ -259,11 +282,25 @@ impl TrustWpVerificationEngine {
         self
     }
 
+    /// Accept and discard historical replay evidence outside unit-test inspection.
+    ///
+    /// The method remains API-compatible, but production builds deliberately
+    /// retain no decoder state, including when `trust-build` exposes metadata
+    /// conformance helpers to downstream crates.
+    #[cfg(not(all(test, feature = "trust-build")))]
+    #[must_use]
+    pub fn with_native_replay_evidence(
+        self,
+        native_replay_evidence: Vec<ObligationEvidence>,
+    ) -> Self {
+        drop(native_replay_evidence);
+        self
+    }
+
     /// Build fail-closed trust_wp evidence for a rejected native TrustIr proof input.
     ///
-    /// This is used by routers that selected trust_wp through a typed
-    /// `NativeVerificationBundle`: public metadata alone is not allowed to fall
-    /// through as proof when the native request identity is missing or invalid.
+    /// Historical bundle readers use this to reject a typed TrustWP request;
+    /// public metadata alone is never allowed to revive retired authority.
     #[must_use]
     pub fn native_trust_ir_bundle_unsupported_evidence(
         &self,
@@ -281,16 +318,32 @@ impl TrustWpVerificationEngine {
         unsupported
     }
 
-    /// Verify one public obligation using a matched trust_wp request from a typed
-    /// TrustIr native verification bundle.
+    /// Reject a historical TrustWP request at the public native-bundle boundary.
     ///
-    /// Existing public `trust.trust_wp.*` metadata is stripped before trust-wp's
-    /// controlled metadata helper regenerates proof-relevant context from the
-    /// supplied native bundle. This prevents stale or metadata-only replay
-    /// evidence from being accepted as native TrustIr proof.
+    /// The wire objects remain accepted by TrustIR's serializer, but this
+    /// adapter owns no current claim and therefore never decodes or replays the
+    /// supplied request as verdict authority.
     #[cfg(feature = "trust-build")]
     #[must_use]
     pub fn verify_obligation_with_native_trust_ir_request(
+        &self,
+        bundle: &TrustContractBundle,
+        obligation: &TrustObligation,
+        _native_bundle: &trust_ir::NativeVerificationBundle,
+        _request: &trust_ir::TrustWpNativeRequest,
+        _proof_obligation_id: trust_ir::ProofId,
+    ) -> ObligationEvidence {
+        self.native_trust_ir_bundle_unsupported_evidence(
+            bundle,
+            obligation,
+            "trust-wp owns no current native claim; historical TrustWpNativeRequest data is diagnostic-only",
+        )
+    }
+
+    /// Exercise the historical native decoder in unit tests without exposing it
+    /// as a production verification entrypoint.
+    #[cfg(all(feature = "trust-build", test))]
+    fn inspect_native_trust_ir_request_for_test(
         &self,
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
@@ -462,28 +515,27 @@ impl TrustWpVerificationEngine {
         obligation: &TrustObligation,
     ) -> ObligationEvidence {
         let mut diagnostics = Vec::new();
-        if is_trust_wp_owned_obligation_kind(&obligation.kind) {
-            diagnostics.push(trust_wp_owned_fail_closed_diagnostic(&obligation.kind));
-        } else {
-            diagnostics.push(format!(
-                "trust-wp native pure replay owns precondition/postcondition/loop-invariant/refinement/termination obligations, not {:?}",
-                obligation.kind
-            ));
+        diagnostics.push(format!(
+            "trust-wp advertises no full-verification capability, including {:?}",
+            obligation.kind
+        ));
+        // v7/D3: the refusal carries its options for the kinds whose designated
+        // owner engine is elsewhere in the fleet.
+        if let Some(options) = narrowed_obligation_kind_options(&obligation.kind) {
+            diagnostics.push(options.to_string());
         }
-        diagnostics.push(
-            format!(
-                "TrustContractBundle lowering into TrustWpPureExprV1 claims plus replayable {} and {} artifacts is required before trust_wp evidence can be Proved",
-                TRUST_WP_NATIVE_PURE_REPLAY_REQUIRED_ARTIFACTS[0],
-                TRUST_WP_NATIVE_PURE_REPLAY_REQUIRED_ARTIFACTS[1],
-            ),
-        );
+        diagnostics.push(format!(
+            "historical TrustWpPureExprV1 rows may carry {} and {} artifacts for inspection, but they cannot authorize a current full-verification claim",
+            TRUST_WP_NATIVE_PURE_REPLAY_REQUIRED_ARTIFACTS[0],
+            TRUST_WP_NATIVE_PURE_REPLAY_REQUIRED_ARTIFACTS[1],
+        ));
         diagnostics.push(trust_wp_omitted_proof_strength_diagnostic());
         diagnostics.push(
-            "symbolic, opaque, or unlowered predicates remain fail-closed until trust_wp can decode and replay them under the native proof-evidence schema"
+            "symbolic, opaque, unlowered, and structural give-back predicates are outside the current TrustWP capability manifest"
                 .to_string(),
         );
         diagnostics.push(
-            "each refinement, termination, and non-contract obligation remains fail-closed until dedicated native trust_wp replay evidence is supplied"
+            "body-aware pre/post/loop/termination obligations route to trust-mc; refinement routes to trust-vc; the formula-less structural give-back record is not a proof claim"
                 .to_string(),
         );
         diagnostics.push(
@@ -499,13 +551,26 @@ impl TrustWpVerificationEngine {
             decline: None,
             proof_strength: None,
             artifacts: Vec::new(),
-            counterexample: None::<Counterexample>,
+            counterexample: None,
             publication: EvidencePublicationMetadata::default(),
             diagnostics,
         }
     }
 
     fn verify_one(
+        &self,
+        bundle: &TrustContractBundle,
+        obligation: &TrustObligation,
+    ) -> ObligationEvidence {
+        self.unsupported_evidence(bundle, obligation)
+    }
+
+    /// Decode and replay historical TrustWP rows for parser/transport tests.
+    ///
+    /// This is deliberately test-only: the public verifier above never calls
+    /// it and therefore cannot turn a historical row into current authority.
+    #[cfg(all(test, feature = "trust-build"))]
+    fn inspect_historical_one_for_test(
         &self,
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
@@ -565,7 +630,7 @@ impl TrustWpVerificationEngine {
         }
     }
 
-    #[cfg_attr(not(feature = "trust-build"), allow(dead_code))]
+    #[cfg(all(test, feature = "trust-build"))]
     fn verify_one_with_claim(
         &self,
         bundle: &TrustContractBundle,
@@ -574,8 +639,8 @@ impl TrustWpVerificationEngine {
         trust_ir_functions: Option<Vec<serde_json::Value>>,
     ) -> ObligationEvidence {
         // Symmetric decode of the wide-int digest tagging applied when the
-        // pure-replay transport was built (see
-        // `verify_obligation_with_native_trust_ir_request`). This is the exact
+        // historical pure-replay transport was built (see the test-only
+        // `inspect_native_trust_ir_request_for_test`). This is the exact
         // inverse of the encode: any representable value round-trips to the very
         // bytes a plain `serde_json::to_value` would have produced, and a
         // genuinely out-of-range magnitude is preserved LOSSLESSLY as its tagged
@@ -599,6 +664,7 @@ impl TrustWpVerificationEngine {
         }
     }
 
+    #[cfg(all(test, feature = "trust-build"))]
     fn lower_contract_obligation(
         &self,
         bundle: &TrustContractBundle,
@@ -613,12 +679,7 @@ impl TrustWpVerificationEngine {
         self.lower_typed_claim_obligation(bundle, obligation, &claim, None)
     }
 
-    // `trust_ir_functions` is consumed by direct_trust_wp_native_evidence under
-    // `feature = "trust-build"` (line ~454 below). Without that feature
-    // the param is genuinely unused, so silence the lint conditionally
-    // rather than underscoring the name (which would force callers to
-    // know about the feature flag).
-    #[cfg_attr(not(feature = "trust-build"), allow(unused_variables))]
+    #[cfg(all(test, feature = "trust-build"))]
     fn lower_typed_claim_obligation(
         &self,
         bundle: &TrustContractBundle,
@@ -630,47 +691,16 @@ impl TrustWpVerificationEngine {
             .map_err(|diagnostic| NativeContractLoweringOutcome::Unsupported { diagnostic })?;
         summary_facts_for_obligation(bundle, obligation)
             .map_err(|diagnostic| NativeContractLoweringOutcome::Unsupported { diagnostic })?;
-        #[cfg(feature = "trust-build")]
-        {
-            direct_trust_wp_native_evidence(
-                &self.manifest,
-                bundle,
-                obligation,
-                claim,
-                trust_ir_functions,
-            )
-        }
-
-        #[cfg(not(feature = "trust-build"))]
-        {
-            let NativeTrustWpClaim::TrustWpPureExprV1(predicate) = claim else {
-                return Err(NativeContractLoweringOutcome::Unsupported {
-                    diagnostic: format!(
-                        "typed `{}` payload for obligation `{}` requires trust-wp's in-process NativeTrustWpBundleVerifier; this build is fail-closed without `trust-build`",
-                        claim.claim_schema(),
-                        obligation.obligation_id,
-                    ),
-                });
-            };
-            let replay = match replay_typed_predicate_for_evidence(predicate) {
-                Ok(replay) => replay,
-                Err(NativeReplayFailure::False { diagnostic }) => {
-                    return Err(NativeContractLoweringOutcome::Failed {
-                        diagnostic,
-                        counterexample: Some(native_replay_counterexample(obligation, predicate)),
-                    });
-                }
-                Err(NativeReplayFailure::Unknown { diagnostic }) => {
-                    return Err(NativeContractLoweringOutcome::Unsupported { diagnostic });
-                }
-            };
-
-            Err(NativeContractLoweringOutcome::Unsupported {
-                diagnostic: aggregate_gate_missing_diagnostic(obligation, &replay),
-            })
-        }
+        direct_trust_wp_native_evidence(
+            &self.manifest,
+            bundle,
+            obligation,
+            claim,
+            trust_ir_functions,
+        )
     }
 
+    #[cfg(all(test, feature = "trust-build"))]
     fn failed_native_contract_evidence(
         &self,
         obligation: &TrustObligation,
@@ -694,18 +724,13 @@ impl TrustWpVerificationEngine {
         }
     }
 
+    #[cfg(all(test, feature = "trust-build"))]
     fn validate_native_replay_evidence(
         &self,
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
         evidence: &ObligationEvidence,
     ) -> Result<(), NativeReplayEvidenceRejection> {
-        if !is_trust_wp_owned_obligation_kind(&obligation.kind) {
-            return Err(NativeReplayEvidenceRejection::Invalid(format!(
-                "trust-wp native replay does not own {:?} obligations",
-                obligation.kind
-            )));
-        }
         if evidence.engine.name != self.manifest.name {
             return Err(NativeReplayEvidenceRejection::Invalid(format!(
                 "candidate evidence engine `{}` is not trust-wp-owned evidence",
@@ -759,7 +784,7 @@ impl TrustWpVerificationEngine {
     }
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn strip_trust_wp_native_metadata_from_bundle(bundle: &TrustContractBundle) -> TrustContractBundle {
     let mut stripped = bundle.clone();
     stripped.metadata.retain(|entry| !is_trust_wp_native_metadata_key(&entry.key));
@@ -778,14 +803,14 @@ fn strip_trust_wp_native_metadata_from_bundle(bundle: &TrustContractBundle) -> T
     stripped
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn strip_trust_wp_native_metadata_from_obligation(obligation: &TrustObligation) -> TrustObligation {
     let mut stripped = obligation.clone();
     stripped.metadata.retain(|entry| !is_trust_wp_native_metadata_key(&entry.key));
     stripped
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn is_trust_wp_native_metadata_key(key: &str) -> bool {
     matches!(
         key,
@@ -801,81 +826,33 @@ fn is_trust_wp_native_metadata_key(key: &str) -> bool {
     )
 }
 
-#[cfg_attr(all(feature = "trust-build", not(trust_wp_proof_transport_api)), allow(dead_code))]
+#[cfg(all(test, feature = "trust-build"))]
 enum NativeContractLoweringOutcome {
     Failed { diagnostic: String, counterexample: Option<Counterexample> },
     Unsupported { diagnostic: String },
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 enum NativeReplayFailure {
     False { diagnostic: String },
     Unknown { diagnostic: String },
 }
 
 fn trust_wp_support_for_obligation_kind(kind: &ObligationKind) -> SupportLevel {
-    if !is_trust_wp_owned_obligation_kind(kind) {
-        return SupportLevel::Unsupported {
-            reason: format!(
-                "trust-wp native pure replay owns precondition/postcondition/loop-invariant/refinement/termination obligations, not {kind:?}"
-            ),
-        };
+    let mut reason = format!(
+        "trust-wp has no currently dischargeable full-verification obligation kind, including {kind:?}; body-aware contracts route to trust-mc, refinement routes to trust-vc, and the formula-less TrustIR give-back record is not a proof claim"
+    );
+    // v7/D3: attach the concrete rerouting options where a designated owner
+    // engine exists for the refused kind.
+    if let Some(options) = narrowed_obligation_kind_options(kind) {
+        reason.push_str("; ");
+        reason.push_str(options);
     }
-
-    #[cfg(all(
-        feature = "trust-build",
-        trust_wp_proof_transport_api,
-        trust_wp_structured_context_api
-    ))]
-    {
-        if is_auto_lowered_contract_obligation_kind(kind) {
-            SupportLevel::Supported
-        } else {
-            SupportLevel::Experimental {
-                reason: format!(
-                    "trust-wp owns {kind:?} obligations, but direct TrustContractBundle lowering currently covers precondition, postcondition, and loop-invariant typed pure obligations"
-                ),
-            }
-        }
-    }
-
-    #[cfg(all(
-        feature = "trust-build",
-        trust_wp_proof_transport_api,
-        not(trust_wp_structured_context_api)
-    ))]
-    {
-        SupportLevel::Experimental {
-            reason: stale_trust_wp_structured_context_diagnostic_for_kind(kind),
-        }
-    }
-
-    #[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
-    {
-        SupportLevel::Experimental {
-            reason: stale_trust_wp_transport_api_diagnostic_for_kind(kind),
-        }
-    }
-
-    #[cfg(not(feature = "trust-build"))]
-    {
-        SupportLevel::Experimental {
-            reason: TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_NOT_WIRED.to_string(),
-        }
-    }
+    SupportLevel::Unsupported { reason }
 }
 
 #[cfg(all(
-    feature = "trust-build",
-    trust_wp_proof_transport_api,
-    not(trust_wp_structured_context_api)
-))]
-fn stale_trust_wp_structured_context_diagnostic_for_kind(kind: &ObligationKind) -> String {
-    format!(
-        "{TRUST_WP_STRUCTURED_CONTEXT_API_MISSING}; trust_wp owns {kind:?} obligations only when `first-party/trust-wp` exposes typed TrustIr source, native verifier/replay/solver, proof-context, and abstract-interpretation summary fact metadata that are committed into `{TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION}` / `{TRUST_WP_NATIVE_PURE_REPLAY_SCHEMA_VERSION}` artifacts"
-    )
-}
-
-#[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     not(trust_wp_structured_context_api)
@@ -887,14 +864,7 @@ fn stale_trust_wp_structured_context_diagnostic(obligation: &TrustObligation) ->
     )
 }
 
-#[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
-fn stale_trust_wp_transport_api_diagnostic_for_kind(kind: &ObligationKind) -> String {
-    format!(
-        "{TRUST_WP_PROOF_TRANSPORT_API_MISSING}; trust_wp owns {kind:?} obligations only when `first-party/trust-wp` exposes digest-checked proof transport artifacts for request, native replay, summary, and aggregate manifest evidence under `{TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION}` / `{TRUST_WP_NATIVE_PURE_REPLAY_SCHEMA_VERSION}`"
-    )
-}
-
-#[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
+#[cfg(all(test, feature = "trust-build", not(trust_wp_proof_transport_api)))]
 fn stale_trust_wp_transport_api_diagnostic(obligation: &TrustObligation) -> String {
     format!(
         "{TRUST_WP_PROOF_TRANSPORT_API_MISSING} for obligation `{}`; refresh `first-party/trust-wp` to a trust_wp revision with `EvidenceArtifact::has_transport` and inline artifact bytes before reporting deductive proof strength",
@@ -902,74 +872,9 @@ fn stale_trust_wp_transport_api_diagnostic(obligation: &TrustObligation) -> Stri
     )
 }
 
-fn trust_wp_owned_fail_closed_diagnostic(kind: &ObligationKind) -> String {
-    #[cfg(all(
-        feature = "trust-build",
-        trust_wp_proof_transport_api,
-        trust_wp_structured_context_api
-    ))]
-    {
-        format!(
-            "trust-wp owns {kind:?} obligations only after they are lowered to TrustWpPureExprV1 and replayed through trust_wp VerifyBundleResult aggregation from `{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT}` with proof-grade `{TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION}` / `{TRUST_WP_NATIVE_PURE_REPLAY_SCHEMA_VERSION}` evidence; direct committed trust_wp replay is enabled for precondition/postcondition/loop-invariant typed pure obligations"
-        )
-    }
-
-    #[cfg(all(
-        feature = "trust-build",
-        trust_wp_proof_transport_api,
-        not(trust_wp_structured_context_api)
-    ))]
-    {
-        stale_trust_wp_structured_context_diagnostic_for_kind(kind)
-    }
-
-    #[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
-    {
-        stale_trust_wp_transport_api_diagnostic_for_kind(kind)
-    }
-
-    #[cfg(not(feature = "trust-build"))]
-    {
-        format!(
-            "{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_NOT_WIRED}; trust_wp owns {kind:?} obligations only after they are lowered to TrustWpPureExprV1 and replayed through trust_wp VerifyBundleResult aggregation from `{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT}` with proof-grade `{TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION}` / `{TRUST_WP_NATIVE_PURE_REPLAY_SCHEMA_VERSION}` evidence"
-        )
-    }
-}
-
 fn trust_wp_omitted_proof_strength_diagnostic() -> String {
-    #[cfg(all(
-        feature = "trust-build",
-        trust_wp_proof_transport_api,
-        trust_wp_structured_context_api
-    ))]
-    {
-        "proof_strength is intentionally omitted unless trust-wp's direct aggregate native replay evidence gate returns proof-grade evidence"
-            .to_string()
-    }
-
-    #[cfg(all(
-        feature = "trust-build",
-        trust_wp_proof_transport_api,
-        not(trust_wp_structured_context_api)
-    ))]
-    {
-        format!(
-            "proof_strength is intentionally omitted because {TRUST_WP_STRUCTURED_CONTEXT_API_MISSING}"
-        )
-    }
-
-    #[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
-    {
-        format!(
-            "proof_strength is intentionally omitted because {TRUST_WP_PROOF_TRANSPORT_API_MISSING}"
-        )
-    }
-
-    #[cfg(not(feature = "trust-build"))]
-    {
-        "proof_strength is intentionally omitted because Trust has not run the checked trust_wp aggregate native replay evidence gate"
-            .to_string()
-    }
+    "proof_strength is intentionally omitted because TrustWP owns no current full-verification obligation kind"
+        .to_string()
 }
 
 impl Default for TrustWpVerificationEngine {
@@ -984,16 +889,10 @@ impl VerificationEngine for TrustWpVerificationEngine {
     }
 
     fn supports(&self, obligation: &TrustObligation) -> SupportLevel {
-        if is_trust_wp_owned_obligation_kind(&obligation.kind) {
-            trust_wp_support_for_obligation_kind(&obligation.kind)
-        } else {
-            SupportLevel::Unsupported {
-                reason: format!(
-                    "trust-wp native pure replay owns precondition/postcondition/loop-invariant/refinement/termination obligations, not {:?}",
-                    obligation.kind
-                ),
-            }
-        }
+        // Every kind resolves through `trust_wp_support_for_obligation_kind`,
+        // which fail-closes unconditionally (zero advertised kinds) with the
+        // v7/D3 rerouting options attached where an owner engine exists.
+        trust_wp_support_for_obligation_kind(&obligation.kind)
     }
 
     fn verify_validated(
@@ -1059,10 +958,10 @@ fn bind_trust_wp_evidence_batch_publication(evidence: &mut [ObligationEvidence])
 /// Build typed `trust.trust_wp.*` replay metadata for a trust_wp request inside a
 /// TrustIr native verification bundle.
 ///
-/// This is the compiler/router bridge for trust_wp native evidence. It converts
-/// TrustIr request provenance, compiler source facts, and replay context into
-/// trust-wp's controlled native replay metadata helper instead of constructing
-/// proof-relevant JSON strings by hand.
+/// This historical transport helper converts TrustIr request provenance,
+/// source facts, and replay context into controlled metadata for conformance
+/// inspection. Producing these rows does not route TrustWP or grant proof or
+/// publication authority.
 #[cfg(feature = "trust-build")]
 pub fn trust_wp_native_replay_metadata_entries_from_trust_ir_bundle(
     native_bundle: &trust_ir::NativeVerificationBundle,
@@ -1497,6 +1396,7 @@ fn hex_digest(bytes: &[u8; 32]) -> String {
 ///
 /// This is not a source-expression parser. Callers must pass a typed JSON value
 /// under the `TrustWpPureExprV1` schema.
+#[cfg(feature = "trust-build")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum TrustWpPureExprV1 {
@@ -1515,6 +1415,7 @@ pub(crate) enum TrustWpPureExprV1 {
     Binary { op: TrustWpPureBinaryOpV1, lhs: Box<TrustWpPureExprV1>, rhs: Box<TrustWpPureExprV1> },
 }
 
+#[cfg(feature = "trust-build")]
 impl TrustWpPureExprV1 {
     fn sort(&self) -> Option<TrustWpPureSortV1> {
         match self {
@@ -1577,7 +1478,7 @@ impl TrustWpPureExprV1 {
     /// declarations and treats a bare name as Unknown. Keeping this separate
     /// preserves public/native diagnostic identity and prevents repeated
     /// serialization from expanding an already-canonical formula.
-    #[cfg(feature = "trust-build")]
+    #[cfg(all(test, feature = "trust-build"))]
     fn native_replay_text(&self) -> String {
         match self {
             Self::Bool { value } => value.to_string(),
@@ -1610,9 +1511,9 @@ impl TrustWpPureExprV1 {
 }
 
 /// Canonicalize the one typed shape whose sorts cannot be recovered from bare
-/// stable text. This fold is deliberately structural and idempotent so it is
-/// available at both default and `trust-build` JSON ingress without depending
-/// on the feature-gated text parser.
+/// stable text. This fold is deliberately structural and idempotent so the
+/// feature-gated historical JSON and text ingress paths agree exactly.
+#[cfg(feature = "trust-build")]
 fn canonicalize_trust_wp_pure_expr(expr: TrustWpPureExprV1) -> TrustWpPureExprV1 {
     match expr {
         TrustWpPureExprV1::Not { expr } => {
@@ -1649,6 +1550,7 @@ fn canonicalize_trust_wp_pure_expr(expr: TrustWpPureExprV1) -> TrustWpPureExprV1
 }
 
 /// Binary operators supported by the first native replay adapter fragment.
+#[cfg(feature = "trust-build")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TrustWpPureBinaryOpV1 {
@@ -1665,6 +1567,7 @@ pub(crate) enum TrustWpPureBinaryOpV1 {
     Sub,
 }
 
+#[cfg(feature = "trust-build")]
 impl TrustWpPureBinaryOpV1 {
     fn as_str(self) -> &'static str {
         match self {
@@ -1685,6 +1588,7 @@ impl TrustWpPureBinaryOpV1 {
     }
 }
 
+#[cfg(feature = "trust-build")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TrustWpPureSortV1 {
@@ -1692,12 +1596,14 @@ pub(crate) enum TrustWpPureSortV1 {
     Int,
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustWpNativeReplay {
     normalized_predicate: String,
     steps: Vec<TrustWpNativeReplayStep>,
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrustWpNativeReplayStep {
     DecodeTrustWpPureExprV1,
@@ -1706,6 +1612,7 @@ enum TrustWpNativeReplayStep {
     Verified,
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 impl TrustWpNativeReplayStep {
     fn as_wire_line(&self) -> String {
         match self {
@@ -1717,26 +1624,30 @@ impl TrustWpNativeReplayStep {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 enum ReplayTruth {
     True { rule: &'static str },
     False { rule: &'static str },
     Unknown { reason: String },
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 impl ReplayTruth {
     fn from_bool(value: bool, rule: &'static str) -> Self {
         if value { Self::True { rule } } else { Self::False { rule } }
     }
 }
 
+#[cfg(feature = "trust-build")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeTrustWpClaim {
     TrustWpPureExprV1(TrustWpPureExprV1),
     TrustFormulaV1(String),
 }
 
+#[cfg(feature = "trust-build")]
 impl NativeTrustWpClaim {
-    #[cfg_attr(all(feature = "trust-build", not(trust_wp_proof_transport_api)), allow(dead_code))]
+    #[cfg(all(test, feature = "trust-build"))]
     fn claim_schema(&self) -> &'static str {
         match self {
             Self::TrustWpPureExprV1(_) => TRUST_WP_PURE_EXPR_SCHEMA_VERSION,
@@ -1754,7 +1665,7 @@ impl NativeTrustWpClaim {
     /// This formula-only value is never used as proof authority. Controlled
     /// replay metadata uses `canonical_obligation_semantic_digest_sha256`,
     /// which also binds the public obligation and its full referenced context.
-    #[cfg(feature = "trust-build")]
+    #[cfg(all(test, feature = "trust-build"))]
     fn diagnostic_digest(&self) -> Result<ArtifactHash, String> {
         use sha2::{Digest as _, Sha256};
 
@@ -1781,6 +1692,7 @@ impl NativeTrustWpClaim {
     }
 
     #[cfg(all(
+        test,
         feature = "trust-build",
         trust_wp_proof_transport_api,
         trust_wp_structured_context_api
@@ -1811,6 +1723,7 @@ impl NativeTrustWpClaim {
 /// could represent, decode∘encode is the identity on bytes; for the rest the
 /// exact decimal magnitude is preserved with no precision loss. It can only undo
 /// a tag the encode itself introduced, so it never fabricates or alters a value.
+#[cfg(all(test, feature = "trust-build"))]
 fn restore_wide_int_digest_tagged_value(value: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
@@ -1847,6 +1760,7 @@ fn restore_wide_int_digest_tagged_value(value: serde_json::Value) -> serde_json:
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn typed_trust_wp_claim(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -1855,6 +1769,7 @@ fn typed_trust_wp_claim(
     typed_trust_wp_claim_from_contract(contract)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn contract_for_obligation<'a>(
     bundle: &'a TrustContractBundle,
     obligation: &TrustObligation,
@@ -1872,6 +1787,7 @@ fn contract_for_obligation<'a>(
     })
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn typed_trust_wp_claim_from_contract(
     contract: &TrustContract,
 ) -> Result<NativeTrustWpClaim, String> {
@@ -1930,13 +1846,14 @@ fn typed_trust_wp_claim_from_contract(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn validate_contract_route_eligibility(
     obligation: &TrustObligation,
     contract_kind: Option<ContractKind>,
 ) -> Result<(), String> {
     if !is_auto_lowered_contract_obligation_kind(&obligation.kind) {
         return Err(format!(
-            "trust-wp typed routing is ineligible for {:?} obligation `{}`: currently eligible typed inputs are precondition, postcondition, and loop-invariant pure contract obligations; each refinement, termination, and non-contract obligation remains fail-closed until dedicated native trust_wp replay evidence is supplied",
+            "historical trust-wp typed decoding is ineligible for {:?} obligation `{}`: the retained decoder recognizes only precondition, postcondition, and loop-invariant pure contract wire records and grants no current routing authority",
             obligation.kind, obligation.obligation_id
         ));
     }
@@ -1953,6 +1870,7 @@ fn validate_contract_route_eligibility(
     Ok(())
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn contract_kind_matches_obligation(
     contract_kind: ContractKind,
     obligation_kind: &ObligationKind,
@@ -1966,7 +1884,7 @@ fn contract_kind_matches_obligation(
     )
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn native_trust_ir_typed_claim(
     native_bundle: &trust_ir::NativeVerificationBundle,
     proof_obligation_id: trust_ir::ProofId,
@@ -1996,7 +1914,7 @@ fn native_trust_ir_typed_claim(
     })
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn native_trust_ir_claim_for_obligation(
     public_bundle: &TrustContractBundle,
     native_bundle: &trust_ir::NativeVerificationBundle,
@@ -2280,7 +2198,7 @@ fn native_trust_ir_claim_for_obligation(
 ///
 /// Non-`TrustWpPureExprV1` claims and ground (variable-free) predicates pass
 /// through unchanged.
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn definition_site_requires_echo(claim: NativeTrustWpClaim) -> NativeTrustWpClaim {
     match claim {
         NativeTrustWpClaim::TrustWpPureExprV1(predicate)
@@ -2298,7 +2216,7 @@ fn definition_site_requires_echo(claim: NativeTrustWpClaim) -> NativeTrustWpClai
 
 /// Whether a typed pure predicate mentions at least one free variable, i.e. is
 /// not a fully ground (constant-foldable) expression.
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_wp_pure_expr_contains_var(expr: &TrustWpPureExprV1) -> bool {
     match expr {
         TrustWpPureExprV1::Var { .. } => true,
@@ -2310,7 +2228,7 @@ fn trust_wp_pure_expr_contains_var(expr: &TrustWpPureExprV1) -> bool {
     }
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_wp_public_obligation_kind_from_trust_ir(
     kind: &trust_ir::ObligationKind,
 ) -> Option<ObligationKind> {
@@ -2415,6 +2333,7 @@ fn decode_trust_ir_trust_wp_pure_expr_payload(payload: &str) -> Result<TrustWpPu
 /// and the body-bound fragment
 /// (`trust_ir_bridge::trust_wp_claim::spec_predicate_to_sibling_json`,
 /// blueprint amendment 1).
+#[cfg(feature = "trust-build")]
 fn trust_wp_pure_bare_claim_arithmetic_refusal(op: &str) -> String {
     format!(
         "TrustWpPureExprV1 arithmetic operator `{op}` is outside the trust-wp stable-text bare-claim fragment: machine arithmetic modeled over unbounded Int is a false-proof vector (`x + 1 > x` is Int-provable but false at u64::MAX); see 2026-07-17 trust-wp lowering blueprint amendment 1"
@@ -2427,6 +2346,7 @@ fn trust_wp_pure_bare_claim_arithmetic_refusal(op: &str) -> String {
 /// parser's arithmetic gate. (`*`/`/`/`%`/unary-neg have no `TrustWpPureExprV1`
 /// representation, so `Add`/`Sub` are the only arithmetic operators this fold
 /// can encounter.) Fail-closed for the same amendment-1 reason.
+#[cfg(feature = "trust-build")]
 fn trust_wp_pure_expr_reject_arithmetic(expr: &TrustWpPureExprV1) -> Result<(), String> {
     fn visit(
         expr: &TrustWpPureExprV1,
@@ -2472,6 +2392,7 @@ fn trust_wp_pure_expr_reject_arithmetic(expr: &TrustWpPureExprV1) -> Result<(), 
 /// parser, excluding all of its reserved keywords. Typed JSON variables are
 /// emitted as stable text, so accepting any wider spelling can become postfix
 /// syntax, token injection, or a parser keyword at replay time.
+#[cfg(feature = "trust-build")]
 fn trust_wp_pure_var_name_lexes_as_identifier(name: &str) -> bool {
     trust_types::trust_formula_v1::trust_wp_pure_expr_v1_opaque_identifier(name)
 }
@@ -2724,6 +2645,7 @@ fn parse_pure_expr_text(text: &str) -> Result<TrustWpPureExprV1, String> {
     Ok(expr)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn typed_trust_wp_pure_predicate(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -2745,6 +2667,7 @@ fn typed_trust_wp_pure_predicate(
 /// quantifiers, out-of-`i64` literals, non-int/bool variable sorts). Callers must
 /// treat the error as Unsupported and never report a proof from an unlowered
 /// predicate.
+#[cfg(feature = "trust-build")]
 fn trust_types_formula_value_to_trust_formula_payload(
     value: &serde_json::Value,
 ) -> Result<String, String> {
@@ -2754,10 +2677,12 @@ fn trust_types_formula_value_to_trust_formula_payload(
     trust_types::trust_formula_v1::formula_to_trust_formula_v1_envelope(&formula)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn canonical_trust_formula_payload(value: &serde_json::Value) -> Result<String, String> {
     trust_types::trust_formula_v1::canonical_arithmetic_free_trust_formula_v1_payload(value)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_predicate_to_trust_formula_payload(
     predicate: &TrustSpecPredicate,
 ) -> Result<String, String> {
@@ -2835,6 +2760,7 @@ fn trust_spec_predicate_to_trust_formula_payload(
     })
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_expr_to_trust_formula_body(
     expr: &TrustSpecExpr,
     result_sort: &mut Option<TrustSpecSort>,
@@ -2940,6 +2866,7 @@ fn trust_spec_expr_to_trust_formula_body(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_expr_mentions_array_sort(root: &TrustSpecExpr) -> bool {
     let mut pending = vec![root];
     while let Some(expr) = pending.pop() {
@@ -2981,6 +2908,7 @@ fn trust_spec_expr_mentions_array_sort(root: &TrustSpecExpr) -> bool {
     false
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_expr_mentions_float_sort(root: &TrustSpecExpr) -> bool {
     let mut pending = vec![root];
     while let Some(expr) = pending.pop() {
@@ -3027,16 +2955,19 @@ fn trust_spec_expr_mentions_float_sort(root: &TrustSpecExpr) -> bool {
 // lane. Kept as a single helper so the walker's unary (`Neg`) and binary
 // (`Add`/`Sub`/`Mul`/`Div`/`Mod`) refusals stay message-identical with the
 // compiler's copy of this lowering (rustc_mir_transform::trust_verify).
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_bare_claim_arithmetic_refusal(op: &str) -> String {
     format!(
         "TrustSpecPredicate arithmetic operator `{op}` is outside the trust-wp TrustFormulaV1 bare-claim fragment: machine arithmetic modeled over unbounded Int is a false-proof vector (`ensures result + 1 > result` is Int-provable but false at u64::MAX); see 2026-07-17 trust-wp lowering blueprint amendment 1"
     )
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn validate_trust_spec_div_mod_defined(expr: &TrustSpecExpr) -> Result<(), String> {
     validate_trust_spec_expr_div_mod_defined(expr, &[])
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn validate_trust_spec_expr_div_mod_defined(
     expr: &TrustSpecExpr,
     assumptions: &[TrustSpecExpr],
@@ -3095,6 +3026,7 @@ fn validate_trust_spec_expr_div_mod_defined(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn collect_trust_spec_definedness_facts(expr: &TrustSpecExpr, facts: &mut Vec<TrustSpecExpr>) {
     match &expr.kind {
         TrustSpecExprKind::Binary { op: TrustSpecBinaryOp::And, lhs, rhs } => {
@@ -3111,6 +3043,7 @@ fn collect_trust_spec_definedness_facts(expr: &TrustSpecExpr, facts: &mut Vec<Tr
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_is_definedness_fact_operator(op: TrustSpecBinaryOp) -> bool {
     matches!(
         op,
@@ -3123,6 +3056,7 @@ fn trust_spec_is_definedness_fact_operator(op: TrustSpecBinaryOp) -> bool {
     )
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_expr_known_nonzero(expr: &TrustSpecExpr, assumptions: &[TrustSpecExpr]) -> bool {
     trust_spec_constant_int(expr).is_some_and(|value| value != 0)
         || assumptions
@@ -3130,6 +3064,7 @@ fn trust_spec_expr_known_nonzero(expr: &TrustSpecExpr, assumptions: &[TrustSpecE
             .any(|assumption| trust_spec_assumption_proves_nonzero(assumption, expr))
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_assumption_proves_nonzero(
     assumption: &TrustSpecExpr,
     target: &TrustSpecExpr,
@@ -3150,6 +3085,7 @@ fn trust_spec_assumption_proves_nonzero(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_contains_div_mod(expr: &TrustSpecExpr) -> bool {
     match &expr.kind {
         TrustSpecExprKind::Binary {
@@ -3174,10 +3110,12 @@ fn trust_spec_contains_div_mod(expr: &TrustSpecExpr) -> bool {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_is_int_zero(expr: &TrustSpecExpr) -> bool {
     trust_spec_constant_int(expr) == Some(0)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_constant_int(expr: &TrustSpecExpr) -> Option<i64> {
     match &expr.kind {
         TrustSpecExprKind::IntLiteral { value } => value.parse::<i64>().ok(),
@@ -3185,6 +3123,7 @@ fn trust_spec_constant_int(expr: &TrustSpecExpr) -> Option<i64> {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn require_sort(
     expr: &TrustSpecExpr,
     expected: TrustSpecSort,
@@ -3200,6 +3139,7 @@ fn require_sort(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn validate_trust_spec_binary(
     op: TrustSpecBinaryOp,
     expr: &TrustSpecExpr,
@@ -3246,6 +3186,7 @@ fn validate_trust_spec_binary(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_sort_label(sort: TrustSpecSort) -> &'static str {
     match sort {
         TrustSpecSort::Bool => "bool",
@@ -3259,6 +3200,7 @@ fn trust_spec_sort_label(sort: TrustSpecSort) -> &'static str {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_unary_op_label(op: TrustSpecUnaryOp) -> Result<&'static str, String> {
     match op {
         TrustSpecUnaryOp::Not => Ok("not"),
@@ -3270,6 +3212,7 @@ fn trust_spec_unary_op_label(op: TrustSpecUnaryOp) -> Result<&'static str, Strin
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn trust_spec_binary_op_label(op: TrustSpecBinaryOp) -> Result<&'static str, String> {
     match op {
         TrustSpecBinaryOp::Add => Ok("add"),
@@ -3293,7 +3236,7 @@ fn trust_spec_binary_op_label(op: TrustSpecBinaryOp) -> Result<&'static str, Str
     }
 }
 
-#[cfg(feature = "trust-build")]
+#[cfg(all(test, feature = "trust-build"))]
 fn direct_trust_wp_native_evidence(
     manifest: &EngineManifest,
     bundle: &TrustContractBundle,
@@ -3452,7 +3395,12 @@ fn direct_trust_wp_native_evidence(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_verify_bundle_request(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -3548,7 +3496,12 @@ fn trust_wp_verify_bundle_request(
 /// validated TrustFormulaV1 may additionally contain its schema's `old`, `let`,
 /// and trigger-free quantifier nodes. Casts, calls, postfix projections, and
 /// future parser extensions cannot become proof inputs by reinterpretation.
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn normalize_and_validate_trust_wp_proof_context_claims(
     context: &mut trust_wp_core::verify_bundle::BundleProofContext,
 ) -> Result<(), String> {
@@ -3568,7 +3521,12 @@ fn normalize_and_validate_trust_wp_proof_context_claims(
     Ok(())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn normalize_and_validate_trust_wp_proof_input_claim(
     claim: &mut trust_wp_core::verify_bundle::BundleClaim,
 ) -> Result<(), String> {
@@ -3618,7 +3576,12 @@ fn normalize_and_validate_trust_wp_proof_input_claim(
     validate_trust_wp_native_arithmetic_free_expr(&decoded.predicate, structured_trust_formula)
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn validate_trust_wp_native_arithmetic_free_expr(
     expr: &trust_wp_core::formula::PureExpr,
     structured_trust_formula: bool,
@@ -3669,7 +3632,12 @@ fn validate_trust_wp_native_arithmetic_free_expr(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_obligation_kind(
     obligation: &TrustObligation,
     subject_label: &str,
@@ -3712,7 +3680,12 @@ fn trust_wp_obligation_kind(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_source_span(
     source: &trust_verifier_api::SourceLocation,
 ) -> Option<trust_wp_core::verify_bundle::BundleSourceSpan> {
@@ -3722,7 +3695,12 @@ fn trust_wp_source_span(
     Some(trust_wp_core::verify_bundle::BundleSourceSpan::new(file.clone(), line, column))
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn attach_required_trust_wp_artifact_context(
     mut trust_wp_obligation: trust_wp_core::verify_bundle::BundleObligation,
     bundle: &TrustContractBundle,
@@ -3814,6 +3792,7 @@ fn attach_required_trust_wp_artifact_context(
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -3836,6 +3815,7 @@ where
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -3869,6 +3849,7 @@ where
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -3895,7 +3876,12 @@ where
         .collect()
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn metadata_entries<'a>(
     bundle: &'a TrustContractBundle,
     obligation: &'a TrustObligation,
@@ -3903,7 +3889,12 @@ fn metadata_entries<'a>(
     bundle.metadata.iter().chain(obligation.metadata.iter())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn validate_unique_trust_wp_proof_context_metadata_json(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -3930,6 +3921,7 @@ fn validate_unique_trust_wp_proof_context_metadata_json(
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -3952,6 +3944,7 @@ fn trust_wp_native_replay_metadata_input(
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -3974,6 +3967,7 @@ struct TrustWpNativeOriginMetadata {
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -3988,6 +3982,7 @@ enum TrustWpNativeOriginMode {
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -4000,6 +3995,7 @@ struct TrustWpNativeDigestMetadata {
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -4057,6 +4053,7 @@ fn trust_wp_native_origin_from_metadata(
 }
 
 #[cfg(all(
+    test,
     feature = "trust-build",
     trust_wp_proof_transport_api,
     trust_wp_structured_context_api,
@@ -4074,7 +4071,12 @@ fn required_trust_wp_native_origin_from_metadata(
     })
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_native_origin_mode_label(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -4095,7 +4097,12 @@ fn trust_wp_native_origin_mode_label(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_summary_facts_for_obligation(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -4117,7 +4124,12 @@ fn trust_wp_summary_facts_for_obligation(
     Ok(trust_wp_summary_facts)
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_summary_fact(fact: &SummaryFact) -> trust_wp_core::verify_bundle::BundleSummaryFact {
     use trust_wp_core::verify_bundle::{
         BundleDigest as TrustWpDigest, BundleSummaryFact as TrustWpSummaryFact,
@@ -4153,7 +4165,12 @@ fn trust_wp_summary_fact(fact: &SummaryFact) -> trust_wp_core::verify_bundle::Bu
     )
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_verified_evidence_to_trust(
     manifest: &EngineManifest,
     bundle: &TrustContractBundle,
@@ -4279,7 +4296,12 @@ fn trust_wp_verified_evidence_to_trust(
     })
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_native_transport_binding_id(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -4296,7 +4318,12 @@ fn trust_wp_native_transport_binding_id(
     ))
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn validate_trust_wp_proof_result_metadata(
     obligation: &TrustObligation,
     claim: &NativeTrustWpClaim,
@@ -4377,7 +4404,12 @@ fn validate_trust_wp_proof_result_metadata(
     Ok(())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_native_claim_format_label(claim: &NativeTrustWpClaim) -> &'static str {
     match claim {
         NativeTrustWpClaim::TrustWpPureExprV1(_) => "TrustWpPureExprV1",
@@ -4385,7 +4417,12 @@ fn trust_wp_native_claim_format_label(claim: &NativeTrustWpClaim) -> &'static st
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_verified_evidence_diagnostics(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -4423,7 +4460,12 @@ fn trust_wp_verified_evidence_diagnostics(
     diagnostics
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn validate_trust_wp_proof_transport_artifacts(
     obligation: &TrustObligation,
     evidence_label: &str,
@@ -4472,7 +4514,12 @@ fn validate_trust_wp_proof_transport_artifacts(
     Ok(())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn required_native_replay_artifacts(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -4488,7 +4535,12 @@ fn required_native_replay_artifacts(
     Ok(required)
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_structured_evidence_artifacts(
     evidence: &trust_wp_core::verify_bundle::ProofEvidence,
     aggregate_evidence: &trust_wp_core::verify_bundle::ProofEvidence,
@@ -4523,7 +4575,12 @@ fn trust_wp_structured_evidence_artifacts(
     Ok(artifacts)
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_structural_input_manifest(
     evidence: &trust_wp_core::verify_bundle::ProofEvidence,
     aggregate_evidence: &trust_wp_core::verify_bundle::ProofEvidence,
@@ -4624,7 +4681,12 @@ fn trust_wp_structural_input_manifest(
     })
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn push_trust_wp_manifest_field(target: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
     target.extend_from_slice(
         &u32::try_from(value.len())
@@ -4635,7 +4697,12 @@ fn push_trust_wp_manifest_field(target: &mut Vec<u8>, value: &[u8]) -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn validate_trust_wp_upstream_transcript_relation(
     evidence: &trust_wp_core::verify_bundle::ProofEvidence,
 ) -> Result<(), String> {
@@ -4679,7 +4746,12 @@ fn validate_trust_wp_upstream_transcript_relation(
     Ok(())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn bind_trust_wp_transcript_to_replay(
     artifacts: &mut [EvidenceArtifact],
     obligation_id: &str,
@@ -4769,7 +4841,12 @@ fn bind_trust_wp_transcript_to_replay(
     Ok(())
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn validate_trust_replay_and_check_artifacts(
     obligation: &TrustObligation,
     artifacts: &[EvidenceArtifact],
@@ -4789,7 +4866,12 @@ fn validate_trust_replay_and_check_artifacts(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_native_trust_ir_identity_material(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -4820,7 +4902,12 @@ fn trust_wp_native_trust_ir_identity_material(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_native_trust_ir_identity_from_parts(
     obligation: &TrustObligation,
     origin: &trust_wp_core::verify_bundle::BundleNativeOrigin,
@@ -4865,7 +4952,12 @@ fn trust_wp_native_trust_ir_identity_from_parts(
     ))
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_evidence_artifact(
     artifact: &trust_wp_core::verify_bundle::EvidenceArtifact,
     proof_binding_id: &str,
@@ -4909,7 +5001,12 @@ fn trust_wp_evidence_artifact(
     })
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_evidence_artifact_descriptor(
     artifact: &trust_wp_core::verify_bundle::EvidenceArtifact,
 ) -> Result<EvidenceArtifact, String> {
@@ -4946,7 +5043,12 @@ fn trust_wp_evidence_artifact_descriptor(
     })
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_public_artifact_kind(
     kind: &trust_wp_core::verify_bundle::EvidenceArtifactKind,
 ) -> EvidenceArtifactKind {
@@ -4970,7 +5072,12 @@ fn trust_wp_public_artifact_kind(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn trust_wp_result_diagnostics(
     result: &trust_wp_core::verify_bundle::VerifyBundleResult,
 ) -> String {
@@ -4993,7 +5100,12 @@ fn trust_wp_result_diagnostics(
     }
 }
 
-#[cfg(all(feature = "trust-build", trust_wp_proof_transport_api, trust_wp_structured_context_api))]
+#[cfg(all(
+    test,
+    feature = "trust-build",
+    trust_wp_proof_transport_api,
+    trust_wp_structured_context_api
+))]
 fn bundle_crate_name(bundle: &TrustContractBundle) -> String {
     match &bundle.subject {
         trust_verifier_api::BundleSubject::Crate { name } => name.clone(),
@@ -5021,6 +5133,7 @@ fn bundle_crate_name(bundle: &TrustContractBundle) -> String {
 /// retryable class and `Failed` is terminal, so a refutation wearing
 /// `Unsupported` would invite a second engine to re-litigate a settled
 /// refutation.
+#[cfg(all(test, feature = "trust-build"))]
 #[derive(Debug, Clone)]
 enum NativeReplayEvidenceRejection {
     /// The candidate evidence row is not acceptable. Says nothing about the
@@ -5031,6 +5144,7 @@ enum NativeReplayEvidenceRejection {
     Refuted { diagnostic: String, counterexample: Box<Counterexample> },
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 impl From<String> for NativeReplayEvidenceRejection {
     fn from(diagnostic: String) -> Self {
         Self::Invalid(diagnostic)
@@ -5044,6 +5158,7 @@ impl From<String> for NativeReplayEvidenceRejection {
 /// which preserves the refutation/incompleteness distinction. This flattening
 /// helper is only appropriate where the outcome is already known to be a success
 /// or the distinction genuinely does not matter.
+#[cfg(all(test, feature = "trust-build"))]
 fn replay_typed_predicate(predicate: &TrustWpPureExprV1) -> Result<TrustWpNativeReplay, String> {
     replay_typed_predicate_for_evidence(predicate).map_err(|failure| match failure {
         NativeReplayFailure::False { diagnostic } | NativeReplayFailure::Unknown { diagnostic } => {
@@ -5054,6 +5169,7 @@ fn replay_typed_predicate(predicate: &TrustWpPureExprV1) -> Result<TrustWpNative
 
 /// Replay a typed predicate, preserving the refutation/incompleteness
 /// distinction the caller needs to pick a status.
+#[cfg(all(test, feature = "trust-build"))]
 fn replay_typed_predicate_for_candidate(
     obligation: &TrustObligation,
     predicate: &TrustWpPureExprV1,
@@ -5069,6 +5185,7 @@ fn replay_typed_predicate_for_candidate(
     })
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn replay_typed_predicate_for_evidence(
     predicate: &TrustWpPureExprV1,
 ) -> Result<TrustWpNativeReplay, NativeReplayFailure> {
@@ -5092,26 +5209,14 @@ fn replay_typed_predicate_for_evidence(
     }
 }
 
-#[cfg(not(feature = "trust-build"))]
-fn aggregate_gate_missing_diagnostic(
-    obligation: &TrustObligation,
-    replay: &TrustWpNativeReplay,
-) -> String {
-    format!(
-        "local typed TrustWpPureExprV1 replay for obligation `{}` normalized `{}` but did not pass through trust_wp VerifyBundleResult aggregate native replay evidence gate `{}` from commit `{}`; proof_strength remains omitted until Trust wires that gate",
-        obligation.obligation_id,
-        replay.normalized_predicate,
-        TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION,
-        TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT,
-    )
-}
-
+#[cfg(all(test, feature = "trust-build"))]
 fn validate_aggregate_native_replay_gate(_evidence: &ObligationEvidence) -> Result<(), String> {
     Err(format!(
-        "candidate trust_wp evidence matched local typed replay metadata, but Trust has not called trust_wp VerifyBundleResult aggregate native replay gate `{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION}` from commit `{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT}`; refusing to report deductive proof strength without that aggregate ProofCheckReport"
+        "candidate trust_wp evidence matched historical typed replay metadata `{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION}` from commit `{TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT}`, but TrustWP owns no current full-verification claim; refusing proof strength"
     ))
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn prove_typed_predicate(predicate: &TrustWpPureExprV1) -> ReplayTruth {
     match eval_value(predicate) {
         Some(TrustWpPureValue::Bool(value)) => ReplayTruth::from_bool(value, "typed-constant-fold"),
@@ -5124,12 +5229,14 @@ fn prove_typed_predicate(predicate: &TrustWpPureExprV1) -> ReplayTruth {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrustWpPureValue {
     Bool(bool),
     Int(i64),
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn eval_value(expr: &TrustWpPureExprV1) -> Option<TrustWpPureValue> {
     match expr {
         TrustWpPureExprV1::Bool { value } => Some(TrustWpPureValue::Bool(*value)),
@@ -5145,6 +5252,7 @@ fn eval_value(expr: &TrustWpPureExprV1) -> Option<TrustWpPureValue> {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn eval_binary(
     op: TrustWpPureBinaryOpV1,
     lhs: &TrustWpPureExprV1,
@@ -5188,6 +5296,7 @@ fn eval_binary(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedNativeReplayMetadata {
     evidence_id: String,
@@ -5195,6 +5304,7 @@ struct ExpectedNativeReplayMetadata {
     evidence_bundle_hash: String,
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn expected_native_replay_metadata(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -5262,6 +5372,7 @@ fn expected_native_replay_metadata(
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn evidence_manifest_material(artifacts: &[EvidenceArtifact]) -> String {
     let mut material = format!(
         "api={api}\nevidence-schema={evidence_schema}\nformat={format}\nstrength=sound\nchecker={checker}\nartifact-count={artifact_count}\n",
@@ -5283,6 +5394,7 @@ fn evidence_manifest_material(artifacts: &[EvidenceArtifact]) -> String {
     material
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn validate_summary_facts(summary_facts: &[SummaryFact]) -> Result<(), String> {
     let mut ids = std::collections::BTreeSet::new();
     for fact in summary_facts {
@@ -5299,6 +5411,7 @@ fn validate_summary_facts(summary_facts: &[SummaryFact]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn summary_facts_for_obligation(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
@@ -5320,6 +5433,7 @@ fn summary_facts_for_obligation(
     Ok(summary_facts)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn summary_facts_artifact(summary_facts: &[SummaryFact]) -> Option<EvidenceArtifact> {
     (!summary_facts.is_empty()).then(|| {
         let hash = stable_digest(&summary_facts_material(summary_facts));
@@ -5332,6 +5446,7 @@ fn summary_facts_artifact(summary_facts: &[SummaryFact]) -> Option<EvidenceArtif
     })
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn summary_facts_material(summary_facts: &[SummaryFact]) -> String {
     let mut facts = summary_facts.iter().collect::<Vec<_>>();
     facts.sort_by(|left, right| left.id.cmp(&right.id));
@@ -5369,10 +5484,12 @@ fn stable_digest(material: &str) -> ArtifactHash {
     ArtifactHash { algorithm: "sha256".to_string(), value: format!("{digest:x}") }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn stable_artifact_uri(kind: EvidenceArtifactKind, hash: &ArtifactHash) -> String {
     format!("artifact://trust-wp/{}/{}/{}", artifact_kind_label(kind), hash.algorithm, hash.value)
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn native_replay_artifact_mismatch_detail(
     expected: &[EvidenceArtifact],
     actual: &[EvidenceArtifact],
@@ -5423,6 +5540,7 @@ fn native_replay_artifact_mismatch_detail(
     "candidate trust_wp evidence does not match deterministic typed replay metadata".to_string()
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn artifact_kind_label(kind: EvidenceArtifactKind) -> &'static str {
     match kind {
         EvidenceArtifactKind::NormalizedObligation => "normalized-obligation",
@@ -5446,6 +5564,7 @@ fn artifact_kind_label(kind: EvidenceArtifactKind) -> &'static str {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn obligation_kind_label(kind: &ObligationKind) -> String {
     match kind {
         ObligationKind::Precondition => "precondition".to_string(),
@@ -5457,6 +5576,7 @@ fn obligation_kind_label(kind: &ObligationKind) -> String {
     }
 }
 
+#[cfg(all(test, feature = "trust-build"))]
 fn bundle_subject_label(bundle: &TrustContractBundle) -> String {
     match &bundle.subject {
         trust_verifier_api::BundleSubject::Function { path, .. } => path.clone(),
@@ -5471,8 +5591,8 @@ fn bundle_subject_label(bundle: &TrustContractBundle) -> String {
 // `cfg(not(trust-build))` only because its sole caller was. The candidate
 // -validation path attaches a counterexample to a refutation in every build
 // configuration, and a refutation that silently loses its counterexample under
-// `trust-build` — the compiler's own configuration — would be the one place it
-// matters most.
+// the feature-enabled historical inspector would corrupt diagnostic fidelity.
+#[cfg(all(test, feature = "trust-build"))]
 fn native_replay_counterexample(
     obligation: &TrustObligation,
     predicate: &TrustWpPureExprV1,
@@ -5488,30 +5608,43 @@ fn native_replay_counterexample(
 }
 
 /// Obligation kinds owned by the current trust_wp native replay adapter.
+///
+/// Empty is intentional. TrustIR's give-back elaborator produces structural
+/// data but no ground formula. Advertising that record would promise proof
+/// authority the native adapter does not have.
 #[must_use]
-pub fn trust_wp_owned_obligation_kinds() -> [ObligationKind; 5] {
-    [
-        ObligationKind::Precondition,
-        ObligationKind::Postcondition,
-        ObligationKind::LoopInvariant,
-        ObligationKind::Refinement,
-        ObligationKind::Termination,
-    ]
+pub fn trust_wp_owned_obligation_kinds() -> [ObligationKind; 0] {
+    []
 }
 
-/// Returns true for obligations trust-wp's current replay schema can prove natively.
+/// Returns false: no current TrustWP kind has a ground, function-bound claim.
 #[must_use]
-pub fn is_trust_wp_owned_obligation_kind(kind: &ObligationKind) -> bool {
-    matches!(
-        kind,
-        ObligationKind::Precondition
-            | ObligationKind::Postcondition
-            | ObligationKind::LoopInvariant
-            | ObligationKind::Refinement
-            | ObligationKind::Termination
-    )
+pub fn is_trust_wp_owned_obligation_kind(_kind: &ObligationKind) -> bool {
+    false
 }
 
+/// v7/D3 — a refusal must carry the fix, with options. Next steps for the
+/// refused obligation kinds that have a designated owner engine elsewhere in
+/// the fleet (TrustWP itself advertises zero kinds).
+fn narrowed_obligation_kind_options(kind: &ObligationKind) -> Option<&'static str> {
+    match kind {
+        ObligationKind::Refinement => Some(
+            "options: (1) route Refinement to trust-vc, its v6/D3 owner, via a typed TrustVc \
+             certificate import; (2) a RustHorn prophecy `&mut` refinement stays fail-closed \
+             until trust-wp ships a typed prophecy lane — none exists today, so do not route it \
+             here expecting a verdict",
+        ),
+        ObligationKind::Termination => Some(
+            "options: (1) emit the body-aware E5 decreases payload (the typed TrustSpecPredicate \
+             `trust.vc.formula.payload` envelope) so the obligation routes to trust-mc's CHC/PDR \
+             lane; (2) a payload-less termination claim stays fail-closed — trust-wp has no \
+             native termination discharge",
+        ),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "trust-build"))]
 fn is_auto_lowered_contract_obligation_kind(kind: &ObligationKind) -> bool {
     matches!(
         kind,
@@ -5782,12 +5915,44 @@ mod tests {
 
     use trust_verifier_api::{
         BundleSubject, ContractKind, ContractPredicate, MetadataEntry, ProofStrength,
-        SourceLocation, SummaryFactKind, TrustContract, TrustSpecBinaryOp, TrustSpecExpr,
-        TrustSpecPredicate, TrustSpecVariable, TrustSpecVariableOrigin, VerificationRunStatus,
-        VerifierExecutionContext,
+        SourceLocation, TrustContract, VerificationRunStatus, VerifierExecutionContext,
+    };
+    #[cfg(feature = "trust-build")]
+    use trust_verifier_api::{
+        SummaryFactKind, TrustSpecBinaryOp, TrustSpecExpr, TrustSpecPredicate, TrustSpecVariable,
+        TrustSpecVariableOrigin,
     };
 
     use super::*;
+
+    #[cfg(feature = "trust-build")]
+    fn inspect_historical_evidence(
+        engine: &TrustWpVerificationEngine,
+        bundle: &TrustContractBundle,
+    ) -> Vec<ObligationEvidence> {
+        let mut evidence = bundle
+            .obligations
+            .iter()
+            .map(|obligation| engine.inspect_historical_one_for_test(bundle, obligation))
+            .collect::<Vec<_>>();
+        bind_trust_wp_evidence_batch_publication(&mut evidence);
+        evidence
+    }
+
+    #[cfg(feature = "trust-build")]
+    fn inspect_historical_with_context(
+        engine: &TrustWpVerificationEngine,
+        bundle: &TrustContractBundle,
+        context: &VerifierExecutionContext,
+    ) -> trust_verifier_api::VerificationRunResult {
+        trust_verifier_api::VerificationRunResult::from_evidence(
+            context.snapshot(),
+            bundle,
+            engine.manifest().clone(),
+            &bundle.obligations,
+            inspect_historical_evidence(engine, bundle),
+        )
+    }
 
     fn obligation(kind: ObligationKind, id: &str) -> TrustObligation {
         TrustObligation {
@@ -5829,6 +5994,7 @@ mod tests {
         bundle
     }
 
+    #[cfg(feature = "trust-build")]
     fn typed_expr(value: bool) -> TrustWpPureExprV1 {
         TrustWpPureExprV1::Binary {
             op: TrustWpPureBinaryOpV1::Eq,
@@ -5840,10 +6006,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(
-        not(feature = "trust-build"),
-        all(feature = "trust-build", trust_wp_proof_transport_api)
-    ))]
+    #[cfg(feature = "trust-build")]
     fn trust_formula_value(value: bool) -> serde_json::Value {
         serde_json::json!({
             "schema": TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION,
@@ -5871,6 +6034,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "trust-build")]
     fn trust_spec_result_predicate() -> TrustSpecPredicate {
         TrustSpecPredicate::new(
             TrustSpecExpr::binary(
@@ -5891,6 +6055,7 @@ mod tests {
     // other arithmetic operator (a nonzero-divisor guard removes the
     // div-by-zero hazard but not the Int-vs-machine-semantics hazard). This
     // test now pins the refusal.
+    #[cfg(feature = "trust-build")]
     #[test]
     fn trust_spec_predicate_trust_formula_payload_refuses_guarded_div_and_mod() {
         let int_sort = trust_verifier_api::TrustSpecSort::Int;
@@ -5942,6 +6107,7 @@ mod tests {
         assert!(err.contains("false at u64::MAX"), "{err}");
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn trust_spec_predicate_trust_formula_payload_rejects_unguarded_div_and_mod() {
         let int_sort = trust_verifier_api::TrustSpecSort::Int;
@@ -5973,6 +6139,7 @@ mod tests {
         assert!(err.contains("divisor must"), "{err}");
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn trust_spec_predicate_trust_formula_payload_rejects_arrays_before_scalar_emission() {
         let array_sort = trust_verifier_api::TrustSpecSort::Array {
@@ -6002,6 +6169,7 @@ mod tests {
         assert!(err.contains("array sort is outside"), "{err}");
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn trust_spec_predicate_trust_formula_payload_rejects_floats_before_scalar_emission() {
         // IEEE-754 comparisons (NaN is unordered, +0.0 == -0.0) have no
@@ -6036,6 +6204,7 @@ mod tests {
     // them) but false at `u64::MAX` / `0u64` under wrapping machine
     // semantics; before this gate the native trust-wp lane reported them
     // "verified". Blueprint amendment 1.
+    #[cfg(feature = "trust-build")]
     #[test]
     fn trust_spec_predicate_trust_formula_payload_refuses_arithmetic_int_tautologies() {
         let int_sort = trust_verifier_api::TrustSpecSort::Int;
@@ -6075,6 +6244,7 @@ mod tests {
     }
 
     // Trust (#29, falsification): unary negation is arithmetic too.
+    #[cfg(feature = "trust-build")]
     #[test]
     fn trust_spec_predicate_trust_formula_payload_refuses_unary_neg() {
         let int_sort = trust_verifier_api::TrustSpecSort::Int;
@@ -6091,6 +6261,7 @@ mod tests {
         assert!(err.contains("arithmetic operator `neg`"), "{err}");
     }
 
+    #[cfg(feature = "trust-build")]
     fn summary_fact(id: &str, digest: &str) -> SummaryFact {
         SummaryFact::new(
             id,
@@ -6404,6 +6575,7 @@ mod tests {
         assert_eq!(assertion["native_span"]["column"], 7);
     }
 
+    #[cfg(feature = "trust-build")]
     fn typed_bundle(
         obligation: TrustObligation,
         predicate: TrustWpPureExprV1,
@@ -6436,6 +6608,7 @@ mod tests {
         bundle
     }
 
+    #[cfg(feature = "trust-build")]
     fn typed_bundle_with_obligations(
         obligations: Vec<TrustObligation>,
         predicate: TrustWpPureExprV1,
@@ -6470,6 +6643,7 @@ mod tests {
         bundle
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn direct_typed_contract_json_refuses_machine_add_and_sub() {
         let var = || TrustWpPureExprV1::Var { name: "x".to_string(), sort: TrustWpPureSortV1::Int };
@@ -6506,6 +6680,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn direct_typed_contract_json_rejects_unknown_fields_and_formula_arithmetic() {
         let unknown_field_contract = TrustContract {
@@ -7581,7 +7756,41 @@ mod tests {
 
     #[cfg(feature = "trust-build")]
     #[test]
-    fn native_trust_ir_adapter_validates_replay_atom_payload_digest_before_admission() {
+    fn public_native_trust_wp_boundary_is_unconditionally_unsupported() {
+        let public_obligation =
+            obligation(ObligationKind::Postcondition, "native-retired-authority");
+        let public_bundle = typed_bundle_with_obligations(
+            vec![public_obligation.clone()],
+            TrustWpPureExprV1::Bool { value: true },
+        );
+        let native_bundle = native_bundle_with_trust_wp_formula(
+            trust_ir::ObligationKind::Postcondition,
+            Some(trust_ir::ProofFormula::new("TrustWpPureExprV1", "true")),
+            &public_bundle,
+            &public_obligation,
+        );
+
+        let evidence = TrustWpVerificationEngine::new()
+            .verify_obligation_with_native_trust_ir_request(
+                &public_bundle,
+                &public_obligation,
+                &native_bundle,
+                native_trust_wp_request(&native_bundle),
+                trust_ir::ProofId::new(2),
+            );
+
+        assert_eq!(evidence.status, EvidenceStatus::Unsupported);
+        assert!(evidence.proof_strength.is_none());
+        assert!(evidence.artifacts.is_empty());
+        assert!(evidence.counterexample.is_none());
+        assert!(evidence.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("historical TrustWpNativeRequest data is diagnostic-only")
+        }));
+    }
+
+    #[cfg(feature = "trust-build")]
+    #[test]
+    fn historical_native_decoder_validates_replay_atom_payload_digest() {
         let public_obligation =
             obligation(ObligationKind::Postcondition, "native-invalid-atom-digest");
         let public_bundle = typed_bundle_with_obligations(
@@ -7596,14 +7805,13 @@ mod tests {
         );
         native_trust_wp_request_mut(&mut native_bundle).provenance.replay_context.atoms[0]
             .formula = trust_ir::ProofFormula::new("TrustWpPureExprV1", "false");
-        let evidence = TrustWpVerificationEngine::new()
-            .verify_obligation_with_native_trust_ir_request(
-                &public_bundle,
-                &public_obligation,
-                &native_bundle,
-                native_trust_wp_request(&native_bundle),
-                trust_ir::ProofId::new(2),
-            );
+        let evidence = TrustWpVerificationEngine::new().inspect_native_trust_ir_request_for_test(
+            &public_bundle,
+            &public_obligation,
+            &native_bundle,
+            native_trust_wp_request(&native_bundle),
+            trust_ir::ProofId::new(2),
+        );
 
         assert_eq!(evidence.status, EvidenceStatus::Unsupported);
         assert!(evidence.proof_strength.is_none());
@@ -7620,7 +7828,7 @@ mod tests {
 
     #[cfg(feature = "trust-build")]
     #[test]
-    fn native_trust_ir_adapter_rejects_substituted_public_obligation_record() {
+    fn historical_native_decoder_rejects_substituted_public_obligation_record() {
         let canonical_obligation =
             obligation(ObligationKind::Postcondition, "native-substituted-record");
         let public_bundle = typed_bundle_with_obligations(
@@ -7636,14 +7844,13 @@ mod tests {
         let mut substituted_obligation = canonical_obligation;
         substituted_obligation.description = "attacker-controlled alias record".to_string();
 
-        let evidence = TrustWpVerificationEngine::new()
-            .verify_obligation_with_native_trust_ir_request(
-                &public_bundle,
-                &substituted_obligation,
-                &native_bundle,
-                native_trust_wp_request(&native_bundle),
-                trust_ir::ProofId::new(2),
-            );
+        let evidence = TrustWpVerificationEngine::new().inspect_native_trust_ir_request_for_test(
+            &public_bundle,
+            &substituted_obligation,
+            &native_bundle,
+            native_trust_wp_request(&native_bundle),
+            trust_ir::ProofId::new(2),
+        );
 
         assert_eq!(evidence.status, EvidenceStatus::Unsupported);
         assert!(evidence.proof_strength.is_none());
@@ -7833,6 +8040,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "trust-build")]
     fn locally_shaped_candidate_evidence(
         manifest: &EngineManifest,
         bundle: &TrustContractBundle,
@@ -7860,48 +8068,14 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "trust-build"))]
-    #[test]
-    fn structured_trust_formula_predicate_fails_closed_without_trust_build() {
-        let obligation = obligation(ObligationKind::Postcondition, "post-trust-formula");
-        let mut bundle = TrustContractBundle::empty(
-            "bundle-trust-wp-trust-formula",
-            BundleSubject::Function {
-                crate_name: "demo".to_string(),
-                path: "demo::deductive".to_string(),
-            },
-        );
-        bundle.contracts.push(TrustContract {
-            contract_id: obligation.contract_id.clone().expect("test obligation has contract"),
-            kind: ContractKind::Ensures,
-            predicate: ContractPredicate::CanonicalJson {
-                schema: TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION.to_string(),
-                value: trust_formula_value(true),
-            },
-            source: SourceLocation::default(),
-            metadata: Vec::new(),
-        });
-        bundle.obligations = vec![obligation];
-
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
-
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
-        assert!(evidence[0].proof_strength.is_none());
-        assert!(evidence[0].artifacts.is_empty());
-        assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains(TRUST_WP_TRUST_FORMULA_SCHEMA_VERSION)
-                && diagnostic.contains("NativeTrustWpBundleVerifier")
-        }));
-    }
-
     #[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
     #[test]
     fn trust_build_stale_trust_wp_dependency_fails_closed_without_transport_api() {
         let obligation = obligation(ObligationKind::Postcondition, "post-stale-trust-wp");
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
@@ -7944,7 +8118,8 @@ mod tests {
         });
         bundle.obligations = vec![obligation];
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(
@@ -7994,7 +8169,8 @@ mod tests {
         });
         bundle.obligations = vec![obligation];
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(
@@ -8011,6 +8187,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn malformed_trust_formula_predicate_fails_closed() {
         let obligation = obligation(ObligationKind::Postcondition, "post-bad-trust-formula");
@@ -8033,7 +8210,8 @@ mod tests {
         });
         bundle.obligations = vec![obligation];
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
@@ -8044,6 +8222,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn mismatched_public_contract_kind_is_not_routed_to_trust_wp() {
         let obligation = obligation(ObligationKind::Postcondition, "post-requires-mismatch");
@@ -8067,7 +8246,8 @@ mod tests {
         });
         bundle.obligations = vec![obligation];
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
@@ -8080,6 +8260,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn unsupported_trust_spec_fragment_fails_closed_without_text_heuristics() {
         let obligation = obligation(ObligationKind::Postcondition, "post-symbolic-trust-spec");
@@ -8101,7 +8282,8 @@ mod tests {
         });
         bundle.obligations = vec![obligation];
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_ne!(evidence[0].status, EvidenceStatus::Proved);
@@ -8125,25 +8307,68 @@ mod tests {
     }
 
     #[test]
-    fn supports_trust_wp_owned_full_verification_obligations() {
+    fn trust_wp_manifest_advertises_zero_full_verification_obligations() {
         let engine = TrustWpVerificationEngine::new();
-        for kind in trust_wp_owned_obligation_kinds() {
-            let support = engine.supports(&obligation(kind, "owned"));
-            assert!(support.is_supported(), "expected trust_wp to own {support:?}");
-        }
-
-        let support = engine.supports(&obligation(ObligationKind::Ownership, "ownership"));
-        assert!(matches!(support, SupportLevel::Unsupported { .. }));
-
-        for kind in [ObligationKind::Invariant, ObligationKind::ArithmeticSafety] {
+        assert!(trust_wp_owned_obligation_kinds().is_empty());
+        assert!(engine.manifest().capabilities.is_empty());
+        assert!(engine.manifest().proof_modes.is_empty());
+        for kind in [
+            ObligationKind::Precondition,
+            ObligationKind::Postcondition,
+            ObligationKind::LoopInvariant,
+            ObligationKind::Refinement,
+            ObligationKind::Termination,
+            ObligationKind::Ownership,
+            ObligationKind::Invariant,
+            ObligationKind::ArithmeticSafety,
+        ] {
+            assert!(!is_trust_wp_owned_obligation_kind(&kind));
             let support = engine.supports(&obligation(kind, "not-replay-owned"));
-            assert!(matches!(support, SupportLevel::Unsupported { .. }));
+            assert!(matches!(
+                support,
+                SupportLevel::Unsupported { reason }
+                    if reason.contains("no currently dischargeable")
+            ));
+        }
+    }
+
+    /// Refinement and Termination are not advertised (TrustWP advertises zero
+    /// kinds), so `supports()` must refuse them up front, and (v7/D3) the
+    /// refusal must name the fix with options routing to the owner engine.
+    #[test]
+    fn narrowed_refinement_and_termination_are_unsupported_with_options() {
+        let engine = TrustWpVerificationEngine::new();
+        assert!(
+            !trust_wp_owned_obligation_kinds().iter().any(|kind| matches!(
+                kind,
+                ObligationKind::Refinement | ObligationKind::Termination
+            )),
+            "narrowed kinds must not reappear in the owned advertisement"
+        );
+        for (kind, expected_option_fragment) in
+            [(ObligationKind::Refinement, "trust-vc"), (ObligationKind::Termination, "trust-mc")]
+        {
+            let support = engine.supports(&obligation(kind.clone(), "narrowed"));
+            let SupportLevel::Unsupported { reason } = support else {
+                panic!("narrowed kind {kind:?} must be Unsupported, got {support:?}");
+            };
+            assert!(
+                reason.contains("no currently dischargeable full-verification obligation kind"),
+                "refusal must state the zero-capability ownership: {reason}"
+            );
+            assert!(
+                reason.contains("options:") && reason.contains(expected_option_fragment),
+                "v7/D3: refusal for {kind:?} must carry options naming {expected_option_fragment}: {reason}"
+            );
         }
     }
 
     #[test]
-    fn owned_obligations_return_unsupported_until_native_proof_exists() {
+    fn former_owned_obligations_return_unsupported_without_parsing_or_proof() {
         let engine = TrustWpVerificationEngine::new();
+        // TrustWP owns no obligation kinds; every submitted kind fail-closes
+        // with the zero-capability refusal, and the kinds with a designated
+        // owner engine elsewhere additionally carry v7/D3 rerouting options.
         let bundle = bundle_with(vec![
             obligation(ObligationKind::Precondition, "pre"),
             obligation(ObligationKind::Postcondition, "post"),
@@ -8156,55 +8381,27 @@ mod tests {
 
         assert_eq!(evidence.len(), 5);
         for item in evidence {
+            let narrowed_kind = matches!(item.obligation_id.as_str(), "refinement" | "termination");
             assert_eq!(item.engine.name, TRUST_WP_ENGINE_NAME);
             assert_eq!(item.status, EvidenceStatus::Unsupported);
             assert!(item.proof_strength.is_none());
             assert!(item.artifacts.is_empty());
             assert!(item.counterexample.is_none());
-            #[cfg(not(feature = "trust-build"))]
-            assert!(
-                item.diagnostics.iter().any(|diagnostic| diagnostic.contains("not wired")),
-                "missing not-wired diagnostic: {:?}",
-                item.diagnostics
-            );
-            #[cfg(all(
-                feature = "trust-build",
-                trust_wp_proof_transport_api,
-                trust_wp_structured_context_api
-            ))]
-            assert!(
-                item.diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.contains("direct committed trust_wp replay")),
-                "missing direct-replay diagnostic: {:?}",
-                item.diagnostics
-            );
-            #[cfg(all(
-                feature = "trust-build",
-                trust_wp_proof_transport_api,
-                not(trust_wp_structured_context_api)
-            ))]
+            if narrowed_kind {
+                // v7/D3: the refusal for a kind with a designated owner engine
+                // elsewhere in the fleet carries its rerouting options in
+                // addition to the zero-capability diagnostics below.
+                assert!(
+                    item.diagnostics.iter().any(|diagnostic| diagnostic.contains("options:")),
+                    "v7/D3: narrowed refusal must carry options: {:?}",
+                    item.diagnostics
+                );
+            }
             assert!(
                 item.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.contains(TRUST_WP_STRUCTURED_CONTEXT_API_MISSING)
+                    diagnostic.contains("advertises no full-verification capability")
                 }),
-                "missing structured-context diagnostic: {:?}",
-                item.diagnostics
-            );
-            #[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
-            assert!(
-                item.diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.contains(TRUST_WP_PROOF_TRANSPORT_API_MISSING)),
-                "missing stale-transport diagnostic: {:?}",
-                item.diagnostics
-            );
-            assert!(
-                item.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.contains(TRUST_WP_PROOF_EVIDENCE_SCHEMA_VERSION)
-                        && diagnostic.contains(TRUST_WP_NATIVE_PURE_REPLAY_SCHEMA_VERSION)
-                }),
-                "missing replay schema diagnostic: {:?}",
+                "missing zero-capability diagnostic: {:?}",
                 item.diagnostics
             );
             assert!(
@@ -8220,6 +8417,31 @@ mod tests {
     }
 
     #[test]
+    fn attached_historical_evidence_cannot_revive_the_public_zero_capability_path() {
+        let bundle = bundle_with(vec![obligation(ObligationKind::Postcondition, "post")]);
+        let mut replay_shaped =
+            TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations).remove(0);
+        replay_shaped.status = EvidenceStatus::Proved;
+        replay_shaped.proof_strength = Some(ProofStrength::deductive());
+        replay_shaped.publication.evidence_bundle_hash = Some("sha256:historical".to_string());
+
+        let evidence = TrustWpVerificationEngine::new()
+            .with_native_replay_evidence(vec![replay_shaped])
+            .verify(&bundle, &bundle.obligations);
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+        assert!(evidence[0].proof_strength.is_none());
+        assert!(evidence[0].artifacts.is_empty());
+        assert!(evidence[0].publication.evidence_bundle_hash.is_none());
+        assert!(evidence[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("advertises no full-verification capability")));
+    }
+
+    #[cfg(feature = "trust-build")]
+    #[test]
     fn replay_shaped_evidence_is_rejected_without_trust_wp_aggregate_gate() {
         let obligation = obligation(ObligationKind::Postcondition, "post-typed");
         let bundle = typed_bundle(obligation, typed_expr(true));
@@ -8233,9 +8455,9 @@ mod tests {
         );
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let result = engine.verify_with_context(
+        let result = inspect_historical_with_context(
+            &engine,
             &bundle,
-            &bundle.obligations,
             &VerifierExecutionContext::new("trust-wp-replay"),
         );
 
@@ -8247,12 +8469,15 @@ mod tests {
         assert!(result.evidence[0].proof_strength.is_none());
         assert!(result.evidence[0].artifacts.is_empty());
         assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("VerifyBundleResult")
+            diagnostic.contains("historical typed replay metadata")
                 && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION)
                 && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT)
+                && diagnostic.contains("owns no current full-verification claim")
+                && diagnostic.contains("refusing proof strength")
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn replay_shaped_evidence_missing_replay_artifact_is_rejected_structurally() {
         let obligation = obligation(ObligationKind::Postcondition, "post-missing-replay");
@@ -8268,9 +8493,9 @@ mod tests {
         evidence.artifacts.retain(|artifact| artifact.kind != EvidenceArtifactKind::ReplayLog);
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let result = engine.verify_with_context(
+        let result = inspect_historical_with_context(
+            &engine,
             &bundle,
-            &bundle.obligations,
             &VerifierExecutionContext::new("trust-wp-replay-missing-artifact"),
         );
 
@@ -8284,43 +8509,6 @@ mod tests {
             diagnostic.contains("missing deterministic native replay artifacts")
                 && diagnostic.contains("replay-log")
         }));
-    }
-
-    #[cfg(not(feature = "trust-build"))]
-    #[test]
-    fn typed_requires_and_ensures_do_not_claim_strength_without_aggregate_gate() {
-        let bundle = typed_bundle_with_obligations(
-            vec![
-                obligation(ObligationKind::Precondition, "pre-typed"),
-                obligation(ObligationKind::Postcondition, "post-typed"),
-            ],
-            typed_expr(true),
-        );
-        let engine = TrustWpVerificationEngine::new();
-
-        let evidence = engine.verify(&bundle, &bundle.obligations);
-
-        assert_eq!(evidence.len(), 2);
-        for item in &evidence {
-            assert_eq!(item.engine.name, TRUST_WP_ENGINE_NAME);
-            assert_eq!(item.status, EvidenceStatus::Unsupported);
-            assert!(item.proof_strength.is_none());
-            assert!(item.publication.evidence_bundle_hash.is_none());
-            assert!(item.artifacts.is_empty());
-            assert!(item.diagnostics.iter().any(|diagnostic| {
-                diagnostic.contains("local typed TrustWpPureExprV1 replay")
-                    && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION)
-                    && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT)
-            }));
-            assert!(
-                item.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.contains("proof_strength")
-                        && diagnostic.contains("aggregate native replay evidence gate")
-                }),
-                "missing aggregate-gate no-strength diagnostic: {:?}",
-                item.diagnostics
-            );
-        }
     }
 
     #[cfg(all(
@@ -8337,7 +8525,7 @@ mod tests {
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
         let engine = TrustWpVerificationEngine::new();
 
-        let evidence = engine.verify(&bundle, &bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].engine.name, TRUST_WP_ENGINE_NAME);
@@ -8418,9 +8606,10 @@ mod tests {
         ];
         let bundle =
             typed_bundle_with_obligations(obligations, TrustWpPureExprV1::Bool { value: true });
-        let result = TrustWpVerificationEngine::new().verify_with_context(
+        let engine = TrustWpVerificationEngine::new();
+        let result = inspect_historical_with_context(
+            &engine,
             &bundle,
-            &bundle.obligations,
             &VerifierExecutionContext::new("trust-wp-multi-clause-publication"),
         );
 
@@ -8448,7 +8637,8 @@ mod tests {
             "weakest_precondition",
         );
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
         let proved = &evidence[0];
 
         assert_eq!(proved.status, EvidenceStatus::Proved);
@@ -8574,7 +8764,8 @@ mod tests {
         let obligation = obligation(ObligationKind::Postcondition, "post-missing-native-context");
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
@@ -8606,7 +8797,8 @@ mod tests {
         }
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
@@ -8644,7 +8836,8 @@ mod tests {
             .expect("placeholder solver serializes");
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
@@ -8664,12 +8857,10 @@ mod tests {
     fn trust_build_request_rejects_semantic_proof_context_injection_and_round_trips_names() {
         use std::sync::Arc;
 
-        use trust_wp_core::{
-            formula::{BinOp, PureExpr},
-            verify_bundle::{
-                BundleClaim, BundleClaimFormat, BundleProofAtom, BundleProofAtomRole,
-                BundleProofContext, BundleTmirSourceSpan, native_predicate_for_obligation,
-            },
+        use trust_wp_core::formula::{BinOp, PureExpr};
+        use trust_wp_core::verify_bundle::{
+            BundleClaim, BundleClaimFormat, BundleProofAtom, BundleProofAtomRole,
+            BundleProofContext, BundleTmirSourceSpan, native_predicate_for_obligation,
         };
 
         fn atom(
@@ -9232,7 +9423,8 @@ mod tests {
         ));
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(
             evidence[0].status,
@@ -9284,7 +9476,8 @@ mod tests {
         });
         let bundle = typed_bundle(obligation, TrustWpPureExprV1::Bool { value: true });
 
-        let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+        let engine = TrustWpVerificationEngine::new();
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(
             evidence[0].status,
@@ -9548,7 +9741,8 @@ mod tests {
                 Some(mode)
             );
 
-            let evidence = TrustWpVerificationEngine::new().verify(&bundle, &bundle.obligations);
+            let engine = TrustWpVerificationEngine::new();
+            let evidence = inspect_historical_evidence(&engine, &bundle);
 
             assert_eq!(
                 evidence[0].status,
@@ -9562,6 +9756,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn false_typed_postcondition_fails_without_proof_strength_upgrade() {
         let obligation = obligation(ObligationKind::Postcondition, "post-false");
@@ -9574,7 +9769,7 @@ mod tests {
         let bundle = typed_bundle(obligation, typed_expr(false));
         let engine = TrustWpVerificationEngine::new();
 
-        let evidence = engine.verify(&bundle, &bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence.len(), 1);
         #[cfg(all(feature = "trust-build", not(trust_wp_proof_transport_api)))]
@@ -9604,44 +9799,12 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "trust-build"))]
-    #[test]
-    fn loop_invariant_phases_keep_stable_ids_but_require_aggregate_gate() {
-        let bundle = typed_bundle_with_obligations(
-            vec![
-                obligation(ObligationKind::LoopInvariant, "loop-init"),
-                obligation(ObligationKind::LoopInvariant, "loop-consecution"),
-                obligation(ObligationKind::LoopInvariant, "loop-sufficiency"),
-            ],
-            typed_expr(true),
-        );
-        let engine = TrustWpVerificationEngine::new();
-
-        let evidence = engine.verify(&bundle, &bundle.obligations);
-
-        assert_eq!(evidence.len(), 3);
-        assert_eq!(evidence[0].obligation_id, "loop-init");
-        assert_eq!(evidence[1].obligation_id, "loop-consecution");
-        assert_eq!(evidence[2].obligation_id, "loop-sufficiency");
-        for item in evidence {
-            assert_eq!(item.status, EvidenceStatus::Unsupported);
-            assert!(item.proof_strength.is_none());
-            assert!(item.evidence_id.contains(&item.obligation_id));
-            assert!(item.diagnostics.iter().any(|diagnostic| {
-                diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION)
-            }));
-        }
-    }
-
     #[test]
     fn refinement_and_termination_remain_fail_closed_without_native_replay_evidence() {
-        let bundle = typed_bundle_with_obligations(
-            vec![
-                obligation(ObligationKind::Refinement, "refinement-typed"),
-                obligation(ObligationKind::Termination, "termination-typed"),
-            ],
-            typed_expr(true),
-        );
+        let bundle = bundle_with(vec![
+            obligation(ObligationKind::Refinement, "refinement"),
+            obligation(ObligationKind::Termination, "termination"),
+        ]);
         let engine = TrustWpVerificationEngine::new();
 
         let evidence = engine.verify(&bundle, &bundle.obligations);
@@ -9651,13 +9814,14 @@ mod tests {
             assert_eq!(item.status, EvidenceStatus::Unsupported);
             assert!(item.proof_strength.is_none());
             assert!(item.diagnostics.iter().any(|diagnostic| {
-                diagnostic.contains("remains fail-closed") && diagnostic.contains("replay evidence")
+                diagnostic.contains("advertises no full-verification capability")
             }));
         }
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
-    fn typed_native_replay_with_summary_facts_still_requires_aggregate_gate() {
+    fn typed_native_replay_with_summary_facts_cannot_restore_retired_authority() {
         let mut obligation = obligation(ObligationKind::Postcondition, "post-summary");
         obligation.summary_facts.push(summary_fact(
             "summary-pointer-p-q",
@@ -9674,9 +9838,9 @@ mod tests {
         );
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let result = engine.verify_with_context(
+        let result = inspect_historical_with_context(
+            &engine,
             &bundle,
-            &bundle.obligations,
             &VerifierExecutionContext::new("trust-wp-summary-replay"),
         );
 
@@ -9686,13 +9850,17 @@ mod tests {
         assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
         assert!(result.evidence[0].proof_strength.is_none());
         assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("VerifyBundleResult")
+            diagnostic.contains("historical typed replay metadata")
+                && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION)
                 && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT)
+                && diagnostic.contains("owns no current full-verification claim")
+                && diagnostic.contains("refusing proof strength")
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
-    fn typed_native_replay_consumes_summary_fact_metadata_entries() {
+    fn typed_native_replay_consumes_summary_metadata_then_refuses_retired_authority() {
         let mut obligation = obligation(ObligationKind::Postcondition, "post-summary-metadata");
         obligation.metadata.push(
             summary_fact(
@@ -9715,16 +9883,20 @@ mod tests {
         );
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let evidence = engine.verify(&bundle, &bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
         assert!(evidence[0].proof_strength.is_none());
         assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("VerifyBundleResult")
+            diagnostic.contains("historical typed replay metadata")
+                && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_SCHEMA_VERSION)
                 && diagnostic.contains(TRUST_WP_AGGREGATE_NATIVE_REPLAY_GATE_COMMIT)
+                && diagnostic.contains("owns no current full-verification claim")
+                && diagnostic.contains("refusing proof strength")
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn typed_native_replay_rejects_tampered_summary_fact_digest() {
         let mut obligation = obligation(ObligationKind::Postcondition, "post-summary-tamper");
@@ -9747,7 +9919,7 @@ mod tests {
         let tampered_bundle = typed_bundle(obligation, typed_expr(true));
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let evidence = engine.verify(&tampered_bundle, &tampered_bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &tampered_bundle);
 
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
         assert!(
@@ -9758,6 +9930,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn copied_replay_evidence_for_false_predicate_is_rejected() {
         let obligation = obligation(ObligationKind::Postcondition, "post-typed");
@@ -9774,7 +9947,7 @@ mod tests {
         let engine =
             TrustWpVerificationEngine::new().with_native_replay_evidence(vec![copied_evidence]);
 
-        let evidence = engine.verify(&false_bundle, &false_bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &false_bundle);
 
         assert_eq!(evidence.len(), 1);
         // A predicate that replays to FALSE is a REFUTATION of the program, not a
@@ -9806,6 +9979,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn diagnostic_or_unsupported_replay_shaped_evidence_is_rejected() {
         let obligation = obligation(ObligationKind::Postcondition, "post-typed");
@@ -9823,7 +9997,7 @@ mod tests {
         evidence.diagnostics.push("diagnostic replay only".to_string());
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let evidence = engine.verify(&bundle, &bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &bundle);
 
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
         assert!(evidence[0].proof_strength.is_none());
@@ -9832,6 +10006,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn timeout_replay_shaped_evidence_remains_structured_non_proof() {
         let obligation = obligation(ObligationKind::Postcondition, "post-timeout");
@@ -9850,9 +10025,9 @@ mod tests {
         evidence.diagnostics.push("native trust_wp replay timed out".to_string());
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let result = engine.verify_with_context(
+        let result = inspect_historical_with_context(
+            &engine,
             &bundle,
-            &bundle.obligations,
             &VerifierExecutionContext::new("trust-wp-timeout-replay"),
         );
 
@@ -9870,6 +10045,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "trust-build")]
     #[test]
     fn source_strings_are_not_accepted_as_typed_trust_wp_formulas() {
         let obligation = obligation(ObligationKind::Postcondition, "post");
@@ -9885,7 +10061,7 @@ mod tests {
         let source_string_bundle = bundle_with(vec![obligation]);
         let engine = TrustWpVerificationEngine::new().with_native_replay_evidence(vec![evidence]);
 
-        let evidence = engine.verify(&source_string_bundle, &source_string_bundle.obligations);
+        let evidence = inspect_historical_evidence(&engine, &source_string_bundle);
 
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
         assert!(evidence[0].proof_strength.is_none());
@@ -9929,9 +10105,9 @@ mod tests {
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
         assert!(evidence[0].proof_strength.is_none());
         assert!(evidence[0].artifacts.is_empty());
-        assert!(evidence[0].diagnostics.iter().any(
-            |diagnostic| diagnostic.contains("symbolic") && diagnostic.contains("fail-closed")
-        ));
+        assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("symbolic") && diagnostic.contains("outside the current")
+        }));
     }
 
     #[test]
@@ -9943,8 +10119,9 @@ mod tests {
 
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
-        assert!(
-            evidence[0].diagnostics.iter().any(|diagnostic| diagnostic.contains("not Ownership"))
-        );
+        assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("advertises no full-verification capability")
+                && diagnostic.contains("Ownership")
+        }));
     }
 }

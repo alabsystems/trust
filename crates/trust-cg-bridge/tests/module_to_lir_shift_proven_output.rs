@@ -81,12 +81,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::Module;
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // The kind of right shift being modeled. `Shl` is direction-agnostic.
@@ -191,7 +188,13 @@ fn make_bridge_shift_module(kind: ShiftKind) -> Module {
         },
         def_path: "shift::op".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 2, return_ty: val_ty, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 2,
+            return_ty: val_ty,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -685,8 +688,8 @@ fn shift_lir_shape_carries_guarded_shift() {
     ];
     for &(kind, is_shift) in cases {
         let module = make_bridge_shift_module(kind);
-        let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
-            .expect("shift lowers");
+        let lir =
+            lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("shift lowers");
         assert!(lir.stack_slots.is_empty(), "shift must materialize NO memory ({kind:?})");
         let mut shifts = 0;
         let mut brif = 0;
@@ -718,7 +721,8 @@ fn right_shift_signedness_selects_arithmetic_vs_logical() {
     use trust_cg_lower::instructions::Opcode as LO;
     let signed = make_bridge_shift_module(ShiftKind::AShr);
     let lir_s = lower_trust_ir_function_to_lir(&signed, &signed.functions[0]).expect("ashr lowers");
-    let has_sshr = lir_s.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sshr)));
+    let has_sshr =
+        lir_s.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sshr)));
     let has_ushr_in_signed =
         lir_s.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ushr)));
     assert!(has_sshr, "signed a>>b must be Sshr (arithmetic)");
@@ -727,7 +731,8 @@ fn right_shift_signedness_selects_arithmetic_vs_logical() {
     let unsigned = make_bridge_shift_module(ShiftKind::LShr);
     let lir_u =
         lower_trust_ir_function_to_lir(&unsigned, &unsigned.functions[0]).expect("lshr lowers");
-    let has_ushr = lir_u.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ushr)));
+    let has_ushr =
+        lir_u.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ushr)));
     let has_sshr_in_unsigned =
         lir_u.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Sshr)));
     assert!(has_ushr, "unsigned a>>b must be Ushr (logical)");
@@ -776,7 +781,10 @@ fn shift_emitted_bytes_values_are_correct() {
     let (code, base) = emit_text(&make_bridge_shift_module(ShiftKind::LShr));
     assert!(bytes_value_equals(&code, base, 8, 1, 4), "8u32 >> 1 == 4 (logical)");
     // -1 as u32 == 0xFFFF_FFFF; >> 1 logical == 0x7FFF_FFFF == i32::MAX.
-    assert!(bytes_value_equals(&code, base, -1, 1, i32::MAX), "0xFFFFFFFF >> 1 == 0x7FFFFFFF (zero fills)");
+    assert!(
+        bytes_value_equals(&code, base, -1, 1, i32::MAX),
+        "0xFFFFFFFF >> 1 == 0x7FFFFFFF (zero fills)"
+    );
 }
 
 // ===========================================================================

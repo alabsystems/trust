@@ -136,7 +136,13 @@ fn func(
         name: "a".into(),
         def_path: "a".into(),
         span: span(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Tuple(vec![]), datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::Tuple(vec![]),
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions,
@@ -162,10 +168,7 @@ fn postcondition_formulas(f: &VerifiableFunction) -> Vec<String> {
 
 /// Every emitted VC's `(kind, formula)`, for the fail-closed assertions.
 fn all_vc_kinds(f: &VerifiableFunction) -> Vec<String> {
-    generate_v2_contract_vcs_impl(f, None)
-        .into_iter()
-        .map(|vc| format!("{:?}", vc.kind))
-        .collect()
+    generate_v2_contract_vcs_impl(f, None).into_iter().map(|vc| format!("{:?}", vc.kind)).collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -482,6 +485,7 @@ fn call_havoc_on_the_return_edge_suppresses_the_merge_pin() {
                     atomic: None,
                     is_foreign: false,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     unwind: Default::default(),
                 },
             ),
@@ -501,8 +505,6 @@ fn call_havoc_on_the_return_edge_suppresses_the_merge_pin() {
          could mint a FALSE PROOF: {vcs:?}"
     );
 }
-
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE DECISIVE CHECK — satisfiability, not string shape.
@@ -576,11 +578,8 @@ fn is_sat(f: &Formula) -> bool {
     atoms(f, &mut names);
     assert!(names.len() <= 16, "skeleton too large to enumerate: {names:?}");
     (0u32..(1u32 << names.len())).any(|mask| {
-        let env: Vec<(String, bool)> = names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), mask & (1 << i) != 0))
-            .collect();
+        let env: Vec<(String, bool)> =
+            names.iter().enumerate().map(|(i, n)| (n.clone(), mask & (1 << i) != 0)).collect();
         eval(f, &env)
     })
 }
@@ -715,6 +714,7 @@ fn opaque_call_body(positive_clause: bool) -> VerifiableFunction {
                     atomic: None,
                     is_foreign: false,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     unwind: Default::default(),
                 },
             ),

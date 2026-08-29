@@ -424,11 +424,7 @@ mod tests {
             (&BOX[..], "std::boxed::Box", "alloc::boxed::Box"),
             (&NON_NULL[..], "std::ptr::NonNull", "core::ptr::non_null::NonNull"),
             (&UNIQUE[..], "std::ptr::Unique", "core::ptr::unique::Unique"),
-            (
-                &HASH_SET[..],
-                "std::collections::HashSet",
-                "std::collections::hash::set::HashSet",
-            ),
+            (&HASH_SET[..], "std::collections::HashSet", "std::collections::hash::set::HashSet"),
         ] {
             assert!(is(old, pins), "{old} is the pre-2026-07-13 rendering");
             assert!(is(new, pins), "{new} is the post-2026-07-13 rendering");

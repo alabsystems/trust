@@ -501,6 +501,16 @@ fn is_same_place_operand(place: &Place, op: &Operand) -> bool {
 ///
 /// For `SwitchInt { discr, targets: [(val, _)], otherwise }`, the bound
 /// is typically `val` (the comparison target in a `while i < bound` loop).
+///
+/// RAW LABEL, DELIBERATELY. This reads the arm label as a magnitude without the
+/// typed decode every obligation-bearing lane now applies, because it has only a
+/// `&BasicBlock` — no local types, so no width or signedness to decode under.
+/// It is safe to leave raw: `classify_loop_pattern` / `infer_invariant_interval`
+/// / `LoopPattern` are re-exported from `lib.rs` and have NO in-tree consumer,
+/// so no `bound` computed here reaches an SMT term or an obligation. (On the
+/// `while i < n` shape it is already only ever `0`/`1`: the header switches on
+/// the BOOL temp `_g = i < n`, not on `i`.) If this ever gains a consumer, give
+/// it the function and route it through `Ty::decode_switch_label` first.
 fn extract_switch_bound(header: &BasicBlock) -> Option<i128> {
     if let Terminator::SwitchInt { targets, .. } = &header.terminator
         && let Some((val, _)) = targets.first()
@@ -547,6 +557,7 @@ fn terminator_targets_block(term: &Terminator, target: BlockId) -> bool {
         }
         Terminator::Assert { target: t, .. } => *t == target,
         Terminator::Call { target: t, .. } => t.as_ref() == Some(&target),
+        Terminator::TailCall { .. } => false,
         Terminator::Drop { target: t, .. } => *t == target,
         Terminator::Opaque { targets, .. } => targets.contains(&target),
         _ => false,

@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end fail-closed evidence gate for the trust-mc/trust-wp/trust-vc sample.
+# End-to-end fail-closed evidence gate for the active trust-mc/trust-vc/TY fleet.
 
 set -euo pipefail
 
@@ -259,16 +259,14 @@ if isinstance(manifest, dict):
         errors.append(f"router aggregate must be Inconclusive, got {manifest.get('status')!r}")
 
     summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
-    # After the ratified b62 "reject unreplayed native proof authority" hardening,
-    # only trust-wp supplies same-run materialized native proof for this synthetic
-    # sample; trust-mc and trust-vc are both native-authority debt. The honest
-    # aggregate is 1/3, NOT 2/3 — do not restore proved=2 without genuine live
-    # native trust-mc authority.
+    # The routing sample deliberately supplies no proof authority. It proves
+    # the exact MC/VC/TY ownership split and requires all six rows to decline
+    # without artifacts.
     expected_summary = {
-        "requested_obligations": 3,
-        "evidence_count": 3,
-        "proved": 1,
-        "unsupported": 2,
+        "requested_obligations": 6,
+        "evidence_count": 6,
+        "proved": 0,
+        "unsupported": 6,
     }
     for key, expected_value in expected_summary.items():
         if summary.get(key) != expected_value:
@@ -293,73 +291,31 @@ if isinstance(manifest, dict):
     accepted = manifest.get("accepted_evidence", [])
     rejected = manifest.get("rejected_evidence", [])
     skipped = manifest.get("skipped", [])
-    if not isinstance(accepted, list) or len(accepted) != 1:
-        errors.append("router manifest must contain exactly one accepted evidence row")
+    if not isinstance(accepted, list) or accepted:
+        errors.append("router manifest must contain no accepted proof rows")
         accepted = []
-    if not isinstance(rejected, list) or len(rejected) != 2:
-        errors.append("router manifest must contain exactly two rejected evidence rows")
+    if not isinstance(rejected, list) or len(rejected) != 6:
+        errors.append("router manifest must contain exactly six rejected evidence rows")
         rejected = []
     if skipped:
         errors.append("router manifest must not skip any requested suite")
 
-    expected_accepted = {
-        "sample::trust-wp-postcondition": "trust-wp",
-    }
-    accepted_by_obligation = {
-        row.get("obligation_id"): row for row in accepted if isinstance(row, dict)
-    }
-    if set(accepted_by_obligation) != set(expected_accepted):
-        errors.append(
-            "accepted router obligations must be exactly the trust-wp postcondition"
-        )
-    for obligation_id, suite in expected_accepted.items():
-        row = accepted_by_obligation.get(obligation_id)
-        if row is None:
-            continue
-        engine = row.get("engine") if isinstance(row.get("engine"), dict) else {}
-        diagnostics = row.get("diagnostics", [])
-        artifacts = row.get("artifacts", [])
-        if engine.get("name") != "trust-full-verifier":
-            errors.append(f"{suite}: accepted row has the wrong engine")
-        if row.get("status") != "Proved" or row.get("disposition") != "AcceptedProof":
-            errors.append(f"{suite}: row is not accepted proof evidence")
-        if not isinstance(artifacts, list) or not artifacts:
-            errors.append(f"{suite}: accepted row has no proof artifacts")
-        elif not any(
-            isinstance(artifact, dict) and artifact.get("materialization") is not None
-            for artifact in artifacts
-        ):
-            errors.append(f"{suite}: accepted row has no materialized same-run artifact")
-        if not any(
-            isinstance(diagnostic, str)
-            and f"primary owner {suite}@" in diagnostic
-            and "accepted evidence" in diagnostic
-            for diagnostic in diagnostics
-        ):
-            errors.append(f"{suite}: accepted row lacks its primary-owner acceptance diagnostic")
-
-    # trust-mc and trust-vc are both rejected as unsupported, artifact-free
-    # native-authority debt. Each keeps its specific fail-closed cause: trust-mc
-    # requires a live opaque native-bundle CHC/PDR authority the sample does not
-    # carry; trust-vc's admitted native bundle contains no TrustVc request.
     expected_rejected = {
-        "sample::trust-mc-arithmetic-safety": (
-            "trust-mc",
-            "trust-mc proof-grade admission requires a live opaque native-bundle authority",
-        ),
-        "sample::trust-vc-ownership": (
-            "trust-vc",
-            "contains no TrustVc requests",
-        ),
+        "pre": "trust-mc",
+        "post": "trust-mc",
+        "loop": "trust-mc",
+        "termination": "trust-mc",
+        "refinement": "trust-vc",
+        "temporal": "ty",
     }
     rejected_by_obligation = {
         row.get("obligation_id"): row for row in rejected if isinstance(row, dict)
     }
     if set(rejected_by_obligation) != set(expected_rejected):
         errors.append(
-            "rejected router obligations must be exactly trust-mc arithmetic safety and trust-vc ownership"
+            "rejected router obligations must be exactly the six active MC/VC/TY routing samples"
         )
-    for obligation_id, (suite, cause) in expected_rejected.items():
+    for obligation_id, suite in expected_rejected.items():
         row = rejected_by_obligation.get(obligation_id)
         if row is None:
             continue
@@ -374,11 +330,6 @@ if isinstance(manifest, dict):
         if row.get("artifacts", []):
             errors.append(f"{suite} rejection must not carry counterfeit proof artifacts")
         if not any(
-            isinstance(diagnostic, str) and cause in diagnostic
-            for diagnostic in diagnostics
-        ):
-            errors.append(f"{suite} rejection lacks its native-authority-unavailable diagnostic")
-        if not any(
             isinstance(diagnostic, str)
             and f"primary owner {suite}@" in diagnostic
             and "rejected evidence" in diagnostic
@@ -389,12 +340,12 @@ elif manifest is not None:
     errors.append("router verifier manifest must be a JSON object")
 
 if errors:
-    print("FAIL: router verifier manifest violated the fail-closed 1/3 contract", file=sys.stderr)
+    print("FAIL: router verifier manifest violated the fail-closed MC/VC/TY contract", file=sys.stderr)
     for error in errors:
         print(f"  - {error}", file=sys.stderr)
     raise SystemExit(2)
 
-print("Validated router manifest: Inconclusive, trust-wp accepted, trust-mc/trust-vc rejected pending live native authority")
+print("Validated router manifest: Inconclusive, six MC/VC/TY rows rejected artifact-free")
 PY
 }
 
@@ -413,9 +364,9 @@ report = json.loads(report_path.read_text(encoding="utf-8"))
 expected = {
     "trust-wp-native": {
         "status": {"passed"},
-        "tests": ["native_verify_rejects_pure_obligation_without_replay_evidence"],
+        "tests": ["trust_wp_manifest_advertises_zero_full_verification_obligations"],
         "command": ["-p trust-wp", "--features trust-build"],
-        "diagnostic": "trust-wp native replay gate exercised fail-closed before proof upgrade",
+        "diagnostic": "historical trust-wp adapter is present only as a zero-capability fail-closed diagnostic",
     },
     "trust-vc-native": {
         "status": {"passed-fail-closed"},
@@ -425,24 +376,24 @@ expected = {
     },
     "trust-mc-typed-adapter": {
         "status": {"passed"},
-        "tests": ["native_typed_chc_pdr_solver_proves_compiler_spec_binary_constraint_rule"],
+        "tests": ["verifier_api::tests::fresh_exact_direct_pdr_dispatch_retains_nonserializable_e4_e5_receipt"],
         "command": ["-p trust-bmc", "--features trust-mc-native-solver"],
-        "diagnostic": "trust-mc direct typed CHC adapter produced native proof evidence",
+        "diagnostic": "fresh exact trust-mc E4/E5 direct PDR dispatch retained and revalidated live nonserializable receipts",
     },
     "trust-mc-native-bootstrap": {
         "status": {"passed", "blocked-fail-closed"},
         "tests": ["native_typed_chc_pdr_solver_feature_does_not_enable_trust_mc_compiler_facade"],
         "command": ["-p trust-bmc", "--features trust-mc-native-solver"],
-        "diagnostic": "trust-mc library-only typed CHC/PDR native runner produced proof evidence",
+        "diagnostic": "trust-mc library-only native-solver feature remained non-authoritative and did not enable the compiler facade",
     },
     "router-full-verifier-three-suite": {
-        "status": {"passed-fail-closed", "blocked-fail-closed"},
+        "status": {"passed"},
         "tests": [
-            "sample_bundle_required_suite_mode_rejects_missing_native_suite",
-            "sample_bundle_records_trust_vc_memory_bridge_debt",
+            "required_native_fleet_rejects_a_missing_active_engine",
+            "active_three_suite_routes_cover_the_v6_d3_split_fail_closed",
         ],
         "command": ["-p trust-router", "--features trust-build", "--test full_verifier_three_suite_sample"],
-        "diagnostic": "Router accepted suite-native trust-wp evidence and rejected trust-mc and trust-vc because no live native-bundle CHC/PDR (trust-mc) or kernel-replayed TrustVc (trust-vc) proof authority was available",
+        "diagnostic": "Router materialized the exact MC/VC/TY ownership manifest and rejected every proof-free obligation artifact-free",
     },
 }
 
@@ -467,7 +418,7 @@ def verification_evidence_for(suite, status, log_path, observed_tests, diagnosti
             "uri": str(log_path),
         }
     ]
-    if inconclusive and suite == "router-full-verifier-three-suite":
+    if suite == "router-full-verifier-three-suite":
         artifacts.append(
             {
                 "kind": "verification_run_manifest",
@@ -606,33 +557,17 @@ for suite, spec in expected.items():
             r"UnknownPreReleaseTag\(\"trust\"\)",
             r"Failed to get rustc version",
             r"test_scheduling_t030_exact_optimum\.pbp",
-            r"router three-suite sample still uses proof-grade trust-wp fixture evidence",
         ]
         if not any(re.search(pattern, text, re.DOTALL) for pattern in blocker_patterns):
             errors.append(f"{suite}: blocked status lacks a classified blocker")
-        if suite == "router-full-verifier-three-suite":
-            gaps.append(
-                {
-                    "suite": suite,
-                    "kind": "trust-wp-fixture-router-integration-blocker",
-                    "detail": "The router required-suite sample still has fixture or text-only trust-wp proof evidence. It must use suite-native trust-wp replay/check artifacts generated from typed TrustIr before this row may be reported as passed.",
-                    "log": str(log_path),
-                }
-            )
-            for test_name in spec["tests"]:
-                if re.search(rf"test [^\n]*{re.escape(test_name)}[^\n]*\.\.\. ok", text):
-                    observed_tests.append(test_name)
-                else:
-                    errors.append(f"{suite}: expected executable test did not pass: {test_name}")
-        else:
-            gaps.append(
-                {
-                    "suite": suite,
-                    "kind": "active-adapter-api-bootstrap-blocker",
-                    "detail": "trust-mc library-only native typed CHC/PDR bootstrap failed before proof completion; direct typed trust-mc adapter evidence still passed.",
-                    "log": str(log_path),
-                }
-            )
+        gaps.append(
+            {
+                "suite": suite,
+                "kind": "active-adapter-api-bootstrap-blocker",
+                "detail": "trust-mc library-only native typed CHC/PDR bootstrap failed before proof completion; direct typed trust-mc adapter evidence still passed.",
+                "log": str(log_path),
+            }
+        )
     else:
         running = [int(match.group(1)) for match in re.finditer(r"running\s+(\d+)\s+tests?", text)]
         if not running or max(running) == 0:
@@ -643,16 +578,6 @@ for suite, spec in expected.items():
             else:
                 errors.append(f"{suite}: expected executable test did not pass: {test_name}")
 
-    if suite == "router-full-verifier-three-suite" and status == "passed-fail-closed":
-        gaps.append(
-            {
-                "suite": suite,
-                "kind": "trust-vc-kernel-replay-authority-gap",
-                "detail": "The exact three-suite sample is intentionally Inconclusive: trust-mc and trust-wp supply accepted native evidence, while trust-vc is rejected until its exact certificate is replayed by an actual Lean kernel authority.",
-                "manifest": __import__("os").environ["ROUTER_MANIFEST"],
-                "log": str(log_path),
-            }
-        )
     if suite == "trust-vc-native" and status == "passed-fail-closed":
         gaps.append(
             {
@@ -695,7 +620,7 @@ if errors:
 report["validated_suites"] = validated
 report["gaps"] = gaps
 report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print("Validated executable full-verifier evidence for trust-mc, trust-wp, trust-vc, and router")
+print("Validated executable full-verifier evidence for active trust-mc/trust-vc/TY routing and historical TrustWP zero-capability")
 PY
 }
 
@@ -732,11 +657,11 @@ run_trust-mc_typed_adapter_probe() {
     local log="$OUTPUT_DIR/$suite.log"
     local command
 
-    command="RUSTC_WRAPPER=$RUSTC_PRIVATE_SYSROOT_FILTER $TARGO_BIN --unverified test --manifest-path $CRATES_MANIFEST -p trust-bmc --features trust-mc-native-solver native_typed_chc_pdr_solver_proves_compiler_spec_binary_constraint_rule"
+    command="RUSTC_WRAPPER=$RUSTC_PRIVATE_SYSROOT_FILTER $TARGO_BIN --unverified test --manifest-path $CRATES_MANIFEST -p trust-bmc --features trust-mc-native-solver verifier_api::tests::fresh_exact_direct_pdr_dispatch_retains_nonserializable_e4_e5_receipt"
     if ! run_and_capture_with_rustc_wrapper "$suite" "$log" "$RUSTC_PRIVATE_SYSROOT_FILTER" \
         "$TARGO_BIN" --unverified test --manifest-path "$CRATES_MANIFEST" \
         -p trust-bmc --features trust-mc-native-solver \
-        native_typed_chc_pdr_solver_proves_compiler_spec_binary_constraint_rule
+        verifier_api::tests::fresh_exact_direct_pdr_dispatch_retains_nonserializable_e4_e5_receipt
     then
         tail -n 80 "$log" >&2 || true
         fail "$suite failed; log: $log"
@@ -751,7 +676,6 @@ run_router_required_suite() {
     local log="$OUTPUT_DIR/$suite.log"
     local manifest="$ROUTER_MANIFEST"
     local command="TRUST_THREE_SUITE_MANIFEST_OUT=$manifest $TARGO_BIN --unverified test --manifest-path $CRATES_MANIFEST -p trust-router --features trust-build --test full_verifier_three_suite_sample"
-    local router_test="$TRUST_ROOT/crates/trust-router/tests/full_verifier_three_suite_sample.rs"
 
     rm -f "$manifest"
     if ! run_and_capture "$suite" "$log" \
@@ -765,16 +689,7 @@ run_router_required_suite() {
     assert_tests_ran_without_ignored "$suite" "$log"
     validate_router_manifest "$manifest"
 
-    if grep -Eq 'ProofGradetrust-wpFixtureEngine|fixture aggregate trust-wp|trust-wp:fixture-proof' "$router_test"; then
-        {
-            echo
-            echo "BLOCKED: router three-suite sample still uses proof-grade trust-wp fixture evidence; suite-native trust-wp replay/check artifacts are required before this row may be reported as passed."
-        } >> "$log"
-        record_status "$suite" "blocked-fail-closed" "$log" "$command"
-        return
-    fi
-
-    record_status "$suite" "passed-fail-closed" "$log" "$command"
+    record_status "$suite" "passed" "$log" "$command"
 }
 
 run_trust-mc_native_bootstrap_probe() {
@@ -817,7 +732,7 @@ run_required_suite \
     "$OUTPUT_DIR/trust-wp-native.log" \
     "$TARGO_BIN" --unverified test --manifest-path "$CRATES_MANIFEST" \
     -p trust-wp --features trust-build \
-    native_verify_rejects_pure_obligation_without_replay_evidence
+    trust_wp_manifest_advertises_zero_full_verification_obligations
 
 run_fail_closed_suite \
     "trust-vc-native" \
@@ -830,12 +745,11 @@ run_trust-mc_typed_adapter_probe
 
 run_trust-mc_native_bootstrap_probe
 
-export TRUST_FULL_VERIFIER_THREE_SUITE_MODE="${TRUST_FULL_VERIFIER_THREE_SUITE_MODE:-required-native-suites}"
 run_router_required_suite
 
 write_report
 validate_evidence_report
 
 echo
-echo "Full-verifier three-suite evidence passed fail-closed (TrustVc kernel-replay gap recorded)"
+echo "Full-verifier active MC/VC/TY routing evidence passed fail-closed"
 echo "Report: $REPORT_JSON"

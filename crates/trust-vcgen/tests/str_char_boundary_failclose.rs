@@ -51,13 +51,14 @@ fn str_slice_rangefrom_computed_offset_fails_closed() {
     // char_indices yield nor the constant 0 — so the body must fail closed. The
     // `a > len` bounds disjunct is REPLACED by the always-true fail-close, so `a`
     // no longer appears as the load-bearing upper bound.
-    let marked = BASE.replace(
-        "std::ops::Index::index",
-        "std::ops::Index::index::<__trust_str_index>",
-    );
+    let marked =
+        BASE.replace("std::ops::Index::index", "std::ops::Index::index::<__trust_str_index>");
     assert!(marked.contains("__trust_str_index"), "marker injection must land");
     let formulas = slice_bounds_formulas(&marked);
-    assert!(!formulas.is_empty(), "a marked str RangeFrom must still produce an (unprovable) bounds VC");
+    assert!(
+        !formulas.is_empty(),
+        "a marked str RangeFrom must still produce an (unprovable) bounds VC"
+    );
     assert!(
         formulas.iter().all(|f| !f.contains("Gt(Var(\"a\"")),
         "marked str RangeFrom at a computed offset must fail closed — the `a > len` \

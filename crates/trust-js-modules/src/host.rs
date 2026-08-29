@@ -31,9 +31,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::error::{ParseError, ResolveError};
 use std::fmt::Debug;
 use std::hash::Hash;
+
+use crate::error::{ParseError, ResolveError};
 
 /// An `ImportEntry` (§16.2.1.4): one imported binding. `module_request` is a
 /// specifier appearing in `[[RequestedModules]]`; `local_name` is the name bound
@@ -224,7 +225,7 @@ pub trait Host {
     /// module key over the virtual, content-addressed map. No ambient disk — the
     /// corpus supplies the graph, so resolution is reproducible.
     fn resolve(&mut self, referrer: &Self::Key, specifier: &str)
-        -> Result<Self::Key, ResolveError>;
+    -> Result<Self::Key, ResolveError>;
 
     /// ParseModule: parse the source addressed by `key` into its record data.
     /// The graph models the record; this supplies the parse.
@@ -244,11 +245,7 @@ pub trait Host {
     /// (Evaluate step 9.c.ii / AsyncModuleExecutionFulfilled step 7.b), `Err`
     /// rejects it with the error (Evaluate step 8.c / AsyncModuleExecutionRejected
     /// step 8.b).
-    fn settle_top_level(
-        &mut self,
-        cap: &Self::TopLevelCapability,
-        result: Result<(), Self::Error>,
-    );
+    fn settle_top_level(&mut self, cap: &Self::TopLevelCapability, result: Result<(), Self::Error>);
 
     /// ExecuteModule for a SYNCHRONOUS module body (no top-level await): run it to
     /// completion, returning `Ok` on a normal completion or `Err(thrown)` on an

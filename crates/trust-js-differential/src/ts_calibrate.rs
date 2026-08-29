@@ -22,9 +22,9 @@ use trust_js_trace::traces_equal;
 
 use crate::calibrate::HeadAudit;
 use crate::heads::{
-    write_driver, AssembledCase, BunHead, EngineHead, HeadResult, NodeHead, RunMode, TrustTsHead,
+    AssembledCase, BunHead, EngineHead, HeadResult, NodeHead, RunMode, TrustTsHead, write_driver,
 };
-use crate::util::{probe_engine, Engine};
+use crate::util::{Engine, probe_engine};
 
 pub struct TsCalibrateOpts {
     /// Directory of `.ts` corpus programs (tests/ts-corpus for the erasable

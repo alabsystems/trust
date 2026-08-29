@@ -93,7 +93,12 @@ fn signed_bit_method_delegates_certify_modulo_3() {
 
 /// Mutate the block's sole cast assignment so its destination integer becomes
 /// `(width, signed)`. Returns the mutated function.
-fn mutate_cast_dest_ty(mut v: serde_json::Value, block: usize, width: u64, signed: bool) -> VerifiableFunction {
+fn mutate_cast_dest_ty(
+    mut v: serde_json::Value,
+    block: usize,
+    width: u64,
+    signed: bool,
+) -> VerifiableFunction {
     let stmts = v["body"]["blocks"][block]["stmts"].as_array_mut().expect("stmts");
     let assign = stmts
         .iter_mut()
@@ -157,11 +162,11 @@ fn w_cast_arg_forgeries_all_decline() {
     let reg = unsigned_primary_registry();
 
     // The genuine controls (must certify) so a decline below is the MUTATION's doing.
-    for rel in ["dumps/num__<impl i8>__leading_zeros.json", "dumps/num__<impl i8>__swap_bytes.json"] {
+    for rel in ["dumps/num__<impl i8>__leading_zeros.json", "dumps/num__<impl i8>__swap_bytes.json"]
+    {
         let f = load(rel);
         assert!(
-            function_fully_faithful_witness_with_callees(&f, &reg)
-                .is_some_and(|c| c.is_modulo_3()),
+            function_fully_faithful_witness_with_callees(&f, &reg).is_some_and(|c| c.is_modulo_3()),
             "{rel}: genuine control must certify (else the forgery test is vacuous)"
         );
     }

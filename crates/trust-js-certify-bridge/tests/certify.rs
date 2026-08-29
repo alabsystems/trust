@@ -5,21 +5,20 @@
 
 use clean_kernel::Expr;
 use trust_certify::finite_dfa::{
-    certify_finite_sim, enum_cases_refl_proof, enum_transition_body, FiniteSimSpec, SimFlavor,
+    FiniteSimSpec, SimFlavor, certify_finite_sim, enum_cases_refl_proof, enum_transition_body,
 };
 use trust_ir::ProofEvidence;
-
 use trust_js_certify_bridge::{
-    ascii_domain, certify_encuri_unreserved_ascii, certify_hexval_ascii, certify_tolowercase_ascii,
-    certify_touppercase_ascii, certify_whitespace_ascii, extract_interp_encuri_unreserved_table,
-    extract_interp_hexval_table, extract_interp_lowercase_table, extract_interp_uppercase_table,
-    extract_interp_whitespace_table, node_encuri_unreserved_table, node_hexval_table,
-    node_lowercase_table, node_uppercase_table, node_whitespace_table, table_checksum,
-    CertifiedBuiltin, ASCII_DOMAIN, ASSURANCE_TIER, ENCURI_UNRESERVED_ASCII_TRANSCRIPTION,
+    ASCII_DOMAIN, ASSURANCE_TIER, CertifiedBuiltin, ENCURI_UNRESERVED_ASCII_TRANSCRIPTION,
     ENCURI_UNRESERVED_TRANSCRIPTION_SHA256, HEXVAL_ASCII_TRANSCRIPTION, HEXVAL_NOT_A_DIGIT,
     HEXVAL_TRANSCRIPTION_SHA256, TOLOWER_ASCII_TRANSCRIPTION, TOUPPER_ASCII_TRANSCRIPTION,
     TOUPPER_TRANSCRIPTION_SHA256, TRANSCRIPTION_SHA256, WHITESPACE_ASCII_TRANSCRIPTION,
-    WHITESPACE_TRANSCRIPTION_SHA256,
+    WHITESPACE_TRANSCRIPTION_SHA256, ascii_domain, certify_encuri_unreserved_ascii,
+    certify_hexval_ascii, certify_tolowercase_ascii, certify_touppercase_ascii,
+    certify_whitespace_ascii, extract_interp_encuri_unreserved_table, extract_interp_hexval_table,
+    extract_interp_lowercase_table, extract_interp_uppercase_table,
+    extract_interp_whitespace_table, node_encuri_unreserved_table, node_hexval_table,
+    node_lowercase_table, node_uppercase_table, node_whitespace_table, table_checksum,
 };
 
 /// One certified-builtin case, wired to its public API.
@@ -159,8 +158,7 @@ fn run_full(case: &Case) {
     );
 
     // Emit the committed artifact and round-trip it.
-    let path =
-        certified.emit_certificate().unwrap_or_else(|e| panic!("[{}] emit: {e}", case.name));
+    let path = certified.emit_certificate().unwrap_or_else(|e| panic!("[{}] emit: {e}", case.name));
     let back: trust_js_certify_bridge::BuiltinCertificate =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("re-read cert");
     assert_eq!(back.assurance_tier, ASSURANCE_TIER);
@@ -226,13 +224,9 @@ fn encuri_unreserved_certifies_and_cross_checks() {
 
 #[test]
 fn all_builtins_fail_closed_on_one_wrong_cell() {
-    for case in [
-        tolower_case(),
-        toupper_case(),
-        whitespace_case(),
-        hexval_case(),
-        encuri_unreserved_case(),
-    ] {
+    for case in
+        [tolower_case(), toupper_case(), whitespace_case(), hexval_case(), encuri_unreserved_case()]
+    {
         assert_one_wrong_cell_fails(&case);
     }
 }
@@ -279,8 +273,9 @@ fn transcriptions_encode_the_ecma_rules() {
     assert_eq!(HEXVAL_ASCII_TRANSCRIPTION[0x2f], HEXVAL_NOT_A_DIGIT); // '/'
     assert_eq!(HEXVAL_ASCII_TRANSCRIPTION[0x3a], HEXVAL_NOT_A_DIGIT); // ':'
     // exactly the 22 HexDigit code points carry a real value.
-    let digits: Vec<usize> =
-        (0..ASCII_DOMAIN).filter(|&i| HEXVAL_ASCII_TRANSCRIPTION[i] != HEXVAL_NOT_A_DIGIT).collect();
+    let digits: Vec<usize> = (0..ASCII_DOMAIN)
+        .filter(|&i| HEXVAL_ASCII_TRANSCRIPTION[i] != HEXVAL_NOT_A_DIGIT)
+        .collect();
     assert_eq!(digits.len(), 22);
 }
 

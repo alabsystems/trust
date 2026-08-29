@@ -162,7 +162,11 @@ fn test_extract_failure_model() {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "redis::Commands::get".to_string(),
                         args: vec![],
                         dest: Place::local(1),
@@ -181,7 +185,11 @@ fn test_extract_failure_model() {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "sqlx::query".to_string(),
                         args: vec![],
                         dest: Place::local(2),
@@ -447,7 +455,11 @@ fn test_analyze_function_with_unwrap_call() {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "std::result::Result::unwrap".to_string(),
                         args: vec![],
                         dest: Place::local(1),
@@ -628,7 +640,11 @@ fn test_analyze_function_with_external_deps_and_unwrap() {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "redis::Commands::get".to_string(),
                         args: vec![],
                         dest: Place::local(1),
@@ -640,7 +656,11 @@ fn test_analyze_function_with_external_deps_and_unwrap() {
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::result::Result::unwrap".to_string(),
                         args: vec![Operand::Move(Place::local(1))],
                         dest: Place::local(2),
@@ -745,7 +765,11 @@ fn test_error_handling_swallowing_detected() {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "get_data".to_string(),
                         args: vec![],
                         dest: Place::local(1),
@@ -930,7 +954,11 @@ fn test_classify_achieved_level_fragile_with_panics() {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { unwind: UnwindEdge::Unreachable, is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        unwind: UnwindEdge::Unreachable,
+                        is_unsafe_sig: false,
+                        callee_identity: None,
+                        is_foreign: false,
                         func: "core::result::Result::unwrap".to_string(),
                         args: vec![],
                         dest: Place::local(1),

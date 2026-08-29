@@ -5,7 +5,7 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use trust_js_sem::{evaluate_case, SemOutcome};
+use trust_js_sem::{SemOutcome, evaluate_case};
 use trust_js_trace::{Completion, HostEvent, ProjectedValue};
 
 fn stdout_of(body: &str) -> Vec<ProjectedValue> {
@@ -89,10 +89,7 @@ fn no_yield_generator() {
              var a = it.next();\n\
              console.log(a.value === undefined, a.done);"
         ),
-        vec![
-            ProjectedValue::Bool { v: true },
-            ProjectedValue::Bool { v: true }
-        ]
+        vec![ProjectedValue::Bool { v: true }, ProjectedValue::Bool { v: true }]
     );
 }
 
@@ -198,9 +195,7 @@ fn executing_reentrancy_is_typeerror() {
              try { it.next(); } catch (e) { t = e instanceof TypeError; }\n\
              t;"
         ),
-        Completion::Normal {
-            v: Some(ProjectedValue::Bool { v: true })
-        }
+        Completion::Normal { v: Some(ProjectedValue::Bool { v: true }) }
     );
 }
 
@@ -213,9 +208,7 @@ fn new_generator_is_typeerror() {
              try { new g(); } catch (e) { t = e instanceof TypeError; }\n\
              t;"
         ),
-        Completion::Normal {
-            v: Some(ProjectedValue::Bool { v: true })
-        }
+        Completion::Normal { v: Some(ProjectedValue::Bool { v: true }) }
     );
 }
 

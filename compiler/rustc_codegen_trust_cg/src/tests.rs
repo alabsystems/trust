@@ -193,18 +193,12 @@ fn abi_convention_policy_rejects_hidden_or_unwinding_conventions() {
 
 #[test]
 fn scalar_register_argument_limits_are_target_abi_exact() {
-    for triple in [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-gnu",
-        "aarch64-unknown-linux-musl",
-    ] {
+    for triple in
+        ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
+    {
         assert_eq!(scalar_register_argument_limit(triple), Some(8), "{triple}");
     }
-    for triple in [
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl",
-    ] {
+    for triple in ["x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"] {
         assert_eq!(scalar_register_argument_limit(triple), Some(6), "{triple}");
     }
     for triple in ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"] {
@@ -299,14 +293,8 @@ fn production_linkage_policy_never_strengthens_weak_definitions() {
     // admitted because the function-symbol path now carries a per-function
     // binding (Mach-O local / ELF `STB_LOCAL`) AND the codegen unit is emitted
     // as ONE object, so a local callee stays reachable from its callers.
-    assert!(production_function_symbol_contract_supported(
-        Linkage::External,
-        Visibility::Default
-    ));
-    assert!(production_function_symbol_contract_supported(
-        Linkage::Internal,
-        Visibility::Default
-    ));
+    assert!(production_function_symbol_contract_supported(Linkage::External, Visibility::Default));
+    assert!(production_function_symbol_contract_supported(Linkage::Internal, Visibility::Default));
 
     // VISIBILITY is still `Default`-only, on BOTH admitted linkages: no writer
     // carries an `N_PEXT` / `STV_HIDDEN` / `STV_PROTECTED` channel, so admitting
@@ -436,6 +424,7 @@ fn apply_direct_call_name_overrides_rewrites_call_terminators() {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "krate::helper".to_string(),
                         args: vec![],
@@ -463,6 +452,7 @@ fn apply_direct_call_name_overrides_rewrites_call_terminators() {
                     stmts: vec![],
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::process::exit".to_string(),
                         args: vec![],

@@ -7,9 +7,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::fx::{FxHashMap, FxHashSet};
-
 use trust_types::Formula;
+use trust_types::fx::{FxHashMap, FxHashSet};
 
 /// KLEE-style constraint independence engine.
 ///

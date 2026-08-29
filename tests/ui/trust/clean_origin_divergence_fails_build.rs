@@ -36,7 +36,7 @@ mod m {
     clean {
         def g (a : UInt64) (b : UInt64) : UInt64 := a
     }
-    //~^^ ERROR the emitted body does not agree with the declaration
+    //~^^ ERROR the emitted body could not be established to agree with the declaration
 }
 
 fn main() {
@@ -45,4 +45,3 @@ fn main() {
     // in clean_origin_call_parity.rs.)
     let _ = crate::m::g(6, 7);
 }
-

@@ -17,8 +17,8 @@
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
 use std::fmt::Write;
-use trust_types::fx::FxHashMap;
 
+use trust_types::fx::FxHashMap;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, Contract, ContractKind, Formula, LocalDecl, Operand,
     Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody,

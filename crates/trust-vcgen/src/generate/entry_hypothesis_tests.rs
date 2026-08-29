@@ -283,8 +283,12 @@ fn surviving_requires_leaves_the_row_untouched() {
 /// excluded.
 #[test]
 fn function_without_requires_still_refutes() {
-    let func =
-        identity_fn(None, "result >= 0", ge(int_var("_0"), Formula::Int(0)), vec![i32_range_fact("n")]);
+    let func = identity_fn(
+        None,
+        "result >= 0",
+        ge(int_var("_0"), Formula::Int(0)),
+        vec![i32_range_fact("n")],
+    );
     assert!(dropped_requires_clauses(&func).is_empty());
     assert_eq!(
         postcondition_vcs(&func).len(),
@@ -341,7 +345,11 @@ fn search_declines_when_the_row_has_no_model() {
         eq(int_var("_0"), int_var("n")),
         Formula::Not(Box::new(ge(int_var("_0"), int_var("n")))),
     ]);
-    assert!(!only_excluded_counterexamples(&no_parameters(), &vc, &[ge(int_var("n"), Formula::Int(0))]));
+    assert!(!only_excluded_counterexamples(
+        &no_parameters(),
+        &vc,
+        &[ge(int_var("n"), Formula::Int(0))]
+    ));
 }
 
 #[test]
@@ -350,7 +358,11 @@ fn search_fires_when_every_model_violates_the_dropped_clause() {
         eq(int_var("_0"), int_var("n")),
         Formula::Not(Box::new(ge(int_var("_0"), Formula::Int(0)))),
     ]);
-    assert!(only_excluded_counterexamples(&no_parameters(), &vc, &[ge(int_var("n"), Formula::Int(0))]));
+    assert!(only_excluded_counterexamples(
+        &no_parameters(),
+        &vc,
+        &[ge(int_var("n"), Formula::Int(0))]
+    ));
 }
 
 #[test]
@@ -383,7 +395,11 @@ fn search_declines_outside_the_declared_fragment() {
         eq(bv.clone(), Formula::Var("n".to_string(), Sort::BitVec(32))),
         Formula::Not(Box::new(Formula::Ge(Box::new(bv), Box::new(Formula::Int(0))))),
     ]);
-    assert!(!only_excluded_counterexamples(&no_parameters(), &vc, &[ge(int_var("n"), Formula::Int(0))]));
+    assert!(!only_excluded_counterexamples(
+        &no_parameters(),
+        &vc,
+        &[ge(int_var("n"), Formula::Int(0))]
+    ));
 }
 
 #[test]
@@ -394,7 +410,11 @@ fn search_declines_on_an_uninterpreted_leaf() {
         eq(int_var("_0"), Formula::Div(Box::new(int_var("n")), Box::new(Formula::Int(2)))),
         Formula::Not(Box::new(ge(int_var("_0"), Formula::Int(0)))),
     ]);
-    assert!(!only_excluded_counterexamples(&no_parameters(), &vc, &[ge(int_var("n"), Formula::Int(0))]));
+    assert!(!only_excluded_counterexamples(
+        &no_parameters(),
+        &vc,
+        &[ge(int_var("n"), Formula::Int(0))]
+    ));
 }
 
 #[test]
@@ -412,7 +432,11 @@ fn search_declines_over_the_variable_budget() {
         conjuncts.push(ge(int_var(name), Formula::Int(0)));
     }
     let vc = Formula::And(conjuncts);
-    assert!(!only_excluded_counterexamples(&no_parameters(), &vc, &[ge(int_var("_0"), Formula::Int(0))]));
+    assert!(!only_excluded_counterexamples(
+        &no_parameters(),
+        &vc,
+        &[ge(int_var("_0"), Formula::Int(0))]
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -533,22 +557,10 @@ fn the_restated_clause_never_enters_an_emitted_formula() {
 
 /// `fn f(<p1>: <t1>, <p2>: <t2>)`, parameter locals 1 and 2 in declaration order.
 fn two_param_fn(first: (Option<&str>, Ty), second: (Option<&str>, Ty)) -> VerifiableFunction {
-    let mut func = identity_fn(
-        Some("n >= 0"),
-        "result >= 0",
-        ge(int_var("_0"), Formula::Int(0)),
-        vec![],
-    );
-    func.body.locals[1] = LocalDecl {
-        index: 1,
-        ty: first.1,
-        name: first.0.map(str::to_string),
-    };
-    func.body.locals.push(LocalDecl {
-        index: 2,
-        ty: second.1,
-        name: second.0.map(str::to_string),
-    });
+    let mut func =
+        identity_fn(Some("n >= 0"), "result >= 0", ge(int_var("_0"), Formula::Int(0)), vec![]);
+    func.body.locals[1] = LocalDecl { index: 1, ty: first.1, name: first.0.map(str::to_string) };
+    func.body.locals.push(LocalDecl { index: 2, ty: second.1, name: second.0.map(str::to_string) });
     func.body.arg_count = 2;
     func
 }
@@ -630,10 +642,7 @@ fn a_single_underscore_user_spelling_can_resolve_to_a_parameter() {
 fn a_projection_or_deref_spelling_is_never_resolved_to_a_parameter() {
     for name in ["n*", "self.0", "n#3"] {
         assert_eq!(
-            forced_parameter_alias(
-                &shadowed_dropped(),
-                &[ge(int_var(name), Formula::Int(0))]
-            ),
+            forced_parameter_alias(&shadowed_dropped(), &[ge(int_var(name), Formula::Int(0))]),
             None,
             "{name} is a place rendering, not a parameter's own name"
         );

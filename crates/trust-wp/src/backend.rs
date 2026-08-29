@@ -5,8 +5,9 @@
 
 //! Backend trait for pluggable trust_wp verification implementations.
 //!
-//! The `TrustWpBackend` trait defines the transitional interface shared by the
-//! CLI compatibility bridge and the target direct in-process tRustc backend.
+//! The `TrustWpBackend` trait defines a standalone compatibility interface for
+//! explicit diagnostic callers. It is not registered with the compiler or the
+//! full-verifier fleet and grants no publication authority.
 
 use crate::contract::ContractSet;
 use crate::error::TrustWpLibError;
@@ -14,9 +15,8 @@ use crate::result::{LoopInvariant, TrustWpResult};
 
 /// Backend trait for trust_wp verification.
 ///
-/// Implementations provide different strategies for invoking trust-wp:
-/// - `CliBackend`: subprocess via the trust_wp CLI for compatibility runs
-/// - `DirectBackend`: target `TyCtxt` + `DefId` + TrustContractBundle path
+/// The retained `CliBackend` invokes the trust_wp CLI for explicit standalone
+/// compatibility runs. No compiler/full-verifier backend implements this trait.
 pub trait TrustWpBackend {
     /// Verify a function's contracts.
     ///

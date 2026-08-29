@@ -13,13 +13,17 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_parse::ast::{
+    DeclKind, Expr, ForHead, ForInit, ObjProp, Pat, PropKey as AstKey, Stmt,
+};
+use trust_js_value::{JsObject, JsValue, ObjId, ObjKind, PropKey, Property};
+
 use crate::destr::FastIter;
 use crate::expr::JsRef;
 use crate::host::{AsyncExec, AsyncId, JobFn};
 use crate::interp::{Abrupt, Compl, Ctx, ERes, Interp};
-use std::rc::Rc;
-use trust_js_parse::ast::{DeclKind, Expr, ForHead, ForInit, ObjProp, Pat, PropKey as AstKey, Stmt};
-use trust_js_value::{JsObject, JsValue, ObjKind, ObjId, PropKey, Property};
 
 /// Cap on the generator frame-stack depth (heap-allocated, so this is a
 /// resource bound, not a Rust-stack bound).
@@ -165,29 +169,15 @@ pub(crate) enum TryPhase {
 /// One resumable control node.
 pub(crate) enum GenFrame {
     /// A statement list executed sequentially in `ctx`.
-    Seq {
-        stmts: Rc<Vec<Stmt>>,
-        idx: usize,
-        ctx: Ctx,
-    },
+    Seq { stmts: Rc<Vec<Stmt>>, idx: usize, ctx: Ctx },
     /// A `yield <arg>` point: eval the operand on Start, suspend, resume→value.
-    YieldPoint {
-        arg: Option<Rc<Expr>>,
-        ctx: Ctx,
-    },
+    YieldPoint { arg: Option<Rc<Expr>>, ctx: Ctx },
     /// A `yield* <arg>` delegation.
-    YieldStar {
-        arg: Rc<Expr>,
-        ctx: Ctx,
-        it: Option<FastIter>,
-    },
+    YieldStar { arg: Rc<Expr>, ctx: Ctx, it: Option<FastIter> },
     /// An `await <arg>` point: eval the operand on Start, suspend (the async
     /// driver does PromiseResolve + reaction scheduling), resume→resolved value
     /// (or a throw at the await point on rejection).
-    AwaitPoint {
-        arg: Rc<Expr>,
-        ctx: Ctx,
-    },
+    AwaitPoint { arg: Rc<Expr>, ctx: Ctx },
     /// `await <value-from-child>`: the operand was produced by a sub-spine (a
     /// nested suspend, e.g. `await await e`, or the AsyncGeneratorYield await of
     /// a suspendable yield operand). On the child value, suspend at an `await`;
@@ -199,33 +189,17 @@ pub(crate) enum GenFrame {
     /// + resumes/suspends); resume→the resumption value.
     AsyncGenYieldComplete,
     /// Assign the produced value to a target, then pass it upward.
-    AssignCont {
-        target: AssignTarget,
-        ctx: Ctx,
-    },
+    AssignCont { target: AssignTarget, ctx: Ctx },
     /// Initialize a single declaration binding with the produced value.
-    DeclInit {
-        name: String,
-        kind: DeclKind,
-        ctx: Ctx,
-    },
+    DeclInit { name: String, kind: DeclKind, ctx: Ctx },
     /// `return <spine>`: turn the produced value into a Return completion.
     ReturnCont,
     /// A yield-free statement, evaluated wholesale.
-    Wholesale {
-        stmt: Rc<Stmt>,
-        ctx: Ctx,
-    },
+    Wholesale { stmt: Rc<Stmt>, ctx: Ctx },
     /// Deliver a fixed completion immediately (empty if-branch, etc.).
     Immediate(Option<Compl>),
     /// while / do-while (test is yield-free; body stepped).
-    While {
-        test: Rc<Expr>,
-        body: Rc<Stmt>,
-        ctx: Ctx,
-        labels: Vec<String>,
-        is_do: bool,
-    },
+    While { test: Rc<Expr>, body: Rc<Stmt>, ctx: Ctx, labels: Vec<String>, is_do: bool },
     /// C-style for. `ctx` is the (possibly per-iteration) loop environment.
     For {
         test: Option<Rc<Expr>>,
@@ -238,20 +212,9 @@ pub(crate) enum GenFrame {
         started: bool,
     },
     /// for-of over `it` (the iterator captured at head evaluation).
-    ForOf {
-        it: FastIter,
-        left: Rc<ForHead>,
-        body: Rc<Stmt>,
-        ctx: Ctx,
-        labels: Vec<String>,
-    },
+    ForOf { it: FastIter, left: Rc<ForHead>, body: Rc<Stmt>, ctx: Ctx, labels: Vec<String> },
     /// A labelled statement wrapper (catches `break <label>`).
-    Labeled {
-        label: String,
-        body: Rc<Stmt>,
-        ctx: Ctx,
-        labels: Vec<String>,
-    },
+    Labeled { label: String, body: Rc<Stmt>, ctx: Ctx, labels: Vec<String> },
     /// try/catch/finally.
     Try {
         phase: TryPhase,
@@ -283,7 +246,7 @@ impl Interp {
         match (state, &input) {
             (GenState::Executing, _) => return Err(self.throw_type_error()),
             (GenState::Completed, ResumeInput::Next(_)) => {
-                return self.create_iter_result(JsValue::Undefined, true)
+                return self.create_iter_result(JsValue::Undefined, true);
             }
             (GenState::Completed, ResumeInput::Return(v)) => {
                 let v = v.clone();
@@ -362,10 +325,7 @@ impl Interp {
     /// CreateIterResultObject (7.4.9): ordinary object, `value` then `done`.
     pub(crate) fn create_iter_result(&mut self, value: JsValue, done: bool) -> ERes {
         let o = self.new_plain()?;
-        self.heap
-            .obj_mut(o)
-            .props
-            .insert(PropKey::from_str("value"), Property::data(value));
+        self.heap.obj_mut(o).props.insert(PropKey::from_str("value"), Property::data(value));
         self.heap
             .obj_mut(o)
             .props
@@ -375,20 +335,11 @@ impl Interp {
 
     /// Build a fresh generator object (suspendedStart) for a generator-function
     /// [[Call]]. FunctionDeclarationInstantiation has already run in `body_ctx`.
-    pub(crate) fn make_generator(
-        &mut self,
-        fid: ObjId,
-        body: &[Stmt],
-        body_ctx: Ctx,
-    ) -> ERes {
+    pub(crate) fn make_generator(&mut self, fid: ObjId, body: &[Stmt], body_ctx: Ctx) -> ERes {
         let proto =
             self.get_prototype_from_constructor(&JsValue::Obj(fid), self.intr.generator_proto)?;
         let gobj = self.alloc_obj(JsObject::new(ObjKind::Generator, Some(proto)))?;
-        let initial = GenFrame::Seq {
-            stmts: Rc::new(body.to_vec()),
-            idx: 0,
-            ctx: body_ctx,
-        };
+        let initial = GenFrame::Seq { stmts: Rc::new(body.to_vec()), idx: 0, ctx: body_ctx };
         self.gen_state.insert(
             gobj,
             GenExec {
@@ -419,11 +370,7 @@ impl Interp {
                 ctx: body_ctx,
             }
         } else {
-            GenFrame::Seq {
-                stmts: Rc::new(body.to_vec()),
-                idx: 0,
-                ctx: body_ctx,
-            }
+            GenFrame::Seq { stmts: Rc::new(body.to_vec()), idx: 0, ctx: body_ctx }
         };
         let (result_obj, _pid, cap) = self.new_promise_object()?;
         let id = self.async_execs.len();
@@ -483,7 +430,8 @@ impl Interp {
                 // await v == PromiseResolve(v).then(<resume next>, <resume throw>).
                 self.rx_op(|it, rx| {
                     let p = rx.promise_resolve(it, awaited);
-                    let _dep = rx.then(it, p, Some(JobFn::AsyncNext(id)), Some(JobFn::AsyncThrow(id)));
+                    let _dep =
+                        rx.then(it, p, Some(JobFn::AsyncNext(id)), Some(JobFn::AsyncThrow(id)));
                 });
                 Ok(())
             }
@@ -530,16 +478,10 @@ impl Interp {
         body: &[Stmt],
         body_ctx: Ctx,
     ) -> ERes {
-        let proto = self.get_prototype_from_constructor(
-            &JsValue::Obj(fid),
-            self.intr.async_generator_proto,
-        )?;
+        let proto = self
+            .get_prototype_from_constructor(&JsValue::Obj(fid), self.intr.async_generator_proto)?;
         let gobj = self.alloc_obj(JsObject::new(ObjKind::AsyncGenerator, Some(proto)))?;
-        let initial = GenFrame::Seq {
-            stmts: Rc::new(body.to_vec()),
-            idx: 0,
-            ctx: body_ctx,
-        };
+        let initial = GenFrame::Seq { stmts: Rc::new(body.to_vec()), idx: 0, ctx: body_ctx };
         self.async_gen_state.insert(
             gobj,
             AsyncGenExec {
@@ -557,9 +499,7 @@ impl Interp {
     pub(crate) fn async_gen_method(&mut self, this: &JsValue, req: AsyncGenReq) -> ERes {
         // `.return()` — refuse before any observable side effect (sound).
         if matches!(req, AsyncGenReq::Return(_)) {
-            return Err(Abrupt::Fatal(
-                "async generator .return() (out of slice)".to_string(),
-            ));
+            return Err(Abrupt::Fatal("async generator .return() (out of slice)".to_string()));
         }
         // NewPromiseCapability(%Promise%).
         let (pobj, _pid, cap) = self.new_promise_object()?;
@@ -587,10 +527,7 @@ impl Interp {
                     return Ok(JsValue::Obj(pobj));
                 }
                 self.async_gen_enqueue(oid, ResumeInput::Next(v), cap);
-                if matches!(
-                    state,
-                    AsyncGenState::SuspendedStart | AsyncGenState::SuspendedYield
-                ) {
+                if matches!(state, AsyncGenState::SuspendedStart | AsyncGenState::SuspendedYield) {
                     self.async_gen_resume(oid)?;
                 }
                 Ok(JsValue::Obj(pobj))
@@ -769,12 +706,7 @@ impl Interp {
         completion: Result<JsValue, JsValue>,
         done: bool,
     ) -> Result<(), Abrupt> {
-        let req = self
-            .async_gen_state
-            .get_mut(&oid)
-            .expect("present")
-            .queue
-            .pop_front();
+        let req = self.async_gen_state.get_mut(&oid).expect("present").queue.pop_front();
         let Some(req) = req else {
             return Ok(());
         };
@@ -860,7 +792,9 @@ impl Interp {
                 }
                 Step::Push(children) => {
                     if stack.len() + children.len() + 1 > MAX_GEN_STACK {
-                        return DriveResult::Refuse("generator frame-stack cap exceeded".to_string());
+                        return DriveResult::Refuse(
+                            "generator frame-stack cap exceeded".to_string(),
+                        );
                     }
                     stack.push(frame);
                     stack.extend(children);
@@ -969,9 +903,7 @@ impl Interp {
                 Feed::Resume(ResumeInput::Return(_)) => Step::Done(Err(Abrupt::Fatal(
                     "async generator return-resumption at a yield (out of slice)".to_string(),
                 ))),
-                Feed::Start => {
-                    Step::Done(Err(Abrupt::Fatal("yield-complete started".to_string())))
-                }
+                Feed::Start => Step::Done(Err(Abrupt::Fatal("yield-complete started".to_string()))),
             },
 
             GenFrame::AssignCont { target, ctx } => match feed {
@@ -1019,13 +951,7 @@ impl Interp {
 
             GenFrame::Immediate(c) => Step::Done(c.take().unwrap_or(Ok(None))),
 
-            GenFrame::While {
-                test,
-                body,
-                ctx,
-                labels,
-                is_do,
-            } => {
+            GenFrame::While { test, body, ctx, labels, is_do } => {
                 // Decide whether to (re)run the body this round.
                 let proceed = match feed {
                     Feed::Start => {
@@ -1054,7 +980,7 @@ impl Interp {
                     }
                     Feed::Child(Err(a)) => return Step::Done(Err(a)),
                     Feed::Resume(_) => {
-                        return Step::Done(Err(Abrupt::Fatal("resume to while".to_string())))
+                        return Step::Done(Err(Abrupt::Fatal("resume to while".to_string())));
                     }
                 };
                 if !proceed {
@@ -1073,16 +999,7 @@ impl Interp {
                 push_body(self, body, ctx, mode)
             }
 
-            GenFrame::For {
-                test,
-                update,
-                body,
-                ctx,
-                labels,
-                per_iter,
-                outer,
-                started,
-            } => {
+            GenFrame::For { test, update, body, ctx, labels, per_iter, outer, started } => {
                 // React to the previous body completion.
                 match feed {
                     Feed::Start => {}
@@ -1100,7 +1017,7 @@ impl Interp {
                     }
                     Feed::Child(Err(a)) => return Step::Done(Err(a)),
                     Feed::Resume(_) => {
-                        return Step::Done(Err(Abrupt::Fatal("resume to for".to_string())))
+                        return Step::Done(Err(Abrupt::Fatal("resume to for".to_string())));
                     }
                 }
                 // After the first iteration: fresh per-iteration env, then update.
@@ -1133,13 +1050,7 @@ impl Interp {
                 push_body(self, body, ctx, mode)
             }
 
-            GenFrame::ForOf {
-                it,
-                left,
-                body,
-                ctx,
-                labels,
-            } => {
+            GenFrame::ForOf { it, left, body, ctx, labels } => {
                 match feed {
                     Feed::Start | Feed::Child(Ok(_)) => {}
                     Feed::Child(Err(Abrupt::Continue { label, .. })) => {
@@ -1154,7 +1065,8 @@ impl Interp {
                             }
                             return Step::Done(Ok(None));
                         }
-                        let a = self.close_after_body_abrupt(it, Abrupt::Break { label, value: None });
+                        let a =
+                            self.close_after_body_abrupt(it, Abrupt::Break { label, value: None });
                         return Step::Done(Err(a));
                     }
                     Feed::Child(Err(a)) => {
@@ -1162,7 +1074,7 @@ impl Interp {
                         return Step::Done(Err(a));
                     }
                     Feed::Resume(_) => {
-                        return Step::Done(Err(Abrupt::Fatal("resume to for-of".to_string())))
+                        return Step::Done(Err(Abrupt::Fatal("resume to for-of".to_string())));
                     }
                 }
                 if let Err(a) = self.charge_loop() {
@@ -1184,12 +1096,7 @@ impl Interp {
                 }
             }
 
-            GenFrame::Labeled {
-                label,
-                body,
-                ctx,
-                labels,
-            } => match feed {
+            GenFrame::Labeled { label, body, ctx, labels } => match feed {
                 Feed::Start => {
                     let mut ls = labels.clone();
                     ls.push(label.clone());
@@ -1202,19 +1109,12 @@ impl Interp {
                     Step::Done(Ok(None))
                 }
                 Feed::Child(c) => Step::Done(c),
-                Feed::Resume(_) => {
-                    Step::Done(Err(Abrupt::Fatal("resume to labelled".to_string())))
-                }
+                Feed::Resume(_) => Step::Done(Err(Abrupt::Fatal("resume to labelled".to_string()))),
             },
 
-            GenFrame::Try {
-                phase,
-                block,
-                catch,
-                finally,
-                ctx,
-                saved,
-            } => self.try_step(phase, block, catch, finally, ctx, saved, feed),
+            GenFrame::Try { phase, block, catch, finally, ctx, saved } => {
+                self.try_step(phase, block, catch, finally, ctx, saved, feed)
+            }
         }
     }
 
@@ -1238,11 +1138,7 @@ impl Interp {
                     Ok(c) => c,
                     Err(a) => return Step::Done(Err(a)),
                 };
-                Step::Push(vec![GenFrame::Seq {
-                    stmts: Rc::clone(block),
-                    idx: 0,
-                    ctx: inner,
-                }])
+                Step::Push(vec![GenFrame::Seq { stmts: Rc::clone(block), idx: 0, ctx: inner }])
             }
             Feed::Child(result) => match *phase {
                 TryPhase::Block => match result {
@@ -1303,11 +1199,7 @@ impl Interp {
                     Ok(c) => c,
                     Err(a) => return Step::Done(Err(a)),
                 };
-                Step::Push(vec![GenFrame::Seq {
-                    stmts: Rc::clone(fbody),
-                    idx: 0,
-                    ctx: inner,
-                }])
+                Step::Push(vec![GenFrame::Seq { stmts: Rc::clone(fbody), idx: 0, ctx: inner }])
             }
             None => Step::Done(saved.take().unwrap_or(Ok(None))),
         }
@@ -1322,10 +1214,7 @@ impl Interp {
         ctx: &Ctx,
     ) -> Result<Vec<GenFrame>, Abrupt> {
         let cenv = self.alloc_env(Some(ctx.env));
-        let cctx = Ctx {
-            env: cenv,
-            strict: ctx.strict,
-        };
+        let cctx = Ctx { env: cenv, strict: ctx.strict };
         if let Some(pat) = param {
             let mut names = Vec::new();
             crate::interp::hoist::pat_bound_names(pat, &mut names);
@@ -1338,11 +1227,7 @@ impl Interp {
             self.bind_pattern(pat, exc, Some(cenv), &cctx)?;
         }
         let inner = self.enter_block_scope(body, &cctx)?;
-        Ok(vec![GenFrame::Seq {
-            stmts: Rc::new(body.to_vec()),
-            idx: 0,
-            ctx: inner,
-        }])
+        Ok(vec![GenFrame::Seq { stmts: Rc::new(body.to_vec()), idx: 0, ctx: inner }])
     }
 
     // -- statement dispatch --------------------------------------------------
@@ -1358,11 +1243,7 @@ impl Interp {
         match s {
             Stmt::Block(body) => {
                 let inner = self.enter_block_scope(body, ctx)?;
-                Ok(vec![GenFrame::Seq {
-                    stmts: Rc::new(body.clone()),
-                    idx: 0,
-                    ctx: inner,
-                }])
+                Ok(vec![GenFrame::Seq { stmts: Rc::new(body.clone()), idx: 0, ctx: inner }])
             }
             Stmt::Expr(e) => self.build_spine_frames(e, ctx, mode),
             Stmt::Decl { kind, decls } => {
@@ -1397,11 +1278,7 @@ impl Interp {
                     return Err(Abrupt::Fatal(suspend_pos_msg(mode, "an if test")));
                 }
                 let t = self.eval_expr(test, ctx)?;
-                let branch = if self.to_boolean(&t) {
-                    Some(cons.as_ref())
-                } else {
-                    alt.as_deref()
-                };
+                let branch = if self.to_boolean(&t) { Some(cons.as_ref()) } else { alt.as_deref() };
                 match branch {
                     None => Ok(vec![GenFrame::Immediate(Some(Ok(None)))]),
                     Some(b) => self.step_or_wholesale(b, ctx, &[], mode),
@@ -1431,18 +1308,16 @@ impl Interp {
                     is_do: true,
                 }])
             }
-            Stmt::For {
-                init,
-                test,
-                update,
+            Stmt::For { init, test, update, body } => self.step_into_for(
+                init.as_ref(),
+                test.as_ref(),
+                update.as_ref(),
                 body,
-            } => self.step_into_for(init.as_ref(), test.as_ref(), update.as_ref(), body, ctx, labels, mode),
-            Stmt::ForOf {
-                left,
-                right,
-                body,
-                is_await,
-            } => {
+                ctx,
+                labels,
+                mode,
+            ),
+            Stmt::ForOf { left, right, body, is_await } => {
                 if *is_await {
                     return Err(Abrupt::Fatal("for-await-of (async, M2)".to_string()));
                 }
@@ -1466,11 +1341,7 @@ impl Interp {
                 ctx: ctx.clone(),
                 labels: labels.to_vec(),
             }]),
-            Stmt::Try {
-                block,
-                catch,
-                finally,
-            } => Ok(vec![GenFrame::Try {
+            Stmt::Try { block, catch, finally } => Ok(vec![GenFrame::Try {
                 phase: TryPhase::Start,
                 block: Rc::new(block.clone()),
                 catch: catch.clone().map(Rc::new),
@@ -1478,15 +1349,13 @@ impl Interp {
                 ctx: ctx.clone(),
                 saved: None,
             }]),
-            Stmt::ForIn { .. } => Err(Abrupt::Fatal(
-                "yield in a for-in body (out of slice)".to_string(),
-            )),
-            Stmt::Switch { .. } => Err(Abrupt::Fatal(
-                "yield in a switch statement (out of slice)".to_string(),
-            )),
-            Stmt::With { .. } => {
-                Err(Abrupt::Fatal("with statement (out of slice)".to_string()))
+            Stmt::ForIn { .. } => {
+                Err(Abrupt::Fatal("yield in a for-in body (out of slice)".to_string()))
             }
+            Stmt::Switch { .. } => {
+                Err(Abrupt::Fatal("yield in a switch statement (out of slice)".to_string()))
+            }
+            Stmt::With { .. } => Err(Abrupt::Fatal("with statement (out of slice)".to_string())),
             _ => Err(Abrupt::Fatal(
                 "yield in an unsupported statement position (out of slice)".to_string(),
             )),
@@ -1504,22 +1373,24 @@ impl Interp {
         labels: &[String],
         mode: SuspendKind,
     ) -> Result<Vec<GenFrame>, Abrupt> {
-        if test.is_some_and(|e| expr_has_suspend(e, mode)) || update.is_some_and(|e| expr_has_suspend(e, mode)) {
-            return Err(Abrupt::Fatal(
-                "yield in a for test/update (out of slice)".to_string(),
-            ));
+        if test.is_some_and(|e| expr_has_suspend(e, mode))
+            || update.is_some_and(|e| expr_has_suspend(e, mode))
+        {
+            return Err(Abrupt::Fatal("yield in a for test/update (out of slice)".to_string()));
         }
         let mut cur = ctx.clone();
         let mut per_iter: Vec<String> = Vec::new();
         match init {
             Some(ForInit::Decl(DeclKind::Var, decls)) => {
-                if decls.iter().any(|(_, e)| e.as_ref().is_some_and(|e| expr_has_suspend(e, mode))) {
+                if decls.iter().any(|(_, e)| e.as_ref().is_some_and(|e| expr_has_suspend(e, mode)))
+                {
                     return Err(Abrupt::Fatal("yield in a for init (out of slice)".to_string()));
                 }
                 self.eval_decl(DeclKind::Var, decls, ctx)?;
             }
             Some(ForInit::Decl(kind @ (DeclKind::Let | DeclKind::Const), decls)) => {
-                if decls.iter().any(|(_, e)| e.as_ref().is_some_and(|e| expr_has_suspend(e, mode))) {
+                if decls.iter().any(|(_, e)| e.as_ref().is_some_and(|e| expr_has_suspend(e, mode)))
+                {
                     return Err(Abrupt::Fatal("yield in a for init (out of slice)".to_string()));
                 }
                 let env = self.alloc_env(Some(ctx.env));
@@ -1534,17 +1405,14 @@ impl Interp {
                         .bindings
                         .insert(n.clone(), trust_js_value::Binding::tdz(mutable));
                 }
-                cur = Ctx {
-                    env,
-                    strict: ctx.strict,
-                };
+                cur = Ctx { env, strict: ctx.strict };
                 self.eval_decl(*kind, decls, &cur)?;
                 if mutable {
                     per_iter = names;
                 }
             }
             Some(ForInit::Decl(DeclKind::Using | DeclKind::AwaitUsing, _)) => {
-                return Err(Abrupt::Fatal("using declaration (out of slice)".to_string()))
+                return Err(Abrupt::Fatal("using declaration (out of slice)".to_string()));
             }
             Some(ForInit::Expr(e)) => {
                 if expr_has_suspend(e, mode) {
@@ -1580,10 +1448,7 @@ impl Interp {
         if stmt_has_suspend(s, mode) {
             self.step_into_stmt(s, ctx, labels, mode)
         } else {
-            Ok(vec![GenFrame::Wholesale {
-                stmt: Rc::new(s.clone()),
-                ctx: ctx.clone(),
-            }])
+            Ok(vec![GenFrame::Wholesale { stmt: Rc::new(s.clone()), ctx: ctx.clone() }])
         }
     }
 
@@ -1592,7 +1457,12 @@ impl Interp {
     /// Frames for a spine expression (a yield/await, possibly wrapped in `=`
     /// assigns). In `AsyncGen` mode the operand of a `yield`/`await` may itself
     /// be a spine (e.g. `yield await e`), so those recurse.
-    fn build_spine_frames(&mut self, e: &Expr, ctx: &Ctx, mode: SuspendKind) -> Result<Vec<GenFrame>, Abrupt> {
+    fn build_spine_frames(
+        &mut self,
+        e: &Expr,
+        ctx: &Ctx,
+        mode: SuspendKind,
+    ) -> Result<Vec<GenFrame>, Abrupt> {
         let mut inner = e;
         while let Expr::Paren(p) = inner {
             inner = p;
@@ -1601,10 +1471,7 @@ impl Interp {
             // `await <operand>`.
             Expr::Await(a) if mode.awaits() => self.build_await_spine(a, ctx, mode),
             // `yield <operand>` (non-delegating).
-            Expr::Yield {
-                arg,
-                delegate: false,
-            } if mode.yields() => {
+            Expr::Yield { arg, delegate: false } if mode.yields() => {
                 if mode == SuspendKind::AsyncGen {
                     // AsyncGeneratorYield: evaluate the operand (which may itself
                     // suspend), Await the result, then complete the step.
@@ -1623,13 +1490,10 @@ impl Interp {
                 }])
             }
             // `yield* <operand>` — sync generators only; async delegation refuses.
-            Expr::Yield { delegate: true, .. } if mode == SuspendKind::AsyncGen => Err(
-                Abrupt::Fatal("async generator yield* delegation (out of slice)".to_string()),
-            ),
-            Expr::Yield {
-                arg,
-                delegate: true,
-            } if mode == SuspendKind::Yield => {
+            Expr::Yield { delegate: true, .. } if mode == SuspendKind::AsyncGen => {
+                Err(Abrupt::Fatal("async generator yield* delegation (out of slice)".to_string()))
+            }
+            Expr::Yield { arg, delegate: true } if mode == SuspendKind::Yield => {
                 let a = arg
                     .as_ref()
                     .ok_or_else(|| Abrupt::Fatal("yield* without operand".to_string()))?;
@@ -1644,16 +1508,9 @@ impl Interp {
                     it: None,
                 }])
             }
-            Expr::Assign {
-                op: "=",
-                target,
-                value,
-            } => {
+            Expr::Assign { op: "=", target, value } => {
                 let tgt = self.resolve_assign_target(target, ctx, mode)?;
-                let mut frames = vec![GenFrame::AssignCont {
-                    target: tgt,
-                    ctx: ctx.clone(),
-                }];
+                let mut frames = vec![GenFrame::AssignCont { target: tgt, ctx: ctx.clone() }];
                 frames.extend(self.build_spine_frames(value, ctx, mode)?);
                 Ok(frames)
             }
@@ -1665,23 +1522,29 @@ impl Interp {
 
     /// Spine for `await <operand>`: if the operand is suspend-free, a direct
     /// `AwaitPoint`; otherwise evaluate the operand spine then await its value.
-    fn build_await_spine(&mut self, a: &Expr, ctx: &Ctx, mode: SuspendKind) -> Result<Vec<GenFrame>, Abrupt> {
+    fn build_await_spine(
+        &mut self,
+        a: &Expr,
+        ctx: &Ctx,
+        mode: SuspendKind,
+    ) -> Result<Vec<GenFrame>, Abrupt> {
         if expr_has_suspend(a, mode) {
             let mut frames = vec![GenFrame::AwaitFromChild];
             frames.extend(self.build_spine_frames(a, ctx, mode)?);
             Ok(frames)
         } else {
-            Ok(vec![GenFrame::AwaitPoint {
-                arg: Rc::new(a.clone()),
-                ctx: ctx.clone(),
-            }])
+            Ok(vec![GenFrame::AwaitPoint { arg: Rc::new(a.clone()), ctx: ctx.clone() }])
         }
     }
 
     /// Spine for an async generator `yield <operand>`: evaluate the operand,
     /// `Await` the result (AsyncGeneratorYield step), then AsyncGeneratorComplete-
     /// Step. Frames run top-first: operand → await → complete.
-    fn build_async_yield_spine(&mut self, arg: Option<&Expr>, ctx: &Ctx) -> Result<Vec<GenFrame>, Abrupt> {
+    fn build_async_yield_spine(
+        &mut self,
+        arg: Option<&Expr>,
+        ctx: &Ctx,
+    ) -> Result<Vec<GenFrame>, Abrupt> {
         let mut frames = vec![GenFrame::AsyncGenYieldComplete];
         match arg {
             // `yield` (no operand): AsyncGeneratorYield(undefined) — Await(undefined).
@@ -1696,10 +1559,7 @@ impl Interp {
             }
             Some(a) => {
                 // Simple operand: an AwaitPoint evaluates and awaits it directly.
-                frames.push(GenFrame::AwaitPoint {
-                    arg: Rc::new(a.clone()),
-                    ctx: ctx.clone(),
-                });
+                frames.push(GenFrame::AwaitPoint { arg: Rc::new(a.clone()), ctx: ctx.clone() });
             }
         }
         Ok(frames)
@@ -1707,7 +1567,12 @@ impl Interp {
 
     /// Resolve a `=`-assignment target's reference now (spec order: LHS before
     /// the RHS yield). Only plain identifiers and member expressions qualify.
-    fn resolve_assign_target(&mut self, target: &Pat, ctx: &Ctx, mode: SuspendKind) -> Result<AssignTarget, Abrupt> {
+    fn resolve_assign_target(
+        &mut self,
+        target: &Pat,
+        ctx: &Ctx,
+        mode: SuspendKind,
+    ) -> Result<AssignTarget, Abrupt> {
         match target {
             Pat::Ident(name) => Ok(AssignTarget::Ident(name.clone())),
             Pat::Expr(m) => {
@@ -1927,7 +1792,9 @@ fn expr_has_suspend(e: &Expr, mode: SuspendKind) -> bool {
         Expr::Assign { target, value, .. } => pat_has_suspend(target, mode) || has(value),
         Expr::Cond { test, cons, alt } => has(test) || has(cons) || has(alt),
         Expr::Member { obj, prop, .. } => has(obj) || key_has_suspend(prop, mode),
-        Expr::Call { callee, args, .. } => has(callee) || args.iter().any(|a| arg_has_suspend(a, mode)),
+        Expr::Call { callee, args, .. } => {
+            has(callee) || args.iter().any(|a| arg_has_suspend(a, mode))
+        }
         Expr::New { callee, args } => has(callee) || args.iter().any(|a| arg_has_suspend(a, mode)),
         Expr::ImportCall(list) => list.iter().any(has),
         Expr::SuperCall(args) => args.iter().any(|a| arg_has_suspend(a, mode)),
@@ -1995,19 +1862,12 @@ fn stmt_has_suspend(s: &Stmt, mode: SuspendKind) -> bool {
             (mode == SuspendKind::AsyncGen && e.is_some()) || e.as_ref().is_some_and(se)
         }
         Stmt::Block(body) => body.iter().any(ss),
-        Stmt::Decl { decls, .. } => decls
-            .iter()
-            .any(|(p, e)| pat_has_suspend(p, mode) || e.as_ref().is_some_and(se)),
-        Stmt::If { test, cons, alt } => {
-            se(test) || ss(cons) || alt.as_deref().is_some_and(ss)
+        Stmt::Decl { decls, .. } => {
+            decls.iter().any(|(p, e)| pat_has_suspend(p, mode) || e.as_ref().is_some_and(se))
         }
+        Stmt::If { test, cons, alt } => se(test) || ss(cons) || alt.as_deref().is_some_and(ss),
         Stmt::DoWhile { body, test } | Stmt::While { test, body } => se(test) || ss(body),
-        Stmt::For {
-            init,
-            test,
-            update,
-            body,
-        } => {
+        Stmt::For { init, test, update, body } => {
             init.as_ref().is_some_and(|i| for_init_has_suspend(i, mode))
                 || test.as_ref().is_some_and(se)
                 || update.as_ref().is_some_and(se)
@@ -2020,15 +1880,9 @@ fn stmt_has_suspend(s: &Stmt, mode: SuspendKind) -> bool {
         Stmt::Labeled { body, .. } => ss(body),
         Stmt::Switch { disc, cases } => {
             se(disc)
-                || cases.iter().any(|c| {
-                    c.test.as_ref().is_some_and(se) || c.body.iter().any(ss)
-                })
+                || cases.iter().any(|c| c.test.as_ref().is_some_and(se) || c.body.iter().any(ss))
         }
-        Stmt::Try {
-            block,
-            catch,
-            finally,
-        } => {
+        Stmt::Try { block, catch, finally } => {
             block.iter().any(ss)
                 || catch.as_ref().is_some_and(|(_, b)| b.iter().any(ss))
                 || finally.as_ref().is_some_and(|b| b.iter().any(ss))
@@ -2038,9 +1892,9 @@ fn stmt_has_suspend(s: &Stmt, mode: SuspendKind) -> bool {
 
 fn for_init_has_suspend(init: &ForInit, mode: SuspendKind) -> bool {
     match init {
-        ForInit::Decl(_, decls) => decls
-            .iter()
-            .any(|(p, e)| pat_has_suspend(p, mode) || e.as_ref().is_some_and(|e| expr_has_suspend(e, mode))),
+        ForInit::Decl(_, decls) => decls.iter().any(|(p, e)| {
+            pat_has_suspend(p, mode) || e.as_ref().is_some_and(|e| expr_has_suspend(e, mode))
+        }),
         ForInit::Expr(e) => expr_has_suspend(e, mode),
     }
 }

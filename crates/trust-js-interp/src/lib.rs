@@ -49,15 +49,14 @@ mod promise;
 mod props;
 mod proxy;
 
-pub use project::escape_units;
-
 use std::collections::HashMap;
 
 use interp::{Abrupt, Interp};
+pub use project::escape_units;
 use trust_js_parse::ast::{ExportDecl, Stmt};
-use trust_js_parse::{parse_module, parse_script, ParseOutcome, Program};
+use trust_js_parse::{ParseOutcome, Program, parse_module, parse_script};
 use trust_js_trace::{
-    Completion, ObservableTrace, ProjectionCaps, ThrownProjection, SCHEMA_VERSION,
+    Completion, ObservableTrace, ProjectionCaps, SCHEMA_VERSION, ThrownProjection,
 };
 
 /// A sibling-module resolver: given the (canonical) key of the importing
@@ -74,20 +73,16 @@ pub enum InterpOutcome {
     Trace(ObservableTrace),
     /// The case uses syntax or semantics outside the implemented S1a slice.
     /// Sound: never a false divergence; counted (audited) by the harness.
-    NoCoverage { reason: String },
+    NoCoverage {
+        reason: String,
+    },
 }
 
 /// The projection caps the driver declares; ours are identical by
 /// construction.
 #[must_use]
 pub fn projection_caps() -> ProjectionCaps {
-    ProjectionCaps {
-        depth: 8,
-        keys: 64,
-        nodes: 4096,
-        string: 4096,
-        timers: 10_000,
-    }
+    ProjectionCaps { depth: 8, keys: 64, nodes: 4096, string: 4096, timers: 10_000 }
 }
 
 /// The thrown projection a conforming engine produces for a parse-time
@@ -170,9 +165,7 @@ fn run_case_on_thread(
         Ok(handle) => handle.join().unwrap_or_else(|_| InterpOutcome::NoCoverage {
             reason: "internal interpreter panic (refused, not judged)".to_string(),
         }),
-        Err(e) => InterpOutcome::NoCoverage {
-            reason: format!("case thread spawn failed: {e}"),
-        },
+        Err(e) => InterpOutcome::NoCoverage { reason: format!("case thread spawn failed: {e}") },
     }
 }
 
@@ -266,9 +259,9 @@ fn evaluate_case_inner(
                 }
                 Err(reason) => InterpOutcome::NoCoverage { reason },
             },
-            ParseOutcome::Unsupported { reason } => InterpOutcome::NoCoverage {
-                reason: format!("module body parse: {reason}"),
-            },
+            ParseOutcome::Unsupported { reason } => {
+                InterpOutcome::NoCoverage { reason: format!("module body parse: {reason}") }
+            }
         };
     }
 
@@ -295,24 +288,15 @@ fn evaluate_case_inner(
                 schema: SCHEMA_VERSION.to_string(),
                 caps: Some(projection_caps()),
                 events: it.events,
-                completion: Completion::Throw {
-                    v: syntax_error_thrown(),
-                    phase: None,
-                },
+                completion: Completion::Throw { v: syntax_error_thrown(), phase: None },
             });
         }
         ParseOutcome::Unsupported { reason } => {
-            return InterpOutcome::NoCoverage {
-                reason: format!("body parse: {reason}"),
-            }
+            return InterpOutcome::NoCoverage { reason: format!("body parse: {reason}") };
         }
     };
     programs.push(body_prog);
-    finish_body_run(
-        &mut it,
-        programs.last().expect("just pushed"),
-        completion_witness,
-    )
+    finish_body_run(&mut it, programs.last().expect("just pushed"), completion_witness)
 }
 
 /// Run one already-parsed body `Program` (a script body, or a module lowered to
@@ -343,7 +327,7 @@ fn finish_body_run(it: &mut Interp, prog: &Program, completion_witness: bool) ->
                     Err(e) => {
                         return InterpOutcome::NoCoverage {
                             reason: format!("completion projection: {e}"),
-                        }
+                        };
                     }
                 }
             } else {
@@ -353,16 +337,14 @@ fn finish_body_run(it: &mut Interp, prog: &Program, completion_witness: bool) ->
         Err(Abrupt::Throw(v)) => match project::project_thrown(it, &v) {
             Ok(t) => Completion::Throw { v: t, phase: None },
             Err(e) => {
-                return InterpOutcome::NoCoverage {
-                    reason: format!("thrown projection: {e}"),
-                }
+                return InterpOutcome::NoCoverage { reason: format!("thrown projection: {e}") };
             }
         },
         Err(Abrupt::Fatal(e)) => return InterpOutcome::NoCoverage { reason: e },
         Err(other) => {
             return InterpOutcome::NoCoverage {
                 reason: format!("abrupt completion escaped script: {other:?}"),
-            }
+            };
         }
     };
     InterpOutcome::Trace(ObservableTrace {
@@ -392,15 +374,13 @@ fn run_harness_includes(
                     schema: SCHEMA_VERSION.to_string(),
                     caps: Some(projection_caps()),
                     events: std::mem::take(&mut it.events),
-                    completion: Completion::HarnessIncludeError {
-                        v: syntax_error_thrown(),
-                    },
+                    completion: Completion::HarnessIncludeError { v: syntax_error_thrown() },
                 }));
             }
             ParseOutcome::Unsupported { reason } => {
                 return Err(InterpOutcome::NoCoverage {
                     reason: format!("include[{i}] parse: {reason}"),
-                })
+                });
             }
         };
         programs.push(prog);
@@ -412,7 +392,7 @@ fn run_harness_includes(
                     Err(e) => {
                         return Err(InterpOutcome::NoCoverage {
                             reason: format!("include[{i}] thrown projection: {e}"),
-                        })
+                        });
                     }
                 };
                 return Err(InterpOutcome::Trace(ObservableTrace {
@@ -423,14 +403,12 @@ fn run_harness_includes(
                 }));
             }
             Err(Abrupt::Fatal(e)) => {
-                return Err(InterpOutcome::NoCoverage {
-                    reason: format!("include[{i}]: {e}"),
-                })
+                return Err(InterpOutcome::NoCoverage { reason: format!("include[{i}]: {e}") });
             }
             Err(other) => {
                 return Err(InterpOutcome::NoCoverage {
                     reason: format!("include[{i}]: abrupt completion escaped script: {other:?}"),
-                })
+                });
             }
         }
     }
@@ -494,9 +472,7 @@ pub fn evaluate_module_graph(
         Ok(handle) => handle.join().unwrap_or_else(|_| InterpOutcome::NoCoverage {
             reason: "internal interpreter panic (refused, not judged)".to_string(),
         }),
-        Err(e) => InterpOutcome::NoCoverage {
-            reason: format!("case thread spawn failed: {e}"),
-        },
+        Err(e) => InterpOutcome::NoCoverage { reason: format!("case thread spawn failed: {e}") },
     }
 }
 
@@ -531,9 +507,7 @@ fn evaluate_module_graph_inner(
     let main_prog = match parse_module(main_src) {
         ParseOutcome::EarlyError { .. } => return syntax_error_trace(&mut it),
         ParseOutcome::Unsupported { reason } => {
-            return InterpOutcome::NoCoverage {
-                reason: format!("module body parse: {reason}"),
-            }
+            return InterpOutcome::NoCoverage { reason: format!("module body parse: {reason}") };
         }
         ParseOutcome::Script(p) => p,
     };
@@ -561,15 +535,8 @@ fn evaluate_module_graph_inner(
     let mut modules: HashMap<String, GraphNode> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut on_stack: Vec<String> = Vec::new();
-    match build_graph(
-        main_key,
-        main_lowered,
-        0,
-        resolver,
-        &mut modules,
-        &mut order,
-        &mut on_stack,
-    ) {
+    match build_graph(main_key, main_lowered, 0, resolver, &mut modules, &mut order, &mut on_stack)
+    {
         Ok(()) => {}
         Err(GraphFail::SyntaxError) => return syntax_error_trace(&mut it),
         Err(GraphFail::Refuse(reason)) => return InterpOutcome::NoCoverage { reason },
@@ -613,7 +580,8 @@ fn evaluate_module_graph_inner(
     // through the shared trace tail. `build_graph` pushes each module POST-order
     // and keeps the main module on the DFS stack throughout, so the main module
     // is placed exactly once, last.
-    let mut full_exports: HashMap<String, HashMap<String, trust_js_value::JsValue>> = HashMap::new();
+    let mut full_exports: HashMap<String, HashMap<String, trust_js_value::JsValue>> =
+        HashMap::new();
     let mut local_vals: HashMap<String, HashMap<String, trust_js_value::JsValue>> = HashMap::new();
     // A dependency's Module Namespace Exotic Object is created once and shared
     // by every `import * as` / `export * as` of it (namespace identity is
@@ -645,7 +613,8 @@ fn evaluate_module_graph_inner(
             .map(|(local, source)| (local.clone(), node.spec_to_key[source].clone()))
             .collect();
         for (local, dep_key) in ns_reqs {
-            let ns_val = match namespace_of(&mut it, &dep_key, &full_exports, &mut namespace_cache) {
+            let ns_val = match namespace_of(&mut it, &dep_key, &full_exports, &mut namespace_cache)
+            {
                 Ok(v) => v,
                 Err(outcome) => return outcome,
             };
@@ -665,13 +634,13 @@ fn evaluate_module_graph_inner(
             Err(Abrupt::Throw(_)) => {
                 return InterpOutcome::NoCoverage {
                     reason: "dependency module threw during evaluation (out of slice)".to_string(),
-                }
+                };
             }
             Err(Abrupt::Fatal(e)) => return InterpOutcome::NoCoverage { reason: e },
             Err(other) => {
                 return InterpOutcome::NoCoverage {
                     reason: format!("dependency abrupt completion escaped module: {other:?}"),
-                }
+                };
             }
         };
         // Capture this module's LOCAL export binding values (the resolution
@@ -693,17 +662,17 @@ fn evaluate_module_graph_inner(
         // resolution materializes (once, cached) the source module's namespace
         // object. Collect the resolution list first to release the borrow on
         // `export_sets` before touching `it` / the caches.
-        let resolutions: Vec<(String, Resolution)> = export_sets[key]
-            .iter()
-            .map(|(name, res)| (name.clone(), res.clone()))
-            .collect();
+        let resolutions: Vec<(String, Resolution)> =
+            export_sets[key].iter().map(|(name, res)| (name.clone(), res.clone())).collect();
         let mut fe: HashMap<String, trust_js_value::JsValue> = HashMap::new();
         for (name, res) in resolutions {
             let val = match res {
                 Resolution::Binding { module, local } => {
                     let Some(v) = local_vals.get(&module).and_then(|m| m.get(&local)) else {
                         return InterpOutcome::NoCoverage {
-                            reason: format!("re-exported binding `{local}` unavailable at link time"),
+                            reason: format!(
+                                "re-exported binding `{local}` unavailable at link time"
+                            ),
                         };
                     };
                     v.clone()
@@ -722,9 +691,7 @@ fn evaluate_module_graph_inner(
 
     // `order` is non-empty (it contains the main module) and the main module is
     // handled inside the loop, so this is unreachable.
-    InterpOutcome::NoCoverage {
-        reason: "empty module graph (linker bug)".to_string(),
-    }
+    InterpOutcome::NoCoverage { reason: "empty module graph (linker bug)".to_string() }
 }
 
 /// DFS that parses, lowers, and places every module reachable from `key` into
@@ -755,29 +722,23 @@ fn build_graph(
         spec_to_key.insert(spec.clone(), dep_key.clone());
 
         if on_stack.iter().any(|k| k == &dep_key) {
-            return Err(GraphFail::Refuse(format!(
-                "import cycle detected (`{spec}`)"
-            )));
+            return Err(GraphFail::Refuse(format!("import cycle detected (`{spec}`)")));
         }
         if modules.contains_key(&dep_key) {
             continue; // already placed (DAG re-reference).
         }
         if modules.len() + 1 >= MAX_MODULES {
-            return Err(GraphFail::Refuse(format!(
-                "module graph exceeds {MAX_MODULES} modules"
-            )));
+            return Err(GraphFail::Refuse(format!("module graph exceeds {MAX_MODULES} modules")));
         }
         if depth + 1 > MAX_DEPTH {
-            return Err(GraphFail::Refuse(format!(
-                "module graph exceeds depth {MAX_DEPTH}"
-            )));
+            return Err(GraphFail::Refuse(format!("module graph exceeds depth {MAX_DEPTH}")));
         }
         let dep_lowered = match parse_module(&dep_src) {
             // A parse error ANYWHERE in the graph is a Loading-phase
             // SyntaxError, before any evaluation.
             ParseOutcome::EarlyError { .. } => return Err(GraphFail::SyntaxError),
             ParseOutcome::Unsupported { reason } => {
-                return Err(GraphFail::Refuse(format!("dependency parse: {reason}")))
+                return Err(GraphFail::Refuse(format!("dependency parse: {reason}")));
             }
             ParseOutcome::Script(p) => match module_lower::lower_linked(p) {
                 Ok(m) => m,
@@ -821,16 +782,14 @@ fn finish_module_run(
         Err(Abrupt::Throw(v)) => match project::project_thrown(it, &v) {
             Ok(t) => Completion::Throw { v: t, phase: None },
             Err(e) => {
-                return InterpOutcome::NoCoverage {
-                    reason: format!("thrown projection: {e}"),
-                }
+                return InterpOutcome::NoCoverage { reason: format!("thrown projection: {e}") };
             }
         },
         Err(Abrupt::Fatal(e)) => return InterpOutcome::NoCoverage { reason: e },
         Err(other) => {
             return InterpOutcome::NoCoverage {
                 reason: format!("abrupt completion escaped module: {other:?}"),
-            }
+            };
         }
     };
     InterpOutcome::Trace(ObservableTrace {
@@ -850,10 +809,7 @@ fn syntax_error_trace(it: &mut Interp) -> InterpOutcome {
         schema: SCHEMA_VERSION.to_string(),
         caps: Some(projection_caps()),
         events: std::mem::take(&mut it.events),
-        completion: Completion::Throw {
-            v: syntax_error_thrown(),
-            phase: None,
-        },
+        completion: Completion::Throw { v: syntax_error_thrown(), phase: None },
     })
 }
 
@@ -929,9 +885,9 @@ fn compute_export_sets(
         // already-computed set. An unresolved name is a link-time SyntaxError.
         for re in &low.named_reexports {
             let src_key = &node.spec_to_key[&re.source];
-            let src_set = sets
-                .get(src_key)
-                .ok_or_else(|| LinkFail::Refuse("re-export source unresolved (linker bug)".to_string()))?;
+            let src_set = sets.get(src_key).ok_or_else(|| {
+                LinkFail::Refuse("re-export source unresolved (linker bug)".to_string())
+            })?;
             match src_set.get(&re.imported) {
                 Some(res) => {
                     names.insert(re.exported.clone(), res.clone());
@@ -952,9 +908,9 @@ fn compute_export_sets(
         let mut ambiguous = false;
         for source in &low.star_reexports {
             let src_key = &node.spec_to_key[source];
-            let src_set = sets
-                .get(src_key)
-                .ok_or_else(|| LinkFail::Refuse("star source unresolved (linker bug)".to_string()))?;
+            let src_set = sets.get(src_key).ok_or_else(|| {
+                LinkFail::Refuse("star source unresolved (linker bug)".to_string())
+            })?;
             for (n, res) in src_set {
                 if n == "default" || names.contains_key(n) {
                     continue;
@@ -1011,7 +967,7 @@ fn namespace_of(
         Err(other) => {
             return Err(InterpOutcome::NoCoverage {
                 reason: format!("namespace object construction: {other:?}"),
-            })
+            });
         }
     };
     let v = trust_js_value::JsValue::Obj(oid);
@@ -1021,8 +977,9 @@ fn namespace_of(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_trace::{HostEvent, ProjectedValue, PropKey, ThrownProjection};
+
+    use super::*;
 
     /// Witness-on run (unit tests inspect completion values).
     fn run(body: &str) -> InterpOutcome {
@@ -1068,9 +1025,7 @@ mod tests {
 
     fn logged(body: &str) -> Vec<ProjectedValue> {
         let InterpOutcome::Trace(t) = run(body) else {
-            let InterpOutcome::NoCoverage { reason } = run(body) else {
-                unreachable!()
-            };
+            let InterpOutcome::NoCoverage { reason } = run(body) else { unreachable!() };
             panic!("unexpected NoCoverage: {reason}");
         };
         assert!(
@@ -1150,7 +1105,9 @@ mod tests {
         );
         // BigInt64Array / BigUint64Array round-trip + element coercion.
         assert_eq!(
-            logged("var a = new BigInt64Array(2); a[0] = 5n; a[1] = -1n; console.log(a[0], a[1], a.length);"),
+            logged(
+                "var a = new BigInt64Array(2); a[0] = 5n; a[1] = -1n; console.log(a[0], a[1], a.length);"
+            ),
             vec![bi("5"), bi("-1"), num("2")]
         );
         assert_eq!(
@@ -1159,7 +1116,9 @@ mod tests {
         );
         // BigInt64Array wraps on store; DataView setBigInt64/getBigInt64.
         assert_eq!(
-            logged("var d = new DataView(new ArrayBuffer(8)); d.setBigUint64(0, 18446744073709551615n); console.log(d.getBigUint64(0), d.getBigInt64(0));"),
+            logged(
+                "var d = new DataView(new ArrayBuffer(8)); d.setBigUint64(0, 18446744073709551615n); console.log(d.getBigUint64(0), d.getBigInt64(0));"
+            ),
             vec![bi("18446744073709551615"), bi("-1")]
         );
         // Number(bigint) converts (does NOT throw); huge value → Infinity.
@@ -1217,10 +1176,7 @@ mod tests {
             "class C { *m(){ yield 1; } } [...new C().m()];",
             "function* g(){ yield 1; } var it = g(); it.next(); it.next(); it.return(5); it.next();",
         ] {
-            assert!(
-                matches!(run(src), InterpOutcome::Trace(_)),
-                "expected coverage for: {src}"
-            );
+            assert!(matches!(run(src), InterpOutcome::Trace(_)), "expected coverage for: {src}");
         }
         // Intractable yield positions refuse SOUNDLY (never a wrong trace, never
         // a panic). Refusal happens at resume time, so `.next()` is needed.
@@ -1229,7 +1185,7 @@ mod tests {
             "function* g(){ var x = 1 + (yield 2); } g().next();",     // operator operand
             "function* g(){ var a = yield 1, b = yield 2; } g().next();", // multi-declarator
             "function* g(){ switch (yield 1) { case 1: yield 2; } } g().next();", // yield in switch disc
-            "function* g(){ ({ [yield 1]: 2 }); } g().next();",        // computed key
+            "function* g(){ ({ [yield 1]: 2 }); } g().next();",                   // computed key
         ] {
             assert!(
                 matches!(run(src), InterpOutcome::NoCoverage { .. }),
@@ -1344,10 +1300,8 @@ mod tests {
         ));
         // Non-object receivers still throw TypeError (Type(C) is not Object).
         assert_eq!(
-            completion_of(run(
-                "var t = false; try { Promise.resolve.call(undefined, 1); } \
-                 catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("var t = false; try { Promise.resolve.call(undefined, 1); } \
+                 catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
     }
@@ -1384,16 +1338,35 @@ mod tests {
              123456789012345680000, NaN, Infinity, -Infinity, -0, 0);",
         );
         let want: Vec<ProjectedValue> = [
-            "1", "0.1", "0.30000000000000004", "1e+21", "1e-7", "123456789", "5e-324",
-            "1.7976931348623157e+308", "100", "0.000001", "-1.5", "2e+21", "1.5e+22",
-            "123456789012345680000", "NaN", "Infinity", "-Infinity", "-0", "0",
+            "1",
+            "0.1",
+            "0.30000000000000004",
+            "1e+21",
+            "1e-7",
+            "123456789",
+            "5e-324",
+            "1.7976931348623157e+308",
+            "100",
+            "0.000001",
+            "-1.5",
+            "2e+21",
+            "1.5e+22",
+            "123456789012345680000",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "-0",
+            "0",
         ]
         .iter()
         .map(|x| num(x))
         .collect();
         assert_eq!(vs, want);
         // String coercion of -0 is "0"; the projection alone says "-0".
-        assert_eq!(logged("console.log(String(-0), '' + -0, `${-0}`);"), vec![s("0"), s("0"), s("0")]);
+        assert_eq!(
+            logged("console.log(String(-0), '' + -0, `${-0}`);"),
+            vec![s("0"), s("0"), s("0")]
+        );
     }
 
     #[test]
@@ -1449,7 +1422,9 @@ mod tests {
         );
         // Bitwise / shifts (ToInt32/ToUint32 wrapping).
         assert_eq!(
-            logged("console.log(5 & 3, 5 | 3, 5 ^ 3, ~5, 1 << 31, -1 >>> 0, -8 >> 1, 2 ** 10, (-2) ** 3);"),
+            logged(
+                "console.log(5 & 3, 5 | 3, 5 ^ 3, ~5, 1 << 31, -1 >>> 0, -8 >> 1, 2 ** 10, (-2) ** 3);"
+            ),
             vec![
                 num("1"),
                 num("7"),
@@ -1498,10 +1473,8 @@ mod tests {
             Completion::Normal { v: Some(b(true)) }
         );
         assert_eq!(
-            completion_of(run(
-                "var f = function g() { 'use strict'; g = 5; };\n\
-                 var t = false; try { f(); } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("var f = function g() { 'use strict'; g = 5; };\n\
+                 var t = false; try { f(); } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
     }
@@ -1520,10 +1493,8 @@ mod tests {
             vec![b(true), num("1")]
         );
         assert_eq!(
-            completion_of(run(
-                "const c = 1; var t = false;\n\
-                 try { c = 2; } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("const c = 1; var t = false;\n\
+                 try { c = 2; } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
         // typeof of a TDZ binding throws.
@@ -1553,10 +1524,7 @@ mod tests {
     #[test]
     fn object_property_order_and_projection() {
         let c = completion_of(run("[7, 8];"));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { cls, props, .. }),
-        } = c
-        else {
+        let Completion::Normal { v: Some(ProjectedValue::Obj { cls, props, .. }) } = c else {
             panic!("expected object completion");
         };
         assert_eq!(cls.as_deref(), Some("Array"));
@@ -1573,10 +1541,7 @@ mod tests {
         );
 
         let c = completion_of(run("var o = { b: 1, 2: 'two', a: 3, 0: 'zero' }; o;"));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { props, .. }),
-        } = c
-        else {
+        let Completion::Normal { v: Some(ProjectedValue::Obj { props, .. }) } = c else {
             panic!("expected object completion");
         };
         let keys: Vec<String> = props
@@ -1591,10 +1556,7 @@ mod tests {
 
         // Cycles project as back-references.
         let c = completion_of(run("var o = {}; o.self = o; o;"));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { id, props, .. }),
-        } = c
-        else {
+        let Completion::Normal { v: Some(ProjectedValue::Obj { id, props, .. }) } = c else {
             panic!("expected object completion");
         };
         assert_eq!(id, 0);
@@ -1604,13 +1566,8 @@ mod tests {
         );
 
         // Accessors project without being invoked.
-        let c = completion_of(run(
-            "var n = 0; var o = { get x() { n++; return 1; } }; o;"
-        ));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { props, .. }),
-        } = c
-        else {
+        let c = completion_of(run("var n = 0; var o = { get x() { n++; return 1; } }; o;"));
+        let Completion::Normal { v: Some(ProjectedValue::Obj { props, .. }) } = c else {
             panic!("expected object completion");
         };
         assert_eq!(
@@ -1626,10 +1583,7 @@ mod tests {
     fn thrown_projections() {
         assert_eq!(
             completion_of(run("throw 42;")),
-            Completion::Throw {
-                v: ThrownProjection::Prim { v: num("42") },
-                phase: None
-            }
+            Completion::Throw { v: ThrownProjection::Prim { v: num("42") }, phase: None }
         );
         assert_eq!(
             completion_of(run("throw new TypeError('boom');")),
@@ -1645,10 +1599,8 @@ mod tests {
         // A user-constructor instance: Object class, ctor_name from
         // prototype.constructor.name.
         assert_eq!(
-            completion_of(run(
-                "function Test262Error(m) { this.message = m || ''; }\n\
-                 throw new Test262Error('nope');"
-            )),
+            completion_of(run("function Test262Error(m) { this.message = m || ''; }\n\
+                 throw new Test262Error('nope');")),
             Completion::Throw {
                 v: ThrownProjection::Error {
                     ctor: Some("Object".to_string()),
@@ -1758,7 +1710,9 @@ mod tests {
         ));
         // ...but its identity is exact.
         assert_eq!(
-            completion_of(run("var t; try { null.x; } catch (e) { t = e instanceof TypeError; } t;")),
+            completion_of(run(
+                "var t; try { null.x; } catch (e) { t = e instanceof TypeError; } t;"
+            )),
             Completion::Normal { v: Some(b(true)) }
         );
         // Out-of-slice syntax surfaces refuse at evaluation. Regex literals
@@ -1791,10 +1745,8 @@ mod tests {
             Completion::Normal { v: Some(b(true)) }
         );
         assert_eq!(
-            completion_of(run(
-                "var o = {}; o[Symbol.iterator] = function () {}; \
-                 var t = false; try { for (var k of o) {} } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("var o = {}; o[Symbol.iterator] = function () {}; \
+                 var t = false; try { for (var k of o) {} } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
         // Private class elements are in slice (S1e); generator methods are in
@@ -1933,8 +1885,7 @@ mod tests {
         // data: appended entries are visited, completion latches, keys===values
         // for Set, @@iterator self-returns, and the class tag is exact.
         assert_eq!(
-            completion_of(run(
-                "var m = new Map([['a', 1], ['b', 2]]); var it = m.entries();\n\
+            completion_of(run("var m = new Map([['a', 1], ['b', 2]]); var it = m.entries();\n\
                  var r0 = it.next(); var ok0 = r0.value[0] === 'a' && r0.value[1] === 1 && !r0.done;\n\
                  m.set('c', 3);\n\
                  var r1 = it.next(); var r2 = it.next(); var r3 = it.next();\n\
@@ -1945,8 +1896,7 @@ mod tests {
                    && s.entries().next().value[0] === 1;\n\
                  ok && sok && it[Symbol.iterator]() === it\n\
                    && Object.prototype.toString.call(it) === '[object Map Iterator]'\n\
-                   && Object.prototype.toString.call(sv) === '[object Set Iterator]';"
-            )),
+                   && Object.prototype.toString.call(sv) === '[object Set Iterator]';")),
             Completion::Normal { v: Some(b(true)) }
         );
         // The set-methods surface stays a sound refusal.
@@ -1955,17 +1905,13 @@ mod tests {
         // A tampered @@iterator (own or on the prototype) now drives the user
         // protocol: `function () {}` returns undefined → GetIterator TypeError.
         assert_eq!(
-            completion_of(run(
-                "var m = new Map(); m[Symbol.iterator] = function () {}; \
-                 var t = false; try { for (var e of m) {} } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("var m = new Map(); m[Symbol.iterator] = function () {}; \
+                 var t = false; try { for (var e of m) {} } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
         assert_eq!(
-            completion_of(run(
-                "Map.prototype[Symbol.iterator] = function () {}; \
-                 var t = false; try { for (var e of new Map()) {} } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("Map.prototype[Symbol.iterator] = function () {}; \
+                 var t = false; try { for (var e of new Map()) {} } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
     }
@@ -2013,12 +1959,10 @@ mod tests {
         // A `return` that returns a non-object throws TypeError at a normal
         // (non-throw) close.
         assert_eq!(
-            completion_of(run(
-                "var it = { [Symbol.iterator]() { return {\n\
+            completion_of(run("var it = { [Symbol.iterator]() { return {\n\
                    next() { return { value: 1, done: false }; },\n\
                    return() { return 5; } }; } };\n\
-                 var t = false; try { for (var x of it) break; } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+                 var t = false; try { for (var x of it) break; } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
         // A throwing body: the original throw wins; `return` is still called
@@ -2147,12 +2091,10 @@ mod tests {
         );
         // Derived double-brand: super() returning a shared object twice throws.
         assert_eq!(
-            completion_of(run(
-                "class Base { constructor(o) { return o; } }\n\
+            completion_of(run("class Base { constructor(o) { return o; } }\n\
                  class D extends Base { #x = 1; constructor(o) { super(o); } }\n\
                  var shared = {}; new D(shared);\n\
-                 var t = false; try { new D(shared); } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+                 var t = false; try { new D(shared); } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
     }
@@ -2332,10 +2274,7 @@ mod tests {
         );
         // Projection: a Date instance has NO own properties.
         let c = completion_of(run("new Date(5);"));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { cls, props, .. }),
-        } = c
-        else {
+        let Completion::Normal { v: Some(ProjectedValue::Obj { cls, props, .. }) } = c else {
             panic!("expected date object completion");
         };
         assert_eq!(cls.as_deref(), Some("Date"));
@@ -2403,11 +2342,7 @@ mod tests {
                  });\n\
                  console.log(log.join('|'), 'a' in r, r.b.join(','));"
             ),
-            vec![
-                s("a:3:1|0:3:2|1:3:3|b:3:undefined|:3:undefined"),
-                b(false),
-                s("20,30"),
-            ]
+            vec![s("a:3:1|0:3:2|1:3:3|b:3:undefined|:3:undefined"), b(false), s("20,30"),]
         );
         // Source dropped for values mutated before their visit.
         assert_eq!(
@@ -2438,9 +2373,13 @@ mod tests {
                  JSON.stringify(-0), JSON.stringify({a: [, 2]}), JSON.stringify([1], [], 4), JSON.stringify(5, 'notafn'));"
             ),
             vec![
-                s("{\\u000a  \\\"a\\\": 1,\\u000a  \\\"b\\\": [\\u000a    1,\\u000a    {\\u000a      \\\"c\\\": 2\\u000a    }\\u000a  ]\\u000a}"),
+                s(
+                    "{\\u000a  \\\"a\\\": 1,\\u000a  \\\"b\\\": [\\u000a    1,\\u000a    {\\u000a      \\\"c\\\": 2\\u000a    }\\u000a  ]\\u000a}"
+                ),
                 s("[\\u000a--1,\\u000a--\\\"a\\\"\\u000a]"),
-                s("{\\u000a          \\\"a\\\": {\\u000a                    \\\"b\\\": 1\\u000a          }\\u000a}"),
+                s(
+                    "{\\u000a          \\\"a\\\": {\\u000a                    \\\"b\\\": 1\\u000a          }\\u000a}"
+                ),
                 s("{\\\"b\\\":2,\\\"a\\\":1,\\\"0\\\":\\\"z\\\"}"),
                 s("{\\\"a\\\":10,\\\"b\\\":[20,30]}"),
                 s("{\\\"t\\\":[\\\"t\\\",true]}"),
@@ -2541,10 +2480,7 @@ mod tests {
         );
         // The regex-literal projection carries the nonenum lastIndex.
         let c = completion_of(run("/ab/g;"));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { cls, props, .. }),
-        } = c
-        else {
+        let Completion::Normal { v: Some(ProjectedValue::Obj { cls, props, .. }) } = c else {
             panic!("expected regex object completion");
         };
         assert_eq!(cls.as_deref(), Some("RegExp"));
@@ -2588,13 +2524,7 @@ mod tests {
                  console.log(typeof Proxy, Proxy.name, Proxy.length, t,\n\
                  Object.getOwnPropertyDescriptor(Proxy, 'prototype'));"
             ),
-            vec![
-                s("function"),
-                s("Proxy"),
-                num("2"),
-                b(true),
-                ProjectedValue::Undefined,
-            ]
+            vec![s("function"), s("Proxy"), num("2"), b(true), ProjectedValue::Undefined,]
         );
         // Proxy construction is now live (§10.5 trap dispatch): a proxy with an
         // empty handler forwards to its target's ordinary internal methods.
@@ -2686,17 +2616,13 @@ mod tests {
                  }\n\
                  f(1, 2);"
             ),
-            vec![
-                num("42"),
-                num("7"),
-                ProjectedValue::Undefined,
-                num("2"),
-                b(true),
-            ]
+            vec![num("42"), num("7"), ProjectedValue::Undefined, num("2"), b(true),]
         );
         // Duplicate params: only the last occurrence maps.
         assert_eq!(
-            logged("function d(x, x) { x = 99; console.log(arguments[0], arguments[1]); } d(1, 2);"),
+            logged(
+                "function d(x, x) { x = 99; console.log(arguments[0], arguments[1]); } d(1, 2);"
+            ),
             vec![num("1"), num("99")]
         );
         // Unmapped (strict): no aliasing; callee is a throwing accessor.
@@ -2716,10 +2642,7 @@ mod tests {
         );
         // Projection carries the @@iterator symbol prop and callee.
         let c = completion_of(run("(function (x) { return arguments; })(1);"));
-        let Completion::Normal {
-            v: Some(ProjectedValue::Obj { cls, props, .. }),
-        } = c
-        else {
+        let Completion::Normal { v: Some(ProjectedValue::Obj { cls, props, .. }) } = c else {
             panic!("expected arguments object");
         };
         assert_eq!(cls.as_deref(), Some("Object"));
@@ -2727,10 +2650,7 @@ mod tests {
         assert_eq!(props[0], (PropKey::Str("0".to_string()), num("1")));
         assert_eq!(
             props[1],
-            (
-                PropKey::Str("length".to_string()),
-                ProjectedValue::Nonenum { v: Box::new(num("1")) }
-            )
+            (PropKey::Str("length".to_string()), ProjectedValue::Nonenum { v: Box::new(num("1")) })
         );
         assert!(matches!(
             &props[2],
@@ -2781,15 +2701,7 @@ mod tests {
                  var d = Object.getOwnPropertyDescriptor(o, 'p');\n\
                  console.log(typeof d.get, typeof d.set, d.get.name, d.set.name, d.enumerable);"
             ),
-            vec![
-                num("7"),
-                num("3"),
-                s("function"),
-                s("function"),
-                s("get p"),
-                s("set p"),
-                b(true),
-            ]
+            vec![num("7"), num("3"), s("function"), s("function"), s("get p"), s("set p"), b(true),]
         );
         // Object.keys / getOwnPropertyNames order; function own-key order.
         assert_eq!(
@@ -2864,7 +2776,9 @@ mod tests {
         );
         // Destructuring assignment to member targets.
         assert_eq!(
-            logged("var o = {}; [o.a, o.b] = [1, 2]; ({ c: o.c } = { c: 3 }); console.log(o.a, o.b, o.c);"),
+            logged(
+                "var o = {}; [o.a, o.b] = [1, 2]; ({ c: o.c } = { c: 3 }); console.log(o.a, o.b, o.c);"
+            ),
             vec![num("1"), num("2"), num("3")]
         );
     }
@@ -2932,18 +2846,13 @@ mod tests {
         );
         // finally overrides with its own abrupt completion.
         assert_eq!(
-            completion_of(run(
-                "(function () { try { return 1; } finally { return 2; } })();"
-            )),
+            completion_of(run("(function () { try { return 1; } finally { return 2; } })();")),
             Completion::Normal { v: Some(num("2")) }
         );
         // Catch-less finally re-throws.
         assert_eq!(
             completion_of(run("try { throw 'x'; } finally { 1; }")),
-            Completion::Throw {
-                v: ThrownProjection::Prim { v: s("x") },
-                phase: None
-            }
+            Completion::Throw { v: ThrownProjection::Prim { v: s("x") }, phase: None }
         );
         // Destructuring catch parameter.
         assert_eq!(
@@ -2955,9 +2864,7 @@ mod tests {
     #[test]
     fn templates_and_optional_chaining() {
         assert_eq!(
-            logged(
-                "var x = 6; console.log(`a${x * 7}b`, `line1\nline2`.length, `${'q'}`);"
-            ),
+            logged("var x = 6; console.log(`a${x * 7}b`, `line1\nline2`.length, `${'q'}`);"),
             vec![s("a42b"), num("11"), s("q")]
         );
         assert_eq!(
@@ -3009,7 +2916,9 @@ mod tests {
         );
         // in operator.
         assert_eq!(
-            logged("var o = { a: 1 }; console.log('a' in o, 'b' in o, '0' in [7], 'length' in []);"),
+            logged(
+                "var o = { a: 1 }; console.log('a' in o, 'b' in o, '0' in [7], 'length' in []);"
+            ),
             vec![b(true), b(false), b(true), b(true)]
         );
     }
@@ -3085,11 +2994,7 @@ mod tests {
                  Object.getOwnPropertyNames(function f(x) {}).join(','),\n\
                  Object.getOwnPropertyNames(isNaN).join(','));"
             ),
-            vec![
-                s("length,name,prototype"),
-                s("length,name,prototype"),
-                s("length,name"),
-            ]
+            vec![s("length,name,prototype"), s("length,name,prototype"), s("length,name"),]
         );
         // %ThrowTypeError% via the unmapped-arguments callee accessor.
         assert_eq!(
@@ -3616,13 +3521,7 @@ mod tests {
                  Object.getOwnPropertyDescriptor(C.prototype, 'm').enumerable,\n\
                  Object.getPrototypeOf(N.prototype), new N() instanceof N);"
             ),
-            vec![
-                num("0"),
-                b(false),
-                b(false),
-                ProjectedValue::Null,
-                b(true),
-            ]
+            vec![num("0"), b(false), b(false), ProjectedValue::Null, b(true),]
         );
     }
 
@@ -3874,7 +3773,9 @@ mod tests {
         ));
         // Async/generator resumption machine, abrupt finally:
         assert!(matches!(
-            run("async function m(){ try { await Array.fromAsync([1]); } finally { throw 0; } } m();"),
+            run(
+                "async function m(){ try { await Array.fromAsync([1]); } finally { throw 0; } } m();"
+            ),
             InterpOutcome::NoCoverage { .. }
         ));
         // A GENUINE throw in `try` is still overridden by an abrupt finally
@@ -4080,17 +3981,13 @@ mod tests {
         );
         // A non-disposable object (no @@dispose) passed to `use` throws TypeError.
         assert_eq!(
-            completion_of(run(
-                "var t = false; const s = new DisposableStack();\n\
-                 try { s.use({}); } catch (e) { t = e instanceof TypeError; } t;"
-            )),
+            completion_of(run("var t = false; const s = new DisposableStack();\n\
+                 try { s.use({}); } catch (e) { t = e instanceof TypeError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
         assert_eq!(
-            completion_of(run(
-                "var t = false; const s = new DisposableStack(); s.dispose();\n\
-                 try { s.use({}); } catch (e) { t = e instanceof ReferenceError; } t;"
-            )),
+            completion_of(run("var t = false; const s = new DisposableStack(); s.dispose();\n\
+                 try { s.use({}); } catch (e) { t = e instanceof ReferenceError; } t;")),
             Completion::Normal { v: Some(b(true)) }
         );
     }
@@ -4185,10 +4082,7 @@ mod tests {
             InterpOutcome::NoCoverage { .. }
         ));
         // AsyncDisposableStack stays unmodeled → refuses (NoCoverage).
-        assert!(matches!(
-            run("new AsyncDisposableStack();"),
-            InterpOutcome::NoCoverage { .. }
-        ));
+        assert!(matches!(run("new AsyncDisposableStack();"), InterpOutcome::NoCoverage { .. }));
     }
 
     #[test]
@@ -4223,15 +4117,9 @@ mod tests {
             InterpOutcome::NoCoverage { .. }
         ));
         // Async generators are out of reach → refuse at definition.
-        assert!(matches!(
-            run("async function* g() {} g();"),
-            InterpOutcome::NoCoverage { .. }
-        ));
+        assert!(matches!(run("async function* g() {} g();"), InterpOutcome::NoCoverage { .. }));
         // Unhandled rejection → refuse (engine-divergent observability).
-        assert!(matches!(
-            run("Promise.reject(1);"),
-            InterpOutcome::NoCoverage { .. }
-        ));
+        assert!(matches!(run("Promise.reject(1);"), InterpOutcome::NoCoverage { .. }));
     }
 
     #[test]
@@ -4253,8 +4141,9 @@ mod tests {
 
 #[cfg(test)]
 mod module_graph_tests {
-    use super::*;
     use trust_js_trace::{Completion, HostEvent, ProjectedValue, ThrownProjection};
+
+    use super::*;
 
     /// Link `main_src` (key `./main.js`) against an in-memory sibling set. The
     /// resolver keys each file by its own specifier (flat directory) so a
@@ -4327,10 +4216,9 @@ mod module_graph_tests {
     #[test]
     fn dependency_evaluates_before_main_in_order() {
         // Side-effect import: dep logs 'a', then main logs 'b'.
-        let InterpOutcome::Trace(t) = graph(
-            "import './dep.js'; console.log('b');",
-            &[("./dep.js", "console.log('a');")],
-        ) else {
+        let InterpOutcome::Trace(t) =
+            graph("import './dep.js'; console.log('b');", &[("./dep.js", "console.log('a');")])
+        else {
             panic!("expected trace");
         };
         let logged: Vec<String> = t
@@ -4375,10 +4263,8 @@ mod module_graph_tests {
 
     #[test]
     fn missing_export_is_link_syntax_error() {
-        let o = graph(
-            "$NEVER; import { y } from './dep.js';",
-            &[("./dep.js", "export const x = 1;")],
-        );
+        let o =
+            graph("$NEVER; import { y } from './dep.js';", &[("./dep.js", "export const x = 1;")]);
         assert!(is_syntax_error(&completion(o)), "expected SyntaxError");
     }
 
@@ -4386,10 +4272,7 @@ mod module_graph_tests {
     fn dependency_parse_error_is_syntax_error() {
         // A parse error anywhere in the graph is a load-time SyntaxError; the
         // main body never evaluates (its `throw` never runs).
-        let o = graph(
-            "import './dep.js'; throw 'should-not-run';",
-            &[("./dep.js", "let x = ;")],
-        );
+        let o = graph("import './dep.js'; throw 'should-not-run';", &[("./dep.js", "let x = ;")]);
         assert!(is_syntax_error(&completion(o)), "expected SyntaxError");
     }
 
@@ -4421,10 +4304,7 @@ mod module_graph_tests {
         // The `test262update`-style pattern: an exported binding mutated later.
         let r = refusal(graph(
             "import { x } from './dep.js';",
-            &[(
-                "./dep.js",
-                "export var x = 1; globalThis.bump = function () { x = 2; };",
-            )],
+            &[("./dep.js", "export var x = 1; globalThis.bump = function () { x = 2; };")],
         ));
         assert!(r.contains("live binding"), "reason: {r}");
     }
@@ -4455,7 +4335,10 @@ mod module_graph_tests {
         // scope in the exporter and callable; the importer sees `.name === 'f'`.
         let o = graph(
             "import d from './dep.js'; if (d() !== 7) throw 'call'; if (d.name !== 'f') throw 'name';",
-            &[("./dep.js", "export default function f() { return 7; } if (f() !== 7) throw 'localf';")],
+            &[(
+                "./dep.js",
+                "export default function f() { return 7; } if (f() !== 7) throw 'localf';",
+            )],
         );
         assert!(matches!(completion(o), Completion::Normal { .. }));
     }
@@ -4520,10 +4403,7 @@ mod module_graph_tests {
 
     #[test]
     fn missing_default_export_is_link_syntax_error() {
-        let o = graph(
-            "import d from './dep.js';",
-            &[("./dep.js", "export const x = 1;")],
-        );
+        let o = graph("import d from './dep.js';", &[("./dep.js", "export const x = 1;")]);
         assert!(is_syntax_error(&completion(o)), "expected SyntaxError");
     }
 
@@ -4553,7 +4433,10 @@ mod module_graph_tests {
              if (Object.getPrototypeOf(ns) !== null) throw 'proto'; \
              if (ns.nope !== undefined) throw 'absent'; if ('nope' in ns) throw 'in'; \
              if (Object.isExtensible(ns)) throw 'ext'; if (typeof ns !== 'object') throw 'typeof';",
-            &[("./dep.js", "export const b = 2; export const a = 1; export function f(){ return 7; } export default 9;")],
+            &[(
+                "./dep.js",
+                "export const b = 2; export const a = 1; export function f(){ return 7; } export default 9;",
+            )],
         );
         assert!(matches!(completion(o), Completion::Normal { .. }));
     }
@@ -4652,10 +4535,7 @@ mod module_graph_tests {
             "import * as ns from './dep.js'; \
              if (Object.keys(ns).join(',') !== 'x') throw Object.keys(ns).join(','); \
              if (ns.x !== 1) throw 'x';",
-            &[
-                ("./dep.js", "export * from './other.js';"),
-                ("./other.js", "export const x = 1;"),
-            ],
+            &[("./dep.js", "export * from './other.js';"), ("./other.js", "export const x = 1;")],
         );
         assert!(matches!(completion(o), Completion::Normal { .. }));
     }
@@ -4665,10 +4545,7 @@ mod module_graph_tests {
         // `import { x }` of a dep that `export *`s from another module resolves.
         let o = graph(
             "import { x } from './dep.js'; if (x !== 5) throw 'x';",
-            &[
-                ("./dep.js", "export * from './other.js';"),
-                ("./other.js", "export const x = 5;"),
-            ],
+            &[("./dep.js", "export * from './other.js';"), ("./other.js", "export const x = 5;")],
         );
         assert!(matches!(completion(o), Completion::Normal { .. }));
     }
@@ -4838,10 +4715,7 @@ mod module_graph_tests {
     fn dependency_throw_refused() {
         // A dependency that throws during evaluation is refused (the
         // cross-module evaluation-throw trace is not modeled).
-        let r = refusal(graph(
-            "import './dep.js';",
-            &[("./dep.js", "throw new Error('boom');")],
-        ));
+        let r = refusal(graph("import './dep.js';", &[("./dep.js", "throw new Error('boom');")]));
         assert!(r.contains("threw during evaluation"), "reason: {r}");
     }
 

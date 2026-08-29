@@ -17,15 +17,15 @@ pub mod ctl;
 pub mod fairness;
 pub mod liveness;
 pub mod ltl;
-pub mod ty_bridge;
 pub mod tla_spec_gen;
+pub mod ty_bridge;
+
+use std::collections::VecDeque;
 
 pub use bmc::{BmcEngine, BmcResult, SafetyProperty};
 pub use ctl::{CtlFormula, CtlModelChecker, CtlResult};
 pub use liveness::{LivenessProperty, LivenessResult};
 pub use ltl::LtlFormula;
-
-use std::collections::VecDeque;
 use trust_types::fx::FxHashSet;
 
 /// Identifier for a state in a state machine.

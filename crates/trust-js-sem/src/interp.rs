@@ -11,15 +11,17 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use trust_js_trace::HostEvent;
+
 use crate::ast::{BindTarget, DeclKind, Expr, ForInOfLeft, ForInit, Program, Stmt};
 use crate::builtins::Intrinsics;
 use crate::value::{
-    array_index_of, units_from_str, units_to_lossy, Binding, EnvFrame, EnvId, NativeErrorKind,
-    ObjId, ObjKind, Object, Prop, PropVal, Units, Value,
+    Binding, EnvFrame, EnvId, NativeErrorKind, ObjId, ObjKind, Object, Prop, PropVal, Units, Value,
+    array_index_of, units_from_str, units_to_lossy,
 };
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use trust_js_trace::HostEvent;
 
 pub const MAX_CALL_DEPTH: u32 = 512;
 pub const MAX_LOOP_ITERS: u64 = 1_000_000;
@@ -149,7 +151,10 @@ enum VarTarget {
 /// against Node).
 pub enum JsRef {
     Env(String),
-    Member { base: Value, key: RefKey },
+    Member {
+        base: Value,
+        key: RefKey,
+    },
     /// A super property reference: [[HomeObject]].[[GetPrototypeOf]] base
     /// with the method's `this` as receiver.
     SuperMember {
@@ -371,16 +376,12 @@ impl Interp {
             for f in &prog.funcs {
                 let fobj = self.create_function(f, lex, true, None);
                 let key = units_from_str(f.name.as_ref().expect("declaration has a name"));
-                self.obj_mut(self.global)
-                    .props
-                    .insert(key, Prop::data(Value::Obj(fobj)));
+                self.obj_mut(self.global).props.insert(key, Prop::data(Value::Obj(fobj)));
             }
             for v in &prog.vars {
                 let key = units_from_str(v);
                 if !self.obj(self.global).props.contains_key(&key) {
-                    self.obj_mut(self.global)
-                        .props
-                        .insert(key, Prop::data(Value::Undefined));
+                    self.obj_mut(self.global).props.insert(key, Prop::data(Value::Undefined));
                 }
             }
             lex
@@ -417,7 +418,7 @@ impl Interp {
             Err(_) => {
                 return Err(Abrupt::Fatal(
                     "eval source contains a lone surrogate (out of slice)".to_string(),
-                ))
+                ));
             }
         };
         // A direct eval evaluated inside a formal-parameter initializer runs
@@ -585,9 +586,7 @@ impl Interp {
                 }
                 VarTarget::Global => {
                     let key = units_from_str(&name);
-                    self.obj_mut(self.global)
-                        .props
-                        .insert(key, Prop::data(Value::Obj(fobj)));
+                    self.obj_mut(self.global).props.insert(key, Prop::data(Value::Obj(fobj)));
                 }
             }
         }
@@ -606,9 +605,7 @@ impl Interp {
                 VarTarget::Global => {
                     let key = units_from_str(name);
                     if !self.obj(self.global).props.contains_key(&key) {
-                        self.obj_mut(self.global)
-                            .props
-                            .insert(key, Prop::data(Value::Undefined));
+                        self.obj_mut(self.global).props.insert(key, Prop::data(Value::Undefined));
                     }
                 }
             }
@@ -719,10 +716,7 @@ impl Interp {
             Stmt::Block(body) => {
                 let env = self.alloc_env(Some(ctx.env));
                 self.declare_lexical(env, body)?;
-                let inner = Ctx {
-                    env,
-                    ..ctx.clone()
-                };
+                let inner = Ctx { env, ..ctx.clone() };
                 let mut v: Option<Value> = None;
                 self.eval_stmt_list(body, &inner, &mut v)?;
                 Ok(v)
@@ -780,12 +774,7 @@ impl Interp {
                     }
                 }
             }
-            Stmt::For {
-                init,
-                test,
-                update,
-                body,
-            } => {
+            Stmt::For { init, test, update, body } => {
                 let mut loop_ctx = ctx.clone();
                 let mut per_iter: Option<Vec<String>> = None;
                 match init {
@@ -799,15 +788,9 @@ impl Interp {
                                     }
                                 }
                                 BindTarget::Pattern(p) => {
-                                    let e =
-                                        ie.as_ref().expect("parser: pattern has initializer");
+                                    let e = ie.as_ref().expect("parser: pattern has initializer");
                                     let val = self.eval_expr(e, ctx)?;
-                                    self.destructure(
-                                        p,
-                                        &val,
-                                        ctx,
-                                        crate::pattern::BindMode::Var,
-                                    )?;
+                                    self.destructure(p, &val, ctx, crate::pattern::BindMode::Var)?;
                                 }
                             }
                         }
@@ -832,10 +815,7 @@ impl Interp {
                                 },
                             );
                         }
-                        loop_ctx = Ctx {
-                            env: loop_env,
-                            ..ctx.clone()
-                        };
+                        loop_ctx = Ctx { env: loop_env, ..ctx.clone() };
                         for (t, ie) in decls {
                             match t {
                                 BindTarget::Name(n) => {
@@ -846,8 +826,7 @@ impl Interp {
                                     self.initialize_binding(loop_env, n, val);
                                 }
                                 BindTarget::Pattern(p) => {
-                                    let e =
-                                        ie.as_ref().expect("parser: pattern has initializer");
+                                    let e = ie.as_ref().expect("parser: pattern has initializer");
                                     let val = self.eval_expr(e, &loop_ctx)?;
                                     self.destructure(
                                         p,
@@ -863,10 +842,7 @@ impl Interp {
                             // the first test, and again before each update.
                             let names: Vec<String> = all_names;
                             let e = self.copy_iteration_env(loop_env, &names, ctx.env);
-                            loop_ctx = Ctx {
-                                env: e,
-                                ..ctx.clone()
-                            };
+                            loop_ctx = Ctx { env: e, ..ctx.clone() };
                             per_iter = Some(names);
                         }
                     }
@@ -897,10 +873,7 @@ impl Interp {
                     }
                     if let Some(names) = &per_iter {
                         let e = self.copy_iteration_env(loop_ctx.env, names, ctx.env);
-                        loop_ctx = Ctx {
-                            env: e,
-                            ..ctx.clone()
-                        };
+                        loop_ctx = Ctx { env: e, ..ctx.clone() };
                     }
                     if let Some(u) = update {
                         self.eval_expr(u, &loop_ctx)?;
@@ -922,20 +895,13 @@ impl Interp {
             }
             Stmt::Break => Err(Abrupt::Break(None)),
             Stmt::Continue => Err(Abrupt::Continue(None)),
-            Stmt::Try {
-                block,
-                catch,
-                finally,
-            } => {
+            Stmt::Try { block, catch, finally } => {
                 let b = self.eval_block_scoped(block, ctx);
                 let handled = match b {
                     Err(Abrupt::Throw(exc)) => {
                         if let Some((param, cbody)) = catch {
                             let cenv = self.alloc_env(Some(ctx.env));
-                            let cctx = Ctx {
-                                env: cenv,
-                                ..ctx.clone()
-                            };
+                            let cctx = Ctx { env: cenv, ..ctx.clone() };
                             match param {
                                 None => {}
                                 Some(BindTarget::Name(p)) => {
@@ -985,26 +951,25 @@ impl Interp {
     fn eval_block_scoped(&mut self, body: &[Stmt], ctx: &Ctx) -> Compl {
         let env = self.alloc_env(Some(ctx.env));
         self.declare_lexical(env, body)?;
-        let inner = Ctx {
-            env,
-            ..ctx.clone()
-        };
+        let inner = Ctx { env, ..ctx.clone() };
         let mut v: Option<Value> = None;
         self.eval_stmt_list(body, &inner, &mut v)?;
         Ok(v)
     }
 
-    fn eval_switch(&mut self, disc: &Expr, cases: &[(Option<Expr>, Vec<Stmt>)], ctx: &Ctx) -> Compl {
+    fn eval_switch(
+        &mut self,
+        disc: &Expr,
+        cases: &[(Option<Expr>, Vec<Stmt>)],
+        ctx: &Ctx,
+    ) -> Compl {
         let d = self.eval_expr(disc, ctx)?;
         // One block scope for the whole case block.
         let env = self.alloc_env(Some(ctx.env));
         for (_, b) in cases {
             self.declare_lexical(env, b)?;
         }
-        let inner = Ctx {
-            env,
-            ..ctx.clone()
-        };
+        let inner = Ctx { env, ..ctx.clone() };
         // Selector search: source order, skipping default.
         let mut start: Option<usize> = None;
         for (i, (test, _)) in cases.iter().enumerate() {
@@ -1061,10 +1026,7 @@ impl Interp {
                         },
                     );
                 }
-                let hctx = Ctx {
-                    env: head_env,
-                    ..ctx.clone()
-                };
+                let hctx = Ctx { env: head_env, ..ctx.clone() };
                 self.eval_expr(e, &hctx)
             }
             _ => self.eval_expr(e, ctx),
@@ -1099,10 +1061,7 @@ impl Interp {
             }
             ForInOfLeft::Lex(target, is_const) => {
                 let env = self.alloc_env(Some(ctx.env));
-                let ictx = Ctx {
-                    env,
-                    ..ctx.clone()
-                };
+                let ictx = Ctx { env, ..ctx.clone() };
                 match target {
                     BindTarget::Name(name) => {
                         self.envs[env.0 as usize].bindings.insert(
@@ -1137,13 +1096,7 @@ impl Interp {
         }
     }
 
-    fn eval_for_in(
-        &mut self,
-        left: &ForInOfLeft,
-        obj: &Expr,
-        body: &Stmt,
-        ctx: &Ctx,
-    ) -> Compl {
+    fn eval_for_in(&mut self, left: &ForInOfLeft, obj: &Expr, body: &Stmt, ctx: &Ctx) -> Compl {
         let expr_val = self.eval_forinof_head(left, obj, ctx)?;
         let Some(mut st) = self.build_for_in_state(&expr_val)? else {
             // undefined/null: the head returns a break completion, which the
@@ -1182,9 +1135,8 @@ impl Interp {
                 cur = Some(*o);
             }
             Value::Str(s) => {
-                let mut snap: Vec<Units> = (0..s.len())
-                    .map(|i| units_from_str(&i.to_string()))
-                    .collect();
+                let mut snap: Vec<Units> =
+                    (0..s.len()).map(|i| units_from_str(&i.to_string())).collect();
                 snap.push(units_from_str("length"));
                 hops.push((EnumHop::StrOwn, snap));
                 cur = Some(self.intr.string_proto);
@@ -1229,7 +1181,8 @@ impl Interp {
             }
             if matches!(self.obj(o).kind, ObjKind::TypedArray { .. }) {
                 return Err(Abrupt::Fatal(
-                    "for-in over a typed array (element-index enumeration out of slice)".to_string(),
+                    "for-in over a typed array (element-index enumeration out of slice)"
+                        .to_string(),
                 ));
             }
             if matches!(self.obj(o).kind, ObjKind::Proxy { .. }) {
@@ -1243,12 +1196,7 @@ impl Interp {
             cur = self.obj(o).proto;
             n += 1;
         }
-        Ok(Some(ForInState {
-            hops,
-            cur: 0,
-            idx: 0,
-            visited: HashSet::new(),
-        }))
+        Ok(Some(ForInState { hops, cur: 0, idx: 0, visited: HashSet::new() }))
     }
 
     /// The next for-in key, with the spec's visited/shadow discipline and the
@@ -1327,13 +1275,7 @@ impl Interp {
         }
     }
 
-    fn eval_for_of(
-        &mut self,
-        left: &ForInOfLeft,
-        expr: &Expr,
-        body: &Stmt,
-        ctx: &Ctx,
-    ) -> Compl {
+    fn eval_for_of(&mut self, left: &ForInOfLeft, expr: &Expr, body: &Stmt, ctx: &Ctx) -> Compl {
         let val = self.eval_forinof_head(left, expr, ctx)?;
         let mut iter = self.slice_iterator(&val)?;
         let mut v = Value::Undefined;
@@ -1394,9 +1336,7 @@ impl Interp {
                 .bindings
                 .get(n)
                 .map_or(Value::Undefined, |b| b.value.clone());
-            self.envs[e.0 as usize]
-                .bindings
-                .insert(n.clone(), Binding::var(val));
+            self.envs[e.0 as usize].bindings.insert(n.clone(), Binding::var(val));
         }
         e
     }

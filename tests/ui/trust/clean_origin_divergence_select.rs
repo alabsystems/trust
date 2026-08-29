@@ -18,7 +18,7 @@ mod m {
     clean {
         def min2 (a : UInt64) (b : UInt64) : UInt64 := if a < b then a else b
     }
-    //~^^ ERROR the emitted body does not agree with the declaration
+    //~^^ ERROR the emitted body could not be established to agree with the declaration
 }
 
 fn main() {

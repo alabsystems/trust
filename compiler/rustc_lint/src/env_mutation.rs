@@ -16,6 +16,7 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust,compile_fail
+    /// #![deny(env_mutation)]
     /// unsafe { std::env::set_var("KEY", "VALUE") };
     /// ```
     ///
@@ -31,17 +32,38 @@ declare_lint! {
     /// mutation through a single lock-scoped helper that sets, runs, and
     /// restores the variable under a global lock, and scope an exception for
     /// exactly that blessed call site with `#[allow(env_mutation)]`.
-    // Trust: `Warn` by default, not `Deny`. This lint is a Trust-specific safety
-    // stance (env-mutation races), but a default-`Deny` breaks a CLEAN build of
-    // the compiler's own first-party tool fleet from an empty cache — 352 lib/bin
-    // call sites across ay, ty, trust-cg, trust-vc, ... legitimately manage env
-    // vars (RUSTC_BOOTSTRAP set-restore, solver config) and it was only ever green
-    // because cached tool `.rlib`s masked the lint. Emitting at `Warn` keeps the
-    // full diagnostic signal (every site is still reported) without gating the
-    // toolchain build; crates that want hard enforcement opt in with
-    // `#![deny(env_mutation)]` (or the whole-VC verified surface can escalate it).
+    // Trust: `Allow` by default. This is a Trust-SPECIFIC safety stance, and a
+    // default-on level of ANY severity breaks the release gate that outranks it:
+    // "All valid Rust must compile identically" (CLAUDE.md, upstream discipline).
+    // A warning is still output — it lands in stderr, which is what upstream UI
+    // tests compare — so `Warn` fails every upstream test whose subject legally
+    // mutates the environment.
+    //
+    // Measured 2026-08-23 by `targo trust domination upstream-tests --execute`,
+    // the first run of that gate to reach the suite: 8 of its 15 upstream UI
+    // failures were THIS LINT and nothing else —
+    //   tests/ui/backtrace/{std-backtrace,line-tables-only,dylib-dep}.rs
+    //   tests/ui/command/command-exec.rs   tests/ui/issues/issue-45731.rs
+    //   tests/ui/process/{process-envs,process-remove-from-env}.rs
+    //   tests/ui/rust-2024/unsafe-env-suggestion.rs
+    // and the count grows with every upstream test that touches `set_var`.
+    // Blessing them would record a Trust opinion as an upstream expectation.
+    //
+    // The earlier note here reasoned only about `Deny` vs `Warn` for the
+    // first-party tool fleet (352 legitimate call sites across ay, ty, trust-cg,
+    // trust-vc that manage `RUSTC_BOOTSTRAP` and solver config). That trade-off
+    // is real and is unchanged — it is simply not the only constraint. `Allow`
+    // satisfies both: the toolchain builds, and upstream code compiles
+    // identically.
+    //
+    // NOTHING IS LOST for the code Trust owns. `crates/Cargo.toml`'s
+    // `[workspace.lints.rust]` now carries `env_mutation = "warn"`, which every
+    // Trust-owned member inherits through `[lints] workspace = true` — the
+    // opt-in that `src/tools/tidy/src/workspace_lints.rs` ratchets at zero, so
+    // a member cannot silently drop out of it. Escalate per crate with
+    // `#![deny(env_mutation)]` where the stance should be hard.
     pub ENV_MUTATION,
-    Warn,
+    Allow,
     "mutation of the process-global environment"
 }
 

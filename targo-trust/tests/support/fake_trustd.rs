@@ -1,14 +1,13 @@
 #![cfg(unix)]
 
-use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
 use std::time::Duration;
+use std::{fs, thread};
 
 static TRUSTD_LOCK: Mutex<()> = Mutex::new(());
 

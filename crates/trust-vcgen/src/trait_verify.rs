@@ -271,10 +271,7 @@ fn return_place_derived_leaf(name: &str) -> bool {
         .any(|suffix| name.strip_suffix(suffix).is_some_and(return_place_derived_leaf))
 }
 
-fn parameter_derived_leaf(
-    name: &str,
-    parameters: &std::collections::BTreeSet<&str>,
-) -> bool {
+fn parameter_derived_leaf(name: &str, parameters: &std::collections::BTreeSet<&str>) -> bool {
     if parameters.contains(name) {
         return true;
     }
@@ -287,11 +284,9 @@ fn parameter_derived_leaf(
     if let Some((base, _)) = name.split_once('.') {
         return parameter_derived_leaf(base, parameters);
     }
-    ["__len", "__discr", "__value", "__sign"]
-        .into_iter()
-        .any(|suffix| name.strip_suffix(suffix).is_some_and(|base| {
-            parameter_derived_leaf(base, parameters)
-        }))
+    ["__len", "__discr", "__value", "__sign"].into_iter().any(|suffix| {
+        name.strip_suffix(suffix).is_some_and(|base| parameter_derived_leaf(base, parameters))
+    })
 }
 
 /// Build a conjunction of formulas. Returns `true` for empty input.

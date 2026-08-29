@@ -194,16 +194,24 @@ impl RewriteEngine {
                             file_path: rewrite.file_path.clone(),
                             reason: error.to_string(),
                         })?;
-                Ok(self.insert_at(
+                // When the clause splits a line (a `{` on the signature line),
+                // the signature's trailing blanks would otherwise survive at
+                // end-of-line in the rewritten output. Back the insertion
+                // point over them so generated code never carries trailing
+                // whitespace (which a formatting sweep would silently strip,
+                // desynchronizing byte-exact fixtures from this engine).
+                let insert_offset = source[..rewrite.offset].trim_end_matches([' ', '\t']).len();
+                let clause_text = self.format_contract_clause_insertion(
                     source,
-                    rewrite.offset,
-                    &self.format_contract_clause_insertion(
-                        source,
-                        rewrite.offset,
-                        clause.keyword(),
-                        &expression,
-                    ),
-                ))
+                    insert_offset,
+                    clause.keyword(),
+                    &expression,
+                );
+                let mut result = String::with_capacity(source.len() + clause_text.len());
+                result.push_str(&source[..insert_offset]);
+                result.push_str(&clause_text);
+                result.push_str(&source[rewrite.offset..]);
+                Ok(result)
             }
             RewriteKind::ReplaceExpression { old_text, new_text } => {
                 self.replace_at(source, rewrite, old_text, new_text)

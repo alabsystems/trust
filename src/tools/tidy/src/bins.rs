@@ -123,6 +123,25 @@ mod os_impl {
             ".hooks/commit-msg",
             // Extensionless tool scripts that are intentionally executable.
             "src/tools/miri/miri",
+            // Trust: git hook sources. Git dispatches hooks by EXACT filename,
+            // so these cannot carry a `.sh` extension and cannot be skipped by
+            // the extension test above; they must stay executable because
+            // `core.hooksPath` runs them directly. Both directories are listed
+            // because they are mutually exclusive installs — see CLAUDE.md,
+            // "Two hook directories, and which one to install".
+            "scripts/hooks/post-checkout",
+            "scripts/hooks/post-merge",
+            "scripts/hooks/post-rewrite",
+            "scripts/hooks/pre-push",
+            "scripts/hooks-pin/post-checkout",
+            "scripts/hooks-pin/post-merge",
+            "scripts/hooks-pin/post-rewrite",
+            "scripts/hooks-pin/pre-push",
+            // Trust: the dyld anti-contamination wrapper every measurement lane
+            // copies (`scripts/seal_driver.sh`, and the 2026-08-13 verification
+            // -integrity report). A POSIX shell script, deliberately named
+            // without an extension because lanes invoke it as a bare `tc`.
+            "scratchpad/wave-tr-ledger/tc",
         ];
 
         for p in RI_EXCLUSION_LIST {

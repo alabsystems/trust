@@ -8,11 +8,7 @@ fn denominator_is_valid(den: u32) -> bool {
 }
 
 fn ratio_guarded(num: u32, den: u32) -> u32 {
-    if denominator_is_valid(den) {
-        num / den
-    } else {
-        0
-    }
+    if denominator_is_valid(den) { num / den } else { 0 }
 }
 
 fn main() {

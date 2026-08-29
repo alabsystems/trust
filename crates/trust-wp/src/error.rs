@@ -3,12 +3,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-//! Error types for the trust_wp tRustc integration boundary.
+//! Error types for standalone trust_wp compatibility and inspection APIs.
 
 /// Errors from the trust_wp library integration.
 #[derive(Debug, thiserror::Error)]
 pub enum TrustWpLibError {
-    /// The trust_wp binary was not found at the configured path or on PATH.
+    /// The trust_wp binary was not found at the explicitly configured path.
     #[error("trust-wp binary not found: {reason}")]
     BinaryNotFound {
         /// Details about where we looked.

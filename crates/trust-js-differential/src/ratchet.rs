@@ -159,8 +159,8 @@ fn load_ledger(path: &Path) -> anyhow::Result<Option<CoverageLedger>> {
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-    let ledger: CoverageLedger = toml::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+    let ledger: CoverageLedger =
+        toml::from_str(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     Ok(Some(ledger))
 }
 
@@ -219,8 +219,9 @@ pub fn run_ratchet(opts: &RatchetOpts) -> anyhow::Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde::Deserialize;
+
+    use super::*;
 
     fn totals(head: CoverageHead, counts: (u64, u64, u64, u64, u64)) -> ScorecardTotals {
         let (cases, covered, equal, divergent, no_coverage) = counts;
@@ -288,10 +289,16 @@ mod tests {
         let t = totals(CoverageHead::Trustjs, (100, 40, 40, 0, 60));
         let findings = check_findings(&t, Some(&l));
         assert_eq!(findings.len(), 2, "{findings:?}");
-        assert!(findings.iter().any(|f| f.contains("head trustjs") && f.contains("40 < ledger covered 45")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("head trustjs") && f.contains("40 < ledger covered 45"))
+        );
         // The sem head is checked independently: a scorecard that never ran
         // sem (covered 0) regresses against its floor — fail-closed.
-        assert!(findings.iter().any(|f| f.contains("head sem") && f.contains("0 < ledger covered 90")));
+        assert!(
+            findings.iter().any(|f| f.contains("head sem") && f.contains("0 < ledger covered 90"))
+        );
     }
 
     #[test]
@@ -415,7 +422,12 @@ mod tests {
         assert_eq!(run_ratchet(&opts).expect("check"), 0);
 
         // Propose still prints (exit 0) with the ledger missing.
-        let opts = RatchetOpts { scorecard: sc_path.clone(), ledger: missing_ledger, propose: true, allow_soundness_decrease: false };
+        let opts = RatchetOpts {
+            scorecard: sc_path.clone(),
+            ledger: missing_ledger,
+            propose: true,
+            allow_soundness_decrease: false,
+        };
         assert_eq!(run_ratchet(&opts).expect("propose"), 0);
 
         // With a higher floor on record the check fails (exit 1).
@@ -425,13 +437,22 @@ mod tests {
             toml::to_string(&ledger(vec![entry("cov-1", CoverageHead::Trustjs, 50)])).unwrap(),
         )
         .unwrap();
-        let opts =
-            RatchetOpts { scorecard: sc_path.clone(), ledger: ledger_path.clone(), propose: false, allow_soundness_decrease: false };
+        let opts = RatchetOpts {
+            scorecard: sc_path.clone(),
+            ledger: ledger_path.clone(),
+            propose: false,
+            allow_soundness_decrease: false,
+        };
         assert_eq!(run_ratchet(&opts).expect("check"), 1);
 
         // A corrupt ledger is a hard error, never a silent pass.
         std::fs::write(&ledger_path, "schema_version = \"1\"\nnot toml [").unwrap();
-        let opts = RatchetOpts { scorecard: sc_path, ledger: ledger_path, propose: false, allow_soundness_decrease: false };
+        let opts = RatchetOpts {
+            scorecard: sc_path,
+            ledger: ledger_path,
+            propose: false,
+            allow_soundness_decrease: false,
+        };
         assert!(run_ratchet(&opts).is_err());
     }
 }

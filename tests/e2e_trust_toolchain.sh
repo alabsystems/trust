@@ -583,7 +583,7 @@ suite_by_name = {
     for suite in report.get("verifier_suites", [])
     if isinstance(suite, dict)
 }
-expected_suites = ["trust-mc", "trust-wp", "trust-vc"]
+expected_suites = ["trust-mc", "trust-vc"]
 for name in expected_suites:
     suite = suite_by_name.get(name)
     if not suite:
@@ -592,6 +592,12 @@ for name in expected_suites:
         fail(f"{name} adapter is not compiled: {suite!r}")
     if suite.get("capability_available") is not True:
         fail(f"{name} capability is not available: {suite!r}")
+trust_wp = suite_by_name.get("trust-wp")
+if trust_wp is not None:
+    if trust_wp.get("capability_available") is not False:
+        fail(f"retired trust-wp route claims capability: {trust_wp!r}")
+    if (trust_wp.get("manifest") or {}).get("capabilities") not in ([], None):
+        fail(f"retired trust-wp manifest is not zero-capability: {trust_wp!r}")
 PY
 }
 

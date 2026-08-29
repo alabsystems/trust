@@ -179,11 +179,15 @@ fn main() {
             t.lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .filter_map(|l| u32::from_str_radix(l.split_whitespace().next().unwrap_or(l), 16).ok())
+                .filter_map(|l| {
+                    u32::from_str_radix(l.split_whitespace().next().unwrap_or(l), 16).ok()
+                })
                 .collect(),
         )
     } else {
-        eprintln!("usage: natinv --full | --sample COUNT | --words FILE  [--workers N] [--workdir D] [--out PREFIX]");
+        eprintln!(
+            "usage: natinv --full | --sample COUNT | --words FILE  [--workers N] [--workdir D] [--out PREFIX]"
+        );
         std::process::exit(2);
     };
 
@@ -275,9 +279,7 @@ fn main() {
                 drop(s);
                 *scanned = 0;
                 if done % (200 * CHUNK as u64) < CHUNK as u64 {
-                    eprintln!(
-                        "  .. scanned {done} / {total_words}  violations so far {viol}"
-                    );
+                    eprintln!("  .. scanned {done} / {total_words}  violations so far {viol}");
                 }
                 buf.clear();
             };
@@ -322,9 +324,15 @@ fn main() {
         s.candidates,
         100.0 * s.candidates as f64 / s.scanned.max(1) as f64
     );
-    p!("attribution: {} words whose opcode is outside the attributed decoder leaf{}",
+    p!(
+        "attribution: {} words whose opcode is outside the attributed decoder leaf{}",
         s.attribution_errors,
-        if s.attribution_errors == 0 { " (mirror agrees with the decoder)" } else { " — RANKING BELOW IS SUSPECT" });
+        if s.attribution_errors == 0 {
+            " (mirror agrees with the decoder)"
+        } else {
+            " — RANKING BELOW IS SUSPECT"
+        }
+    );
     p!("");
     p!("-- native outcome over the candidate set --");
     for i in 0..OUT_N {
@@ -346,8 +354,11 @@ fn main() {
 
     if v > 0 {
         p!("-- violations by decoder function --");
-        let mut rows: Vec<_> =
-            s.by_fn.iter().map(|(f, t)| (*f, t.counts[OUT_SIGILL], t.counts.iter().sum::<u64>())).collect();
+        let mut rows: Vec<_> = s
+            .by_fn
+            .iter()
+            .map(|(f, t)| (*f, t.counts[OUT_SIGILL], t.counts.iter().sum::<u64>()))
+            .collect();
         rows.sort_by_key(|(_, sig, _)| std::cmp::Reverse(*sig));
         for (f, sig, tot) in rows.iter().filter(|(_, s, _)| *s > 0) {
             p!("{f:<52} {sig:>12} / {tot:<12} ({:>6.2}%)", 100.0 * *sig as f64 / *tot as f64);
@@ -361,7 +372,10 @@ fn main() {
             .collect();
         rows.sort_by_key(|(_, _, sig, _)| std::cmp::Reverse(*sig));
         for (f, o, sig, tot) in rows.iter().filter(|(_, _, s, _)| *s > 0).take(60) {
-            p!("{f:<44} {o:<12} {sig:>12} / {tot:<12} ({:>6.2}%)", 100.0 * *sig as f64 / *tot as f64);
+            p!(
+                "{f:<44} {o:<12} {sig:>12} / {tot:<12} ({:>6.2}%)",
+                100.0 * *sig as f64 / *tot as f64
+            );
         }
     }
 

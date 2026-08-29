@@ -69,7 +69,26 @@ pub fn transfer_function(
                 && matches!(func.body.locals.get(place.local).map(|l| &l.ty), Some(Ty::Bool));
             if !is_bool_dest {
                 let target_name = crate::place_to_var_name(func, place);
-                let interval = eval_rvalue(rvalue, func, state);
+                let mut interval = eval_rvalue(rvalue, func, state);
+                // Trust (2026-08-20, bare-BinaryOp wrapping): a PLAIN MIR
+                // integer `Add`/`Sub`/`Mul` WRAPS mod 2^w — the
+                // overflow-checked form is the separate `CheckedBinaryOp` +
+                // `Assert` pair, whose overflow path never survives past its
+                // assert edge. `eval_rvalue`'s mathematical interval is exact
+                // for the bare form ONLY when it fits the destination type
+                // entirely (then no input drawn from the operand intervals can
+                // wrap); otherwise some execution may wrap and the machine
+                // value can land anywhere in the type's range — clamp to that
+                // full range (sound: it contains every machine value; Top when
+                // the type range is unknown/unrepresentable). Without this,
+                // `a ∈ [0,3] ⇒ a - 1 ∈ [-1,2]` EXCLUDED the real wrapped
+                // value `u64::MAX` at `a == 0`, and `try_discharge_batch`
+                // could discharge a bounds VC the runtime violates — the
+                // interval-lane sibling of the unbounded-def false PROVE
+                // fixed in `guards::extract_block_definitions` the same day.
+                if let Rvalue::BinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, ..) = rvalue {
+                    interval = clamp_bare_binop_to_dest_range(interval, func, place);
+                }
                 result.set(target_name, interval);
             }
         }
@@ -111,7 +130,7 @@ fn transfer_terminator(
     if result.is_unreachable {
         return result;
     }
-    if matches!(terminator, Terminator::Call { .. }) {
+    if matches!(terminator, Terminator::Call { .. } | Terminator::TailCall { .. }) {
         let havoc = crate::generate::terminator_def_names(func, block);
         if !havoc.is_empty() {
             // Forget any tracked variable whose name is (prefix-)overlapped by a
@@ -122,6 +141,36 @@ fn transfer_terminator(
         }
     }
     result
+}
+
+/// The wrapping clamp for a bare (plain-MIR, therefore wrapping) integer
+/// binop's destination — see the call site in [`transfer_function`] for the
+/// soundness argument. Bottom passes through (unreachable stays unreachable);
+/// a math interval contained in the destination's representable range is kept
+/// EXACTLY (no input can wrap, so machine == math); anything else becomes the
+/// full type range, or Top when the destination's integer range is unknown
+/// (non-integer/u128 destinations — `type_bounds` refuses those).
+fn clamp_bare_binop_to_dest_range(
+    math: Interval,
+    func: &VerifiableFunction,
+    place: &Place,
+) -> Interval {
+    if math.is_bottom() {
+        return math;
+    }
+    let range = crate::place_ty_cow(func, place).as_deref().and_then(|ty| match ty {
+        // Faithful pointer-width spelling: the pinned 64-bit target
+        // (`Ty::int_width`'s own convention). Kept local to this clamp so
+        // `type_bounds`' authority surface in the discharge lane is unchanged.
+        Ty::PtrSizedInt { signed } => {
+            super::discharge::type_bounds(&Ty::Int { width: 64, signed: *signed })
+        }
+        other => super::discharge::type_bounds(other),
+    });
+    let Some((lo, hi)) = range else {
+        return Interval::TOP;
+    };
+    if math.lo >= lo && math.hi <= hi { math } else { Interval::new(lo, hi) }
 }
 
 /// Evaluate an rvalue to an interval.
@@ -218,7 +267,7 @@ fn terminator_successors(term: &Terminator) -> Vec<BlockId> {
         Terminator::Assert { target, .. } => vec![*target],
         Terminator::Call { target, .. } => target.iter().copied().collect(),
         Terminator::Opaque { targets, .. } => targets.clone(),
-        Terminator::Return | Terminator::Unreachable => vec![],
+        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => vec![],
         _ => vec![],
     }
 }
@@ -628,6 +677,21 @@ pub(crate) fn compute_successor_states(
     }
 }
 
+/// The typed `SwitchInt`-label decode this interval domain uses.
+///
+/// `Ty::decode_switch_label` declines `Bool` on purpose (a bool switch is a
+/// polarity, not an integer equality, and the FORMULA lanes render it
+/// themselves). This domain has no boolean sort — it narrows the integer
+/// interval of the modeled variable — so a bool discriminant is decoded as an
+/// unsigned width-1 value, reproducing the previous `0`/`1` narrowing EXACTLY.
+/// Anything wider than a bool's one bit is a malformed label and declines.
+fn interval_switch_label(ty: &Ty, raw: u128) -> Option<i128> {
+    if matches!(ty, Ty::Bool) {
+        return trust_types::decode_raw_two_complement(raw, 1, false);
+    }
+    ty.decode_switch_label(raw)
+}
+
 /// Narrow state for the SwitchInt otherwise branch.
 ///
 /// If the discriminant is a single variable, exclude all target values.
@@ -650,9 +714,17 @@ pub(crate) fn narrow_from_otherwise(
             return result;
         }
 
-        // Collect excluded values.
+        // Collect excluded values. A raw MIR arm label is a two's-complement
+        // BIT PATTERN at the discriminant's width, so it must be DECODED under
+        // that type before it can be compared against an interval over the
+        // value's mathematical range: the raw spelling read an `i32` `-1` arm as
+        // `4294967295`, which never touches `[-2^31, 2^31-1]`'s edges and so
+        // silently lost the exclusion. An undecodable label is DROPPED, which
+        // only widens the `otherwise` interval (fails closed).
+        let discr_ty = crate::operand_ty_cow(func, discr);
+        let Some(discr_ty) = discr_ty.as_deref() else { return result };
         let mut excluded: Vec<i128> =
-            targets.iter().filter_map(|(v, _)| i128::try_from(*v).ok()).collect();
+            targets.iter().filter_map(|(v, _)| interval_switch_label(discr_ty, *v)).collect();
         excluded.sort_unstable();
 
         if excluded.is_empty() {
@@ -905,7 +977,14 @@ fn narrow_from_condition(
     let mut result = state.clone();
     if let Operand::Copy(place) | Operand::Move(place) = discr {
         let name = crate::place_to_var_name(func, place);
-        if let Ok(v) = i128::try_from(value) {
+        // Decode the raw arm label under the discriminant's declared type before
+        // pinning the interval to it — `Interval::constant(4294967295)` for an
+        // `i32` `-1` arm is a WRONG (and, against the type's own range, empty)
+        // narrowing. An undecodable label leaves the interval untouched.
+        if let Some(v) = crate::operand_ty_cow(func, discr)
+            .as_deref()
+            .and_then(|t| interval_switch_label(t, value))
+        {
             result.set(name, Interval::constant(v));
         }
     }

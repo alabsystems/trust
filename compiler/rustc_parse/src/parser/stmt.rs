@@ -516,6 +516,40 @@ impl<'a> Parser<'a> {
     fn error_block_no_opening_brace_msg(&mut self, msg: Cow<'static, str>) -> Diag<'a> {
         let prev = self.prev_token.span;
         let sp = self.token.span;
+
+        // Trust: `invariant` and `decreases` are first-class loop clause
+        // keywords (two-language design E4/E5), but they are contextual
+        // identifiers, so reaching here means one was written in a position
+        // that has no clause slot. Vanilla recovery would offer
+        // `{ invariant } n <= limit`, which names no fix and is never what was
+        // meant. Name the construct and the positions that do exist instead.
+        if self.token.is_non_raw_ident_where(|id| matches!(id.name, sym::invariant | sym::decreases))
+            && let Some((ident, _)) = self.token.ident()
+        {
+            let name = ident.name;
+            let mut err = self.dcx().struct_span_err(
+                sp,
+                format!(
+                    "`{name}` is a Trust loop clause and is not allowed in this position"
+                ),
+            );
+            err.span_label(sp, format!("no `{name}` clause position here"));
+            err.note(
+                "first-class loop clauses go between a `while` or `loop` header and its body: \
+                 `while cond invariant P decreases e { .. }` or \
+                 `loop invariant P decreases e { .. }`",
+            );
+            err.note(
+                "`for` loops have no clause position: their header is entered through the \
+                 `IntoIterator::into_iter` call, which the verifier cannot model exactly",
+            );
+            err.note(
+                "a function-level termination measure is written in the signature instead: \
+                 `fn f(..) -> T decreases e { .. }`",
+            );
+            return err;
+        }
+
         let mut err = self.dcx().struct_span_err(sp, msg);
         self.label_expected_raw_ref(&mut err);
 

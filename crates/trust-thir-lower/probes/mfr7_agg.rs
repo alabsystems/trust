@@ -97,7 +97,7 @@ pub fn g09_four_middle_pair_equal(a: u32, b: u32, c: u32) -> G4 {
 
 #[inline(never)]
 pub fn g10_four_outer_pair_equal(a: u32, b: u32, c: u32) -> G4 {
-    G4 { a: a ^ b, b: c, c: c, d: a ^ b }
+    G4 { a: a ^ b, b: c, c, d: a ^ b }
 }
 
 #[inline(never)]

@@ -3,11 +3,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::FxHashMap;
 use std::hash::{Hash, Hasher};
 
 use super::arena::FormulaArena;
 use super::types::{FormulaNode, FormulaRef};
+use crate::fx::FxHashMap;
 
 impl FormulaArena {
     // -----------------------------------------------------------------------

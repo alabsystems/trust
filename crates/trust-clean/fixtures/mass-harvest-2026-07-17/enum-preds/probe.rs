@@ -110,11 +110,8 @@ fn main() {
     } else {
         Ordering::Greater
     };
-    let cf: ControlFlow<i32, i32> = if n > 0 {
-        ControlFlow::Break(n)
-    } else {
-        ControlFlow::Continue(n)
-    };
+    let cf: ControlFlow<i32, i32> =
+        if n > 0 { ControlFlow::Break(n) } else { ControlFlow::Continue(n) };
     let p: Poll<i32> = if n > 0 { Poll::Ready(n) } else { Poll::Pending };
     let b: Bound<i32> = if n > 1 {
         Bound::Included(n)

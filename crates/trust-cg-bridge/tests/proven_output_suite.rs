@@ -156,12 +156,10 @@ fn emit_text(func: &VerifiableFunction) -> (Vec<u8>, u64) {
 
 /// Extract the `__text` section bytes + vmaddr from a 64-bit Mach-O object.
 fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let rd_u32 = |o: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?))
-    };
-    let rd_u64 = |o: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?))
-    };
+    let rd_u32 =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(obj.get(o..o + 4)?.try_into().ok()?)) };
+    let rd_u64 =
+        |o: usize| -> Option<u64> { Some(u64::from_le_bytes(obj.get(o..o + 8)?.try_into().ok()?)) };
     if rd_u32(0)? != 0xfeed_facf {
         return None;
     }
@@ -262,9 +260,9 @@ fn sort_width(sort: &Sort) -> u32 {
 fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
     match f {
         Formula::Var(name, sort) => solver.bv_var(name, sort_width(sort)),
-        Formula::BitVec { value, width } => solver
-            .try_bv_const_bigint(&BigInt::from(*value), *width)
-            .expect("bv const"),
+        Formula::BitVec { value, width } => {
+            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
+        }
         Formula::BvAdd(a, b, _) => {
             let a = formula_to_term(solver, a);
             let b = formula_to_term(solver, b);
@@ -393,11 +391,7 @@ fn prove_output_equiv(func: &VerifiableFunction, ir_spec: &Formula) -> Verdict {
     let (code, base) = emit_text(func);
     assert!(!code.is_empty(), "emitted __text is empty for {}", func.name);
     let machine_out = symbolic_machine_output(&code, base);
-    if discharge_equal(&machine_out, ir_spec) {
-        Verdict::Proven
-    } else {
-        Verdict::CounterExample
-    }
+    if discharge_equal(&machine_out, ir_spec) { Verdict::Proven } else { Verdict::CounterExample }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,11 +413,7 @@ fn bin(op: fn(Box<Formula>, Box<Formula>, u32) -> Formula, a: Formula, b: Formul
 /// AArch64 32-bit variable shifts mask the shift amount to its low 5 bits.
 /// The IR spec models this with `amt & 31`.
 fn masked_shift_amt(n: u32) -> Formula {
-    Formula::BvAnd(
-        Box::new(wn(n)),
-        Box::new(Formula::BitVec { value: 31, width: 32 }),
-        32,
-    )
+    Formula::BvAnd(Box::new(wn(n)), Box::new(Formula::BitVec { value: 31, width: 32 }), 32)
 }
 
 // ---------------------------------------------------------------------------

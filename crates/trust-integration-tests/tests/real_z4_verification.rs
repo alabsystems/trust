@@ -10,7 +10,7 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_integration_tests::ay_test_support::{require_ay, ay_available};
+use trust_integration_tests::ay_test_support::{ay_available, require_ay};
 use trust_router::VerificationBackend;
 use trust_types::*;
 

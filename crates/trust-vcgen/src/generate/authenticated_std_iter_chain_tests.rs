@@ -126,6 +126,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: Option<BlockId>) 
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     }
 }

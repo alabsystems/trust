@@ -50,11 +50,9 @@ assert_eq!(None, finder.find(b"quux baz bar"));
 ```
 */
 
-use crate::{
-    arch::all::packedpair::HeuristicFrequencyRank,
-    cow::{self, CowBytes},
-    scan,
-};
+use crate::arch::all::packedpair::HeuristicFrequencyRank;
+use crate::cow::{self, CowBytes};
+use crate::scan;
 
 /// Prefilter controls whether heuristics are used to accelerate prefix
 /// matching.
@@ -230,10 +228,7 @@ impl<'h, 'n> Iterator for FindIter<'h, 'n> {
             Some(haystack_len) => match cow::as_slice(&self.finder.needle).len() {
                 // Empty needles always succeed and match at every point
                 // (including the very end)
-                0 => (
-                    haystack_len.saturating_add(1),
-                    haystack_len.checked_add(1),
-                ),
+                0 => (haystack_len.saturating_add(1), haystack_len.checked_add(1)),
                 needle_len => (0, Some(haystack_len / needle_len)),
             },
         }
@@ -458,10 +453,7 @@ impl<'n> FinderRev<'n> {
     /// assert_eq!(None, it.next());
     /// ```
     #[inline]
-    pub fn rfind_iter<'a, 'h>(
-        &'a self,
-        haystack: &'h [u8],
-    ) -> FindRevIter<'h, 'a> {
+    pub fn rfind_iter<'a, 'h>(&'a self, haystack: &'h [u8]) -> FindRevIter<'h, 'a> {
         let finder = FinderRev { needle: cow::borrowed(cow::as_slice(&self.needle)) };
         let pos = Some(haystack.len());
         FindRevIter { haystack, finder, pos }
@@ -521,10 +513,7 @@ impl FinderBuilder {
 
     /// Build a forward finder using the given needle from the current
     /// settings.
-    pub fn build_forward<'n, B: ?Sized + AsRef<[u8]>>(
-        &self,
-        needle: &'n B,
-    ) -> Finder<'n> {
+    pub fn build_forward<'n, B: ?Sized + AsRef<[u8]>>(&self, needle: &'n B) -> Finder<'n> {
         let _ = self.prefilter;
         Finder { needle: cow::borrowed(needle.as_ref()) }
     }
@@ -542,11 +531,7 @@ impl FinderBuilder {
     /// Build a forward finder using the given needle and a custom heuristic
     /// for determining the frequency of a given byte in the dataset. See
     /// [`HeuristicFrequencyRank`] for more details.
-    pub fn build_forward_with_ranker<
-        'n,
-        R: HeuristicFrequencyRank,
-        B: ?Sized + AsRef<[u8]>,
-    >(
+    pub fn build_forward_with_ranker<'n, R: HeuristicFrequencyRank, B: ?Sized + AsRef<[u8]>>(
         &self,
         _ranker: R,
         needle: &'n B,
@@ -574,10 +559,7 @@ impl FinderBuilder {
 
     /// Build a reverse finder using the given needle from the current
     /// settings.
-    pub fn build_reverse<'n, B: ?Sized + AsRef<[u8]>>(
-        &self,
-        needle: &'n B,
-    ) -> FinderRev<'n> {
+    pub fn build_reverse<'n, B: ?Sized + AsRef<[u8]>>(&self, needle: &'n B) -> FinderRev<'n> {
         FinderRev { needle: cow::borrowed(needle.as_ref()) }
     }
 

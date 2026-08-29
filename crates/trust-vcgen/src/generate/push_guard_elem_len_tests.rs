@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
-    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue,
-    SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+    Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{build_push_guard_elem_len_map, generate_vcs};
@@ -31,6 +30,7 @@ fn call(func: &str, args: Vec<Operand>, dest: usize, target: usize) -> Terminato
         span: sp(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     }
 }
@@ -131,12 +131,7 @@ fn build_matrix(
         BasicBlock {
             id: BlockId(5),
             stmts: vec![assign(7, Rvalue::Ref { mutable: true, place: Place::local(2) })],
-            terminator: call(
-                "std::vec::Vec::<Vec<i64>>::push",
-                vec![mv(7), mv(3)],
-                8,
-                push_target,
-            ),
+            terminator: call("std::vec::Vec::<Vec<i64>>::push", vec![mv(7), mv(3)], 8, push_target),
         },
         BasicBlock {
             id: BlockId(6),
@@ -152,8 +147,7 @@ fn build_matrix(
     ];
 
     if has_extra {
-        let mut bb9_stmts =
-            vec![assign(14, Rvalue::Ref { mutable: true, place: Place::local(2) })];
+        let mut bb9_stmts = vec![assign(14, Rvalue::Ref { mutable: true, place: Place::local(2) })];
         let bb9_term = if pop {
             call("std::vec::Vec::<Vec<i64>>::pop", vec![mv(14)], 15, 6)
         } else if index_mut_store {
@@ -175,7 +169,13 @@ fn build_matrix(
         name: "matrix".to_string(),
         def_path: "test::matrix".to_string(),
         span: sp(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::i64(), datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: Ty::i64(),
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],

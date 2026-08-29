@@ -68,15 +68,14 @@ use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch}
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_cg_lower::instructions::Opcode as LirOpcode;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::interpret::{InterpretValue, Interpreter};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
 use trust_ir::{Block, Constant, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build the aggregate-in-memory Module for sf(a,b) = { let t=(a,b); t.0+t.1 }.
@@ -240,7 +239,11 @@ fn count_single_ldr_str(code: &[u8], base: u64) -> (usize, usize) {
         if let Ok(insn) = decode_aarch64(&bytes, pc) {
             match insn.opcode {
                 Opcode::Str | Opcode::Strb | Opcode::Strh => strs += 1,
-                Opcode::Ldr | Opcode::Ldrb | Opcode::Ldrh | Opcode::Ldrsb | Opcode::Ldrsh
+                Opcode::Ldr
+                | Opcode::Ldrb
+                | Opcode::Ldrh
+                | Opcode::Ldrsb
+                | Opcode::Ldrsh
                 | Opcode::Ldrsw => ldrs += 1,
                 _ => {}
             }
@@ -305,7 +308,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort in machine output for {name}: {other:?}"),
     }

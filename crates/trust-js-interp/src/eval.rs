@@ -20,14 +20,16 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::interp::{hoist, Abrupt, Ctx, ERes, Interp};
 use std::rc::Rc;
+
 use trust_js_parse::ast::{Expr, Func, Stmt};
-use trust_js_parse::{parse_script, ParseOutcome, Program};
+use trust_js_parse::{ParseOutcome, Program, parse_script};
 use trust_js_value::{
     Binding, EnvId, ErrKind, FnData, FnFlavor, JsValue, NativeFn, ObjId, ObjKind, PropKey,
-    Property, PropValue,
+    PropValue, Property,
 };
+
+use crate::interp::{Abrupt, Ctx, ERes, Interp, hoist};
 
 /// Where a running eval hoists its `var`/function declarations.
 #[derive(Clone, Copy)]
@@ -106,26 +108,15 @@ impl Interp {
         // strictness + directness (PerformEval steps 12-16).
         let (lex_env, var_target) = if let Some(c) = caller {
             let lex = self.alloc_env(Some(c.env));
-            if strict {
-                (lex, VarTarget::Env(lex))
-            } else {
-                (lex, self.caller_var_target(c.env))
-            }
+            if strict { (lex, VarTarget::Env(lex)) } else { (lex, self.caller_var_target(c.env)) }
         } else {
             let lex = self.alloc_env(Some(EnvId(0)));
-            if strict {
-                (lex, VarTarget::Env(lex))
-            } else {
-                (lex, VarTarget::Global)
-            }
+            if strict { (lex, VarTarget::Env(lex)) } else { (lex, VarTarget::Global) }
         };
 
         self.eval_declaration_instantiation(&prog.body, lex_env, var_target, strict)?;
 
-        let ctx = Ctx {
-            env: lex_env,
-            strict,
-        };
+        let ctx = Ctx { env: lex_env, strict };
         let mut v: Option<JsValue> = None;
         self.eval_stmt_list(&prog.body, &ctx, &mut v)?;
         Ok(v.unwrap_or(JsValue::Undefined))
@@ -194,11 +185,8 @@ impl Interp {
     ) -> Result<(), Abrupt> {
         let analysis = hoist::analyze(body, strict).map_err(Abrupt::Fatal)?;
         let lexical = hoist::lexical_decls(body).map_err(Abrupt::Fatal)?;
-        let func_names: Vec<String> = analysis
-            .funcs
-            .iter()
-            .filter_map(|f| f.name.clone())
-            .collect();
+        let func_names: Vec<String> =
+            analysis.funcs.iter().filter_map(|f| f.name.clone()).collect();
 
         // VarDeclaredNames = var names + top-level function names.
         let mut var_names: Vec<String> = analysis.vars.clone();
@@ -230,10 +218,7 @@ impl Interp {
 
         // Lexical declarations (TDZ) into lexEnv.
         for (n, mutable) in &lexical {
-            self.heap
-                .env_mut(lex_env)
-                .bindings
-                .insert(n.clone(), Binding::tdz(*mutable));
+            self.heap.env_mut(lex_env).bindings.insert(n.clone(), Binding::tdz(*mutable));
         }
         // Function declarations: instantiated with lexEnv as scope, bound into
         // the variable target (last-wins already resolved by `analysis.funcs`).
@@ -284,7 +269,11 @@ impl Interp {
 
     /// CanDeclareGlobalFunction / CanDeclareGlobalVar for a non-extensible
     /// global: a new binding cannot be added, so throw TypeError up front.
-    fn can_declare_globals(&mut self, vars: &[String], func_names: &[String]) -> Result<(), Abrupt> {
+    fn can_declare_globals(
+        &mut self,
+        vars: &[String],
+        func_names: &[String],
+    ) -> Result<(), Abrupt> {
         let extensible = self.heap.obj(self.global).extensible;
         for f in func_names {
             let key = PropKey::from_str(f);
@@ -407,7 +396,7 @@ impl Interp {
             ParseOutcome::Unsupported { reason } => {
                 return Err(Abrupt::Fatal(format!(
                     "Function constructor body (out of slice): {reason}"
-                )))
+                )));
             }
         };
         let prog = Rc::new(prog);
@@ -438,7 +427,9 @@ impl Interp {
     fn dyn_fn_arg_string(&mut self, v: &JsValue) -> Result<String, Abrupt> {
         let u = self.to_string_units(v)?;
         String::from_utf16(&u).map_err(|_| {
-            Abrupt::Fatal("Function constructor argument with lone surrogate (out of slice)".to_string())
+            Abrupt::Fatal(
+                "Function constructor argument with lone surrogate (out of slice)".to_string(),
+            )
         })
     }
 

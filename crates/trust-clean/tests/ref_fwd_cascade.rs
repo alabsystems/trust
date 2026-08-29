@@ -3,14 +3,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use trust_clean::mirsem::{
-    CalleeFact, function_fully_faithful_witness_with_callees,
-};
+use trust_clean::mirsem::{CalleeFact, function_fully_faithful_witness_with_callees};
 use trust_types::VerifiableFunction;
 
 fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/ref-fwd-cascade-2026-07-17/dumps")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/ref-fwd-cascade-2026-07-17/dumps")
 }
 
 fn load_corpus() -> BTreeMap<String, VerifiableFunction> {

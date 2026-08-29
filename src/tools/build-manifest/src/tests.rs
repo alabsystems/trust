@@ -1,5 +1,6 @@
-use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::*;
 
 fn empty_manifest() -> Manifest {
     Manifest {

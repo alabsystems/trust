@@ -1,17 +1,18 @@
 #![deny(unused_variables)]
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Error};
 use build_helper::stage0_parser::{Stage0Config, VersionMetadata, parse_stage0_file};
 use curl::easy::Easy;
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 
 const PATH: &str = "src/stage0";
 const COMPILER_COMPONENTS: &[&str] = &[
     "trustc",
     "trust-std",
-    "targo", // Trust: produced frontend component is targo
+    "targo",         // Trust: produced frontend component is targo
     "tippy-preview", // Trust: produced linter component is tippy
     "trustfmt-preview",
     "trust-docs",

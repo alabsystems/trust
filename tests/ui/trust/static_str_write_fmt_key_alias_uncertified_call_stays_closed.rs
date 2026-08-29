@@ -55,6 +55,50 @@
 //! (specialization), and a GENERIC call whose key is spelled like a generic
 //! DEFINITION's path, a MEASURED still-open false proof. Both are enumerated on
 //! `direct_call_def_path`. The key is narrowed, NOT injective.
+//!
+//! # THE 2026-08-24 MOVE: A NEIGHBOUR ROW DISCHARGED, THE GUARDED ROW UNTOUCHED
+//!
+//! `render`'s Level 0 line dropped from ERROR "2 obligation(s) were not proved"
+//! to WARN with 1, and the ERROR pin minted for it on 2026-08-23 is gone. A
+//! refusal getting quieter is exactly the shape of a LOST REFUSAL, so it was
+//! graded on the rows and not the colour — `-Ztrust-verify-output=json`, stage2
+//! built from `8d592268f3`:
+//!
+//! ```text
+//! render — out of 2 obligation(s):
+//!   vc:…__render:assertion:0                 typed_kind=Unreachable
+//!     outcome=proved  solver=clean-kernel-certified
+//!     (assurance=Certified, validation=KernelRechecked, axiom_closure=Empty)
+//!   vc:…__render:assertion:panic-freedom:0   Assertion
+//!     "[trust-expected-absent-callee-assumption] call to absent callee
+//!      `<…render::S#1 as core::fmt::Write>::write_fmt` (body not in the
+//!      lowered bundle) may panic"
+//!     outcome=runtime_checked  solver=trust-full-verifier
+//!     proof_evidence suite=trust-mc status=UNSUPPORTED
+//! ```
+//!
+//! The row that moved is the `?`-desugar's `Unreachable`, which this file does
+//! not guard. THE ROW THIS FILE GUARDS — panic-freedom for the uncertified,
+//! `#[trust::skip]`-bodied `write_fmt` — is still charged, still unproved, and
+//! still names the disambiguated `S#1` callee, so the uncertified call STAYS
+//! CLOSED: both pinned errors still fire and the exit code is still 1. The
+//! reduction machinery itself did not move at all —
+//! `git diff d740d28560 HEAD -- trust_verify/static_str_write_fmt.rs
+//! trust_verify/dyn_dispatch_reliance.rs` is empty across the change.
+//!
+//! The NOTE annotation on `render` below pins the census line for the same
+//! reason the sibling `assumed_total_key_alias_write_fmt_recovery.rs` does. The
+//! two `strict verification failed` / `full verification skipped` pins witness
+//! that a refusal FIRED; neither would notice the guarded row ceasing to be
+//! CHARGED, because a `#[trust::skip]` body keeps the second error alive on its
+//! own. If that row is ever dropped the census reads `out of 1 obligation(s)`
+//! and this file goes red.
+//!
+//! (The annotation sigil is deliberately not spelled anywhere in this prose:
+//! compiletest's expectation regex matches it ANYWHERE on a line, comment or
+//! not, so quoting it in a doc comment mints a phantom expectation — and the
+//! follow-form does not merely fail, it PANICS the harness with "encountered
+//! without preceding" before any test runs.)
 #![no_std]
 #![allow(dead_code)]
 #![feature(register_tool)]
@@ -64,6 +108,7 @@ use core::fmt::{self, Write as _};
 
 pub fn render() -> fmt::Result {
     //~^ ERROR Trust strict verification failed
+    //~| NOTE Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked out of 2 obligation(s)
     {
         // Certified site: `Arguments::from_str`-backed, and its own `write_str`
         // is provably panic-free.

@@ -62,7 +62,20 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
 /// the rustc version can't be found to compare with `rustc_version()`.
 // Trust: (I7) — bumped 11 -> 12: +`trust_clean_verdict_digest` table,
 // +`trust_clean_island_sources`/`trust_clean_origin_exports` CrateRoot fields.
-const METADATA_VERSION: u8 = 12;
+//
+// Trust: bumped 12 -> 13 — f24fdb2fdb added `Statement::trust_modular_arith` to
+// the MIR statement encoding WITHOUT bumping this constant. MIR bodies ride
+// rmeta (`optimized_mir`/`mir_for_ctfe` tables), so that changed the wire format
+// while the header still said 12: a driver at f24fdb2fdb+ decoding a
+// pre-f24fdb2fdb v12 sysroot ICEs mid-stream ("invalid enum variant tag while
+// decoding `StmtDebugInfo`, expected 0..2, actual 15" — the missing trailing
+// bool misaligns the next statement's tag) instead of refusing with E0514.
+// This bump restores the refusal. NOTE FOR THE NEXT ENCODING CHANGE: any field
+// or variant added to a `TyEncodable` MIR type changes this format, even when
+// no rmeta TABLE changes — bump here in the SAME commit, and see
+// `seal_driver.sh sysrootcheck`'s decode probe, which catches the skew class
+// this comment exists to prevent.
+const METADATA_VERSION: u8 = 13;
 
 /// Metadata header which includes `METADATA_VERSION`.
 ///

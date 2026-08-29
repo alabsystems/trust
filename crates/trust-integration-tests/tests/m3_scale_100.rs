@@ -34,8 +34,8 @@
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
 use std::fmt::Write;
-use trust_types::fx::FxHashMap;
 
+use trust_types::fx::FxHashMap;
 use trust_types::{
     AggregateKind, AssertMessage, BasicBlock, BinOp, BlockId, Contract, ContractKind, Formula,
     LocalDecl, Operand, Place, Projection, Rvalue, Sort, SourceSpan, Statement, Terminator, Ty,
@@ -71,10 +71,7 @@ fn bounded(name: &str, lo: i128, hi: i128) -> Formula {
 
 /// `var != lit` for a named integer-typed variable.
 fn not_eq(name: &str, lit: i128) -> Formula {
-    Formula::Not(Box::new(Formula::Eq(
-        Box::new(ivar(name)),
-        Box::new(Formula::Int(lit)),
-    )))
+    Formula::Not(Box::new(Formula::Eq(Box::new(ivar(name)), Box::new(Formula::Int(lit)))))
 }
 
 /// `var < lit` for a named integer-typed variable.
@@ -218,10 +215,7 @@ fn make_division(name: &str, ty: Ty) -> VerifiableFunction {
     if ty_is_signed(&ty) {
         // Require divisor > 0 to also rule out the INT_MIN/-1 signed
         // division overflow.
-        preconditions.push(Formula::Gt(
-            Box::new(ivar("y")),
-            Box::new(Formula::Int(0)),
-        ));
+        preconditions.push(Formula::Gt(Box::new(ivar("y")), Box::new(Formula::Int(0))));
     }
     VerifiableFunction {
         name: name.to_string(),
@@ -765,8 +759,7 @@ fn make_len_check(name: &str) -> VerifiableFunction {
 /// so the worst-case product is 1_000_000 << u32::MAX.
 fn make_branching(name: &str) -> VerifiableFunction {
     let tuple_ty = Ty::Tuple(vec![Ty::u32(), Ty::Bool]);
-    let preconditions =
-        vec![bounded("x", 0, 1_000), bounded("y", 0, 1_000)];
+    let preconditions = vec![bounded("x", 0, 1_000), bounded("y", 0, 1_000)];
     VerifiableFunction {
         name: name.to_string(),
         def_path: format!("scale_crate::{name}"),
@@ -1180,7 +1173,8 @@ fn test_scale_full_pipeline_132_functions() {
     // obligations that must discharge through the in-process interval backend.
     let proved_pct = (functions_fully_proved as f64 / total_functions as f64) * 100.0;
     assert_eq!(
-        functions_fully_proved, total_functions,
+        functions_fully_proved,
+        total_functions,
         "all functions in the safe-pattern scale fixture should be fully proved; \
          got {functions_fully_proved}/{total_functions} ({proved_pct:.1}%); \
          proved={proved}, failed={failed}, unknown={unknown}; \

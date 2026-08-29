@@ -10,11 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChainValidator, ProofCertificate};
-
 use super::types::{
     ChangeKind, ComposedProof, CompositionError, CompositionNodeStatus, FunctionStrength,
 };
+use crate::{ChainValidator, ProofCertificate};
 
 /// A node in the proof composition DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

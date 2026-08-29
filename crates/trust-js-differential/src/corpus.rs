@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use crate::model::{CorpusPin, CORPUS_PIN_SCHEMA};
-use crate::util::{git_head, sha256_file, Finding};
+use crate::model::{CORPUS_PIN_SCHEMA, CorpusPin};
+use crate::util::{Finding, git_head, sha256_file};
 
 /// Recompute the pin manifest hash over the payload list as ordered.
 pub fn manifest_hash(pin: &CorpusPin) -> String {
@@ -117,10 +117,8 @@ pub fn corpus_verify(corpus: &Path, pin_path: &Path) -> Vec<Finding> {
                 "payload-sha256-drift",
                 format!("{}: pinned {} actual {actual}", payload.relative_path, payload.sha256),
             )),
-            Err(e) => findings.push(Finding::new(
-                "payload-missing",
-                format!("{}: {e}", payload.relative_path),
-            )),
+            Err(e) => findings
+                .push(Finding::new("payload-missing", format!("{}: {e}", payload.relative_path))),
         }
     }
 
@@ -168,11 +166,10 @@ mod tests {
             let abs = root.join(rel);
             std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
             std::fs::write(&abs, content).unwrap();
-            payloads
-                .push(PinPayload {
-                    relative_path: rel.to_string(),
-                    sha256: trust_js_trace::sha256_hex(content.as_bytes()),
-                });
+            payloads.push(PinPayload {
+                relative_path: rel.to_string(),
+                sha256: trust_js_trace::sha256_hex(content.as_bytes()),
+            });
         }
         payloads.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         let mut pin = CorpusPin {

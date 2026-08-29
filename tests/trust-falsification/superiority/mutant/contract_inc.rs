@@ -6,4 +6,6 @@
 // (the postcondition fails) — proving the contract verification is non-vacuous.
 #[core::contracts::requires(x < 100)]
 #[core::contracts::ensures(move |ret: &u32| *ret > x)]
-pub fn contract_inc(x: u32) -> u32 { x }
+pub fn contract_inc(x: u32) -> u32 {
+    x
+}

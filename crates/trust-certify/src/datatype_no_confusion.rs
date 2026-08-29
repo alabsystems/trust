@@ -431,8 +431,9 @@ pub fn recheck_datatype_disequality(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_ir::ProofEvidence;
+
+    use super::*;
 
     // ── (a)(b)(c): the no-confusion reconstruction closes ────────────────────
 

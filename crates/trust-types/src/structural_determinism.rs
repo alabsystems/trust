@@ -49,7 +49,12 @@ fn statement_is_nondeterministic(stmt: &Statement) -> bool {
 /// (`Opaque`) control flow — which may hide a nondeterministic read (inline asm
 /// observing a hardware source, an unmodeled terminator), so it fails closed.
 fn terminator_is_nondeterministic(t: &Terminator) -> bool {
-    matches!(t, Terminator::Call { atomic: Some(_), .. } | Terminator::Opaque { .. })
+    matches!(
+        t,
+        Terminator::Call { atomic: Some(_), .. }
+            | Terminator::TailCall { atomic: Some(_), .. }
+            | Terminator::Opaque { .. }
+    )
 }
 
 /// Whether no block REACHABLE from the entry introduces own nondeterminism (see
@@ -121,6 +126,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         }
     }
@@ -147,6 +153,7 @@ mod tests {
             atomic: Some(an_atomic()),
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         };
         let blocks = vec![block(0, Vec::new(), atomic), block(1, Vec::new(), Terminator::Return)];
@@ -174,6 +181,7 @@ mod tests {
             atomic: Some(an_atomic()),
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
             unwind: UnwindEdge::Unreachable,
         };
         // bb0 returns; the atomic op in the unreachable bb1 cannot execute.

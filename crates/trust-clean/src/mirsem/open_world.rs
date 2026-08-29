@@ -621,7 +621,9 @@ pub fn check_cfg_rank_terminates() -> RefinementVerdict {
     check_cfg_rank_terminates_inner(None)
 }
 
-pub(super) fn check_cfg_rank_terminates_inner(claimed_concl_rank: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_cfg_rank_terminates_inner(
+    claimed_concl_rank: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
@@ -672,7 +674,9 @@ pub fn check_higher_order_call() -> RefinementVerdict {
     check_higher_order_call_inner(None)
 }
 
-pub(super) fn check_higher_order_call_inner(claimed_concl_post: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_higher_order_call_inner(
+    claimed_concl_post: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
@@ -727,7 +731,9 @@ pub fn check_higher_order_disjunction() -> RefinementVerdict {
     check_higher_order_disjunction_inner(None)
 }
 
-pub(super) fn check_higher_order_disjunction_inner(claimed_membership: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_higher_order_disjunction_inner(
+    claimed_membership: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
@@ -835,7 +841,9 @@ pub fn check_loop_invariant_rule() -> RefinementVerdict {
     check_loop_invariant_rule_inner(None)
 }
 
-pub(super) fn check_loop_invariant_rule_inner(claimed_concl_pred: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_loop_invariant_rule_inner(
+    claimed_concl_pred: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
@@ -888,7 +896,9 @@ pub fn check_loop_rank_terminates() -> RefinementVerdict {
     check_loop_rank_terminates_inner(None)
 }
 
-pub(super) fn check_loop_rank_terminates_inner(claimed_concl_rank: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_loop_rank_terminates_inner(
+    claimed_concl_rank: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),
@@ -1075,7 +1085,9 @@ pub fn check_call_refines_contract() -> RefinementVerdict {
     check_call_refines_contract_inner(None)
 }
 
-pub(super) fn check_call_refines_contract_inner(claimed_concl_pred: Option<&Expr>) -> RefinementVerdict {
+pub(super) fn check_call_refines_contract_inner(
+    claimed_concl_pred: Option<&Expr>,
+) -> RefinementVerdict {
     let mut env = match mirsem_env() {
         Ok(e) => e,
         Err(e) => return RefinementVerdict::KernelRejected(e),

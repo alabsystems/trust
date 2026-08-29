@@ -34,7 +34,8 @@ impl Heap {
     }
 
     pub fn alloc(&mut self, o: JsObject) -> ObjId {
-        let id = ObjId(u32::try_from(self.objects.len()).expect("heap bounded by interpreter caps"));
+        let id =
+            ObjId(u32::try_from(self.objects.len()).expect("heap bounded by interpreter caps"));
         self.objects.push(o);
         id
     }
@@ -56,8 +57,7 @@ impl Heap {
 
     /// Allocate a fresh user symbol with the given [[Description]].
     pub fn alloc_symbol(&mut self, desc: Option<Units>) -> SymId {
-        let id =
-            u32::try_from(self.symbols.len()).expect("symbols bounded by interpreter caps");
+        let id = u32::try_from(self.symbols.len()).expect("symbols bounded by interpreter caps");
         self.symbols.push(desc);
         SymId::User(id)
     }

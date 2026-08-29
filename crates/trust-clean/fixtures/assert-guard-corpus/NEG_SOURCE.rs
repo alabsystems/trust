@@ -13,11 +13,19 @@
 //     discharge it. The shape still recovers/reflects (adequacy), but the safety
 //     VC must stay UNDISCHARGED, so the function must NOT be counted fully
 //     faithful.
-pub fn either(c: bool, x: u64, y: u64) -> u64 { if c { x } else { y } }
+pub fn either(c: bool, x: u64, y: u64) -> u64 {
+    if c { x } else { y }
+}
 
 #[inline(never)]
-pub fn non_panic_helper(x: u64) -> u64 { x + 1 }
+pub fn non_panic_helper(x: u64) -> u64 {
+    x + 1
+}
 
-pub fn weird_guard(x: u64) -> u64 { if x < 1000000000 { x } else { non_panic_helper(x) } }
+pub fn weird_guard(x: u64) -> u64 {
+    if x < 1000000000 { x } else { non_panic_helper(x) }
+}
 
-pub fn unsafe_double(x: u64) -> u64 { x + x }
+pub fn unsafe_double(x: u64) -> u64 {
+    x + x
+}

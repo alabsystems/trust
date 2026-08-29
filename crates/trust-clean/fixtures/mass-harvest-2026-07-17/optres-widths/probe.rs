@@ -1,122 +1,226 @@
 #[inline(never)]
-pub fn opt_is_some_i8(o: &Option<i8>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_i8(o: &Option<i8>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_i8(o: &Option<i8>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_i8(o: &Option<i8>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_i8(r: &Result<i8, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_i8(r: &Result<i8, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_i8(r: &Result<i8, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_i8(r: &Result<i8, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_i16(o: &Option<i16>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_i16(o: &Option<i16>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_i16(o: &Option<i16>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_i16(o: &Option<i16>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_i16(r: &Result<i16, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_i16(r: &Result<i16, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_i16(r: &Result<i16, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_i16(r: &Result<i16, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_i32(o: &Option<i32>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_i32(o: &Option<i32>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_i32(o: &Option<i32>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_i32(o: &Option<i32>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_i32(r: &Result<i32, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_i32(r: &Result<i32, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_i32(r: &Result<i32, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_i32(r: &Result<i32, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_i64(o: &Option<i64>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_i64(o: &Option<i64>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_i64(o: &Option<i64>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_i64(o: &Option<i64>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_i64(r: &Result<i64, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_i64(r: &Result<i64, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_i64(r: &Result<i64, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_i64(r: &Result<i64, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_i128(o: &Option<i128>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_i128(o: &Option<i128>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_i128(o: &Option<i128>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_i128(o: &Option<i128>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_i128(r: &Result<i128, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_i128(r: &Result<i128, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_i128(r: &Result<i128, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_i128(r: &Result<i128, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_isize(o: &Option<isize>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_isize(o: &Option<isize>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_isize(o: &Option<isize>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_isize(o: &Option<isize>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_isize(r: &Result<isize, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_isize(r: &Result<isize, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_isize(r: &Result<isize, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_isize(r: &Result<isize, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_u8(o: &Option<u8>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_u8(o: &Option<u8>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_u8(o: &Option<u8>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_u8(o: &Option<u8>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_u8(r: &Result<u8, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_u8(r: &Result<u8, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_u8(r: &Result<u8, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_u8(r: &Result<u8, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_u16(o: &Option<u16>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_u16(o: &Option<u16>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_u16(o: &Option<u16>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_u16(o: &Option<u16>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_u16(r: &Result<u16, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_u16(r: &Result<u16, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_u16(r: &Result<u16, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_u16(r: &Result<u16, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_u32(o: &Option<u32>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_u32(o: &Option<u32>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_u32(o: &Option<u32>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_u32(o: &Option<u32>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_u32(r: &Result<u32, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_u32(r: &Result<u32, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_u32(r: &Result<u32, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_u32(r: &Result<u32, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_u64(o: &Option<u64>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_u64(o: &Option<u64>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_u64(o: &Option<u64>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_u64(o: &Option<u64>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_u64(r: &Result<u64, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_u64(r: &Result<u64, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_u64(r: &Result<u64, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_u64(r: &Result<u64, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_u128(o: &Option<u128>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_u128(o: &Option<u128>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_u128(o: &Option<u128>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_u128(o: &Option<u128>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_u128(r: &Result<u128, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_u128(r: &Result<u128, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_u128(r: &Result<u128, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_u128(r: &Result<u128, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn opt_is_some_usize(o: &Option<usize>) -> bool { Option::is_some(o) }
+pub fn opt_is_some_usize(o: &Option<usize>) -> bool {
+    Option::is_some(o)
+}
 #[inline(never)]
-pub fn opt_is_none_usize(o: &Option<usize>) -> bool { Option::is_none(o) }
+pub fn opt_is_none_usize(o: &Option<usize>) -> bool {
+    Option::is_none(o)
+}
 #[inline(never)]
-pub fn res_is_ok_usize(r: &Result<usize, u8>) -> bool { Result::is_ok(r) }
+pub fn res_is_ok_usize(r: &Result<usize, u8>) -> bool {
+    Result::is_ok(r)
+}
 #[inline(never)]
-pub fn res_is_err_usize(r: &Result<usize, u8>) -> bool { Result::is_err(r) }
+pub fn res_is_err_usize(r: &Result<usize, u8>) -> bool {
+    Result::is_err(r)
+}
 
 #[inline(never)]
-pub fn mcall_opt_is_some_i32(o: Option<i32>) -> bool { o.is_some() }
+pub fn mcall_opt_is_some_i32(o: Option<i32>) -> bool {
+    o.is_some()
+}
 
 #[inline(never)]
-pub fn mcall_opt_is_some_u64(o: Option<u64>) -> bool { o.is_some() }
+pub fn mcall_opt_is_some_u64(o: Option<u64>) -> bool {
+    o.is_some()
+}
 
 #[inline(never)]
-pub fn mcall_opt_is_some_i128(o: Option<i128>) -> bool { o.is_some() }
+pub fn mcall_opt_is_some_i128(o: Option<i128>) -> bool {
+    o.is_some()
+}
 
 #[inline(never)]
-pub fn mcall_opt_is_some_usize(o: Option<usize>) -> bool { o.is_some() }
+pub fn mcall_opt_is_some_usize(o: Option<usize>) -> bool {
+    o.is_some()
+}
 
 fn main() {
     let n = std::env::args().count();

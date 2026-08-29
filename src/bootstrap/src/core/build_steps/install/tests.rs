@@ -8,11 +8,9 @@ const WINDOWS_INSTALLER: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/installer/msi/rust.wxs"));
 
 fn opening_xml_element<'a>(document: &'a str, marker: &str) -> &'a str {
-    let start =
-        document.find(marker).unwrap_or_else(|| panic!("missing XML marker `{marker}`"));
+    let start = document.find(marker).unwrap_or_else(|| panic!("missing XML marker `{marker}`"));
     let remaining = &document[start..];
-    let end =
-        remaining.find('>').unwrap_or_else(|| panic!("unterminated XML element `{marker}`"));
+    let end = remaining.find('>').unwrap_or_else(|| panic!("unterminated XML element `{marker}`"));
     &remaining[..=end]
 }
 

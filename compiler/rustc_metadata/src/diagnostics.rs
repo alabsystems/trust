@@ -268,9 +268,7 @@ impl<'a> MissingNativeLibrary<'a> {
         let suggested_name = if !verbatim {
             // trust stage0-staircase shim: `strip_circumfix` is unstable on the 1.96
             // genesis seed; prefix-then-suffix is its exact definition.
-            if let Some(libname) =
-                libname.strip_prefix("lib").and_then(|s| s.strip_suffix(".a"))
-            {
+            if let Some(libname) = libname.strip_prefix("lib").and_then(|s| s.strip_suffix(".a")) {
                 // this is a unix style filename so trim prefix & suffix
                 Some(libname)
             } else if let Some(libname) = libname.strip_suffix(".lib") {

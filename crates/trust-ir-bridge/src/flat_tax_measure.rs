@@ -179,10 +179,7 @@ mod tests {
             // Combined reference (the function the compiler's cold path mirrors).
             let combined: GenResult =
                 trust_vcgen::generate_vcs_with_discharge_and_summaries_configured_with_context(
-                    func,
-                    &summaries,
-                    false,
-                    &ctx,
+                    func, &summaries, false, &ctx,
                 );
             let combined_key = key(&combined);
 
@@ -204,11 +201,8 @@ mod tests {
             // (b) prospective measurement-only re-discharge == combined. This
             // is not the compiler cache path and authorizes no generation skip.
             if let Some(raw_body) = raw {
-                let rehydrated = trust_vcgen::discharge_captured_raw_body_with_context(
-                    func,
-                    raw_body,
-                    &ctx,
-                );
+                let rehydrated =
+                    trust_vcgen::discharge_captured_raw_body_with_context(func, raw_body, &ctx);
                 assert_eq!(
                     key(&rehydrated),
                     combined_key,

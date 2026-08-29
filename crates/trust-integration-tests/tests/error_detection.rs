@@ -888,7 +888,10 @@ fn invalid_discriminant_safe() -> VerifiableFunction {
                 LocalDecl { index: 0, ty: Ty::u32(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt { adt_kind: None, layout: None, variants: Vec::new(),
+                    ty: Ty::Adt {
+                        adt_kind: None,
+                        layout: None,
+                        variants: Vec::new(),
                         name: "Option".to_string(),
                         fields: vec![
                             ("None".to_string(), Ty::Unit),
@@ -896,7 +899,9 @@ fn invalid_discriminant_safe() -> VerifiableFunction {
                         ],
                         disc_index_safe: false,
                         // Trust (B3-1 field completion): pre-existing E0063.
-                        faithful_enum_repr: None, enum_layout: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                    },
                     name: Some("opt".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::u32(), name: None },

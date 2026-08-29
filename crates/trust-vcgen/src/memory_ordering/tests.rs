@@ -3,12 +3,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use trust_types::UnwindEdge;
 use trust_types::{
     Aarch64AtomicSemanticFact, Aarch64ExclusiveMonitorSemantics, Aarch64SyncBoundaryKind,
     Aarch64SyncBoundarySemanticFact, Aarch64SyncOrdering, Aarch64SyncScope, AtomicOpKind,
     AtomicOperation, AtomicOrdering, AtomicRmwOp, ConcurrencyPoint, Formula, HappensBeforeEdgeKind,
-    MemoryAccessKind, MemoryOrderingSemantics, Place, Sort, SourceSpan, VcKind,
+    MemoryAccessKind, MemoryOrderingSemantics, Place, Sort, SourceSpan, UnwindEdge, VcKind,
 };
 
 use super::*;
@@ -2669,6 +2668,7 @@ fn make_spawn_join_function() -> trust_types::VerifiableFunction {
                     terminator: trust_types::Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::thread::spawn::<closure>".into(),
                         args: vec![trust_types::Operand::Move(trust_types::Place::local(1))],
@@ -2691,6 +2691,7 @@ fn make_spawn_join_function() -> trust_types::VerifiableFunction {
                     terminator: trust_types::Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "std::thread::JoinHandle::<()>::join".into(),
                         args: vec![trust_types::Operand::Move(trust_types::Place::local(2))],

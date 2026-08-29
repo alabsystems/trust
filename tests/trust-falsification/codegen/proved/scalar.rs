@@ -7,4 +7,6 @@
 // function's IR semantics on every input. A straight-line scalar arithmetic
 // function is inside the fragment where that proof is reachable.
 #[trust::verified_codegen]
-pub fn add(x: u32, y: u32) -> u32 { x.wrapping_add(y) }
+pub fn add(x: u32, y: u32) -> u32 {
+    x.wrapping_add(y)
+}

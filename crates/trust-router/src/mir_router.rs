@@ -1,9 +1,10 @@
 // trust-router/mir_router.rs: MIR-level verification strategy router
 //
-// Pipeline v2 target - classifies functions at the MIR level
-// and dispatches to trust-mc-lib (BMC plus CHC/PDR safety), trust-wp-lib
-// (deductive contracts), trust_vc (proof/refinement obligations), or the
-// existing v1 Formula-based pipeline. Sits ABOVE the existing Router.
+// Pipeline v2 target - classifies functions at the MIR level and dispatches to
+// trust-mc-lib (BMC plus CHC/PDR safety), trust_vc (proof/refinement
+// obligations), or the existing v1 Formula-based pipeline. The retained
+// TrustWP contract classification is a compatibility diagnostic that always
+// returns Unknown; it is not a proof route. Sits ABOVE the existing Router.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -15,7 +16,7 @@
 //! and dispatches each to the most appropriate verification backend:
 //!
 //! - **trust-mc-lib**: Safety/reachability via BMC plus target CHC/PDR proof modes
-//! - **trust-wp-lib**: Deductive verification for contract-bearing functions
+//! - **TrustWP compatibility classification**: diagnostic-only, always Unknown
 //! - **trust-vc**: Proof functions, ghost/refinement, and ownership obligations
 //! - **v1 pipeline**: The existing `Router` for everything else
 //!
@@ -44,9 +45,9 @@ pub enum MirStrategy {
     /// trust_mc safety/reachability. Current compatibility path is BMC-shaped;
     /// target tRustc integration can select BMC, CHC, or PDR/IC3.
     BoundedModelCheck,
-    /// Deductive via trust-wp-lib (contract verification).
+    /// Retired TrustWP contract classification; diagnostic-only and always Unknown.
     ContractVerification,
-    /// Unsafe audit - portfolio over trust-mc, trust-wp, and trust_vc where applicable.
+    /// Unsafe audit — active TrustMC plus a non-authoritative contract diagnostic.
     UnsafeAudit,
     /// Ownership/separation logic — v1 pipeline.
     SeparationLogic,
@@ -106,9 +107,9 @@ pub struct MirRouterConfig {
     /// When true, portfolio strategies are dispatched in parallel using rayon
     /// with early termination on the first definitive result.
     pub enable_portfolio_racing: bool,
-    /// Enable loop invariant inference via trust_wp before BMC dispatch.
-    /// When true, functions with loops are first analyzed by trust_wp for invariant
-    /// hints which are logged for the strengthen feedback loop.
+    /// Enable a standalone trust_wp invariant-hint diagnostic before BMC dispatch.
+    /// The hints are logged for non-verdict analysis only and never authorize or
+    /// strengthen the BMC result.
     pub infer_invariants: bool,
     /// Enable trust_cg codegen backend for scalar function lowering.
     /// When true (and the `trust_cg-backend` feature is enabled), the classifier
@@ -179,8 +180,9 @@ pub(crate) struct ShadowResult {
 ///
 /// The MirRouter sits above the existing `Router`, intercepting functions before
 /// VC generation. Functions with specific MIR-level properties (contracts, unsafe
-/// blocks, loops) are dispatched directly to specialized backends (trust-mc-lib,
-/// trust-wp-lib). Everything else falls through to the v1 pipeline.
+/// blocks, loops) are dispatched to active backends such as trust-mc-lib. The
+/// retained TrustWP contract classification reports a compatibility gap and
+/// cannot prove; everything else falls through to the v1 pipeline.
 pub struct MirRouter {
     /// The v1 VC-level router for fallback dispatch.
     v1_router: Router,
@@ -236,9 +238,11 @@ impl MirRouter {
     /// Classify a function to determine its verification strategy.
     ///
     /// The classification priority is:
-    /// 1. Has `unsafe` blocks with contracts -> UnsafeAudit (both backends)
-    /// 2. Has `#[requires]`/`#[ensures]` contracts -> ContractVerification (trust-wp)
-    /// 3. Has `#[invariant]` annotations -> ContractVerification (trust-wp)
+    /// 1. Has `unsafe` blocks with contracts -> UnsafeAudit (TrustMC plus diagnostic)
+    /// 2. Has `#[requires]`/`#[ensures]` contracts -> ContractVerification
+    ///    (retired compatibility classification; typed obligations are owned by TrustMC)
+    /// 3. Has `#[invariant]` annotations -> ContractVerification
+    ///    (retired compatibility classification; typed obligations are owned by TrustMC)
     /// 4. Has atomic operations / thread spawns -> DataRace
     /// 5. Has raw pointer operations -> SeparationLogic
     /// 6. Has FFI calls -> FFIBoundary
@@ -254,12 +258,12 @@ impl MirRouter {
         let has_ffi = has_ffi_calls(func);
         let has_loops = has_loops(func);
 
-        // Unsafe with contracts gets both backends for maximum coverage.
+        // Unsafe with contracts gets active TrustMC plus the contract-gap diagnostic.
         if has_unsafe && has_contracts {
             return MirStrategy::UnsafeAudit;
         }
 
-        // Contract-bearing functions go to trust_wp for deductive proof.
+        // Retain the historical contract classification, but never claim a proof.
         if has_contracts || has_invariant_annotations {
             return MirStrategy::ContractVerification;
         }
@@ -533,7 +537,12 @@ impl MirRouter {
         }
     }
 
-    /// Dispatch to trust-wp-lib for deductive contract verification.
+    /// Retired TrustWP compatibility gap.
+    ///
+    /// Contract strings do not carry body semantics, so this path always
+    /// returns `Unknown`; it is neither a current ownership route nor proof
+    /// authority. Active contract obligations are routed through typed
+    /// TrustMC requests by the full verifier.
     fn dispatch_contract(&self, func: &VerifiableFunction) -> VerificationResult {
         let contracts = build_trust_wp_contracts(func);
         if contracts.requires.is_empty()
@@ -547,9 +556,9 @@ impl MirRouter {
             };
         }
 
-        // Contract strings alone do not prove source behavior.
-        // Until the router passes executable MIR/body facts into trust-wp, keep
-        // this path as an explicit gap instead of upgrading to Proved.
+        // Contract strings alone do not prove source behavior. Keep this
+        // historical compatibility path as an explicit gap; it may not be
+        // upgraded or advertised as a current TrustWP route.
         VerificationResult::Unknown {
             solver: "trust-wp-lib".into(),
             time_ms: 0,
@@ -557,11 +566,13 @@ impl MirRouter {
         }
     }
 
-    /// Dispatch to both trust_mc and trust_wp for unsafe code audit.
+    /// Dispatch TrustMC plus the retired TrustWP compatibility diagnostic for
+    /// unsafe-code audit.
     ///
     /// When portfolio racing is enabled, dispatches BMC and contract verification
-    /// in parallel and returns the first definitive result. Otherwise runs both
-    /// sequentially and merges (preferring failure over proof).
+    /// in parallel and returns the first definitive result. The TrustWP arm is
+    /// permanently `Unknown`, so it cannot win as proof authority. Otherwise
+    /// both run sequentially and merge (preferring failure over proof).
     fn dispatch_unsafe_audit(&self, func: &VerifiableFunction) -> VerificationResult {
         if self.config.enable_portfolio_racing {
             let strategies =
@@ -709,8 +720,9 @@ impl MirRouter {
         })
     }
 
-    /// When BMC encounters a function with loops, optionally invoke
-    /// trust_wp for invariant hints and log them for the strengthen feedback loop.
+    /// When BMC encounters a function with loops, optionally invoke the
+    /// standalone TrustWP compatibility probe for non-verdict invariant hints.
+    /// The hints are logged for analysis and never authorize the BMC result.
     fn dispatch_bmc_with_invariant_hints(&self, func: &VerifiableFunction) -> VerificationResult {
         let trust_wp_config = trust_wp::TrustWpConfig::new().with_timeout(self.config.timeout_ms);
 
@@ -909,12 +921,14 @@ fn has_unsafe_operations(func: &VerifiableFunction) -> bool {
     })
 }
 
-/// Returns true if the function has atomic operations (from Terminator::Call with atomic field).
+/// Returns true if the function has atomic operations (from call metadata).
 fn has_atomic_operations(func: &VerifiableFunction) -> bool {
-    func.body
-        .blocks
-        .iter()
-        .any(|bb| matches!(&bb.terminator, Terminator::Call { atomic: Some(_), .. }))
+    func.body.blocks.iter().any(|bb| {
+        matches!(
+            &bb.terminator,
+            Terminator::Call { atomic: Some(_), .. } | Terminator::TailCall { atomic: Some(_), .. }
+        )
+    })
 }
 
 /// Returns true if the function body has raw pointer operations.
@@ -940,15 +954,15 @@ fn has_raw_pointer_operations(func: &VerifiableFunction) -> bool {
 
 /// Returns true if the function has FFI calls (extern function calls).
 ///
-/// In MIR, FFI calls appear as `Terminator::Call` where the function name
-/// contains `::` patterns like `std::ffi::`, `extern`, or `libc::`.
+/// Compiler-authenticated foreign identity is authoritative. Name matching is
+/// retained only for synthetic and legacy bodies that lack that metadata.
 fn has_ffi_calls(func: &VerifiableFunction) -> bool {
-    func.body.blocks.iter().any(|bb| {
-        matches!(
-            &bb.terminator,
-            Terminator::Call { func: callee, .. }
-                if is_ffi_callee(callee)
-        )
+    func.body.blocks.iter().any(|bb| match &bb.terminator {
+        Terminator::Call { func: callee, is_foreign, .. }
+        | Terminator::TailCall { func: callee, is_foreign, .. } => {
+            *is_foreign || is_ffi_callee(callee)
+        }
+        _ => false,
     })
 }
 
@@ -1043,6 +1057,7 @@ fn successor_blocks(terminator: &Terminator) -> Vec<usize> {
             succs
         }
         Terminator::Call { target, .. } => target.iter().map(|bid| bid.0).collect(),
+        Terminator::TailCall { .. } => vec![],
         Terminator::Assert { target, .. } => vec![target.0],
         Terminator::Drop { target, .. } => vec![target.0],
         Terminator::Return | Terminator::Unreachable => vec![],
@@ -2137,18 +2152,11 @@ fn collect_operand_unsupported_v1(
 fn unsupported_aggregate_kind_v1(kind: &trust_types::AggregateKind) -> Option<(String, String)> {
     match kind {
         trust_types::AggregateKind::Adt {
-            name,
-            variant,
-            active_field: Some(active_field),
-            ..
-        } => {
-            Some((
-                "AggregateKind::Adt(active_field)".to_string(),
-                format!(
-                    "union-like aggregate {name} variant {variant} active_field {active_field}"
-                ),
-            ))
-        }
+            name, variant, active_field: Some(active_field), ..
+        } => Some((
+            "AggregateKind::Adt(active_field)".to_string(),
+            format!("union-like aggregate {name} variant {variant} active_field {active_field}"),
+        )),
         trust_types::AggregateKind::Closure { name, .. } => Some((
             "AggregateKind::Closure".to_string(),
             format!("closure aggregate {name} requires captured-environment semantics"),
@@ -2258,6 +2266,7 @@ mod tests {
         f.body.blocks[0].terminator = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "std::sync::atomic::AtomicU64::fetch_add".to_string(),
             args: vec![],
@@ -2291,6 +2300,7 @@ mod tests {
         f.body.blocks[0].terminator = Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "libc::malloc".to_string(),
             args: vec![],
@@ -2300,6 +2310,33 @@ mod tests {
             atomic: None,
         };
         f
+    }
+
+    fn tailify(mut func: VerifiableFunction) -> VerifiableFunction {
+        let Terminator::Call {
+            func: callee,
+            args,
+            span,
+            atomic,
+            is_foreign,
+            is_unsafe_sig,
+            callee_identity,
+            ..
+        } = func.body.blocks[0].terminator.clone()
+        else {
+            unreachable!();
+        };
+        func.body.blocks[0].terminator =
+            Terminator::TailCall {
+                func: callee,
+                args,
+                span,
+                atomic,
+                is_foreign,
+                is_unsafe_sig,
+                callee_identity,
+            };
+        func
     }
 
     fn func_with_loop(name: &str) -> VerifiableFunction {
@@ -2491,6 +2528,13 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_tail_call_atomics() {
+        let router = MirRouter::with_defaults();
+        let func = tailify(func_with_atomics("atomic_tail"));
+        assert_eq!(router.classify(&func), MirStrategy::DataRace);
+    }
+
+    #[test]
     fn test_classify_raw_pointer_locals() {
         let router = MirRouter::with_defaults();
         let func = func_with_raw_ptr_locals("raw_ptr");
@@ -2501,6 +2545,20 @@ mod tests {
     fn test_classify_ffi() {
         let router = MirRouter::with_defaults();
         let func = func_with_ffi("ffi_call");
+        assert_eq!(router.classify(&func), MirStrategy::FFIBoundary);
+    }
+
+    #[test]
+    fn test_classify_authenticated_tail_call_ffi() {
+        let router = MirRouter::with_defaults();
+        let mut func = tailify(func_with_ffi("ffi_tail"));
+        let Terminator::TailCall { func: callee, is_foreign, .. } =
+            &mut func.body.blocks[0].terminator
+        else {
+            unreachable!();
+        };
+        *callee = "compute_hash".to_string();
+        *is_foreign = true;
         assert_eq!(router.classify(&func), MirStrategy::FFIBoundary);
     }
 
@@ -3225,7 +3283,7 @@ mod tests {
 
         let shadow = router.shadow_verify(&func);
 
-        // Contract function uses ContractVerification strategy via MIR router.
+        // Contract functions retain the diagnostic-only compatibility classification.
         assert_eq!(shadow.strategy, MirStrategy::ContractVerification);
         // Both results are present regardless of discrepancy.
         assert!(!shadow.mir_result.solver_name().is_empty());
@@ -3249,9 +3307,9 @@ mod tests {
     #[test]
     fn test_shadow_verify_fallback_to_v1_on_mir_unknown() {
         let router = shadow_router();
-        // A contract function dispatches to trust-wp-lib which returns Unknown
-        // in the mock test environment. The v1 path with no VCs now also
-        // returns Unknown rather than a vacuous proof.
+        // A contract function enters the retired compatibility classification,
+        // which always returns Unknown. The v1 path with no VCs also returns
+        // Unknown rather than a vacuous proof.
         let func = func_with_spec("fallback_shadow");
 
         let shadow = router.shadow_verify(&func);

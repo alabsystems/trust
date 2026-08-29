@@ -66,9 +66,8 @@ pub(crate) fn abstractor_fold_fvar_opt_func() -> trust_types::VerifiableFunction
     };
     VerifiableFunction {
         name: "fold_fvar_opt".into(),
-        def_path:
-            "<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt"
-                .into(),
+        def_path: "<expr::subst::Abstractor as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt"
+            .into(),
         span: Default::default(),
         body: VerifiableBody {
             locals: vec![
@@ -104,18 +103,15 @@ pub(crate) fn abstractor_fold_fvar_opt_func() -> trust_types::VerifiableFunction
                     ],
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
-                        func: trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL
-                            .into(),
-                        args: vec![
-                            Operand::Move(Place::local(4)),
-                            Operand::Move(Place::local(5)),
-                        ],
+                        func: trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL.into(),
+                        args: vec![Operand::Move(Place::local(4)), Operand::Move(Place::local(5))],
                         dest: Place::local(3),
                         target: Some(BlockId(1)),
                         span: Default::default(),
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 // bb1: SwitchInt(_3) [0 → bb4] else bb2
@@ -163,6 +159,7 @@ pub(crate) fn abstractor_fold_fvar_opt_func() -> trust_types::VerifiableFunction
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 // bb3: _0 = Some(_6) → bb5
@@ -223,8 +220,7 @@ pub(crate) fn fvarsubst_fold_fvar_opt_func() -> trust_types::VerifiableFunction 
 
     let mut func = abstractor_fold_fvar_opt_func();
     func.def_path =
-        "<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt"
-            .into();
+        "<expr::subst::FVarSubst<'_> as expr::visitor::opt::ExprFolderOpt>::fold_fvar_opt".into();
     func.body.locals[1].ty = ref_of(
         Ty::adt(
             "expr::subst::FVarSubst",
@@ -237,10 +233,7 @@ pub(crate) fn fvarsubst_fold_fvar_opt_func() -> trust_types::VerifiableFunction 
         place: Place::local(7),
         rvalue: Rvalue::Use(Operand::Copy(trust_types::Place {
             local: 1,
-            projections: vec![
-                trust_types::Projection::Deref,
-                trust_types::Projection::Field(1),
-            ],
+            projections: vec![trust_types::Projection::Deref, trust_types::Projection::Field(1)],
         })),
         span: Default::default(),
     }];
@@ -254,6 +247,7 @@ pub(crate) fn fvarsubst_fold_fvar_opt_func() -> trust_types::VerifiableFunction 
         atomic: None,
         is_foreign: false,
         is_unsafe_sig: false,
+        callee_identity: None,
     };
     func
 }
@@ -269,10 +263,7 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
     };
     let u32t = || Ty::Int { width: 32, signed: false };
     let lifter_ty = || {
-        Ty::adt(
-            "expr::subst::Lifter",
-            vec![("start".into(), u32t()), ("amount".into(), u32t())],
-        )
+        Ty::adt("expr::subst::Lifter", vec![("start".into(), u32t()), ("amount".into(), u32t())])
     };
     let ek_kind_ty = || {
         Ty::adt_enum(
@@ -296,11 +287,7 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
         body: VerifiableBody {
             locals: vec![
                 LocalDecl { index: 0, ty: opt_ty(), name: None },
-                LocalDecl {
-                    index: 1,
-                    ty: ref_of(lifter_ty(), true),
-                    name: Some("self".into()),
-                },
+                LocalDecl { index: 1, ty: ref_of(lifter_ty(), true), name: Some("self".into()) },
                 LocalDecl { index: 2, ty: u32t(), name: Some("idx".into()) },
                 LocalDecl { index: 3, ty: Ty::Bool, name: None },
                 LocalDecl { index: 4, ty: u32t(), name: None },
@@ -361,6 +348,7 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 // bb2: _6 = ExprKind::BVar(_7); _5 = ek(_6) → bb3
@@ -389,6 +377,7 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
                         atomic: None,
                         is_foreign: false,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                     },
                 },
                 // bb3: _0 = Some(_5) → bb5

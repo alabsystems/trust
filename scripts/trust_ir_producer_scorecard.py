@@ -57,6 +57,7 @@ import argparse
 import collections
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -175,7 +176,27 @@ RUSTC_LOG_FILTER = (
     # never appears and every module reports UNMEASURED — which is what the first run did, and
     # is exactly why the parser distinguishes "no summary event" from "total=0". A filter that
     # silently omits an instrument is the same failure as a gate that cannot fail.
-    "trust_thir_lower::crate_module=debug"
+    "trust_thir_lower::crate_module=debug,"
+    # Trust: `differential` needs its own entry for the same reason `crate_module` does — a
+    # filter that omits a module silences EVERY instrument in it. The aggregate-param batch
+    # shipped `aggregate_name_split_probe` to convert P1's accepted residual (a zero-field
+    # struct whose two sides render different names) from an assertion into a measurement. It
+    # is gated on `tracing::enabled!(DEBUG)`, which is false when the filter does not name the
+    # module — so the probe was DEAD ON ARRIVAL and every sweep since has silently measured
+    # nothing. That is a +0-by-construction instrument: the worst kind, because its silence is
+    # indistinguishable from a clean result.
+    #
+    # MEASURED before adding this: on tests/ui/array-slice-vec/infer_array_len.rs the probe
+    # emits 0 events without this entry and 2 with it — and both are real:
+    #   thir_name="A", oracle_name="infer_array_len::A", fields=0, zero_field=true
+    # i.e. the renderer split P1 was designed around DOES occur on admitted zero-field params.
+    # It is QUALIFICATION drift (same entity, two spellings), not two entities sharing a key,
+    # which is the benign shape — and it is also why name-equality was rejected as the pin: it
+    # would have refused these outright for a systematic +0.
+    #
+    # Cost measured, not assumed: `differential.rs` holds 6 debug/trace sites against
+    # `crate_module.rs`'s 4, and the whole file's stderr came to 6 lines.
+    "trust_thir_lower::differential=debug"
 )
 
 UNSUP_RE = re.compile(
@@ -231,6 +252,42 @@ VALERR_RE = re.compile(
     r"n=(?P<n>\d+)"
 )
 VALSUM_RE = re.compile(r"trust-ir-lower: module validation summary, total=(?P<total>\d+)")
+# Trust (extern-750 attribution): the row-1 dead-path probe. `crate_module.rs` has emitted this
+# on EVERY sweep since the B8 split — `RUSTC_LOG_FILTER` already carries
+# `trust_thir_lower::crate_module=debug` — and the scorecard threw it away. That discard is the
+# whole reason the 750-row `extern` bucket, ~40% of the MODELLED->Agreed gap, has been costed
+# from a hand-collected n=104 instead of from the corpus.
+#
+#   trust-ir-lower: row1 dead-path probe, def_index=3, def_path="ADD_A", declarations=1,
+#                   outcome="divergence-or-trap", samples=0
+#
+# VALIDATED against real stderr before landing (tests/ui/consts/const-int-wrapping-rpass.rs,
+# stage1 b38db06a6d: 16 events, outcomes divergence-or-trap / oracle-live-havoc / not-run).
+# This is deliberately NOT how the seam-blocker parser was built — that one was written against
+# a note format and only later measured, and the measurement found the margin was zero.
+ROW1_PROBE_RE = re.compile(
+    r'trust-ir-lower: row1 dead-path probe, '
+    r'def_index=(?P<def_index>\d+), '
+    r'def_path="(?P<def_path>[^"]*)", '
+    r'declarations=(?P<declarations>\d+), '
+    r'outcome="(?P<outcome>[^"]*)", '
+    r'samples=(?P<samples>\d+)'
+)
+# The probe emits a BARE LEAF NAME (`ADD_A`) while a body is keyed by its full crate-qualified
+# path (`const_int_wrapping_rpass[34f5]::ADD_A`). Joining on the leaf is the obvious move and it
+# is WRONG: two modules can each hold a `foo`, so the leaf is not injective over bodies — the
+# same two-entities-one-key hazard that has produced repeated false agreement in this project.
+# The DefId text carries `0:3`, and the probe carries `def_index=3`; a DefIndex IS injective
+# within a crate. So this recovers index -> path from the differential line and joins on the
+# index. `DIFF_RE` is deliberately NOT modified — it is the core body parser, and a separate
+# read-only regex cannot break it.
+#
+# MEASURED before landing: 16 probe events, 16 bodies, 16 joined on one file; a leaf-name join
+# scored 0/16 because of the qualification mismatch, which is exactly the silent-empty result
+# that would have read as "the probe found nothing".
+DEFIDX_RE = re.compile(
+    r'trust-ir-lower: differential, def=DefId\(\d+:(?P<index>\d+)\s*~\s*(?P<path>[^)]+)\)'
+)
 DIFF_RE = re.compile(
     r"trust-ir-lower: differential, "
     r"def=DefId\([^~]*~\s*(?P<path>.+?)\), equal=(?P<equal>true|false), "
@@ -337,8 +394,134 @@ def audit_ui_pin_manifest(repo, eligible_rel, excluded, in_pool):
     return errors, notes
 
 
-def classify_note(mode: str, note: str) -> str:
-    """Map a differential-event (mode, note) pair to a stable class name."""
+# Trust (B8 step 1): the declaration-blocker taxonomy, mirrored from `DeclKind` in
+# crates/trust-thir-lower/src/crate_module.rs. THE ORDER IS LOAD-BEARING — it is tractability,
+# least tractable first, and `classify_note` attributes a body carrying several classes to the
+# FIRST one present. That rule means no class is ever credited with a body that retiring it alone
+# would not unblock, so every per-class count is a LOWER bound on what the class is worth.
+#
+# What this replaced: one anonymous `clean-skip-extern-callee` string covering 983 clean rows
+# (919 MODELLED + 64 OPAQUE-COLLAPSE) across 577 files on postbuild-slice20-control — the corpus's
+# largest single non-verdict class, 50.0% of the MODELLED->Agreed gap, and misnamed for four
+# fifths of what it held. The five members are retired by unrelated work (see the Rust docs), so
+# the merged class could not be ranked against at all.
+SEAM_BLOCKER_KINDS = ["extern", "unknown", "havoc", "ambiguous", "local-unlowered"]
+
+# Anything the producer named that this list does not know. Ordered FIRST in the dominance rule
+# on purpose: a residue means the Python taxonomy has drifted from `DeclKind`, and a body carrying
+# an unknown class must surface as such rather than be absorbed by a known co-blocker.
+SEAM_BLOCKER_UNCLASSIFIED = "unclassified"
+
+_SEAM_BLOCKERS_RE = re.compile(r"\[blockers: ([^\]]+)\]")
+
+
+def parse_seam_blockers(note: str) -> dict:
+    """`{kind: count}` from a step-2 declaration-gate skip note.
+
+    Returns `{}` when the note carries no `[blockers: ...]` marker, which is how an artifact
+    produced BEFORE this split is recognized: those rows keep the legacy merged class rather than
+    being silently attributed to one member of a taxonomy their compiler never applied.
+    """
+    m = _SEAM_BLOCKERS_RE.search(note)
+    if not m:
+        return {}
+    out = {}
+    for part in m.group(1).split(","):
+        kind, _, count = part.strip().partition("=")
+        if kind:
+            out[kind] = int(count) if count.isdigit() else 0
+    return out
+
+
+def seam_blocker_dominant(kinds: dict) -> str:
+    """The single class a body is attributed to: the least tractable one present.
+
+    `unclassified` wins outright, and so does any class the mirror does not know — a taxonomy
+    drift must never hide behind a co-occurring known blocker.
+    """
+    if SEAM_BLOCKER_UNCLASSIFIED in kinds or set(kinds) - set(SEAM_BLOCKER_KINDS):
+        return SEAM_BLOCKER_UNCLASSIFIED
+    for kind in SEAM_BLOCKER_KINDS:
+        if kind in kinds:
+            return kind
+    return SEAM_BLOCKER_UNCLASSIFIED
+
+
+def seam_blocker_census(bodies) -> dict:
+    """Trust (B8 step 1): the checked census behind the `clean-skip-seam-decl-*` split.
+
+    Four views, because the merged class was ranked wrongly for want of exactly these:
+
+    * `dominant` — the 5-way partition `classify_note` uses. Sums to `rows_split` BY
+      CONSTRUCTION; `dominant_sums` records that as a checkable fact rather than a promise.
+    * `sole_blocker` — bodies whose closure carries ONE class. This is the number that says what
+      retiring that class ALONE recovers, and it is the one to rank against.
+    * `participation` — bodies where the class appears at all. `sole` and `participation` bracket
+      the truth, and this campaign has been burned in BOTH directions by quoting one alone
+      (sole-counts inflated by first-fail masking; sole-counts under-counting a widening wave).
+    * `combinations` — the exact co-occurrence sets, so a two-class campaign can be priced
+      without another sweep.
+
+    `dominant_modelled` restates the partition over MODELLED rows only, since that is the
+    population the MODELLED->Agreed gap is measured over.
+    """
+    rows = [b for b in bodies if "extern/declaration-only callee" in (b.get("note") or "")]
+    # Prefer the STRUCTURED field; fall back to the note only for artifacts written before it
+    # existed. The note is truncated to 160 chars and the marker sits at offset ~112, so parsing
+    # it is correct only by luck of name lengths — see the record-construction comment.
+    parsed = [
+        (b, b["seam_blockers"] if isinstance(b.get("seam_blockers"), dict)
+            else parse_seam_blockers(b.get("note") or ""))
+        for b in rows
+    ]
+    split = [(b, k) for b, k in parsed if k]
+    out = {
+        "rows_total": len(rows),
+        "rows_split": len(split),
+        # Non-zero only when reading an artifact built before the split shipped.
+        "rows_legacy_unsplit": len(rows) - len(split),
+    }
+    if not split:
+        return out
+    dominant = collections.Counter()
+    dominant_modelled = collections.Counter()
+    sole = collections.Counter()
+    participation = collections.Counter()
+    combos = collections.Counter()
+    for b, kinds in split:
+        known = [k for k in SEAM_BLOCKER_KINDS if k in kinds]
+        extra = sorted(set(kinds) - set(SEAM_BLOCKER_KINDS))
+        for k in known + extra:
+            participation[k] += 1
+        combos["+".join(known + extra)] += 1
+        d = seam_blocker_dominant(kinds)
+        dominant[d] += 1
+        if b.get("symbolic") is False and b.get("opaque_collapse") is False:
+            dominant_modelled[d] += 1
+        if len(kinds) == 1:
+            sole[next(iter(kinds))] += 1
+    out.update(
+        dominant=dict(dominant),
+        dominant_modelled=dict(dominant_modelled),
+        sole_blocker=dict(sole),
+        participation=dict(participation),
+        combinations=dict(combos.most_common()),
+        # The gate. If this ever disagrees the partition is not a partition.
+        dominant_sums=sum(dominant.values()),
+    )
+    return out
+
+
+# NB: no PEP 604 (`dict | None`) annotation here — this script runs under the macOS
+# CommandLineTools python3.9, where that raises TypeError at import time.
+def classify_note(mode: str, note: str, blockers=None) -> str:
+    """Map a differential-event (mode, note) pair to a stable class name.
+
+    `blockers` is the STRUCTURED seam-blocker census for this row, when the caller has it. Pass
+    it. Parsing it back out of `note` works only while the note is intact, and the stored note is
+    TRUNCATED to 160 chars — see `parse_seam_blockers` for why that is a trap rather than a
+    detail.
+    """
     if mode == "Agreed":
         return "agreed"
     if mode == "MirOracle":
@@ -368,7 +551,14 @@ def classify_note(mode: str, note: str) -> str:
     if "callee-set asymmetry" in note:
         return "clean-skip-callee-asymmetry"
     if "extern/declaration-only callee" in note:
-        return "clean-skip-extern-callee"
+        # Trust (B8 step 1): the split. `[blockers: ...]` is appended by
+        # `run_seam_differentials` step 2 and names the DeclKind classes actually reachable from
+        # this body. Its absence means the artifact predates the split — keep the merged class
+        # rather than attributing a body to a taxonomy its compiler never applied.
+        b = blockers if blockers is not None else parse_seam_blockers(note)
+        if not b:
+            return "clean-skip-extern-callee"
+        return "clean-skip-seam-decl-" + seam_blocker_dominant(b)
     # Trust (B9-A): seam-only representation artifacts, reclassified from a false divergence to a
     # coverage-only skip. Neither is a semantic disagreement (see run_seam_differentials step 8).
     if "unit-call arity gap" in note:
@@ -379,6 +569,81 @@ def classify_note(mode: str, note: str) -> str:
     # precise class; the dead-seed population now converts to real verdicts ("agreed").
     if "LIVE havoc" in note:
         return "clean-skip-oracle-havoc"
+    # Trust (drop-glue lane): the held-back half of the old oracle-panic-model class. The
+    # neutralisation is TOTAL and SYMMETRIC — it rewrites iff every const-false oracle assert in
+    # the body is a fatal drop-glue marker (and there is at least one; that conjunct is the
+    # anti-vacuity guard, since "every const-false assert here is drop glue" is trivially true of
+    # a body with none). Anything else refuses and lands here, so this class measures the price of
+    # the refusal instead of hiding it in the anonymous bucket.
+    #
+    # The token LEADS the note, so the 160-char store cap can never truncate it away — unlike the
+    # seam-blocker marker, which ended at offset 160 of 160 with the closing bracket as the last
+    # byte retained. Checked BEFORE the `oracle-panic-model` rule below because that rule's
+    # substring would otherwise claim these rows.
+    if note.startswith("oracle-drop-glue-mixed"):
+        return "clean-skip-drop-glue-mixed"
+    # Trust (drop-glue lane ride-along): `sig_tys_agree` returned Err — the two sides' SIGNATURES
+    # are not comparable, so step (5) declines rather than judging. Measured on postbuild-dropglue:
+    # neutralising the drop-glue markers pushed 40 bodies past the const-false guard and straight
+    # into this refusal, and with no rule they all landed in the anonymous `clean-skip-other`.
+    #
+    # That is the exact failure this project has already paid for once — an anonymous catch-all hid
+    # the second-largest bucket on the board and cost a whole unplannable wave. A wave that RETIRES
+    # a named class by moving 40 rows into `clean-skip-other` has not retired them; it has hidden
+    # them, and the histogram reads like progress.
+    #
+    # Three distinct spelling splits share this prefix and are all worth counting separately, so the
+    # class keeps the parenthesised reason rather than collapsing them:
+    #   nested spelling-split G0 quarantine (no enum provenance)
+    #   array-vs-tuple  (producer spells [T; N>0] as Tuple, oracle as Array)  <- this is #202
+    #   enum spelled first-class on one side only (mid-B3 residue)
+    # Keyed on `startswith`, and that is load-bearing rather than stylistic: the STORED note is
+    # truncated to 160 chars, so a rule keyed on a marker that can sit past that offset is
+    # unreadable from the artifact afterwards. Measured while adding this rule —
+    # `clean-skip-unmodeled-observation` rows store as exactly 160 chars ending
+    # `"...; observable-effect comp"`, with their own marker cut mid-phrase. Their stored
+    # `note_class` is RIGHT (classified from the full note at sweep time); it is OFFLINE
+    # re-classification that is wrong for them.
+    #
+    # THE RULE THAT FOLLOWS FROM THAT: `note_class` in an artifact is authoritative. Do not
+    # re-derive it from the stored `note` — you will silently mis-bucket every row whose marker
+    # sits past 160. This is the third truncation defect in this file's neighbourhood tonight;
+    # the first had ZERO characters of margin.
+    if note.startswith("signature comparability failure"):
+        return "clean-skip-sig-incomparable"
+    # Trust: split `clean-skip-other`, which had grown to 397 rows / 15 distinct note prefixes —
+    # the second-largest governance-clear population and completely unenumerated. An anonymous
+    # catch-all has already cost this project one unplannable wave; leaving 397 rows in it while
+    # ranking lanes off the histogram is ranking against a number that means nothing.
+    #
+    # Measured on postbuild-opaquerespell (rows / of which MODELLED):
+    #   249/75  entry not spliced into the crate module   <- the UNDETERMINED bucket; its cause is
+    #                                                        NOT recorded, and the one-line
+    #                                                        diagnostic that would explain it sits
+    #                                                        inside BYTE-IDENTICAL-frozen
+    #                                                        crate_module.rs. Naming it does not
+    #                                                        explain it — it makes the size of the
+    #                                                        un-explainable part visible.
+    #    61/35  call args carry a place-path value carrier
+    #    32/30  call args carry a ZST closure value (Ty::Unit/PhantomData)
+    #     9/9   producer-synthesized closure->fn-ptr shim
+    #    32/22  both sides errored non-trappily (THIR out_of_fuel) — the interpreter fuel class
+    #
+    # 351 of the 397 are SEAM rows, i.e. `crate_module.rs` territory and governance-blocked. That
+    # is the finding: the catch-all was mostly one frozen class wearing four names. Ordered
+    # most-specific-first; every arm keys on a marker that leads its note or its seam prefix, so
+    # none can be truncated away by the 160-char store.
+    if note.startswith("seam-deferred body:"):
+        if "entry not spliced" in note:
+            return "clean-skip-seam-unspliced-entry"
+        if "place-path value carrier" in note:
+            return "clean-skip-seam-callarg-placepath"
+        if "ZST closure value" in note:
+            return "clean-skip-seam-callarg-zst-closure"
+        if "closure→fn-p" in note or "closure->fn-p" in note:
+            return "clean-skip-seam-closure-fnptr-shim"
+    if note.startswith("both sides errored non-trappily") and "out_of_fuel" in note:
+        return "clean-skip-interpreter-fuel"
     if "oracle-panic-model" in note:
         return "clean-skip-oracle-panic-model"
     if "Inst::Undef" in note or "CheckedBinaryOp" in note:
@@ -395,6 +660,22 @@ def classify_note(mode: str, note: str) -> str:
     # it. Both notes say "is READ"; only this one says the referent is layout-agreeing.
     if "layout-agreeing AGGREGATE referent" in note:
         return "clean-skip-ptr-pointee-aggregate"
+    # Trust (aggregate-param batch): a param the new aggregate lanes (ptr-leaf / fieldless /
+    # tuple / wide) WOULD admit, withheld because `sig_tys_agree` returned Ok(false) — which at
+    # step (5) publishes a DIVERGENCE. The batch admits bodies that previously died at the
+    # non-scalar refusal, so admitting them opens a brand-new divergence-publication channel on
+    # a RETURN-side spelling split, against a gate that says divergences 0. Conjunct (v) blocks
+    # exactly that, and only for the newly-admitted lanes: a param that was already admissible
+    # keeps today's behaviour and still publishes its divergence.
+    #
+    # It needs its own class rather than `clean-skip-other` for the reason that fallthrough keeps
+    # earning: a held-back population in the anonymous bucket is a population nobody can rank, and
+    # this one is the direct measure of how much the batch is leaving on the table.
+    #
+    # Keyed on the full phrase, NOT the bare word `aggregate` — that would be claimed by (and
+    # would claim) the `layout-agreeing AGGREGATE referent` rule immediately above.
+    if "aggregate param admissible but signature spelling split" in note:
+        return "clean-skip-aggregate-sig-split"
     # Slice 3 (opaque-param widening) skip classes: a Ptr/Unit param that is actually READ
     # (opaque sampling refused, fail-closed), and an opacity-scan infrastructure failure.
     if "opaque sampling refused" in note:
@@ -491,6 +772,27 @@ def parse_bodies(stderr: str):
     for m in CLASS_RE.finditer(stderr):
         symbolic[m.group("path")] = m.group("symbolic") == "true"
         opaque[m.group("path")] = m.group("opaque") == "true"
+    # Trust (extern-750 attribution): row-1 probe outcomes, joined to bodies by DefIndex (see
+    # DEFIDX_RE for why not by leaf name). An index that resolves to two different paths, or a
+    # probe whose index no body claims, is DROPPED and counted rather than guessed at — an
+    # attribution that quietly mis-joins is worse than one that reports a hole.
+    _idx_to_path, _idx_ambiguous = {}, set()
+    for m in DEFIDX_RE.finditer(stderr):
+        i, p = m.group("index"), m.group("path")
+        if _idx_to_path.setdefault(i, p) != p:
+            _idx_ambiguous.add(i)
+    _row1, _row1_unjoined = {}, 0
+    for m in ROW1_PROBE_RE.finditer(stderr):
+        i = m.group("def_index")
+        p = _idx_to_path.get(i)
+        if p is None or i in _idx_ambiguous:
+            _row1_unjoined += 1
+            continue
+        _row1[p] = {
+            "outcome": m.group("outcome"),
+            "samples": int(m.group("samples")),
+            "declarations": int(m.group("declarations")),
+        }
     collect_primary = collections.defaultdict(list)
     collect_cascade = collections.defaultdict(list)
     for m in COLLECT_RE.finditer(stderr):
@@ -534,7 +836,29 @@ def parse_bodies(stderr: str):
             # None, NOT as False — "not measured" must stay distinguishable from "modelled".
             "symbolic": symbolic.get(p),
             "opaque_collapse": opaque.get(p),
-            "note_class": classify_note(mode, note),
+            # Trust (extern-750 attribution): the row-1 probe outcome for this body, when the
+            # producer emitted one. Absent means the probe did not run for this body — which
+            # must stay distinguishable from "ran and found nothing", because the ONLY reason
+            # this bucket has been costed off n=104 is that nobody could tell those apart.
+            **({"row1_probe": _row1.get(p)} if _row1.get(p) else {}),
+            # Trust (B8 step 1): the seam-blocker census is a STRUCTURED FIELD, parsed from the
+            # FULL note here and never re-parsed from the stored one.
+            #
+            # `note` below is truncated to 160 chars. Measured on postbuild-b8-treat, ALL 1021
+            # step-2 rows already hit that cap, and the longest surviving marker
+            # (`[blockers: extern=1, havoc=1, local-unlowered=2]`) ends at offset 160 of 160 —
+            # its closing `]` is the LAST CHARACTER RETAINED. The margin is ZERO, not small.
+            # (An earlier reading of this put it at nine characters; that measured the longest
+            # TWO-kind marker and missed the three-kind rows, which are longer and survived by
+            # exactly nothing. Re-measure `max(end of marker)`, not a marker you picked.)
+            # One more character anywhere before the marker loses the closing `]`,
+            # at which point `parse_seam_blockers` returns {} and the row degrades to the LEGACY
+            # MERGED CLASS. That failure is invisible in the worst way: the histogram shows
+            # "some rows did not split", which reads as a partial wave rather than a broken
+            # parse. Raising the cap would buy margin and leave the same bug for whoever adds a
+            # fifth blocker kind. The note is for humans; the field is for the classifier.
+            **({"seam_blockers": _seam_blockers} if (_seam_blockers := parse_seam_blockers(note)) else {}),
+            "note_class": classify_note(mode, note, _seam_blockers),
             "note": note[:160],
             "collect_primary": collect_primary.get(p, []),
             "collect_cascade": collect_cascade.get(p, []),
@@ -657,6 +981,68 @@ def _eligible_ui_files(repo: str):
     return all_files, eligible, filter_stats
 
 
+def collect_locked_corpus(repo: str, lock_path: str):
+    """The corpus as PINNED BY CONTENT, bypassing sampling entirely.
+
+    `random.sample` is a function of the population LENGTH, so the seeded
+    corpus was only ever stable while `len(eligible)` was --- and it was not.
+    See scripts/trust_ir_corpus_lock.py for the measured drift and for why the
+    campaign-pin manifest could not prevent it (it governs tests/ui/trust/ only,
+    while the population is all of tests/ui).
+
+    Under a lock the corpus is the list, so nothing landing anywhere in the tree
+    can move it, and a sweep is directly comparable to the artifact the lock was
+    generated from. The content filters are NOT applied here: they are a
+    selection heuristic for choosing files that compile standalone, not a
+    measurement requirement, and re-applying them would silently drop locked
+    files that later gained a `//~` annotation --- which is one of the drifts
+    this exists to stop.
+    """
+    rows, missing = [], []
+    with open(lock_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                raise ValueError(f"malformed corpus-lock row: {line!r}")
+            digest, rel = parts[0].strip(), parts[1].strip()
+            abs_path = os.path.join(repo, rel)
+            if not os.path.isfile(abs_path):
+                missing.append(rel)
+                continue
+            rows.append((abs_path, rel, digest))
+    if missing:
+        raise UiPinManifestError(
+            f"corpus lock names {len(missing)} file(s) that do not exist; the corpus "
+            f"cannot be measured as specified. Re-check with "
+            f"`python3 scripts/trust_ir_corpus_lock.py --check`:\n  - "
+            + "\n  - ".join(missing[:20])
+            + (f"\n  - ... and {len(missing) - 20} more" if len(missing) > 20 else "")
+        )
+    if not rows:
+        raise UiPinManifestError("corpus lock names no files; refusing a vacuous sweep")
+
+    drift = [rel for abs_path, rel, digest in rows
+             if hashlib.sha256(open(abs_path, "rb").read()).hexdigest() != digest]
+    sample = sorted(abs_path for abs_path, _, _ in rows)
+    return sample, {
+        "ui_root": os.path.relpath(os.path.join(repo, "tests", "ui"), repo),
+        "selection": "corpus-lock",
+        "corpus_lock": os.path.relpath(lock_path, repo),
+        "locked_files": len(rows),
+        "content_drift": len(drift),
+        "content_drift_files": sorted(drift)[:50],
+        "eligible": len(rows),
+        "sampled": len(sample),
+        "seed": None,
+        "note": "corpus pinned by content; sampling bypassed, content filters not "
+                "re-applied (they are a selection heuristic, not a measurement "
+                "requirement)",
+    }
+
+
 def collect_ui_sample(repo: str, seed: int, size: int):
     """size <= 0 means FULL POPULATION: every eligible file, no sampling.
     (size >= len(eligible) also degenerates to the full population — the
@@ -702,6 +1088,198 @@ def collect_ui_sample(repo: str, seed: int, size: int):
         "seed": seed,
         "filters": [f"{n}: /{r.pattern}/" for n, r in UI_CONTENT_FILTERS],
     }
+
+
+_DECL_KIND_SOURCE = os.path.join("crates", "trust-thir-lower", "src", "crate_module.rs")
+
+
+def scan_decl_kind_prefixes(repo):
+    """The `DeclKind::prefix()` strings, read out of the Rust source.
+
+    Trust (B8 step 1) — THE DRIFT GATE. `SEAM_BLOCKER_KINDS` is a mirror of a Rust enum, and a
+    mirror nobody checks is a comment. If someone adds a sixth `DeclKind` variant, every body
+    reaching it lands in `unclassified` and the split silently stops partitioning the class it
+    exists to partition. Scanning the arms is cheap and catches that at edit time rather than one
+    forty-minute sweep later.
+
+    Deliberately narrow: it reads only the `match self` arms of `fn prefix`, so unrelated string
+    literals in the file cannot manufacture a phantom class.
+    """
+    path = os.path.join(repo, _DECL_KIND_SOURCE)
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    m = re.search(r"fn prefix\(self\) -> &'static str \{\s*match self \{(.*?)\n        \}", src, re.S)
+    if not m:
+        raise RuntimeError(
+            f"{_DECL_KIND_SOURCE}: could not locate `DeclKind::prefix`'s match block. The drift "
+            f"gate cannot verify SEAM_BLOCKER_KINDS; fix the scan rather than deleting it."
+        )
+    return re.findall(r'DeclKind::\w+\s*=>\s*"([^"]+)"', m.group(1))
+
+
+def check_seam_blockers(repo):
+    """`--check-seam-blockers`: the taxonomy gate. No compiler, no artifact, ~0s."""
+    errors = []
+    try:
+        rust = scan_decl_kind_prefixes(repo)
+    except (OSError, RuntimeError) as e:
+        print(f"SEAM-BLOCKER TAXONOMY: FAIL\n  {e}", file=sys.stderr)
+        return 1
+    if sorted(rust) != sorted(SEAM_BLOCKER_KINDS):
+        errors.append(
+            f"SEAM_BLOCKER_KINDS {sorted(SEAM_BLOCKER_KINDS)} != DeclKind::prefix() "
+            f"{sorted(rust)} — the Python mirror has drifted from the Rust taxonomy"
+        )
+    if SEAM_BLOCKER_UNCLASSIFIED in rust:
+        errors.append(
+            f"{SEAM_BLOCKER_UNCLASSIFIED!r} is a reserved residue label and must not be a "
+            f"DeclKind prefix"
+        )
+    # The dominance rule is a total order over the known classes; a duplicate would make the
+    # partition order-dependent.
+    if len(set(SEAM_BLOCKER_KINDS)) != len(SEAM_BLOCKER_KINDS):
+        errors.append("SEAM_BLOCKER_KINDS contains a duplicate")
+    if errors:
+        print("SEAM-BLOCKER TAXONOMY: FAIL", file=sys.stderr)
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        return 1
+    print(
+        f"SEAM-BLOCKER TAXONOMY: OK — {len(SEAM_BLOCKER_KINDS)} classes mirrored from "
+        f"DeclKind ({', '.join(SEAM_BLOCKER_KINDS)}), tractability order least-tractable-first"
+    )
+    return 0
+
+
+def _seam_note(marker=None):
+    """A step-2 skip note exactly as `run_seam_differentials` spells it."""
+    blockers = f" [blockers: {marker}]" if marker is not None else ""
+    return (
+        "seam-deferred body: reachable callee closure includes an extern/declaration-only "
+        f"callee (no local body to link){blockers}; crate-seam interpretation not asserted "
+        "(coverage-only)"
+    )
+
+
+def selftest_seam_blockers(repo):
+    """`--selftest-seam-blockers`: the mutation proof that the split actually splits.
+
+    A gate nobody has watched fail is a gate nobody knows is wired up — the repo's established
+    style. Seven properties, each with the mutation that must break it.
+    """
+    fails = []
+
+    def check(name, got, want):
+        if got != want:
+            fails.append(f"{name}: got {got!r}, want {want!r}")
+
+    modelled = {"symbolic": False, "opaque_collapse": False}
+
+    # 1. Every class round-trips from a real note, and lands in its own class.
+    for kind in SEAM_BLOCKER_KINDS:
+        note = _seam_note(f"{kind}=1")
+        check(f"parse[{kind}]", parse_seam_blockers(note), {kind: 1})
+        check(f"classify[{kind}]", classify_note("NotRun", note), f"clean-skip-seam-decl-{kind}")
+
+    # 2. A pre-split note keeps the legacy merged class. MUTATION: returning a split class here
+    #    would silently re-label every historical artifact.
+    check("legacy", classify_note("NotRun", _seam_note()), "clean-skip-extern-callee")
+    check("legacy-parse", parse_seam_blockers(_seam_note()), {})
+
+    # 3. Dominance is least-tractable-first, not first-seen and not alphabetical.
+    check(
+        "dominance",
+        seam_blocker_dominant({"local-unlowered": 3, "extern": 1}),
+        "extern",
+    )
+    check("dominance-order", seam_blocker_dominant({"ambiguous": 1, "havoc": 1}), "havoc")
+
+    # 4. An unknown class wins outright — it may never hide behind a known co-blocker.
+    check("stranger", seam_blocker_dominant({"extern": 1, "brand-new": 1}), "unclassified")
+    check("stranger-alone", seam_blocker_dominant({"brand-new": 1}), "unclassified")
+    check(
+        "stranger-classify",
+        classify_note("NotRun", _seam_note("extern=1, brand-new=1")),
+        "clean-skip-seam-decl-unclassified",
+    )
+
+    # 5. The partition is a partition: dominant sums to rows_split, over a mixed population.
+    bodies = (
+        [dict(note=_seam_note("extern=2"), **modelled) for _ in range(5)]
+        + [dict(note=_seam_note("local-unlowered=1"), **modelled) for _ in range(3)]
+        + [dict(note=_seam_note("extern=1, havoc=1"), **modelled) for _ in range(2)]
+        + [dict(note=_seam_note("havoc=1"), symbolic=False, opaque_collapse=True)]
+        + [dict(note=_seam_note(), **modelled)]  # pre-split row
+        + [dict(note="an unrelated skip", **modelled)]
+    )
+    c = seam_blocker_census(bodies)
+    check("census.rows_total", c["rows_total"], 12)
+    check("census.rows_split", c["rows_split"], 11)
+    check("census.rows_legacy", c["rows_legacy_unsplit"], 1)
+    check("census.sums", c["dominant_sums"], c["rows_split"])
+    check("census.dominant", c["dominant"], {"extern": 7, "local-unlowered": 3, "havoc": 1})
+    # `dominant` counts ALL clean rows at the gate; `dominant_modelled` drops the OPAQUE-COLLAPSE
+    # one. This is the 983-vs-919 relationship in miniature, and getting it backwards is how the
+    # gap would be quoted against the wrong denominator.
+    check("census.modelled", c["dominant_modelled"], {"extern": 7, "local-unlowered": 3})
+    # SOLE excludes the two co-blocked rows; participation includes them. The pair is the point.
+    check("census.sole", c["sole_blocker"], {"extern": 5, "local-unlowered": 3, "havoc": 1})
+    check(
+        "census.participation",
+        c["participation"],
+        {"extern": 7, "local-unlowered": 3, "havoc": 3},
+    )
+    check(
+        "census.combinations",
+        c["combinations"],
+        {"extern": 5, "local-unlowered": 3, "extern+havoc": 2, "havoc": 1},
+    )
+
+    # 6. Counts are parsed, not merely presence-detected.
+    check("counts", parse_seam_blockers(_seam_note("extern=12, havoc=3")), {"extern": 12, "havoc": 3})
+
+    # 7. The marker must not leak into a NEIGHBOURING classifier rule. `havoc` is a substring
+    #    trigger for `clean-skip-oracle-havoc` further down the chain, and `extern=` sits inside a
+    #    note the `direct call` rule also scans.
+    check(
+        "no-rule-bleed",
+        classify_note("NotRun", _seam_note("havoc=1")),
+        "clean-skip-seam-decl-havoc",
+    )
+
+    # 8. THE TRUNCATION TRAP, pinned as a property rather than left to luck.
+    #    The stored note is `note[:160]`; measured on postbuild-b8-treat every one of the 1021
+    #    step-2 rows already hits that cap, with the longest surviving marker ending at 151 — nine
+    #    characters of headroom. These two assertions encode both halves: a truncated note DOES
+    #    silently degrade to the legacy merged class, and the structured field is immune to it.
+    full = _seam_note("extern=1, local-unlowered=1, ambiguous=1")
+    truncated = full[:160]
+    check("truncation-loses-marker", parse_seam_blockers(truncated), {})
+    check(
+        "truncation-degrades-to-legacy",
+        classify_note("NotRun", truncated),
+        "clean-skip-extern-callee",
+    )
+    # The field survives what the note cannot — this is the whole reason the field exists.
+    field = parse_seam_blockers(full)
+    check(
+        "field-survives-truncation",
+        classify_note("NotRun", truncated, field),
+        "clean-skip-seam-decl-extern",
+    )
+    # And the census prefers the field over a mangled note.
+    c2 = seam_blocker_census([dict(note=truncated, seam_blockers=field, **modelled)])
+    check("census-prefers-field", c2["dominant"], {"extern": 1})
+    check("census-field-not-legacy", c2["rows_legacy_unsplit"], 0)
+
+    if fails:
+        print("SEAM-BLOCKER SELFTEST: FAIL", file=sys.stderr)
+        for f in fails:
+            print(f"  {f}", file=sys.stderr)
+        return 1
+    print("SEAM-BLOCKER SELFTEST: OK — 8 properties, taxonomy mirrored, partition checked, "
+          "truncation trap pinned")
+    return check_seam_blockers(repo)
 
 
 def check_ui_pins(repo):
@@ -860,6 +1438,10 @@ def aggregate(results):
             "by_kind": dict(collections.Counter(b["kind"] for b in bs)),
             "clean_by_kind": dict(collections.Counter(b["kind"] for b in clean)),
             "note_class_histogram": dict(collections.Counter(b["note_class"] for b in bs)),
+            # Trust (B8 step 1): the internal structure of what used to be the corpus's largest
+            # anonymous class. Keyed off the note, so it re-derives from any artifact — including
+            # pre-split ones, which report `rows_legacy_unsplit` and nothing else.
+            "seam_declaration_blockers": seam_blocker_census(bs),
             "unsupported_count_per_body_histogram": {str(k): v for k, v in sorted(hist.items())},
             "agreed": sum(1 for b in bs if b["mode"] == "Agreed"),
             "divergences": sorted(b["def"] for b in bs if b["mode"] == "MirOracle"),
@@ -1045,6 +1627,33 @@ def render_markdown(data):
                 out.append(f"  - by class: {v['class_histogram']}")
         out.append(f"- by kind: {b['by_kind']} (clean: {b['clean_by_kind']})")
         out.append(f"- note-class histogram: {b['note_class_histogram']}")
+        sdb = b.get("seam_declaration_blockers") or {}
+        if sdb.get("rows_total"):
+            out.append(
+                f"- seam declaration-gate blockers: **{sdb['rows_total']} rows**"
+                f" ({sdb['rows_split']} split, {sdb['rows_legacy_unsplit']} pre-split)"
+            )
+            if sdb.get("rows_split"):
+                # The partition gate, rendered rather than asserted: a reader can check it.
+                ok = "OK" if sdb["dominant_sums"] == sdb["rows_split"] else "**BROKEN**"
+                out.append(
+                    f"  - dominant (least-tractable present; sums to rows_split: {ok}):"
+                    f" {sdb['dominant']}"
+                )
+                out.append(f"  - dominant, MODELLED rows only: {sdb['dominant_modelled']}")
+                out.append(
+                    f"  - SOLE blocker (rank against THIS — what retiring the class alone"
+                    f" recovers): {sdb['sole_blocker']}"
+                )
+                out.append(f"  - participation (appears at all): {sdb['participation']}")
+                out.append(f"  - co-occurrence sets: {sdb['combinations']}")
+                unc = sdb["dominant"].get(SEAM_BLOCKER_UNCLASSIFIED, 0)
+                if unc:
+                    out.append(
+                        f"  - **UNCLASSIFIED {unc}** — the producer named a declaration class"
+                        f" this taxonomy does not know. `DeclKind` and `SEAM_BLOCKER_KINDS`"
+                        f" have drifted; this is a finding, not a rounding error."
+                    )
         tags = list(b["reason_tag_histogram"].items())
         if tags:
             out.append(f"- reason-tag histogram (top 20 of {len(tags)}): {dict(tags[:20])}")
@@ -1134,6 +1743,13 @@ def main():
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--edition", default="2021")
     ap.add_argument("--no-ui-sample", action="store_true")
+    ap.add_argument(
+        "--corpus-lock", metavar="PATH", default=None,
+        help="measure the corpus PINNED BY CONTENT in PATH (see "
+             "scripts/trust_ir_corpus_lock.py) instead of re-deriving it with a "
+             "seeded sample. The seeded sample is a function of the eligible "
+             "population LENGTH and so was never stable; a lock makes a sweep "
+             "directly comparable to the artifact the lock was generated from.")
     ap.add_argument("--corpus", action="append", default=[],
                     metavar="NAME=PATH", help="extra single-file corpus (repeatable)")
     ap.add_argument("--scratch", default=None,
@@ -1145,6 +1761,13 @@ def main():
     ap.add_argument("--selftest-ui-pins", action="store_true",
                     help="mutation proof that the manifest audit actually fails on a broken "
                          "manifest (does not modify anything on disk)")
+    ap.add_argument("--check-seam-blockers", action="store_true",
+                    help="verify SEAM_BLOCKER_KINDS still mirrors `DeclKind` in "
+                         "crates/trust-thir-lower/src/crate_module.rs and exit (no compiler, "
+                         "no artifact, ~0s)")
+    ap.add_argument("--selftest-seam-blockers", action="store_true",
+                    help="mutation proof that the declaration-blocker split actually splits "
+                         "(also runs --check-seam-blockers)")
     ap.add_argument("--rerender", metavar="DIR",
                     help="recompute `aggregate` and rewrite SCORECARD.md from an EXISTING "
                          "postbuild dir's data.json per-body rows. No compiler, no corpus "
@@ -1163,6 +1786,10 @@ def main():
         return check_ui_pins(os.path.abspath(args.repo))
     if args.selftest_ui_pins:
         return selftest_ui_pins(os.path.abspath(args.repo))
+    if args.check_seam_blockers:
+        return check_seam_blockers(os.path.abspath(args.repo))
+    if args.selftest_seam_blockers:
+        return selftest_seam_blockers(os.path.abspath(args.repo))
     if args.rerender:
         return rerender(args.rerender, check_only=args.rerender_check)
     if not args.trustc:
@@ -1187,18 +1814,32 @@ def main():
         name, _, path = spec.partition("=")
         corpora.append((name, [os.path.abspath(path)], None))
     if not args.no_ui_sample:
-        sample, sample_meta = collect_ui_sample(repo, args.seed, args.sample_size)
+        if args.corpus_lock:
+            sample, sample_meta = collect_locked_corpus(repo, args.corpus_lock)
+        else:
+            sample, sample_meta = collect_ui_sample(repo, args.seed, args.sample_size)
         # Self-describing run: a sweep that silently sampled a different population is
         # the failure mode this line exists to make visible in the log.
-        print(
-            f"[ui_sample] eligible {sample_meta['eligible']}"
-            f" · sampled {sample_meta['sampled']}"
-            f" · campaign pins excluded from the pool"
-            f" {sample_meta['campaign_pins_excluded_from_pool']}"
-            f" of {sample_meta['campaign_pins_listed']} listed"
-            f" ({sample_meta['campaign_pins_manifest']})",
-            flush=True,
-        )
+        if sample_meta.get("selection") == "corpus-lock":
+            print(
+                f"[ui_sample] CORPUS LOCK {sample_meta['corpus_lock']}"
+                f" · {sample_meta['locked_files']} file(s) pinned by content"
+                f" · content drift {sample_meta['content_drift']}"
+                f" · sampling bypassed (comparable to the artifact the lock came from)",
+                flush=True,
+            )
+            for rel in sample_meta.get("content_drift_files", [])[:10]:
+                print(f"[ui_sample] drift: {rel}", flush=True)
+        else:
+            print(
+                f"[ui_sample] eligible {sample_meta['eligible']}"
+                f" · sampled {sample_meta['sampled']}"
+                f" · campaign pins excluded from the pool"
+                f" {sample_meta['campaign_pins_excluded_from_pool']}"
+                f" of {sample_meta['campaign_pins_listed']} listed"
+                f" ({sample_meta['campaign_pins_manifest']})",
+                flush=True,
+            )
         for note in sample_meta.get("campaign_pin_notes", []):
             print(f"[ui_sample] note: {note}", flush=True)
         corpora.append(("ui_sample", sample, sample_meta))

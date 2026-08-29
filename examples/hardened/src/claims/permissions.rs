@@ -1,10 +1,9 @@
-use std::io;
-use std::path::Path;
-
 #[cfg(unix)]
 use std::fs::{self, File};
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 #[cfg(unix)]
 pub(crate) fn permission_create_boundary(path: &Path) -> io::Result<()> {

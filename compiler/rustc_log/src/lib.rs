@@ -125,10 +125,8 @@ where
         // Cap those targets at ERROR by default; setting RUSTC_LOG explicitly
         // still opts into everything.
         _ => {
-            let mut filter =
-                EnvFilter::default().add_directive(Directive::from(LevelFilter::WARN));
-            for target in
-                ["ay_chc", "ay_dpll", "ay_core", "ay_lia", "ay_lra", "ay_nia", "ay_proof"]
+            let mut filter = EnvFilter::default().add_directive(Directive::from(LevelFilter::WARN));
+            for target in ["ay_chc", "ay_dpll", "ay_core", "ay_lia", "ay_lra", "ay_nia", "ay_proof"]
             {
                 if let Ok(directive) = format!("{target}=error").parse() {
                     filter = filter.add_directive(directive);

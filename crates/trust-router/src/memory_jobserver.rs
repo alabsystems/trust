@@ -1936,10 +1936,10 @@ mod tests {
         // policy. If that policy is retuned these must be updated with it —
         // which is the point.
         for (total, expected) in [
-            (0u64, 0u64),                          // nothing observable -> no budget
-            (1, 0),                                // rounds DOWN, never up to 1
-            (10, 7),                               // 10 * 70/100
-            (1_073_741_824, 751_619_276),          // 1 GiB
+            (0u64, 0u64),                           // nothing observable -> no budget
+            (1, 0),                                 // rounds DOWN, never up to 1
+            (10, 7),                                // 10 * 70/100
+            (1_073_741_824, 751_619_276),           // 1 GiB
             (u64::MAX, 12_912_720_851_596_686_130), // no overflow via the u128 widening
         ] {
             set_test_total_memory(Some(total));

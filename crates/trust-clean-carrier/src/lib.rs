@@ -81,6 +81,14 @@
 //! hardware-referenced agreement tests, hand-transcribed Lean-semantics pins,
 //! and the executed differential against clean-kernel's reduction lanes).
 
+/// The hypothesis lift: reading an erased proof binder as a caller obligation.
+pub mod hypothesis;
+
+pub use hypothesis::Hypothesis;
+pub use trust_types::clean_origin_precondition::{
+    CleanOriginPrecondition, PreconditionOperand, PreconditionRelation,
+};
+
 use clean_kernel::{BigNat, Expr, ExprKind, Literal};
 use trust_symbols::{
     CarrierEvidence, CarrierExtent, CarrierWitness, ObligationNotDischarged, OperationAgreement,
@@ -223,7 +231,7 @@ pub fn recognize(ty: &Expr) -> Option<CleanType> {
     }
 }
 
-fn strip_mdata(e: &Expr) -> &Expr {
+pub(crate) fn strip_mdata(e: &Expr) -> &Expr {
     let mut cur = e;
     while let ExprKind::MData(_, inner) = cur.kind() {
         cur = inner;
@@ -231,7 +239,7 @@ fn strip_mdata(e: &Expr) -> &Expr {
     cur
 }
 
-fn nat_literal(e: &Expr) -> Option<&BigNat> {
+pub(crate) fn nat_literal(e: &Expr) -> Option<&BigNat> {
     match e.kind() {
         ExprKind::Lit(Literal::Nat(n)) => Some(n),
         _ => None,
@@ -294,7 +302,11 @@ fn rust_name(ty: &Ty) -> String {
         Ty::BignumNat => "trust_bignum::Nat".to_string(),
         Ty::Int { width, signed } => format!("{}{width}", if *signed { 'i' } else { 'u' }),
         Ty::PtrSizedInt { signed } => {
-            if *signed { "isize".to_string() } else { "usize".to_string() }
+            if *signed {
+                "isize".to_string()
+            } else {
+                "usize".to_string()
+            }
         }
         Ty::Char => "char".to_string(),
         Ty::Float { width } => format!("f{width}"),
@@ -412,8 +424,17 @@ impl core::fmt::Display for SignaturePosition {
 /// be lying around, because the fields are private:
 ///
 /// ```compile_fail,E0451
-/// let sig = trust_clean_carrier::CarrierSignature { arguments: vec![], result: todo!() };
+/// let sig = trust_clean_carrier::CarrierSignature {
+///     arguments: vec![],
+///     result: todo!(),
+///     hypotheses: vec![],
+/// };
 /// ```
+///
+/// Every field is named on purpose, including `hypotheses`. Omitting one makes
+/// rustc report the "field not provided" error instead of `E0451`, which would
+/// still fail the block — but for the wrong reason, and the block would then
+/// keep passing even if the fields it DOES name were made public.
 ///
 /// The partner positive control — the same API, exercised so the block above
 /// cannot "pass" because of a typo:
@@ -430,6 +451,15 @@ impl core::fmt::Display for SignaturePosition {
 pub struct CarrierSignature {
     arguments: Vec<Carrier>,
     result: Carrier,
+    /// The **erased** hypothesis binders, in telescope order.
+    ///
+    /// Always empty from [`carrier_signature_for`] — that function refuses
+    /// every dependent `Pi`, hypothesis or not, and its behaviour is unchanged.
+    /// Only [`carrier_signature_with_hypotheses_for`] ever populates it. So a
+    /// consumer written before the lift cannot be handed a signature whose
+    /// obligations it silently drops: to obtain one, it must call the function
+    /// whose name says obligations may come with it.
+    hypotheses: Vec<Hypothesis>,
 }
 
 impl CarrierSignature {
@@ -464,6 +494,25 @@ impl CarrierSignature {
     #[must_use]
     pub fn evidence(&self) -> CarrierEvidence {
         CarrierEvidence::Total
+    }
+
+    /// The erased hypothesis binders, in telescope order.
+    ///
+    /// Empty for every signature [`carrier_signature_for`] produced.
+    #[must_use]
+    pub fn hypotheses(&self) -> &[Hypothesis] {
+        &self.hypotheses
+    }
+
+    /// The caller obligations this signature carries — one per hypothesis.
+    ///
+    /// This is the list a mint site must forward and a call-site lane must
+    /// discharge. It is a `Vec` of values rather than a borrow because it
+    /// crosses into `trust-vcgen` via `trust-types`, which is the only crate
+    /// the two sides share.
+    #[must_use]
+    pub fn preconditions(&self) -> Vec<CleanOriginPrecondition> {
+        self.hypotheses.iter().map(|h| h.precondition().clone()).collect()
     }
 
     /// Record the **result** carrier on a symbol header.
@@ -532,7 +581,205 @@ pub fn carrier_signature_for(ty: &Expr) -> Result<CarrierSignature, CarrierRefus
         cause: Box::new(cause),
     })?;
 
-    Ok(CarrierSignature { arguments, result })
+    Ok(CarrierSignature { arguments, result, hypotheses: Vec::new() })
+}
+
+/// Decompose a Clean type into argument carriers, a result carrier, and the
+/// **caller obligations** its erased hypothesis binders impose.
+///
+/// This is [`carrier_signature_for`] plus exactly one lift: a `Pi` whose domain
+/// is a recognised proposition over earlier value arguments is read as a
+/// **hypothesis** — erased from the Rust signature, and restated as a
+/// [`CleanOriginPrecondition`] every call site must discharge. Everything else
+/// is byte-identical to `carrier_signature_for`, including the arity, the
+/// argument carriers, the result carrier, and every refusal.
+///
+/// `crate::hypothesis` carries the five conditions and the argument that the
+/// lift can only ever cost a mint, never produce a wrong binary. The short
+/// version: a hypothesis whose statement cannot be carried is REFUSED, so no
+/// declaration is ever made callable with fewer requirements than the kernel
+/// checked it under.
+///
+/// # Why this is a separate function and not a widening of the old one
+///
+/// `carrier_signature_for` is called by the plan lane, the mint site, and the
+/// admission digest. Widening it in place would silently hand every one of them
+/// signatures carrying obligations they were not written to forward — and an
+/// obligation nobody forwards is exactly the fail-open this lane exists to
+/// close. A caller opts in by name, and the type it gets back
+/// ([`CarrierSignature::preconditions`]) makes the obligations impossible to
+/// miss.
+///
+/// # Errors
+///
+/// Every refusal [`carrier_signature_for`] can return, plus:
+///
+/// * [`CarrierRefused::UnrecognisedHypothesis`] when a binder's domain is
+///   shaped like a proposition but is not an atom this crate can restate;
+/// * [`CarrierRefused::DependentFunctionType`] when a **value** position or the
+///   result depends on an earlier binder, or when anything downstream depends
+///   on a proof — the original refusal, unchanged in force.
+pub fn carrier_signature_with_hypotheses_for(
+    ty: &Expr,
+) -> Result<CarrierSignature, CarrierRefused> {
+    // Pass 1 — peel the telescope, classifying each binder, WITHOUT deciding
+    // any dependency yet. The dependency rules differ per class, so they cannot
+    // be applied while the class is still unknown.
+    enum Binder<'a> {
+        Value(&'a Expr),
+        Hypothesis(CleanOriginPrecondition),
+    }
+
+    let mut binders: Vec<Binder<'_>> = Vec::new();
+    // `carried_index_of_binder[b]` — the carried-argument index of telescope
+    // binder `b`, or `None` when `b` is an erased hypothesis. Built as we go so
+    // a hypothesis can only ever name binders to its LEFT.
+    let mut carried_index_of_binder: Vec<Option<usize>> = Vec::new();
+    let mut carried = 0usize;
+    let mut cursor = strip_mdata(ty);
+
+    while let ExprKind::Pi(_, domain, body) = cursor.kind() {
+        let binder_index = binders.len();
+        let domain = strip_mdata(domain);
+
+        match carrier_for(domain) {
+            Ok(_) => {
+                // A VALUE binder. Its domain must be closed — a value type that
+                // depends on an earlier argument has no Rust spelling, which is
+                // the refusal this lift does NOT touch.
+                if domain.has_loose_bvars_quick() {
+                    return Err(CarrierRefused::DependentFunctionType {
+                        binder_index,
+                        signature: render_signature(ty),
+                    });
+                }
+                binders.push(Binder::Value(domain));
+                carried_index_of_binder.push(Some(carried));
+                carried += 1;
+            }
+            Err(cause) => {
+                // Not a carried value. It is a hypothesis binder if — and only
+                // if — this crate can restate it.
+                if let Some(precondition) = hypothesis::recognise_hypothesis(
+                    domain,
+                    binder_index,
+                    &carried_index_of_binder,
+                ) {
+                    // Nothing downstream may depend on the PROOF. `body` is the
+                    // whole remainder, and a loose bvar in it at this depth
+                    // means the proof itself is used later — no Rust type for
+                    // that, so the original refusal stands.
+                    if body_depends_on_this_binder(body) {
+                        return Err(CarrierRefused::DependentFunctionType {
+                            binder_index,
+                            signature: render_signature(ty),
+                        });
+                    }
+                    binders.push(Binder::Hypothesis(precondition));
+                    carried_index_of_binder.push(None);
+                } else if hypothesis::is_proposition_shaped(domain) {
+                    return Err(CarrierRefused::UnrecognisedHypothesis {
+                        binder_index,
+                        rendered: render_head(domain),
+                        signature: render_signature(ty),
+                    });
+                } else {
+                    // Not a value and not proposition-shaped: the ordinary
+                    // positional refusal, carrying the base cause verbatim —
+                    // identical to what `carrier_signature_for` reports.
+                    return Err(CarrierRefused::SignatureComponent {
+                        position: SignaturePosition::Argument(carried),
+                        arity: count_arrows(ty),
+                        signature: render_signature(ty),
+                        cause: Box::new(cause),
+                    });
+                }
+            }
+        }
+
+        cursor = strip_mdata(body);
+    }
+
+    // The RESULT may not depend on any binder — value or proof. A dependent
+    // result is the case `carrier_signature_for`'s doc names, and it is still
+    // refused.
+    if cursor.has_loose_bvars_quick() {
+        return Err(CarrierRefused::DependentFunctionType {
+            binder_index: binders.len().saturating_sub(1),
+            signature: render_signature(ty),
+        });
+    }
+
+    // Pass 2 — mint the carriers. `carrier_for` is called a SECOND time per
+    // value position rather than reusing pass 1's, so the granted carrier and
+    // the classification come from the same function with no shortcut between
+    // them, and the positional refusal keeps the base cause verbatim.
+    let mut arguments: Vec<Carrier> = Vec::new();
+    let mut hypotheses: Vec<Hypothesis> = Vec::new();
+    for (binder_index, binder) in binders.into_iter().enumerate() {
+        match binder {
+            Binder::Value(domain) => {
+                let index = arguments.len();
+                let carrier =
+                    carrier_for(domain).map_err(|cause| CarrierRefused::SignatureComponent {
+                        position: SignaturePosition::Argument(index),
+                        arity: count_arrows(ty),
+                        signature: render_signature(ty),
+                        cause: Box::new(cause),
+                    })?;
+                arguments.push(carrier);
+            }
+            Binder::Hypothesis(precondition) => {
+                hypotheses.push(hypothesis::seal(binder_index, precondition));
+            }
+        }
+    }
+
+    let result = carrier_for(cursor).map_err(|cause| CarrierRefused::SignatureComponent {
+        position: SignaturePosition::Result,
+        arity: arguments.len(),
+        signature: render_signature(ty),
+        cause: Box::new(cause),
+    })?;
+
+    Ok(CarrierSignature { arguments, result, hypotheses })
+}
+
+/// Whether the remainder of a telescope, taken under a just-opened binder,
+/// mentions THAT binder.
+///
+/// `has_loose_bvars_quick` on `body` answers "does it mention this binder or
+/// any outer one", which is too coarse: an outer VALUE binder mentioned by a
+/// later hypothesis is precisely the case being admitted. This narrows it to
+/// index 0 — the binder just opened — by an explicit traversal.
+fn body_depends_on_this_binder(body: &Expr) -> bool {
+    fn occurs(e: &Expr, depth: u32) -> bool {
+        // A subtree with no loose bvars at all cannot mention anything outside
+        // itself, so the metadata flag prunes whole branches for free.
+        if !e.has_loose_bvars_quick() {
+            return false;
+        }
+        match e.kind() {
+            ExprKind::BVar(index) => *index == depth,
+            ExprKind::App(f, a) => occurs(f, depth) || occurs(a, depth),
+            ExprKind::Lam(_, ty, b) | ExprKind::Pi(_, ty, b) => {
+                occurs(ty, depth) || occurs(b, depth + 1)
+            }
+            ExprKind::Let(_, ty, value, b, _) => {
+                occurs(ty, depth) || occurs(value, depth) || occurs(b, depth + 1)
+            }
+            ExprKind::MData(_, inner) => occurs(inner, depth),
+            ExprKind::Proj(_, _, inner) => occurs(inner, depth),
+            // Sorts, constants, literals, free variables and metavariables hold
+            // no bound-variable occurrences. `has_loose_bvars_quick` already
+            // returned `true` for this node, so falling through to `true` keeps
+            // an unmodeled variant fail-CLOSED (it refuses the lift) rather
+            // than silently answering "no dependency".
+            ExprKind::Sort(_) | ExprKind::SProp | ExprKind::Const(..) | ExprKind::Lit(_) => false,
+            _ => true,
+        }
+    }
+    occurs(body, 0)
 }
 
 /// How many arrows the type has at the top level.
@@ -701,6 +948,29 @@ pub enum CarrierRefused {
     DependentFunctionType {
         /// Which argument's binder is used downstream, 0-based.
         binder_index: usize,
+        /// The whole signature, rendered.
+        signature: String,
+    },
+    /// A binder's domain is **shaped like a proposition** — so it is a
+    /// hypothesis the declaration requires of its callers — but it is not an
+    /// atom this crate can restate as a
+    /// [`trust_types::clean_origin_precondition::CleanOriginPrecondition`].
+    ///
+    /// Refused rather than erased, and that is the whole discipline of the
+    /// hypothesis lift: erasing a proof binder is only sound when the
+    /// requirement it stands for is carried forward to the call sites. A
+    /// hypothesis this crate cannot state would be erased into nothing, and the
+    /// minted `fn` would then advertise a WEAKER contract than the declaration
+    /// the kernel checked.
+    ///
+    /// Only [`carrier_signature_with_hypotheses_for`] can produce this;
+    /// [`carrier_signature_for`] reports `DependentFunctionType` for the same
+    /// type, as it always has.
+    UnrecognisedHypothesis {
+        /// Which binder, 0-based, counting value and hypothesis binders alike.
+        binder_index: usize,
+        /// The proposition's head, as much as can be read without guessing.
+        rendered: String,
         /// The whole signature, rendered.
         signature: String,
     },
@@ -880,6 +1150,30 @@ impl core::fmt::Display for CarrierRefused {
                  by this map today; (4) if this shape should be carried, extend \
                  `trust-clean-carrier` — extending capability extends the CHECK, never \
                  trust (v7/D2)"
+            ),
+            Self::UnrecognisedHypothesis { binder_index, rendered, signature } => write!(
+                f,
+                "in `{signature}`, binder {binder_index} is a HYPOTHESIS — a proof argument \
+                 whose statement is a requirement this declaration makes of its callers — \
+                 but `{rendered}` is not a proposition this compiler can restate as a Rust \
+                 precondition.\n\
+                 A proof argument is erased in the emitted signature, so the requirement it \
+                 stands for has to travel to the call sites instead. One this compiler \
+                 cannot state would be erased into NOTHING, and the minted `fn` would then \
+                 advertise a weaker contract than the declaration the kernel checked. It is \
+                 refused for that reason, not because the proof itself is a problem.\n\
+                 supported today: `a ≠ b` (equivalently `¬ (a = b)`) at `UInt8`/`UInt16`/\
+                 `UInt32`/`UInt64`, with each side an earlier value argument or an in-range \
+                 numeral.\n\
+                 options: (1) restate the hypothesis in that form — a divisor guard \
+                 `(h : b ≠ 0)` is carried today; (2) drop the hypothesis argument and make \
+                 the definition total on all inputs, which needs no caller obligation at \
+                 all; (3) keep it and cite the declaration from PROOF position, where a \
+                 hypothesis costs nothing and no carrier is needed; (4) if this proposition \
+                 should be carried, extend the hypothesis recogniser in \
+                 `trust-clean-carrier` — and its matching renderer in `trust-vcgen`, since \
+                 an atom the renderer cannot spell withholds the whole summary \
+                 (v7/D2: extending capability extends the CHECK, never trust)"
             ),
             Self::ObligationDeclined(inner) => write!(
                 f,
@@ -1145,11 +1439,7 @@ pub fn representable_at(value: &BigNat, width: u32) -> Result<(), CarrierRefused
     if fits_in_bits(value, width) {
         return Ok(());
     }
-    Err(CarrierRefused::OutOfRange {
-        value: to_decimal(value),
-        width,
-        max: max_for_width(width),
-    })
+    Err(CarrierRefused::OutOfRange { value: to_decimal(value), width, max: max_for_width(width) })
 }
 
 /// `value < 2^bits`, computed on the limbs so it is exact at any precision.
@@ -1243,8 +1533,9 @@ fn decimal_of_limbs(limbs: &[u64]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use clean_kernel::Name;
+
+    use super::*;
 
     fn c(name: &str) -> Expr {
         Expr::const_(Name::from_string(name), vec![])
@@ -1313,7 +1604,10 @@ mod tests {
         // is unbounded, Rust `i64` is not.
         let err = carrier_at(&c("Int"), &Ty::Int { width: 64, signed: true })
             .expect_err("Clean `Int` is unbounded");
-        assert!(matches!(err, CarrierRefused::TargetDependentWidth { .. } | CarrierRefused::Narrowing { .. }));
+        assert!(matches!(
+            err,
+            CarrierRefused::TargetDependentWidth { .. } | CarrierRefused::Narrowing { .. }
+        ));
     }
 
     #[test]
@@ -1377,9 +1671,8 @@ mod tests {
     #[test]
     fn a_known_out_of_range_value_is_named_in_the_refusal() {
         let two_64 = BigNat::from_limbs(vec![0, 1]);
-        let err =
-            carrier_at_value(&c("Nat"), Some(&two_64), &Ty::Int { width: 64, signed: false })
-                .expect_err("Nat -> u64 is refused");
+        let err = carrier_at_value(&c("Nat"), Some(&two_64), &Ty::Int { width: 64, signed: false })
+            .expect_err("Nat -> u64 is refused");
         let text = err.to_string();
         assert!(text.contains("18446744073709551616"), "names the value: {text}");
         assert!(text.contains("18446744073709551615"), "names the width's max: {text}");

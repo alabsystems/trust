@@ -4,11 +4,7 @@
 // bounds proof surface without std I/O noise.
 
 fn slice_lookup_guarded(data: &[u32], idx: usize) -> u32 {
-    if idx < data.len() {
-        data[idx]
-    } else {
-        0
-    }
+    if idx < data.len() { data[idx] } else { 0 }
 }
 
 fn main() {

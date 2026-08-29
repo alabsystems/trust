@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/termination.rs: Termination checking via decreases clauses
 //
 // Extracts loop variants and recursive function decreases measures from MIR,
@@ -207,14 +208,17 @@ pub(crate) fn detect_recursive_calls(func: &VerifiableFunction) -> Vec<Recursive
     let mut sites = Vec::new();
 
     for block in &func.body.blocks {
-        if let Terminator::Call { func: callee, args, span, .. } = &block.terminator {
-            if is_direct_self_call(func, callee) {
-                sites.push(RecursiveCallSite {
-                    block: block.id,
-                    args: args.clone(),
-                    span: span.clone(),
-                });
-            }
+        let (callee, args, span) = match &block.terminator {
+            Terminator::Call { func, args, span, .. }
+            | Terminator::TailCall { func, args, span, .. } => (func, args, span),
+            _ => continue,
+        };
+        if is_direct_self_call(func, callee) {
+            sites.push(RecursiveCallSite {
+                block: block.id,
+                args: args.clone(),
+                span: span.clone(),
+            });
         }
     }
 
@@ -254,7 +258,9 @@ fn is_direct_self_call(func: &VerifiableFunction, callee: &str) -> bool {
 /// the authored clause actually proved.
 fn authored_recursion_identity_uncertainty(func: &VerifiableFunction) -> Option<String> {
     func.body.blocks.iter().find_map(|block| match &block.terminator {
-        Terminator::Call { func: callee, .. } if !is_direct_self_call(func, callee) => {
+        Terminator::Call { func: callee, .. } | Terminator::TailCall { func: callee, .. }
+            if !is_direct_self_call(func, callee) =>
+        {
             Some(format!(
                 "function-level decreases cannot classify non-self call `{callee}` in bb{} as \
                  non-recursive",
@@ -275,6 +281,7 @@ fn authored_recursion_identity_uncertainty(func: &VerifiableFunction) -> Option<
         // call/control-flow effect as non-recursive and could authorize a
         // partial or vacuous E5 discharge.
         Terminator::Call { .. }
+        | Terminator::TailCall { .. }
         | Terminator::Goto(_)
         | Terminator::SwitchInt { .. }
         | Terminator::Return
@@ -1610,6 +1617,7 @@ fn block_successors(term: &Terminator) -> Vec<BlockId> {
         }
         Terminator::Return | Terminator::Unreachable => vec![],
         Terminator::Call { target, .. } => target.iter().copied().collect(),
+        Terminator::TailCall { .. } => Vec::new(),
         Terminator::Assert { target, .. } => vec![*target],
         Terminator::Drop { target, .. } => vec![*target],
         Terminator::Opaque { targets, .. } => targets.clone(),
@@ -1688,6 +1696,7 @@ fn terminator_span(term: &Terminator) -> SourceSpan {
     match term {
         Terminator::SwitchInt { span, .. }
         | Terminator::Call { span, .. }
+        | Terminator::TailCall { span, .. }
         | Terminator::Assert { span, .. }
         | Terminator::Drop { span, .. }
         | Terminator::Opaque { span, .. } => span.clone(),
@@ -2094,6 +2103,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "test::factorial".to_string(),
                             args: vec![Operand::Copy(Place::local(3))],
@@ -2150,6 +2160,35 @@ mod tests {
             span: SourceSpan::default(),
             body: "n".to_string(),
         });
+        func
+    }
+
+    /// The explicit-tail-call form of `recursive_with_decreases`.
+    fn recursive_tail_with_decreases() -> VerifiableFunction {
+        let mut func = recursive_with_decreases();
+        let Terminator::Call {
+            func: callee,
+            args,
+            span,
+            atomic,
+            is_foreign,
+            is_unsafe_sig,
+            callee_identity,
+            ..
+        } = func.body.blocks[3].terminator.clone()
+        else {
+            unreachable!();
+        };
+        func.body.blocks[3].terminator = Terminator::TailCall {
+            func: callee,
+            args,
+            span,
+            atomic,
+            is_foreign,
+            is_unsafe_sig,
+            callee_identity,
+        };
+        func.body.blocks.truncate(4);
         func
     }
 
@@ -2515,6 +2554,51 @@ mod tests {
     }
 
     #[test]
+    fn exact_direct_self_tail_call_retains_one_nonvacuous_e5_row() {
+        let func = recursive_tail_with_decreases();
+        crate::validate_function(&func).expect("the structured TailCall must be valid Trust MIR");
+        let calls = detect_recursive_calls(&func);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].block, BlockId(3));
+
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(vcs.len(), 1, "one tail-call site must produce one exact E5 row");
+        assert!(matches!(
+            &vcs[0].kind,
+            VcKind::NonTermination { context, measure }
+                if context == "recursion" && measure == "n"
+        ));
+        assert_ne!(vcs[0].formula, Formula::Bool(false), "a real tail call is not vacuous");
+        assert_eq!(vcs[0].location, calls[0].span);
+        assert_eq!(
+            vcs[0].contract_metadata.and_then(|metadata| metadata.source_contract_index),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn nonself_tail_call_keeps_authored_decreases_fail_closed() {
+        let mut func = recursive_tail_with_decreases();
+        let Terminator::TailCall { func: callee, .. } = &mut func.body.blocks[3].terminator else {
+            unreachable!();
+        };
+        *callee = "other::rec_cs".to_string();
+
+        assert!(detect_recursive_calls(&func).is_empty());
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(vcs.len(), 1);
+        assert!(matches!(
+            &vcs[0].kind,
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == RECURSION_DECREASES_UNSUPPORTED_KIND
+                    && detail.contains("non-self call `other::rec_cs`")
+        ));
+        assert_eq!(vcs[0].formula, Formula::Bool(true));
+    }
+
+    #[test]
     fn test_generic_direct_self_call_preserves_exact_recursion_identity() {
         let mut func = recursive_with_decreases();
         let Terminator::Call { func: callee, .. } = &mut func.body.blocks[3].terminator else {
@@ -2719,6 +2803,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "test::spin_rec".to_string(),
                             args: vec![],
@@ -2985,6 +3070,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "test::spin_same".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -3031,6 +3117,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: trust_types::UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "test::wrap".to_string(),
                             args: vec![Operand::Copy(Place::local(2))],
@@ -3278,6 +3365,7 @@ mod tests {
         func.body.blocks[4].terminator = Terminator::Call {
             unwind: trust_types::UnwindEdge::Unreachable,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
             func: "test::helper".to_string(),
             args: vec![Operand::Copy(Place::local(1))],
@@ -3340,6 +3428,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: "test::helper".to_string(),
                     args: vec![],
@@ -3646,6 +3735,7 @@ mod tests {
                         terminator: Terminator::Call {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                             is_foreign: false,
                             func: "test::rec_cs".to_string(),
                             args: vec![Operand::Move(Place::local(4))],
@@ -3728,9 +3818,14 @@ mod tests {
                 id: BlockId(1),
                 stmts: pred.stmts,
                 terminator: match pred.terminator {
-                    Terminator::Assert { cond, expected, msg, span, .. } => {
-                        Terminator::Assert { unwind: trust_types::UnwindEdge::Unreachable, cond, expected, msg, target: BlockId(0), span }
-                    }
+                    Terminator::Assert { cond, expected, msg, span, .. } => Terminator::Assert {
+                        unwind: trust_types::UnwindEdge::Unreachable,
+                        cond,
+                        expected,
+                        msg,
+                        target: BlockId(0),
+                        span,
+                    },
                     _ => unreachable!(),
                 },
             },
@@ -3759,8 +3854,8 @@ mod tests {
                 _ => None,
             }
         }
-        let or = find_ge_or(&vcs[0].formula)
-            .expect("non-termination Ge-disjunction must be present");
+        let or =
+            find_ge_or(&vcs[0].formula).expect("non-termination Ge-disjunction must be present");
         let Formula::Ge(call, entry) = &or[0] else {
             unreachable!("selected Or has a Ge first disjunct by construction");
         };

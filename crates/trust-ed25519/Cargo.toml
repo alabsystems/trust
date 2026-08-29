@@ -1,0 +1,56 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-ed25519 — the Trust-owned Ed25519 (RFC 8032 §5.1).
+#
+# WHY THIS CRATE EXISTS.
+# `crates/trust-proof-cert` signs and verifies proof certificates with
+# `ed25519-dalek`, which the verified lane reports as
+# `dependency-policy-excluded`. Every proof certificate's authenticity is
+# therefore conditional on a compilation unit Trust does not own — and on the
+# 34-package forward closure behind it. This is phase 1d of the third-party
+# replacement (`sha2` and `hmac` shipped as phase 1a), and it is the one that
+# actually removes crates.io `sha2` from `crates/`, because `ed25519-dalek` is
+# the live shipping edge that still pulls it.
+#
+# THE DEPENDENCY LIST IS ONE FIRST-PARTY PATH ENTRY, AND THAT IS THE FLOOR.
+# RFC 8032 Ed25519 is SHA-512 by definition — the hash is not a parameter of
+# the scheme — so this crate has to name a hash. `trust-sha2` is Trust-owned,
+# in this workspace, and itself zero-dependency, so no third-party unit enters
+# the graph. There is no arrangement with fewer than one dependency that still
+# implements the standard.
+#
+# NOTE ON `generate`: the incumbent's `SigningKey::generate` takes a
+# `rand_core` trait object. This crate deliberately omits it rather than
+# depend on `rand_core` — see the `SigningKey` docs. That is the one place the
+# swap is not source-compatible, and it is a three-line change in a
+# Trust-owned function.
+#
+# `#![no_std]`, no `alloc`, `#![forbid(unsafe_code)]`.
+
+[package]
+name = "trust-ed25519"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned Ed25519 per RFC 8032, with curve25519 field and group arithmetic. No third-party dependencies, no_std, no unsafe."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ONLY dependency, and it is first-party and zero-dependency itself.
+# Read the header before adding a second.
+trust-sha2 = { workspace = true }
+
+[dev-dependencies]
+# TEST-ONLY: the differential acceptance gate against the incumbent
+# (`tests/differential_ed25519.rs`). Delete when the incumbent leaves the graph.
+## NOT `workspace = true`. The workspace `ed25519-dalek` entry is not yet
+## redirected, but it will be, and at that moment `workspace = true` here would
+## silently become a self-dependency and the differential would compare this
+## crate against itself — a gate that passes unconditionally. Naming the
+## version explicitly makes that impossible.
+ed25519-dalek = { version = "2", features = ["rand_core"] }

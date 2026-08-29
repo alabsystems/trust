@@ -949,8 +949,9 @@ impl RegionMap {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::Ty;
+
+    use super::*;
 
     fn i32_ty() -> Ty {
         Ty::i32()
@@ -965,11 +966,16 @@ mod tests {
     }
 
     fn struct_point_ty() -> Ty {
-        Ty::Adt { adt_kind: None, layout: None, variants: Vec::new(),
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new(),
             name: "Point".into(),
             fields: vec![("x".into(), i32_ty()), ("y".into(), i32_ty())],
             disc_index_safe: false,
-         faithful_enum_repr: None, enum_layout: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
     }
 
     // --- Basic binding and read ---

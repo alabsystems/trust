@@ -51,12 +51,9 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{
-    Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula,
-};
-use trust_types::{Formula, Sort};
-
 use trust_ir::Module;
+use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // The kind of unary op being modeled.
@@ -152,7 +149,13 @@ fn make_bridge_unop_module(kind: UnKind) -> Module {
         name: name.to_string(),
         def_path: "unop::op".to_string(),
         span: SourceSpan::default(),
-        body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: i32t, datatype_defs: Default::default() },
+        body: VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 1,
+            return_ty: i32t,
+            datatype_defs: Default::default(),
+        },
         contracts: vec![],
         preconditions: vec![],
         postconditions: vec![],
@@ -636,8 +639,8 @@ fn unop_lir_shape_carries_right_opcode_and_guard() {
     ];
     for &(kind, is_unop, want_brif) in cases {
         let module = make_bridge_unop_module(kind);
-        let lir = lower_trust_ir_function_to_lir(&module, &module.functions[0])
-            .expect("unop lowers");
+        let lir =
+            lower_trust_ir_function_to_lir(&module, &module.functions[0]).expect("unop lowers");
         assert!(lir.stack_slots.is_empty(), "unop must materialize NO memory ({kind:?})");
         let mut unops = 0;
         let mut brif = 0;
@@ -667,20 +670,28 @@ fn unop_lir_shape_carries_right_opcode_and_guard() {
 fn unop_mapping_is_not_swapped() {
     use trust_cg_lower::instructions::Opcode as LO;
     let not_m = make_bridge_unop_module(UnKind::Not);
-    let not_lir =
-        lower_trust_ir_function_to_lir(&not_m, &not_m.functions[0]).expect("not lowers");
-    let has_bnot = not_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Bnot)));
-    let has_ineg_in_not =
-        not_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ineg)));
+    let not_lir = lower_trust_ir_function_to_lir(&not_m, &not_m.functions[0]).expect("not lowers");
+    let has_bnot = not_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Bnot)));
+    let has_ineg_in_not = not_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ineg)));
     assert!(has_bnot, "!a must be Bnot (bitwise complement)");
     assert!(!has_ineg_in_not, "!a must NOT be Ineg — that would compute -a, off by one");
 
     let neg_m = make_bridge_unop_module(UnKind::NegBare);
-    let neg_lir =
-        lower_trust_ir_function_to_lir(&neg_m, &neg_m.functions[0]).expect("neg lowers");
-    let has_ineg = neg_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ineg)));
-    let has_bnot_in_neg =
-        neg_lir.blocks.values().any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Bnot)));
+    let neg_lir = lower_trust_ir_function_to_lir(&neg_m, &neg_m.functions[0]).expect("neg lowers");
+    let has_ineg = neg_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Ineg)));
+    let has_bnot_in_neg = neg_lir
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| matches!(i.opcode, LO::Bnot)));
     assert!(has_ineg, "-a must be Ineg (negation)");
     assert!(!has_bnot_in_neg, "-a must NOT be Bnot — that would compute ~a, off by one");
 }
@@ -699,14 +710,12 @@ fn unop_emits_object_and_guard_branch_only_when_guarded() {
         assert!(!code.is_empty(), "emitted __text is empty for {kind:?}");
         let has_branch = has_conditional_branch(&code, base);
         match kind {
-            UnKind::NegGuarded => assert!(
-                has_branch,
-                "guarded -a must carry a conditional branch (guard lowered)"
-            ),
-            UnKind::Not | UnKind::NegBare => assert!(
-                !has_branch,
-                "unguarded {kind:?} must be straight-line (no guard)"
-            ),
+            UnKind::NegGuarded => {
+                assert!(has_branch, "guarded -a must carry a conditional branch (guard lowered)")
+            }
+            UnKind::Not | UnKind::NegBare => {
+                assert!(!has_branch, "unguarded {kind:?} must be straight-line (no guard)")
+            }
         }
     }
 }

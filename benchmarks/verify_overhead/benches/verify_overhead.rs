@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use trust_router::MirRouter;
 use trust_types::VerifiableFunction;
 use trust_vcgen::generate_vcs;
@@ -101,13 +101,9 @@ fn bench_classify(c: &mut Criterion) {
     let router = MirRouter::with_defaults();
     let mut group = c.benchmark_group("classify");
     for (name, func) in &fixtures {
-        group.bench_with_input(
-            BenchmarkId::new("mir_classify", name),
-            func,
-            |b, func| {
-                b.iter(|| router.classify(func));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mir_classify", name), func, |b, func| {
+            b.iter(|| router.classify(func));
+        });
     }
     group.finish();
 }
@@ -128,10 +124,7 @@ fn bench_verify_function(c: &mut Criterion) {
     for (name, func) in &fixtures {
         let block_count = func.body.blocks.len();
         group.bench_with_input(
-            BenchmarkId::new(
-                "verify_function",
-                format!("{name} ({block_count} blocks)"),
-            ),
+            BenchmarkId::new("verify_function", format!("{name} ({block_count} blocks)")),
             func,
             |b, func| {
                 b.iter(|| router.verify_function(func));
@@ -157,10 +150,7 @@ fn bench_all_fixtures_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch");
 
     group.bench_function(
-        BenchmarkId::new(
-            "vcgen_all",
-            format!("{} funcs, {} blocks", fixtures.len(), total_blocks),
-        ),
+        BenchmarkId::new("vcgen_all", format!("{} funcs, {} blocks", fixtures.len(), total_blocks)),
         |b| {
             b.iter(|| {
                 for (_, func) in &fixtures {

@@ -41,9 +41,15 @@ mod check_pointers;
 // Trust (I5): the SOLE CONSTRUCTOR of a Clean-origin `Body`, and the
 // carrier-typed faithfulness gate that stands in front of it. This is the one
 // direction in Trust that produces a value, so a disagreement is a wrong
-// binary; read that file's header before touching any of its four call sites
-// (`mir_keys`, `inner_optimized_mir`, `inner_mir_for_ctfe`, `promoted_mir`).
+// binary; read that file's header before touching any of its five call sites
+// (`mir_keys`, `inner_optimized_mir`, `inner_mir_for_ctfe`, `promoted_mir`,
+// `mir_drops_elaborated_and_const_checked`).
 mod clean_origin_mir;
+// Trust: (IR-1) — the Clean-origin trust-ir RECORDING PATH: finalize-seam
+// collection with a re-earned kernel verdict per def, feeding the per-crate
+// direct Module (docs/design/2026-08-27-two-language-direct-to-trust-ir.md §3).
+// `pub` because `rustc_interface::passes` drives it at the finalize seam.
+pub mod clean_origin_ir;
 // Trust: (I7) — Clean-origin verdict-digest EXPORT providers (encode half).
 mod clean_origin_export;
 // Trust: (I7) — Clean-origin cross-crate IMPORT lane (readmission + re-gate).
@@ -64,9 +70,16 @@ mod trivial_const;
 mod trust_contract_query;
 // Trust: P1 item 5 — the trust-ir flip: `inner_optimized_mir` consumes MIR derived from the
 // green (DerivedAgreed) trust-ir Module. See trust_ir_flip.rs for the full design notes.
+// Trust (wall A): the per-INSTANCE trust-ir flip — the codegen-seam lane for GENERIC bodies the
+// `optimized_mir` seam cannot flip. See trust_instance_flip.rs.
+mod trust_instance_flip;
 mod trust_ir_flip;
 mod trust_proof_query;
 mod trust_r1_oracle;
+// Trust (v6/D1): the `targo trust spec --emit clean` session-artifact writer.
+// `pub` so the emit surface is externally reachable (and warning-free) even
+// before/without the trust_verify.rs call sites that feed it.
+pub mod trust_spec_emit;
 
 /// Exposed for rustc drivers.
 pub use shim::build_drop_shim;
@@ -245,12 +258,18 @@ declare_passes! {
 // Trust (lane CTFE): the trivial-const flip probe. MEASUREMENT ONLY — gated on
 // `-Ztrust-ctfe-trivial-probe`, installs no body, changes no emitted code.
 pub use trust_ir_flip::probe_trivial_const_flips as trust_probe_trivial_const_flips;
-pub use trust_verify::trust_init_r1_attributions;
 pub use trust_verify::{
     initialize_ay_solver_identity as trust_initialize_ay_solver_identity,
     trust_emit_transport_crate_summary, trust_ensure_whole_crate_verification,
-    trust_init_backing_certificates,
+    trust_init_backing_certificates, trust_init_r1_attributions,
 };
+
+/// Trust (wall A): emit the per-INSTANCE flip census at the post-codegen seam. A no-op unless the
+/// instance lane is enabled. Re-exported because `rustc_interface` owns that seam and cannot
+/// reach a private module here.
+pub fn trust_instance_flip_census(tcx: TyCtxt<'_>) {
+    trust_instance_flip::emit_census(tcx);
+}
 
 pub fn provide(providers: &mut Providers) {
     coverage::query::provide(providers);
@@ -264,6 +283,7 @@ pub fn provide(providers: &mut Providers) {
         mir_promoted,
         mir_drops_elaborated_and_const_checked,
         mir_for_trust_verification,
+        trust_instance_flip_body: trust_instance_flip::trust_instance_flip_body,
         trust_mir_direct_local_callees: trust_verify::trust_mir_direct_local_callees,
         trust_mir_mutually_recursive_functions:
             trust_verify::trust_mir_mutually_recursive_functions,

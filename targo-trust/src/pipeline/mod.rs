@@ -9,9 +9,11 @@
 //   override channel merged after config-derived policy
 // - transport: parse trustc's stderr JSON transport into VerificationResult records
 // - hardened: gate hardened-profile obligations on publishable proof evidence
-// - kani_gate: fail-closed build boundary for packages that declare a `kani` dependency
-// - creusot_gate: fail-closed build boundary for packages that declare a Creusot-family
-//   dependency (their `#[requires]`/`#[ensures]`/`#[logic]` specs would be silently unverified)
+// - kani_gate: disclosure build boundary for packages that declare a `kani` dependency
+//   (zero-authority ingestion lane, v5 §3.2: the build proceeds, the operator is told)
+// - creusot_gate: disclosure build boundary for packages that declare a Creusot-family
+//   dependency (same v5 lane; the disclosure names the tippy reader for migration —
+//   their `#[requires]`/`#[ensures]`/`#[logic]` specs are otherwise silently unverified)
 // - provenance: import binary-source-provenance and source-backpropagation-gate artifacts
 // - standalone: source-level analysis renderer (no compiler invocation)
 // - run: build the trustc command, spawn it, render the report, drive the rewrite loop

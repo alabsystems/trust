@@ -19,7 +19,7 @@
 //! mutant ever passes, the defect is in the emitter or the gate — never here.
 
 use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level, Name};
-use trust_clean_origin::{admit_lowering, plan_clean_origin_body, CleanOriginShape, EmitRefusal};
+use trust_clean_origin::{CleanOriginShape, EmitRefusal, admit_lowering, plan_clean_origin_body};
 use trust_types::admissible_body::SelectCmp;
 use trust_types::{
     BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
@@ -202,10 +202,7 @@ fn half_4_the_wrong_carrier_width_is_refused_by_the_kernel() {
         .expect_err("a truncating select emission must be refused");
     assert!(refusal.is_compiler_defect());
     assert!(
-        matches!(
-            refusal,
-            EmitRefusal::Gate(trust_clean_origin::GateRefusal::Disagreement { .. })
-        ),
+        matches!(refusal, EmitRefusal::Gate(trust_clean_origin::GateRefusal::Disagreement { .. })),
         "the width mistake must be caught by the KERNEL comparison: {refusal:?}"
     );
 }

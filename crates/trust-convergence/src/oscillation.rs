@@ -209,8 +209,9 @@ fn compute_ewma(history: &[f64], alpha: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::f64::consts::PI;
+
+    use super::*;
 
     fn default_config() -> OscillationConfig {
         OscillationConfig::default()

@@ -220,10 +220,7 @@ fn launch_and_driver_calls_reject_unsafe_signatures() {
             let decline = sem_fold_launch_wrapper_of(&doctored, &bodies)
                 .expect_err("an unsafe-signature launch edge must decline");
             assert!(
-                matches!(
-                    decline,
-                    FoldWrapDecline::LaunchShape(_) | FoldWrapDecline::GuardShape(_)
-                ),
+                matches!(decline, FoldWrapDecline::LaunchShape(_) | FoldWrapDecline::GuardShape(_)),
                 "{row} call #{call_index}: {decline:?}"
             );
         }
@@ -260,16 +257,38 @@ fn launch_and_driver_calls_reject_unsafe_signatures() {
 /// Instantiator SCC's `fold_bvar_opt` leaf, which main's leaf-assert landing
 /// (P-ORD-CMP ordering-dispatch lane) has since certified — the launch arm
 /// now composes with that certificate, no rung-E code change needed.
+///
+/// UPDATED 2026-08-25 — `ABSTRACT_FVAR_AT` is DEFERRED, and its own body is not the
+/// cause. It launches the Abstractor SCC, whose leaf
+/// `<Abstractor as ExprFolderOpt>::fold_expr_opt` raises
+/// `UnsupportedMir { kind: "ConstValue::OpaqueScalar" }`; that DECLINED row is not an
+/// `is_safety_vc_kind` member, so before the decline clause it fell out of the filter and
+/// the SCC certified over a set with the only raised row REMOVED (Channel 2 of the
+/// decline-handling false proof). See
+/// `expr_fold_corpus::abstractor_and_lifter_scc_rows_fully_faithful_on_production_gate`.
+/// The other three launch rows are UNCHANGED, which is what keeps this discriminating.
 #[test]
 fn launch_wrappers_fully_faithful_on_production_gate() {
     let bodies = all_bodies();
     let empty: BTreeMap<String, CalleeFact> = BTreeMap::new();
-    for row in [SUBST_FVAR, LIFT_AT, ABSTRACT_FVAR_AT, INSTANTIATE_AT] {
+    for row in [SUBST_FVAR, LIFT_AT, INSTANTIATE_AT] {
         let func = load(row);
         let diag = trust_clean::diagnose_fully_faithful_gate_with_bodies(&func, &empty, &bodies);
         assert!(diag.via_ir_shape, "{row}: the rung-E launch arm must accept the shape");
         assert!(diag.fully_faithful, "{row} must be FULLY_FAITHFUL");
     }
+    let abstract_fvar_at = load(ABSTRACT_FVAR_AT);
+    assert!(
+        !trust_clean::mirsem::function_emits_declined_vc(&abstract_fvar_at),
+        "{ABSTRACT_FVAR_AT}: the deferral is INHERITED from its SCC leaf, not its own body"
+    );
+    assert!(
+        !trust_clean::diagnose_fully_faithful_gate_with_bodies(&abstract_fvar_at, &empty, &bodies)
+            .fully_faithful,
+        "{ABSTRACT_FVAR_AT}: its Abstractor SCC leaf carries an open DECLINED row; if this \
+         flips, vcgen models `ConstValue::OpaqueScalar` — move the row back into the loop \
+         above, do not weaken the gate"
+    );
 }
 
 // ===========================================================================
@@ -284,12 +303,14 @@ fn launch_wrappers_fully_faithful_on_production_gate() {
 fn delegates_fully_faithful_with_certified_callee_registry_only() {
     let bodies = all_bodies();
     let empty: BTreeMap<String, CalleeFact> = BTreeMap::new();
-    for (row, callee) in [
-        (LIFT, LIFT_AT),
-        (LIFT_FROM, LIFT_AT),
-        (ABSTRACT_FVAR, ABSTRACT_FVAR_AT),
-        (INSTANTIATE, INSTANTIATE_AT),
-    ] {
+    // UPDATED 2026-08-25 — the `(ABSTRACT_FVAR, ABSTRACT_FVAR_AT)` pair is dropped, and
+    // the cause is the CALLEE, not the delegate arm: `ABSTRACT_FVAR_AT` launches the
+    // Abstractor SCC, whose leaf raises
+    // `UnsupportedMir { kind: "ConstValue::OpaqueScalar" }`, so this test's own
+    // precondition ("the callee itself is FF (launch arm)") no longer holds and every
+    // assertion after it would measure nothing. The pair is asserted at that precondition
+    // instead, below. See `launch_wrappers_fully_faithful_on_production_gate`.
+    for (row, callee) in [(LIFT, LIFT_AT), (LIFT_FROM, LIFT_AT), (INSTANTIATE, INSTANTIATE_AT)] {
         let func = load(row);
         // Empty registry: the delegate arm must decline (no callee fact).
         let diag = trust_clean::diagnose_fully_faithful_gate_with_bodies(&func, &empty, &bodies);
@@ -306,6 +327,28 @@ fn delegates_fully_faithful_with_certified_callee_registry_only() {
         assert!(diag.via_ir_shape, "{row}: the rung-E delegate arm must accept the shape");
         assert!(diag.fully_faithful, "{row} must be FULLY_FAITHFUL with {callee} registered");
     }
+    // THE DROPPED PAIR, asserted at the precondition that stopped holding.
+    let callee_func = load(ABSTRACT_FVAR_AT);
+    assert!(
+        !trust_clean::diagnose_fully_faithful_gate_with_bodies(&callee_func, &empty, &bodies)
+            .fully_faithful,
+        "{ABSTRACT_FVAR_AT}: while its SCC leaf carries an open DECLINED row it cannot be \
+         registered, so {ABSTRACT_FVAR} has nothing to compose over; if this flips, put \
+         the pair back in the loop above"
+    );
+    // MEASURED: forging the callee fact does NOT recover the delegate, because the
+    // composition point RE-RUNS the callee's launch certificate over the current sibling
+    // body — the property
+    // `delegate_rechecks_recognizable_callee_semantics_at_composition_point` exists to
+    // pin. So the deferral propagates through a registry entry rather than around it,
+    // which is the fail-closed direction.
+    let mut reg: BTreeMap<String, CalleeFact> = BTreeMap::new();
+    reg.insert(callee_func.def_path.clone(), CalleeFact::of_certified(&callee_func));
+    assert!(
+        !trust_clean::diagnose_fully_faithful_gate_with_bodies(&load(ABSTRACT_FVAR), &reg, &bodies)
+            .fully_faithful,
+        "{ABSTRACT_FVAR}: a registry entry must not launder its callee's open DECLINED row"
+    );
 }
 
 #[test]

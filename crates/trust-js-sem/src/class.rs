@@ -14,22 +14,25 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::ast::{ClassKey, ClassLit, ClassMember, Expr, MethodKind};
-use crate::interp::{Abrupt, Ctx, CtorFrame, ERes, Interp, MAX_CALL_DEPTH};
-use crate::value::{
-    units_from_str, Builtin, ClassCtorRec, FieldKey, FieldRec, FnImpl, NativeErrorKind, ObjId,
-    ObjKind, Object, PrivElemKind, PrivName, PrivateElement, Prop, PropDesc, PropVal, Units, Value,
-};
 use std::rc::Rc;
+
+use crate::ast::{ClassKey, ClassLit, ClassMember, Expr, MethodKind};
+use crate::interp::{Abrupt, CtorFrame, Ctx, ERes, Interp, MAX_CALL_DEPTH};
+use crate::value::{
+    Builtin, ClassCtorRec, FieldKey, FieldRec, FnImpl, NativeErrorKind, ObjId, ObjKind, Object,
+    PrivElemKind, PrivName, PrivateElement, Prop, PropDesc, PropVal, Units, Value, units_from_str,
+};
 
 /// Add a private method/accessor element to a list, merging a getter/setter
 /// pair (same PrivateName) into one accessor element.
-fn merge_private_method(list: &mut Vec<PrivateElement>, key: PrivName, mk: MethodKind, fnobj: ObjId) {
+fn merge_private_method(
+    list: &mut Vec<PrivateElement>,
+    key: PrivName,
+    mk: MethodKind,
+    fnobj: ObjId,
+) {
     match mk {
-        MethodKind::Normal => list.push(PrivateElement {
-            key,
-            kind: PrivElemKind::Method(fnobj),
-        }),
+        MethodKind::Normal => list.push(PrivateElement { key, kind: PrivElemKind::Method(fnobj) }),
         MethodKind::Get | MethodKind::Set => {
             if let Some(e) = list.iter_mut().find(|e| e.key == key) {
                 if let PrivElemKind::Accessor { get, set } = &mut e.kind {
@@ -40,15 +43,9 @@ fn merge_private_method(list: &mut Vec<PrivateElement>, key: PrivName, mk: Metho
                     }
                 }
             } else {
-                let (get, set) = if mk == MethodKind::Get {
-                    (Some(fnobj), None)
-                } else {
-                    (None, Some(fnobj))
-                };
-                list.push(PrivateElement {
-                    key,
-                    kind: PrivElemKind::Accessor { get, set },
-                });
+                let (get, set) =
+                    if mk == MethodKind::Get { (Some(fnobj), None) } else { (None, Some(fnobj)) };
+                list.push(PrivateElement { key, kind: PrivElemKind::Accessor { get, set } });
             }
         }
     }
@@ -171,10 +168,7 @@ impl Interp {
             for n in &cl.private_names {
                 names.insert(n.clone(), self.alloc_priv_name());
             }
-            std::rc::Rc::new(crate::interp::PrivEnvFrame {
-                parent: ctx.priv_env.clone(),
-                names,
-            })
+            std::rc::Rc::new(crate::interp::PrivEnvFrame { parent: ctx.priv_env.clone(), names })
         };
         let class_ctx = Ctx {
             env: class_env,
@@ -260,11 +254,8 @@ impl Interp {
         ));
         #[allow(clippy::cast_precision_loss)]
         let ctor_len = cl.ctor.as_ref().map_or(0.0, |c| c.params.len() as f64);
-        let class_name = cl
-            .name
-            .clone()
-            .or_else(|| cl.inferred_name.borrow().clone())
-            .unwrap_or_default();
+        let class_name =
+            cl.name.clone().or_else(|| cl.inferred_name.borrow().clone()).unwrap_or_default();
         self.obj_mut(f).props.insert(
             units_from_str("length"),
             Prop::with_attrs(Value::Num(ctor_len), false, false, true),
@@ -292,16 +283,8 @@ impl Interp {
         let mut priv_methods: Vec<PrivateElement> = Vec::new();
         for m in &cl.members {
             match m {
-                ClassMember::Method {
-                    stat,
-                    key: ClassKey::Private(name),
-                    mk,
-                    lit,
-                } => {
-                    let pn = *class_priv_env
-                        .names
-                        .get(name)
-                        .expect("declared private name");
+                ClassMember::Method { stat, key: ClassKey::Private(name), mk, lit } => {
+                    let pn = *class_priv_env.names.get(name).expect("declared private name");
                     let target_home = if *stat { f } else { proto };
                     let fnobj = self.create_method(
                         lit,
@@ -329,8 +312,12 @@ impl Interp {
                 ClassMember::Method { stat, key, mk, lit } => {
                     let key_u = self.eval_class_key(key, &class_ctx)?;
                     let target = if *stat { f } else { proto };
-                    let fnobj =
-                        self.create_method(lit, class_env, target, Some(Rc::clone(&class_priv_env)));
+                    let fnobj = self.create_method(
+                        lit,
+                        class_env,
+                        target,
+                        Some(Rc::clone(&class_priv_env)),
+                    );
                     let prefix = match mk {
                         MethodKind::Normal => "",
                         MethodKind::Get => "get ",
@@ -367,21 +354,12 @@ impl Interp {
                         return Err(self.throw_native(NativeErrorKind::TypeError));
                     }
                 }
-                ClassMember::Field {
-                    stat,
-                    key: ClassKey::Private(name),
-                    init,
-                } => {
-                    let pn = *class_priv_env
-                        .names
-                        .get(name)
-                        .expect("declared private name");
+                ClassMember::Field { stat, key: ClassKey::Private(name), init } => {
+                    let pn = *class_priv_env.names.get(name).expect("declared private name");
                     let mut ident = units_from_str("#");
                     ident.extend_from_slice(&units_from_str(name));
-                    let rec = FieldRec {
-                        key: FieldKey::Private { name: pn, ident },
-                        init: init.clone(),
-                    };
+                    let rec =
+                        FieldRec { key: FieldKey::Private { name: pn, ident }, init: init.clone() };
                     if *stat {
                         static_fields.push(rec);
                     } else {
@@ -390,10 +368,7 @@ impl Interp {
                 }
                 ClassMember::Field { stat, key, init } => {
                     let key_u = self.eval_class_key(key, &class_ctx)?;
-                    let rec = FieldRec {
-                        key: FieldKey::Public(key_u),
-                        init: init.clone(),
-                    };
+                    let rec = FieldRec { key: FieldKey::Public(key_u), init: init.clone() };
                     if *stat {
                         static_fields.push(rec);
                     } else {
@@ -475,9 +450,9 @@ impl Interp {
                 // symbol key through a string coercion.
                 match self.to_property_key(&v)? {
                     crate::value::PropertyKey::Str(u) => Ok(u),
-                    crate::value::PropertyKey::Sym(_) => Err(Abrupt::Fatal(
-                        "symbol-keyed class member (out of slice)".to_string(),
-                    )),
+                    crate::value::PropertyKey::Sym(_) => {
+                        Err(Abrupt::Fatal("symbol-keyed class member (out of slice)".to_string()))
+                    }
                 }
             }
             ClassKey::Private(_) => Err(Abrupt::Fatal(
@@ -645,11 +620,8 @@ impl Interp {
                 Err(other) => Err(other),
             }
         } else {
-            let frame = Rc::new(CtorFrame {
-                cell: std::cell::RefCell::new(None),
-                new_target,
-                active: fid,
-            });
+            let frame =
+                Rc::new(CtorFrame { cell: std::cell::RefCell::new(None), new_target, active: fid });
             let Some(lit) = &rec.lit else {
                 // Default derived constructor: constructor(...args) {
                 // super(...args); } — performed directly.
@@ -692,11 +664,7 @@ impl Interp {
     /// arguments BEFORE the IsConstructor check, construct with the original
     /// new.target, bind the this cell (ReferenceError when already bound),
     /// then the active class's instance fields.
-    pub(crate) fn perform_super_call(
-        &mut self,
-        frame: &Rc<CtorFrame>,
-        args: Vec<Value>,
-    ) -> ERes {
+    pub(crate) fn perform_super_call(&mut self, frame: &Rc<CtorFrame>, args: Vec<Value>) -> ERes {
         let parent = self.obj(frame.active).proto;
         let parent_ok = parent.is_some_and(|p| self.is_constructor(p));
         if !parent_ok {
@@ -714,11 +682,7 @@ impl Interp {
         }
         let rec = match &self.obj(frame.active).kind {
             ObjKind::Function(FnImpl::ClassCtor(rec)) => Rc::clone(rec),
-            _ => {
-                return Err(Abrupt::Fatal(
-                    "super() with a non-class active function".to_string(),
-                ))
-            }
+            _ => return Err(Abrupt::Fatal("super() with a non-class active function".to_string())),
         };
         self.init_instance_fields(&result, &rec)?;
         Ok(result)

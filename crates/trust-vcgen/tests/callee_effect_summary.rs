@@ -119,9 +119,7 @@ fn bool_vars(f: &Formula, out: &mut Vec<String>) {
 fn eval(f: &Formula, env: &[(String, bool)]) -> Option<bool> {
     match f {
         Formula::Bool(b) => Some(*b),
-        Formula::Var(n, Sort::Bool) => {
-            env.iter().find(|(k, _)| k == n).map(|(_, v)| *v)
-        }
+        Formula::Var(n, Sort::Bool) => env.iter().find(|(k, _)| k == n).map(|(_, v)| *v),
         Formula::Not(a) => Some(!eval(a, env)?),
         Formula::And(xs) => {
             let mut acc = true;
@@ -150,11 +148,8 @@ fn is_unsat(f: &Formula) -> Option<bool> {
     bool_vars(f, &mut vars);
     assert!(vars.len() <= 16, "brute force is only meant for these small VCs");
     for mask in 0u32..(1u32 << vars.len()) {
-        let env: Vec<(String, bool)> = vars
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), (mask >> i) & 1 == 1))
-            .collect();
+        let env: Vec<(String, bool)> =
+            vars.iter().enumerate().map(|(i, n)| (n.clone(), (mask >> i) & 1 == 1)).collect();
         if eval(f, &env)? {
             return Some(false);
         }
@@ -303,8 +298,7 @@ fn a_body_under_the_wrong_name_grants_nothing() {
     let callee = parse(HELPER_NO_FLAG);
     let mut db = SummaryDatabase::new();
     db.insert(
-        FunctionSummary::new("p2::G::some_other_method")
-            .with_extracted_body(Arc::new(callee)),
+        FunctionSummary::new("p2::G::some_other_method").with_extracted_body(Arc::new(callee)),
     );
 
     let rows = spec_unverifiable_rows(&all_vcs(&func, &db));

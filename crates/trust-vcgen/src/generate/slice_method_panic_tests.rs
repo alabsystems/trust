@@ -1,7 +1,7 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     AggregateKind, BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue,
-    Sort, SourceSpan, Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    Sort, SourceSpan, Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody,
+    VerifiableFunction,
 };
 
 use super::generate_vcs;
@@ -23,11 +23,7 @@ fn formula_mentions(f: &Formula, name: &str) -> bool {
 /// `a` to arg 1 (local 2), the second `b` to arg 2 (local 3) — exactly the
 /// shape the recognizer keys on. `args` are the call's MIR operands (already
 /// including the receiver); `pre` optionally adds a precondition.
-fn slice_method_func(
-    method: &str,
-    args: Vec<Operand>,
-    pre: Vec<Formula>,
-) -> VerifiableFunction {
+fn slice_method_func(method: &str, args: Vec<Operand>, pre: Vec<Formula>) -> VerifiableFunction {
     VerifiableFunction {
         name: "slice_caller".to_string(),
         def_path: "test::slice_caller".to_string(),
@@ -51,6 +47,7 @@ fn slice_method_func(
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -197,7 +194,9 @@ fn range_family_defining_module_path_emits_slice_bounds_vc() {
         name: range_name.into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+    };
     let func = VerifiableFunction {
         name: "range_to_caller".into(),
         def_path: "test::range_to_caller".into(),
@@ -227,17 +226,16 @@ fn range_family_defining_module_path_emits_slice_bounds_vc() {
                 }],
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
-                    func: "<[u8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index"
-                        .into(),
-                    args: vec![
-                        Operand::Copy(Place::local(1)),
-                        Operand::Move(Place::local(3)),
-                    ],
+                    func:
+                        "<[u8] as core::ops::index::Index<core::ops::range::RangeTo<usize>>>::index"
+                            .into(),
+                    args: vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(3))],
                     dest: Place::local(4),
                     target: None,
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -325,6 +323,7 @@ fn ignores_swap_on_non_slice_receiver() {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -410,15 +409,13 @@ fn dominating_nonzero_guard_carries_into_chunks_vc() {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         func: "core::slice::<impl [u8]>::chunks".to_string(),
-                        args: vec![
-                            Operand::Copy(Place::local(1)),
-                            Operand::Copy(Place::local(2)),
-                        ],
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(0),
                         target: Some(BlockId(2)),
                         span: SourceSpan::default(),
                         atomic: None,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                     },
                 },
@@ -484,6 +481,7 @@ fn vec_scalar_index_func() -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -548,8 +546,7 @@ fn hashmap_index_emits_visible_unknown_not_silent() {
 #[test]
 fn btreemap_index_emits_visible_unknown() {
     let mut func = vec_scalar_index_func();
-    func.body.locals[1].ty =
-        Ty::adt("std::collections::btree::map::BTreeMap<i32, i32>", vec![]);
+    func.body.locals[1].ty = Ty::adt("std::collections::btree::map::BTreeMap<i32, i32>", vec![]);
     let vcs = generate_vcs(&func);
     assert!(
         vcs.iter().any(|vc| matches!(
@@ -654,6 +651,7 @@ fn vec_scalar_index_mut_write_func() -> VerifiableFunction {
                     span: SourceSpan::default(),
                     atomic: None,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                 },
             }],
@@ -719,6 +717,7 @@ fn resized_vec_scalar_index_fails_honest() {
             span: SourceSpan::default(),
             atomic: None,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
         },
     });

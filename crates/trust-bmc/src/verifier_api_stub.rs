@@ -170,6 +170,8 @@ pub fn trust_mc_owned_obligation_kinds() -> Vec<ObligationKind> {
     let mut kinds = vec![
         ObligationKind::Precondition,
         ObligationKind::Postcondition,
+        ObligationKind::LoopInvariant,
+        ObligationKind::Termination,
         ObligationKind::Assertion,
         ObligationKind::ArithmeticSafety,
         ObligationKind::Invariant,
@@ -191,9 +193,11 @@ pub fn is_trust_mc_owned_obligation_kind(kind: &ObligationKind) -> bool {
             // Postcondition obligations; keep the stub's ownership set in step with
             // the native adapter's.
             | ObligationKind::Postcondition
-            // Trust (P1.2 precedent, extended): call-site `#[requires]` VCs reach
-            // trust-mc as typed-CHC Precondition obligations; kept in step.
+            // Trust (P1.2 precedent, extended): every `#[requires]` row is
+            // TrustMC-owned; a missing typed CHC payload fails closed.
             | ObligationKind::Precondition
+            | ObligationKind::LoopInvariant
+            | ObligationKind::Termination
     ) || is_hardened_custom_obligation_kind(kind)
 }
 

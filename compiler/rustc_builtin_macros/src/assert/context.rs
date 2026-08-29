@@ -310,7 +310,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
             | ExprKind::IncludedBytes(..)
             | ExprKind::InlineAsm(_)
             | ExprKind::Lit(_)
-            | ExprKind::Loop(_, _, _)
+            | ExprKind::Loop(_, _, _, _)
             | ExprKind::MacCall(_)
             | ExprKind::OffsetOf(_, _)
             | ExprKind::Path(_, _)

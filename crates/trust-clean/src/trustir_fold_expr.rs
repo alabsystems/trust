@@ -997,12 +997,7 @@ fn check_p_acyc_payload(defs: &DatatypeDefs, ty: &Ty, path: &str) -> R<()> {
     check_p_acyc_payload_fueled(defs, ty, path, P_ACYC_WALK_FUEL)
 }
 
-fn check_p_acyc_payload_fueled(
-    defs: &DatatypeDefs,
-    ty: &Ty,
-    path: &str,
-    fuel: u32,
-) -> R<()> {
+fn check_p_acyc_payload_fueled(defs: &DatatypeDefs, ty: &Ty, path: &str, fuel: u32) -> R<()> {
     let Some(fuel) = fuel.checked_sub(1) else {
         // FAIL CLOSED. Before R0 this walk descended strict subterms, so it
         // terminated structurally. `arc_pointee_ty` may now hand back a node
@@ -1046,7 +1041,12 @@ fn check_p_acyc_payload_fueled(
             {
                 return Err(bad(format!("{path}: unpinned full Arc payload layout")));
             }
-            return check_p_acyc_payload_fueled(defs, pointee, &format!("{path}<Arc-pointee>"), fuel);
+            return check_p_acyc_payload_fueled(
+                defs,
+                pointee,
+                &format!("{path}<Arc-pointee>"),
+                fuel,
+            );
         }
         Ty::Adt { name, .. } | Ty::Datatype { name, .. } => {
             if name == EXPR_NAME {
@@ -4047,6 +4047,7 @@ fn match_ctor_closure(
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 ..
             } if dest.projections.is_empty() => {
                 if output_written || !defined.insert(dest.local) {
@@ -5162,7 +5163,10 @@ fn match_zst_ctor_closure(
                 Statement::Assign {
                     place,
                     rvalue:
-                        Rvalue::Aggregate(AggregateKind::Adt { name, variant, active_field: None, .. }, ops),
+                        Rvalue::Aggregate(
+                            AggregateKind::Adt { name, variant, active_field: None, .. },
+                            ops,
+                        ),
                     ..
                 } if place.projections.is_empty() => {
                     if !defined.insert(place.local) {
@@ -5247,6 +5251,7 @@ fn match_zst_ctor_closure(
                 atomic: None,
                 is_foreign: false,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 ..
             } if dest.projections.is_empty() => {
                 if output_written || !defined.insert(dest.local) {
@@ -5376,9 +5381,13 @@ fn has_exposed_interior_mutability_fueled(defs: &DatatypeDefs, ty: &Ty, fuel: u3
         Ty::Slice { elem } | Ty::Array { elem, .. } | Ty::SymArray { elem, .. } => {
             has_exposed_interior_mutability_fueled(defs, elem, fuel)
         }
-        Ty::Tuple(fields) => fields.iter().any(|f| has_exposed_interior_mutability_fueled(defs, f, fuel)),
+        Ty::Tuple(fields) => {
+            fields.iter().any(|f| has_exposed_interior_mutability_fueled(defs, f, fuel))
+        }
         Ty::Ref { mutable: true, .. } | Ty::RawPtr { .. } => true,
-        Ty::Ref { mutable: false, inner } => has_exposed_interior_mutability_fueled(defs, inner, fuel),
+        Ty::Ref { mutable: false, inner } => {
+            has_exposed_interior_mutability_fueled(defs, inner, fuel)
+        }
         Ty::Adt { name, fields, variants, .. } => {
             if suspicious_name(name)
                 || matches!(
@@ -5412,10 +5421,13 @@ fn has_exposed_interior_mutability_fueled(defs: &DatatypeDefs, ty: &Ty, fuel: u3
                 // Ignore Arc's private refcounts, but never its logical
                 // pointee. A malformed/erased layout is not evidence of
                 // immutability and therefore fails closed.
-                return crate::trustir_fold::arc_pointee_ty(defs, ty)
-                    .map_or(true, |pointee| has_exposed_interior_mutability_fueled(defs, pointee, fuel));
+                return crate::trustir_fold::arc_pointee_ty(defs, ty).map_or(true, |pointee| {
+                    has_exposed_interior_mutability_fueled(defs, pointee, fuel)
+                });
             }
-            fields.iter().any(|(_, field)| has_exposed_interior_mutability_fueled(defs, field, fuel))
+            fields
+                .iter()
+                .any(|(_, field)| has_exposed_interior_mutability_fueled(defs, field, fuel))
                 || variants
                     .iter()
                     .flat_map(|variant| &variant.fields)

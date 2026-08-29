@@ -13,19 +13,58 @@
 
 use std::collections::HashMap;
 
+use crate::Program;
 use crate::ast::*;
 use crate::lexer::{Fail, Lexer, P, StrFlags, Token, TokenKind};
-use crate::Program;
 
 pub const ALWAYS_RESERVED: &[&str] = &[
-    "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete",
-    "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if",
-    "import", "in", "instanceof", "new", "null", "return", "super", "switch", "this", "throw",
-    "true", "try", "typeof", "var", "void", "while", "with",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
 ];
 
 pub const STRICT_RESERVED: &[&str] = &[
-    "implements", "interface", "let", "package", "private", "protected", "public", "static",
+    "implements",
+    "interface",
+    "let",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "static",
     "yield",
 ];
 
@@ -62,17 +101,10 @@ pub struct Scope {
 
 impl Scope {
     fn new(kind: ScopeKind) -> Self {
-        Scope {
-            kind,
-            var_names: HashMap::new(),
-            lex: HashMap::new(),
-        }
+        Scope { kind, var_names: HashMap::new(), lex: HashMap::new() }
     }
     fn is_var_boundary(&self) -> bool {
-        matches!(
-            self.kind,
-            ScopeKind::Top | ScopeKind::FnBody | ScopeKind::StaticBlock
-        )
+        matches!(self.kind, ScopeKind::Top | ScopeKind::FnBody | ScopeKind::StaticBlock)
     }
 }
 
@@ -219,14 +251,9 @@ impl Parser {
             return Err(Fail::early("unexpected token at top level"));
         }
         if let Some((name, _)) = self.private_refs.first() {
-            return Err(Fail::early(format!(
-                "reference to undeclared private name #{name}"
-            )));
+            return Err(Fail::early(format!("reference to undeclared private name #{name}")));
         }
-        Ok(Program {
-            body,
-            strict: self.ctx.strict,
-        })
+        Ok(Program { body, strict: self.ctx.strict })
     }
 
     // ---- module goal ----------------------------------------------------
@@ -249,9 +276,7 @@ impl Parser {
             return Err(Fail::early("unexpected token at module top level"));
         }
         if let Some((name, _)) = self.private_refs.first() {
-            return Err(Fail::early(format!(
-                "reference to undeclared private name #{name}"
-            )));
+            return Err(Fail::early(format!("reference to undeclared private name #{name}")));
         }
         Ok(Program { body, strict: true })
     }
@@ -277,9 +302,7 @@ impl Parser {
         let declared = self.top_declared_names();
         for r in &local_refs {
             if !declared.contains(r) {
-                return Err(Fail::early(format!(
-                    "export '{r}' is not declared in the module"
-                )));
+                return Err(Fail::early(format!("export '{r}' is not declared in the module")));
             }
         }
         Ok(stmts)
@@ -351,9 +374,7 @@ impl Parser {
                 } else if self.tok.is_punct(P::LBrace) {
                     named = self.parse_named_imports()?;
                 } else {
-                    return Err(Fail::early(
-                        "expected '*' or '{' after ',' in import clause",
-                    ));
+                    return Err(Fail::early("expected '*' or '{' after ',' in import clause"));
                 }
             }
         } else if self.tok.is_punct(P::Star) {
@@ -367,12 +388,7 @@ impl Parser {
         let source = self.parse_module_specifier()?;
         self.check_no_import_attributes()?;
         self.semicolon()?;
-        Ok(Stmt::Import(ImportDecl {
-            default,
-            namespace,
-            named,
-            source,
-        }))
+        Ok(Stmt::Import(ImportDecl { default, namespace, named, source }))
     }
 
     /// An ImportedBinding (`BindingIdentifier[~Yield, ~Await]`), declared as a
@@ -417,9 +433,7 @@ impl Parser {
                         n
                     }
                     ModuleExportName::Str(_) => {
-                        return Err(Fail::early(
-                            "a string import name requires an 'as' binding",
-                        ));
+                        return Err(Fail::early("a string import name requires an 'as' binding"));
                     }
                 }
             };
@@ -558,15 +572,11 @@ impl Parser {
             && !self.peek()?.newline_before;
         if self.tok.is_kw("function") || async_fn {
             let func = self.parse_default_function()?;
-            return Ok(Stmt::Export(ExportDecl::Default(Box::new(Stmt::FuncDecl(
-                func,
-            )))));
+            return Ok(Stmt::Export(ExportDecl::Default(Box::new(Stmt::FuncDecl(func)))));
         }
         if self.tok.is_kw("class") {
             let class = self.parse_default_class()?;
-            return Ok(Stmt::Export(ExportDecl::Default(Box::new(Stmt::ClassDecl(
-                class,
-            )))));
+            return Ok(Stmt::Export(ExportDecl::Default(Box::new(Stmt::ClassDecl(class)))));
         }
         let e = self.parse_assignment(false)?;
         self.semicolon()?;
@@ -638,9 +648,9 @@ impl Parser {
                         self.next()?;
                         Ok(ModuleExportName::Str(s))
                     }
-                    None => Err(Fail::unsupported(
-                        "module export name string with a lone surrogate",
-                    )),
+                    None => {
+                        Err(Fail::unsupported("module export name string with a lone surrogate"))
+                    }
                 }
             }
             _ => Err(Fail::early("expected a module export name")),
@@ -662,11 +672,7 @@ impl Parser {
     }
 
     fn expect_from(&mut self) -> PResult<()> {
-        if self.tok.is_kw("from") {
-            self.next()
-        } else {
-            Err(Fail::early("expected 'from'"))
-        }
+        if self.tok.is_kw("from") { self.next() } else { Err(Fail::early("expected 'from'")) }
     }
 
     /// Import attributes (`with { … }` / legacy `assert { … }`) are a grammar
@@ -678,9 +684,7 @@ impl Parser {
         if self.tok.is_kw("assert") && !self.tok.newline_before {
             let p = self.peek()?;
             if p.is_punct(P::LBrace) && !p.newline_before {
-                return Err(Fail::unsupported(
-                    "import attributes (legacy assert clause)",
-                ));
+                return Err(Fail::unsupported("import attributes (legacy assert clause)"));
             }
         }
         Ok(())
@@ -832,9 +836,7 @@ impl Parser {
             return Err(Fail::early(format!("unexpected reserved word '{name}'")));
         }
         if self.ctx.strict && STRICT_RESERVED.contains(&name) {
-            return Err(Fail::early(format!(
-                "'{name}' is reserved in strict mode"
-            )));
+            return Err(Fail::early(format!("'{name}' is reserved in strict mode")));
         }
         if name == "yield" && self.ctx.yield_expr {
             return Err(Fail::early("'yield' is reserved in generator context"));
@@ -855,9 +857,7 @@ impl Parser {
     pub fn check_binding_ident(&self, name: &str) -> PResult<()> {
         self.check_ident_ref(name)?;
         if self.ctx.strict && (name == "eval" || name == "arguments") {
-            return Err(Fail::early(format!(
-                "cannot bind '{name}' in strict mode"
-            )));
+            return Err(Fail::early(format!("cannot bind '{name}' in strict mode")));
         }
         Ok(())
     }
@@ -896,7 +896,7 @@ impl Parser {
                     _ => {
                         return Err(Fail::early(format!(
                             "identifier '{name}' has already been declared"
-                        )))
+                        )));
                     }
                 }
             }
@@ -920,18 +920,12 @@ impl Parser {
             {
                 // Annex B B.3.3 tolerates duplicate sloppy block-level
                 // function declarations.
-                return Err(Fail::unsupported(
-                    "annexB duplicate block-level function declaration",
-                ));
+                return Err(Fail::unsupported("annexB duplicate block-level function declaration"));
             }
-            return Err(Fail::early(format!(
-                "identifier '{name}' has already been declared"
-            )));
+            return Err(Fail::early(format!("identifier '{name}' has already been declared")));
         }
         if scope.var_names.contains_key(name) {
-            return Err(Fail::early(format!(
-                "identifier '{name}' has already been declared"
-            )));
+            return Err(Fail::early(format!("identifier '{name}' has already been declared")));
         }
         scope.lex.insert(name.to_string(), kind);
         Ok(())
@@ -940,16 +934,12 @@ impl Parser {
     /// Declare a function-declaration name: var-like at var boundaries,
     /// lexical in blocks.
     pub fn declare_function_name(&mut self, name: &str) -> PResult<()> {
-        let at_boundary = self
-            .scopes
-            .last()
-            .map(|s| s.is_var_boundary())
-            .unwrap_or(true);
+        let at_boundary = self.scopes.last().map(|s| s.is_var_boundary()).unwrap_or(true);
         // At the top level of a Module, function declarations are LEXICALLY
         // declared (`function f(){} function f(){}` is a duplicate-declaration
         // SyntaxError, unlike a Script where both are var-scoped and legal).
-        let at_module_top = self.ctx.in_module
-            && self.scopes.last().map(|s| s.kind) == Some(ScopeKind::Top);
+        let at_module_top =
+            self.ctx.in_module && self.scopes.last().map(|s| s.kind) == Some(ScopeKind::Top);
         if at_boundary && !at_module_top {
             self.declare_var(name)
         } else {
@@ -960,10 +950,7 @@ impl Parser {
     // ---- labels ---------------------------------------------------------
 
     fn find_label(&self, name: &str) -> Option<&LabelEntry> {
-        self.labels[self.label_barrier..]
-            .iter()
-            .rev()
-            .find(|l| l.name == name)
+        self.labels[self.label_barrier..].iter().rev().find(|l| l.name == name)
     }
 
     // ---- statements -----------------------------------------------------
@@ -991,12 +978,7 @@ impl Parser {
             }
             let s = self.parse_stmt_list_item()?;
             if in_prologue {
-                if let Stmt::Expr(Expr::Str {
-                    raw,
-                    any_escape,
-                    octal,
-                }) = &s
-                {
+                if let Stmt::Expr(Expr::Str { raw, any_escape, octal }) = &s {
                     if *octal {
                         prologue_octal = true;
                     }
@@ -1014,14 +996,10 @@ impl Parser {
             stmts.push(s);
         }
         if has_use_strict && !params_simple {
-            return Err(Fail::early(
-                "'use strict' directive in a body with non-simple parameters",
-            ));
+            return Err(Fail::early("'use strict' directive in a body with non-simple parameters"));
         }
         if became_strict && prologue_octal {
-            return Err(Fail::early(
-                "octal escape in directive prologue of strict body",
-            ));
+            return Err(Fail::early("octal escape in directive prologue of strict body"));
         }
         Ok((stmts, became_strict))
     }
@@ -1159,14 +1137,12 @@ impl Parser {
                         ));
                     }
                     "class" => {
-                        return Err(Fail::early(
-                            "class declaration in single-statement position",
-                        ))
+                        return Err(Fail::early("class declaration in single-statement position"));
                     }
                     "const" => {
                         return Err(Fail::early(
                             "lexical declaration in single-statement position",
-                        ))
+                        ));
                     }
                     "async" => {
                         let p = self.peek()?;
@@ -1230,10 +1206,7 @@ impl Parser {
         }
         let is_iter = self.tok.is_kw("for") || self.tok.is_kw("while") || self.tok.is_kw("do");
         for n in &names {
-            self.labels.push(LabelEntry {
-                name: n.clone(),
-                iteration: is_iter,
-            });
+            self.labels.push(LabelEntry { name: n.clone(), iteration: is_iter });
         }
         // Labelled function declarations.
         let body = if self.tok.is_kw("function") {
@@ -1268,10 +1241,7 @@ impl Parser {
         let body = body?;
         let mut stmt = body;
         for n in names.into_iter().rev() {
-            stmt = Stmt::Labeled {
-                label: n,
-                body: Box::new(stmt),
-            };
+            stmt = Stmt::Labeled { label: n, body: Box::new(stmt) };
         }
         Ok(stmt)
     }
@@ -1282,16 +1252,9 @@ impl Parser {
         let test = self.parse_expression()?;
         self.expect_punct(P::RParen, "')'")?;
         let cons = self.parse_if_clause_body()?;
-        let alt = if self.eat_kw("else")? {
-            Some(Box::new(self.parse_if_clause_body()?))
-        } else {
-            None
-        };
-        Ok(Stmt::If {
-            test,
-            cons: Box::new(cons),
-            alt,
-        })
+        let alt =
+            if self.eat_kw("else")? { Some(Box::new(self.parse_if_clause_body()?)) } else { None };
+        Ok(Stmt::If { test, cons: Box::new(cons), alt })
     }
 
     /// If-clause bodies: Annex B B.3.2 lets sloppy code put a bare function
@@ -1329,10 +1292,7 @@ impl Parser {
         if self.tok.is_punct(P::Semi) {
             self.next()?;
         }
-        Ok(Stmt::DoWhile {
-            body: Box::new(body),
-            test,
-        })
+        Ok(Stmt::DoWhile { body: Box::new(body), test })
     }
 
     fn parse_while(&mut self) -> PResult<Stmt> {
@@ -1341,10 +1301,7 @@ impl Parser {
         let test = self.parse_expression()?;
         self.expect_punct(P::RParen, "')'")?;
         let body = self.parse_iteration_body()?;
-        Ok(Stmt::While {
-            test,
-            body: Box::new(body),
-        })
+        Ok(Stmt::While { test, body: Box::new(body) })
     }
 
     fn parse_break_continue(&mut self, kw: &str) -> PResult<Stmt> {
@@ -1383,11 +1340,7 @@ impl Parser {
             }
         }
         self.semicolon()?;
-        Ok(if is_break {
-            Stmt::Break(label)
-        } else {
-            Stmt::Continue(label)
-        })
+        Ok(if is_break { Stmt::Break(label) } else { Stmt::Continue(label) })
     }
 
     fn parse_return(&mut self) -> PResult<Stmt> {
@@ -1417,10 +1370,7 @@ impl Parser {
         let obj = self.parse_expression()?;
         self.expect_punct(P::RParen, "')'")?;
         let body = self.parse_statement(true)?;
-        Ok(Stmt::With {
-            obj,
-            body: Box::new(body),
-        })
+        Ok(Stmt::With { obj, body: Box::new(body) })
     }
 
     fn parse_switch(&mut self) -> PResult<Stmt> {
@@ -1538,11 +1488,7 @@ impl Parser {
         if catch.is_none() && finally.is_none() {
             return Err(Fail::early("try without catch or finally"));
         }
-        Ok(Stmt::Try {
-            block,
-            catch,
-            finally,
-        })
+        Ok(Stmt::Try { block, catch, finally })
     }
 
     // ---- variable / lexical declarations --------------------------------
@@ -1558,16 +1504,12 @@ impl Parser {
     /// the script top level) and never directly in a case/default clause.
     fn check_using_position(&self, direct_case: bool) -> PResult<()> {
         if direct_case {
-            return Err(Fail::early(
-                "using declaration directly in a case or default clause",
-            ));
+            return Err(Fail::early("using declaration directly in a case or default clause"));
         }
         // A using declaration is banned at the top level of a SCRIPT, but
         // ALLOWED at the top level of a Module (ModuleItemList → StatementListItem).
         if self.scopes.last().map(|s| s.kind) == Some(ScopeKind::Top) && !self.ctx.in_module {
-            return Err(Fail::early(
-                "using declaration at the top level of a script",
-            ));
+            return Err(Fail::early("using declaration at the top level of a script"));
         }
         Ok(())
     }
@@ -1579,17 +1521,11 @@ impl Parser {
             self.next()?; // await
         }
         self.next()?; // using
-        let kind = if is_await {
-            DeclKind::AwaitUsing
-        } else {
-            DeclKind::Using
-        };
+        let kind = if is_await { DeclKind::AwaitUsing } else { DeclKind::Using };
         let mut decls = Vec::new();
         loop {
             if !matches!(self.tok.kind, TokenKind::Ident(_)) {
-                return Err(Fail::early(
-                    "using declaration binding must be an identifier",
-                ));
+                return Err(Fail::early("using declaration binding must be an identifier"));
             }
             let pat = self.parse_binding_target(BindTarget::LetConst)?;
             if !self.eat_punct(P::Eq)? {
@@ -1719,11 +1655,7 @@ impl Parser {
                 self.next()?; // await
             }
             self.next()?; // using
-            let kind = if await_using {
-                DeclKind::AwaitUsing
-            } else {
-                DeclKind::Using
-            };
+            let kind = if await_using { DeclKind::AwaitUsing } else { DeclKind::Using };
             let pat = self.parse_binding_target(BindTarget::LetConst)?;
             if self.tok.is_kw("of") {
                 self.next()?;
@@ -1738,9 +1670,7 @@ impl Parser {
                 });
             }
             if self.tok.is_kw("in") {
-                return Err(Fail::early(
-                    "using declarations are not allowed in for-in",
-                ));
+                return Err(Fail::early("using declarations are not allowed in for-in"));
             }
             if is_await || await_using {
                 return Err(Fail::early("await using in for requires for-of form"));
@@ -1761,9 +1691,7 @@ impl Parser {
                     break;
                 }
                 if !matches!(self.tok.kind, TokenKind::Ident(_)) {
-                    return Err(Fail::early(
-                        "using declaration binding must be an identifier",
-                    ));
+                    return Err(Fail::early("using declaration binding must be an identifier"));
                 }
                 cur = self.parse_binding_target(BindTarget::LetConst)?;
             }
@@ -1841,9 +1769,7 @@ impl Parser {
             // Classic for with declaration list.
             if init.is_none() {
                 if is_pattern {
-                    return Err(Fail::early(
-                        "destructuring declaration requires initializer",
-                    ));
+                    return Err(Fail::early("destructuring declaration requires initializer"));
                 }
                 if kind == DeclKind::Const {
                     return Err(Fail::early("const declaration requires initializer"));
@@ -1886,11 +1812,7 @@ impl Parser {
             let right = self.parse_expression()?;
             self.expect_punct(P::RParen, "')'")?;
             let body = self.parse_iteration_body()?;
-            return Ok(Stmt::ForIn {
-                left: ForHead::Pat(target),
-                right,
-                body: Box::new(body),
-            });
+            return Ok(Stmt::ForIn { left: ForHead::Pat(target), right, body: Box::new(body) });
         }
         if self.tok.is_kw("of") {
             if first_is_let {
@@ -1941,25 +1863,13 @@ impl Parser {
     }
 
     fn parse_for_classic(&mut self, init: Option<ForInit>) -> PResult<Stmt> {
-        let test = if self.tok.is_punct(P::Semi) {
-            None
-        } else {
-            Some(self.parse_expression()?)
-        };
+        let test = if self.tok.is_punct(P::Semi) { None } else { Some(self.parse_expression()?) };
         self.expect_punct(P::Semi, "';' in for header")?;
-        let update = if self.tok.is_punct(P::RParen) {
-            None
-        } else {
-            Some(self.parse_expression()?)
-        };
+        let update =
+            if self.tok.is_punct(P::RParen) { None } else { Some(self.parse_expression()?) };
         self.expect_punct(P::RParen, "')'")?;
         let body = self.parse_iteration_body()?;
-        Ok(Stmt::For {
-            init,
-            test,
-            update,
-            body: Box::new(body),
-        })
+        Ok(Stmt::For { init, test, update, body: Box::new(body) })
     }
 
     // ---- functions ------------------------------------------------------
@@ -2083,9 +1993,7 @@ impl Parser {
     pub fn revalidate_strict_params(&self, info: &ParamInfo, name: Option<&str>) -> PResult<()> {
         for n in &info.names {
             if Self::strict_banned_binding(n) {
-                return Err(Fail::early(format!(
-                    "parameter name '{n}' is illegal in strict mode"
-                )));
+                return Err(Fail::early(format!("parameter name '{n}' is illegal in strict mode")));
             }
         }
         if info.has_dup {
@@ -2093,9 +2001,7 @@ impl Parser {
         }
         if let Some(n) = name {
             if Self::strict_banned_binding(n) {
-                return Err(Fail::early(format!(
-                    "function name '{n}' is illegal in strict mode"
-                )));
+                return Err(Fail::early(format!("function name '{n}' is illegal in strict mode")));
             }
         }
         Ok(())
@@ -2159,10 +2065,8 @@ impl Parser {
         };
         let derived = heritage.is_some();
         self.expect_punct(P::LBrace, "'{' before class body")?;
-        self.class_frames.push(ClassFrame {
-            declared: HashMap::new(),
-            refs_mark: self.private_refs.len(),
-        });
+        self.class_frames
+            .push(ClassFrame { declared: HashMap::new(), refs_mark: self.private_refs.len() });
         let r = self.parse_class_body(derived);
         let frame = self.class_frames.pop().expect("class frame");
         // Resolve private references recorded within this class body:
@@ -2187,17 +2091,11 @@ impl Parser {
         let elements = r?;
         if self.class_frames.is_empty() {
             if let Some(n) = unresolved_here {
-                return Err(Fail::early(format!(
-                    "reference to undeclared private name #{n}"
-                )));
+                return Err(Fail::early(format!("reference to undeclared private name #{n}")));
             }
         }
         self.expect_punct(P::RBrace, "'}' after class body")?;
-        Ok(Class {
-            name,
-            heritage,
-            elements,
-        })
+        Ok(Class { name, heritage, elements })
     }
 
     fn declare_private(&mut self, name: &str, bit: u8) -> PResult<()> {
@@ -2269,8 +2167,8 @@ impl Parser {
         let mut accessor: Option<MethodKind> = None;
         if self.tok.is_kw("async") {
             let p = self.peek()?;
-            let name_follows = !p.newline_before
-                && (self.token_is_property_name_start(&p) || p.is_punct(P::Star));
+            let name_follows =
+                !p.newline_before && (self.token_is_property_name_start(&p) || p.is_punct(P::Star));
             if name_follows {
                 is_async = true;
                 self.next()?;
@@ -2281,11 +2179,7 @@ impl Parser {
             self.next()?;
         }
         if !is_gen && !is_async && (self.tok.is_kw("get") || self.tok.is_kw("set")) {
-            let which = if self.tok.is_kw("get") {
-                MethodKind::Get
-            } else {
-                MethodKind::Set
-            };
+            let which = if self.tok.is_kw("get") { MethodKind::Get } else { MethodKind::Set };
             let p = self.peek()?;
             if self.token_is_property_name_start(&p) {
                 accessor = Some(which);
@@ -2341,12 +2235,7 @@ impl Parser {
                 &kind,
                 /*super_call_ok=*/ is_ctor && derived,
             )?;
-            return Ok(ClassElement::Method {
-                is_static,
-                kind,
-                key,
-                func,
-            });
+            return Ok(ClassElement::Method { is_static, kind, key, func });
         }
         // Field.
         if is_async || is_gen || accessor.is_some() {
@@ -2387,11 +2276,7 @@ impl Parser {
             None
         };
         self.class_field_semicolon()?;
-        Ok(ClassElement::Field {
-            is_static,
-            key,
-            init,
-        })
+        Ok(ClassElement::Field { is_static, key, init })
     }
 
     fn class_field_semicolon(&mut self) -> PResult<()> {
@@ -2609,9 +2494,7 @@ pub fn cook_string(raw: &str, _flags: StrFlags) -> Option<String> {
                     let mut j = i + 2;
                     let mut v: u32 = 0;
                     while j < chars.len() && chars[j] != '}' {
-                        v = v
-                            .saturating_mul(16)
-                            .saturating_add(chars[j].to_digit(16).unwrap_or(0));
+                        v = v.saturating_mul(16).saturating_add(chars[j].to_digit(16).unwrap_or(0));
                         j += 1;
                     }
                     push_scalar(&mut units, v);

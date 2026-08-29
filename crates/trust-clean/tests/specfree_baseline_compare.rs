@@ -6,6 +6,7 @@
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
 
 use std::path::Path;
+
 use trust_clean::prove_dump_dir;
 
 fn report(label: &str, rel: &str) {

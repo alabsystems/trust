@@ -16,10 +16,10 @@
 //! Author: Andrew Yates
 //! Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::unicode::{
-    canonicalize, in_ranges, is_line_terminator, is_word_char, read_backward, read_forward, Fold,
-};
 use crate::ExecError;
+use crate::unicode::{
+    Fold, canonicalize, in_ranges, is_line_terminator, is_word_char, read_backward, read_forward,
+};
 
 pub(crate) const UNSET: usize = usize::MAX;
 const PATCH: u32 = u32::MAX;
@@ -46,23 +46,74 @@ pub(crate) struct ClassTable {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Insn {
-    Char { cp: u32, fold: Fold, back: bool },
-    Class { idx: u32, invert: bool, fold: Fold, back: bool },
-    Dot { dot_all: bool, back: bool },
-    Bol { multiline: bool },
-    Eol { multiline: bool },
-    WordB { negate: bool, extended: bool },
-    Jmp { to: u32 },
-    Split { prefer: u32, alt: u32 },
-    Save { slot: u32 },
-    LoopInit { id: u32 },
-    LoopDecide { id: u32, min: u64, max: u64, greedy: bool, enter: u32, exit: u32 },
+    Char {
+        cp: u32,
+        fold: Fold,
+        back: bool,
+    },
+    Class {
+        idx: u32,
+        invert: bool,
+        fold: Fold,
+        back: bool,
+    },
+    Dot {
+        dot_all: bool,
+        back: bool,
+    },
+    Bol {
+        multiline: bool,
+    },
+    Eol {
+        multiline: bool,
+    },
+    WordB {
+        negate: bool,
+        extended: bool,
+    },
+    Jmp {
+        to: u32,
+    },
+    Split {
+        prefer: u32,
+        alt: u32,
+    },
+    Save {
+        slot: u32,
+    },
+    LoopInit {
+        id: u32,
+    },
+    LoopDecide {
+        id: u32,
+        min: u64,
+        max: u64,
+        greedy: bool,
+        enter: u32,
+        exit: u32,
+    },
     /// Iteration entry: journal the entry position, reset captures
     /// `cap_lo..=cap_hi` (RepeatMatcher step 3-4).
-    LoopEnter { id: u32, cap_lo: u32, cap_hi: u32 },
-    LoopEnd { id: u32, head: u32, min: u64 },
-    Look { negative: bool, body: u32, next: u32 },
-    Backref { list: u32, fold: Fold, back: bool },
+    LoopEnter {
+        id: u32,
+        cap_lo: u32,
+        cap_hi: u32,
+    },
+    LoopEnd {
+        id: u32,
+        head: u32,
+        min: u64,
+    },
+    Look {
+        negative: bool,
+        body: u32,
+        next: u32,
+    },
+    Backref {
+        list: u32,
+        fold: Fold,
+        back: bool,
+    },
     Accept,
 }
 
@@ -197,8 +248,7 @@ impl<'a> Machine<'a> {
                 },
                 Insn::Bol { multiline } => {
                     if pos == 0
-                        || (multiline
-                            && is_line_terminator(read_backward(self.input, pos, uni).0))
+                        || (multiline && is_line_terminator(read_backward(self.input, pos, uni).0))
                     {
                         Step::Next
                     } else {
@@ -207,8 +257,7 @@ impl<'a> Machine<'a> {
                 }
                 Insn::Eol { multiline } => {
                     if pos == self.input.len()
-                        || (multiline
-                            && is_line_terminator(read_forward(self.input, pos, uni).0))
+                        || (multiline && is_line_terminator(read_forward(self.input, pos, uni).0))
                     {
                         Step::Next
                     } else {
@@ -216,15 +265,11 @@ impl<'a> Machine<'a> {
                     }
                 }
                 Insn::WordB { negate, extended } => {
-                    let a = pos > 0
-                        && is_word_char(read_backward(self.input, pos, uni).0, extended);
+                    let a =
+                        pos > 0 && is_word_char(read_backward(self.input, pos, uni).0, extended);
                     let b = pos < self.input.len()
                         && is_word_char(read_forward(self.input, pos, uni).0, extended);
-                    if (a != b) != negate {
-                        Step::Next
-                    } else {
-                        Step::Fail
-                    }
+                    if (a != b) != negate { Step::Next } else { Step::Fail }
                 }
                 Insn::Jmp { to } => {
                     pc = to;
@@ -315,7 +360,8 @@ impl<'a> Machine<'a> {
                         None => Step::Next, // undefined capture matches empty
                         Some((s, e)) => {
                             let len = e - s;
-                            let fits = if back { pos >= len } else { pos + len <= self.input.len() };
+                            let fits =
+                                if back { pos >= len } else { pos + len <= self.input.len() };
                             if !fits {
                                 Step::Fail
                             } else {
@@ -398,11 +444,7 @@ impl<'a> Machine<'a> {
 
     fn read(&self, pos: usize, back: bool, uni: bool) -> Option<(u32, usize)> {
         if back {
-            if pos == 0 {
-                None
-            } else {
-                Some(read_backward(self.input, pos, uni))
-            }
+            if pos == 0 { None } else { Some(read_backward(self.input, pos, uni)) }
         } else if pos >= self.input.len() {
             None
         } else {

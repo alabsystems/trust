@@ -16,7 +16,7 @@ use crate::model::{
     Js262AuditEntry, Js262AuditStatus, Js262Baseline, Js262Classification, Js262DivergenceAudit,
     Js262ExceptionStatus, Js262TestExceptionLedger,
 };
-use crate::util::{is_valid_date, Finding};
+use crate::util::{Finding, is_valid_date};
 
 /// Ledger identities surfaced into evidence artifacts.
 #[derive(Debug, Clone, Default)]
@@ -56,11 +56,15 @@ pub fn validate_ledgers(dir: &Path, validation_date: &str) -> (Vec<Finding>, Led
                 if baseline.upstream.channel != "test262" {
                     findings.push(Finding::new(
                         "baseline-channel",
-                        format!("upstream.channel is {:?}, want \"test262\"", baseline.upstream.channel),
+                        format!(
+                            "upstream.channel is {:?}, want \"test262\"",
+                            baseline.upstream.channel
+                        ),
                     ));
                 }
                 if baseline.schema_version.trim().is_empty() {
-                    findings.push(Finding::new("baseline-schema-version", "schema_version is blank"));
+                    findings
+                        .push(Finding::new("baseline-schema-version", "schema_version is blank"));
                 }
                 for entry in &baseline.entries {
                     if entry.surface.trim().is_empty() {
@@ -71,7 +75,9 @@ pub fn validate_ledgers(dir: &Path, validation_date: &str) -> (Vec<Finding>, Led
                     }
                 }
             }
-            Err(e) => findings.push(Finding::new("baseline-parse-error", format!("baseline.toml: {e}"))),
+            Err(e) => {
+                findings.push(Finding::new("baseline-parse-error", format!("baseline.toml: {e}")))
+            }
         },
         None => {}
     }
@@ -103,7 +109,10 @@ pub fn validate_ledgers(dir: &Path, validation_date: &str) -> (Vec<Finding>, Led
                     if sound && exc.expires_on <= exc.reviewed_on {
                         findings.push(Finding::new(
                             "exception-expiry-before-review",
-                            format!("{id}: expires_on {} <= reviewed_on {}", exc.expires_on, exc.reviewed_on),
+                            format!(
+                                "{id}: expires_on {} <= reviewed_on {}",
+                                exc.expires_on, exc.reviewed_on
+                            ),
                         ));
                         sound = false;
                     }
@@ -192,7 +201,10 @@ pub fn validate_ledgers(dir: &Path, validation_date: &str) -> (Vec<Finding>, Led
                         Some(e) if e.as_str() <= entry.reviewed_on.as_str() => {
                             findings.push(Finding::new(
                                 "audit-expiry-before-review",
-                                format!("{id}: expires_on {e} <= reviewed_on {}", entry.reviewed_on),
+                                format!(
+                                    "{id}: expires_on {e} <= reviewed_on {}",
+                                    entry.reviewed_on
+                                ),
                             ));
                         }
                         Some(e) if e.as_str() <= validation_date => {
@@ -256,18 +268,17 @@ pub fn test_exception_is_active(e: &crate::model::Js262TestException, date: &str
 pub fn load_audit(dir: &Path) -> Js262DivergenceAudit {
     let path = dir.join("divergence-audit.toml");
     match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).unwrap_or(Js262DivergenceAudit {
-            schema_version: "1".to_string(),
-            entries: vec![],
-        }),
+        Ok(text) => toml::from_str(&text)
+            .unwrap_or(Js262DivergenceAudit { schema_version: "1".to_string(), entries: vec![] }),
         Err(_) => Js262DivergenceAudit { schema_version: "1".to_string(), entries: vec![] },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
+    use super::*;
 
     const DATE: &str = "2026-07-21";
 

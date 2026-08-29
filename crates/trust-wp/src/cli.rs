@@ -1,17 +1,17 @@
 // trust_wp CLI backend
 //
-// Phase 1 implementation: delegates to trust_wp CLI via subprocess.
-// Will be replaced by direct in-process integration in Phase 2.
+// Standalone compatibility implementation: delegates to trust_wp CLI via
+// an explicitly configured subprocess. It is not compiler verdict authority.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 //! Subprocess-based trust_wp backend.
 //!
-//! Invokes the trust_wp deductive verifier as a subprocess, passing contracts
-//! via stdin/files and parsing the structured result protocol from stderr.
-//! This is the Phase 1 implementation; Phase 2 (trust-build feature) will
-//! call trust-wp's verification context in-process via `TyCtxt`.
+//! Explicit compatibility callers may invoke the trust_wp deductive verifier
+//! as a subprocess, passing contracts via stdin/files and parsing the structured
+//! result protocol from stderr. The compiler/full verifier never calls this
+//! backend and cannot promote its parsed result.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
@@ -69,13 +69,11 @@ fn spawn_trust_wp_command(cmd: &mut Command) -> std::io::Result<Child> {
 ///
 /// Trust #soundness (H1, fail-closed hardening): ONLY an explicitly-configured
 /// `TRUST_WP_PATH` env var is honored. There is deliberately NO `$PATH`
-/// discovery (`which cargo-trust-wp` / `which trust-wp`): this backend is
-/// embedded in the compiler's router, and the compiler path must never let an
-/// arbitrary binary that happens to be on a developer's PATH become a proof
-/// authority (the in-tree `trust-wp` placeholder binary prints usage and exits
-/// 0 for ANY args — under PATH discovery it would have been engaged as a
-/// verifier). Absent/invalid `TRUST_WP_PATH` ⇒ decline (`BinaryNotFound`,
-/// which the router surfaces as `Unknown` — never a verdict).
+/// discovery (`which cargo-trust-wp` / `which trust-wp`): even a standalone
+/// diagnostic must not silently execute an arbitrary binary from a developer's
+/// PATH (the in-tree `trust-wp` placeholder prints usage and exits 0 for any
+/// arguments). Absent/invalid `TRUST_WP_PATH` therefore declines with
+/// `BinaryNotFound`; no compiler or publication route consumes that result.
 fn probe_trust_wp_path() -> Option<String> {
     probe_trust_wp_path_from(std::env::var("TRUST_WP_PATH").ok())
 }
@@ -89,10 +87,9 @@ fn probe_trust_wp_path_from(env_path: Option<String>) -> Option<String> {
 
 /// Subprocess-based trust_wp backend.
 ///
-/// Communicates with trust_wp via the CLI, parsing the structured result
-/// protocol for machine-readable output. This is the Phase 1 implementation
-/// that will be superseded by direct in-process integration when the
-/// `trust-build` feature is enabled.
+/// Communicates with trust_wp via the CLI and parses its structured protocol for
+/// explicit standalone diagnostics. `trust-build` does not supersede or route
+/// this backend into the compiler/full verifier.
 pub struct CliBackend {
     /// Resolved solver path.
     solver_path: Option<String>,
@@ -118,7 +115,7 @@ impl CliBackend {
         Self {
             // Capture ambient executable authority per backend/session. A
             // process-global cache made the first TRUST_WP_PATH value sticky
-            // across later compiler invocations in long-lived hosts.
+            // across later invocations in long-lived compatibility hosts.
             solver_path: config.solver_path.clone().or_else(probe),
             solver_args: config.solver_args.clone(),
             timeout_ms: config.timeout_ms,
@@ -132,7 +129,7 @@ impl CliBackend {
     fn resolve_path(&self) -> Result<&str, TrustWpLibError> {
         self.solver_path.as_deref().ok_or_else(|| TrustWpLibError::BinaryNotFound {
             reason: "set TRUST_WP_PATH to an explicit trust-wp binary (PATH discovery \
-                         is deliberately disabled for this compiler-embedded lane)"
+                         is deliberately disabled for this standalone compatibility lane)"
                 .to_string(),
         })
     }

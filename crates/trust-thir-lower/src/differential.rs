@@ -66,16 +66,42 @@
 //! `wrappers_agree` ASSERTS it structurally (instruction-for-instruction, modulo each side's own
 //! entry `FuncId`) and fails CLOSED rather than leaving the argument in a comment. The
 //! pass-through param types are held id-free by admission (`pointer_lane_param_ok`), which is
-//! what makes that assertion a plain equality rather than a cross-module type comparison.
+//! what makes that assertion a plain equality at every position EXCEPT the referent's.
+//!
+//! SLICE B — THE AGGREGATE REFERENT, and the one exemption it needs. A referent that is a whole
+//! struct (`#[derive(Clone)]` on a `Copy` type reads `*self` as a single whole `Load`) is spelled
+//! `Ty::Struct(id)` — a MODULE-LOCAL index, so the two sides' wrappers name DIFFERENT types at
+//! the referent position even when they describe the same object. `wrappers_agree` therefore
+//! takes the proven referent PAIR and exempts exactly three positions — the wrapper block's param
+//! `index`, the `Alloca { ty }` and the `Store { ty }` — and only when each side names ITS OWN
+//! half of that pair. Everything else stays exact equality.
+//!
+//! What discharges the exemption is not the exemption: it is `struct_layout_agrees`, which proves
+//! size / align / repr and every field's (name, offset, type) equal on both sides, recursively,
+//! BEFORE the lane is minted; plus `aggregate_param_admission`'s conjunct (i), which proves the
+//! two sides marshal to the SAME leaf sequence. Identical layout plus identical leaf values means
+//! the two `Store`s write byte-identical images, which is the whole content of "the two wrappers
+//! are the same program" for an INPUT MATERIALIZATION. (Padding-byte provenance is the one fact
+//! `struct_layout_agrees` does not carry — a memory COMPARISON would need it; materializing an
+//! input does not, because no `Load` in either entry reads a padding byte.)
+//!
+//! THE TRAP THIS SHAPE INVITES, named so nobody re-opens it: passing ONE pointee to both
+//! `build_pointee_wrapper` calls makes `wrappers_agree` pass VACUOUSLY (both wrappers then name
+//! the same type) while the two sides are handed different inputs — the oracle would realize the
+//! PRODUCER's `StructId` against the ORACLE's struct table. The assertion that exists to prevent
+//! exactly that would be satisfied BY the bug. The exemption is keyed on the ordered pair
+//! `(pointee_a, pointee_b)` precisely so the mistake fails closed instead of passing; see
+//! `wrappers_agree_refuses_one_shared_pointee_fed_to_both_sides`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rustc_middle::mir;
 use rustc_middle::ty::{TyCtxt, TypeVisitableExt};
 use rustc_span::def_id::LocalDefId;
 use trust_ir::interpret::{InterpretErrorCode, InterpretValue, InterpretValueKind, Interpreter};
 use trust_ir::{
-    Block, CastOp, Constant, FuncId, FuncTy, Function, Inst, InstrNode, Module, Ty, ValueId,
+    Block, CastOp, Constant, FuncId, FuncTy, Function, Inst, InstrNode, Module, ObligationKind, Ty,
+    ValueId,
 };
 
 use crate::Lowered;
@@ -131,10 +157,25 @@ enum ParamClass {
     /// `InterpretValue`'s `Ty::Enum(id)` carries a MODULE-LOCAL id, so one shared value
     /// cannot type against both modules).
     Enum,
-    /// Trust (aggregate param lane): eligible BY-VALUE STRUCT param — same index-encoded
-    /// column shape as `Enum`, realized PER SIDE against that module's OWN `StructDef`
-    /// (`Ty::Struct(id)` is module-local for the identical reason). Eligibility is
-    /// deliberately narrower than `tys_agree`'s comparison: see `struct_param_admissible`.
+    /// Trust (aggregate param lane): eligible BY-VALUE AGGREGATE param — `Ty::Struct` OR
+    /// `Ty::Tuple`. Same index-encoded column shape as `Enum`, realized PER SIDE against that
+    /// module's OWN `StructDef` (`Ty::Struct(id)` is module-local for the identical reason;
+    /// `Ty::Tuple(Vec<Ty>)` is inline and needs no table, but is realized per side anyway so
+    /// the two kinds share one recipe). Eligibility is deliberately narrower than `tys_agree`'s
+    /// comparison: see `aggregate_param_admission`.
+    ///
+    /// The variant is named `Struct` and covers tuples DELIBERATELY. A `ParamClass::Tuple`
+    /// would have to be added at five consumers, two of which WERE non-exhaustive `matches!`
+    /// filters (`scalar_params` in step (4), `expected_columns` in `build_side_args`) that the
+    /// compiler did not check — omitting it there desynchronizes the column count and turns
+    /// every tuple body into `"sample tuple has N column(s), expected M"`. One class, one
+    /// column discipline, no unchecked site to forget.
+    ///
+    /// Trust (Slice B): those two sites are now ONE exhaustive `match`, `consumes_sample_column`,
+    /// so that particular hazard is retired — the compiler refuses a new class that has not been
+    /// classified there. The two `match (class, slot)` table-alignment filters in
+    /// `build_side_args` still carry a `_ =>` catch-all and are still unchecked; they are the
+    /// ones a new class must be added to by hand.
     Struct,
     /// Trust (Q1, pointer-param INPUT lane): a READ `Ty::Ptr` param whose referent type was
     /// recovered from the body. It consumes ONE sample column exactly like `Scalar` — but the
@@ -143,6 +184,62 @@ enum ParamClass {
     /// carried out-of-band in `ptr_pointees[i]`, the same parallel-vec idiom `enum_samples`
     /// and `struct_samples` use, so `ParamClass` stays `Copy`.
     PtrTo,
+    /// Trust (Slice B, aggregate referent sampler): a READ `Ty::Ptr` param whose recovered
+    /// referent is a whole AGGREGATE whose two-sided byte layout was proven by
+    /// `struct_layout_agrees` and whose marshalling was admitted by `aggregate_param_admission`.
+    ///
+    /// It is the CROSS of the two classes above and takes exactly one column from each:
+    ///   * from `PtrTo` — the value is materialized by the synthesized wrapper, so the wrapper's
+    ///     signature (not the entry's) is what the args site marshals against, and param `index`
+    ///     of that signature is the POINTEE type, never `Ty::Ptr`;
+    ///   * from `Struct` — the column is INDEX-ENCODED over `struct_samples[i]`, the same
+    ///     abstract flat-leaf table the by-value aggregate lane uses, realized PER SIDE through
+    ///     `realize_aggregate_arg` against that side's own module.
+    ///
+    /// It SHARES `struct_samples` with `ParamClass::Struct` rather than adding a fifth parallel
+    /// vec, and that sharing is exact rather than convenient: both classes carry the identical
+    /// payload (a flat depth-first leaf-raw list per abstract sample) and both realize it through
+    /// the identical function. The alignment invariant `build_side_args` enforces widens from
+    /// "`Some` iff `Struct`" to "`Some` iff `Struct` or `PtrToAggregate`", and both directions
+    /// are checked there.
+    ///
+    /// A SEPARATE variant rather than a reuse of `Struct`, deliberately: reusing `Struct` would
+    /// have required step (6) to silently substitute `ptr_pointees[i]` for the signature's own
+    /// param type at one index, which is an unnamed special case inside a shared arm — the exact
+    /// "argued relaxation left in a comment" shape this file exists to refuse.
+    ///
+    /// The cost of a new variant is the sites the compiler does not check.
+    /// `ParamClass::Struct`'s doc names two `matches!` column filters; this lane RETIRED that
+    /// pair into one exhaustive `consumes_sample_column`, so what remains are the two
+    /// `match (class, slot)` table-alignment filters in `build_side_args`, both of which carry a
+    /// `_ =>` catch-all. Both are moved here, and
+    /// `ptr_to_aggregate_moved_every_unchecked_matches_filter` pins all of them together — a
+    /// single `build_side_args` call that fails if ANY of them was left behind.
+    PtrToAggregate,
+}
+
+/// Trust (Slice B): does this parameter class consume ONE column of the cartesian sample tuple?
+///
+/// THE SINGLE SOURCE OF TRUTH for what used to be two hand-written `matches!` filters —
+/// `scalar_params` in step (4) (which enforces `MAX_PARAMS`) and `expected_columns` in
+/// `build_side_args` (which enforces tuple/column alignment). `ParamClass::Struct`'s doc names
+/// those two as the sites the compiler does NOT check, and it is right: a `matches!` that omits a
+/// variant compiles, and then the two filters disagree — one relaxes a cap, the other converts
+/// every body on the new lane into `"sample tuple has N column(s), expected M"`.
+///
+/// Written as an EXHAUSTIVE `match` rather than a `matches!` on purpose. That is the whole point:
+/// the next class added to `ParamClass` fails to COMPILE here, at one site, instead of silently
+/// desynchronizing two. Do not re-inline it.
+fn consumes_sample_column(class: &ParamClass) -> bool {
+    match class {
+        ParamClass::Scalar
+        | ParamClass::Enum
+        | ParamClass::Struct
+        | ParamClass::PtrTo
+        | ParamClass::PtrToAggregate => true,
+        // A proven-never-read param gets one placeholder OUTSIDE the product.
+        ParamClass::Opaque => false,
+    }
 }
 
 /// Cap on the nesting depth of an eligible by-value struct param. A struct whose fields are
@@ -150,10 +247,31 @@ enum ParamClass {
 /// (coverage-only), never approximately.
 const MAX_STRUCT_DEPTH: u32 = 4;
 
-/// Cap on the number of SCALAR LEAVES an eligible by-value struct param may carry. Every leaf
-/// is an independent sample column inside the aggregate, so this bounds both the marshalling
-/// work and the width over which the leaf-rotation recipe below can keep leaves distinguishable.
-const MAX_STRUCT_LEAVES: usize = 8;
+/// Cap on the number of MARSHALLABLE LEAVES an eligible by-value aggregate param may carry.
+/// Every leaf is an independent sample column inside the aggregate, so this bounds both the
+/// marshalling work and the width over which the leaf-rotation recipe below can keep leaves
+/// distinguishable.
+///
+/// Trust (cap widening, 8 -> 64): the leaf count does NOT multiply the sample space. The
+/// aggregate contributes exactly ONE product column whatever its width
+/// (`aggregate_abstract_samples` mints at most `MAX_STRUCT_SAMPLES` samples and the args site
+/// spends one tuple slot on it), so this bounds marshalling work — a linear walk per sample —
+/// and nothing else. What the old value of 8 actually purchased was a refusal of wide ADTs, not
+/// a bound on interpretation cost.
+///
+/// The rotation's distinguishability property is INDEPENDENT of this cap: sample `k` gives leaf
+/// `i` the value `pool_i[(k + i) % pool_i.len()]`, so two same-typed siblings at indices `i` and
+/// `j` differ whenever `i != j (mod pool.len())`. That is a property of the pool length (>= 2 for
+/// every non-`Ptr` leaf type `sample_values` mints), not of the leaf count — widening the cap
+/// cannot weaken it. It CAN mean two same-typed leaves 8 apart in a 64-leaf aggregate share a
+/// value in some sample; that costs a chance to catch a transposition of exactly those two, and
+/// `aggregate_field_names_agree` is the gate that pins transposition, not the rotation.
+const MAX_STRUCT_LEAVES: usize = 64;
+
+/// The PRE-WIDENING leaf bound (`MAX_STRUCT_LEAVES` was 8). Retained for ONE purpose: the `wide`
+/// attribution tag on the agreed note, so a single measurement sweep can separate the bodies the
+/// cap widening bought from the bodies the other three admissions bought. It is never a gate.
+const PRE_WIDENING_STRUCT_LEAVES: usize = 8;
 
 /// Number of abstract samples minted for one by-value struct param.
 const MAX_STRUCT_SAMPLES: usize = 8;
@@ -418,15 +536,42 @@ pub fn compare<'tcx>(
     // path infeasible) but not a faithful trap reference for the INTERPRETER: executing it
     // traps at the model, not at source semantics. Previously masked by the Undef skip firing
     // first. Fail-closed skip, precisely classed.
+    //
+    // Trust (drop-glue coverage lane): MOST of what reaches this guard is not a panic call at
+    // all — it is DROP GLUE. A source-level `panic!`/`assert!`/`unwrap` is a THIR `Call`, so
+    // `contains_call_forces_not_run` returns `NotRun` at step (0.5) BEFORE the oracle is even
+    // built; ten of the bridge's twelve `Assert(const false)` sites live in its
+    // `Terminator::Call` arm and are therefore unreachable from here. The two that are
+    // reachable are both in its `Terminator::Drop` arm (trust-ir-bridge lower.rs, the
+    // per-charged-variant lane and the blanket lane). `neutralize_drop_glue_markers` neutralizes
+    // exactly those, on this differential's LOCAL oracle copy, and only under a TOTAL,
+    // NON-VACUOUS accounting; the guard below then fires on precisely what it refused. See that
+    // function for the soundness argument and for the +243-shaped move that is refused there.
+    let mut oracle = oracle;
+    let drop_glue = neutralize_drop_glue_markers(&mut oracle);
     if oracle_has_const_false_assert(&oracle) {
         report.equal = false;
         report.mode = DiffMode::NotRun;
-        report.notes.push(
+        // The guard, not the audit, is the authority on whether anything survived: if the
+        // rewrite ever completed only partially, this is still reached and the body is still
+        // skipped. `drop_glue_rows > 0` distinguishes a body the lane could ALMOST take (some
+        // marker here IS drop glue, but a non-drop marker rides along and nothing node-local
+        // separates them) from one this guard describes correctly today. The first gets its own
+        // class so it stays rankable; the second keeps the note VERBATIM.
+        report.notes.push(if drop_glue.drop_glue_rows > 0 {
+            format!(
+                "oracle-drop-glue-mixed: {} ({}/{} const-false oracle asserts are drop-glue); \
+                 coverage-only skip",
+                drop_glue.refusal_reason(),
+                drop_glue.drop_glue_rows,
+                drop_glue.candidates,
+            )
+        } else {
             "oracle models a diverging panic call as an unconditional assert(false) \
              (oracle-panic-model, a verification model not a faithful trap reference); \
              coverage-only skip"
-                .to_string(),
-        );
+                .to_string()
+        });
         return (report, Some(vf));
     }
     // Trust (B9-B1b): the bridge lowers an `expected=false` assert condition as
@@ -460,6 +605,7 @@ pub fn compare<'tcx>(
             // note verbatim.
             if let Some(mut tail) = const_param_column_compare(&thir_side.module, &oracle) {
                 tail.unsupported = report.unsupported;
+                stamp_drop_glue_neutralization(&mut tail, &drop_glue);
                 return (tail, Some(vf));
             }
             report.equal = false;
@@ -470,6 +616,7 @@ pub fn compare<'tcx>(
                  coverage-only skip — NOT a THIR divergence",
                 undef_trace.map(|t| format!("; offender: {t}")).unwrap_or_default()
             ));
+            stamp_drop_glue_neutralization(&mut report, &drop_glue);
             return (report, Some(vf));
         }
     };
@@ -499,6 +646,7 @@ pub fn compare<'tcx>(
     // Trust (B9-A): the per-body path delegates to the entry-parameterized core below.
     let mut tail = compare_entries(thir_module, FuncId::new(0), &oracle, FuncId::new(0));
     tail.unsupported = report.unsupported;
+    stamp_drop_glue_neutralization(&mut tail, &drop_glue);
     (tail, Some(vf))
 }
 
@@ -1905,6 +2053,11 @@ pub(crate) fn compare_entries(
     let pointer_lane =
         pointer_param_input_lane(thir_module, thir_fn, thir_sig, oracle, oracle_fn, oracle_sig);
     let mut classes: Vec<ParamClass> = Vec::with_capacity(thir_sig.params.len());
+    // Trust (aggregate param lane): which of the aggregate admissions this body actually used.
+    // ATTRIBUTION ONLY — it is appended to the agreed note's suffix so one measurement sweep can
+    // separate four lanes, and it gates nothing. Empty for every body admitted on the
+    // pre-existing all-scalar struct rule, which keeps those notes byte-identical.
+    let mut aggregate_tags: BTreeSet<&'static str> = BTreeSet::new();
     for (i, t) in thir_sig.params.iter().enumerate() {
         if is_interpretable_scalar(t) {
             classes.push(ParamClass::Scalar);
@@ -1914,6 +2067,15 @@ pub(crate) fn compare_entries(
         // machinery sees it; the pointee it samples over is carried in `ptr_pointees` below.
         if matches!(&pointer_lane, Some(PointerLane::Scalar { index, .. }) if *index == i) {
             classes.push(ParamClass::PtrTo);
+            continue;
+        }
+        // Trust (Slice B): the same claim one shape up — an AGGREGATE referent. The lane is
+        // minted only when `struct_layout_agrees` AND `aggregate_param_admission` both passed
+        // two-sidedly, and only when `sig_tys_agree` is not `Ok(false)` (see
+        // `pointer_param_input_lane`), so by the time the param is claimed here every gate the
+        // by-value aggregate lane applies has already been applied to the REFERENT.
+        if matches!(&pointer_lane, Some(PointerLane::Aggregate { index, .. }) if *index == i) {
+            classes.push(ParamClass::PtrToAggregate);
             continue;
         }
         // Trust (B3/E6): an eligible FIRST-CLASS enum param samples as EnumDef-valid
@@ -1944,19 +2106,27 @@ pub(crate) fn compare_entries(
                 continue;
             }
         }
-        // Trust (aggregate param lane): an eligible BY-VALUE STRUCT param samples as a
-        // positional aggregate of its scalar leaves, realized per side at the args site.
+        // Trust (aggregate param lane): an eligible BY-VALUE AGGREGATE param samples as a
+        // positional aggregate of its leaves, realized per side at the args site.
+        //
+        // Trust (B4): `Ty::Tuple` is a SIBLING alternative here, not a second class. Both kinds
+        // take `ParamClass::Struct` and its column discipline — see that variant's doc for the
+        // two non-compiler-checked `matches!` filters a `ParamClass::Tuple` would have had to
+        // be threaded through by hand. The two sides must agree on the KIND (struct/struct or
+        // tuple/tuple); a cross-kind pair is refused by `aggregate_param_admission`, because a
+        // tuple-vs-struct reclass is exactly the divergence-manufacturing hole this lane's
+        // two-sided admission exists to prevent.
         //
         // Unlike the `Enum` arm above, eligibility here is TWO-SIDED and is checked BEFORE
         // the body is admitted, not left to `sig_tys_agree` at step (5). That is deliberate:
-        // today every struct param returns the byte-identical non-scalar refusal below and
+        // today every aggregate param returns the byte-identical non-scalar refusal below and
         // therefore NEVER REACHES step (5), so admitting one on a THIR-local test alone would
         // newly expose it to the divergence-publication channel on a SPELLING split — exactly
         // the divergence-manufacturing hole the B3-3 tuple-vs-struct reclass and TEST_P1S3_Foo
         // both came from. Two-sided admission keeps an unmarshallable shape on its existing
         // `not-run`, and admits only shapes whose marshalling is identical on both sides.
         //
-        // `struct_param_admissible` is also STRICTER than `tys_agree`'s struct arm, which
+        // `aggregate_param_admission` is also STRICTER than `tys_agree`'s struct arm, which
         // compares field COUNT and field TYPES only: it additionally requires the two
         // `StructDef`s to agree on field NAMES, pairwise and recursively. Both producers read
         // that name from the SAME rustc `FieldDef` in source-declaration index order
@@ -1966,10 +2136,40 @@ pub(crate) fn compare_entries(
         // shape. Without it, `MemoryRegion { AllocationId, usize, usize }` would compare equal
         // to itself with its two `usize` fields transposed, and a positional marshalling would
         // then feed the two sides semantically different inputs.
-        if let (Ty::Struct(_), Some(ot @ Ty::Struct(_))) = (t, oracle_sig.params.get(i)) {
-            if struct_param_admissible(thir_module, oracle, t, ot) {
-                classes.push(ParamClass::Struct);
-                continue;
+        if let (Ty::Struct(_), Some(ot @ Ty::Struct(_))) | (Ty::Tuple(_), Some(ot @ Ty::Tuple(_))) =
+            (t, oracle_sig.params.get(i))
+        {
+            match aggregate_param_admission(thir_module, oracle, t, ot, thir_sig, oracle_sig) {
+                // `lanes` is EMPTY for a param that was already admissible before this batch, so
+                // such a body collects no attribution tag and its agreed note stays byte-identical
+                // to the one the burn-down ratchet already holds.
+                AggregateParamAdmission::Admitted(lanes) => {
+                    // Trust (P1 residual): measure the name split this admission accepts. Gates
+                    // nothing — see `aggregate_name_split_probe`.
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        aggregate_name_split_probe(thir_module, oracle, t, ot, MAX_STRUCT_DEPTH);
+                    }
+                    aggregate_tags.extend(lanes);
+                    classes.push(ParamClass::Struct);
+                    continue;
+                }
+                // Conjunct (v), which only a NEWLY-admitted param can reach. Its OWN note, not
+                // the verbatim non-scalar one: this body is marshallable and is being held back
+                // solely by a whole-signature spelling split, and that population is what the
+                // next measurement has to be able to count. Returning here rather than falling
+                // through is what keeps a body that has NEVER had a verdict out of step (5)'s
+                // divergence channel — while a param that was already admissible does NOT come
+                // through here and still publishes its divergence at step (5), unchanged.
+                AggregateParamAdmission::SignatureSplit => {
+                    report.mode = DiffMode::NotRun;
+                    report.notes.push(
+                        "aggregate param admissible but signature spelling split; \
+                         coverage-only skip"
+                            .to_string(),
+                    );
+                    return report;
+                }
+                AggregateParamAdmission::Refused => {}
             }
         }
         // Trust (B2-3): a trait-object fat param joins the opacity-provable set — like
@@ -1989,19 +2189,43 @@ pub(crate) fn compare_entries(
             (Ok(true), Ok(true)) => classes.push(ParamClass::Opaque),
             (Ok(false), _) | (_, Ok(false)) => {
                 report.mode = DiffMode::NotRun;
-                // Trust (Q1, Slice B ceiling probe): the referent is a whole AGGREGATE whose byte
-                // layout was proven to agree across both sides, so this body is materializable —
-                // it is just not sampled YET (the aggregate sampler is the follow-on lane). Given
-                // its own class so the follow-on's yield is measured on the corpus instead of
-                // estimated from the `#[derive(Clone)]`-on-`Copy` file survey.
+                // Trust (Q1 / Slice B): the referent is a whole AGGREGATE whose byte layout was
+                // proven to agree across both sides, so the body is materializable — but the
+                // sampler DECLINED it, for one of exactly two reasons, and each gets its own
+                // note. A held-back population that shares one note is a population nobody can
+                // rank; a held-back population with NO note falls into `clean-skip-other`, which
+                // is the anonymous-catch-all failure this project has already paid for once.
+                //
+                // BOTH notes deliberately still carry the phrase `layout-agreeing AGGREGATE
+                // referent`, which is the classifier key for `clean-skip-ptr-pointee-aggregate`.
+                // That is what makes the sweep's own gate readable WITHOUT a scorecard edit: the
+                // class falls from its pre-lane count to exactly the number of declines, so the
+                // delta is the sampler's yield and the residue is still in a NAMED class. Each
+                // note additionally LEADS with a distinct token so a finer rule can split them
+                // later — leading, not trailing, because the artifact stores notes truncated to
+                // 160 characters and a marker past that offset is unreadable offline.
                 if matches!(
                     &pointer_lane,
                     Some(PointerLane::AggregateCeiling { index }) if *index == i
                 ) {
                     report.notes.push(format!(
-                        "param {i} ({t}) is READ through a layout-agreeing AGGREGATE referent — \
-                         materializable, aggregate referent sampling not implemented \
-                         (coverage-only skip)"
+                        "ptr-aggregate-unmarshallable: param {i} ({t}) is READ through a \
+                         layout-agreeing AGGREGATE referent, but the referent is not exactly \
+                         marshallable (leaf/depth/name/placeholder admission refused); \
+                         coverage-only skip"
+                    ));
+                    return report;
+                }
+                if matches!(
+                    &pointer_lane,
+                    Some(PointerLane::AggregateSignatureSplit { index }) if *index == i
+                ) {
+                    report.notes.push(format!(
+                        "ptr-aggregate-sig-split: param {i} ({t}) is READ through a \
+                         layout-agreeing AGGREGATE referent and IS marshallable, but the two \
+                         signatures are a spelling split (sig_tys_agree Ok(false)); withheld so a \
+                         body that has never reached step (5) cannot publish a divergence; \
+                         coverage-only skip"
                     ));
                     return report;
                 }
@@ -2022,15 +2246,13 @@ pub(crate) fn compare_entries(
     // (the note string stays verbatim — it is a classifier key).
     // Trust (aggregate param lane): struct columns do too, for the same reason.
     // Trust (Q1): so does a materialized-referent column — it is a scalar column over the POINTEE.
-    let scalar_params = classes
-        .iter()
-        .filter(|c| {
-            matches!(
-                c,
-                ParamClass::Scalar | ParamClass::Enum | ParamClass::Struct | ParamClass::PtrTo
-            )
-        })
-        .count();
+    // Trust (Slice B): AND SO DOES `PtrToAggregate`. This used to be a `matches!` — one of the
+    // two filters `ParamClass::Struct`'s doc names as NOT COMPILER-CHECKED, where adding a class
+    // without adding it here does not fail to build, it silently UNDERCOUNTS and so relaxes
+    // `MAX_PARAMS`. It is now `consumes_sample_column`, an exhaustive `match`, shared with
+    // `build_side_args`' `expected_columns`: the next class to be added fails to COMPILE at one
+    // site instead of desynchronizing two.
+    let scalar_params = classes.iter().filter(|c| consumes_sample_column(c)).count();
     if scalar_params > MAX_PARAMS {
         report.mode = DiffMode::NotRun;
         report.notes.push(format!(
@@ -2135,13 +2357,33 @@ pub(crate) fn compare_entries(
     // Trust (aggregate param lane): the struct twin of `enum_samples` — one abstract sample is
     // the FLAT depth-first list of scalar-leaf raws, side-portable because the two `StructDef`s
     // were proven to agree (shape AND field names) at the admission gate.
+    //
+    // Trust (Slice B): SHARED with `ParamClass::PtrToAggregate`, whose payload is the identical
+    // flat leaf list realized through the identical `realize_aggregate_arg`. The difference is
+    // only WHICH type the leaves describe — the param type for `Struct`, the recovered POINTEE
+    // for `PtrToAggregate` — and that difference is resolved here, once, when the table is
+    // filled, so every consumer downstream sees one uniform table.
     let mut struct_samples: Vec<Option<Vec<Vec<i128>>>> = vec![None; thir_sig.params.len()];
     // Trust (Q1): the recovered referent type per param — the pointer twin of `enum_samples`.
-    // `Some` exactly at the `ParamClass::PtrTo` index; the wrapper's signature and the args site
-    // both read the sampled column at the POINTEE type, never at `Ty::Ptr`.
+    // `Some` exactly at the `ParamClass::PtrTo` / `ParamClass::PtrToAggregate` index; the
+    // wrapper's signature and the args site both read the sampled column at the POINTEE type,
+    // never at `Ty::Ptr`.
+    //
+    // Trust (Slice B): the THIR side's spelling is stored, and using it to build the ABSTRACT
+    // samples is sound for both sides because `aggregate_param_admission`'s conjunct (i) proved
+    // the two sides' leaf sequences EQUAL. Each side then realizes those raws against its OWN
+    // module (`build_side_args`), which is the same discipline the by-value aggregate lane runs.
     let mut ptr_pointees: Vec<Option<Ty>> = vec![None; thir_sig.params.len()];
-    if let Some(PointerLane::Scalar { index, pointee }) = &pointer_lane {
-        ptr_pointees[*index] = Some(pointee.clone());
+    match &pointer_lane {
+        Some(PointerLane::Scalar { index, pointee }) => {
+            ptr_pointees[*index] = Some(pointee.clone());
+        }
+        Some(PointerLane::Aggregate { index, pointee_a, .. }) => {
+            ptr_pointees[*index] = Some(pointee_a.clone());
+        }
+        Some(PointerLane::AggregateCeiling { .. })
+        | Some(PointerLane::AggregateSignatureSplit { .. })
+        | None => {}
     }
     let mut per_param: Vec<Vec<i128>> = Vec::new();
     for (i, (t, c)) in thir_sig.params.iter().zip(classes.iter()).enumerate() {
@@ -2159,11 +2401,47 @@ pub(crate) fn compare_entries(
                 };
                 per_param.push(sample_values(&pointee));
             }
+            // Trust (Slice B): THE POSITION THAT DECIDES WHETHER THIS LANE MEASURES ANYTHING.
+            //
+            // `sample_values(&Ty::Struct(_))` is an EMPTY vec — it handles `Ty::Ptr`, `Ty::Bool`,
+            // the floats and `Ty::Char`, then falls to `int_shape`, which answers `None`. An
+            // empty column makes `CartesianProduct::new` set `finished` immediately, the sample
+            // loop never runs, `value_samples` stays 0, and step (8) returns `NotRun` with a note
+            // no `classify_note` rule matches — i.e. +0 Agreed AND the whole population silently
+            // relocated into the anonymous `clean-skip-other`. So the column here is INDEX-ENCODED
+            // over `aggregate_abstract_samples`, exactly like `ParamClass::Struct`, and the type
+            // it is taken over is the recovered POINTEE, never the `Ty::Ptr` param type (which
+            // `aggregate_component_tys` refuses, producing the same empty-column death one step
+            // earlier).
+            ParamClass::PtrToAggregate => {
+                let Some(pointee) = ptr_pointees[i].clone() else {
+                    report.mode = DiffMode::NotRun;
+                    report.notes.push(
+                        "could not build sample argument (coverage-only skip): recovered \
+                         aggregate referent type unavailable"
+                            .to_string(),
+                    );
+                    return report;
+                };
+                let Some(samples) = aggregate_abstract_samples(thir_module, &pointee) else {
+                    report.mode = DiffMode::NotRun;
+                    report.notes.push(
+                        "could not build sample argument (coverage-only skip): aggregate \
+                         referent sample description unavailable"
+                            .to_string(),
+                    );
+                    return report;
+                };
+                per_param.push((0..samples.len() as i128).collect());
+                struct_samples[i] = Some(samples);
+            }
             ParamClass::Struct => {
-                let samples = (|| {
-                    let Ty::Struct(sid) = t else { return None };
-                    struct_abstract_samples(thir_module, *sid)
-                })();
+                // Trust (B4): dispatched on the `Ty`, so `Ty::Struct` and `Ty::Tuple` share the
+                // one column. Trust (B3): a FIELDLESS aggregate legitimately answers with a
+                // single ZERO-LEAF sample, so this is `Some(vec![vec![]])` and NOT `None` — a
+                // `None` here would land the body on "struct sample description unavailable",
+                // which is a coverage skip that reads like a regression.
+                let samples = aggregate_abstract_samples(thir_module, t);
                 let Some(samples) = samples else {
                     report.mode = DiffMode::NotRun;
                     report.notes.push(
@@ -2219,10 +2497,27 @@ pub(crate) fn compare_entries(
     // on `thir_entry`/`oracle_entry`. `wrappers_agree` is what pays for that: the wrapper's own
     // memory effects go uncompared, which is sound only because the two wrappers are the same
     // program, and that is ASSERTED here rather than argued.
+    //
+    // Trust (Slice B): THE REFERENT IS TWO-SIDED. `pointee_a` builds the THIR wrapper and
+    // `pointee_b` builds the ORACLE's — never one shared value. For `PointerLane::Scalar` the
+    // two ARE the same `Ty` (the lane requires `a == b`), so the pair spelling is byte-identical
+    // in behaviour there; for an aggregate they are two module-local `StructId`s naming the same
+    // proven layout in two different tables, and feeding one side's id to the other is the
+    // manufactured-agreement trap the module docs name. The proven pair is handed to
+    // `wrappers_agree` so its exemption is keyed on exactly these two types and no others.
     let mut wrapped: Option<(Module, FuncId, FuncTy, Module, FuncId, FuncTy)> = None;
-    if let Some(PointerLane::Scalar { index, pointee }) = &pointer_lane {
-        let built = build_pointee_wrapper(thir_module, thir_entry, thir_sig, *index, pointee)
-            .zip(build_pointee_wrapper(oracle, oracle_entry, oracle_sig, *index, pointee));
+    let referent: Option<(usize, &Ty, &Ty)> = match &pointer_lane {
+        Some(PointerLane::Scalar { index, pointee }) => Some((*index, pointee, pointee)),
+        Some(PointerLane::Aggregate { index, pointee_a, pointee_b }) => {
+            Some((*index, pointee_a, pointee_b))
+        }
+        Some(PointerLane::AggregateCeiling { .. })
+        | Some(PointerLane::AggregateSignatureSplit { .. })
+        | None => None,
+    };
+    if let Some((index, pointee_a, pointee_b)) = referent {
+        let built = build_pointee_wrapper(thir_module, thir_entry, thir_sig, index, pointee_a)
+            .zip(build_pointee_wrapper(oracle, oracle_entry, oracle_sig, index, pointee_b));
         let Some(((tm, tf, ts), (om, of, os))) = built else {
             report.mode = DiffMode::NotRun;
             report.notes.push(
@@ -2232,9 +2527,17 @@ pub(crate) fn compare_entries(
             );
             return report;
         };
+        // The referent exemption is passed ONLY for the aggregate lane. The scalar lane keeps
+        // exact structural equality end to end — `None` here is what makes that a checkable
+        // statement rather than a claim, and `wrappers_agree_across_identically_shaped_sides`
+        // (which passes `None` on both of its assertions) pins it.
+        let exemption = match &pointer_lane {
+            Some(PointerLane::Aggregate { .. }) => Some((index, pointee_a, pointee_b)),
+            _ => None,
+        };
         // Scoped so the two wrapper borrows END before the modules move into `wrapped` below.
         let agreement = match (tm.function_by_id(tf), om.function_by_id(of)) {
-            (Some(wa), Some(wb)) => wrappers_agree(wa, thir_entry, wb, oracle_entry),
+            (Some(wa), Some(wb)) => wrappers_agree(wa, thir_entry, wb, oracle_entry, exemption),
             _ => Err("a wrapper is unresolvable after construction".to_string()),
         };
         if let Err(why) = agreement {
@@ -2503,16 +2806,34 @@ pub(crate) fn compare_entries(
     report.mode = DiffMode::Agreed;
     report.samples_checked = checked;
     let opaque_params = classes.iter().filter(|c| **c == ParamClass::Opaque).count();
+    // Trust (aggregate param lane): ATTRIBUTION SUFFIX. One measurement sweep pays for four
+    // admissions (fieldless, ptr-leaf, tuple, cap widening) and a bare agreed count cannot say
+    // which one bought which body. Tags are emitted in `BTreeSet` order and joined with `+` when
+    // a body used more than one.
+    //
+    // The PREFIX `"THIR-trust-ir == MIR-trust-ir on"` is untouched — the notes are the burn-down
+    // ratchet's keys — and the suffix is appended INSIDE the existing parenthetical only when at
+    // least one tag applies. A body admitted on the pre-existing all-scalar struct rule collects
+    // no tags, so its note is byte-identical to the one already in the ratchet.
+    let aggregate_suffix = if aggregate_tags.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; aggregate param admitted [{}]",
+            aggregate_tags.iter().copied().collect::<Vec<_>>().join("+")
+        )
+    };
     report.notes.push(if opaque_params > 0 {
         format!(
             "THIR-trust-ir == MIR-trust-ir on {} sampled input(s) (differential \
-             interpretation; {} proven-never-read opaque param(s) as placeholders)",
-            checked, opaque_params
+             interpretation; {} proven-never-read opaque param(s) as placeholders{})",
+            checked, opaque_params, aggregate_suffix
         )
     } else {
         format!(
-            "THIR-trust-ir == MIR-trust-ir on {} sampled input(s) (differential interpretation)",
-            checked
+            "THIR-trust-ir == MIR-trust-ir on {} sampled input(s) (differential \
+             interpretation{})",
+            checked, aggregate_suffix
         )
     });
     report
@@ -2994,6 +3315,324 @@ pub(crate) fn oracle_has_const_false_assert(module: &Module) -> bool {
         }
     }
     false
+}
+
+/// Trust (drop-glue coverage lane): every `Inst::Assert` node in `module` whose condition is a
+/// `Const Bool(false)`, as `(function_index, block_index, node_index)`.
+///
+/// This is [`oracle_has_const_false_assert`]'s OWN traversal, transcribed — same per-function
+/// `false_ids` accumulation, same block/node order, same `results.first()` handling — differing
+/// only in that it collects every hit instead of returning at the first. That is not a stylistic
+/// choice: the whole lane rests on "neutralize every site this list names ⇒ the guard no longer
+/// fires", and that implication is only as true as the two walks are identical. A second,
+/// independently-written walk could be NARROWER, leave a site behind, and hand the guard a
+/// half-rewritten oracle. `const_false_assert_sites_agrees_with_the_guard` pins the equivalence
+/// rather than leaving it to a reading of two functions.
+///
+/// The guard is deliberately NOT narrowed to reach this list — narrowing the DETECTOR without
+/// neutralising the marker would leave a trapping `Assert(false)` in the module and convert
+/// coverage-only skips into `MirOracle` divergences at the `(Ok, Err(Panic))` arm. Detector and
+/// rewrite move together or not at all.
+fn const_false_assert_sites(module: &Module) -> Vec<(usize, usize, usize)> {
+    let mut sites = Vec::new();
+    for (fi, func) in module.functions.iter().enumerate() {
+        let mut false_ids: HashSet<ValueId> = HashSet::new();
+        for (bi, blk) in func.blocks.iter().enumerate() {
+            for (ni, node) in blk.body.iter().enumerate() {
+                match &node.inst {
+                    Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) } => {
+                        if let Some(&r) = node.results.first() {
+                            false_ids.insert(r);
+                        }
+                    }
+                    Inst::Assert { cond } if false_ids.contains(cond) => sites.push((fi, bi, ni)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    sites
+}
+
+/// Trust (drop-glue coverage lane): true iff `obligation` is one of the bridge's FATAL drop-glue
+/// markers — the rows that ride with an `Assert(const false)`.
+///
+/// The bridge's `Terminator::Drop` arm mints exactly four `Assert` shapes, and only two of them
+/// are `false`:
+///
+/// | arm | assert | description |
+/// |---|---|---|
+/// | whole-ADT proven panic-free | `Assert(true)` | `"drop glue for ... — discharged: ..."`, NO prefix |
+/// | per-variant, all live arms proved | `Assert(true)` | `"drop glue for ... — discharged per variant: ..."`, NO prefix |
+/// | per-variant, arm CHARGED | `Assert(false)` | [`DROP_GLUE_ASSUMPTION_PREFIX`] + `"drop glue for variant ..."` |
+/// | blanket / generic-param | `Assert(false)` | [`DROP_GLUE_ASSUMPTION_PREFIX`] (or, for a bare `T`, [`EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX`]) + `"drop glue for ..."` |
+///
+/// [`DROP_GLUE_ASSUMPTION_PREFIX`]: trust_types::assumption::DROP_GLUE_ASSUMPTION_PREFIX
+/// [`EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX`]: trust_types::assumption::EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX
+///
+/// So the recognizer is: a `PanicFreedom` row carrying ONE OF THE TWO ASSUMPTION PREFIXES whose
+/// remainder begins `"drop glue for "`. Both halves are load-bearing and each excludes a real
+/// neighbour:
+///
+///  * **Requiring a prefix** excludes the two DISCHARGED rows, which say `"drop glue for ..."`
+///    too but ride with `Assert(const TRUE)`. Counting one would inflate `drop_glue_rows` past
+///    `candidates` and — under the equality test below — refuse a body that should be taken.
+///  * **Requiring the `"drop glue for "` stem** excludes the ordinary absent-callee rows, which
+///    share `EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX` but say `"call to absent callee ..."`.
+///    Those DO ride with an `Assert(const false)`, so keying on the prefix alone would
+///    mis-attribute a call marker as drop glue.
+///
+/// Nothing else in the bridge emits `"drop glue for "` after an assumption prefix (grep: four
+/// sites, all in the `Terminator::Drop` arm), and the whole-function aggregate row minted at the
+/// end of `lower_function_into` (`"<name>: all assertions hold"`) carries no prefix and no
+/// `Assert` node, so it is excluded on both counts.
+///
+/// This is TEXT, and the design that scoped this lane asked for a node-local structural witness
+/// instead. That witness is NOT AVAILABLE, and the reason is worth recording: `ProofObligation`
+/// has carried a v34 `site: Option<ObligationSite>` backref — the exact `(function, block,
+/// inst_index)` this would need — since the format grew it, but the bridge's `add_obligation`
+/// never calls `with_site`, so every obligation it mints has `site: None`. The structural
+/// alternative the design proposed (an `Assert(false)` adjacent to neither `Unreachable` nor
+/// `Undef`) is ALSO unsound: the absent-callee arms emit their `Undef` havoc only when the call
+/// destination is non-`Unit`, so a unit-returning absent callee produces the drop-glue shape
+/// exactly. Populating `site` in the bridge is the real fix and would let this lane become
+/// per-node instead of per-module; until then the accounting below is what makes text safe.
+fn obligation_is_fatal_drop_glue_marker(obligation: &trust_ir::ProofObligation) -> bool {
+    if obligation.kind != ObligationKind::PanicFreedom {
+        return false;
+    }
+    const DROP_GLUE_DESC_STEM: &str = "drop glue for ";
+    [
+        trust_types::assumption::DROP_GLUE_ASSUMPTION_PREFIX,
+        trust_types::assumption::EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| {
+        obligation
+            .description
+            .strip_prefix(*prefix)
+            .is_some_and(|rest| rest.starts_with(DROP_GLUE_DESC_STEM))
+    })
+}
+
+/// Trust (drop-glue coverage lane): what [`neutralize_drop_glue_markers`] did, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DropGlueMarkerAudit {
+    /// `Assert(const false)` nodes found, counted with the guard's own traversal.
+    pub(crate) candidates: usize,
+    /// Module obligations positively identified as the bridge's fatal drop-glue marker.
+    pub(crate) drop_glue_rows: usize,
+    /// Candidates actually rewritten. Zero unless the total accounting held.
+    pub(crate) neutralized: usize,
+    /// The accounting held but a touched function had no room to mint the fresh `true` consts.
+    pub(crate) id_space_exhausted: bool,
+}
+
+impl DropGlueMarkerAudit {
+    /// A short, stable tag naming WHY the lane declined, for the skip note. Only meaningful when
+    /// at least one drop-glue row was seen (otherwise the body is not this lane's business and
+    /// keeps the pre-existing note verbatim).
+    fn refusal_reason(&self) -> &'static str {
+        if self.id_space_exhausted {
+            "value-id-space-exhausted"
+        } else if self.drop_glue_rows > self.candidates {
+            "row-count-asymmetry"
+        } else {
+            "mixed-markers"
+        }
+    }
+}
+
+/// Trust (drop-glue coverage lane): rewrite every `Assert(const false)` in `module` to
+/// `Assert(const true)` — but ONLY when every one of them is accounted for by a fatal drop-glue
+/// obligation. Applied to this differential's LOCAL oracle copy; the bridge, trust-mc, the pinned
+/// interpreter, the verifier lanes and the flip gate are untouched.
+///
+/// # What the disagreement actually is
+///
+/// The producer's trust-ir contains **nothing at all** for a MIR `Terminator::Drop` — trust-ir
+/// has no destructor instruction, and `crate::lower_module` emits none (`needs_drop` appears only
+/// in admission predicates). The oracle contains a **verification marker** whose only semantic
+/// content is "panic-freedom of this glue is unproven": an in-body `Assert(false)+NoPanic` that
+/// keeps the panic reachable to the CHC interpreter on every path, plus one honest
+/// `PanicFreedom` obligation. That encoding is correct for the VERIFIER and is deliberately left
+/// alone. It is not a trap reference for the INTERPRETER, which executes `Assert(false)` as
+/// `InterpretErrorCode::Panic` — a genuine trap by `is_trap` — so the oracle traps on EVERY input
+/// while the producer returns normally, and the `(Ok, Err(trap))` arm would publish a false
+/// `MirOracle` "THIR returned X but the MIR oracle proved a trap" divergence. Hence today's
+/// fail-closed skip; hence this rewrite, which removes a marker only ONE side has rather than
+/// carrying any fact across.
+///
+/// # Why this is bounded — and exactly what it is NOT
+///
+/// Bounded with respect to the question this differential asks ("do the two modules interpret the
+/// same?"): neither side models a destructor, and the doctrine "a drop is a no-op on both sides"
+/// ALREADY SHIPS, in two independent forms that are live on this very path:
+///
+///  * a `Terminator::Drop` of a trivially-no-drop type (`is_trivially_no_drop_ty` — scalars,
+///    refs, raw pointers, unit, fn items, and arrays/tuples/closure-upvars of those) lowers to
+///    NOTHING but the successor `Br`. No assert, no obligation. Such bodies are compared today,
+///    with their drops unmodelled on both sides, and this arm is unconditional;
+///  * a drop the classifier PROVES panic-free emits `Assert(const true)`, which does not trip the
+///    detector. Reachable here despite the differential's empty certificate sets, because the
+///    `ManuallyDrop`/`MaybeUninit`, total-std-leaf and vetted `Option`/`Result` arms of
+///    `is_panic_free_drop_ext` are keyed on the type NAME and consult no certificate at all.
+///
+/// Extending that treatment to the UNPROVEN case adds no new blindness of a KIND; it widens the
+/// SET. That is the whole claim, and it is narrower than it may look:
+///
+/// **AN `Agreed` EARNED HERE IS AN `Agreed` ABOUT THE VALUE FLOW *AROUND* THE DROPS, NOT ABOUT
+/// THE DROPS.** trust-ir has no destructor instruction, so there is nothing for the producer to
+/// emit and nothing for the interpreter to run; `mir_differential` — the flip gate — independently
+/// refuses every `Terminator::Drop` outright. The named gap is an operational destructor model in
+/// trust-ir plus producer emission of it, and until that exists this class has a permanent
+/// ceiling on what its verdicts MEAN. Rows the lane takes are stamped with that caveat by
+/// [`stamp_drop_glue_neutralization`] so it travels with the row instead of living only here.
+///
+/// # The +243-shaped move that is REFUSED ON THE RECORD
+///
+/// There is a much cheaper way to make this whole class "agree": mirror the `Assert(const false)`
+/// on the PRODUCER side. Both modules would then trap identically, reach the `(Err, Err)` arm,
+/// and `ea.code == eb.code && is_trap(ea.code)` would count every sample as CHECKED — trap
+/// agreement is agreement. It would score the entire class at once. **It must never be done.**
+/// It is a manufactured agreement of exactly the kind this differential already refuses in
+/// writing at step (0.5) ("both sides would merely error at the call — a vacuous 'agreement' we
+/// refuse to report as a verdict"), it would agree about a marker neither language has, and —
+/// unlike everything in this function — it would poison `Lowered::module`, which feeds `splice_ok`
+/// and the assembled crate module. The rewrite here goes the other way on purpose: it touches a
+/// LOCAL COPY OF THE ORACLE ONLY, so it can withdraw a skip but can never manufacture a trap.
+///
+/// # The accounting, and why it is a TOTAL equality rather than a filter
+///
+/// `site` is `None` on every bridge obligation (see [`obligation_is_fatal_drop_glue_marker`]), so
+/// there is no way to bind marker row #2 to assert node #2. The substitute is a total,
+/// non-vacuous, symmetric accounting over the whole module:
+///
+/// ```text
+/// candidates >= 1  &&  candidates == drop_glue_rows   ⇒  rewrite ALL
+/// anything else                                       ⇒  rewrite NOTHING
+/// ```
+///
+/// Both conjuncts are doing work:
+///
+///  * `candidates >= 1` is the ANTI-VACUITY conjunct. "Every `Assert(const false)` here is drop
+///    glue" is VACUOUSLY TRUE of a module containing none, and an `iter().all(..)` phrasing would
+///    have silently claimed every clean body in the corpus. The equality already implies it when
+///    `drop_glue_rows > 0`, but it is written out because the degenerate case is the one that has
+///    burned this campaign before.
+///  * The EQUALITY (not `>=`, not "every candidate matches some row") is what makes a per-module
+///    text scan safe without per-node binding. Each fatal drop arm emits exactly one assert and
+///    exactly one row, so a body whose counts agree cannot contain an unattributed marker: one
+///    panic-call marker riding along with one drop marker gives 2 candidates against 1 row and is
+///    refused. It fails closed in BOTH directions — a row without an assert (lowering drift) is
+///    refused just as loudly as an assert without a row.
+///
+/// All-or-nothing per module: a mixed body keeps its skip. That is what preserves the file's
+/// SAMPLE-MORE-OR-REFUSE-MORE posture — this can widen what is COMPARED and can add a refusal,
+/// and it can never widen what is ACCEPTED, because it does not touch any acceptance predicate.
+///
+/// Returns the audit; `neutralized > 0` iff the module was rewritten.
+pub(crate) fn neutralize_drop_glue_markers(module: &mut Module) -> DropGlueMarkerAudit {
+    let mut audit = DropGlueMarkerAudit {
+        drop_glue_rows: module
+            .proof_obligations
+            .iter()
+            .filter(|o| obligation_is_fatal_drop_glue_marker(o))
+            .count(),
+        ..DropGlueMarkerAudit::default()
+    };
+    let sites = const_false_assert_sites(module);
+    audit.candidates = sites.len();
+
+    // THE TOTAL, NON-VACUOUS ACCOUNTING. Note what the empty case degenerates to: zero
+    // candidates returns here having mutated nothing, the guard at the call site then finds no
+    // const-false assert either, and the body proceeds to comparison exactly as it does today.
+    // Declining is never itself a skip — the guard, not this function, decides that.
+    if sites.is_empty() || sites.len() != audit.drop_glue_rows {
+        return audit;
+    }
+
+    // ALL-OR-NOTHING, so the id-space budget is checked for every touched function BEFORE a
+    // single node moves. Same fail-closed posture as `rewrite_bool_not_icmp`'s `u32::MAX` guard,
+    // but totalized: each function needs room for one fresh `true` const per candidate it holds.
+    let mut per_func: BTreeMap<usize, usize> = BTreeMap::new();
+    for (fi, _, _) in &sites {
+        *per_func.entry(*fi).or_insert(0) += 1;
+    }
+    for (fi, needed) in &per_func {
+        let max = module.functions[*fi].max_value_id();
+        if (u32::MAX - max) < *needed as u32 {
+            audit.id_space_exhausted = true;
+            return audit;
+        }
+    }
+
+    // Apply. Grouped by (function, block) and walked in DESCENDING node index so each insertion
+    // shifts only nodes we have already rewritten — the surviving indices stay exact without any
+    // offset bookkeeping. The fresh `Const Bool(true)` goes immediately BEFORE its assert, in the
+    // same block (the `rewrite_bool_not_icmp` idiom), so the definition trivially dominates its
+    // use; a single hoisted const would run fine on the dominance-blind interpreter and be wrong
+    // in the IR, which is precisely the class of defect only the validator catches.
+    let mut by_block: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    for (fi, bi, ni) in &sites {
+        by_block.entry((*fi, *bi)).or_default().push(*ni);
+    }
+    let mut next_id: BTreeMap<usize, u32> =
+        per_func.keys().map(|fi| (*fi, module.functions[*fi].max_value_id() + 1)).collect();
+    for ((fi, bi), mut nis) in by_block {
+        nis.sort_unstable();
+        for ni in nis.into_iter().rev() {
+            let Some(next) = next_id.get_mut(&fi) else { continue };
+            let true_id = ValueId::new(*next);
+            let blk = &mut module.functions[fi].blocks[bi];
+            // Defensive, not decorative: if the node under `ni` is somehow not the assert this
+            // list named, leave it alone. `neutralized` then stays below `candidates`, the guard
+            // at the call site still fires, and the body keeps its skip — a partial rewrite can
+            // cost coverage but can never produce a compared oracle with a marker still in it.
+            if !matches!(&blk.body[ni].inst, Inst::Assert { .. }) {
+                continue;
+            }
+            *next += 1;
+            blk.body.insert(
+                ni,
+                InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                    .with_result(true_id),
+            );
+            if let Inst::Assert { cond } = &mut blk.body[ni + 1].inst {
+                *cond = true_id;
+                audit.neutralized += 1;
+            }
+        }
+    }
+    audit
+}
+
+/// Trust (drop-glue coverage lane): stamp the honest caveat onto whatever verdict a neutralized
+/// body ended up with.
+///
+/// APPENDS to the last note rather than pushing a new one, because the coverage event publishes
+/// `notes.last()` — a pushed note would REPLACE the verdict text, and those strings are the
+/// burn-down ratchet's classifier keys. The existing prefix is left byte-identical, exactly as
+/// the aggregate-param attribution suffix does one screen down.
+///
+/// No pre-existing artifact row can acquire this suffix: it is written only when the rewrite
+/// fired, and every body the rewrite can fire on is a body that reaches the const-false guard,
+/// i.e. one that is `clean-skip-oracle-panic-model` today. So every OTHER row's note stays
+/// byte-identical and the classifier partition moves only where this lane moved it.
+///
+/// It is stamped on skips as well as on agreements, deliberately: a body this lane freed which
+/// then dies at the live-havoc gate or the parameter gate is the follow-on lane's target, and it
+/// should be countable as such instead of silently joining a class it did not come from.
+fn stamp_drop_glue_neutralization(report: &mut DiffReport, audit: &DropGlueMarkerAudit) {
+    if audit.neutralized == 0 {
+        return;
+    }
+    if let Some(last) = report.notes.last_mut() {
+        last.push_str(&format!(
+            " [drop-glue markers neutralised: {}; drops unmodelled on both sides]",
+            audit.neutralized
+        ));
+    }
 }
 
 /// Trust (wave-DA): the FIRST **ADT-interior literal byte arithmetic** in `module`, named, or
@@ -4439,120 +5078,462 @@ fn enum_abstract_samples(def: &trust_ir::EnumDef) -> Option<Vec<(usize, Vec<i128
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Trust (aggregate param lane): the depth-first list of SCALAR LEAF types of an eligible
-/// by-value struct, or `None` if the struct is not eligible.
+/// Trust (aggregate param lane): the component types of a marshallable AGGREGATE `Ty`, in
+/// declaration order — the SINGLE place `Ty::Struct` and `Ty::Tuple` are unified, so every
+/// function below dispatches on `Ty` instead of on a `StructId`.
+///
+/// `None` for anything that is not an aggregate this lane marshals, and for a `Ty::Struct` whose
+/// id does not resolve in `module`'s OWN table — fail CLOSED, because a `StructId` is
+/// module-local and an unresolvable one is a shape this side cannot speak about at all.
+///
+/// The two kinds differ in exactly one respect that matters downstream, and it is handled by
+/// `aggregate_field_names_agree`, not here: a struct's positional identity is carried by FIELD
+/// NAMES (two same-typed siblings can be transposed without `tys_agree` noticing), whereas a
+/// tuple's identity IS the position — there is no name to disagree about and nothing to
+/// transpose. `Ty::Tuple(Vec<Ty>)` is inline rather than table-indexed, so it also carries no
+/// cross-module id numbering to defend against.
+fn aggregate_component_tys(module: &Module, t: &Ty) -> Option<Vec<Ty>> {
+    match t {
+        Ty::Struct(sid) => {
+            Some(module.struct_def(*sid)?.fields.iter().map(|f| f.ty.clone()).collect())
+        }
+        Ty::Tuple(elems) => Some(elems.clone()),
+        _ => None,
+    }
+}
+
+/// Trust (aggregate param lane): the depth-first list of MARSHALLABLE LEAF types of an eligible
+/// by-value aggregate (`Ty::Struct` or `Ty::Tuple`), or `None` if it is not eligible.
 ///
 /// Eligible means, exactly (fail CLOSED on everything else — a shape this cannot marshal
 /// EXACTLY must stay `not-run`, because a wrong marshalling is a wrong verdict):
-///   * the `StructId` resolves in `module`'s own table;
-///   * the struct has at least one field (a field-less struct carries no observable value, so
-///     admitting it would buy a verdict over an empty input space);
-///   * every field is either an `is_interpretable_scalar` leaf or another eligible struct,
-///     recursively, within `MAX_STRUCT_DEPTH`;
+///   * the aggregate resolves (`aggregate_component_tys`);
+///   * every component is an `is_interpretable_scalar` leaf, a `Ty::Ptr` leaf, or another
+///     eligible aggregate, recursively, within `MAX_STRUCT_DEPTH`;
 ///   * the total leaf count is at most `MAX_STRUCT_LEAVES`.
 ///
+/// # The `Ty::Ptr` leaf — what is ASSERTED and what is ARGUED
+///
+/// ASSERTED, and it is the whole premise: `sample_values(Ty::Ptr)` is the SINGLETON pool `[0]`
+/// and `build_arg(Ty::Ptr, _)` is `InterpretValueKind::NullPtr` — a concrete, side-portable,
+/// IDENTITY-FREE value. That is what separates this from `PointerLane::Scalar`, which is
+/// restricted to a sole-`Load` use precisely because a MATERIALIZED referent's
+/// `InterpretPointer { allocation, offset }` is an allocation-ORDER artifact the two sides do
+/// not share. Null has no allocation and no order, so minting the same value on both sides is
+/// not a coincidence to be defended — it is the only value there is.
+///
+/// ARGUED from that premise, over everything a body can do with the leaf:
+///   * never extracted — inert, byte-for-byte the opaque treatment the param has today;
+///   * extracted and compared / returned / `PtrToInt`'d — same input on both sides, same
+///     observable, so a real (if deliberately weak) verdict;
+///   * extracted and DEREFERENCED — both sides trap. Because the pool is a singleton, EVERY
+///     sample traps, `value_samples` stays 0, and step (8) returns `NotRun`. A ptr-leaf body
+///     therefore cannot mint an `Agreed` out of trap-only evidence.
+///
+/// The singleton pool is load-bearing for the third bullet. **Do not make it multi-valued.**
+///
+/// Note what is NOT claimed: this is not a `param_never_read` opacity proof, and it must not be
+/// built on one. `fn read_scalar_field(m: Mixed) -> i32 { m.n }` READS the param while never
+/// touching the pointer, so a whole-param opacity proof fails closed on exactly the class this
+/// admits.
+///
+/// # The FIELDLESS aggregate
+///
+/// A zero-component aggregate marshals to `Aggregate([])` and samples as the single empty leaf
+/// tuple (`aggregate_abstract_samples`). It has exactly ONE inhabitant per side, so admitting it
+/// cannot misrepresent either side's input. What goes unchecked is which NOMINAL type each
+/// producer picked — `tys_agree`'s struct arm compares field COUNT and field TYPES, and BOTH are
+/// vacuously true at zero fields, as is `aggregate_field_names_agree`'s `.all()` over an empty
+/// iterator. That is why `aggregate_placeholder_free` is a MANDATORY conjunct of admission:
+/// four distinct producer entities collapse onto that one vacuous key.
+///
 /// Deliberately NOT eligible, each because the exact value model is not this lane's to invent:
-///   * `Ty::Unit` fields — a producer `Ty::Unit` at a struct-field position is ALSO how the
+///   * `Ty::Unit` components — a producer `Ty::Unit` at a struct-field position is ALSO how the
 ///     union lane spells a `union` member (`struct_field_tys`), and the oracle spells the same
 ///     member as its real field type. Those bodies are already `not-run` (the union lane forces
 ///     `contains_call`), so this arm never sees one — but the refusal is written down rather
 ///     than relied upon, because a genuine ZST field and a union placeholder are the same
-///     `Ty::Unit` here and only one of them is value-less.
-///   * `Ty::Enum` fields — the tag/payload encoding is the `Enum` arm's discipline and carries
-///     its own discriminant and tag-repr obligations; nesting it inside the struct recipe would
-///     duplicate them at a second site.
-///   * arrays, tuples, pointers, fat pointers, closures, records — no exact positional
-///     marshalling is established for them here.
-fn struct_leaf_tys(module: &Module, sid: trust_ir::StructId, depth: u32) -> Option<Vec<Ty>> {
+///     `Ty::Unit` here and only one of them is value-less. (`Ty::Tuple(vec![])` is a DISTINCT
+///     type from `Ty::Unit` in trust-ir — they even render differently — and it IS eligible, as
+///     an ordinary fieldless aggregate.)
+///   * `Ty::Enum` components — the tag/payload encoding is the `Enum` arm's discipline and
+///     carries its own discriminant and tag-repr obligations; nesting it inside the aggregate
+///     recipe would duplicate them at a second site.
+///   * arrays, fat pointers, closures, records — no exact positional marshalling is established
+///     for them here.
+fn aggregate_leaf_tys(module: &Module, t: &Ty, depth: u32) -> Option<Vec<Ty>> {
     if depth == 0 {
         return None;
     }
-    let def = module.struct_def(sid)?;
-    if def.fields.is_empty() {
-        return None;
-    }
+    let components = aggregate_component_tys(module, t)?;
     let mut leaves = Vec::new();
-    for field in &def.fields {
-        match &field.ty {
-            t if is_interpretable_scalar(t) => leaves.push(t.clone()),
-            Ty::Struct(inner) => leaves.extend(struct_leaf_tys(module, *inner, depth - 1)?),
+    for component in &components {
+        match component {
+            leaf if is_interpretable_scalar(leaf) => leaves.push(leaf.clone()),
+            // Trust (B2): the NULL-POINTER leaf. See the ASSERTED/ARGUED block above; the
+            // lockstep partner is `realize_aggregate_arg`'s `Ty::Ptr` arm, which must consume
+            // one cursor slot for every `Ty::Ptr` pushed here.
+            Ty::Ptr => leaves.push(Ty::Ptr),
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                leaves.extend(aggregate_leaf_tys(module, component, depth - 1)?)
+            }
             _ => return None,
         }
         if leaves.len() > MAX_STRUCT_LEAVES {
             return None;
         }
     }
-    if leaves.is_empty() || leaves.len() > MAX_STRUCT_LEAVES { None } else { Some(leaves) }
+    // Trust (B3): `leaves.is_empty()` is NO LONGER a refusal — see the FIELDLESS block above.
+    // The cap is still re-checked, because the in-loop check cannot fire on a zero-component
+    // aggregate and because a nested `extend` can cross it between iterations.
+    if leaves.len() > MAX_STRUCT_LEAVES { None } else { Some(leaves) }
 }
 
-/// Trust (aggregate param lane): do the two sides' `StructDef`s agree on FIELD NAMES, pairwise
-/// and recursively? This is the identity pin `tys_agree`'s struct arm deliberately does not
-/// carry (it ignores names so the oracle may name closure envs differently), and it is what
-/// makes a POSITIONAL marshalling sound: two same-typed sibling fields cannot be transposed
-/// between the producer and the oracle without this disagreeing.
+/// Trust (aggregate param lane): do the two sides' aggregates agree on FIELD NAMES, pairwise and
+/// recursively? This is the identity pin `tys_agree`'s struct arm deliberately does not carry
+/// (it ignores names so the oracle may name closure envs differently), and it is what makes a
+/// POSITIONAL marshalling sound: two same-typed sibling fields cannot be transposed between the
+/// producer and the oracle without this disagreeing.
 ///
 /// Both sides read the name from the same rustc `FieldDef` in source-declaration index order,
 /// so agreement is the expected case and disagreement is a real spelling split — which returns
 /// `false` and leaves the body on its existing `not-run`, never on a manufactured verdict.
-fn struct_field_names_agree(
-    am: &Module,
-    bm: &Module,
-    a: trust_ir::StructId,
-    b: trust_ir::StructId,
-    depth: u32,
-) -> bool {
-    if depth == 0 {
-        return false;
-    }
-    let (Some(da), Some(db)) = (am.struct_def(a), bm.struct_def(b)) else {
-        return false;
-    };
-    if da.fields.len() != db.fields.len() {
-        return false;
-    }
-    da.fields.iter().zip(&db.fields).all(|(fa, fb)| {
-        fa.name == fb.name
-            && match (&fa.ty, &fb.ty) {
-                (Ty::Struct(x), Ty::Struct(y)) => {
-                    struct_field_names_agree(am, bm, *x, *y, depth - 1)
-                }
-                (Ty::Struct(_), _) | (_, Ty::Struct(_)) => false,
-                _ => true,
+///
+/// A `Ty::Tuple` node has no names, and needs none: a tuple's component identity IS its
+/// position, and both sides index it the same way, so there is no transposition for a name to
+/// rule out. Arity is checked here anyway (it is the tuple analogue of `fields.len()`), and the
+/// component types are checked by conjunct (i)'s leaf equality and conjunct (iii)'s `tys_agree`.
+/// A CROSS-KIND node pair (struct against tuple) is `false`: no positional identity connects the
+/// two spellings, and admitting one would be exactly the tuple-vs-struct reclass this lane's
+/// two-sided admission exists to prevent.
+///
+/// The `depth == 0` test sits INSIDE the aggregate arms rather than at the top, deliberately: a
+/// LEAF pair at the bottom of a maximally-nested aggregate must still answer `true`, which is
+/// what the pre-generalization spelling did (it recursed only on `(Struct, Struct)` and let
+/// every other pair fall to `_ => true` without consulting `depth`). Hoisting the test would
+/// silently refuse the deepest admissible shapes.
+fn aggregate_field_names_agree(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) -> bool {
+    match (a, b) {
+        (Ty::Struct(x), Ty::Struct(y)) => {
+            if depth == 0 {
+                return false;
             }
-    })
+            let (Some(da), Some(db)) = (am.struct_def(*x), bm.struct_def(*y)) else {
+                return false;
+            };
+            if da.fields.len() != db.fields.len() {
+                return false;
+            }
+            da.fields.iter().zip(&db.fields).all(|(fa, fb)| {
+                fa.name == fb.name && aggregate_field_names_agree(am, bm, &fa.ty, &fb.ty, depth - 1)
+            })
+        }
+        (Ty::Tuple(xs), Ty::Tuple(ys)) => {
+            if depth == 0 {
+                return false;
+            }
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys)
+                    .all(|(x, y)| aggregate_field_names_agree(am, bm, x, y, depth - 1))
+        }
+        (Ty::Struct(_) | Ty::Tuple(_), _) | (_, Ty::Struct(_) | Ty::Tuple(_)) => false,
+        // Leaves carry no names. Their agreement is conjunct (i)'s and conjunct (iii)'s business.
+        _ => true,
+    }
 }
 
-/// Trust (aggregate param lane): the TWO-SIDED admission gate for a by-value struct param.
+/// Trust (aggregate param lane, P1): the producer/oracle struct names that stand for a WHOLE
+/// CLASS of source entities rather than for one nominal type, and which are minted with ZERO
+/// FIELDS.
+///
+/// At zero fields `tys_agree`'s struct arm is vacuously true (field COUNT 0 == 0, and the
+/// pairwise field loop never runs) and so is `aggregate_field_names_agree` (`.all()` over an
+/// empty iterator). Distinct entities therefore collapse onto ONE comparison key: a real
+/// `struct Foo;`, and these placeholder mints, each VERIFIED at its mint site —
+///
+///   * `"opaque_alias::pre_monomorphization"` — producer `lib.rs`'s `mint_alias_opaque_struct`,
+///     oracle `trust-ir-bridge/src/lower.rs`'s pre-mono alias-marker arm. The producer's own
+///     doc says it "deliberately stands for MANY distinct alias `(DefId, GenericArgs)` pairs at
+///     once", which is the hazard stated by its author.
+///   * `"datatype::{name}"` — the bridge's `Ty::Datatype` sort marker.
+///   * `"coroutine::{name}"` — the bridge's `Ty::Coroutine` frame marker.
+///   * `"closure_env::{name}"` — the bridge's closure-env struct, which has zero fields exactly
+///     when the closure captures nothing.
+///
+/// Matched by PREFIX because three of the four embed a name after the `::`.
+const PLACEHOLDER_AGGREGATE_NAME_PREFIXES: [&str; 4] =
+    ["opaque_alias::", "datatype::", "coroutine::", "closure_env::"];
+
+/// Trust (aggregate param lane, P1): the placeholder pin. `true` iff NEITHER side's aggregate
+/// tree contains a zero-field struct node whose name is one of the class-standing placeholder
+/// mints above.
+///
+/// Three properties, each chosen against a specific way this could go wrong:
+///
+///   * **SIDE-LOCAL.** Each side is walked against its own module and judged on its own name.
+///     There is deliberately NO cross-side string comparison. `da.name == db.name` would be the
+///     obvious pin and it is the WRONG one: the two renderers differ, and this was READ, not
+///     assumed. The producer's `register_struct` mints the name as
+///     `with_no_trimmed_paths!(tcx.def_path_str_with_args(did, args))`. The oracle's
+///     `StructDef.name` is the `trust_types::Ty::Adt` name, which
+///     `trust-mir-extract::convert` renders through `sysroot_authenticated_def_path_str_with_args`
+///     — i.e. `with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
+///     with_no_trimmed_paths!(..))))`, then `apply_cross_namespace_tag`, then
+///     `sysroot_authenticated_path`. Four print controls and two post-passes the producer never
+///     applies. `with_no_visible_paths!` alone plausibly renders `core::marker::PhantomData`
+///     where the other side renders `std::marker::PhantomData` — and `PhantomData` is a leading
+///     member of the fieldless class. A name-equality pin is a live candidate for refusing the
+///     entire population the item was written to admit.
+///   * **A POSITIVE WITNESS, not an absence.** It refuses only when it can NAME the placeholder
+///     it found. It does not require evidence that a struct is a genuine nominal type, which no
+///     data available here could supply.
+///   * **FAIL-CLOSED.** An unresolvable `StructId` or an over-deep nest is `false`, refusing the
+///     body. A false hit costs coverage; it can never cost a verdict.
+///
+/// # Accepted residual, stated rather than hidden
+///
+/// A genuine unit struct `Foo` on one side pairing with a genuine unit struct `Bar` on the other
+/// is admitted. That is acceptable and it is NOT new blindness: for a zero-field param there is
+/// exactly one inhabitant per side, so neither side's INPUT is misrepresented. What goes
+/// unchecked is which NOMINAL type the producer picked — and `tys_agree` has never checked that
+/// for ANY struct, at any field count. The residual is measured rather than argued away, by
+/// `aggregate_name_split_probe`.
+fn aggregate_placeholder_free(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) -> bool {
+    side_placeholder_free(am, a, depth) && side_placeholder_free(bm, b, depth)
+}
+
+/// One side of [`aggregate_placeholder_free`]. Nothing here reads the other module.
+fn side_placeholder_free(module: &Module, t: &Ty, depth: u32) -> bool {
+    match t {
+        Ty::Struct(sid) => {
+            if depth == 0 {
+                return false;
+            }
+            let Some(def) = module.struct_def(*sid) else {
+                return false;
+            };
+            // Only a ZERO-FIELD node can collapse: a placeholder WITH fields is already
+            // distinguished by them, and refusing it would cost coverage for no reason.
+            if def.fields.is_empty()
+                && PLACEHOLDER_AGGREGATE_NAME_PREFIXES.iter().any(|p| def.name.starts_with(*p))
+            {
+                return false;
+            }
+            def.fields.iter().all(|f| side_placeholder_free(module, &f.ty, depth - 1))
+        }
+        Ty::Tuple(elems) => {
+            if depth == 0 {
+                return false;
+            }
+            elems.iter().all(|e| side_placeholder_free(module, e, depth - 1))
+        }
+        _ => true,
+    }
+}
+
+/// Trust (aggregate param lane): the outcome of the TWO-SIDED admission gate for a by-value
+/// aggregate param. Three states rather than a `bool`, because conjunct (v) has to be
+/// distinguishable at the call site — it is the one refusal that must NOT fall through to the
+/// verbatim non-scalar note, since the population it holds back is exactly what the next
+/// measurement needs to count.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum AggregateParamAdmission {
+    /// Every conjunct holds. The param takes a `ParamClass::Struct` column.
+    ///
+    /// Carries the NEW-LANE tag set this param used — **EMPTY exactly when the param was already
+    /// admissible before this batch**. That set has TWO consumers, and they are the same value
+    /// computed ONCE on purpose: it is the agreed note's attribution suffix, and it is conjunct
+    /// (v)'s SCOPE. Recomputing it at the call site would be two sites holding one fact, which
+    /// is the shape of defect this file's history is made of.
+    Admitted(BTreeSet<&'static str>),
+    /// Conjuncts (i)–(iv) hold and the param is admitted by a NEW lane, but the whole SIGNATURE
+    /// compares `Ok(false)`. A param that was already admissible never reaches this state.
+    SignatureSplit,
+    /// Some shape conjunct fails. The param falls through to the byte-identical non-scalar
+    /// refusal it has today.
+    Refused,
+}
+
+/// Trust (aggregate param lane): the TWO-SIDED admission gate for a by-value aggregate param
+/// (`Ty::Struct` or `Ty::Tuple`).
 ///
 /// Every conjunct is an ADMISSION condition, never a comparison: failing any one of them leaves
 /// the parameter on the byte-identical non-scalar refusal it has today (a `not-run`), so this
 /// predicate can only ever produce MORE sampled verdicts, never a laxer comparison.
-fn struct_param_admissible(am: &Module, bm: &Module, a: &Ty, b: &Ty) -> bool {
-    let (Ty::Struct(sa), Ty::Struct(sb)) = (a, b) else {
-        return false;
-    };
+fn aggregate_param_admission(
+    am: &Module,
+    bm: &Module,
+    a: &Ty,
+    b: &Ty,
+    a_sig: &FuncTy,
+    b_sig: &FuncTy,
+) -> AggregateParamAdmission {
+    // Same aggregate KIND on both sides. A struct/tuple cross-kind pair is not a marshalling
+    // this lane establishes — see `aggregate_field_names_agree`'s cross-kind arm.
+    if !matches!((a, b), (Ty::Struct(_), Ty::Struct(_)) | (Ty::Tuple(_), Ty::Tuple(_))) {
+        return AggregateParamAdmission::Refused;
+    }
     // (i) both sides marshal EXACTLY, to the same leaf sequence.
     let (Some(la), Some(lb)) =
-        (struct_leaf_tys(am, *sa, MAX_STRUCT_DEPTH), struct_leaf_tys(bm, *sb, MAX_STRUCT_DEPTH))
+        (aggregate_leaf_tys(am, a, MAX_STRUCT_DEPTH), aggregate_leaf_tys(bm, b, MAX_STRUCT_DEPTH))
     else {
-        return false;
+        return AggregateParamAdmission::Refused;
     };
     if la != lb {
-        return false;
+        return AggregateParamAdmission::Refused;
     }
     // (ii) field identity, not merely field shape.
-    if !struct_field_names_agree(am, bm, *sa, *sb, MAX_STRUCT_DEPTH) {
-        return false;
+    if !aggregate_field_names_agree(am, bm, a, b, MAX_STRUCT_DEPTH) {
+        return AggregateParamAdmission::Refused;
     }
     // (iii) the standard structural agreement the rest of the differential runs on. Checked
-    //       HERE rather than left to step (5) because a struct param that reaches step (5)
+    //       HERE rather than left to step (5) because an aggregate param that reaches step (5)
     //       for the first time would publish a spelling split as a DIVERGENCE.
-    matches!(tys_agree(am, bm, a, b, TY_CMP_DEPTH), Ok(true))
+    if !matches!(tys_agree(am, bm, a, b, TY_CMP_DEPTH), Ok(true)) {
+        return AggregateParamAdmission::Refused;
+    }
+    // (iv) P1: no zero-field node on either side is a class-standing placeholder mint. MANDATORY
+    //      — the fieldless admission does not ship without it.
+    if !aggregate_placeholder_free(am, bm, a, b, MAX_STRUCT_DEPTH) {
+        return AggregateParamAdmission::Refused;
+    }
+    // THE NEW-LANE SET for this param, computed once and used twice (attribution + (v)'s scope).
+    //
+    // Side-local on `am`, and that is sound rather than convenient: (i) proved the two leaf
+    // sequences EQUAL (so `ptr-leaf` and `wide` are side-symmetric), the kind gate above and
+    // (ii)'s cross-kind refusal make the two trees congruent NODE FOR NODE (so `tuple` is), and
+    // (ii) equates `fields.len()` at every struct node and arity at every tuple node (so
+    // `fieldless` is). A tag present on one side is present on the other.
+    let mut lanes: BTreeSet<&'static str> = BTreeSet::new();
+    aggregate_admission_tags(am, a, MAX_STRUCT_DEPTH, &mut lanes);
+
+    // (v) THE MANDATORY FAIL-CLOSE, SCOPED TO THE NEW LANES. `sig_tys_agree` compares params AND
+    //     RETURNS, and at step (5) an `Ok(false)` PUBLISHES A DIVERGENCE. Every body this batch
+    //     NEWLY admits dies today at the non-scalar refusal above and therefore never reaches
+    //     step (5); admitting it opens a brand-new divergence-publication channel on a
+    //     RETURN-SIDE spelling split, against a gate whose control says divergences == 0. That
+    //     channel is what this closes, and closing it is the whole job.
+    //
+    //     `lanes.is_empty()` is the SCOPE, and the equivalence it rests on is exact: a param with
+    //     no tag is a param the PRE-BATCH rules already admitted. Each of the four old refusals
+    //     mints its own tag — a `Ty::Tuple` at the param or at any node mints `tuple`, a `Ty::Ptr`
+    //     component mints `ptr-leaf`, a zero-component node anywhere mints `fieldless`, and a leaf
+    //     count past the old bound mints `wide` — while conjuncts (ii)/(iii) are unchanged for
+    //     struct/struct inputs and (iv) provably cannot refuse a tagless param (a tagless param
+    //     has no zero-field node, which is the only thing (iv) inspects). So tagless ⟺
+    //     already-admissible, and an already-admissible param keeps TODAY'S BEHAVIOUR END TO END,
+    //     including publishing its signature divergence at step (5).
+    //
+    //     Scoping is a capability decision, taken deliberately (owner, 2026-08-20). Unscoped,
+    //     this conjunct would suppress a divergence the differential currently REPORTS, which is
+    //     a capability loss, and it would buy nothing: the control measured divergences 0, so
+    //     scoped and unscoped are measurement-identical on this corpus. It also keeps the change
+    //     inside the already-adjudicated shape of 65f2577dca — claims only bodies that were a
+    //     NotRun skip, reroutes nothing that already had a verdict — instead of making a novel
+    //     adjudication on a frozen oracle file for zero measured benefit.
+    //
+    //     Blocks `Ok(false)` ONLY, and the asymmetry is the entire point. `Err` is a comparability
+    //     failure that step (5) already converts into a `NotRun` byte-identically to today, so
+    //     letting it through costs nothing and changes nothing. Gating on `== Ok(true)` instead
+    //     would refuse every body whose return is an enum, an aggregate-element array, or a
+    //     cross-kind fat pointer — all of which `tys_agree` answers with `Err` by design — which
+    //     is a large fraction of the candidate set and would deliver a systematic +0.
+    if !lanes.is_empty() && matches!(sig_tys_agree(am, bm, a_sig, b_sig), Ok(false)) {
+        return AggregateParamAdmission::SignatureSplit;
+    }
+    AggregateParamAdmission::Admitted(lanes)
 }
 
-/// Trust (aggregate param lane): abstract, side-portable samples for one by-value struct param —
-/// each sample is the FLAT depth-first list of raws for the struct's scalar leaves, realized per
-/// side at the args site against that module's own `StructDef`.
+/// Trust (aggregate param lane, P1 residual): a DEBUG-only tripwire that MEASURES the residual
+/// `aggregate_placeholder_free` accepts — an admitted aggregate whose two sides carry different
+/// struct NAMES at some node.
+///
+/// It gates NOTHING. It never touches the report, the verdict, or the note; it emits its own
+/// `tracing::debug!` event and returns. That is deliberate and follows `crate_module`'s
+/// `row1_dead_path_probe`: name-equality is a live candidate for a systematic +0 (the two sides'
+/// path renderers differ — see `aggregate_placeholder_free`), so the way to learn whether a name
+/// split is common is to COUNT it on the corpus, not to gate on it and read the crater.
+///
+/// Costs nothing on a normal compile: `tracing::enabled!` short-circuits before the walk.
+fn aggregate_name_split_probe(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) {
+    if depth == 0 {
+        return;
+    }
+    match (a, b) {
+        (Ty::Struct(x), Ty::Struct(y)) => {
+            let (Some(da), Some(db)) = (am.struct_def(*x), bm.struct_def(*y)) else {
+                return;
+            };
+            if da.name != db.name {
+                tracing::debug!(
+                    thir_name = da.name.as_str(),
+                    oracle_name = db.name.as_str(),
+                    fields = da.fields.len(),
+                    zero_field = da.fields.is_empty(),
+                    "trust-ir-lower: admitted aggregate param name split"
+                );
+            }
+            for (fa, fb) in da.fields.iter().zip(&db.fields) {
+                aggregate_name_split_probe(am, bm, &fa.ty, &fb.ty, depth - 1);
+            }
+        }
+        (Ty::Tuple(xs), Ty::Tuple(ys)) => {
+            for (x, y) in xs.iter().zip(ys) {
+                aggregate_name_split_probe(am, bm, x, y, depth - 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Trust (aggregate param lane): which of this batch's four admissions an ADMITTED aggregate
+/// param actually used, as `&'static str` tags appended to the agreed note's SUFFIX.
+///
+/// One measurement sweep is paying for four lanes, so an aggregate body that agrees has to say
+/// which relaxation bought it. Side-local on the THIR side by construction: conjunct (i) already
+/// proved the two leaf sequences EQUAL and conjunct (ii)/(iii) proved the trees congruent, so
+/// either side answers identically.
+///
+/// A param that would have been admitted before this batch (a non-empty all-scalar struct of at
+/// most `PRE_WIDENING_STRUCT_LEAVES` leaves, with no fieldless node anywhere) produces NO tags,
+/// and its note therefore stays byte-identical to the one the ratchet already knows.
+///
+/// `depth` is bounded exactly as the marshalling walks are. Attribution is diagnostics, but an
+/// unbounded recursion over a self-referential `StructDef` would hang the compiler, and this
+/// runs on the ADMITTED path where the shape has only been proven bounded for the caller's own
+/// `MAX_STRUCT_DEPTH` — so the bound is carried here too rather than inferred from that.
+fn aggregate_admission_tags(module: &Module, t: &Ty, depth: u32, out: &mut BTreeSet<&'static str>) {
+    if depth == 0 {
+        return;
+    }
+    if matches!(t, Ty::Tuple(_)) {
+        out.insert("tuple");
+    }
+    if let Some(leaves) = aggregate_leaf_tys(module, t, depth) {
+        if leaves.iter().any(|l| matches!(l, Ty::Ptr)) {
+            out.insert("ptr-leaf");
+        }
+        if leaves.len() > PRE_WIDENING_STRUCT_LEAVES {
+            out.insert("wide");
+        }
+    }
+    if let Some(components) = aggregate_component_tys(module, t) {
+        if components.is_empty() {
+            out.insert("fieldless");
+        }
+        for component in &components {
+            if matches!(component, Ty::Struct(_) | Ty::Tuple(_)) {
+                aggregate_admission_tags(module, component, depth - 1, out);
+            }
+        }
+    }
+}
+
+/// Trust (aggregate param lane): abstract, side-portable samples for one by-value aggregate
+/// param — each sample is the FLAT depth-first list of raws for the aggregate's leaves, realized
+/// per side at the args site against that module's own definitions.
 ///
 /// THE LEAF ROTATION, and why it is not a plain diagonal. Sample `k` gives leaf `i` the value
 /// `pool_i[(k + i) % pool_i.len()]`. Rotating by the leaf INDEX is what keeps sibling leaves at
@@ -4564,8 +5545,24 @@ fn struct_param_admissible(am: &Module, bm: &Module, a: &Ty, b: &Ty) -> bool {
 ///
 /// Coverage: `k` runs over the widest leaf pool (capped at `MAX_STRUCT_SAMPLES`), so every leaf
 /// sees the boundary values `sample_values` mints for its own type, modulo its pool length.
-fn struct_abstract_samples(module: &Module, sid: trust_ir::StructId) -> Option<Vec<Vec<i128>>> {
-    let leaves = struct_leaf_tys(module, sid, MAX_STRUCT_DEPTH)?;
+///
+/// Trust (B2): a `Ty::Ptr` leaf's pool is the SINGLETON `[0]`, so it holds `NullPtr` in every
+/// sample and contributes nothing to `widest`. That is not an oversight — it is the premise
+/// `aggregate_leaf_tys` argues the whole ptr-leaf admission from. It also means a ptr-only
+/// aggregate yields exactly one sample, which is the correct amount of evidence for a param with
+/// one admissible value.
+///
+/// Trust (B3): a FIELDLESS aggregate returns `Some(vec![Vec::new()])` — ONE sample carrying ZERO
+/// leaves — and returns it BEFORE the pool machinery, which cannot express it: `pools` would be
+/// empty, `pools.iter().map(Vec::len).max()` is `None` on an empty iterator, and the `?` would
+/// turn the single legitimate sample of a one-inhabitant type into a coverage-only skip. This is
+/// the third of the three sites the fieldless admission needs; relaxing only the two in
+/// `aggregate_leaf_tys` measures exactly zero.
+fn aggregate_abstract_samples(module: &Module, t: &Ty) -> Option<Vec<Vec<i128>>> {
+    let leaves = aggregate_leaf_tys(module, t, MAX_STRUCT_DEPTH)?;
+    if leaves.is_empty() {
+        return Some(vec![Vec::new()]);
+    }
     let pools: Vec<Vec<i128>> = leaves.iter().map(|t| sample_values(t)).collect();
     if pools.iter().any(Vec::is_empty) {
         return None;
@@ -4585,43 +5582,62 @@ fn struct_abstract_samples(module: &Module, sid: trust_ir::StructId) -> Option<V
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Trust (aggregate param lane): realize one abstract struct sample against THIS module's own
-/// `StructDef`, consuming `leaves` depth-first through `cursor`.
+/// Trust (aggregate param lane): realize one abstract aggregate sample against THIS module's own
+/// definitions, consuming `leaves` depth-first through `cursor`.
 ///
 /// The value is a POSITIONAL `InterpretValueKind::Aggregate` with exactly one element per
-/// declared field, in declaration order — the shape `eval_extract_field` indexes (`values.get(field)`)
-/// and `eval_insert_field` rebuilds. trust-ir's aggregate value model carries NO padding and no
-/// offsets (`size`/`align`/`FieldDef::offset` are layout METADATA, never elements), so there is
-/// no padding lane to fabricate; `repr` likewise changes bytes, not the field list, so a
-/// `repr(C)`/`repr(transparent)`/`repr(packed)` struct marshals identically here.
-fn realize_struct_arg(
+/// declared component, in declaration order — the shape `eval_extract_field` indexes
+/// (`values.get(field)`) and `eval_insert_field` rebuilds. trust-ir's aggregate value model
+/// carries NO padding and no offsets (`size`/`align`/`FieldDef::offset` are layout METADATA,
+/// never elements), so there is no padding lane to fabricate; `repr` likewise changes bytes, not
+/// the field list, so a `repr(C)`/`repr(transparent)`/`repr(packed)` struct marshals identically
+/// here.
+///
+/// The result's `ty` is `t` CLONED, never rebuilt from the realized elements. For a struct the
+/// two would coincide; for a `Ty::Tuple` they need not, and the interpreter's entry admission
+/// (`check_signature_values`) is EXACT `Ty` equality against the signature — so the signature's
+/// own spelling is the only safe one to carry.
+///
+/// The `Ty::Ptr` arm CONSUMES a cursor slot. That is not decoration: it is the lockstep partner
+/// of `aggregate_leaf_tys` pushing `Ty::Ptr` into the leaf list. If one site moves without the
+/// other, every leaf after the pointer is realized from the wrong raw and the two sides desync
+/// silently — the `cursor != leaves.len()` check at the args site is what would catch it, and it
+/// would present as a coverage skip rather than as the bug it is.
+fn realize_aggregate_arg(
     module: &Module,
-    sid: trust_ir::StructId,
+    t: &Ty,
     leaves: &[i128],
     cursor: &mut usize,
     depth: u32,
 ) -> Result<InterpretValue, String> {
     if depth == 0 {
-        return Err("struct nesting exceeds marshalling depth".to_string());
+        return Err("aggregate nesting exceeds marshalling depth".to_string());
     }
-    let def = module
-        .struct_def(sid)
-        .ok_or_else(|| format!("struct id {} unresolvable at args site", sid.index()))?;
-    let mut elems = Vec::with_capacity(def.fields.len());
-    for field in &def.fields {
-        match &field.ty {
-            Ty::Struct(inner) => {
-                elems.push(realize_struct_arg(module, *inner, leaves, cursor, depth - 1)?);
+    let components = aggregate_component_tys(module, t)
+        .ok_or_else(|| format!("no aggregate marshalling for param type {t}"))?;
+    let mut elems = Vec::with_capacity(components.len());
+    for component in &components {
+        match component {
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                elems.push(realize_aggregate_arg(module, component, leaves, cursor, depth - 1)?);
             }
-            t if is_interpretable_scalar(t) => {
-                let raw = *leaves.get(*cursor).ok_or("struct sample leaf missing")?;
+            // Trust (B2): the null-pointer leaf. `build_arg` ignores the raw and mints
+            // `NullPtr`; the slot is consumed anyway so the cursor stays in lockstep with
+            // `aggregate_leaf_tys`.
+            Ty::Ptr => {
+                let raw = *leaves.get(*cursor).ok_or("aggregate sample leaf missing")?;
                 *cursor += 1;
-                elems.push(build_arg(t, raw)?);
+                elems.push(build_arg(&Ty::Ptr, raw)?);
             }
-            other => return Err(format!("no struct marshalling for field type {other}")),
+            leaf if is_interpretable_scalar(leaf) => {
+                let raw = *leaves.get(*cursor).ok_or("aggregate sample leaf missing")?;
+                *cursor += 1;
+                elems.push(build_arg(leaf, raw)?);
+            }
+            other => return Err(format!("no aggregate marshalling for component type {other}")),
         }
     }
-    Ok(InterpretValue { ty: Ty::Struct(sid), kind: InterpretValueKind::Aggregate(elems) })
+    Ok(InterpretValue { ty: t.clone(), kind: InterpretValueKind::Aggregate(elems) })
 }
 
 /// Decode enum columns for diagnostics without making note rendering an
@@ -4650,6 +5666,12 @@ fn decoded_enum_sample_suffix(
                 // its value is an ordinary scalar and already appears in the `input {tuple:?}`
                 // prefix, so this enum-only helper has nothing to add for it.
                 ParamClass::PtrTo => column += 1,
+                // Trust (Slice B): so does an aggregate referent column. Missing this arm is not
+                // a compile error and not a wrong verdict — it makes `column != tuple.len()`,
+                // `decode()` return `None`, and `unwrap_or_default()` drop the ENTIRE suffix for
+                // every body that also carries an enum param. A diagnostic that silently vanishes
+                // is worse than one that is absent by design, so the arm is explicit.
+                ParamClass::PtrToAggregate => column += 1,
                 ParamClass::Enum => {
                     let raw = *tuple.get(column)?;
                     column += 1;
@@ -4697,19 +5719,33 @@ fn build_side_args(
     if struct_samples.len() != sig.params.len() {
         return Err("struct sample table length does not match signature".to_string());
     }
+    // NOTE ON ALL THREE `match (class, slot)` FILTERS BELOW: they carry a `_ =>` catch-all, so a
+    // new `ParamClass` variant does NOT make them a compile error — it makes them silently reject
+    // (or silently accept) the new class. Both directions of each invariant are spelled out
+    // explicitly for that reason, and `ptr_to_aggregate_moved_every_unchecked_matches_filter`
+    // pins them.
     for (class, slot) in classes.iter().zip(enum_samples) {
         match (class, slot) {
             (ParamClass::Enum, Some(_))
             | (
-                ParamClass::Scalar | ParamClass::Opaque | ParamClass::Struct | ParamClass::PtrTo,
+                ParamClass::Scalar
+                | ParamClass::Opaque
+                | ParamClass::Struct
+                | ParamClass::PtrTo
+                | ParamClass::PtrToAggregate,
                 None,
             ) => {}
             _ => return Err("enum sample table is not aligned with parameter classes".to_string()),
         }
     }
+    // Trust (Slice B): `PtrToAggregate` SHARES this table with `Struct` — same payload (a flat
+    // depth-first leaf-raw list per abstract sample), same realization function. The invariant
+    // widens from "`Some` iff `Struct`" to "`Some` iff `Struct` or `PtrToAggregate`", and both
+    // directions are still checked: a `Some` under any other class, or a `None` under either of
+    // these two, is a recipe-drift `Err` and a coverage-only skip.
     for (class, slot) in classes.iter().zip(struct_samples) {
         match (class, slot) {
-            (ParamClass::Struct, Some(_))
+            (ParamClass::Struct | ParamClass::PtrToAggregate, Some(_))
             | (
                 ParamClass::Scalar | ParamClass::Opaque | ParamClass::Enum | ParamClass::PtrTo,
                 None,
@@ -4719,15 +5755,11 @@ fn build_side_args(
             }
         }
     }
-    let expected_columns = classes
-        .iter()
-        .filter(|class| {
-            matches!(
-                class,
-                ParamClass::Scalar | ParamClass::Enum | ParamClass::Struct | ParamClass::PtrTo
-            )
-        })
-        .count();
+    // Trust (Slice B): the SECOND of the two filters `ParamClass::Struct`'s doc names, now the
+    // SAME function as the first. Omitting a class here does not fail to build under a `matches!`
+    // — it undercounts the expected columns and turns every body on the omitted lane into
+    // `"sample tuple has N column(s), expected M"`, a fail-closed, named, systematic +0.
+    let expected_columns = classes.iter().filter(|class| consumes_sample_column(class)).count();
     if tuple.len() != expected_columns {
         return Err(format!(
             "sample tuple has {} column(s), expected {expected_columns}",
@@ -4804,7 +5836,15 @@ fn build_side_args(
                     kind: InterpretValueKind::Aggregate(elems),
                 })
             }
-            ParamClass::Struct => {
+            // Trust (B4 / Slice B): ONE arm for both aggregate classes, and the reason they can
+            // share it is that `sig` is the EXEC signature. For `Struct` that is the entry's own
+            // signature and `ty` is the by-value param type; for `PtrToAggregate` it is the
+            // WRAPPER's, whose param at this index `build_pointee_wrapper` already respelled to
+            // THIS SIDE's recovered pointee. Either way `ty` is the aggregate to realize, taken
+            // from this side's own signature, and the pointer is minted by the wrapper's
+            // `Alloca`/`Store` rather than here — exactly as `ParamClass::PtrTo` does for a
+            // scalar referent.
+            ParamClass::Struct | ParamClass::PtrToAggregate => {
                 // MUST consume the tuple exactly like Scalar (column desync otherwise).
                 let raw = tuple.get(k).copied().ok_or("sample tuple column missing")?;
                 k += 1;
@@ -4816,11 +5856,16 @@ fn build_side_args(
                     .map_err(|_| "struct sample index is negative or too large")?;
                 let leaves =
                     samples.get(sample_index).ok_or("struct sample index out of bounds")?;
-                let Ty::Struct(sid) = ty else {
-                    return Err("struct param class on a non-struct signature type".to_string());
-                };
+                // Trust (B4): `Ty::Tuple` shares this class and this column discipline; the
+                // dispatch on which aggregate kind `ty` is lives in `realize_aggregate_arg`,
+                // which fails closed on anything that is not one.
                 let mut cursor = 0usize;
-                let value = realize_struct_arg(module, *sid, leaves, &mut cursor, MAX_STRUCT_DEPTH)?;
+                let value =
+                    realize_aggregate_arg(module, ty, leaves, &mut cursor, MAX_STRUCT_DEPTH)?;
+                // The cross-side desync detector. The leaf list was built ONCE, from the THIR
+                // side; conjunct (i) of the admission proved the two sides' leaf SEQUENCES equal,
+                // so a side that consumes a different number of them has drifted from the shape
+                // that was admitted, and the sample is refused rather than realized short.
                 if cursor != leaves.len() {
                     return Err(
                         "struct sample leaves were not consumed exactly (side shape drift)"
@@ -4838,6 +5883,20 @@ fn build_side_args(
 }
 
 fn sample_values(t: &Ty) -> Vec<i128> {
+    // Trust (B2): the aggregate ptr-leaf pool, and it is a SINGLETON on purpose. `build_arg`
+    // turns the raw into `InterpretValueKind::NullPtr` regardless of its value, so a second
+    // entry would buy nothing; and the singleton is what makes `aggregate_leaf_tys`' third
+    // bullet hold — a body that DEREFERENCES the leaf traps on EVERY sample, `value_samples`
+    // stays 0, and step (8) returns `NotRun` rather than an `Agreed` minted from trap-only
+    // agreement. **Do not make this multi-valued.**
+    //
+    // Inert everywhere else: the only other callers are the `Scalar` column (an
+    // `is_interpretable_scalar` type, which `Ty::Ptr` is not) and the `PtrTo` column (whose
+    // pointee `pointer_param_input_lane` requires to be `is_interpretable_scalar`), so no
+    // pre-existing pool changes by one element.
+    if matches!(t, Ty::Ptr) {
+        return vec![0];
+    }
     if matches!(t, Ty::Bool) {
         return vec![0, 1];
     }
@@ -4900,6 +5959,19 @@ fn sample_values(t: &Ty) -> Vec<i128> {
 /// the low 32 bits — the same convention `float_bits_from_f64` establishes for constants).
 fn build_arg(t: &Ty, raw: i128) -> Result<InterpretValue, String> {
     match t {
+        // Trust (B2): the aggregate ptr-leaf, mirroring `opaque_arg`'s `Ty::Ptr` arm exactly —
+        // the same identity-free `NullPtr` that lane already mints at a TOP-LEVEL param, here at
+        // a leaf position instead. The raw is ignored because `sample_values(Ty::Ptr)` is the
+        // singleton `[0]`; the slot is still consumed by `realize_aggregate_arg` so the leaf
+        // cursor stays in lockstep with the leaf-type list.
+        //
+        // This cannot change any pre-existing call: a top-level `Ty::Ptr` param is classified
+        // `Opaque` or `PtrTo`, never `Scalar` (`is_interpretable_scalar` excludes it); an
+        // eligible enum's payload fields must be `is_interpretable_scalar` or `Ty::Unit`; and
+        // the `PtrTo` column is built at the POINTEE type, which `pointer_param_input_lane`
+        // requires to be `is_interpretable_scalar`. Every existing caller passed a type this
+        // arm does not match.
+        Ty::Ptr => Ok(InterpretValue { ty: Ty::Ptr, kind: InterpretValueKind::NullPtr }),
         Ty::Bool => Ok(InterpretValue::bool(raw != 0)),
         Ty::F32 | Ty::F64 => {
             Ok(InterpretValue { ty: t.clone(), kind: InterpretValueKind::FloatBits(raw as u64) })
@@ -5032,9 +6104,30 @@ fn sole_pointee_load(func: &Function, index: usize) -> Result<Option<Ty>, String
 /// copied out of that side's OWN entry signature, and a table-indexed type (`Ty::Struct(id)`,
 /// `Ty::Enum(id)`, `Ty::FatPtr(TraitObject { trait_id })`, ...) carries a MODULE-LOCAL id, so two
 /// structurally-identical wrappers would compare UNEQUAL on the raw ids alone. Restricting the
-/// pass-through set to id-FREE types is what lets `wrappers_agree` be an exact structural equality
+/// pass-through set to id-FREE types is what keeps `wrappers_agree` an exact structural equality
+/// at every PASS-THROUGH position. The excluded shapes keep the refusal they have today.
+///
+/// # CORRECTED by Slice B — read this before citing the paragraph above
+///
+/// That paragraph used to end "…is what lets `wrappers_agree` be an exact structural equality
 /// instead of a cross-module type comparison — a weaker check that would then need its own
-/// correctness argument. The excluded shapes keep the refusal they have today.
+/// correctness argument." **That is no longer true of the whole wrapper, and the sentence is
+/// replaced rather than quietly left standing**, because an argued relaxation surviving only in a
+/// comment is the defect class this campaign keeps finding.
+///
+/// What changed: the REFERENT position is a table-indexed `Ty::Struct(id)` for an aggregate
+/// referent, and it is not a pass-through — it is minted by `build_pointee_wrapper` from the type
+/// `sole_pointee_load` recovered on THAT side. `wrappers_agree` therefore carries exactly one
+/// exemption, scoped to the referent index and keyed on the ordered pair of proven pointees, and
+/// it IS the "cross-module type comparison" the old sentence ruled out — with the correctness
+/// argument the sentence demanded, supplied and CHECKED rather than assumed:
+/// `struct_layout_agrees` (size/align/repr and every field's name+offset+type, recursively, both
+/// sides) plus `aggregate_param_admission` conjunct (i) (identical leaf sequences) run BEFORE the
+/// lane is minted, and either one failing leaves the body on its existing `not-run`.
+///
+/// What did NOT change: this predicate. The pass-through set is still id-free, every non-referent
+/// position is still compared by exact equality, and the scalar lane still passes `None` for the
+/// exemption so its wrappers are compared exactly as before.
 fn pointer_lane_param_ok(t: &Ty) -> bool {
     is_interpretable_scalar(t) || matches!(t, Ty::Ptr | Ty::Unit)
 }
@@ -5044,11 +6137,43 @@ fn pointer_lane_param_ok(t: &Ty) -> bool {
 enum PointerLane {
     /// Slice A — SHIPPED. A scalar referent: sampled through the synthesized wrapper.
     Scalar { index: usize, pointee: Ty },
-    /// Slice B — CEILING PROBE, not yet sampled. An aggregate referent whose two-sided BYTE
-    /// LAYOUT was proven to agree (`struct_layout_agrees`). Recorded as its own skip class so the
-    /// follow-on lane's yield is a MEASUREMENT on the real corpus rather than an estimate; today
-    /// it still returns `NotRun`.
+    /// Slice B — SHIPPED. An aggregate referent whose two-sided BYTE LAYOUT was proven to agree
+    /// (`struct_layout_agrees`) AND whose marshalling was admitted two-sidedly
+    /// (`aggregate_param_admission`): sampled through the synthesized wrapper as an index-encoded
+    /// aggregate column.
+    ///
+    /// **BOTH POINTEES ARE CARRIED, and that is the soundness-critical field, not `index`.** A
+    /// `Ty::Struct(id)` is a MODULE-LOCAL index: the producer keys its struct table by
+    /// `(DefId, GenericArgs)` first-seen positional, the oracle by registration order, so the two
+    /// sides name the same proven layout with two different ids in general. A single-pointee
+    /// spelling would force the caller to feed ONE side's id to BOTH `build_pointee_wrapper`
+    /// calls, which (a) realizes the producer's `StructId` against the oracle's struct table and
+    /// (b) makes `wrappers_agree` pass VACUOUSLY, because both wrappers would then name the
+    /// identical type. The debt-discharging assertion would be satisfied BY the bug. Carrying the
+    /// pair is what makes that unrepresentable.
+    Aggregate { index: usize, pointee_a: Ty, pointee_b: Ty },
+    /// Slice B residual — layout agrees, but the referent is not exactly MARSHALLABLE
+    /// (`aggregate_param_admission` refused: a non-scalar/non-`Ty::Ptr` leaf, a nest past
+    /// `MAX_STRUCT_DEPTH`, more than `MAX_STRUCT_LEAVES` leaves, a field-name split, a
+    /// `tys_agree` incomparability, or a class-standing zero-field placeholder mint). Keeps a
+    /// `NotRun` with its own note so the held-back population stays countable.
     AggregateCeiling { index: usize },
+    /// Slice B residual — layout agrees AND the referent is marshallable, but the two whole
+    /// SIGNATURES are a spelling split (`sig_tys_agree` returned `Ok(false)`).
+    ///
+    /// This variant exists for one reason and it is a safety reason, not a bookkeeping one. Every
+    /// body this lane newly admits dies TODAY at step (4) and has therefore **never run
+    /// `sig_tys_agree`**; admitting it opens a brand-new divergence-publication channel — step (5)
+    /// turns `Ok(false)` into `DiffMode::MirOracle`, a published divergence — against a
+    /// measurement gate whose control says divergences == 0. Withholding here keeps the body a
+    /// `NotRun`, exactly as it is today, and names the population that is being withheld.
+    ///
+    /// It is checked UNCONDITIONALLY for this lane, which is deliberately stronger than
+    /// `aggregate_param_admission`'s own conjunct (v): that conjunct is scoped to
+    /// `!lanes.is_empty()` (params the by-value batch NEWLY admitted), and a plain all-scalar-leaf
+    /// struct referent is tagless, so relying on (v) alone would leave exactly the commonest
+    /// referent shape publishing divergences on its first ever visit to step (5).
+    AggregateSignatureSplit { index: usize },
 }
 
 /// Trust (Q1): decide the pointer-param input lane for a body, two-sidedly and fail-closed.
@@ -5121,21 +6246,125 @@ fn pointer_param_input_lane(
     if is_interpretable_scalar(&a) && a == b {
         return Some(PointerLane::Scalar { index, pointee: a });
     }
-    // Slice B ceiling probe: a whole-aggregate referent (`#[derive(Clone)]` on a `Copy` type is
-    // `*self`, a WHOLE load) whose byte layout provably agrees across the two sides.
-    if struct_layout_agrees(thir_module, oracle, &a, &b, MAX_STRUCT_DEPTH) {
-        return Some(PointerLane::AggregateCeiling { index });
+    // Slice B: a whole-aggregate referent (`#[derive(Clone)]` on a `Copy` type is `*self`, a
+    // WHOLE load). TWO independent proofs are required and they answer different questions:
+    //
+    //   * `struct_layout_agrees` — do the two sides agree about the referent's BYTES? This is
+    //     the pointer lane's own obligation, because the value round-trips through the
+    //     interpreter's byte funnel (`Store` at declared offsets, `Load` back). It is strictly
+    //     stronger than `tys_agree`'s struct arm and it carries the union / vacuous-key refusals.
+    //   * `aggregate_param_admission` — can the referent be MARSHALLED exactly, and do the two
+    //     sides marshal it to the same leaf sequence? This is the by-value aggregate lane's
+    //     obligation, reused verbatim rather than re-derived: the sampler realizes the referent
+    //     through `realize_aggregate_arg`, which is that lane's function, so it must be admitted
+    //     under that lane's conjuncts or the marshalling is unproven.
+    //
+    // Neither implies the other. Layout parity says nothing about whether a `Ty::Array` field can
+    // be marshalled (it cannot — but it is also refused by `struct_layout_agrees`'s scalar-leaf
+    // arm, so the two refusals overlap heavily on today's corpus); marshalling parity says
+    // nothing about offsets, which is the whole reason the pointer lane needs the first proof.
+    if !struct_layout_agrees(thir_module, oracle, &a, &b, MAX_STRUCT_DEPTH) {
+        return None;
     }
-    None
+    // THE MANDATORY FAIL-CLOSE, and it is UNSCOPED on purpose — see
+    // `PointerLane::AggregateSignatureSplit`. Evaluated before the marshalling gate so that the
+    // more specific reason wins the note: a body held back by a signature split is a body the
+    // sampler could otherwise take, and conflating it with an unmarshallable referent would
+    // misprice both populations.
+    if matches!(sig_tys_agree(thir_module, oracle, thir_sig, oracle_sig), Ok(false)) {
+        return Some(PointerLane::AggregateSignatureSplit { index });
+    }
+    match aggregate_param_admission(thir_module, oracle, &a, &b, thir_sig, oracle_sig) {
+        AggregateParamAdmission::Admitted(_) => {
+            Some(PointerLane::Aggregate { index, pointee_a: a, pointee_b: b })
+        }
+        // UNREACHABLE given the guard above (conjunct (v) fires only on `Ok(false)`), and mapped
+        // explicitly rather than folded into `Refused` so that if the conjunct's trigger ever
+        // widens, this lane reports the signature split as a signature split instead of
+        // mislabelling it "unmarshallable".
+        AggregateParamAdmission::SignatureSplit => {
+            Some(PointerLane::AggregateSignatureSplit { index })
+        }
+        AggregateParamAdmission::Refused => Some(PointerLane::AggregateCeiling { index }),
+    }
+}
+
+/// Trust (Slice B): the BYTE WIDTH of a referent node or leaf, in this module's own terms.
+///
+/// Total on exactly the set `struct_layout_agrees` admits — a `Ty::Struct` whose def carries a
+/// proven `size`, or an `is_interpretable_scalar` leaf — and `None` on everything else, which
+/// makes the caller fail CLOSED. It adds no refusal of its own on that set: a `Ty::Struct` field
+/// whose `size` is `None` is already refused by `struct_layout_agrees`'s own `Some` requirement
+/// one level down, and every admitted leaf has an answer here.
+///
+/// **`Ty::bit_width()` is deliberately NOT called.** It answers `Some(1)` for `Ty::Bool` — one
+/// BIT — and a byte count derived from it would make every `bool` field ZERO bytes wide and so
+/// vacuously disjoint from its neighbours. That is precisely the direction this table must not
+/// fail in, since an UNDER-estimate turns a real overlap into an admitted one.
+///
+/// The widths mirror `trust_ir::interpret`'s own `byte_size` for the shared set, checked
+/// pair-by-pair rather than assumed: `Bool`/`I8`/`U8` 1, `I16`/`U16` 2, `I32`/`U32`/`F32`/`Char`
+/// 4, `I64`/`U64`/`F64`/`Isize`/`Usize` 8, `I128`/`U128` 16. `Isize`/`Usize` are 8 at the pinned
+/// 64-bit reference target, the same convention `int_shape` executes them under; on a narrower
+/// target that is an OVER-estimate, which can only manufacture a false overlap and therefore a
+/// refusal — never a false admission.
+fn layout_byte_size(module: &Module, t: &Ty) -> Option<u64> {
+    match t {
+        Ty::Struct(sid) => module.struct_def(*sid)?.size,
+        Ty::Bool | Ty::I8 | Ty::U8 => Some(1),
+        Ty::I16 | Ty::U16 => Some(2),
+        Ty::I32 | Ty::U32 | Ty::F32 | Ty::Char => Some(4),
+        Ty::I64 | Ty::U64 | Ty::F64 | Ty::Isize | Ty::Usize => Some(8),
+        Ty::I128 | Ty::U128 => Some(16),
+        _ => None,
+    }
+}
+
+/// Trust (Slice B): do this struct's fields occupy PAIRWISE-DISJOINT byte ranges?
+///
+/// The union refusal, stated as a positive witness — see `struct_layout_agrees`' doc for why it is
+/// required for a shape that cannot reach this file today, and what the zero/one-field vacuity
+/// degenerates to.
+///
+/// Fails CLOSED on anything it cannot decide: an absent field offset, a field type with no width
+/// here, or an offset+size that overflows `u64`. Each of those is already refused upstream, so the
+/// only NEW refusal this function contributes is a genuine overlap.
+///
+/// The zero-size convention MIRRORS the interpreter's `byte_ranges_overlap` exactly: a zero-sized
+/// field overlaps nothing, including another zero-sized field at the same offset. That is the
+/// right answer set-theoretically (an empty range aliases no byte) and it is the answer the
+/// component that actually executes the bytes gives, so a referent this admits is not one the
+/// executor will then reject.
+///
+/// Quadratic in the field count, which is bounded by `MAX_STRUCT_LEAVES`, and it runs only for a
+/// referent that has already passed `sole_pointee_load` — i.e. a handful of bodies per crate.
+fn referent_fields_disjoint(module: &Module, def: &trust_ir::StructDef) -> bool {
+    let mut extents: Vec<(u64, u64)> = Vec::with_capacity(def.fields.len());
+    for field in &def.fields {
+        let (Some(offset), Some(size)) = (field.offset, layout_byte_size(module, &field.ty)) else {
+            return false;
+        };
+        // A zero-sized field aliases no byte; recording it would make the sort-and-scan below
+        // reject a legitimate ZST that shares an offset with the field it precedes.
+        if size == 0 {
+            continue;
+        }
+        let Some(end) = offset.checked_add(size) else {
+            return false;
+        };
+        extents.push((offset, end));
+    }
+    extents.sort_unstable();
+    extents.windows(2).all(|pair| pair[0].1 <= pair[1].0)
 }
 
 /// Trust (Q1): TWO-SIDED BYTE-LAYOUT PARITY for an aggregate referent — the reusable primitive.
 ///
-/// This is deliberately a STRICTLY STRONGER gate than `struct_param_admissible`, and the reason is
+/// This is deliberately a STRICTLY STRONGER gate than `aggregate_param_admission`, and the reason is
 /// the whole point of the pointer lane. A BY-VALUE struct param never touches bytes: trust-ir's
 /// aggregate value model is a positional element list with NO padding and no offsets (`size`,
 /// `align` and `FieldDef::offset` are layout METADATA, never elements), so `repr` and field
-/// placement cannot change what `realize_struct_arg` marshals — which is exactly why the by-value
+/// placement cannot change what `realize_aggregate_arg` marshals — which is exactly why the by-value
 /// gate can ignore layout. A POINTER referent is the opposite case: the value is `Store`d into an
 /// allocation and `Load`ed back through the interpreter's BYTE funnel, so offsets, size and align
 /// are live semantics. Two sides that agree on the field LIST but disagree on where those fields
@@ -5150,7 +6379,7 @@ fn pointer_param_input_lane(
 /// the i-th declared field is not the i-th field in memory. Parity is decided on the (name, type,
 /// offset) triple per field, which is invariant under that reordering — while still pinning field
 /// IDENTITY by name, so a struct cannot compare equal to itself with two same-typed fields
-/// transposed (the `MemoryRegion { AllocationId, usize, usize }` hazard `struct_param_admissible`
+/// transposed (the `MemoryRegion { AllocationId, usize, usize }` hazard `aggregate_field_names_agree`
 /// names).
 ///
 /// Generalisation, for the memory lanes this campaign still owes: the shape here — resolve both
@@ -5159,8 +6388,69 @@ fn pointer_param_input_lane(
 /// memory observable will need in order to compare final memory rather than skip it. The only
 /// piece it does not yet carry is padding-byte provenance, which a memory COMPARISON needs and an
 /// input MATERIALIZATION does not.
+///
+/// # THE UNION, and why a refusal is required for a shape that cannot reach this function today
+///
+/// `trust_ir::StructDef` carries **no ADT kind**. The fact exists upstream and is dropped at the
+/// bridge (`trust-mir-extract::ty_convert` stamps `adt_kind: Some(AdtKind::Union)` on
+/// `trust_types::TrustTy::Adt` and has nowhere to put it), and that bridge says in its own words
+/// that it will "treat structs and unions identically below… Modeling the overlapping fields as
+/// independent slots is sound for verification here." So on the oracle side a `union` IS a
+/// `Ty::Struct` whose fields all sit at overlapping offsets, and **nothing above can tell it from
+/// a struct.**
+///
+/// No union reaches here today, by three independent producer-side refusals: `map_ty` has arms
+/// for `is_struct()` and `is_enum()` only, so a top-level union falls to the catch-all, pushes
+/// `unsupported`, and dies at step (0); a nested union field is spelled `Ty::Unit` and forces
+/// `contains_call`, so the body is `NotRun` at step (0.5); and `Ty::Unit` against the oracle's
+/// `Ty::Struct` fails the scalar-leaf arm below anyway.
+///
+/// **That safety is entirely on the PRODUCER side, and this comparator is blind — which is
+/// exactly why the refusal is written here rather than relied upon.** Teaching `map_ty` to spell
+/// a union as `Ty::Struct` is an obvious future "coverage" move, and it would not produce a
+/// divergence; it would produce a MANUFACTURED AGREEMENT. The sampler builds a positional
+/// `Aggregate` of N independent leaves; `encode_value` writes each field at its declared offset,
+/// which for a union is N writes into OVERLAPPING bytes, last-write-wins; `decode_value` reads N
+/// fields back out of that one region. The value the entry sees is not the value that was
+/// sampled — identically on both sides — so the two sides agree about an input that is not an
+/// inhabitant of the type, and the row is graded `Agreed`.
+///
+/// The refusal is a POSITIVE WITNESS computable from data `StructDef` already carries:
+/// `referent_fields_disjoint`. Pairwise-disjoint field byte ranges is precisely what separates a
+/// union from a struct at the byte level, it is exactly the property the positional value model
+/// depends on, and it needs no format change. It also mirrors what the executor would refuse
+/// anyway (`interpret.rs`'s `declared_struct_layout` rejects "overlapping fields"), so the
+/// comparator declines instead of discovering it as a runtime `TypeError`.
+///
+/// # THE EMPTY CASE — asked, not assumed
+///
+/// Pairwise disjointness over a struct with **zero or one field is VACUOUSLY TRUE**, and that is
+/// the same vacuity that lets four distinct producer entities collapse onto one comparison key
+/// (`tys_agree`'s struct arm and `aggregate_field_names_agree` are both vacuous at zero fields).
+/// Two answers, one per arity:
+///
+///   * **One field.** Not a hazard and not papered over: a one-member union has one field at one
+///     offset, so the positional model writes and reads exactly that field and the round-trip IS
+///     faithful. There is no aliasing to detect because there is no second member.
+///   * **Zero fields.** A hazard, and it is closed by a SECOND conjunct rather than by the
+///     disjointness one: `aggregate_placeholder_free`, the by-value lane's P1 pin, refuses a
+///     zero-field node whose name is one of the four class-standing placeholder mints
+///     (`opaque_alias::`, `datatype::`, `coroutine::`, `closure_env::`). Before this, the only
+///     thing keeping such a mint out was that `mint_alias_opaque_struct` happens to set
+///     `size: None`/`align: None` and this function happens to require `Some` on both — a
+///     ONE-NUMBER defence on an unrelated fact, in a file where the other three mints' layout
+///     fill has not been audited. It costs nothing on the corpus (a fieldless referent has one
+///     inhabitant) and it stops a vacuous key from being load-bearing.
 fn struct_layout_agrees(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) -> bool {
     if depth == 0 {
+        return false;
+    }
+    // The zero-field vacuous-key refusal, applied to the WHOLE tree on BOTH sides. Side-local by
+    // construction (it never compares the two sides' names — the two renderers differ, which
+    // `aggregate_placeholder_free`'s own doc establishes by reading both) and idempotent under
+    // this function's recursion, so re-asking at each level costs a bounded re-walk and cannot
+    // change the answer.
+    if !aggregate_placeholder_free(am, bm, a, b, depth) {
         return false;
     }
     match (a, b) {
@@ -5168,6 +6458,13 @@ fn struct_layout_agrees(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) ->
             let (Some(da), Some(db)) = (am.struct_def(*sa), bm.struct_def(*sb)) else {
                 return false;
             };
+            // The union refusal, SIDE-LOCAL on each side against its own module. Both sides are
+            // checked even though the offsets are proven equal below, because the field SIZES are
+            // resolved per side (a `Ty::Struct` field's size comes from that module's own
+            // `StructDef`) and a one-sided check would be an argument rather than a test.
+            if !referent_fields_disjoint(am, da) || !referent_fields_disjoint(bm, db) {
+                return false;
+            }
             // Whole-object footprint must be proven and equal on both sides.
             let (Some(sza), Some(szb)) = (da.size, db.size) else {
                 return false;
@@ -5213,9 +6510,17 @@ fn struct_layout_agrees(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) ->
 /// `signature_mismatch` on an unregistered id, so an unregistered wrapper would fail every body
 /// rather than none.
 ///
-/// The wrapper is built from the ENTRY SIGNATURE and the lane index alone — no module-local ids
-/// enter it (`pointer_lane_param_ok` guarantees the pass-through types are id-free, and the
-/// pointee is a scalar) — which is what makes the two sides' wrappers literally comparable.
+/// The wrapper is built from the ENTRY SIGNATURE, the lane index, and `pointee` — and `pointee`
+/// MUST be the referent recovered on **this** side's module. For `PointerLane::Scalar` the two
+/// sides' pointees are the same `Ty` by admission (`a == b`), so the distinction is invisible
+/// there; for `PointerLane::Aggregate` it is `Ty::Struct(id)` with a MODULE-LOCAL id and passing
+/// the other side's value builds a wrapper that allocates, stores and loads under a struct
+/// definition this module does not have — while simultaneously making `wrappers_agree` pass
+/// vacuously. See the module docs, "THE TRAP THIS SHAPE INVITES".
+///
+/// Every OTHER position in the wrapper is id-free (`pointer_lane_param_ok` guarantees the
+/// pass-through types are), so the referent is the sole position `wrappers_agree` cannot compare
+/// by plain equality.
 fn build_pointee_wrapper(
     module: &Module,
     entry: FuncId,
@@ -5293,18 +6598,68 @@ fn build_pointee_wrapper(
 ///
 /// An argued relaxation left in a comment is the defect class this campaign has spent the day
 /// finding, so this returns a diagnostic and the caller fails CLOSED on it.
+///
+/// # `referent` — the ONE exemption, and what pays for it
+///
+/// `None` is the pre-Slice-B behaviour, unchanged: every position is exact equality. The scalar
+/// lane passes `None`.
+///
+/// `Some((index, pointee_a, pointee_b))` exempts EXACTLY THREE positions — the entry block's
+/// param at `index`, the `Alloca { ty }` and the `Store { ty }` — and exempts them only when side
+/// A names `pointee_a` **and** side B names `pointee_b`. It is not "two struct types may differ
+/// here"; it is "these two specific types, the ordered pair the lane proved, may stand opposite
+/// each other here." Everything else about those three positions (the param's `ValueId`, the
+/// `Alloca`'s `count`/`align`, the `Store`'s `ptr`/`value`/`volatile`/`align`) stays exact.
+///
+/// What discharges it is not stated here, it is CHECKED before the lane is minted:
+/// `struct_layout_agrees(pointee_a, pointee_b)` — equal size, align, repr, and per field equal
+/// name, equal offset, recursively — plus `aggregate_param_admission` conjunct (i), which proves
+/// the two sides marshal to the identical leaf sequence. Same bytes at the same offsets from the
+/// same values is what "the same program" means for an `Alloca`+`Store` that exists only to
+/// materialize an input.
+///
+/// **The keying is what makes the caller's own mistake fail closed.** Feed ONE pointee to both
+/// `build_pointee_wrapper` calls and side B names `pointee_a` where the exemption requires
+/// `pointee_b`: the pair test fails, this returns `Err`, and the body degrades to a coverage-only
+/// skip — instead of the alternative, which is that a plain "both sides are structs" exemption
+/// would have PASSED on the vacuously-identical wrappers the bug produces, and the two sides
+/// would have been executed on different inputs under an assertion that says they were not.
 fn wrappers_agree(
     a: &Function,
     a_entry: FuncId,
     b: &Function,
     b_entry: FuncId,
+    referent: Option<(usize, &Ty, &Ty)>,
 ) -> Result<(), String> {
+    let exempt_index = referent.map(|(index, _, _)| index);
+    // The exempted pair, or a predicate that is never true. Written as a closure taking BOTH
+    // sides' types so there is exactly one place the pair is tested and no way to accidentally
+    // test one half of it. At an exempted position this is REQUIRED, not an alternative to raw
+    // equality: module-local ids can be accidentally equal to the wrong side's id, and accepting
+    // `ta == tb` first would bypass the ordered-pair guard entirely.
+    let exempt_pair = |ta: &Ty, tb: &Ty| match referent {
+        Some((_, pa, pb)) => ta == pa && tb == pb,
+        None => false,
+    };
+
     if a.blocks.len() != b.blocks.len() || a.entry != b.entry {
         return Err("wrapper block structure differs across sides".to_string());
     }
     for (ba, bb) in a.blocks.iter().zip(&b.blocks) {
-        if ba.id != bb.id || ba.params != bb.params {
+        if ba.id != bb.id || ba.params.len() != bb.params.len() {
             return Err("wrapper block parameters differ across sides".to_string());
+        }
+        // Element-wise rather than `ba.params != bb.params`, so the referent position can be
+        // exempted without loosening any other position. `ValueId`s are compared exactly at every
+        // position INCLUDING the referent's — the wrapper's value numbering is deterministic
+        // arithmetic both sides run identically, so a difference there is never legitimate.
+        for (index, ((va, ta), (vb, tb))) in ba.params.iter().zip(&bb.params).enumerate() {
+            let types_agree =
+                if Some(index) == exempt_index { exempt_pair(ta, tb) } else { ta == tb };
+            let same = va == vb && types_agree;
+            if !same {
+                return Err("wrapper block parameters differ across sides".to_string());
+            }
         }
         if ba.body.len() != bb.body.len() {
             return Err("wrapper instruction count differs across sides".to_string());
@@ -5318,6 +6673,27 @@ fn wrappers_agree(
                     Inst::Call { callee: ca, args: aa },
                     Inst::Call { callee: cb, args: ab },
                 ) => *ca == a_entry && *cb == b_entry && aa == ab,
+                // The referent's slot. Everything except `ty` is compared exactly.
+                (
+                    Inst::Alloca { ty: ta, count: ca, align: la },
+                    Inst::Alloca { ty: tb, count: cb, align: lb },
+                ) => {
+                    ca == cb
+                        && la == lb
+                        && if referent.is_some() { exempt_pair(ta, tb) } else { ta == tb }
+                }
+                // The referent's store. Same discipline: only `ty` may differ, and only as the
+                // proven pair.
+                (
+                    Inst::Store { ty: ta, ptr: pa, value: xa, volatile: oa, align: la },
+                    Inst::Store { ty: tb, ptr: pb, value: xb, volatile: ob, align: lb },
+                ) => {
+                    pa == pb
+                        && xa == xb
+                        && oa == ob
+                        && la == lb
+                        && if referent.is_some() { exempt_pair(ta, tb) } else { ta == tb }
+                }
                 (x, y) => x == y,
             };
             if !same {
@@ -6544,6 +7920,309 @@ mod tests {
         function.blocks.push(block);
         module.add_function(function);
         module
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Trust (drop-glue coverage lane)
+    // ---------------------------------------------------------------------------------------
+
+    /// A `PanicFreedom` obligation with an arbitrary description.
+    fn panic_row(id: u32, description: &str) -> trust_ir::ProofObligation {
+        trust_ir::ProofObligation::new(
+            trust_ir::ProofId::new(id),
+            ObligationKind::PanicFreedom,
+            trust_ir::ProofStatus::Pending,
+            description,
+        )
+    }
+
+    /// The bridge's FATAL blanket drop-glue row, spelled exactly as `Terminator::Drop` mints it.
+    fn drop_glue_row(id: u32, ty: &str) -> trust_ir::ProofObligation {
+        panic_row(
+            id,
+            &format!(
+                "{}drop glue for `{ty}` has unproven panic-freedom (user Drop impls may panic)",
+                trust_types::assumption::DROP_GLUE_ASSUMPTION_PREFIX
+            ),
+        )
+    }
+
+    /// The oracle shape of a unit-returning body carrying `markers` drop-glue markers: each is a
+    /// `Const Bool(false)` feeding an `Assert`, with the block continuing normally afterwards
+    /// (NOT terminated by `Unreachable`, and with no `Undef` havoc — the measured drop-arm
+    /// shape). `rows` fatal drop-glue obligations are attached.
+    fn drop_marked_oracle(markers: usize, rows: usize) -> Module {
+        let module = Module::new("drop_oracle");
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        for i in 0..markers {
+            let cond = ValueId::new(i as u32);
+            block.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                    .with_result(cond),
+            );
+            block.body.push(
+                InstrNode::new(Inst::Assert { cond })
+                    .with_proof(trust_ir::ProofAnnotation::NoPanic),
+            );
+        }
+        block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+        let mut module = single_block_module_with(module, "foo", vec![], vec![], block);
+        for i in 0..rows {
+            module.proof_obligations.push(drop_glue_row(100 + i as u32, "ConstDropper<Moose>"));
+        }
+        module
+    }
+
+    /// THE COUPLING. The whole lane rests on "neutralize every site the collector names ⇒ the
+    /// guard stops firing", which is only true while the two walks recognize the same nodes.
+    /// Pinned here rather than left to a reading of two functions that sit far apart.
+    #[test]
+    fn const_false_assert_sites_agrees_with_the_guard() {
+        for (markers, rows) in [(0usize, 0usize), (1, 1), (3, 3), (2, 0)] {
+            let m = drop_marked_oracle(markers, rows);
+            assert_eq!(
+                oracle_has_const_false_assert(&m),
+                !const_false_assert_sites(&m).is_empty(),
+                "guard and site collector disagree on a {markers}-marker module"
+            );
+            assert_eq!(const_false_assert_sites(&m).len(), markers);
+        }
+    }
+
+    /// THE EMPTY CASE, stated as a test because "every const-false assert here is drop glue" is
+    /// VACUOUSLY TRUE of a module with none. A vacuous witness would have claimed every clean
+    /// body in the corpus; the `candidates >= 1` conjunct is what stops it.
+    #[test]
+    fn drop_glue_neutralization_declines_a_module_with_no_candidates() {
+        let mut m = drop_marked_oracle(0, 0);
+        let before = m.clone();
+        let audit = neutralize_drop_glue_markers(&mut m);
+        assert_eq!(audit.candidates, 0);
+        assert_eq!(audit.drop_glue_rows, 0);
+        assert_eq!(audit.neutralized, 0, "an empty module must not be claimed");
+        assert_eq!(m, before, "declining must not mutate");
+        // And declining is not itself a skip: the guard still says nothing is wrong.
+        assert!(!oracle_has_const_false_assert(&m));
+    }
+
+    /// The happy path, end to end: accounted markers are rewritten to `Assert(const true)`, the
+    /// guard stops firing, and the module now INTERPRETS instead of trapping on every input.
+    #[test]
+    fn drop_glue_markers_neutralized_when_every_candidate_is_accounted() {
+        let mut m = drop_marked_oracle(2, 2);
+        assert!(oracle_has_const_false_assert(&m), "precondition: the guard fires today");
+        assert!(
+            Interpreter::with_module(&m).execute_func(FuncId::new(0), []).is_err(),
+            "precondition: the marked oracle traps on every input"
+        );
+
+        let audit = neutralize_drop_glue_markers(&mut m);
+        assert_eq!(audit.candidates, 2);
+        assert_eq!(audit.drop_glue_rows, 2);
+        assert_eq!(audit.neutralized, 2);
+        assert!(!audit.id_space_exhausted);
+        assert!(
+            !oracle_has_const_false_assert(&m),
+            "after a total neutralization the guard must not fire — this is the implication the \
+             whole lane rests on"
+        );
+        Interpreter::with_module(&m)
+            .execute_func(FuncId::new(0), [])
+            .expect("the neutralized oracle interprets to completion");
+    }
+
+    /// ALL-OR-NOTHING. A body mixing a drop-glue marker with any other const-false marker keeps
+    /// its skip, untouched — this is what preserves REFUSE-MORE for mixed bodies, and it is the
+    /// substitute for the per-node binding `ProofObligation::site` would give us if the bridge
+    /// populated it.
+    #[test]
+    fn drop_glue_neutralization_is_all_or_nothing_on_a_mixed_module() {
+        // Two markers, but only one is accounted for by a drop-glue row: the other is a panic
+        // call / absent callee. Nothing node-local separates them, so take neither.
+        let mut m = drop_marked_oracle(2, 1);
+        let before = m.clone();
+        let audit = neutralize_drop_glue_markers(&mut m);
+        assert_eq!(audit.candidates, 2);
+        assert_eq!(audit.drop_glue_rows, 1);
+        assert_eq!(audit.neutralized, 0);
+        assert_eq!(m, before, "a refused module must be byte-identical");
+        assert!(oracle_has_const_false_assert(&m), "the skip is preserved");
+        assert_eq!(audit.refusal_reason(), "mixed-markers");
+    }
+
+    /// The accounting fails closed in the OTHER direction too: a drop-glue row with no assert to
+    /// pair it with is lowering drift, and is refused just as loudly.
+    #[test]
+    fn drop_glue_neutralization_declines_a_row_count_asymmetry() {
+        let mut m = drop_marked_oracle(1, 3);
+        let before = m.clone();
+        let audit = neutralize_drop_glue_markers(&mut m);
+        assert_eq!(audit.neutralized, 0);
+        assert_eq!(m, before);
+        assert_eq!(audit.refusal_reason(), "row-count-asymmetry");
+    }
+
+    /// The recognizer's exclusions, which are what make a TEXT key safe here.
+    #[test]
+    fn drop_glue_recognizer_excludes_its_nearest_neighbours() {
+        // (a) An ordinary absent-callee row shares EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX and
+        //     DOES ride with an `Assert(const false)`. Keying on the prefix alone would
+        //     mis-attribute a call marker as drop glue.
+        let absent = panic_row(
+            1,
+            &format!(
+                "{}call to absent callee `core::fmt::write` (no body) may panic",
+                trust_types::assumption::EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX
+            ),
+        );
+        assert!(!obligation_is_fatal_drop_glue_marker(&absent));
+
+        // (b) The DISCHARGED drop rows say "drop glue for ..." but carry NO assumption prefix and
+        //     ride with `Assert(const TRUE)`. Counting one would inflate the row count past the
+        //     candidate count and refuse a body that should be taken.
+        let discharged = panic_row(
+            2,
+            "drop glue for `Vec<u32>` — discharged: proven panic-free by the structural drop \
+             classifier (std-composed glue, no user Drop impl in the owned field tree)",
+        );
+        assert!(!obligation_is_fatal_drop_glue_marker(&discharged));
+
+        // (c) The whole-function aggregate carrier minted at the end of `lower_function_into`
+        //     has no prefix and no assert node.
+        assert!(!obligation_is_fatal_drop_glue_marker(&panic_row(3, "foo: all assertions hold")));
+
+        // (d) A non-PanicFreedom row is never a marker, whatever it says.
+        let mut wrong_kind = drop_glue_row(4, "Q");
+        wrong_kind.kind = ObligationKind::MemorySafety;
+        assert!(!obligation_is_fatal_drop_glue_marker(&wrong_kind));
+
+        // (e) ...and the two shapes that ARE fatal drop-glue markers.
+        assert!(obligation_is_fatal_drop_glue_marker(&drop_glue_row(5, "ConstDropper<Moose>")));
+        let generic = panic_row(
+            6,
+            &format!(
+                "{}drop glue for generic parameter `T` — dispatches to a per-monomorphization \
+                 Drop impl",
+                trust_types::assumption::EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX
+            ),
+        );
+        assert!(
+            obligation_is_fatal_drop_glue_marker(&generic),
+            "the bare-`T` drop arm emits Assert(false) too, and must be accounted for or the \
+             body is refused"
+        );
+    }
+
+    /// THE CORPUS KEYSTONE, pinned at the module shape.
+    ///
+    /// `tests/ui/traits/const-traits/drop-manually-drop-no-drop-impl.rs::foo` and
+    /// `drop-manually-drop.rs::foo` are the same `const fn foo(_var: ConstDropper<Moose>) {}`,
+    /// differing by exactly one `impl Drop`. Re-confirmed on the postbuild-aggparam artifact
+    /// (repo head b38db06a6d, Agreed 2905): the first is `agreed`, attributed "aggregate param
+    /// admitted [fieldless]", and the second is `clean-skip-oracle-panic-model`. That is this
+    /// entire class isolated by a single source token, and it is what the lane must close.
+    #[test]
+    fn drop_manually_drop_ab_pair_is_pinned_at_the_module_shape() {
+        // The `no_drop_impl` twin: no `Terminator::Drop` marker at all, so nothing to account
+        // for, nothing to rewrite, and it is comparable TODAY. This is the control, and it must
+        // stay untouched by the lane.
+        let mut no_drop_impl = drop_marked_oracle(0, 0);
+        let control_before = no_drop_impl.clone();
+        let control = neutralize_drop_glue_markers(&mut no_drop_impl);
+        assert_eq!(control.neutralized, 0);
+        assert_eq!(no_drop_impl, control_before, "the Agreed twin must not move");
+        assert!(!oracle_has_const_false_assert(&no_drop_impl));
+
+        // The `impl Drop` twin: one blanket drop-glue marker, one fatal row. Skipped today,
+        // taken by the lane, and interpreting to the SAME outcome as its control afterwards.
+        let mut with_drop = drop_marked_oracle(1, 1);
+        assert!(oracle_has_const_false_assert(&with_drop));
+        let treated = neutralize_drop_glue_markers(&mut with_drop);
+        assert_eq!(treated.neutralized, 1);
+        assert!(!oracle_has_const_false_assert(&with_drop));
+
+        let control_out = Interpreter::with_module(&no_drop_impl)
+            .execute_func(FuncId::new(0), [])
+            .expect("control interprets");
+        let treated_out = Interpreter::with_module(&with_drop)
+            .execute_func(FuncId::new(0), [])
+            .expect("treated interprets");
+        assert_eq!(
+            control_out.returns, treated_out.returns,
+            "the one `impl Drop` is the ONLY difference, and it is unmodelled on both sides"
+        );
+    }
+
+    /// The caveat travels with the row: an `Agreed` earned here is an `Agreed` about the value
+    /// flow AROUND the drops. Also pins that the stamp APPENDS — the coverage event publishes
+    /// `notes.last()`, so a pushed note would replace the verdict text and break the ratchet key.
+    #[test]
+    fn drop_glue_stamp_appends_and_never_replaces_the_verdict_note() {
+        let mut report = DiffReport {
+            mode: DiffMode::Agreed,
+            notes: vec![
+                "THIR-trust-ir == MIR-trust-ir on 1 sampled input(s) (differential interpretation)"
+                    .to_string(),
+            ],
+            ..DiffReport::default()
+        };
+        let audit = DropGlueMarkerAudit {
+            candidates: 2,
+            drop_glue_rows: 2,
+            neutralized: 2,
+            id_space_exhausted: false,
+        };
+        stamp_drop_glue_neutralization(&mut report, &audit);
+        assert_eq!(report.notes.len(), 1, "must append, never push a second note");
+        let note = &report.notes[0];
+        assert!(
+            note.starts_with("THIR-trust-ir == MIR-trust-ir on"),
+            "the ratchet's key prefix must stay byte-identical"
+        );
+        assert!(note.contains("drop-glue markers neutralised: 2"));
+        assert!(note.contains("drops unmodelled on both sides"));
+
+        // A body the lane did not take gets no stamp at all, so no pre-existing row's note moves.
+        let mut untouched =
+            DiffReport { notes: vec!["some other skip".to_string()], ..DiffReport::default() };
+        stamp_drop_glue_neutralization(&mut untouched, &DropGlueMarkerAudit::default());
+        assert_eq!(untouched.notes, vec!["some other skip".to_string()]);
+    }
+
+    /// The refusal note must be classifiable, and must not be claimed by any rule that precedes
+    /// it in `scripts/trust_ir_producer_scorecard.py::classify_note`. The token LEADS the string
+    /// so the scorecard's 160-char note cap can never hide it.
+    #[test]
+    fn drop_glue_mixed_refusal_note_is_scorecard_safe() {
+        let audit = DropGlueMarkerAudit { candidates: 2, drop_glue_rows: 1, ..Default::default() };
+        let note = format!(
+            "oracle-drop-glue-mixed: {} ({}/{} const-false oracle asserts are drop-glue); \
+             coverage-only skip",
+            audit.refusal_reason(),
+            audit.drop_glue_rows,
+            audit.candidates,
+        );
+        assert!(note.starts_with("oracle-drop-glue-mixed"));
+        assert!(note.len() < 160, "the token and the counts must survive the note cap");
+        // Every substring `classify_note` tests BEFORE the new rule would sit.
+        for claimed_by_an_earlier_rule in [
+            "observable-effect comparison is not modeled",
+            "callable/frame identity comparison is not modeled",
+            "direct call",
+            "oracle bundle construction failed",
+            "callee-set asymmetry",
+            "extern/declaration-only callee",
+            "unit-call arity gap",
+            "type-id interning differs",
+            "LIVE havoc",
+            // ...and it must NOT be claimed by the class it is being split OUT of.
+            "oracle-panic-model",
+        ] {
+            assert!(
+                !note.contains(claimed_by_an_earlier_rule),
+                "refusal note would be misclassified as `{claimed_by_an_earlier_rule}`"
+            );
+        }
     }
 
     /// The measured THIR shape of `const BAR: &[u8] = &[1, 2, 3]`
@@ -9222,53 +10901,130 @@ mod tests {
         module
     }
 
+    /// A one-struct module holding a single zero-field `StructDef` under `name`.
+    fn fieldless_module(name: &str) -> Module {
+        let mut module = Module::new("fieldless");
+        module.add_struct(sdef_named(0, name, Vec::new()));
+        module
+    }
+
+    /// A one-struct module holding `Wide { f0: u8, .., f{n-1}: u8 }`.
+    fn wide_module(n: usize) -> Module {
+        let mut module = Module::new("wide");
+        module.add_struct(sdef_named(
+            0,
+            "Wide",
+            (0..n).map(|i| sfield(&format!("f{i}"), Ty::U8)).collect(),
+        ));
+        module
+    }
+
+    /// THE CHECKLIST for this batch. Every relaxation is asserted here one by one, and every
+    /// refusal that SURVIVES is asserted next to it — so a half-applied item leaves a stale
+    /// assertion failing rather than measuring a silent zero.
     #[test]
-    fn struct_leaf_tys_admits_nested_scalars_and_refuses_everything_else() {
+    fn aggregate_leaf_tys_admits_scalars_ptr_tuple_fieldless_and_refuses_everything_else() {
+        let s0 = Ty::Struct(trust_ir::StructId::new(0));
         let module = memory_region_module("leaves", false);
         assert_eq!(
-            struct_leaf_tys(&module, trust_ir::StructId::new(1), MAX_STRUCT_DEPTH),
+            aggregate_leaf_tys(&module, &Ty::Struct(trust_ir::StructId::new(1)), MAX_STRUCT_DEPTH),
             Some(vec![Ty::U64, Ty::Usize, Ty::Usize]),
             "a nested scalar wrapper flattens depth-first, in declaration order"
         );
 
-        // Refusals, each a shape whose exact value model this lane does not establish.
-        for bad in [Ty::Unit, Ty::Ptr, Ty::Enum(EnumId::new(0)), Ty::Tuple(vec![Ty::U8])] {
+        // Refusals that SURVIVE. `Ty::Unit` is also the union lane's member spelling; `Ty::Enum`
+        // belongs to the Enum arm's discriminant/tag discipline.
+        for bad in [Ty::Unit, Ty::Enum(EnumId::new(0))] {
             let mut m = Module::new("bad");
             m.add_struct(sdef_named(0, "S", vec![sfield("x", Ty::U8), sfield("y", bad.clone())]));
             assert_eq!(
-                struct_leaf_tys(&m, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH),
+                aggregate_leaf_tys(&m, &s0, MAX_STRUCT_DEPTH),
                 None,
-                "field type {bad} must be refused, not approximated"
+                "component type {bad} must be refused, not approximated"
             );
         }
 
-        // A field-less struct carries no observable value.
-        let mut empty = Module::new("empty");
-        empty.add_struct(sdef_named(0, "Zst", Vec::new()));
-        assert_eq!(struct_leaf_tys(&empty, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH), None);
+        // B2. A `Ty::Ptr` component is a LEAF, and the pool it samples from is the SINGLETON
+        // that the whole ptr-leaf argument rests on — a body that dereferences the leaf then
+        // traps on EVERY sample and step (8) returns NotRun instead of a trap-only Agreed.
+        let mut ptr = Module::new("ptr");
+        ptr.add_struct(sdef_named(0, "Mixed", vec![sfield("n", Ty::U8), sfield("p", Ty::Ptr)]));
+        assert_eq!(
+            aggregate_leaf_tys(&ptr, &s0, MAX_STRUCT_DEPTH),
+            Some(vec![Ty::U8, Ty::Ptr]),
+            "a Ty::Ptr component occupies a leaf slot of its own"
+        );
+        assert_eq!(sample_values(&Ty::Ptr), vec![0], "the ptr-leaf pool must stay a SINGLETON");
+        assert_eq!(
+            build_arg(&Ty::Ptr, 0),
+            Ok(InterpretValue { ty: Ty::Ptr, kind: InterpretValueKind::NullPtr }),
+            "and it must realize as the identity-free null, exactly as opaque_arg does"
+        );
 
-        // Unresolvable id fails closed.
-        assert_eq!(struct_leaf_tys(&empty, trust_ir::StructId::new(7), MAX_STRUCT_DEPTH), None);
-
-        // The leaf cap bites before the marshalling does.
-        let mut wide = Module::new("wide");
-        wide.add_struct(sdef_named(
+        // B4. A `Ty::Tuple` is an aggregate at a COMPONENT position and at the PARAM position.
+        let mut tup = Module::new("tuple");
+        tup.add_struct(sdef_named(
             0,
-            "Wide",
-            (0..=MAX_STRUCT_LEAVES).map(|i| sfield(&format!("f{i}"), Ty::U8)).collect(),
+            "S",
+            vec![sfield("x", Ty::U8), sfield("y", Ty::Tuple(vec![Ty::U16, Ty::U32]))],
         ));
-        assert_eq!(struct_leaf_tys(&wide, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH), None);
+        assert_eq!(
+            aggregate_leaf_tys(&tup, &s0, MAX_STRUCT_DEPTH),
+            Some(vec![Ty::U8, Ty::U16, Ty::U32])
+        );
+        assert_eq!(
+            aggregate_leaf_tys(&tup, &Ty::Tuple(vec![Ty::I8, Ty::Bool]), MAX_STRUCT_DEPTH),
+            Some(vec![Ty::I8, Ty::Bool])
+        );
+
+        // B3. A field-less aggregate is ADMITTED, with an EMPTY leaf list: one inhabitant per
+        // side, not an empty input space. Note the THIRD site — `aggregate_abstract_samples`
+        // must mint one ZERO-LEAF sample. Relaxing only the two guards in this function leaves
+        // `pools.iter().map(len).max()?` answering None, and the item measures exactly zero.
+        let empty = fieldless_module("Zst");
+        assert_eq!(aggregate_leaf_tys(&empty, &s0, MAX_STRUCT_DEPTH), Some(Vec::new()));
+        assert_eq!(
+            aggregate_leaf_tys(&empty, &Ty::Tuple(Vec::new()), MAX_STRUCT_DEPTH),
+            Some(Vec::new()),
+            "Ty::Tuple(vec![]) is a DISTINCT type from Ty::Unit and is an ordinary fieldless \
+             aggregate"
+        );
+        assert_eq!(aggregate_abstract_samples(&empty, &s0), Some(vec![Vec::new()]));
+
+        // Unresolvable id still fails closed.
+        assert_eq!(
+            aggregate_leaf_tys(&empty, &Ty::Struct(trust_ir::StructId::new(7)), MAX_STRUCT_DEPTH),
+            None
+        );
+
+        // The cap. It still bites — at the WIDENED value — and the widening is real: one leaf
+        // past the OLD bound now passes, which is the entire yield of that item.
+        assert!(MAX_STRUCT_LEAVES > PRE_WIDENING_STRUCT_LEAVES);
+        assert!(
+            aggregate_leaf_tys(&wide_module(PRE_WIDENING_STRUCT_LEAVES + 1), &s0, MAX_STRUCT_DEPTH)
+                .is_some(),
+            "one leaf past the pre-widening bound must now be admitted"
+        );
+        assert!(
+            aggregate_leaf_tys(&wide_module(MAX_STRUCT_LEAVES), &s0, MAX_STRUCT_DEPTH).is_some(),
+            "exactly MAX_STRUCT_LEAVES leaves is admissible"
+        );
+        assert_eq!(
+            aggregate_leaf_tys(&wide_module(MAX_STRUCT_LEAVES + 1), &s0, MAX_STRUCT_DEPTH),
+            None,
+            "one leaf past the cap is refused"
+        );
 
         // The depth cap bites too: a self-referential def cannot spin.
         let mut deep = Module::new("deep");
-        deep.add_struct(sdef_named(0, "Rec", vec![sfield("me", Ty::Struct(trust_ir::StructId::new(0)))]));
-        assert_eq!(struct_leaf_tys(&deep, trust_ir::StructId::new(0), MAX_STRUCT_DEPTH), None);
+        deep.add_struct(sdef_named(0, "Rec", vec![sfield("me", s0.clone())]));
+        assert_eq!(aggregate_leaf_tys(&deep, &s0, MAX_STRUCT_DEPTH), None);
     }
 
     #[test]
     fn struct_samples_keep_same_typed_siblings_distinguishable() {
         let module = memory_region_module("rotation", false);
-        let samples = struct_abstract_samples(&module, trust_ir::StructId::new(1))
+        let samples = aggregate_abstract_samples(&module, &Ty::Struct(trust_ir::StructId::new(1)))
             .expect("a three-leaf scalar struct samples");
         assert!(!samples.is_empty());
         assert!(samples.len() <= MAX_STRUCT_SAMPLES);
@@ -9284,12 +11040,12 @@ mod tests {
     }
 
     #[test]
-    fn realize_struct_arg_builds_the_positional_nested_aggregate() {
+    fn realize_aggregate_arg_builds_the_positional_nested_aggregate() {
         let module = memory_region_module("realize", false);
         let mut cursor = 0usize;
-        let value = realize_struct_arg(
+        let value = realize_aggregate_arg(
             &module,
-            trust_ir::StructId::new(1),
+            &Ty::Struct(trust_ir::StructId::new(1)),
             &[11, 22, 33],
             &mut cursor,
             MAX_STRUCT_DEPTH,
@@ -9313,20 +11069,212 @@ mod tests {
         );
     }
 
+    /// The `MemoryRegion -> usize` signature both sides of the helper modules carry.
+    fn region_sig(ret: Ty) -> FuncTy {
+        FuncTy {
+            params: vec![Ty::Struct(trust_ir::StructId::new(1))],
+            returns: vec![ret],
+            is_vararg: false,
+        }
+    }
+
     #[test]
     fn struct_param_admission_requires_field_names_not_merely_field_shape() {
         let thir = memory_region_module("names_thir", false);
         let straight = memory_region_module("names_oracle", false);
         let swapped = memory_region_module("names_swapped", true);
         let region = Ty::Struct(trust_ir::StructId::new(1));
+        let sig = region_sig(Ty::Usize);
 
         // `tys_agree` cannot see the transposition — the field TYPES are identical.
         assert_eq!(tys_agree(&thir, &swapped, &region, &region, TY_CMP_DEPTH), Ok(true));
 
-        assert!(struct_param_admissible(&thir, &straight, &region, &region));
-        assert!(
-            !struct_param_admissible(&thir, &swapped, &region, &region),
+        assert_eq!(
+            aggregate_param_admission(&thir, &straight, &region, &region, &sig, &sig),
+            AggregateParamAdmission::Admitted(BTreeSet::new()),
+            "MemoryRegion was admissible BEFORE this batch: no new lane, so no attribution tag"
+        );
+        assert_eq!(
+            aggregate_param_admission(&thir, &swapped, &region, &region, &sig, &sig),
+            AggregateParamAdmission::Refused,
             "a transposed field NAME must leave the body on its existing not-run"
+        );
+    }
+
+    /// A two-field `Mixed { n: u8, p: *const _ }` module — the smallest NEW-LANE aggregate.
+    fn mixed_ptr_module(name: &str) -> Module {
+        let mut module = Module::new(name);
+        module.add_struct(sdef_named(0, "Mixed", vec![sfield("n", Ty::U8), sfield("p", Ty::Ptr)]));
+        module
+    }
+
+    /// Conjunct (v), and its SCOPE. Three halves, all load-bearing:
+    ///
+    ///   * the SCOPE — applying (v) to a param that was ALREADY admissible would suppress a
+    ///     divergence the differential currently PUBLISHES. That is a capability loss, and it
+    ///     buys nothing: the control measured divergences 0, so scoped and unscoped are
+    ///     measurement-identical. Owner decision, 2026-08-20.
+    ///   * the `Ok(false)` half — a NEWLY-admitted body has never had a verdict, so admitting it
+    ///     OPENS a divergence channel rather than keeping one. That is what (v) closes.
+    ///   * the `Err` half — writing the conjunct as `== Ok(true)` instead of `!= Ok(false)`
+    ///     compiles, reads correct, and turns the whole batch into a systematic +0.
+    #[test]
+    fn conjunct_v_is_scoped_to_new_lanes_and_blocks_only_a_published_divergence() {
+        let thir = memory_region_module("v_thir", false);
+        let oracle = memory_region_module("v_oracle", false);
+        let region = Ty::Struct(trust_ir::StructId::new(1));
+
+        // --- THE SCOPE. `MemoryRegion` is admissible under the PRE-BATCH rules (non-empty,
+        // all-scalar, three leaves, no ptr, no tuple), so it carries no tag and conjunct (v)
+        // must not touch it — even when the signature IS a published divergence. The body keeps
+        // today's behaviour end to end and step (5) publishes, exactly as
+        // `compare_entries_real_signature_difference_is_hard_divergence` requires of every other
+        // shape in this file.
+        assert_eq!(
+            sig_tys_agree(&thir, &oracle, &region_sig(Ty::Usize), &region_sig(Ty::U64)),
+            Ok(false)
+        );
+        assert_eq!(
+            aggregate_param_admission(
+                &thir,
+                &oracle,
+                &region,
+                &region,
+                &region_sig(Ty::Usize),
+                &region_sig(Ty::U64),
+            ),
+            AggregateParamAdmission::Admitted(BTreeSet::new()),
+            "an ALREADY-admissible param must keep the divergence channel it has today"
+        );
+
+        // --- A NEW-LANE param: the same discipline with a `Ty::Ptr` leaf, which nothing admitted
+        // before this batch.
+        let nthir = mixed_ptr_module("v_new_thir");
+        let noracle = mixed_ptr_module("v_new_oracle");
+        let mixed = Ty::Struct(trust_ir::StructId::new(0));
+        let nsig =
+            |ret: Ty| FuncTy { params: vec![mixed.clone()], returns: vec![ret], is_vararg: false };
+        let ptr_leaf: BTreeSet<&'static str> = BTreeSet::from(["ptr-leaf"]);
+
+        assert_eq!(
+            aggregate_param_admission(
+                &nthir,
+                &noracle,
+                &mixed,
+                &mixed,
+                &nsig(Ty::U8),
+                &nsig(Ty::U8),
+            ),
+            AggregateParamAdmission::Admitted(ptr_leaf.clone()),
+            "an agreeing signature admits, and the tag names the lane that bought the body"
+        );
+        assert_eq!(sig_tys_agree(&nthir, &noracle, &nsig(Ty::U8), &nsig(Ty::U64)), Ok(false));
+        assert_eq!(
+            aggregate_param_admission(
+                &nthir,
+                &noracle,
+                &mixed,
+                &mixed,
+                &nsig(Ty::U8),
+                &nsig(Ty::U64),
+            ),
+            AggregateParamAdmission::SignatureSplit
+        );
+
+        // --- THE +0 TRAP. `Err` must NOT block. Step (5) already turns a comparability failure
+        // into a NotRun byte-identically to today, so nothing is gained by refusing here — and
+        // refusing would take out every body whose return is a cross-kind fat pointer, an enum,
+        // or an aggregate-element array, which `tys_agree` answers with `Err` BY DESIGN.
+        let fat = Ty::FatPtr(trust_ir::FatPtrKind::Str);
+        assert!(sig_tys_agree(&nthir, &noracle, &nsig(fat.clone()), &nsig(Ty::Ptr)).is_err());
+        assert_eq!(
+            aggregate_param_admission(&nthir, &noracle, &mixed, &mixed, &nsig(fat), &nsig(Ty::Ptr)),
+            AggregateParamAdmission::Admitted(ptr_leaf),
+            "an Err comparability failure is not a divergence and must not gate admission"
+        );
+    }
+
+    /// P1, the pin B3 does not ship without. At zero fields `tys_agree`'s struct arm and
+    /// `aggregate_field_names_agree` are BOTH vacuously true, so four distinct producer
+    /// entities collapse onto one key.
+    #[test]
+    fn fieldless_placeholder_mints_are_refused_side_locally() {
+        let unit = Ty::Struct(trust_ir::StructId::new(0));
+        let genuine = fieldless_module("mycrate::Foo");
+
+        // The ACCEPTED RESIDUAL, pinned rather than hidden: two GENUINE unit structs pair, even
+        // with different names. For a zero-field param there is one inhabitant per side, so
+        // neither side's INPUT is misrepresented — and `tys_agree` has never checked which
+        // nominal type a struct is, at any field count.
+        assert!(aggregate_placeholder_free(
+            &genuine,
+            &fieldless_module("othercrate::Bar"),
+            &unit,
+            &unit,
+            MAX_STRUCT_DEPTH
+        ));
+
+        for placeholder in [
+            "opaque_alias::pre_monomorphization",
+            "datatype::Nat",
+            "coroutine::my_async_fn",
+            "closure_env::{closure#0}",
+        ] {
+            let side = fieldless_module(placeholder);
+            // SIDE-LOCAL, in BOTH directions, and against ITSELF. The witness is the name this
+            // side minted, never an agreement between the two sides' names — the two renderers
+            // differ (`with_no_visible_paths!` alone can split `core::` from `std::`), so a
+            // name-EQUALITY pin would refuse the population the item exists to admit.
+            assert!(
+                !aggregate_placeholder_free(&side, &genuine, &unit, &unit, MAX_STRUCT_DEPTH),
+                "{placeholder} on the THIR side"
+            );
+            assert!(
+                !aggregate_placeholder_free(&genuine, &side, &unit, &unit, MAX_STRUCT_DEPTH),
+                "{placeholder} on the oracle side"
+            );
+            assert!(
+                !aggregate_placeholder_free(
+                    &side,
+                    &fieldless_module(placeholder),
+                    &unit,
+                    &unit,
+                    MAX_STRUCT_DEPTH
+                ),
+                "{placeholder} against itself — a positive witness, not a disagreement"
+            );
+        }
+
+        // A placeholder mint WITH fields is already distinguished by them; refusing it would
+        // cost coverage for nothing.
+        let mut captured = Module::new("captured");
+        captured.add_struct(sdef_named(0, "closure_env::{closure#0}", vec![sfield("c", Ty::U8)]));
+        assert!(aggregate_placeholder_free(&captured, &captured, &unit, &unit, MAX_STRUCT_DEPTH));
+
+        // The walk reaches a NESTED zero-field node, not only the root.
+        let mut nested = Module::new("nested");
+        nested.add_struct(sdef_named(0, "datatype::Nat", Vec::new()));
+        nested.add_struct(sdef_named(1, "Wrapper", vec![sfield("marker", unit.clone())]));
+        let wrapper = Ty::Struct(trust_ir::StructId::new(1));
+        assert!(!aggregate_placeholder_free(
+            &nested,
+            &nested,
+            &wrapper,
+            &wrapper,
+            MAX_STRUCT_DEPTH
+        ));
+
+        // And it is a conjunct of admission, not a free-standing helper.
+        let placeholder = fieldless_module("datatype::Nat");
+        let sig = FuncTy { params: vec![unit.clone()], returns: vec![Ty::U8], is_vararg: false };
+        assert_eq!(
+            aggregate_param_admission(&placeholder, &placeholder, &unit, &unit, &sig, &sig),
+            AggregateParamAdmission::Refused
+        );
+        assert_eq!(
+            aggregate_param_admission(&genuine, &genuine, &unit, &unit, &sig, &sig),
+            AggregateParamAdmission::Admitted(BTreeSet::from(["fieldless"])),
+            "a genuine unit struct is admitted, and is attributed to the lane that bought it"
         );
     }
 
@@ -9397,6 +11345,185 @@ mod tests {
                 .iter()
                 .any(|n| n == "non-scalar parameter type is non-interpretable (coverage-only skip)"),
             "the refusal reason string is a census classifier key: {:?}",
+            report.notes
+        );
+    }
+
+    /// The one agreed note carrying an attribution tag, with its PREFIX asserted byte-identical.
+    fn agreed_attribution(report: &DiffReport) -> String {
+        let note = report
+            .notes
+            .iter()
+            .find(|n| n.contains("aggregate param admitted"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "one sweep pays for four lanes; the agreed note must attribute: {:?}",
+                    report.notes
+                )
+            })
+            .clone();
+        assert!(
+            note.starts_with("THIR-trust-ir == MIR-trust-ir on "),
+            "the burn-down ratchet keys on this PREFIX; it must stay byte-identical: {note}"
+        );
+        note
+    }
+
+    /// `fn read_scalar_field(m: Mixed) -> u8 { m.n }` — the shape a whole-param opacity proof
+    /// fails CLOSED on (the param IS read) and the shape the ptr-leaf admission is for.
+    fn mixed_ptr_reader(name: &str) -> Module {
+        let mut module = Module::new(name);
+        module.add_struct(sdef_named(0, "Mixed", vec![sfield("n", Ty::U8), sfield("p", Ty::Ptr)]));
+        let mixed = Ty::Struct(trust_ir::StructId::new(0));
+        let v = ValueId::new;
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((v(0), mixed.clone()));
+        block.body.push(
+            InstrNode::new(Inst::ExtractField { ty: Ty::U8, aggregate: v(0), field: 0 })
+                .with_result(v(1)),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
+        single_block_module_with(module, "read_scalar_field", vec![mixed], vec![Ty::U8], block)
+    }
+
+    #[test]
+    fn ptr_leaf_aggregate_param_is_sampled_and_agrees() {
+        let report = compare_entries(
+            &mixed_ptr_reader("ptr_thir"),
+            FuncId::new(0),
+            &mixed_ptr_reader("ptr_oracle"),
+            FuncId::new(0),
+        );
+        assert_eq!(report.mode, DiffMode::Agreed, "{:?}", report.notes);
+        assert!(report.samples_checked > 0, "a verdict requires a real sample count");
+        // The FOUR-SITE lockstep, end to end: `aggregate_leaf_tys` pushes a `Ty::Ptr` leaf,
+        // `sample_values` gives it a singleton pool, `build_arg` mints the null, and
+        // `realize_aggregate_arg` consumes its cursor slot. Relax any three and the cursor
+        // desyncs or the pool is empty — either way this body lands on a coverage skip and the
+        // item measures zero while the histogram merely MOVES rows between skip classes.
+        assert!(agreed_attribution(&report).contains("aggregate param admitted [ptr-leaf]"));
+    }
+
+    /// `fn takes_zst(_: Zst) -> u8 { 7 }` — a by-value ZERO-FIELD param.
+    fn fieldless_param_body(name: &str, struct_name: &str) -> Module {
+        let mut module = Module::new(name);
+        module.add_struct(sdef_named(0, struct_name, Vec::new()));
+        let zst = Ty::Struct(trust_ir::StructId::new(0));
+        let v = ValueId::new;
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((v(0), zst.clone()));
+        block.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::U8, value: Constant::Int(7) }).with_result(v(1)),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
+        single_block_module_with(module, "takes_zst", vec![zst], vec![Ty::U8], block)
+    }
+
+    #[test]
+    fn fieldless_aggregate_param_is_sampled_and_agrees() {
+        let report = compare_entries(
+            &fieldless_param_body("zst_thir", "Zst"),
+            FuncId::new(0),
+            &fieldless_param_body("zst_oracle", "Zst"),
+            FuncId::new(0),
+        );
+        assert_eq!(report.mode, DiffMode::Agreed, "{:?}", report.notes);
+        // ONE sample — the single inhabitant of a zero-field type — not zero and not a skip.
+        assert_eq!(report.samples_checked, 1);
+        assert!(agreed_attribution(&report).contains("aggregate param admitted [fieldless]"));
+    }
+
+    #[test]
+    fn fieldless_placeholder_param_stays_on_the_verbatim_non_scalar_refusal() {
+        // P1 in the pipeline: the pin refuses, and the body falls back to the byte-identical
+        // census classifier key rather than to a new class of its own.
+        let report = compare_entries(
+            &fieldless_param_body("ph_thir", "datatype::Nat"),
+            FuncId::new(0),
+            &fieldless_param_body("ph_oracle", "datatype::Nat"),
+            FuncId::new(0),
+        );
+        assert_eq!(report.mode, DiffMode::NotRun, "{:?}", report.notes);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n == "non-scalar parameter type is non-interpretable (coverage-only skip)"),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    /// `fn f(t: (u64, usize)) -> usize { t.1 }` — a by-value TUPLE param.
+    fn tuple_reader(name: &str) -> Module {
+        let tuple = Ty::Tuple(vec![Ty::U64, Ty::Usize]);
+        let v = ValueId::new;
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((v(0), tuple.clone()));
+        block.body.push(
+            InstrNode::new(Inst::ExtractField { ty: Ty::Usize, aggregate: v(0), field: 1 })
+                .with_result(v(1)),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
+        single_block_module(name, vec![tuple], vec![Ty::Usize], block)
+    }
+
+    #[test]
+    fn tuple_aggregate_param_is_sampled_and_agrees() {
+        let report = compare_entries(
+            &tuple_reader("tup_thir"),
+            FuncId::new(0),
+            &tuple_reader("tup_oracle"),
+            FuncId::new(0),
+        );
+        // This assertion IS the `ParamClass::Tuple` pin. A separate class would have had to be
+        // threaded through two NON-EXHAUSTIVE `matches!` filters the compiler does not check
+        // (`scalar_params`, `expected_columns`); missing either desynchronizes the column count
+        // and `build_side_args` answers "sample tuple has N column(s), expected M" — a NotRun,
+        // not a compile error. Reusing `ParamClass::Struct` is what makes that unreachable.
+        assert_eq!(report.mode, DiffMode::Agreed, "{:?}", report.notes);
+        assert!(report.samples_checked > 0);
+        assert!(agreed_attribution(&report).contains("aggregate param admitted [tuple]"));
+    }
+
+    /// THE CAPABILITY PIN for conjunct (v)'s scope, end to end rather than at the predicate.
+    ///
+    /// An aggregate param that was ALREADY admissible keeps its divergence channel: a
+    /// return-side signature split still reaches step (5) and is still PUBLISHED. Applying (v)
+    /// unscoped would turn this into a coverage-only skip — a capability the differential has
+    /// today, silently withdrawn. Owner decision, 2026-08-20: scope it.
+    #[test]
+    fn already_admissible_aggregate_param_still_publishes_a_signature_divergence() {
+        let thir = memory_region_reader("v_e2e_thir", false, 1);
+        let mut oracle = memory_region_reader("v_e2e_oracle", false, 1);
+        oracle.func_types[0].returns[0] = Ty::U64;
+
+        let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::MirOracle, "{:?}", report.notes);
+        assert!(!report.equal);
+        assert!(
+            report.notes.iter().any(|n| n.starts_with("signature divergence")),
+            "the pre-existing divergence channel must survive this batch: {:?}",
+            report.notes
+        );
+    }
+
+    /// The twin, and the reason (v) exists at all: the SAME signature split on a NEWLY-admitted
+    /// param is held back instead, because that body has never had a verdict — admitting it
+    /// would OPEN a divergence channel rather than keep one. Its own note, so the held-back
+    /// population stays countable.
+    #[test]
+    fn newly_admitted_aggregate_param_withholds_a_signature_split() {
+        let thir = mixed_ptr_reader("v_e2e_new_thir");
+        let mut oracle = mixed_ptr_reader("v_e2e_new_oracle");
+        oracle.func_types[0].returns[0] = Ty::U64;
+
+        let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::NotRun, "{:?}", report.notes);
+        assert!(
+            report.notes.iter().any(|n| n
+                == "aggregate param admissible but signature spelling split; coverage-only skip"),
+            "the held-back class needs its own note or it is unmeasurable: {:?}",
             report.notes
         );
     }
@@ -10825,6 +12952,10 @@ mod tests {
 
     /// The debt-discharging assertion: two wrappers built from the same shape agree, and one
     /// built from a different pointee does not.
+    ///
+    /// Trust (Slice B): the `None` exemption argument is the SCALAR LANE's, and passing `None`
+    /// here is what makes "the scalar lane keeps exact structural equality end to end" a checked
+    /// statement rather than a claim in a comment.
     #[test]
     fn wrappers_agree_across_identically_shaped_sides() {
         let mut am = Module::new("a");
@@ -10841,7 +12972,8 @@ mod tests {
                 aw.function_by_id(af).unwrap(),
                 ae,
                 bw.function_by_id(bf).unwrap(),
-                be
+                be,
+                None
             )
             .is_ok()
         );
@@ -10853,9 +12985,566 @@ mod tests {
                 aw.function_by_id(af).unwrap(),
                 ae,
                 cw.function_by_id(cf).unwrap(),
-                be
+                be,
+                None
             )
             .is_err()
         );
+    }
+
+    // ---- Trust (Slice B): the AGGREGATE REFERENT sampler -----------------------------
+    //
+    // Three groups, each pinning one of the three ways this lane measures +0 or worse:
+    //   * the union / vacuous-key refusals in `struct_layout_agrees` (`referent_fields_disjoint`
+    //     and `aggregate_placeholder_free`);
+    //   * the `wrappers_agree` referent exemption, INCLUDING the one-shared-pointee trap that
+    //     would otherwise satisfy the assertion by means of the bug it exists to catch;
+    //   * the column plumbing, which is where a half-wired lane silently loses its whole
+    //     population into `clean-skip-other`.
+
+    /// `#[derive(Clone)]`-on-`Copy` shape: `fn(ptr) -> S { *ptr }` — the param is used ONLY as a
+    /// plain load ptr, and the loaded type is a whole struct.
+    fn slice_b_aggregate_entry(module: &mut Module, referent: &Ty) -> FuncId {
+        let sig = module.add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![referent.clone()],
+            is_vararg: false,
+        });
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((ValueId::new(0), Ty::Ptr));
+        block.body.push(
+            InstrNode::new(Inst::Load {
+                ty: referent.clone(),
+                ptr: ValueId::new(0),
+                volatile: false,
+                align: None,
+            })
+            .with_results(vec![ValueId::new(1)]),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }));
+        let id = FuncId::new(u32::try_from(module.functions.len()).unwrap());
+        let mut f = Function::new(id, "clone_like", sig, trust_ir::BlockId::new(0));
+        f.blocks = vec![block];
+        module.add_function(f);
+        id
+    }
+
+    /// `{ x: u32, y: u32 }` — two scalar leaves at DISTINCT offsets. The struct control.
+    fn slice_b_pair(id: u32) -> StructDef {
+        q1_sdef(
+            id,
+            "Pair",
+            vec![q1_field("x", Ty::U32, Some(0)), q1_field("y", Ty::U32, Some(4))],
+            Some(8),
+            Some(4),
+            StructRepr::Rust,
+        )
+    }
+
+    /// THE UNION. Same field list, same names, same size and align, same `repr` — and BOTH fields
+    /// at offset 0, which is what a `union` is and what `StructDef` cannot say. Every conjunct
+    /// `struct_layout_agrees` had before this lane is satisfied by this pair against itself.
+    fn slice_b_union_shaped(id: u32) -> StructDef {
+        q1_sdef(
+            id,
+            "Pair",
+            vec![q1_field("x", Ty::U32, Some(0)), q1_field("y", Ty::U32, Some(0))],
+            Some(4),
+            Some(4),
+            StructRepr::Rust,
+        )
+    }
+
+    /// THE CORE UNION REFUSAL. Both sides describe the identical overlapping-field object, so
+    /// every pre-existing conjunct AGREES — size, align, repr, field count, and per field the
+    /// name, the offset and the recursive type. Without `referent_fields_disjoint` this pair is
+    /// admitted, the sampler writes two independent leaves into one 4-byte region last-write-wins
+    /// on BOTH sides, and the row is graded `Agreed` about an input that is not an inhabitant of
+    /// the type. The control below is the same shape with the second field moved to offset 4.
+    #[test]
+    fn layout_refuses_overlapping_fields_the_union_shape() {
+        let (am, bm) = (q1_m("a", slice_b_union_shaped(0)), q1_m("b", slice_b_union_shaped(0)));
+        assert!(
+            !struct_layout_agrees(
+                &am,
+                &bm,
+                &Ty::Struct(StructId::new(0)),
+                &Ty::Struct(StructId::new(0)),
+                MAX_STRUCT_DEPTH
+            ),
+            "two overlapping u32 fields at offset 0 are a union image, not a struct"
+        );
+        // CONTROL: identical in every respect except that the fields do not overlap. If this
+        // failed too, the refusal above would be passing for the wrong reason.
+        let (am, bm) = (q1_m("a", slice_b_pair(0)), q1_m("b", slice_b_pair(0)));
+        assert!(struct_layout_agrees(
+            &am,
+            &bm,
+            &Ty::Struct(StructId::new(0)),
+            &Ty::Struct(StructId::new(0)),
+            MAX_STRUCT_DEPTH
+        ));
+    }
+
+    /// PARTIAL overlap, not just coincident offsets: an 8-byte field at 0 and a 4-byte field at 4
+    /// is fine, but at 6 it is not. Pins that the predicate compares RANGES rather than offsets.
+    #[test]
+    fn layout_refuses_partially_overlapping_fields() {
+        let ok = q1_sdef(
+            0,
+            "P",
+            vec![q1_field("a", Ty::U64, Some(0)), q1_field("b", Ty::U32, Some(8))],
+            Some(16),
+            Some(8),
+            StructRepr::Rust,
+        );
+        assert!(referent_fields_disjoint(&q1_m("m", ok.clone()), &ok));
+        let overlapping = q1_sdef(
+            0,
+            "P",
+            vec![q1_field("a", Ty::U64, Some(0)), q1_field("b", Ty::U32, Some(6))],
+            Some(16),
+            Some(8),
+            StructRepr::Rust,
+        );
+        assert!(
+            !referent_fields_disjoint(&q1_m("m", overlapping.clone()), &overlapping),
+            "u64 at 0 spans bytes 0..8; a u32 at 6 spans 6..10 and shares two of them"
+        );
+    }
+
+    /// THE EMPTY CASE, asked rather than assumed. Pairwise disjointness over zero or one field is
+    /// VACUOUSLY TRUE — `windows(2)` over a one-element slice is empty. Both are ACCEPTED here,
+    /// and this test records that as a decision with its reason attached, not as an oversight:
+    /// a one-member union has exactly one field at one offset, so the positional value model
+    /// round-trips it faithfully and there is no aliasing to detect. The ZERO-field vacuity is a
+    /// real hazard and is closed by a DIFFERENT conjunct — see the placeholder test below.
+    #[test]
+    fn disjointness_is_vacuous_at_zero_and_one_field_and_that_is_deliberate() {
+        let empty = q1_sdef(0, "Z", Vec::new(), Some(0), Some(1), StructRepr::Rust);
+        assert!(referent_fields_disjoint(&q1_m("m", empty.clone()), &empty));
+        let single = q1_sdef(
+            0,
+            "One",
+            vec![q1_field("x", Ty::U32, Some(0))],
+            Some(4),
+            Some(4),
+            StructRepr::Rust,
+        );
+        assert!(referent_fields_disjoint(&q1_m("m", single.clone()), &single));
+    }
+
+    /// A ZERO-SIZED field aliases no byte, so it does not overlap the field it shares an offset
+    /// with. Mirrors the interpreter's own `byte_ranges_overlap`, which returns `false` whenever
+    /// either size is 0 — if this predicate were stricter than the executor it would refuse
+    /// referents the executor accepts, which is a systematic +0 with no soundness gain.
+    #[test]
+    fn disjointness_ignores_zero_sized_fields() {
+        let mut m = Module::new("m");
+        m.add_struct(q1_sdef(1, "Zst", Vec::new(), Some(0), Some(1), StructRepr::Rust));
+        let outer = q1_sdef(
+            0,
+            "WithZst",
+            vec![
+                q1_field("z", Ty::Struct(StructId::new(1)), Some(0)),
+                q1_field("x", Ty::U32, Some(0)),
+            ],
+            Some(4),
+            Some(4),
+            StructRepr::Rust,
+        );
+        m.add_struct(outer.clone());
+        assert!(referent_fields_disjoint(&m, &outer));
+    }
+
+    /// FAIL-CLOSED on a width this file cannot decide. A field type with no byte width here (a
+    /// `Ty::Ptr`, a `Ty::Unit`, an array) makes the whole node refuse rather than be skipped —
+    /// an unmeasurable field cannot be shown not to overlap.
+    #[test]
+    fn disjointness_fails_closed_on_an_unmeasurable_field() {
+        let with_ptr = q1_sdef(
+            0,
+            "P",
+            vec![q1_field("p", Ty::Ptr, Some(0)), q1_field("x", Ty::U32, Some(8))],
+            Some(16),
+            Some(8),
+            StructRepr::Rust,
+        );
+        assert!(!referent_fields_disjoint(&q1_m("m", with_ptr.clone()), &with_ptr));
+        // ... and an absent offset is equally undecidable.
+        let mut no_offset = slice_b_pair(0);
+        no_offset.fields[1].offset = None;
+        assert!(!referent_fields_disjoint(&q1_m("m", no_offset.clone()), &no_offset));
+    }
+
+    /// THE ZERO-FIELD VACUOUS KEY, closed by the second conjunct. A class-standing placeholder
+    /// mint has zero fields, so `tys_agree`'s struct arm, `aggregate_field_names_agree` AND
+    /// `referent_fields_disjoint` are all vacuously true of it — four distinct producer entities
+    /// on one comparison key. Before this lane the only thing keeping such a mint out of the
+    /// referent position was that `mint_alias_opaque_struct` happens to leave `size`/`align`
+    /// `None`; this test gives them BOTH, so it fails against that one-number defence and passes
+    /// only against the explicit `aggregate_placeholder_free` conjunct.
+    #[test]
+    fn layout_refuses_a_zero_field_placeholder_mint_even_with_a_declared_size() {
+        for name in PLACEHOLDER_AGGREGATE_NAME_PREFIXES {
+            let mint = q1_sdef(
+                0,
+                &format!("{name}Whatever"),
+                Vec::new(),
+                Some(0),
+                Some(1),
+                StructRepr::Rust,
+            );
+            assert!(
+                !struct_layout_agrees(
+                    &q1_m("a", mint.clone()),
+                    &q1_m("b", mint.clone()),
+                    &Ty::Struct(StructId::new(0)),
+                    &Ty::Struct(StructId::new(0)),
+                    MAX_STRUCT_DEPTH
+                ),
+                "the class-standing mint {name} must not be admitted as a referent"
+            );
+        }
+        // CONTROL: a genuine zero-field nominal struct is still admitted. The refusal is a
+        // POSITIVE WITNESS on the placeholder names, not a blanket ban on fieldless referents.
+        let unit_struct = q1_sdef(0, "Foo", Vec::new(), Some(0), Some(1), StructRepr::Rust);
+        assert!(struct_layout_agrees(
+            &q1_m("a", unit_struct.clone()),
+            &q1_m("b", unit_struct),
+            &Ty::Struct(StructId::new(0)),
+            &Ty::Struct(StructId::new(0)),
+            MAX_STRUCT_DEPTH
+        ));
+    }
+
+    /// THE CROSS-MODULE ID CASE, which is the whole reason the exemption exists. The producer
+    /// numbers its struct table by first-seen `(DefId, GenericArgs)`; the oracle by registration
+    /// order. Here the identical layout sits at `StructId(0)` on one side and `StructId(3)` on
+    /// the other, so the two wrappers name DIFFERENT types at the referent position while being
+    /// the same program everywhere else.
+    #[test]
+    fn wrappers_agree_exempts_the_proven_referent_pair_across_module_local_ids() {
+        let mut am = Module::new("a");
+        am.add_struct(slice_b_pair(0));
+        let a_ref = Ty::Struct(StructId::new(0));
+        let ae = slice_b_aggregate_entry(&mut am, &a_ref);
+        let asig = am.func_type(am.function_by_id(ae).unwrap().ty).unwrap().clone();
+
+        let mut bm = Module::new("b");
+        bm.add_struct(slice_b_pair(3));
+        let b_ref = Ty::Struct(StructId::new(3));
+        let be = slice_b_aggregate_entry(&mut bm, &b_ref);
+        let bsig = bm.func_type(bm.function_by_id(be).unwrap().ty).unwrap().clone();
+
+        // The layout proof that discharges the exemption must hold first.
+        assert!(struct_layout_agrees(&am, &bm, &a_ref, &b_ref, MAX_STRUCT_DEPTH));
+
+        let (aw, af, _) = build_pointee_wrapper(&am, ae, &asig, 0, &a_ref).unwrap();
+        let (bw, bf, _) = build_pointee_wrapper(&bm, be, &bsig, 0, &b_ref).unwrap();
+        assert!(
+            wrappers_agree(
+                aw.function_by_id(af).unwrap(),
+                ae,
+                bw.function_by_id(bf).unwrap(),
+                be,
+                Some((0, &a_ref, &b_ref))
+            )
+            .is_ok()
+        );
+        // WITHOUT the exemption the same pair is refused — so the exemption is genuinely
+        // load-bearing here and this lane really would measure +0 without position 9.
+        assert!(
+            wrappers_agree(
+                aw.function_by_id(af).unwrap(),
+                ae,
+                bw.function_by_id(bf).unwrap(),
+                be,
+                None
+            )
+            .is_err(),
+            "if exact equality already passed, the exemption would be untested decoration"
+        );
+    }
+
+    /// THE TRAP, pinned. Sharing ONE pointee across both `build_pointee_wrapper` calls is the
+    /// obvious way to write this lane, it makes the two wrappers literally identical, and it is
+    /// WRONG: the oracle's wrapper would then allocate, store and call under the PRODUCER's
+    /// `StructId`, so the two sides are executed on different inputs. A "both sides are structs"
+    /// exemption would PASS on it — the debt-discharging assertion satisfied by the bug it exists
+    /// to catch. Keying on the ordered pair is what makes it fail closed instead.
+    #[test]
+    fn wrappers_agree_refuses_one_shared_pointee_fed_to_both_sides() {
+        let mut am = Module::new("a");
+        am.add_struct(slice_b_pair(0));
+        let a_ref = Ty::Struct(StructId::new(0));
+        let ae = slice_b_aggregate_entry(&mut am, &a_ref);
+        let asig = am.func_type(am.function_by_id(ae).unwrap().ty).unwrap().clone();
+
+        let mut bm = Module::new("b");
+        bm.add_struct(slice_b_pair(3));
+        let b_ref = Ty::Struct(StructId::new(3));
+        let be = slice_b_aggregate_entry(&mut bm, &b_ref);
+        let bsig = bm.func_type(bm.function_by_id(be).unwrap().ty).unwrap().clone();
+
+        let (aw, af, _) = build_pointee_wrapper(&am, ae, &asig, 0, &a_ref).unwrap();
+        // THE BUG: side B's wrapper built from side A's pointee.
+        let (bw, bf, _) = build_pointee_wrapper(&bm, be, &bsig, 0, &a_ref).unwrap();
+        assert!(
+            wrappers_agree(
+                aw.function_by_id(af).unwrap(),
+                ae,
+                bw.function_by_id(bf).unwrap(),
+                be,
+                Some((0, &a_ref, &b_ref))
+            )
+            .is_err(),
+            "side B named the producer's referent; the exemption requires it to name its own"
+        );
+    }
+
+    /// The exemption is not "any two structs". An UNRELATED struct pair at the referent position
+    /// is refused even though both sides are `Ty::Struct` and both wrappers are well-formed.
+    #[test]
+    fn wrappers_agree_exemption_admits_only_the_proven_pair() {
+        let mut am = Module::new("a");
+        am.add_struct(slice_b_pair(0));
+        am.add_struct(q1_sdef(
+            1,
+            "Other",
+            vec![q1_field("z", Ty::U64, Some(0))],
+            Some(8),
+            Some(8),
+            StructRepr::Rust,
+        ));
+        let a_ref = Ty::Struct(StructId::new(0));
+        let a_other = Ty::Struct(StructId::new(1));
+        let ae = slice_b_aggregate_entry(&mut am, &a_ref);
+        let asig = am.func_type(am.function_by_id(ae).unwrap().ty).unwrap().clone();
+
+        let mut bm = Module::new("b");
+        bm.add_struct(slice_b_pair(3));
+        let b_ref = Ty::Struct(StructId::new(3));
+        let be = slice_b_aggregate_entry(&mut bm, &b_ref);
+        let bsig = bm.func_type(bm.function_by_id(be).unwrap().ty).unwrap().clone();
+
+        // Side A's wrapper materializes `Other`, but the exemption names `Pair`.
+        let (aw, af, _) = build_pointee_wrapper(&am, ae, &asig, 0, &a_other).unwrap();
+        let (bw, bf, _) = build_pointee_wrapper(&bm, be, &bsig, 0, &b_ref).unwrap();
+        assert!(
+            wrappers_agree(
+                aw.function_by_id(af).unwrap(),
+                ae,
+                bw.function_by_id(bf).unwrap(),
+                be,
+                Some((0, &a_ref, &b_ref))
+            )
+            .is_err()
+        );
+    }
+
+    /// THE LANE DECISION, end to end and two-sided. The same body on both sides, with the
+    /// referent at a DIFFERENT `StructId` per side, must mint `PointerLane::Aggregate` carrying
+    /// BOTH pointees — not a `Scalar`, not a ceiling, not `None`.
+    #[test]
+    fn pointer_lane_mints_a_two_sided_aggregate_referent() {
+        let mut am = Module::new("a");
+        am.add_struct(slice_b_pair(0));
+        let a_ref = Ty::Struct(StructId::new(0));
+        let ae = slice_b_aggregate_entry(&mut am, &a_ref);
+        let asig = am.func_type(am.function_by_id(ae).unwrap().ty).unwrap().clone();
+
+        let mut bm = Module::new("b");
+        bm.add_struct(slice_b_pair(3));
+        let b_ref = Ty::Struct(StructId::new(3));
+        let be = slice_b_aggregate_entry(&mut bm, &b_ref);
+        let bsig = bm.func_type(bm.function_by_id(be).unwrap().ty).unwrap().clone();
+
+        let lane = pointer_param_input_lane(
+            &am,
+            am.function_by_id(ae).unwrap(),
+            &asig,
+            &bm,
+            bm.function_by_id(be).unwrap(),
+            &bsig,
+        );
+        assert_eq!(
+            lane,
+            Some(PointerLane::Aggregate { index: 0, pointee_a: a_ref, pointee_b: b_ref })
+        );
+    }
+
+    /// A UNION-SHAPED referent takes the lane's `None` path, not its ceiling path: the layout
+    /// proof is what refused it, and a body whose referent has no proven layout is not this
+    /// lane's business at all — it keeps the plain `param N is READ` skip it has today.
+    #[test]
+    fn pointer_lane_refuses_a_union_shaped_referent_outright() {
+        let mut am = Module::new("a");
+        am.add_struct(slice_b_union_shaped(0));
+        let a_ref = Ty::Struct(StructId::new(0));
+        let ae = slice_b_aggregate_entry(&mut am, &a_ref);
+        let asig = am.func_type(am.function_by_id(ae).unwrap().ty).unwrap().clone();
+
+        let mut bm = Module::new("b");
+        bm.add_struct(slice_b_union_shaped(0));
+        let b_ref = Ty::Struct(StructId::new(0));
+        let be = slice_b_aggregate_entry(&mut bm, &b_ref);
+        let bsig = bm.func_type(bm.function_by_id(be).unwrap().ty).unwrap().clone();
+
+        assert_eq!(
+            pointer_param_input_lane(
+                &am,
+                am.function_by_id(ae).unwrap(),
+                &asig,
+                &bm,
+                bm.function_by_id(be).unwrap(),
+                &bsig,
+            ),
+            None
+        );
+    }
+
+    /// POSITION 11: a newly-admitted body whose two SIGNATURES are a spelling split must be
+    /// WITHHELD, not admitted. These bodies have never run `sig_tys_agree` — they die at step (4)
+    /// today — so admitting one opens a divergence-publication channel that did not exist, and
+    /// the sweep's own gate says divergences == 0. The referent layouts agree here; only the
+    /// RETURN spelling differs.
+    #[test]
+    fn pointer_lane_withholds_a_signature_spelling_split() {
+        let mut am = Module::new("a");
+        am.add_struct(slice_b_pair(0));
+        let a_ref = Ty::Struct(StructId::new(0));
+        let ae = slice_b_aggregate_entry(&mut am, &a_ref);
+        let asig = am.func_type(am.function_by_id(ae).unwrap().ty).unwrap().clone();
+
+        // Side B returns a DIFFERENTLY-SHAPED struct while loading the same referent.
+        let mut bm = Module::new("b");
+        bm.add_struct(slice_b_pair(3));
+        bm.add_struct(q1_sdef(
+            4,
+            "Wide",
+            vec![q1_field("x", Ty::U64, Some(0))],
+            Some(8),
+            Some(8),
+            StructRepr::Rust,
+        ));
+        let b_ref = Ty::Struct(StructId::new(3));
+        let be = slice_b_aggregate_entry(&mut bm, &b_ref);
+        let mut bsig = bm.func_type(bm.function_by_id(be).unwrap().ty).unwrap().clone();
+        bsig.returns = vec![Ty::Struct(StructId::new(4))];
+
+        assert_eq!(
+            pointer_param_input_lane(
+                &am,
+                am.function_by_id(ae).unwrap(),
+                &asig,
+                &bm,
+                bm.function_by_id(be).unwrap(),
+                &bsig,
+            ),
+            Some(PointerLane::AggregateSignatureSplit { index: 0 }),
+            "a spelling split must be WITHHELD with its own reason, never sampled and never \
+             allowed to reach step (5)"
+        );
+    }
+
+    /// THE COLUMN PLUMBING, in one assertion. `build_side_args` is where every unchecked filter
+    /// this class had to be threaded through converges: the `enum_samples` alignment `match`, the
+    /// `struct_samples` alignment `match` (whose invariant WIDENED to admit this class), and
+    /// `expected_columns` (now `consumes_sample_column`). Any one of them left behind turns this
+    /// into an `Err`, which downstream is `clean-skip-sample-arg` and a systematic +0.
+    ///
+    /// The signature passed is the WRAPPER's — param 0 is the POINTEE, which is exactly what
+    /// `build_pointee_wrapper` respells it to — so this also pins that the args site marshals
+    /// against the exec signature rather than the entry's `Ty::Ptr`.
+    #[test]
+    fn ptr_to_aggregate_moved_every_unchecked_matches_filter() {
+        let module = q1_m("m", slice_b_pair(0));
+        let wrapper_sig = FuncTy {
+            params: vec![Ty::Struct(StructId::new(0))],
+            returns: vec![Ty::Struct(StructId::new(0))],
+            is_vararg: false,
+        };
+        let classes = [ParamClass::PtrToAggregate];
+        let enum_samples = [None];
+        let struct_samples = [Some(vec![vec![7i128, 9]])];
+        let args = build_side_args(
+            &module,
+            &wrapper_sig,
+            &classes,
+            &enum_samples,
+            &struct_samples,
+            &[0],
+        )
+        .expect("every column filter must admit PtrToAggregate");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].ty, Ty::Struct(StructId::new(0)));
+        match &args[0].kind {
+            InterpretValueKind::Aggregate(elems) => assert_eq!(elems.len(), 2),
+            other => panic!("aggregate referent must realize as a positional aggregate: {other:?}"),
+        }
+        // The column IS consumed: a tuple of the wrong width is a fail-closed Err, never a
+        // silently-shifted realization.
+        assert!(
+            build_side_args(
+                &module,
+                &wrapper_sig,
+                &classes,
+                &enum_samples,
+                &struct_samples,
+                &[]
+            )
+            .is_err()
+        );
+        // And the shared table's alignment invariant is checked in BOTH directions.
+        assert!(
+            build_side_args(&module, &wrapper_sig, &classes, &enum_samples, &[None], &[0]).is_err(),
+            "a PtrToAggregate column with no sample table must fail closed"
+        );
+    }
+
+    /// `consumes_sample_column` is the single source of truth for both column filters, and it is
+    /// an exhaustive `match` so a new class cannot be forgotten. Pinned as a truth table.
+    #[test]
+    fn every_param_class_declares_whether_it_consumes_a_column() {
+        for (class, want) in [
+            (ParamClass::Scalar, true),
+            (ParamClass::Enum, true),
+            (ParamClass::Struct, true),
+            (ParamClass::PtrTo, true),
+            (ParamClass::PtrToAggregate, true),
+            (ParamClass::Opaque, false),
+        ] {
+            assert_eq!(consumes_sample_column(&class), want);
+        }
+    }
+
+    /// END TO END: the wrapper materializes an AGGREGATE referent and the entry loads it back
+    /// through the interpreter's byte funnel. This is the whole lane in one assertion — if
+    /// `encode_value`/`decode_value` did not round-trip a declared struct layout, or the
+    /// wrapper's `Alloca`/`Store` were typed at `Ty::Ptr` instead of the pointee, this is where
+    /// it would fail rather than in a corpus sweep.
+    #[test]
+    fn wrapper_materializes_an_aggregate_referent_the_entry_can_load() {
+        let mut module = Module::new("m");
+        module.add_struct(slice_b_pair(0));
+        let referent = Ty::Struct(StructId::new(0));
+        let entry = slice_b_aggregate_entry(&mut module, &referent);
+        let sig = module.func_type(module.function_by_id(entry).unwrap().ty).unwrap().clone();
+        let (wrapped, wrapper, wsig) =
+            build_pointee_wrapper(&module, entry, &sig, 0, &referent).unwrap();
+        assert_eq!(wsig.params, vec![referent.clone()]);
+
+        let leaves = vec![7i128, 9];
+        let mut cursor = 0usize;
+        let value =
+            realize_aggregate_arg(&wrapped, &referent, &leaves, &mut cursor, MAX_STRUCT_DEPTH)
+                .expect("the referent marshals");
+        assert_eq!(cursor, leaves.len());
+
+        let out = Interpreter::with_module(&wrapped)
+            .execute_func(wrapper, vec![value.clone()])
+            .expect("wrapper executes an aggregate referent");
+        assert_eq!(out.returns, vec![value]);
     }
 }

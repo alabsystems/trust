@@ -840,7 +840,7 @@ fn build_options<O: Default>(
             Some((k, v)) => (k.to_string(), Some(v)),
         };
 
-        // BOOTSTRAP-ONLY COMPAT ALIAS: `-Zno-trust-verify` -> `-Ztrust-verify=off`.
+        // BOOTSTRAP-ONLY COMPAT ALIAS: `-Zno-trust-verify` -> `-Ztrust-verify=<on|off>`.
         //
         // The flag surface was deliberately consolidated to the single
         // `trust_verify` domain (`576db732cd`, "one flag surface, one taxonomy,
@@ -863,13 +863,51 @@ fn build_options<O: Default>(
         // DELETE THIS the moment the bootstrap seed is advanced past the rename.
         // It is a bridge for exactly one seed generation, not a supported name.
         //
-        // The rewrite is exact, not approximate: the removed flag meant "do not
-        // verify", which is precisely `trust_verify = off`. Its only possible
-        // effect is to turn verification OFF, so it can never manufacture a
-        // proof claim.
+        // The rewrite is exact because it maps the AUTHORED VALUE through the
+        // retired option's own parser. `no_trust_verify` was
+        // `bool = (false, parse_bool, [TRACKED])`
+        // (`576db732cd^:compiler/rustc_session/src/options.rs:2788`), and the
+        // pre-rename driver read that bool as
+        // `trust_verification_enabled_by_flags(no_trust_verify)`, so:
+        //
+        //   bare / `=y` / `=yes` / `=on` / `=true` -> no_trust_verify = true
+        //                                          -> verification OFF -> `trust-verify=off`
+        //   `=n` / `=no` / `=off` / `=false`       -> no_trust_verify = false
+        //                                          -> verification ON  -> `trust-verify=on`
+        //   anything else                          -> rejected, exactly as
+        //                                             `parse_bool` rejected it
+        //
+        // `=no` is a LOAD-BEARING spelling, not a curiosity: the retired
+        // ecosystem used it to opt verification ON. Compiletest emitted it for
+        // precisely that (`576db732cd^:src/tools/compiletest/src/directives.rs`,
+        // `has_explicit_trust_verification_config`: "`-Zno-trust-verify=no` opts
+        // verification ON"), and `is_trust_verify_off_option` in
+        // `src/bootstrap/src/utils/shared_helpers.rs` preserves the same split
+        // for the mixed-vintage bootstrap. Discarding the value — as this alias
+        // did until now — mapped `=no` to `off` and INVERTED the control: a
+        // caller that asked for verification got a silently unverified compile.
+        //
+        // Note the double negative in `=off`/`=false`: under `parse_bool` those
+        // set `no_trust_verify = false`, which means verification ON. They are
+        // *not* off-requests, however much the spelling suggests it.
+        //
+        // An unrecognized value is a HARD ERROR rather than a default to `off`.
+        // It was a hard error under the retired parser too, so refusing is the
+        // exact behavior; and even if it were not, aborting is strictly better
+        // than guessing at a verification decision. The message is the same one
+        // `parse_bool` would have produced for this option.
         #[cfg(bootstrap)]
         let (key, value) = if prefix == "Z" && key.replace('-', "_") == "no_trust_verify" {
-            ("trust-verify".to_string(), Some("off"))
+            // `true` meant "do not verify".
+            let no_verify = match value {
+                None | Some("y" | "yes" | "on" | "true") => true,
+                Some("n" | "no" | "off" | "false") => false,
+                Some(other) => early_dcx.early_fatal(format!(
+                    "incorrect value `{other}` for {outputname} option `{key}` - {} was expected",
+                    desc::parse_bool
+                )),
+            };
+            ("trust-verify".to_string(), Some(if no_verify { "off" } else { "on" }))
         } else {
             (key, value)
         };
@@ -975,8 +1013,7 @@ mod desc {
         "one of `auto`, `off`, `mint:<dir>`, or `replay:<dir>`";
     pub(crate) const parse_trust_verify_level: &str = "one of `0`, `1`, or `2`";
     pub(crate) const parse_trust_nonempty_path: &str = "a non-empty path";
-    pub(crate) const parse_trust_dump: &str =
-        "`mir:<dir>`, `mir-only:<dir>`, `native-bundle:<dir>`, or `ir:<dir>` \
+    pub(crate) const parse_trust_dump: &str = "`mir:<dir>`, `mir-only:<dir>`, `native-bundle:<dir>`, `ir:<dir>`, or `spec-clean:<dir>` \
          (repeat the option for more than one sink)";
     pub(crate) const parse_trust_verify_crate_role: &str =
         "one of `unscoped`, `primary`, `dependency`, or `build-script`";
@@ -1756,6 +1793,9 @@ pub mod parse {
             "mir" | "mir-only" => &mut slot.mir,
             "native-bundle" => &mut slot.native_bundle,
             "ir" => &mut slot.ir,
+            // Trust (v6/D1): the kernel-graded Clean goal ledger read back by
+            // `targo trust spec --emit clean`.
+            "spec-clean" => &mut slot.spec_clean,
             _ => return false,
         };
         if sink.is_some() {
@@ -3318,11 +3358,49 @@ written to standard error output)"),
          dispatch (requires the nonfatal `-Ztrust-policy=advisory`), `native-bundle:<dir>` \
          writes each finalized native TrustIr verification bundle, `ir:<dir>` writes the assembled \
          crate-level TrustIr lowering artifacts under a pre-input publication lease (the \
-         user-facing spelling for that last artifact is `--emit=trust-ir`); repeat the option for \
+         user-facing spelling for that last artifact is `--emit=trust-ir`), `spec-clean:<dir>` \
+         writes one JSONL row per kernel-graded spec goal exactly as the discharge lane graded it \
+         (the `targo trust spec --emit clean` session artifact); repeat the option for \
          more than one sink"),
+    // Trust (wall A, the INSTANCE flip seam): like `trust_ir_flip`, this may replace the MIR
+    // codegen consumes, so it is TRACKED — two builds that differ here must not share an
+    // artifact identity. `=no` is the lane's negative control (the "delete the seam" arm of the
+    // mutation matrix): the registry still records nothing, and nothing installs.
+    trust_instance_flip: bool = (true, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "allow the Trust-IR flip to install derived MIR PER INSTANCE at the codegen seam, for \
+         generic bodies the DefId seam cannot flip, after a per-instance differential proof \
+         (default: yes; requires -Ztrust-ir-lower and -Ztrust-ir-flip)"),
+    // Trust (wall A): the ADVERSARIAL controls for the instance seam — each corrupts one input
+    // of the per-instance evidence chain and must make the flip VANISH, never produce a body.
+    // TRACKED because a control that changed emitted code without changing the crate hash would
+    // be indistinguishable from the real thing in a cached build.
+    trust_instance_flip_mutate: Option<String> = (None, parse_opt_string, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "wall-A mutation control: corrupt one input of the per-instance flip's evidence chain and \
+         require the differential to catch it. `abi-anchor` derives at IDENTITY args instead of \
+         the instance's; `abi-swap` swaps the first two re-derived ABI anchors (and REFUSES, \
+         loudly, where a signature has no two distinct ones to swap); `abi-ret` derives at a \
+         wrong return anchor (which bites every signature whose Module HAS a return value); \
+         `abi-arg0` derives at a wrong FIRST-ARGUMENT anchor, which bites every signature that \
+         takes one; `incumbent-args` instantiates the \
+         incumbent at the wrong args; `lineage` corrupts the recorded lineage digest. Any value \
+         makes flips fail closed, never wrong"),
     trust_ir_flip: bool = (true, parse_bool, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "allow the direct Trust-IR frontend to derive compatibility/codegen MIR after an exact differential proof (default: yes)"),
+    // Trust (wall A, instance-flip probe): MEASUREMENT ONLY — stashes nothing but
+    // Session-local clones, installs no body, changes no emitted code. UNTRACKED for
+    // exactly that reason: two compiles differing only in this flag emit identical
+    // artifacts. The driver's option-domain gate requires -Ztrust-verify=off
+    // -Ztrust-ir-lower and refuses every -Ztrust-dump sink (see
+    // trust_thir_lower::instance_probe module docs for the double-count rationale).
+    trust_instance_flip_probe: Option<String> = (None, parse_opt_string, [UNTRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "wall-A measurement probe: for generic `agreed` bodies matching the given def-path \
+         substring (`*` = all), measure per-instance differential agreement and ABI \
+         rederivation at concrete GenericArgs; prints TRUST-WALLA-PROBE lines to stderr; \
+         requires -Ztrust-verify=off -Ztrust-ir-lower and no -Ztrust-dump sink"),
     // This is in the crate hash: the TrustIr flip may replace codegen/CTFE MIR,
     // so builds that differ here must not share an artifact identity.
     // Trust (B3-2a): the SAT-perturbation negative control — re-landing the retired
@@ -3336,7 +3414,7 @@ written to standard error output)"),
     // driver option-domain validation).
     trust_sat_perturb: Option<String> = (None, parse_opt_string, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
-        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|payload-tramp|dr-tramp|dr-retire) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
+        "burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|payload-tramp|dr-tramp|dr-retire|mc-plan|cf-lit-order|chain-ret-order|cf-field-drop|cf-unit-late|cf-pair-order|cf-ret-late|cf-post-late|sw-tramp|swr-tramp|g25-hoist|seq-unit-late|g21-ret-order|uc-unit-late) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower"),
     // Trust: tri-state because no single static default is true of this option.
     // The direct frontend is not optional under verification, so an unset
     // request follows verification; only the explicit `-Ztrust-verify=off`

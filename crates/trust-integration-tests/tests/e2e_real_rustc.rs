@@ -848,8 +848,12 @@ fn test_e2e_real_rustc_no_trust_verify_suppresses_transport() {
     std::fs::write(&src_path, TEST_SOURCE).unwrap();
 
     let output_path = tmp.path().join("test_no_verify.rlib");
-    let mut cmd =
-        verified_lib_command_with_args(&rustc, &src_path, &output_path, &["-Z", "trust-verify=off"]);
+    let mut cmd = verified_lib_command_with_args(
+        &rustc,
+        &src_path,
+        &output_path,
+        &["-Z", "trust-verify=off"],
+    );
     let (output, command_line) = run_rustc_command("no-trust-verify compile", &mut cmd);
     assert_rustc_success("no-trust-verify compile", &rustc, &command_line, &output);
 

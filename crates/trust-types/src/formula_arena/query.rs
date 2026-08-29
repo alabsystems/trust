@@ -6,12 +6,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use crate::fx::FxHashSet;
-
-use crate::formula::Sort;
-
 use super::arena::FormulaArena;
 use super::types::{FormulaNode, FormulaRef};
+use crate::formula::Sort;
+use crate::fx::FxHashSet;
 
 impl FormulaArena {
     // -----------------------------------------------------------------------

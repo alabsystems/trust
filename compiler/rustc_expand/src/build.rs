@@ -372,7 +372,7 @@ impl<'a> ExtCtxt<'a> {
         self.expr(span, ast::ExprKind::Call(expr, args))
     }
     pub fn expr_loop(&self, sp: Span, block: Box<ast::Block>) -> Box<ast::Expr> {
-        self.expr(sp, ast::ExprKind::Loop(block, None, sp))
+        self.expr(sp, ast::ExprKind::Loop(block, None, sp, None))
     }
     pub fn expr_asm(&self, sp: Span, expr: Box<ast::InlineAsm>) -> Box<ast::Expr> {
         self.expr(sp, ast::ExprKind::InlineAsm(expr))

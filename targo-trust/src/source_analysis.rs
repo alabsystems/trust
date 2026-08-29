@@ -1,3 +1,4 @@
+// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Lightweight non-proof source audit for explicit standalone mode.
 //
 // Parses Rust source files to extract function signatures, native contract

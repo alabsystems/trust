@@ -4,11 +4,7 @@
 // arithmetic proof surface without std I/O noise.
 
 fn negate_guarded(x: i32) -> i32 {
-    if x == i32::MIN {
-        i32::MAX
-    } else {
-        -x
-    }
+    if x == i32::MIN { i32::MAX } else { -x }
 }
 
 fn main() {

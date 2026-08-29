@@ -1194,15 +1194,8 @@ fn test_json_kind_tags_are_snake_case() {
 fn every_current_vc_kind_has_a_non_unknown_canonical_tag() {
     let sample = |value: &str| value.to_string();
     let kinds = vec![
-        VcKind::ArithmeticOverflow {
-            op: BinOp::Add,
-            operand_tys: (Ty::u32(), Ty::u32()),
-        },
-        VcKind::ShiftOverflow {
-            op: BinOp::Shl,
-            operand_ty: Ty::u32(),
-            shift_ty: Ty::u32(),
-        },
+        VcKind::ArithmeticOverflow { op: BinOp::Add, operand_tys: (Ty::u32(), Ty::u32()) },
+        VcKind::ShiftOverflow { op: BinOp::Shl, operand_ty: Ty::u32(), shift_ty: Ty::u32() },
         VcKind::DivisionByZero,
         VcKind::RemainderByZero,
         VcKind::IndexOutOfBounds,
@@ -1246,11 +1239,7 @@ fn every_current_vc_kind_has_a_non_unknown_canonical_tag() {
         },
         VcKind::ProtocolViolation { protocol: sample("raft"), violation: sample("split brain") },
         VcKind::NonTermination { context: sample("loop"), measure: sample("n") },
-        VcKind::DataRace {
-            variable: sample("x"),
-            thread_a: sample("a"),
-            thread_b: sample("b"),
-        },
+        VcKind::DataRace { variable: sample("x"), thread_a: sample("a"), thread_b: sample("b") },
         VcKind::InsufficientOrdering {
             variable: sample("x"),
             actual: sample("Relaxed"),
@@ -1258,10 +1247,7 @@ fn every_current_vc_kind_has_a_non_unknown_canonical_tag() {
         },
         VcKind::TranslationValidation { pass: sample("dce"), check: sample("refinement") },
         VcKind::FloatDivisionByZero,
-        VcKind::FloatOverflowToInfinity {
-            op: BinOp::Mul,
-            operand_ty: Ty::Float { width: 64 },
-        },
+        VcKind::FloatOverflowToInfinity { op: BinOp::Mul, operand_ty: Ty::Float { width: 64 } },
         VcKind::InvalidDiscriminant { place_name: sample("value") },
         VcKind::AggregateArrayLengthMismatch { expected: 2, actual: 1 },
         VcKind::UnsafeOperation { desc: sample("raw pointer dereference") },
@@ -2046,11 +2032,11 @@ fn test_append_dep_tcb_ledger_empty_is_noop() {
 fn test_append_dep_tcb_ledger_renders_rows() {
     let mut summary = "Verdict: ok".to_string();
     let lines = vec![
-        "Trusted      core  (std hard-skip)".to_string(),
+        "Trusted      core  (foundational std TCB)".to_string(),
         "Conditional  serde  (scoped out)".to_string(),
     ];
     append_dep_tcb_ledger(&mut summary, &lines);
-    assert!(summary.contains("Dependency trust base (scoped out of verification):"));
+    assert!(summary.contains("Dependency and foundational trust base:"));
     assert!(summary.contains("core"));
     assert!(summary.contains("serde"));
 }

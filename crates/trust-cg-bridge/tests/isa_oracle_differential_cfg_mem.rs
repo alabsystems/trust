@@ -106,7 +106,7 @@ fn run_isa(
     args: &[u64],
     max_steps: usize,
 ) -> Option<u64> {
-    use trust_disasm::{decode_aarch64, Opcode};
+    use trust_disasm::{Opcode, decode_aarch64};
     use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics};
 
     for g in cs.gpr.iter_mut() {
@@ -270,7 +270,8 @@ impl XorShift {
     }
 }
 
-const EDGES: &[i32] = &[0, 1, -1, 2, -2, 5, -5, 100, -100, i32::MIN, i32::MAX, i32::MIN + 1, i32::MAX - 1];
+const EDGES: &[i32] =
+    &[0, 1, -1, 2, -2, 5, -5, 100, -100, i32::MIN, i32::MAX, i32::MIN + 1, i32::MAX - 1];
 
 /// (a,b) pairs: full edge×edge cross product + edge×random + pure random, >= 400.
 fn pairs(seed: u64) -> Vec<Vec<i32>> {
@@ -315,7 +316,8 @@ fn triples(seed: u64) -> Vec<Vec<i32>> {
 /// Single-arg loop bounds: 0, 1, small, boundary, plus seeded small positives.
 fn loop_bounds(seed: u64) -> Vec<Vec<i32>> {
     let mut rng = XorShift::new(seed);
-    let mut v: Vec<Vec<i32>> = vec![0, 1, 2, 3, 5, 10, 50, 100, 256, 1000].into_iter().map(|n| vec![n]).collect();
+    let mut v: Vec<Vec<i32>> =
+        vec![0, 1, 2, 3, 5, 10, 50, 100, 256, 1000].into_iter().map(|n| vec![n]).collect();
     while v.len() < 300 {
         v.push(vec![(rng.next_u64() % 2000) as i32]);
     }
@@ -349,7 +351,11 @@ fn cmp_branch_block(
         id: BlockId(0),
         stmts: vec![Statement::Assign {
             place: Place::local(cond_local),
-            rvalue: Rvalue::BinaryOp(cmp, Operand::Copy(Place::local(lhs)), Operand::Copy(Place::local(rhs))),
+            rvalue: Rvalue::BinaryOp(
+                cmp,
+                Operand::Copy(Place::local(lhs)),
+                Operand::Copy(Place::local(rhs)),
+            ),
             span: sp(),
         }],
         terminator: Terminator::SwitchInt {
@@ -421,7 +427,11 @@ fn author_min() -> VerifiableFunction {
                 LocalDecl { index: 2, ty: Ty::i32(), name: Some("b".into()) },
                 LocalDecl { index: 3, ty: Ty::bool_ty(), name: None },
             ],
-            blocks: vec![cmp_branch_block(BinOp::Le, 1, 2, 3, 1, 2), ret_use_block(1, 1), ret_use_block(2, 2)],
+            blocks: vec![
+                cmp_branch_block(BinOp::Le, 1, 2, 3, 1, 2),
+                ret_use_block(1, 1),
+                ret_use_block(2, 2),
+            ],
             arg_count: 2,
             return_ty: Ty::i32(),
             datatype_defs: Default::default(),
@@ -500,7 +510,11 @@ fn author_clamp() -> VerifiableFunction {
                     id: BlockId(0),
                     stmts: vec![Statement::Assign {
                         place: Place::local(4),
-                        rvalue: Rvalue::BinaryOp(BinOp::Lt, Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Lt,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
                         span: sp(),
                     }],
                     terminator: Terminator::SwitchInt {
@@ -517,7 +531,11 @@ fn author_clamp() -> VerifiableFunction {
                     id: BlockId(2),
                     stmts: vec![Statement::Assign {
                         place: Place::local(5),
-                        rvalue: Rvalue::BinaryOp(BinOp::Gt, Operand::Copy(Place::local(1)), Operand::Copy(Place::local(3))),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Gt,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(3)),
+                        ),
                         span: sp(),
                     }],
                     terminator: Terminator::SwitchInt {
@@ -595,8 +613,16 @@ fn author_sum_loop() -> VerifiableFunction {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![
-                        Statement::Assign { place: Place::local(0), rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))), span: sp() },
-                        Statement::Assign { place: Place::local(2), rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))), span: sp() },
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
+                            span: sp(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
+                            span: sp(),
+                        },
                     ],
                     terminator: Terminator::Goto(BlockId(1)),
                 },
@@ -605,7 +631,11 @@ fn author_sum_loop() -> VerifiableFunction {
                     id: BlockId(1),
                     stmts: vec![Statement::Assign {
                         place: Place::local(3),
-                        rvalue: Rvalue::BinaryOp(BinOp::Lt, Operand::Copy(Place::local(2)), Operand::Copy(Place::local(1))),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Lt,
+                            Operand::Copy(Place::local(2)),
+                            Operand::Copy(Place::local(1)),
+                        ),
                         span: sp(),
                     }],
                     terminator: Terminator::SwitchInt {
@@ -620,8 +650,24 @@ fn author_sum_loop() -> VerifiableFunction {
                 BasicBlock {
                     id: BlockId(2),
                     stmts: vec![
-                        Statement::Assign { place: Place::local(0), rvalue: Rvalue::BinaryOp(BinOp::Add, Operand::Copy(Place::local(0)), Operand::Copy(Place::local(2))), span: sp() },
-                        Statement::Assign { place: Place::local(2), rvalue: Rvalue::BinaryOp(BinOp::Add, Operand::Copy(Place::local(2)), Operand::Constant(ConstValue::Uint(1, 32))), span: sp() },
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(0)),
+                                Operand::Copy(Place::local(2)),
+                            ),
+                            span: sp(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                            span: sp(),
+                        },
                     ],
                     terminator: Terminator::Goto(BlockId(1)),
                 },
@@ -662,7 +708,10 @@ fn author_ptr_rw() -> VerifiableFunction {
                     },
                     Statement::Assign {
                         place: Place::local(0),
-                        rvalue: Rvalue::Use(Operand::Copy(Place { local: 1, projections: vec![Projection::Deref] })),
+                        rvalue: Rvalue::Use(Operand::Copy(Place {
+                            local: 1,
+                            projections: vec![Projection::Deref],
+                        })),
                         span: sp(),
                     },
                 ],
@@ -679,7 +728,12 @@ fn author_ptr_rw() -> VerifiableFunction {
 // Per-function CFG differential (int args -> int result).
 // ===========================================================================
 
-fn differential_cfg(func: &VerifiableFunction, nargs: usize, inputs: &[Vec<i32>], max_steps: usize) {
+fn differential_cfg(
+    func: &VerifiableFunction,
+    nargs: usize,
+    inputs: &[Vec<i32>],
+    max_steps: usize,
+) {
     // route-(b): real CPU, batched.
     let cpu = route_b_run_int(func, nargs, inputs);
 
@@ -717,7 +771,12 @@ fn differential_cfg(func: &VerifiableFunction, nargs: usize, inputs: &[Vec<i32>]
 fn cfg_max_min_clamp_abs_dispatch_loop_match_real_cpu() {
     differential_cfg(&author_max(), 2, &pairs(0x1111), 1000);
     differential_cfg(&author_min(), 2, &pairs(0x2222), 1000);
-    differential_cfg(&author_abs(), 1, &pairs(0x3333).into_iter().map(|r| vec![r[0]]).collect::<Vec<_>>(), 1000);
+    differential_cfg(
+        &author_abs(),
+        1,
+        &pairs(0x3333).into_iter().map(|r| vec![r[0]]).collect::<Vec<_>>(),
+        1000,
+    );
     differential_cfg(&author_clamp(), 3, &triples(0x4444), 1000);
     // dispatch: tags 0..=8 (in + out of range) exhaustively, repeated for >= 400.
     let mut tags: Vec<Vec<i32>> = Vec::new();
@@ -744,7 +803,8 @@ fn mem_store_load_roundtrip_matches_real_cpu() {
 
     // Deterministic v values: edges + seeded random, with a byte-order stress value.
     let mut rng = XorShift::new(0x7777);
-    let mut vs: Vec<i32> = vec![0, 1, -1, 0x1234_5678, -0x1234_5678i32, i32::MIN, i32::MAX, 42, 0x7f, -0x80];
+    let mut vs: Vec<i32> =
+        vec![0, 1, -1, 0x1234_5678, -0x1234_5678i32, i32::MIN, i32::MAX, 42, 0x7f, -0x80];
     while vs.len() < 400 {
         vs.push(rng.next_i32());
     }
@@ -786,11 +846,24 @@ int main(void) {{
         path = data_path.display(),
     );
     fs::write(&c_path, harness).expect("harness");
-    let link = Command::new("cc").arg(&c_path).arg(&obj_path).arg("-o").arg(&bin_path).output().expect("cc");
-    assert!(link.status.success(), "mem route-(b) link FAILED: {}", String::from_utf8_lossy(&link.stderr));
+    let link = Command::new("cc")
+        .arg(&c_path)
+        .arg(&obj_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("cc");
+    assert!(
+        link.status.success(),
+        "mem route-(b) link FAILED: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
     let out = Command::new(&bin_path).output().expect("run");
     assert!(out.status.success(), "mem route-(b) run FAILED: {:?}", out.status);
-    let cpu: Vec<i32> = String::from_utf8_lossy(&out.stdout).split_whitespace().map(|t| t.parse().expect("int")).collect();
+    let cpu: Vec<i32> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(|t| t.parse().expect("int"))
+        .collect();
     assert_eq!(cpu.len(), vs.len() * 2, "route-(b) must print (ret, cell) per input");
 
     // ---- route-(a): formal ISA model, SAME bytes. Seed code image, pick a data
@@ -845,8 +918,10 @@ fn run_isa_inverted_bcond(
     code: &[u8],
     args: &[u64],
 ) -> Option<i32> {
-    use trust_disasm::{decode_aarch64, Opcode};
-    use trust_machine_sem::{eval_condition, Aarch64Semantics, ConcreteFlags, Effect, MachineState, Semantics};
+    use trust_disasm::{Opcode, decode_aarch64};
+    use trust_machine_sem::{
+        Aarch64Semantics, ConcreteFlags, Effect, MachineState, Semantics, eval_condition,
+    };
 
     for g in cs.gpr.iter_mut() {
         *g = 0;
@@ -882,7 +957,9 @@ fn run_isa_inverted_bcond(
                     cs.apply_effect(eff).ok()?;
                     pc_set = true;
                 }
-                Effect::Branch { target } | Effect::Return { target } | Effect::Call { target, .. } => {
+                Effect::Branch { target }
+                | Effect::Return { target }
+                | Effect::Call { target, .. } => {
                     cs.pc = cs.eval_bv(target, 64).ok()? as u64;
                     pc_set = true;
                 }
@@ -947,9 +1024,15 @@ fn coverage_report() {
     // HONEST record of what this rung newly validates-by-execution vs leaves audited.
     println!("=== G13-FULL CFG/compare/select/loop/memory differential coverage ===");
     println!("VALIDATED-BY-EXECUTION (route-a ISA model == route-b real CPU, same bytes):");
-    println!("  ICmp           : cfg_max(Ge) cfg_min(Le) cfg_abs(Lt) cfg_clamp(Lt,Gt) cfg_sum_loop(Lt)");
-    println!("  CondBr (BCond) : every if/loop-guard above; negative control inverts it -> detected");
-    println!("  Select         : if/else materialization (Csinc + branch merge) in max/min/abs/clamp");
+    println!(
+        "  ICmp           : cfg_max(Ge) cfg_min(Le) cfg_abs(Lt) cfg_clamp(Lt,Gt) cfg_sum_loop(Lt)"
+    );
+    println!(
+        "  CondBr (BCond) : every if/loop-guard above; negative control inverts it -> detected"
+    );
+    println!(
+        "  Select         : if/else materialization (Csinc + branch merge) in max/min/abs/clamp"
+    );
     println!("  Switch (multi) : cfg_dispatch (3 cases + default), in+out-of-range tags");
     println!("  Loop backedge  : cfg_sum_loop (backward Branch), bounds 0/1/.../2000");
     println!("  Store (Str)    : mem_ptr_rw  (*p = v), confirmed landed in memory both routes");

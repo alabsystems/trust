@@ -283,36 +283,15 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 }
                 ExprKind::While(cond, body, opt_label, contract) => {
                     // Trust: collect first-class loop clauses (E4/E5) into the
-                    // enclosing body's contract. The HIR id is the unique loop
-                    // association key; the full-expression and true header
-                    // spans are retained separately for honest diagnostics.
-                    if let Some(contract) = contract {
-                        let loop_span = self.lower_span(e.span);
-                        let header_span = self.lower_span(e.span.with_hi(body.span.lo()));
-                        for clause in &contract.clauses {
-                            let kind = match clause.kind {
-                                rustc_ast::LoopClauseKind::Invariant => {
-                                    hir::LoopClauseKind::Invariant
-                                }
-                                rustc_ast::LoopClauseKind::Decreases => {
-                                    hir::LoopClauseKind::Decreases
-                                }
-                            };
-                            self.trust_loop_clauses.push(hir::LoopClause {
-                                loop_id: expr_hir_id,
-                                loop_span,
-                                header_span,
-                                keyword_span: self.lower_span(clause.keyword_span),
-                                payload_span: self.lower_span(clause.clause.predicate),
-                                payload: clause.clause.payload,
-                                kind,
-                                citation: clause
-                                    .clause
-                                    .citation
-                                    .map(|citation| self.lower_trust_citation(citation)),
-                            });
-                        }
-                    }
+                    // enclosing body's contract. `while`, `loop` and `for` all
+                    // route through the one `collect_trust_loop_clauses` helper
+                    // so no surface can grow its own clause semantics.
+                    self.collect_trust_loop_clauses(
+                        expr_hir_id,
+                        e.span,
+                        body.span.lo(),
+                        contract.as_deref(),
+                    );
                     self.with_loop_scope(expr_hir_id, |this| {
                         let span =
                             this.mark_span_with_reason(DesugaringKind::WhileLoop, e.span, None);
@@ -320,7 +299,18 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         this.lower_expr_while_in_loop_scope(span, cond, body, opt_label)
                     })
                 }
-                ExprKind::Loop(body, opt_label, span) => {
+                ExprKind::Loop(body, opt_label, span, contract) => {
+                    // Trust: identical clause collection to `while`. The HIR
+                    // node the clauses are keyed to is this very `hir::Loop`,
+                    // exactly as for `while` after its desugaring, so MIR
+                    // source-scope stamping and natural-header provenance need
+                    // no `loop`-specific path at all.
+                    self.collect_trust_loop_clauses(
+                        expr_hir_id,
+                        e.span,
+                        body.span.lo(),
+                        contract.as_deref(),
+                    );
                     self.with_loop_scope(expr_hir_id, |this| {
                         let opt_label = this.lower_label(*opt_label, e.id, expr_hir_id);
                         hir::ExprKind::Loop(
@@ -1780,6 +1770,32 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
         let loop_hir_id = self.lower_node_id(e.id);
         let label = self.lower_label(opt_label, e.id, loop_hir_id);
+
+        // Trust: `for` carries NO first-class loop clause, and the reason is
+        // written down here because this desugaring IS the reason.
+        //
+        // Had a clause been accepted, it would attach to `loop_hir_id` — the
+        // desugaring's inner `loop`, whose natural MIR header is the block
+        // before `Iterator::next(&mut iter)`. That header is therefore reached
+        // only THROUGH the `IntoIterator::into_iter(head)` call terminator
+        // built below, on every `for` loop without exception, and vcgen has no
+        // exact initiation model across a non-straight-line entry
+        // (`e45.transition.entry-not-straight-line`). Measured end to end on a
+        // build that did wire it through: every `for` clause produced its
+        // obligations and every one came back UNKNOWN.
+        //
+        // A second consequence, worth recording for whoever revisits this: the
+        // loop PATTERN BINDINGS are not in scope at that header either. `x` is
+        // bound by the `Some(x) =>` arm strictly inside the body, and the
+        // clause environment comes from region scopes
+        // (`visible_loop_source_sorts`), which admits a binding only when the
+        // loop scope is a subscope of the binding's scope. So even with an
+        // initiation model, `for x in v invariant P(x)` could not mention `x`.
+        //
+        // The refusal itself lives in the parser
+        // (`Parser::reject_trust_for_loop_contract`) so it can point at the
+        // authored clause keyword.
+
 
         // `None => break`
         let none_arm = {

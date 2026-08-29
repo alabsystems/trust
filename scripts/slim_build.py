@@ -125,15 +125,40 @@ def extra_reap_paths(build: Path, host_root: Path) -> list[Path]:
 
 def build_in_progress(root: Path) -> str | None:
     lock = root / "build" / "lock"
+
+    # The build-tree mutual exclusion lock is authoritative: x.py holds it for the
+    # whole build and run_measurement_sweep.sh holds it for a whole sweep, and
+    # deleting build artifacts under EITHER is destructive. `status` exits 3 when
+    # the tree is busy.
+    build_lock = root / "scripts" / "trust_build_lock.sh"
+    if build_lock.is_file():
+        try:
+            out = subprocess.run(
+                ["/bin/sh", str(build_lock), "status"],
+                capture_output=True, text=True, check=False,
+            )
+            if out.returncode == 3:
+                return "the build tree is locked:\n" + (out.stderr or out.stdout).rstrip()
+        except OSError:
+            pass
+
     try:
-        out = subprocess.run(
-            # "bootstrap build" too: the python x.py wrapper can die while its
-            # bootstrap child keeps building (observed 2026-08-01, attempt 8).
-            ["pgrep", "-f", "x.py|recreate_bootstrap|bootstrap build"],
-            capture_output=True, text=True, check=False,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return f"a build appears to be running (pids {out.stdout.split()})"
+        # Two pgreps, not one, and NEITHER may assume argument order.
+        #
+        # The previous single pattern carried `bootstrap build`, which never
+        # matched: bootstrap.py builds its child argv as
+        # `[bootstrap_binary] + sys.argv[1:]`, so `x.py --stage 1 build` produces
+        # `build/bootstrap/debug/bootstrap --stage 1 build` and the two words are
+        # not adjacent. `pgrep -x` matches the executable NAME and is immune.
+        # (The comment it replaces was right about WHY bootstrap must be matched
+        # separately — the python x.py wrapper can die while its bootstrap child
+        # keeps building, observed 2026-08-01, attempt 8 — and the pattern it
+        # justified could not do it.)
+        for args in (["pgrep", "-f", r"x\.py|recreate_bootstrap"],
+                     ["pgrep", "-x", "bootstrap"]):
+            out = subprocess.run(args, capture_output=True, text=True, check=False)
+            if out.returncode == 0 and out.stdout.strip():
+                return f"a build appears to be running (pids {out.stdout.split()})"
     except OSError:
         pass
     if lock.exists():

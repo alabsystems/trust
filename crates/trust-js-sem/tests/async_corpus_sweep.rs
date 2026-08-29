@@ -13,10 +13,11 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -111,7 +112,9 @@ fn collect_js_files(dir: &Path, cap: usize) -> Vec<PathBuf> {
 #[allow(clippy::too_many_lines)]
 fn async_corpus_sweep_vs_node() {
     let Ok(node) = std::env::var("TRUST_JS_NODE") else {
-        eprintln!("SKIP async_corpus_sweep_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS)");
+        eprintln!(
+            "SKIP async_corpus_sweep_vs_node: set TRUST_JS_NODE (and optionally TRUST_JS262_CORPUS)"
+        );
         return;
     };
     let corpus = std::env::var("TRUST_JS262_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string());
@@ -153,11 +156,8 @@ fn async_corpus_sweep_vs_node() {
             } else {
                 &[false, true]
             };
-            let mut include_names: Vec<String> = if raw {
-                Vec::new()
-            } else {
-                vec!["assert.js".to_string(), "sta.js".to_string()]
-            };
+            let mut include_names: Vec<String> =
+                if raw { Vec::new() } else { vec!["assert.js".to_string(), "sta.js".to_string()] };
             include_names.extend(fm.includes.iter().cloned());
             // The test262 runner auto-includes the async harness (which defines
             // `$DONE`) for every `async`-flagged test, whether or not the
@@ -282,11 +282,7 @@ fn async_corpus_sweep_vs_node() {
 }
 
 fn mode_str(strict: bool) -> &'static str {
-    if strict {
-        "strict"
-    } else {
-        "bare"
-    }
+    if strict { "strict" } else { "bare" }
 }
 
 /// Collapse a refusal reason to a stable bucket key (strip trailing specifics).

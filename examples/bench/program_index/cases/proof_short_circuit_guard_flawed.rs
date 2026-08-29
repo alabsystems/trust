@@ -4,11 +4,7 @@
 // path-sensitive guard surface without std I/O noise.
 
 fn divide_when_enabled(num: u32, den: u32, enabled: bool) -> u32 {
-    if enabled || den != 0 {
-        num / den
-    } else {
-        0
-    }
+    if enabled || den != 0 { num / den } else { 0 }
 }
 
 fn main() {

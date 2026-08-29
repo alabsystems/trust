@@ -7,9 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ProofCertificate;
-
 use super::types::{ComposedProof, CompositionError};
+use crate::ProofCertificate;
 
 /// Check the structural prerequisites for modular cross-function composition.
 ///

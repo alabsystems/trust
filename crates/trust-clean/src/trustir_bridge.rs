@@ -625,8 +625,12 @@ pub const BRIDGE_ROOT_MODULES: &[&str] = &[
 ];
 
 /// Manifest schema ids (versioned, one per vendored tree).
-pub const TRUSTIR_MANIFEST_SCHEMA: &str = "trust.trust-clean.trustir-oleans.manifest.v1";
-pub const LEAN_CORE_MANIFEST_SCHEMA: &str = "trust.vendor.lean-core-oleans.manifest.v1";
+// v2 partitions the file table by build platform (see `ManifestDoc`). The
+// version is matched EXACTLY, not as a minimum: a v1 manifest has a single
+// flat `[files]` table with no platform dimension, so reading one here would
+// silently verify another platform's bytes as if they were ours.
+pub const TRUSTIR_MANIFEST_SCHEMA: &str = "trust.trust-clean.trustir-oleans.manifest.v2";
+pub const LEAN_CORE_MANIFEST_SCHEMA: &str = "trust.vendor.lean-core-oleans.manifest.v2";
 
 // ---------------------------------------------------------------------------
 // Lean sources elaborated by clean against the IMPORTED constants.
@@ -1422,17 +1426,30 @@ const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
         lemma: "Lemma 2 (unsigned-add overflow)",
         form: ArmForm::B,
         reduces_theorem: "overflow_uadd_flag_reduces",
+        // The underflow disjunct's `Decidable` instance is pinned explicitly
+        // (`@Decidable.decide (… < 0) (Int.decLt … 0)`): on a comparison with
+        // a GROUND side (here the literal `0`), clean-elab's instance search
+        // whnf-unfolds the goal past `Int.lt` to `Int.NonNeg …`, misses
+        // `Int.decLt`, and falls back to the noncomputable
+        // `Classical.propDecidable` — which the kernel cannot reduce (rfl
+        // dies) and which drags `Classical.choice` into the axiom closure.
+        // `Int.decLt` is the very instance the imported def carries, so the
+        // pinned statement is the SAME proposition with the SAME decision
+        // procedure — the flag semantics (overflow iff exact ≥ 2^w or
+        // exact < 0) are unchanged and nothing is weakened.
         reduces_src: r#"theorem overflow_uadd_flag_reduces (w : Nat) (l r : Int) :
     TrustIr.semOverflowOp TrustIr.OverflowOp.AddOverflow w false l r =
       Except.ok ((((l + r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
-                 Decidable.decide (l + r ≥ (2:Int)^w) || Decidable.decide (l + r < 0)) := rfl
+                 Decidable.decide (l + r ≥ (2:Int)^w) ||
+                 @Decidable.decide (l + r < 0) (Int.decLt (l + r) 0)) := rfl
 "#,
         extra_src: "",
         connect_theorem: "bridge_overflow_uadd_flag",
         connect_src: r#"theorem bridge_overflow_uadd_flag (w : Nat) (l r : Int) :
     TrustIr.semOverflowOp TrustIr.OverflowOp.AddOverflow w false l r =
       Except.ok ((((l + r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
-                 Decidable.decide (((2:Int)^w - 1) < (l + r)) || Decidable.decide (l + r < 0)) := by
+                 Decidable.decide (((2:Int)^w - 1) < (l + r)) ||
+                 @Decidable.decide (l + r < 0) (Int.decLt (l + r) 0)) := by
   rw [overflow_uadd_flag_reduces, overflow_threshold_decide_eq]
 "#,
     },
@@ -1442,15 +1459,18 @@ const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
         lemma: "Lemma 8 (unsigned-sub underflow)",
         form: ArmForm::BGuarded,
         reduces_theorem: "overflow_usub_flag_reduces",
+        // Underflow disjunct instance pinned for the same reason as the
+        // AddOverflow[u] arm above.
         reduces_src: r#"theorem overflow_usub_flag_reduces (w : Nat) (l r : Int) :
     TrustIr.semOverflowOp TrustIr.OverflowOp.SubOverflow w false l r =
       Except.ok ((((l - r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
-                 Decidable.decide (l - r ≥ (2:Int)^w) || Decidable.decide (l - r < 0)) := rfl
+                 Decidable.decide (l - r ≥ (2:Int)^w) ||
+                 @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0)) := rfl
 "#,
         extra_src: r#"theorem overflow_usub_flag_vacuous (w : Nat) (l r : Int)
     (hl1 : l < (2:Int)^w) (hr0 : (0:Int) ≤ r) :
-    (Decidable.decide (l - r ≥ (2:Int)^w) || Decidable.decide (l - r < 0)) =
-      Decidable.decide (l - r < 0) := by
+    (Decidable.decide (l - r ≥ (2:Int)^w) || @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0)) =
+      @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0) := by
   rw [decide_eq_false (l - r ≥ (2:Int)^w)
         ((Int.not_le ((2:Int)^w) (l - r)).mpr (Int.lt_of_le_of_lt (Int.sub_le_self l r hr0) hl1)),
       Bool.false_or]
@@ -1459,7 +1479,8 @@ const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
         connect_src: r#"theorem bridge_overflow_usub_flag (w : Nat) (l r : Int)
     (hl1 : l < (2:Int)^w) (hr0 : (0:Int) ≤ r) :
     TrustIr.semOverflowOp TrustIr.OverflowOp.SubOverflow w false l r =
-      Except.ok ((((l - r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)), Decidable.decide (l - r < 0)) := by
+      Except.ok ((((l - r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
+                 @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0)) := by
   rw [overflow_usub_flag_reduces, overflow_usub_flag_vacuous w l r hl1 hr0]
 "#,
     },
@@ -1564,10 +1585,12 @@ const OVERFLOW_COMPOSED_SRC: &str = r#"theorem bridge_semOverflowOp_agreement_al
   ∧ (∀ (w : Nat) (l r : Int),
       TrustIr.semOverflowOp TrustIr.OverflowOp.AddOverflow w false l r =
         Except.ok ((((l + r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
-                   Decidable.decide (((2:Int)^w - 1) < (l + r)) || Decidable.decide (l + r < 0)))
+                   Decidable.decide (((2:Int)^w - 1) < (l + r)) ||
+                   @Decidable.decide (l + r < 0) (Int.decLt (l + r) 0)))
   ∧ (∀ (w : Nat) (l r : Int) (hl1 : l < (2:Int)^w) (hr0 : (0:Int) ≤ r),
       TrustIr.semOverflowOp TrustIr.OverflowOp.SubOverflow w false l r =
-        Except.ok ((((l - r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)), Decidable.decide (l - r < 0)))
+        Except.ok ((((l - r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
+                   @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0)))
   ∧ (∀ (w : Nat) (l r : Int),
       TrustIr.semOverflowOp TrustIr.OverflowOp.AddOverflow w true l r =
         Except.ok (((((TrustIr.toSigned l w) + (TrustIr.toSigned r w)) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
@@ -2782,8 +2805,9 @@ const STEPINST_OVERFLOW_CONNECT_SRC: &str = r#"theorem bridge_stepInst_overflow_
               (TrustIr.Value.aggregate [TrustIr.Value.int 8
                   ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
                 TrustIr.Value.bool
-                  (Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r)) ||
-                    Decidable.decide (v_l + v_r < 0))]),
+                  (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
+                      (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
+                    @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))]),
           nextValueId := 3 }) :=
   by
     rw [stepinst_overflow_add_unsigned_chain v_l v_r, bridge_overflow_uadd_flag 8 v_l v_r]
@@ -2810,8 +2834,9 @@ const STEPINST_OVERFLOW_COMPOSED_SRC: &str = r#"theorem bridge_stepInst_overflow
                 (TrustIr.Value.aggregate [TrustIr.Value.int 8
                     ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
                   TrustIr.Value.bool
-                    (Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r)) ||
-                      Decidable.decide (v_l + v_r < 0))]),
+                    (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
+                        (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
+                      @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))]),
             nextValueId := 3 }) :=
   bridge_stepInst_overflow_add_unsigned
 "#;
@@ -3185,8 +3210,9 @@ const STEPINST_CATEGORIES_COMPOSED_SRC: &str = r#"theorem bridge_stepInst_catego
                 (TrustIr.Value.aggregate [TrustIr.Value.int 8
                     ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
                   TrustIr.Value.bool
-                    (Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r)) ||
-                      Decidable.decide (v_l + v_r < 0))]),
+                    (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
+                        (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
+                      @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))]),
             nextValueId := 3 }))
   ∧ (∀ (v_l v_r : Int),
       TrustIr.Sem.run
@@ -4804,6 +4830,15 @@ pub enum BridgeGateError {
          before any Lean was emitted or loaded): {detail}"
     )]
     GeneratedFamilyEnvelopeRefused { family: String, detail: String },
+    #[error(
+        "vendored oleans in {manifest} are not built for this platform: the manifest \
+         vendors [{available}] but this build is {wanted}. Regenerate on this platform \
+         with scripts/regen-trustir-oleans.sh --write (non-destructive — other platforms \
+         are carried forward). This FAILS CLOSED on purpose: falling back to another \
+         platform's bytes would feed foreign artifacts into the kernel replay path, \
+         which is the exact thing the manifest exists to prevent."
+    )]
+    PlatformNotVendored { manifest: PathBuf, available: String, wanted: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -4814,7 +4849,22 @@ pub enum BridgeGateError {
 struct ManifestDoc {
     schema: String,
     provenance: ManifestProvenance,
+    /// Files whose bytes are identical on every vendored platform.
     files: BTreeMap<String, String>,
+    /// Per-platform artifacts, keyed by target triple. A file appears here
+    /// only when the vendored platforms actually DISAGREE about its bytes; its
+    /// on-disk path is `platform/<triple>/<key>`. Empty on a single-platform
+    /// tree, which is why it defaults rather than being required.
+    #[serde(default)]
+    platforms: BTreeMap<String, ManifestPlatform>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestPlatform {
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    // (lean_version / built_on are recorded per platform for humans; the gate
+    // does not read them.)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4822,8 +4872,28 @@ struct ManifestProvenance {
     #[serde(default)]
     trustir_commit: Option<String>,
     lean_toolchain: String,
-    // (The manifests carry further human-facing provenance — lean_version,
-    // root_module, build_command, built_on — not needed by the gate logic.)
+    // (The manifests carry further human-facing provenance — root_module,
+    // build_command — not needed by the gate logic. `lean_version`/`built_on`
+    // moved into the per-platform tables in schema v2: a single stamp here
+    // necessarily named one platform while claiming to describe every byte.)
+}
+
+/// The target triple this build verifies vendored oleans for.
+///
+/// Must match the triple `scripts/regen-trustir-oleans.sh` derives from Lean's
+/// own version string, because that is what names the `platform/<triple>/`
+/// directories.
+fn host_triple() -> String {
+    format!(
+        "{}-{}",
+        std::env::consts::ARCH,
+        match (std::env::consts::OS, std::env::consts::FAMILY) {
+            ("macos", _) => "apple-darwin",
+            ("linux", _) => "unknown-linux-gnu",
+            ("windows", _) => "pc-windows-msvc",
+            (other, _) => other,
+        }
+    )
 }
 
 /// A verified vendored-olean tree: files listed in the manifest, each with a
@@ -4831,9 +4901,21 @@ struct ManifestProvenance {
 #[derive(Debug)]
 struct VerifiedTree {
     dir: PathBuf,
+    /// `<dir>/platform/<host triple>` — where artifacts whose bytes differ per
+    /// platform live. Searched BEFORE `dir` so a platform-specific olean
+    /// shadows the shared one; absent (and simply never matching) on a tree
+    /// with no platform-specific files.
+    platform_dir: PathBuf,
     files: BTreeSet<String>,
     trustir_commit: Option<String>,
     lean_toolchain: String,
+}
+
+impl VerifiedTree {
+    /// Directories to search for this tree's oleans, most specific first.
+    fn search_dirs(&self) -> Vec<PathBuf> {
+        vec![self.platform_dir.clone(), self.dir.clone()]
+    }
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -4869,9 +4951,28 @@ fn verify_manifest(
             field: "trustir_commit".to_string(),
         });
     }
+    // Schema v2 partitions the file table by build platform. Verify the shared
+    // set plus THIS platform's overrides, and nothing else: another platform's
+    // bytes are legitimately present on disk but are not ours to check.
+    let triple = host_triple();
+    let mine = doc.platforms.get(&triple);
+    if !doc.platforms.is_empty() && mine.is_none() {
+        return Err(BridgeGateError::PlatformNotVendored {
+            manifest: manifest_path,
+            available: doc.platforms.keys().cloned().collect::<Vec<_>>().join(", "),
+            wanted: triple,
+        });
+    }
+
     let mut files = BTreeSet::new();
-    for (rel, expected_sha) in &doc.files {
-        let full = dir.join(rel);
+    let shared = doc.files.iter().map(|(r, s)| (r, s, false));
+    let specific = mine.into_iter().flat_map(|p| p.files.iter().map(|(r, s)| (r, s, true)));
+    for (rel, expected_sha, is_platform) in shared.chain(specific) {
+        // A platform-specific artifact lives under platform/<triple>/, so that
+        // two platforms can vendor the same logical module without one
+        // overwriting the other at a shared path.
+        let full =
+            if is_platform { dir.join("platform").join(&triple).join(rel) } else { dir.join(rel) };
         let actual = sha256_file(&full).map_err(|_| BridgeGateError::OleanMissing {
             rel: rel.clone(),
             manifest: manifest_path.clone(),
@@ -4883,10 +4984,13 @@ fn verify_manifest(
                 actual,
             });
         }
+        // Keyed by LOGICAL module path in both cases — callers look modules up
+        // by name and must not have to know which platform provided the bytes.
         files.insert(rel.clone());
     }
     Ok(VerifiedTree {
         dir: dir.to_path_buf(),
+        platform_dir: dir.join("platform").join(&triple),
         files,
         trustir_commit: doc.provenance.trustir_commit,
         lean_toolchain: doc.provenance.lean_toolchain,
@@ -5779,7 +5883,8 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
     // -- 3. Machine-import the vendored closure (the UNION of both roots). --
     let mut env = Environment::default();
     env.ensure_native_reducers();
-    let search_paths = vec![trustir_tree.dir.clone(), core_tree.dir.clone()];
+    let mut search_paths = trustir_tree.search_dirs();
+    search_paths.extend(core_tree.search_dirs());
     let root_modules: Vec<String> = BRIDGE_ROOT_MODULES.iter().map(|s| (*s).to_string()).collect();
     let summaries = load_modules_with_deps(&mut env, &root_modules, &search_paths)
         .map_err(|e| BridgeGateError::Import { detail: format!("{e:?}") })?;
@@ -7282,7 +7387,8 @@ mod tests {
                 .expect("core manifest");
         let mut env = Environment::default();
         env.ensure_native_reducers();
-        let search_paths = vec![trustir_tree.dir.clone(), core_tree.dir.clone()];
+        let mut search_paths = trustir_tree.search_dirs();
+        search_paths.extend(core_tree.search_dirs());
         let root_modules: Vec<String> =
             BRIDGE_ROOT_MODULES.iter().map(|s| (*s).to_string()).collect();
         load_modules_with_deps(&mut env, &root_modules, &search_paths).expect("closure import");
@@ -7576,7 +7682,8 @@ mod tests {
                 .expect("core manifest");
         let mut env = Environment::default();
         env.ensure_native_reducers();
-        let search_paths = vec![trustir_tree.dir.clone(), core_tree.dir.clone()];
+        let mut search_paths = trustir_tree.search_dirs();
+        search_paths.extend(core_tree.search_dirs());
         let root_modules: Vec<String> =
             BRIDGE_ROOT_MODULES.iter().map(|s| (*s).to_string()).collect();
         load_modules_with_deps(&mut env, &root_modules, &search_paths).expect("closure import");

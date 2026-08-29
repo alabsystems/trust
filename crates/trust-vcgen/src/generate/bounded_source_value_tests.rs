@@ -66,8 +66,9 @@ const MAP_EXPLOIT: &str = include_str!(
 const MAP_CONTROL: &str = include_str!(
     "../../fixtures/unbounded-sysroot-iterator-2026-08-17/map_over_rangefrom_ordinary_crate_name.json"
 );
-const COMPACTED_EXPLOIT: &str =
-    include_str!("../../fixtures/compacted-source-2026-08-18/compacted_cycle_impersonating_std.json");
+const COMPACTED_EXPLOIT: &str = include_str!(
+    "../../fixtures/compacted-source-2026-08-18/compacted_cycle_impersonating_std.json"
+);
 const COMPACTED_CONTROL: &str = include_str!(
     "../../fixtures/compacted-source-2026-08-18/compacted_cycle_ordinary_crate_name.json"
 );
@@ -502,8 +503,7 @@ fn a_compacted_aggregate_is_still_refused_by_its_preserved_name() {
 
     // …and a compacted aggregate that names nothing unbounded is NOT refused on
     // its own account — the refusal above is the name, not the compaction.
-    let compacted_vec =
-        Ty::Datatype { name: "alloc::vec::Vec".to_string(), variants: Vec::new() };
+    let compacted_vec = Ty::Datatype { name: "alloc::vec::Vec".to_string(), variants: Vec::new() };
     assert!(!ty_is_unbounded_sysroot_iterator(&compacted_vec));
     assert!(!ty_is_unbounded_sysroot_iterator(&Ty::adt(
         "alloc::vec::into_iter::IntoIter",

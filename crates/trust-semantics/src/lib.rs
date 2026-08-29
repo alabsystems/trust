@@ -46,6 +46,110 @@
 //! meaning and risk a false-PROVE — so we deliberately do not.
 
 #![forbid(unsafe_code)]
+// Trust (contract attachment, 2026-08-26): the `#[requires(..)]` clauses written
+// out in English below are now ATTACHED, behind a cfg.
+//
+// The blocker the author recorded was real but narrower than it reads: the
+// contract attribute desugars through `#![feature(contracts)]`, and THIS clone's
+// stage0 (`build/<host>/genesis-stage0/bin/trustc`) is a renamed Homebrew STABLE
+// rustc, which answers `error[E0554]: #![feature] may not be used on the stable
+// release channel`. `x.py` compiles this crate with that stage0 (it is in the
+// compiler's link closure via trust-vcgen -> rustc_mir_transform), so an
+// UNCONDITIONAL `#![feature(contracts)]` breaks the build outright — measured.
+//
+// `cfg_attr` strips BEFORE the feature gate is checked, which removes the
+// dilemma. MEASURED on a probe of exactly this shape:
+//   stage0 (stable), cfg OFF -> rc=0, artifact produced      (x.py unaffected)
+//   stage1 trustc,   cfg ON  -> the contract is READ:
+//       "conditional definition-entry assumption; every caller must establish
+//        the requires contract"      2 kernel-certified, 0 failed
+//
+// Enable with `--cfg trust_contracts`. HONEST LIMIT: with the cfg OFF the
+// artifact carries NO contract metadata, so an ordinary `x.py` build makes no
+// claim — only the verified lane does. Attaching a contract here is therefore
+// additive: it can add a proof obligation, never remove one.
+//
+// NO RUNTIME EFFECT at the default setting, checked rather than assumed:
+// `-Zcontract-checks` is documented in `compiler/rustc_session/src/options.rs`
+// as "emit runtime checks for contract pre- and post-conditions (default: no)",
+// and its default is `None`. So these clauses are proof obligations only.
+// This matters here specifically: every one of these bodies was deliberately
+// rewritten to be TOTAL — out-of-domain widths saturate where they once
+// panicked — so a contract that lowered to a runtime assert would REINTRODUCE
+// the panics the author removed. Under `-Zcontract-checks=yes` it would.
+// Do not turn that flag on for this crate without re-reading the totality
+// paragraphs on each function below.
+//
+// The domain is propagated, not just asserted at the leaves. `signed_min` /
+// `signed_max` state it; `type_min_formula` / `type_max_formula` and the two
+// `noOverflow_*` builders repeat it because they pass `width` straight down.
+// Measured: attaching it to the two leaves alone left 2 FAILED caller-side
+// rows (a correct refusal — the callers could not establish it); propagating
+// one level turned those into PROVED rows (23 -> 25) and moved the frontier
+// outward rather than deleting it, with the row total RISING (83 -> 89).
+// Propagating to the two `noOverflow_*` builders closed the chain INSIDE this
+// crate.
+//
+// THE `29 proved` THIS PARAGRAPH USED TO CLAIM IS STALE — re-measured
+// 2026-08-27 on driver `trustc 31ccf1b56` at 27, not 29, with the same
+// `91 total` and `24/24 (complete)`. `tests/self-proof/trust-semantics.baseline`
+// carries the same stale `proved_min = 29`, so that floor is currently
+// UNREACHABLE; it is not load-bearing today only because the gate refuses this
+// crate outright on the 27 pre-existing compile errors (7 native-lowering
+// failures) documented in that baseline file. Do not raise it to 29.
+//
+// POSTCONDITIONS ADDED 2026-08-27 (`signed_min`, `signed_max`). Measured on the
+// same driver, `RUSTFLAGS=--cfg=trust_contracts targo trust check -p
+// trust-semantics`, baseline -> with-ensures:
+//
+//   27 proved, 0 failed, 6 assumed, 44 inconclusive (91 total)
+//   31 proved, 0 failed, 6 assumed, 48 inconclusive (99 total)
+//
+// The row TOTAL ROSE 91 -> 99 and NO surviving row changed outcome (per-key
+// multiset diff: 8 genuinely new rows, 0 outcome changes; the 6 keys that
+// "disappeared" are index-renumbered twins of 6 gained ones, same kind and same
+// outcome). All 4 new proved rows are kernel-certified
+// (`Certified`/`Constructive`, backend `clean-kernel`) — so this is a
+// discharged obligation, not a vanished one.
+//
+// The 27 compile errors are UNCHANGED by this: the postconditions neither
+// caused nor fixed them.
+//
+// TWO HAZARDS THIS CONTRACT CARRIES. Both are recorded because they are real,
+// not to argue against the contract.
+//
+// (1) THE CROSS-CHECK TESTS DELIBERATELY CALL OUT OF CONTRACT. Verified:
+//     `crates/trust-vcgen/src/range.rs:110` pins
+//     `CROSS_CHECK_WIDTHS = [0, 1, 7, 8, 16, 32, 64, 126, 127, 128, 255]`, and
+//     its own comment says why — `127` is where the historical `(1 << w) - 1`
+//     wrapped, `129`/`255` "shift past the i128 word". Widths `0` and `255`
+//     VIOLATE `1 <= width && width <= 128`. Those differential tests exist to
+//     pin that this crate's copies and trust-vcgen's private originals agree
+//     out of domain, which is exactly the saturating behaviour the totality
+//     rewrite added. So the contract states the MEANINGFUL domain while the
+//     bodies remain total as defense-in-depth — coherent, and the author's own
+//     wording ("routing an out-of-contract width to a concrete bound") shows
+//     that was the intent. It is safe today ONLY because contract checks are
+//     off by default: under `-Zcontract-checks=yes` those two widths would
+//     panic and the cross-check tests would fail. Flagged for the author as a
+//     design call, not resolved here.
+//
+// (2) A CALLER-SIDE PRECONDITION IS LOST UNDER MIR INLINING. Recorded in
+//     `reports/audit-2026-07-25-contract-loss-under-inlining.md` §1: at
+//     `-Copt-level=3` a caller that VIOLATES a `requires` was silently
+//     accepted (exit 0, zero errors), and `-Zinline-mir=no` restored the
+//     rejection — the call terminator disappears, so the VC is never minted.
+//     Callee-side `ensures` is unaffected. These four functions are tiny and
+//     un-annotated, i.e. prime inlining candidates. `targo trust check` runs
+//     the dev profile at opt-level 0, so the measurements above are valid; a
+//     RELEASE-profile verify of this crate would not be. That audit is dated
+//     2026-07-25 and I did not re-confirm it at HEAD — treat the status as
+//     unverified-today, the mechanism as documented.
+#![cfg_attr(trust_contracts, expect(incomplete_features))]
+#![cfg_attr(trust_contracts, feature(contracts))]
+
+#[cfg(trust_contracts)]
+use core::contracts::{ensures, requires};
 
 use clean_kernel::name::Name;
 use clean_kernel::{BinderInfo, Declaration, Environment, Expr, Level};
@@ -76,6 +180,7 @@ use trust_types::{Formula, Sort};
 /// the value the historical wrapping arithmetic produced) — a defined,
 /// non-panicking over-approximation that never makes a real value look in-range.
 #[must_use]
+#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn type_max_formula(width: u32, signed: bool) -> Formula {
     if signed {
         Formula::Int(signed_max(width))
@@ -93,6 +198,7 @@ pub fn type_max_formula(width: u32, signed: bool) -> Formula {
 /// Minimum value for an integer type, as a [`Formula`].
 /// Mirrors `trust_vcgen::range::type_min_formula`.
 #[must_use]
+#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn type_min_formula(width: u32, signed: bool) -> Formula {
     if signed { Formula::Int(signed_min(width)) } else { Formula::Int(0) }
 }
@@ -126,7 +232,16 @@ pub fn type_min_formula(width: u32, signed: bool) -> Formula {
 /// out-of-contract width to a concrete bound (rather than fabricating an
 /// arbitrary in-range value) keeps this a sound over-approximation: it never
 /// makes a real over-/under-flow look in-range.
+/// TOTAL postcondition, true for EVERY `u32` width — not just in-contract ones,
+/// and it does not lean on the `requires` above. Every arm returns a strictly
+/// negative value: `width == 128` and the out-of-domain arm both return
+/// `i128::MIN`; the middle arm returns `-(1i128 << (width - 1))` with the shift
+/// amount in `0..=126`, so the shifted value is in `1..=2^126` and its negation
+/// is in `-2^126..=-1`. Stated as `< 0` because that is exactly what the three
+/// arms jointly establish; the body is unchanged.
 #[must_use]
+#[cfg_attr(trust_contracts, ensures(move |ret: &i128| *ret < 0))]
+#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn signed_min(width: u32) -> i128 {
     // `1 <= width <= 127`: `width - 1` in `0..=126`, shift in range.
     // `width == 128`: i128::MIN. `width == 0` or `width > 128`: saturate to MIN.
@@ -164,7 +279,16 @@ pub fn signed_min(width: u32) -> i128 {
 /// (`width == 0` or `width > 128`), which previously panicked, saturate to
 /// `i128::MAX` — a defined, non-panicking value that is a sound
 /// over-approximation (never makes a real overflow look in-range).
+/// TOTAL postcondition, true for EVERY `u32` width — not just in-contract ones,
+/// and it does not lean on the `requires` above. Every arm returns a
+/// non-negative value: `width == 128` and the out-of-domain arm both return
+/// `i128::MAX`; the middle arm returns `(1i128 << (width - 1)) - 1` with the
+/// shift amount in `0..=126`, so the shifted value is in `1..=2^126` and the
+/// result is in `0..=2^126 - 1` (it is exactly `0` at `width == 1`, which is why
+/// the bound is `>= 0` and not `> 0`). The body is unchanged.
 #[must_use]
+#[cfg_attr(trust_contracts, ensures(move |ret: &i128| *ret >= 0))]
+#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn signed_max(width: u32) -> i128 {
     if width == 128 {
         i128::MAX
@@ -208,6 +332,7 @@ pub fn signed_max(width: u32) -> i128 {
 /// result term name the generator threads through `operand_to_formula`.
 #[must_use]
 #[allow(non_snake_case)]
+#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn noOverflow_violation_formula(width: u32, signed: bool, result_var: &str) -> Formula {
     let result = Formula::Var(result_var.to_string(), Sort::Int);
     let min_f = type_min_formula(width, signed);
@@ -232,6 +357,7 @@ pub fn noOverflow_violation_formula(width: u32, signed: bool, result_var: &str) 
 /// successful refutation establishes). Same fragment/scope caveats apply.
 #[must_use]
 #[allow(non_snake_case)]
+#[cfg_attr(trust_contracts, requires(1 <= width && width <= 128))]
 pub fn noOverflow_safe_range_formula(width: u32, signed: bool, result_var: &str) -> Formula {
     let result = Formula::Var(result_var.to_string(), Sort::Int);
     let min_f = type_min_formula(width, signed);
@@ -327,11 +453,7 @@ fn no_overflow_body() -> Expr {
     Expr::lam(
         BinderInfo::Default,
         int_ty(),
-        Expr::lam(
-            BinderInfo::Default,
-            int_ty(),
-            Expr::lam(BinderInfo::Default, int_ty(), body),
-        ),
+        Expr::lam(BinderInfo::Default, int_ty(), Expr::lam(BinderInfo::Default, int_ty(), body)),
     )
 }
 
@@ -445,7 +567,11 @@ fn binary_int_pred(name: &str, body: Expr) -> Declaration {
         name: Name::from_string(name),
         level_params: vec![],
         type_: Expr::arrow(int_ty(), Expr::arrow(int_ty(), prop_ty())),
-        value: Expr::lam(BinderInfo::Default, int_ty(), Expr::lam(BinderInfo::Default, int_ty(), body)),
+        value: Expr::lam(
+            BinderInfo::Default,
+            int_ty(),
+            Expr::lam(BinderInfo::Default, int_ty(), body),
+        ),
         is_reducible: true,
     }
 }
@@ -470,7 +596,11 @@ pub fn rustvir_full_env() -> Option<Environment> {
     // panic-freedom
     env.add_decl(noNegOverflowSub_definition()).ok()?;
     // inBounds idx len := And (0 <= idx) (idx < len)   (idx = bvar1, len = bvar0)
-    env.add_decl(binary_int_pred(IN_BOUNDS_NAME, and_prop(le_int(int_zero(), Expr::bvar(1)), lt_int(Expr::bvar(1), Expr::bvar(0))))).ok()?;
+    env.add_decl(binary_int_pred(
+        IN_BOUNDS_NAME,
+        and_prop(le_int(int_zero(), Expr::bvar(1)), lt_int(Expr::bvar(1), Expr::bvar(0))),
+    ))
+    .ok()?;
     // ownership / type invariants
     env.add_decl(binary_int_pred(BORROW_VALID_NAME, lt_int(Expr::bvar(1), Expr::bvar(0)))).ok()?; // now < end
     env.add_decl(binary_int_pred(OUTLIVES_NAME, le_int(Expr::bvar(0), Expr::bvar(1)))).ok()?; // eb <= ea

@@ -12,14 +12,10 @@ const REQUIRED_AGREED: [&str; 5] = [
     "fieldless_reassignment",
     "nested_holder_round_trip",
 ];
-const REQUIRED_FAIL_CLOSED: [&str; 2] = [
-    "option_wildcard_before_variant",
-    "multi_wildcard_before_variant",
-];
-const REQUIRED_DIVERGING_GUARD_FAIL_CLOSED: [&str; 2] = [
-    "option_diverging_guard",
-    "multi_diverging_guard",
-];
+const REQUIRED_FAIL_CLOSED: [&str; 2] =
+    ["option_wildcard_before_variant", "multi_wildcard_before_variant"];
+const REQUIRED_DIVERGING_GUARD_FAIL_CLOSED: [&str; 2] =
+    ["option_diverging_guard", "multi_diverging_guard"];
 
 fn main() {
     if std::env::var_os(TRUST_VANILLA_REAL_RUSTC_ENV).is_some() {
@@ -110,9 +106,8 @@ fn main() {
         // divergence is admitted either. Pin the honest executed-but-skipped state
         // (accepting a future return to full "agreed") rather than a false claim.
         let interpreter = &body["differentials"]["interpreter"];
-        let interpreter_verdict = interpreter["verdict"]
-            .as_str()
-            .expect("interpreter verdict must be typed text");
+        let interpreter_verdict =
+            interpreter["verdict"].as_str().expect("interpreter verdict must be typed text");
         assert!(
             matches!(interpreter_verdict, "agreed" | "not-run"),
             "`{required}` interpreter verdict must be agreement or a conservative \
@@ -142,9 +137,8 @@ fn main() {
         let body = matching[0];
         assert_eq!(body["lowered"], false, "`{required}` must fail closed: {body}");
         assert_eq!(body["spliced"], false, "`{required}` must not splice: {body}");
-        let unsupported = body["unsupported"]
-            .as_array()
-            .expect("unsupported inventory must be an array");
+        let unsupported =
+            body["unsupported"].as_array().expect("unsupported inventory must be an array");
         assert_eq!(
             unsupported
                 .iter()
@@ -173,9 +167,8 @@ fn main() {
         let body = matching[0];
         assert_eq!(body["lowered"], false, "`{required}` must fail closed: {body}");
         assert_eq!(body["spliced"], false, "`{required}` must not splice: {body}");
-        let unsupported = body["unsupported"]
-            .as_array()
-            .expect("unsupported inventory must be an array");
+        let unsupported =
+            body["unsupported"].as_array().expect("unsupported inventory must be an array");
         assert_eq!(
             unsupported
                 .iter()

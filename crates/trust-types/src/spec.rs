@@ -376,6 +376,28 @@ pub enum SpecParseError {
     #[error("trailing tokens after expression")]
     TrailingTokens,
 
+    /// An `as` cast in a first-class (native) clause.
+    ///
+    /// Split out of the generic [`Self::TrailingTokens`] because that message
+    /// hid WHICH construct was refused: `requires idx <= u32::MAX as usize`
+    /// reported only "trailing tokens after expression", while `u32::MAX` on
+    /// its own was accepted — so the message pointed away from the cast that
+    /// was actually the problem.
+    ///
+    /// The refusal itself is correct and stays. Deciding whether a cast
+    /// preserves its operand's value needs the operand's TYPE and the target's
+    /// pointer width, and this parser deliberately runs outside a rustc target
+    /// context (see `primitive_integer_constant`), so it cannot make that
+    /// judgement. Guessing would be exactly the truncating-cast false proof.
+    #[error(
+        "`as` casts are not supported in a first-class clause (in `{clause}`): this parser has \
+         no type or target-width information, so it cannot tell a value-preserving cast from a \
+         truncating one, and assuming the wrong one would be a false proof; drop the cast if the \
+         bound holds without it, or state the clause on the attribute surface, where the cast is \
+         checked against the real types and refused unless it preserves every value"
+    )]
+    UnsupportedCast { clause: String },
+
     /// Quantifier syntax error.
     #[error("invalid quantifier syntax: {detail}")]
     InvalidQuantifier { detail: String },

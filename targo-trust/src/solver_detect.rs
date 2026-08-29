@@ -45,13 +45,20 @@ const KNOWN_SOLVERS: &[SolverSpec] = &[
     SolverSpec {
         name: "trust-vc",
         binary: "trust-vc",
-        description: "Ownership-aware verification",
+        description: "Auto-active SMT proof calculus; mir-memory certificates",
         proof_levels: &["L0"],
     },
+    // Trust (TrustWP verdict-authority retirement): the `L1` level below is a
+    // ROUTING fact, not a capability claim. `TrustWpRouterBackend` is registered
+    // unconditionally (`trust_verify.rs`, `discover_router_backends`) and its
+    // `Deductive` role ranks first for `L1Functional` (`trust-router`
+    // `routing.rs`, `backend_preference_rank`), but the native engine behind it
+    // advertises no obligation kinds, so past canonical constant folding
+    // (`trust_wp_backend.rs`, `verify`) every routed VC fail-closes to `Unknown`.
     SolverSpec {
         name: "trust-wp",
         binary: "trust-wp",
-        description: "Deductive verification, strongest postconditions",
+        description: "Zero-capability: routed for L1 contract VCs, proves only constant folds",
         proof_levels: &["L1"],
     },
     SolverSpec {
@@ -398,8 +405,8 @@ pub(crate) fn render_solvers_terminal(solvers: &[SolverInfo]) {
         );
         eprintln!();
         eprintln!("Solver requirements by proof level:");
-        eprintln!("  L0 (basic):    ay + trust_mc + trust-vc");
-        eprintln!("  L1 (moderate): L0 + trust-wp");
+        eprintln!("  L0 (basic):    ay + trust-mc + trust-vc");
+        eprintln!("  L1 (moderate): L0 (trust-wp is routed but zero-capability)");
         eprintln!("  L2 (full):     L1 + ty + clean");
     } else if available_count < total {
         eprintln!();

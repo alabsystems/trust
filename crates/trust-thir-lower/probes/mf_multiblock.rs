@@ -52,22 +52,14 @@ pub fn cast_if(v: u64) -> u32 {
 // A nested diamond in the THEN arm.
 #[inline(never)]
 pub fn nested_if(a: u32, b: u32) -> u32 {
-    if a == 0 {
-        if b == 0 { 1 } else { 2 }
-    } else {
-        3
-    }
+    if a == 0 { if b == 0 { 1 } else { 2 } } else { 3 }
 }
 
 // `clean_kernel`'s `expr::bvar_in_range`, verbatim: a nested diamond in the ELSE arm, 21 markers
 // over 9 built blocks — the body lane K was funded for.
 #[inline(never)]
 pub fn bvar_in_range(idx: u32, start: u32, end: u32) -> bool {
-    if end == u32::MAX {
-        idx >= start
-    } else {
-        idx >= start && idx < end
-    }
+    if end == u32::MAX { idx >= start } else { idx >= start && idx < end }
 }
 
 // ---- OUT of the planned class, each for a named reason. NOT a to-do list. ------------------
@@ -149,9 +141,5 @@ pub fn to_signed(val: u64, bits: u32) -> i64 {
         return val as i64;
     }
     let sign_bit = 1u64 << (bits - 1);
-    if val & sign_bit != 0 {
-        val as i64 - (1i64 << bits)
-    } else {
-        val as i64
-    }
+    if val & sign_bit != 0 { val as i64 - (1i64 << bits) } else { val as i64 }
 }

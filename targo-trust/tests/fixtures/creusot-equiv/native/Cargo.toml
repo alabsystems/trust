@@ -1,0 +1,16 @@
+# Blob-equivalence AFTER side: the INDEPENDENTLY AUTHORED native clause.
+# `targo trust spec --emit clean` on this package renders the expected goals;
+# no tool generated the clauses in src/lib.rs and none may regenerate them.
+# NOTE the package NAME is shared with ../proposed/ on purpose: goal rows key
+# on def_path, and a shared crate name makes the two sides' def_paths (and any
+# crate-name leakage into rendered goals) byte-comparable. Pinned by the
+# harness test `both_sides_share_one_crate_name`.
+[package]
+name = "creusot-equiv-subject"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

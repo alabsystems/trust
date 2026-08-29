@@ -1,10 +1,11 @@
 //! Stable, sealed-file validation for one certified-monitor payload directory.
 
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+
+use sha2::{Digest, Sha256};
 
 use super::super::{
     CERTIFIED_MONITOR_EVIDENCE_MANIFEST, CERTIFIED_MONITOR_MAX_IDENTITY_BYTES,

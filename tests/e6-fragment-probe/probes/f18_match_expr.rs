@@ -5,4 +5,9 @@
 clean { def ident_b (x : Bool) : Bool := x }
 pub fn f(x: bool) -> bool
     ensures result == ident_b(x)
-{ match x { true => true, false => false } }
+{
+    match x {
+        true => true,
+        false => false,
+    }
+}

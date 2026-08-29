@@ -16,11 +16,11 @@
 
 use std::collections::HashSet;
 
+use trust_js_parse::Program;
 use trust_js_parse::ast::{
-    Arg, Class, ClassElement, DeclKind, Expr, ExportDecl, ForHead, ForInit, Func, ImportDecl,
+    Arg, Class, ClassElement, DeclKind, ExportDecl, Expr, ForHead, ForInit, Func, ImportDecl,
     ModuleExportName, ObjProp, Pat, PropKey, Stmt,
 };
-use trust_js_parse::Program;
 
 /// Function-nesting context for the `this` / `super` / `new.target` / `await`
 /// guards. All four are lexical through arrow functions, so an arrow inherits;
@@ -91,7 +91,7 @@ fn scan_stmt(stmt: &Stmt, ctx: Ctx) -> Result<(), String> {
         Stmt::Decl { kind, decls } => {
             if matches!(kind, DeclKind::AwaitUsing) && !ctx.in_async {
                 return Err(
-                    "top-level `await using` declaration (async module, out of slice)".to_string(),
+                    "top-level `await using` declaration (async module, out of slice)".to_string()
                 );
             }
             for (pat, init) in decls {
@@ -185,9 +185,7 @@ fn scan_stmt(stmt: &Stmt, ctx: Ctx) -> Result<(), String> {
         }
         Stmt::FuncDecl(f) => scan_func(f, ctx),
         Stmt::ClassDecl(c) => scan_class(c, ctx),
-        Stmt::Import(_) => {
-            Err("`import` declaration (module loader, out of slice)".to_string())
-        }
+        Stmt::Import(_) => Err("`import` declaration (module loader, out of slice)".to_string()),
         Stmt::Export(exp) => match exp {
             ExportDecl::Star { .. } => {
                 Err("`export *` re-export (module loader, out of slice)".to_string())
@@ -247,9 +245,7 @@ fn scan_expr(expr: &Expr, ctx: Ctx) -> Result<(), String> {
             }
         }
         Expr::ImportMeta => Err("`import.meta` (module meta object, out of slice)".to_string()),
-        Expr::ImportCall(_) => {
-            Err("dynamic `import()` (module loader, out of slice)".to_string())
-        }
+        Expr::ImportCall(_) => Err("dynamic `import()` (module loader, out of slice)".to_string()),
         Expr::SuperProp(prop) => {
             if !ctx.in_regular_fn {
                 return Err("module top-level `super`".to_string());
@@ -408,11 +404,7 @@ fn scan_func(func: &Func, outer: Ctx) -> Result<(), String> {
     // a non-arrow function establishes fresh ones.
     let inner = Ctx {
         in_regular_fn: if func.is_arrow { outer.in_regular_fn } else { true },
-        in_async: if func.is_arrow {
-            func.is_async || outer.in_async
-        } else {
-            func.is_async
-        },
+        in_async: if func.is_arrow { func.is_async || outer.in_async } else { func.is_async },
     };
     // Parameter default initializers run in the function's own scope (inner).
     for p in &func.params {
@@ -546,12 +538,7 @@ pub(crate) fn lower_linked(prog: Program) -> Result<LoweredModule, String> {
 
     for stmt in prog.body {
         match stmt {
-            Stmt::Import(ImportDecl {
-                default,
-                namespace,
-                named,
-                source,
-            }) => {
+            Stmt::Import(ImportDecl { default, namespace, named, source }) => {
                 // `import d from "src"`: the default binding is a named import of
                 // the reserved export name "default".
                 if let Some(local) = default {
@@ -569,7 +556,9 @@ pub(crate) fn lower_linked(prog: Program) -> Result<LoweredModule, String> {
                     let imported = match entry.imported {
                         ModuleExportName::Ident(n) => n,
                         ModuleExportName::Str(_) => {
-                            return Err("string module-export-name import (out of slice)".to_string())
+                            return Err(
+                                "string module-export-name import (out of slice)".to_string()
+                            );
                         }
                     };
                     imports.push(ImportBinding {
@@ -591,8 +580,8 @@ pub(crate) fn lower_linked(prog: Program) -> Result<LoweredModule, String> {
                     }
                     Some(ModuleExportName::Str(_)) => {
                         return Err(
-                            "string module-export-name in `export * as` (out of slice)".to_string(),
-                        )
+                            "string module-export-name in `export * as` (out of slice)".to_string()
+                        );
                     }
                 }
                 dep_specs.push(source);
@@ -607,18 +596,22 @@ pub(crate) fn lower_linked(prog: Program) -> Result<LoweredModule, String> {
                             return Err(
                                 "string module-export-name re-export source (out of slice)"
                                     .to_string(),
-                            )
+                            );
                         }
                     };
                     let exported = match e.exported {
                         ModuleExportName::Ident(n) => n,
                         ModuleExportName::Str(_) => {
                             return Err(
-                                "string module-export-name re-export (out of slice)".to_string(),
-                            )
+                                "string module-export-name re-export (out of slice)".to_string()
+                            );
                         }
                     };
-                    named_reexports.push(NamedReexport { exported, imported, source: source.clone() });
+                    named_reexports.push(NamedReexport {
+                        exported,
+                        imported,
+                        source: source.clone(),
+                    });
                 }
                 dep_specs.push(source);
             }
@@ -634,13 +627,15 @@ pub(crate) fn lower_linked(prog: Program) -> Result<LoweredModule, String> {
                     let local = match e.local {
                         ModuleExportName::Ident(n) => n,
                         ModuleExportName::Str(_) => {
-                            return Err("string module-export-name local (out of slice)".to_string())
+                            return Err(
+                                "string module-export-name local (out of slice)".to_string()
+                            );
                         }
                     };
                     let exported = match e.exported {
                         ModuleExportName::Ident(n) => n,
                         ModuleExportName::Str(_) => {
-                            return Err("string module-export-name (out of slice)".to_string())
+                            return Err("string module-export-name (out of slice)".to_string());
                         }
                     };
                     exports.push((exported, local));
@@ -745,14 +740,12 @@ fn lower_default_export(inner: Stmt) -> Result<(String, Stmt), String> {
 /// out-of-slice declaration kind.
 fn export_decl_names(inner: &Stmt) -> Result<Vec<String>, String> {
     match inner {
-        Stmt::FuncDecl(f) => Ok(vec![f
-            .name
-            .clone()
-            .ok_or_else(|| "unnamed exported function".to_string())?]),
-        Stmt::ClassDecl(c) => Ok(vec![c
-            .name
-            .clone()
-            .ok_or_else(|| "unnamed exported class".to_string())?]),
+        Stmt::FuncDecl(f) => {
+            Ok(vec![f.name.clone().ok_or_else(|| "unnamed exported function".to_string())?])
+        }
+        Stmt::ClassDecl(c) => {
+            Ok(vec![c.name.clone().ok_or_else(|| "unnamed exported class".to_string())?])
+        }
         Stmt::Decl { kind, decls } => {
             if matches!(kind, DeclKind::Using | DeclKind::AwaitUsing) {
                 return Err("`using` export declaration (out of slice)".to_string());

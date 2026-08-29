@@ -5,10 +5,7 @@ use trust_verifier_api::{
     TrustObligation,
 };
 
-use super::policy::{
-    TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY, TRUST_VC_HARDENED_NAMESPACE,
-    TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE,
-};
+use super::policy::{TRUST_VC_HARDENED_NAMESPACE, TRUST_VC_UNBOUNDED_ALLOCATION_NAMESPACE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrimaryEngine {
@@ -18,8 +15,10 @@ pub(super) enum PrimaryEngine {
     Ty,
 }
 
-pub(super) const REQUIRED_PRIMARY_ENGINES: [PrimaryEngine; 4] =
-    [PrimaryEngine::TrustWp, PrimaryEngine::TrustVc, PrimaryEngine::TrustMc, PrimaryEngine::Ty];
+// TrustWP remains a recognized historical wire/provenance identity, but is not
+// a required engine while it owns no dischargeable obligation kind.
+pub(super) const REQUIRED_PRIMARY_ENGINES: [PrimaryEngine; 3] =
+    [PrimaryEngine::TrustVc, PrimaryEngine::TrustMc, PrimaryEngine::Ty];
 
 impl PrimaryEngine {
     pub(super) fn name(self) -> &'static str {
@@ -54,7 +53,6 @@ impl PrimaryEngine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProofFamily {
-    TrustWpFunctional,
     TrustVcOwnership,
     TrustMcReachability,
     TyTemporal,
@@ -83,9 +81,6 @@ impl ObligationRoute {
 
     pub(super) fn accepts_reasoning(&self, reasoning: &ReasoningKind) -> bool {
         match self.proof_family {
-            ProofFamily::TrustWpFunctional => {
-                matches!(reasoning, ReasoningKind::Deductive | ReasoningKind::Inductive)
-            }
             ProofFamily::TrustVcOwnership => {
                 matches!(reasoning, ReasoningKind::OwnershipAnalysis | ReasoningKind::Deductive)
             }
@@ -101,7 +96,6 @@ impl ObligationRoute {
 
     pub(super) fn required_strength_description(&self) -> &'static str {
         match self.proof_family {
-            ProofFamily::TrustWpFunctional => "trust-wp deductive or inductive Sound+ proof",
             ProofFamily::TrustVcOwnership => {
                 "trust-vc ownership-analysis or deductive Sound+ proof"
             }
@@ -111,114 +105,13 @@ impl ObligationRoute {
     }
 }
 
-/// Metadata key marking a body-aware VC that carries a typed `TrustSpecPredicate`
-/// formula payload (mirrors `trust.vc.formula.payload` set by the compiler's
-/// mir-extract). A `Postcondition` or `Precondition` obligation carrying it is a
-/// body-aware VC (`¬cond ∧ body_defs`, a closed CHC-reachability query — the
-/// `#[ensures]` VC and the call-site `#[requires]` VC respectively) routed to
-/// trust-mc; one without it is a claim-based obligation kept on trust-wp.
-const TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY: &str = "trust.vc.formula.payload";
-const TRUST_VC_FORMULA_SCHEMA_METADATA_KEY: &str = "trust.vc.formula.schema";
-
-fn obligation_has_vc_formula_payload(obligation: &TrustObligation) -> bool {
-    obligation.metadata.iter().any(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-}
-
-fn unique_metadata_value<'a>(obligation: &'a TrustObligation, key: &str) -> Option<&'a str> {
-    let mut matches = obligation.metadata.iter().filter(|entry| entry.key == key);
-    let value = matches.next()?.value.as_str();
-    matches.next().is_none().then_some(value)
-}
-
-/// E4/E5 become TrustMC-owned only for the exact compiler-authored typed VC
-/// envelope accepted by the TrustMC adapter. Keeping this test identical to
-/// the adapter prevents a partial or forged metadata envelope from changing
-/// dispatch ownership even though downstream proof admission is fail-closed.
-fn is_typed_body_aware_e4_e5_obligation(obligation: &TrustObligation) -> bool {
-    if !matches!(obligation.kind, ObligationKind::LoopInvariant | ObligationKind::Termination) {
-        return false;
-    }
-
-    let Some(schema) = unique_metadata_value(obligation, TRUST_VC_FORMULA_SCHEMA_METADATA_KEY)
-    else {
-        return false;
-    };
-    if schema != trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION {
-        return false;
-    }
-
-    let Some(payload) = unique_metadata_value(obligation, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-    else {
-        return false;
-    };
-    let Ok(predicate) =
-        trust_types::json_depth::from_str_deep::<trust_verifier_api::TrustSpecPredicate>(payload)
-    else {
-        return false;
-    };
-    if predicate.validate().is_err()
-        || !predicate.has_current_schema()
-        || predicate.root_sort != trust_verifier_api::TrustSpecSort::Bool
-        || predicate.root.sort != trust_verifier_api::TrustSpecSort::Bool
-    {
-        return false;
-    }
-
-    let Some(encoded_context) =
-        unique_metadata_value(obligation, trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY)
-    else {
-        return false;
-    };
-    let Ok(context) = trust_types::json_depth::from_str_deep::<trust_verifier_api::ObligationContext>(
-        encoded_context,
-    ) else {
-        return false;
-    };
-    context.has_current_schema()
-        && matches!(&context.producer, trust_verifier_api::ObligationProducer::CompilerMirExtract)
-        && matches!(
-            &context.origin,
-            trust_verifier_api::ObligationOrigin::VerificationCondition {
-                formula_schema: Some(formula_schema),
-                ..
-            } if formula_schema == trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION
-        )
-}
-
-fn uniquely_declared_native_primary(obligation: &TrustObligation) -> Option<PrimaryEngine> {
-    let mut declarations = obligation
-        .metadata
-        .iter()
-        .filter(|entry| entry.key == TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY);
-    let declaration = declarations.next()?;
-    if declarations.next().is_some() {
-        return None;
-    }
-    match declaration.value.as_str() {
-        "trust-vc" => Some(PrimaryEngine::TrustVc),
-        "trust-wp" => Some(PrimaryEngine::TrustWp),
-        "trust-mc" => Some(PrimaryEngine::TrustMc),
-        "ty" => Some(PrimaryEngine::Ty),
-        _ => None,
-    }
-}
-
-/// Payload-aware routing: keeps [`obligation_route_for_kind`] for every claim,
-/// but routes a body-aware VC carrying the compiler's typed violation formula
-/// to trust-mc's CHC/PDR lane. E4/E5 require the complete, current typed
-/// predicate and compiler-origin envelope accepted by the TrustMC adapter;
-/// the older pre/postcondition lane retains its payload-presence dispatch
-/// behavior. This must match the compiler's
-/// `native_trust_ir_route_for_api_obligation` exactly so engine dispatch and the
-/// recorded-suite / expected-suite evidence check agree.
+/// Route one typed obligation under the v6/D3 ownership split.
 ///
-/// `Precondition`/`Postcondition` payloads are closed call/body reachability
-/// queries. E4 `LoopInvariant` payloads are closed initiation or consecution
-/// violations, and E5 `Termination` payloads are closed non-negative/strict-
-/// decrease violations over the reconstructed transition. Payload-less authored
-/// claims stay on trust-wp. Merely selecting this route is never proof: the
-/// trust-mc adapter still requires a well-typed formula plus an exactly matching
-/// native request, replay, and proof-check artifact.
+/// Precondition, postcondition, loop-invariant, and termination obligations are
+/// TrustMC-owned whether or not a producer attached a body formula. A missing
+/// formula fails closed in TrustMC; it never changes ownership or falls back to
+/// the retired TrustWP contract lane. Producer-supplied suite metadata cannot
+/// change this ownership table; it is checked later as a binding invariant.
 pub(super) fn obligation_route(obligation: &TrustObligation) -> Option<ObligationRoute> {
     let body_aware_vc_kind = match &obligation.kind {
         ObligationKind::Postcondition => Some("Postcondition"),
@@ -228,40 +121,12 @@ pub(super) fn obligation_route(obligation: &TrustObligation) -> Option<Obligatio
         _ => None,
     };
     if let Some(obligation_kind) = body_aware_vc_kind {
-        let routes_to_trust_mc = match &obligation.kind {
-            ObligationKind::Precondition | ObligationKind::Postcondition => {
-                obligation_has_vc_formula_payload(obligation)
-            }
-            ObligationKind::LoopInvariant | ObligationKind::Termination => {
-                is_typed_body_aware_e4_e5_obligation(obligation)
-            }
-            _ => false,
-        };
-        if routes_to_trust_mc {
-            return Some(ObligationRoute {
-                obligation_kind,
-                primary: PrimaryEngine::TrustMc,
-                proof_family: ProofFamily::TrustMcReachability,
-                minimum_assurance: RequiredAssurance::SmtBacked,
-            });
-        }
-        // A kernel-certified contract obligation is planned as a typed
-        // TrustVc certificate import. Honor that route only for an exact,
-        // unique native-suite declaration and only for contract kinds. The
-        // declaration is routing input, never proof authority: acceptance
-        // still requires the matching validated native request, public claim
-        // identity, semantic digest, replayed certificate, and import
-        // metadata. Body-aware CHC VCs above retain TrustMc precedence, so a
-        // contradictory TrustVc declaration fails later at the typed suite
-        // binding instead of changing ownership.
-        if uniquely_declared_native_primary(obligation) == Some(PrimaryEngine::TrustVc) {
-            return Some(ObligationRoute {
-                obligation_kind,
-                primary: PrimaryEngine::TrustVc,
-                proof_family: ProofFamily::TrustVcOwnership,
-                minimum_assurance: RequiredAssurance::Sound,
-            });
-        }
+        return Some(ObligationRoute {
+            obligation_kind,
+            primary: PrimaryEngine::TrustMc,
+            proof_family: ProofFamily::TrustMcReachability,
+            minimum_assurance: RequiredAssurance::SmtBacked,
+        });
     }
     obligation_route_for_kind(&obligation.kind)
 }
@@ -393,15 +258,15 @@ pub(super) fn obligation_route_for_kind(kind: &ObligationKind) -> Option<Obligat
     let route = match kind {
         ObligationKind::Precondition => ObligationRoute {
             obligation_kind: "Precondition",
-            primary: PrimaryEngine::TrustWp,
-            proof_family: ProofFamily::TrustWpFunctional,
-            minimum_assurance: RequiredAssurance::Sound,
+            primary: PrimaryEngine::TrustMc,
+            proof_family: ProofFamily::TrustMcReachability,
+            minimum_assurance: RequiredAssurance::SmtBacked,
         },
         ObligationKind::Postcondition => ObligationRoute {
             obligation_kind: "Postcondition",
-            primary: PrimaryEngine::TrustWp,
-            proof_family: ProofFamily::TrustWpFunctional,
-            minimum_assurance: RequiredAssurance::Sound,
+            primary: PrimaryEngine::TrustMc,
+            proof_family: ProofFamily::TrustMcReachability,
+            minimum_assurance: RequiredAssurance::SmtBacked,
         },
         ObligationKind::Assertion => ObligationRoute {
             obligation_kind: "Assertion",
@@ -417,9 +282,9 @@ pub(super) fn obligation_route_for_kind(kind: &ObligationKind) -> Option<Obligat
         },
         ObligationKind::LoopInvariant => ObligationRoute {
             obligation_kind: "LoopInvariant",
-            primary: PrimaryEngine::TrustWp,
-            proof_family: ProofFamily::TrustWpFunctional,
-            minimum_assurance: RequiredAssurance::Sound,
+            primary: PrimaryEngine::TrustMc,
+            proof_family: ProofFamily::TrustMcReachability,
+            minimum_assurance: RequiredAssurance::SmtBacked,
         },
         ObligationKind::ArithmeticSafety => ObligationRoute {
             obligation_kind: "ArithmeticSafety",
@@ -452,15 +317,15 @@ pub(super) fn obligation_route_for_kind(kind: &ObligationKind) -> Option<Obligat
         },
         ObligationKind::Refinement => ObligationRoute {
             obligation_kind: "Refinement",
-            primary: PrimaryEngine::TrustWp,
-            proof_family: ProofFamily::TrustWpFunctional,
+            primary: PrimaryEngine::TrustVc,
+            proof_family: ProofFamily::TrustVcOwnership,
             minimum_assurance: RequiredAssurance::Sound,
         },
         ObligationKind::Termination => ObligationRoute {
             obligation_kind: "Termination",
-            primary: PrimaryEngine::TrustWp,
-            proof_family: ProofFamily::TrustWpFunctional,
-            minimum_assurance: RequiredAssurance::Sound,
+            primary: PrimaryEngine::TrustMc,
+            proof_family: ProofFamily::TrustMcReachability,
+            minimum_assurance: RequiredAssurance::SmtBacked,
         },
         ObligationKind::TemporalSafety => ObligationRoute {
             obligation_kind: "TemporalSafety",

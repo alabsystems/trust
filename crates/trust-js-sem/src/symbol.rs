@@ -10,12 +10,13 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::value::{
-    units_from_str, Builtin, NativeErrorKind, ObjId, ObjKind, Prop, PropDesc, PropVal, PropertyKey,
-    SymData, SymId, Units, Value,
+    Builtin, NativeErrorKind, ObjId, ObjKind, Prop, PropDesc, PropVal, PropertyKey, SymData, SymId,
+    Units, Value, units_from_str,
 };
-use std::rc::Rc;
 
 impl Interp {
     // -- symbol value helpers ------------------------------------------------
@@ -100,24 +101,16 @@ impl Interp {
     pub(crate) fn get_prop_value_sym(&mut self, base: &Value, sid: SymId) -> ERes {
         match base {
             Value::Obj(oid) => self.get_with_receiver_sym(*oid, sid, base.clone()),
-            Value::Str(_) => {
-                self.get_with_receiver_sym(self.intr.string_proto, sid, base.clone())
-            }
-            Value::Num(_) => {
-                self.get_with_receiver_sym(self.intr.number_proto, sid, base.clone())
-            }
+            Value::Str(_) => self.get_with_receiver_sym(self.intr.string_proto, sid, base.clone()),
+            Value::Num(_) => self.get_with_receiver_sym(self.intr.number_proto, sid, base.clone()),
             Value::BigInt(_) => {
                 self.get_with_receiver_sym(self.intr.bigint_proto, sid, base.clone())
             }
             Value::Bool(_) => {
                 self.get_with_receiver_sym(self.intr.boolean_proto, sid, base.clone())
             }
-            Value::Sym(_) => {
-                self.get_with_receiver_sym(self.intr.symbol_proto, sid, base.clone())
-            }
-            Value::Undefined | Value::Null => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Value::Sym(_) => self.get_with_receiver_sym(self.intr.symbol_proto, sid, base.clone()),
+            Value::Undefined | Value::Null => Err(self.throw_native(NativeErrorKind::TypeError)),
         }
     }
 
@@ -269,24 +262,47 @@ impl Interp {
     ) -> Result<(), Abrupt> {
         match base {
             Value::Obj(oid) => self.set_on_object_sym(*oid, sid, v, strict),
-            Value::Str(_) => {
-                self.set_walk_chain_sym(Some(self.intr.string_proto), sid, v, strict, base.clone(), None)
-            }
-            Value::Num(_) => {
-                self.set_walk_chain_sym(Some(self.intr.number_proto), sid, v, strict, base.clone(), None)
-            }
-            Value::BigInt(_) => {
-                self.set_walk_chain_sym(Some(self.intr.bigint_proto), sid, v, strict, base.clone(), None)
-            }
-            Value::Bool(_) => {
-                self.set_walk_chain_sym(Some(self.intr.boolean_proto), sid, v, strict, base.clone(), None)
-            }
-            Value::Sym(_) => {
-                self.set_walk_chain_sym(Some(self.intr.symbol_proto), sid, v, strict, base.clone(), None)
-            }
-            Value::Undefined | Value::Null => {
-                Err(self.throw_native(NativeErrorKind::TypeError))
-            }
+            Value::Str(_) => self.set_walk_chain_sym(
+                Some(self.intr.string_proto),
+                sid,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::Num(_) => self.set_walk_chain_sym(
+                Some(self.intr.number_proto),
+                sid,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::BigInt(_) => self.set_walk_chain_sym(
+                Some(self.intr.bigint_proto),
+                sid,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::Bool(_) => self.set_walk_chain_sym(
+                Some(self.intr.boolean_proto),
+                sid,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::Sym(_) => self.set_walk_chain_sym(
+                Some(self.intr.symbol_proto),
+                sid,
+                v,
+                strict,
+                base.clone(),
+                None,
+            ),
+            Value::Undefined | Value::Null => Err(self.throw_native(NativeErrorKind::TypeError)),
         }
     }
 
@@ -323,9 +339,7 @@ impl Interp {
             return self.mop_define_own(oid, &PropertyKey::Sym(sid), desc);
         }
         if oid == self.global {
-            return Err(Abrupt::Fatal(
-                "defineProperty (symbol) on the global object".to_string(),
-            ));
+            return Err(Abrupt::Fatal("defineProperty (symbol) on the global object".to_string()));
         }
         if !self.obj(oid).sym_props.contains_key(&sid) {
             if let Some(gap) = self.sym_miss_danger(oid, sid) {
@@ -339,10 +353,7 @@ impl Interp {
             }
             let prop = if desc.is_accessor() {
                 Prop {
-                    val: PropVal::Accessor {
-                        get: desc.get.flatten(),
-                        set: desc.set.flatten(),
-                    },
+                    val: PropVal::Accessor { get: desc.get.flatten(), set: desc.set.flatten() },
                     enumerable: desc.enumerable.unwrap_or(false),
                     configurable: desc.configurable.unwrap_or(false),
                     synthetic: false,
@@ -411,11 +422,7 @@ impl Interp {
                 }
             }
         }
-        let p = self
-            .obj_mut(oid)
-            .sym_props
-            .get_mut(&sid)
-            .expect("current exists");
+        let p = self.obj_mut(oid).sym_props.get_mut(&sid).expect("current exists");
         if desc.is_accessor() && p.is_data() {
             p.val = PropVal::Accessor {
                 get: desc.get.clone().flatten(),
@@ -529,11 +536,7 @@ impl Interp {
                     Value::Undefined => None,
                     v => Some(self.to_string_units(&v)?),
                 };
-                let s = self.alloc_symbol(SymData {
-                    desc,
-                    well_known: None,
-                    registry_key: None,
-                });
+                let s = self.alloc_symbol(SymData { desc, well_known: None, registry_key: None });
                 Ok(Value::Sym(s))
             }
             Builtin::SymbolFor => {
@@ -607,18 +610,12 @@ impl Interp {
                                 .to_string(),
                         ));
                     }
-                    self.obj(oid)
-                        .sym_props
-                        .keys()
-                        .map(|s| Value::Sym(*s))
-                        .collect()
+                    self.obj(oid).sym_props.keys().map(|s| Value::Sym(*s)).collect()
                 };
                 let n = syms.len();
                 let arr = self.new_array(n);
                 for (i, v) in syms.into_iter().enumerate() {
-                    self.obj_mut(arr)
-                        .props
-                        .insert(units_from_str(&i.to_string()), Prop::data(v));
+                    self.obj_mut(arr).props.insert(units_from_str(&i.to_string()), Prop::data(v));
                 }
                 #[allow(clippy::cast_precision_loss)]
                 self.set_array_length_raw(arr, n as f64);
@@ -671,7 +668,8 @@ impl Interp {
         if !self.obj(*cid).is_callable() {
             return Ok(false);
         }
-        if let ObjKind::Function(crate::value::FnImpl::Bound { target, .. }) = &self.obj(*cid).kind {
+        if let ObjKind::Function(crate::value::FnImpl::Bound { target, .. }) = &self.obj(*cid).kind
+        {
             let target = *target;
             return self.ordinary_has_instance(&Value::Obj(target), o);
         }
@@ -708,17 +706,11 @@ impl Interp {
 #[must_use]
 pub(crate) fn project_symbol(data: &SymData) -> trust_js_trace::ProjectedValue {
     if let Some(wk) = data.well_known {
-        trust_js_trace::ProjectedValue::Sym {
-            wk: Some(wk.to_string()),
-            v: None,
-        }
+        trust_js_trace::ProjectedValue::Sym { wk: Some(wk.to_string()), v: None }
     } else {
         trust_js_trace::ProjectedValue::Sym {
             wk: None,
-            v: data
-                .desc
-                .as_ref()
-                .map(|d| crate::project::escape_units(d)),
+            v: data.desc.as_ref().map(|d| crate::project::escape_units(d)),
         }
     }
 }

@@ -653,6 +653,37 @@ fn discovered_repo_root_for_test() -> PathBuf {
     }
 }
 
+/// `release validate ledger` was renamed to `ledger-expirations`, and the
+/// removed spelling must keep naming its replacement instead of falling through
+/// to the generic `unknown command` usage dump.
+///
+/// This arm has no in-repo caller by construction — only users type the old
+/// name — so a dead-code sweep reads it as dead. fc5a9655a0 deleted it for
+/// exactly that reason, and no test noticed. This is that test.
+#[test]
+fn removed_release_validate_ledger_alias_points_to_ledger_expirations() {
+    let output = Command::new(targo_trust_binary())
+        .args(["trust", "release", "validate", "ledger", "--help"])
+        .output()
+        .expect("run removed release validate ledger alias");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "release validate ledger alias should be removed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.trim().is_empty(), "removed alias should not run help\nstdout:\n{stdout}");
+    assert!(
+        stderr.contains(
+            "targo trust release validate ledger: removed alias; \
+             use `targo trust release validate ledger-expirations`"
+        ),
+        "release validate ledger alias should explain the canonical command\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 fn targo_trust_binary() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_targo-trust") {
         return PathBuf::from(path);

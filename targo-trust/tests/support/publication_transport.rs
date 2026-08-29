@@ -9,7 +9,7 @@ pub(crate) fn proved_result(
     let kind = typed_kind.transport_tag();
     let description = typed_kind.description();
     let owner = format!("{kind}:{function}:0");
-    let native_id = format!("trust_ir-native-trust-wp-request-{request_id}-proof-{proof_id}");
+    let native_id = format!("trust_ir-native-trust-mc-request-{request_id}-proof-{proof_id}");
     let normalized = bound_proof_artifact(
         "NormalizedObligation",
         b"exact normalized test obligation",
@@ -51,8 +51,8 @@ pub(crate) fn proved_result(
         design_mandate: false,
         native_trust_ir: Some(native_evidence(request_id, proof_id, &native_id)),
         proof_evidence: Some(trust_types::TransportProofEvidence {
-            suite: "trust-wp".to_string(),
-            backend: "trust-wp".to_string(),
+            suite: "trust-mc".to_string(),
+            backend: "trust-mc".to_string(),
             request_id: Some(request_id.to_string()),
             proof_id: Some(proof_id.to_string()),
             native_id: Some(native_id),
@@ -76,7 +76,7 @@ pub(crate) fn failed_result(
     counterexample: &str,
 ) -> trust_types::TransportObligationResult {
     let owner = format!("{kind}:{function}:0");
-    let native_id = format!("trust_ir-native-trust-wp-request-{request_id}-proof-{proof_id}");
+    let native_id = format!("trust_ir-native-trust-mc-request-{request_id}-proof-{proof_id}");
     trust_types::TransportObligationResult {
         obligation_id: Some(owner),
         claim_digest_sha256: None,
@@ -103,8 +103,8 @@ fn native_evidence(
     native_id: &str,
 ) -> trust_types::TransportNativeTrustIrEvidence {
     trust_types::TransportNativeTrustIrEvidence {
-        suite: "trust-wp".to_string(),
-        backend: "trust-wp".to_string(),
+        suite: "trust-mc".to_string(),
+        backend: "trust-mc".to_string(),
         request_id: Some(request_id.to_string()),
         native_id: Some(native_id.to_string()),
         present: true,
@@ -138,7 +138,7 @@ fn native_trust_ir_artifacts(
             digest: bundle.1.clone(),
         }],
     );
-    let request_uri = format!("{bundle_uri}/trust-wp/request/{request_id}/{}", request.1.value);
+    let request_uri = format!("{bundle_uri}/trust-mc/request/{request_id}/{}", request.1.value);
     let normalized = native_materialization(
         "normalized_obligation",
         Some(request_id),
@@ -170,7 +170,7 @@ fn native_materialization(
     let mut value = serde_json::json!({
         "schema": trust_types::NATIVE_TRUST_IR_MATERIALIZATION_SCHEMA,
         "role": role,
-        "suite": if role == "bundle" { None } else { Some("trust-wp") },
+        "suite": if role == "bundle" { None } else { Some("trust-mc") },
         "request_id": request_id,
         "proof_id": proof_id,
         "payload": payload,

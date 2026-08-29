@@ -69,6 +69,7 @@ fn unsafe_ptr_read_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::ptr::read".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -205,6 +206,7 @@ fn transmute_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "core::mem::transmute".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -271,6 +273,7 @@ fn ffi_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: true,
                         func: "libc::ffi::write".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -561,6 +564,22 @@ fn test_generate_safety_vcs_skips_trusted_std_macro_span() {
          missing-SAFETY-comment documentation lint"
     );
 
+    // Enabling behavioral memory-safety rows for a local stdlib SUBJECT must
+    // not broaden the separate source-documentation lint. The same std block
+    // remains user-unannotatable and therefore yields no documentation VC even
+    // inside the exact-owner context that unsuppresses sep-engine rows.
+    let stdlib_subject = crate::VcgenContext::for_function(func.def_path.clone())
+        .with_stdlib_subject_memory_safety(true);
+    let subject_std_vcs =
+        crate::with_function_vcgen_context(&func.def_path, &stdlib_subject, || {
+            generate_safety_vcs(&func, &std_block, &FxHashSet::default())
+        });
+    assert!(
+        subject_std_vcs.is_empty(),
+        "stdlib-subject behavioral policy must not charge the separate \
+         missing-SAFETY-comment documentation lint: {subject_std_vcs:?}"
+    );
+
     // SOUNDNESS BOUNDARY — a genuine first-party (ny-cert) unsafe block is NOT a std
     // span, so it STILL gets its fail-closed missing-SAFETY-comment lint.
     let user_block = vec![UnsafeBlock {
@@ -575,10 +594,15 @@ fn test_generate_safety_vcs_skips_trusted_std_macro_span() {
         safety_claim: None,
         block_id: BlockId(0),
     }];
+    let subject_user_vcs =
+        crate::with_function_vcgen_context(&func.def_path, &stdlib_subject, || {
+            generate_safety_vcs(&func, &user_block, &FxHashSet::default())
+        });
     assert_eq!(
-        generate_safety_vcs(&func, &user_block, &FxHashSet::default()).len(),
+        subject_user_vcs.len(),
         1,
-        "a first-party unsafe block must keep its missing-SAFETY-comment lint"
+        "a first-party unsafe block must keep its missing-SAFETY-comment lint \
+         under stdlib-subject behavioral policy"
     );
 }
 
@@ -708,7 +732,13 @@ fn test_generate_safety_vcs_dropped_for_synthesized_box_deref_span() {
 
     // A DIFFERENT span in the set must NOT suppress this block (precision guard).
     let mut other = FxHashSet::default();
-    other.insert(SourceSpan { file: "other.rs".into(), line_start: 1, col_start: 0, line_end: 1, col_end: 1 });
+    other.insert(SourceSpan {
+        file: "other.rs".into(),
+        line_start: 1,
+        col_start: 0,
+        line_end: 1,
+        col_end: 1,
+    });
     let unaffected = generate_safety_vcs(&func, &blocks, &other);
     assert!(
         unaffected.iter().any(|vc| matches!(
@@ -1650,6 +1680,7 @@ fn unchecked_call_fn(callee: &str, recv_ty: Ty, idx_ty: Ty) -> VerifiableFunctio
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
@@ -1799,6 +1830,7 @@ fn flagged_call_fn(callee: &str, is_unsafe_sig: bool, is_foreign: bool) -> Verif
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig,
                         is_foreign,
+                        callee_identity: None,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(0),
@@ -1818,6 +1850,26 @@ fn flagged_call_fn(callee: &str, is_unsafe_sig: bool, is_foreign: bool) -> Verif
         postconditions: vec![],
         spec: Default::default(),
     }
+}
+
+fn flagged_tail_call_fn(callee: &str, is_unsafe_sig: bool, is_foreign: bool) -> VerifiableFunction {
+    let mut func = flagged_call_fn(callee, is_unsafe_sig, is_foreign);
+    let Terminator::Call { func: callee, args, span, atomic, callee_identity, .. } =
+        func.body.blocks[0].terminator.clone()
+    else {
+        unreachable!();
+    };
+    func.body.blocks[0].terminator = Terminator::TailCall {
+        func: callee,
+        args,
+        span,
+        atomic,
+        is_unsafe_sig,
+        is_foreign,
+        callee_identity,
+    };
+    func.body.blocks.truncate(1);
+    func
 }
 
 #[test]
@@ -1876,6 +1928,24 @@ fn foreign_call_still_demands_safety_comment() {
         emits_missing_safety_lint(&func),
         "undocumented foreign call must keep its missing-SAFETY demand"
     );
+}
+
+#[test]
+fn tail_call_uses_the_same_authenticated_unsafe_boundary() {
+    let safe = flagged_tail_call_fn("std::ffi::OsStr::to_str", false, false);
+    assert!(detect_unsafe_blocks(&safe).is_empty());
+
+    for func in [
+        flagged_tail_call_fn("std::ffi::OsStr::to_str", true, false),
+        flagged_tail_call_fn("compute_hash", false, true),
+    ] {
+        let blocks = detect_unsafe_blocks(&func);
+        assert_eq!(blocks.len(), 1, "authenticated tail-call boundary was dropped");
+        let vcs = generate_safety_vcs(&func, &blocks, &FxHashSet::default());
+        assert!(vcs.iter().any(
+            |vc| matches!(&vc.kind, VcKind::Assertion { message } if message == MISSING_SAFETY_MSG)
+        ));
+    }
 }
 
 #[test]

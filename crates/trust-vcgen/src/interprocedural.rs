@@ -135,6 +135,15 @@ pub fn analyze_functions(functions: &[VerifiableFunction]) -> AnalysisResult {
         };
     }
 
+    // All legacy summary/effect consumers below already understand ordinary
+    // Call + Return.  Feed them the canonical semantic projection so TailCall
+    // edges, results, effects, and exits participate in the same fixpoints.
+    let expanded_functions = functions
+        .iter()
+        .map(|func| func.with_tail_calls_expanded().into_owned())
+        .collect::<Vec<_>>();
+    let functions = expanded_functions.as_slice();
+
     // Build call graph and detect cycles
     let graph = build_call_graph(functions);
     let rec_funcs = recursive_functions(&graph);
@@ -167,8 +176,11 @@ pub fn analyze_functions(functions: &[VerifiableFunction]) -> AnalysisResult {
         // global assumptions. `substitute_callee_summary` remains conservative
         // until it has precise call-site substitution and dominance semantics.
         for block in &func.body.blocks {
-            if let Terminator::Call { func: callee_name, .. } = &block.terminator
-                && let Some(callee_path) = resolver.resolve(callee_name)
+            let callee_name = match &block.terminator {
+                Terminator::Call { func, .. } | Terminator::TailCall { func, .. } => func,
+                _ => continue,
+            };
+            if let Some(callee_path) = resolver.resolve(callee_name)
                 && let Some(callee_summary) = store.get(callee_path)
                 && callee_summary.has_postconditions()
             {
@@ -320,7 +332,7 @@ pub fn compute_summary(func: &VerifiableFunction) -> InterproceduralSummary {
 
         // Check terminator for panics and calls
         match &block.terminator {
-            Terminator::Call { .. } => {
+            Terminator::Call { .. } | Terminator::TailCall { .. } => {
                 has_calls = true;
             }
             Terminator::Assert { .. } => {
@@ -600,6 +612,7 @@ mod tests {
                     terminator: Terminator::Call {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
+                        callee_identity: None,
                         is_foreign: false,
                         func: "callee".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -833,6 +846,7 @@ mod tests {
                 terminator: Terminator::Call {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     is_foreign: false,
                     func: callee.to_string(),
                     args: vec![],

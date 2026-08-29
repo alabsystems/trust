@@ -17,8 +17,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::types::{Capability, PromiseId};
 use crate::Reactor;
+use crate::types::{Capability, PromiseId};
 
 /// The completion of invoking a host callback: a normal return or a throw.
 /// (The spec's normal vs abrupt completion, narrowed to what a reaction needs.)

@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use super::parse::{
     parse_trust_cg_output_gate, parse_trust_nonempty_path, parse_trust_verify_crate_role,
     parse_trust_verify_level, parse_trust_verify_output, parse_trust_verify_package_name,
-    parse_trust_verify_profile, parse_trust_verify_session,
-    parse_trust_verify_target_spec_sha256, parse_trust_verify_timeout_ms,
-    parse_trust_verify_worker_threads,
+    parse_trust_verify_profile, parse_trust_verify_session, parse_trust_verify_target_spec_sha256,
+    parse_trust_verify_timeout_ms, parse_trust_verify_worker_threads,
 };
 
 #[test]

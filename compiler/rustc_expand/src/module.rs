@@ -7,9 +7,7 @@ use rustc_attr_parsing::validate_attr::emit_malformed_attribute;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Diag, ErrorGuaranteed};
 use rustc_parse::lexer::StripTokens;
-use rustc_parse::{
-    exp, new_parser_from_file, trust_parse_clean_unit_decls, unwrap_or_emit_fatal,
-};
+use rustc_parse::{exp, new_parser_from_file, trust_parse_clean_unit_decls, unwrap_or_emit_fatal};
 use rustc_session::Session;
 use rustc_session::parse::ParseSess;
 use rustc_span::fatal_error::FatalError;
@@ -407,8 +405,7 @@ pub(crate) fn load_clean_unit(
     let file = match sess.psess.source_map().load_file(&file_path) {
         Ok(file) => file,
         Err(err) => {
-            sess.dcx()
-                .span_err(span, format!("couldn't read `{}`: {}", file_path.display(), err));
+            sess.dcx().span_err(span, format!("couldn't read `{}`: {}", file_path.display(), err));
             return empty();
         }
     };

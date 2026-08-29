@@ -152,3 +152,47 @@ allowed_patterns = [
 classification = "precision_regression_from_soundness_fix"
 compatibility_status = "accepted_narrow_divergence"
 required_action = "Precision follow-ups scheduled BEHIND the soundness fix, never as a rollback: (a) per-argument reachability refinement (skip havocing pointees no call argument can reach — sound under &mut noalias), (b) arg-pointee non-mutation callee summaries in modular.rs (currently dest-only), (c) wire the snapshot rewrite into trust-backprop so the flywheel auto-repairs regressed sites."
+
+# RETIRED 2026-08-21, same day it was filed: the quarantine
+# "scoped.compiler-check.2026-08-21.trust-verify-tests-drift" is deleted because
+# its SUBJECT IS FIXED, not because it expired. All 9 names it enumerated are
+# reconciled in trust_verify/tests.rs, and `scripts/check_compiler_targets_build.sh`
+# now exits 0 ("compiler and its test targets check clean") with no waiver in
+# effect. Its diagnosis was exactly right — the 3 renamed+re-aritied
+# `verify_full_bundle_with_live_receipts` calls, the `body_bound_receipts`
+# pattern field, and `stdlib_subject_memory_safety_policy`, which turned out to
+# have NEVER been defined in this repository.
+#
+# It was filed rather than fixed to avoid racing the active refactor lane. That
+# was a reasonable call at the time; the reconciliation has since been done, so
+# leaving the row would keep the gate suppressed for a week over a condition
+# that no longer exists — and a live-looking waiver for a fixed defect is worse
+# than no waiver, because the next reader takes it as evidence the lane is
+# still broken.
+
+# RETIRED 2026-08-23, one day after filing: the quarantine
+# "scoped.compiler-check.2026-08-22.trust-mc-driver-artifact-privacy" is deleted
+# because its SUBJECT IS FIXED, not because it expired.
+#
+# Its diagnosis was right — trust-mc-driver read ChcProofRunArtifact/ProofRun
+# fields that trust-mc-core had made private behind accessors. Its REASON for
+# filing was wrong. It said "the trust-mc lane is ACTIVE and owns the
+# reconciliation; racing it risks colliding with in-flight work." Measured the
+# next day: they had ALREADY LANDED IT. trust-mc's own origin/main read
+# `artifact.schema()` at 4320d34a7, and our gitlink simply pointed one commit
+# earlier. Nothing was in flight; a pointer was stale.
+#
+# Advancing the pin (a lossless fast-forward) cleared all 15 errors and exposed
+# two consumer updates that belong with any pin move — trust-bmc's `.result` ->
+# `.result()`, and a pre-existing trust-mir-extract test-initializer skew the
+# earlier failure had been masking.
+#
+# `scripts/check_compiler_targets_build.sh` now exits 0 with NO waiver in
+# effect: 412 crates compiled, 0 errors, 8m32s, "compiler and its test targets
+# check clean".
+#
+# The general rule, now three-for-three in two days: BEFORE quarantining a
+# submodule breakage, run `git -C first-party/<mod> show origin/main:<file>`.
+# If upstream already reads the way rustc is suggesting, the code is fine and
+# the PIN is stale — and a waiver would suppress the gate for a week over
+# something already fixed.

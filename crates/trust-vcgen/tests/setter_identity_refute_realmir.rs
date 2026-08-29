@@ -61,9 +61,9 @@ fn setter_identity_assert_is_grounded_on_real_mir() {
     // there is an `Eq(copied, bridge)` copy-chain link. Assert at least one bridge
     // is itself the subject of a further Eq (the copy link) — i.e. the chain has
     // depth ≥ 2 and closes, not a dangling `bridge == v` with nothing reaching it.
-    let connected = bridge.iter().any(|br| {
-        eqs.iter().any(|(a, b)| (a == br || b == br) && a != "v" && b != "v")
-    });
+    let connected = bridge
+        .iter()
+        .any(|br| eqs.iter().any(|(a, b)| (a == br || b == br) && a != "v" && b != "v"));
     assert!(
         connected,
         "the setter bridge var must also be tied to the copied temp (copy-chain \

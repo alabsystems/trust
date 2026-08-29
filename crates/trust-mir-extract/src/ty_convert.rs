@@ -59,9 +59,38 @@ const MAX_TYPE_LOWERING_NODES: usize = 4096;
 // cluster drives peak verifier RSS ROUGHLY linearly in this budget — measured ~7.8
 // GB at 5_000 (COMPLETES) vs ~32 GB (OOM) at 200_000. 8_000 keeps the peak in a
 // ~10-13 GB band that completes with comfortable margin on a 48 GB host while
-// retaining more datatype-field precision than 5_000. An ordinary function's whole
-// declared-type set is well under this (a few hundred nodes), so ONLY the
-// pathological recursive-enum cluster is ever degraded.
+// retaining more datatype-field precision than 5_000.
+//
+// CORRECTION 2026-08-28 — the sentence that used to end this block said "an ordinary
+// function's whole declared-type set is well under this (a few hundred nodes), so
+// ONLY the pathological recursive-enum cluster is ever degraded." Both halves were
+// measured FALSE on `crates/trust-semantics`:
+//
+//   * The meter was charging `produced_node_count(&lowered)` at EVERY level of
+//     `convert_ty_inner`'s recursion, so the EFFECTIVE allowance was
+//     `budget / average-depth`, not `budget`. Fixed at the charge site; see
+//     `fresh_node_charge`.
+//   * The one type it degraded in the whole crate was NOT the recursive-enum
+//     cluster. It was `Result<(), clean_kernel::EnvError>` — an ACYCLIC error enum
+//     whose nested `InductiveError`/`TypeError` payloads expand into a wide DAG.
+//     83 of 20319 traced walks, every one of them that type, charged 8005 against
+//     this 8000 budget for a walk that materializes 5633 nodes and RETAINS 6
+//     (`compact_oversized_field` collapses the fat fields).
+//
+// Also measured that day, because the record claimed otherwise: with this budget
+// raised to 100_000_000 the lowering TERMINATES — 164 s against a 171 s baseline,
+// peak RSS 6.80 GB vs 6.84 GB with the budget in force, zero degradations, and the
+// obligation set identical to the corrected-meter run. The "never completes /
+// non-terminating lowering" note that used to justify this constant was never
+// backed by a run; the runs that did exist recorded an OOM-KILL WITH PROGRESS
+// ("29/1771 fns in 40 min"), which is memory exhaustion, not divergence. Every
+// recursion in this module is bounded (`MAX_TYPE_LOWERING_DEPTH`,
+// `MAX_TYPE_LOWERING_NODES`, `MAX_CUT_DEFINITION_NESTING` + the `in_progress` set,
+// `MAX_CANONICAL_CUT_NODES`), so divergence is not reachable here.
+//
+// The budget STAYS: it is the only bound on a DAG-to-tree expansion whose size is
+// not otherwise capped, and on this crate it now sits 8000/5633 = 1.42x above the
+// worst real walk. That headroom is small — re-measure before shrinking it.
 const MAX_TYPE_LOWERING_PRODUCED_NODES: usize = 8_000;
 
 /// Total structural-node count of a produced `TrustTy`, short-circuited at `cap`
@@ -111,10 +140,33 @@ fn produced_node_count(ty: &TrustTy, cap: usize) -> usize {
     acc
 }
 
+/// The peak-meter cost of ONE freshly materialized `TrustTy` node.
+///
+/// It is ONE, and the load-bearing property — the whole reason this is a named
+/// function rather than a literal — is that it does **not** depend on `lowered`.
+/// `convert_ty_inner` charges this at EVERY level of its own recursion, so a
+/// size-dependent charge here bills each node once for itself and once more for
+/// every ancestor: the meter becomes O(nodes x depth) and the budget's effective
+/// allowance collapses to `budget / average-depth`. Pinned by
+/// `a_fresh_node_costs_one_regardless_of_its_subtree_size`.
+fn fresh_node_charge(_lowered: &TrustTy) -> usize {
+    1
+}
+
 /// Deterministic produced-tree-size budget. Proof extraction must not depend on
 /// ambient process environment: crossing the bound changes a type to an
 /// explicit fail-closed marker and therefore changes the obligation inventory.
 fn produced_node_budget() -> usize {
+    // Deliberately NOT overridable from the environment. `2c9fdb1dd5` removed the
+    // `TRUST_TYPE_LOWERING_PRODUCED_NODE_BUDGET` variable that used to live here, and
+    // the reason on the doc comment above still holds: crossing this bound changes a
+    // type into a fail-closed marker, so an ambient variable could silently change
+    // the obligation inventory a verdict was minted from.
+    //
+    // The 2026-08-28 ablation recorded on `MAX_TYPE_LOWERING_PRODUCED_NODES` was run
+    // by temporarily making this function read that variable, in a throwaway build.
+    // Re-run it the same way — a temporary patch in a build that carries no verdict —
+    // rather than by landing an override.
     MAX_TYPE_LOWERING_PRODUCED_NODES
 }
 
@@ -868,11 +920,7 @@ fn record_cut_definition<'tcx>(
 /// datatype lowering uses (`datatype_child_field_ty` cuts at every nominal child
 /// unconditionally), so a feedback vertex set computed here breaks every cycle
 /// the lowering can actually walk.
-fn nominal_frontier<'tcx>(
-    ty: ty::Ty<'tcx>,
-    depth: usize,
-    out: &mut Vec<ty::Ty<'tcx>>,
-) {
+fn nominal_frontier<'tcx>(ty: ty::Ty<'tcx>, depth: usize, out: &mut Vec<ty::Ty<'tcx>>) {
     if depth >= MAX_TYPE_LOWERING_DEPTH {
         return;
     }
@@ -1457,13 +1505,6 @@ fn is_expanding_recursive_adt<'tcx>(
     })
 }
 
-/// Convert a rustc Ty to our simplified Ty.
-///
-/// This entry point does **not** attempt opaque-alias normalization: an
-/// `impl Trait` (`AliasTyKind::Opaque`) type lowers to `Unsupported`. Use
-/// it from call sites that do not have a MIR body's `TypingEnv` in scope.
-/// To reveal opaque alias types where it is sound and build-safe to do so,
-/// use [`convert_ty_in_env`] instead. (`Free` aliases are still expanded.)
 // Trust (v25 B1): FAITHFUL-SCALAR extraction mode. When set, isize/usize
 // convert to `TrustTy::PtrSizedInt` and char to `TrustTy::Char` instead of
 // the legacy width collapse — preserving the identity the trust-ir bridge
@@ -1497,10 +1538,41 @@ fn faithful_scalars() -> bool {
     FAITHFUL_SCALARS.with(|f| f.get())
 }
 
+/// Convert a rustc Ty to our simplified Ty.
+///
+/// This entry point does **not** attempt opaque-alias normalization: an
+/// `impl Trait` (`AliasTyKind::Opaque`) type lowers to `Unsupported`. Use
+/// it from call sites that do not have a MIR body's `TypingEnv` in scope.
+/// To reveal opaque alias types where it is sound and build-safe to do so,
+/// use [`convert_ty_in_env`] instead. (`Free` aliases are still expanded.)
 pub(crate) fn convert_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> TrustTy {
     let mut ctx = TyLoweringCtx::default();
     ctx.canonical_cut = canonical_cut_set(tcx, ty);
-    convert_ty_inner(tcx, ty, &mut ctx)
+    let out = convert_ty_inner(tcx, ty, &mut ctx);
+    trace_walk(ty, &out, &ctx);
+    out
+}
+
+/// MEASUREMENT-ONLY per-walk report, gated on `TRUST_VCGEN_TRACE_BUDGET`.
+///
+/// Prints, for ONE root type walk: the guard's own meter (`cum`), the accurate
+/// materialized-node meter (`own`), the size of the tree actually returned
+/// (`final`), the budget in force, and whether the walk was degraded. `cum/own`
+/// is the ancestor re-charge multiplier. Writes nothing and changes nothing when
+/// the variable is unset.
+fn trace_walk<'tcx>(root: ty::Ty<'tcx>, out: &TrustTy, ctx: &TyLoweringCtx<'tcx>) {
+    if std::env::var("TRUST_VCGEN_TRACE_BUDGET").is_err() {
+        return;
+    }
+    let degraded = ctx.produced_nodes > ctx.produced_budget;
+    eprintln!(
+        "[TL_WALK] materialized={} final={} budget={} degraded={} root={:?}",
+        ctx.produced_nodes,
+        produced_node_count(out, usize::MAX),
+        ctx.produced_budget,
+        degraded,
+        root,
+    );
 }
 
 /// Convert a rustc Ty to our simplified Ty, normalizing **opaque** alias
@@ -1527,7 +1599,9 @@ pub(crate) fn convert_ty_in_env<'tcx>(
 ) -> TrustTy {
     let mut ctx = TyLoweringCtx::with_typing_env(typing_env);
     ctx.canonical_cut = canonical_cut_set(tcx, ty);
-    convert_ty_inner(tcx, ty, &mut ctx)
+    let out = convert_ty_inner(tcx, ty, &mut ctx);
+    trace_walk(ty, &out, &ctx);
+    out
 }
 
 fn convert_ty_inner<'tcx>(
@@ -1609,10 +1683,11 @@ fn convert_ty_inner<'tcx>(
         // size against the budget — otherwise the cache lets an unbounded number of
         // fat-subtree clones bypass the budget (the actual OOM mechanism).
         let cached = cached.clone();
-        ctx.produced_nodes = ctx.produced_nodes.saturating_add(produced_node_count(
+        let hit_cost = produced_node_count(
             &cached,
             ctx.produced_budget.saturating_sub(ctx.produced_nodes).saturating_add(1),
-        ));
+        );
+        ctx.produced_nodes = ctx.produced_nodes.saturating_add(hit_cost);
         return cached;
     }
 
@@ -1885,10 +1960,33 @@ fn convert_ty_inner<'tcx>(
                 // (the faithful_enum_repr shield discipline, B3-1). The gates
                 // mirror the THIR producer's T2 fill exactly: fully-concrete
                 // type, layout_of Ok, offsets in source-declaration order.
+                // Trust (lane MKG, 2026-08-27): `!ty.has_escaping_bound_vars()` is
+                // `layout_of`'s PRECONDITION, and this gate did not test it. `layout_of`
+                // wraps its input in a dummy binder and `Binder::dummy` ASSERTS the value
+                // has none; a type that carries them is not a `LayoutError`, so the `.ok()`
+                // below cannot catch it — it is an ICE:
+                //
+                //     panicked at rustc_middle/src/ty/predicate.rs:492:9:
+                //     `<dyn core::fmt::Write as core::marker::Sized>` has escaping bound
+                //     vars, so it cannot be wrapped in a dummy binder.
+                //
+                // MEASURED with a control (same driver, same corpus, same
+                // `-Zbuild-std=core,alloc,std`; the ONLY delta is the flag):
+                // `-Ztrust-ir-lower=off` builds `std` in 12.71 s, `=on` ICEs here. Unseen
+                // until now because nothing had ever lowered `std`; the ICE backtrace names
+                // this frame via `convert_ty_inner::{closure#4}` under
+                // `extract_function_with_purpose` <- `differential::compare`.
+                //
+                // The three existing conjuncts test params, infers and opaques — none of
+                // them is a bound-var test, and a `&mut dyn Write` field reaches here with
+                // late-bound regions intact. Declining leaves `layout: None`, which this
+                // lane already treats as "no faithful layout" and is the same answer the
+                // pre-existing `.ok()` gives for any other unusable type.
                 let layout = if faithful_scalars()
                     && !ty.has_non_region_param()
                     && !ty.has_non_region_infer()
                     && !ty.has_opaque_types()
+                    && !ty.has_escaping_bound_vars()
                 {
                     ctx.typing_env.and_then(|te| {
                         tcx.layout_of(te.as_query_input(ty)).ok().map(|l| {
@@ -2218,13 +2316,34 @@ fn convert_ty_inner<'tcx>(
         }
     };
     ctx.depth -= 1;
-    // verifier-perf (produced-node budget): charge the produced size of this
-    // freshly-lowered subtree (short-circuited just past the remaining headroom so
-    // a huge tree costs O(headroom)). When the cumulative produced size crosses the
-    // budget, the early-return at the top of `convert_ty_inner` degrades every
-    // subsequent lowering to the fail-closed marker (DROP-ONLY).
-    let headroom = ctx.produced_budget.saturating_sub(ctx.produced_nodes).saturating_add(1);
-    ctx.produced_nodes = ctx.produced_nodes.saturating_add(produced_node_count(&lowered, headroom));
+    // verifier-perf (produced-node budget): charge PEAK materialization, not
+    // cumulative re-charge. This call materialized exactly ONE new node on top of
+    // the nodes its children already charged through their own recursive calls, so
+    // `+1` is the whole cost of this level and `produced_nodes` ends up counting the
+    // `TrustTy` nodes this walk actually materialized — which is what the field, the
+    // constant's doc comment and the DROP-ONLY soundness argument all say it counts.
+    //
+    // Until 2026-08-28 this line charged `produced_node_count(&lowered, ..)` — the
+    // size of the WHOLE produced subtree — at EVERY level of this recursion, so a
+    // node was charged once for itself and once again for each of its ancestors. The
+    // meter was therefore O(nodes x depth) and the EFFECTIVE allowance was
+    // `budget / average-depth`, not `budget`. Measured on `crates/trust-semantics`
+    // the day this was fixed: the only type in the crate that the guard degraded was
+    // `Result<(), clean_kernel::EnvError>`, charged 12330 against the 8000 budget for
+    // a walk that materializes 5633 nodes and RETAINS 6 (field compaction collapses
+    // it). It fit the budget with room to spare and was refused anyway.
+    //
+    // This is the same correction `a0f2d05e35` already made to trust-vcgen's sibling
+    // meter: "T2 — meter PEAK type materialization, not cumulative re-query churn".
+    //
+    // SOUNDNESS: unchanged, and the memory ceiling is not raised. The old charge was
+    // >= this one node-for-node (every node it counted, this counts at least once),
+    // so the old meter enforced a STRICTLY STRONGER bound than the constant promises.
+    // Correcting it cannot let a walk exceed `produced_budget` materialized nodes —
+    // the bound the constant states — it only stops degrading walks that were always
+    // inside that bound. Degradation remains DROP-ONLY, so this can only restore
+    // obligations that were being dropped, never manufacture a PROVE.
+    ctx.produced_nodes = ctx.produced_nodes.saturating_add(fresh_node_charge(&lowered));
     if ctx.produced_nodes > ctx.produced_budget && std::env::var("TRUST_VCGEN_TRACE_BUDGET").is_ok()
     {
         eprintln!(
@@ -2692,8 +2811,8 @@ fn lower_enum_adt<'tcx>(
             // (A compacted field is now tiny, so this rarely trips for the recursive
             // cluster; it remains a backstop for a genuinely unbounded expansion.)
             let headroom = ctx.produced_budget.saturating_sub(ctx.produced_nodes).saturating_add(1);
-            ctx.produced_nodes =
-                ctx.produced_nodes.saturating_add(produced_node_count(&field_ty, headroom));
+            let dup_cost = produced_node_count(&field_ty, headroom);
+            ctx.produced_nodes = ctx.produced_nodes.saturating_add(dup_cost);
             if ctx.produced_nodes > ctx.produced_budget {
                 ctx.adt_stack.pop();
                 return produced_budget_degraded_leaf();
@@ -2730,9 +2849,29 @@ fn lower_enum_adt<'tcx>(
             variant_fields.push((field.name.to_string(), variant_field_ty));
         }
         // The variant's discriminant: the concrete tag rustc assigns (honours
-        // explicit `= N` discriminants and `#[repr(iN)]`). `val` is a `u128`
-        // bit pattern; widen into the `i128` the `VariantDef` stores.
-        let discriminant = adt_def.discriminant_for_variant(tcx, v_idx).val as i128;
+        // explicit `= N` discriminants and `#[repr(iN)]`).
+        //
+        // THE RAW-TAG BOUNDARY. `Discr::val` is a `u128` holding the tag's
+        // two's-complement BIT PATTERN at `Discr::ty`'s width — `A = -1` under
+        // `#[repr(i8)]` arrives as `255`, and under `repr(Rust)`/`repr(C)`
+        // (whose discriminant type is `isize`) as `2^64-1`. `val as i128` used
+        // to store that pattern verbatim, so `VariantDef::discriminant` was RAW
+        // and every downstream consumer inherited the convention — including
+        // two `min_disc >= 0` gates (`trust_vcgen::guards`'s enum-disc-index
+        // cast lane and `trust_ir_bridge::lower`'s `Assume(min..=max)`) that
+        // exist precisely to DECLINE a negative-tag enum and, on a raw tag,
+        // could never fire because a sub-128-bit raw pattern is never negative.
+        //
+        // Decode HERE, at the single boundary, so `VariantDef::discriminant` is
+        // the TRUE signed tag and no consumer downstream of extraction can be
+        // raw. `decode_discr_tag_or_raw` falls back to the historical
+        // `val as i128` in exactly the cases where an `i128` FIELD cannot hold
+        // the answer — a `#[repr(u128)]` tag above `i128::MAX`, or a
+        // discriminant type that is neither `Int` nor `Uint` (which rustc does
+        // not produce). Both were already `val as i128` before this change, so
+        // neither is a behaviour delta; see that function's doc.
+        let raw_discr = adt_def.discriminant_for_variant(tcx, v_idx);
+        let discriminant = decode_discr_tag_or_raw(raw_discr.val, raw_discr.ty, tcx);
         variants.push(trust_types::VariantDef {
             name: variant.name.to_string(),
             discriminant,
@@ -3175,6 +3314,58 @@ fn pointer_width(tcx: TyCtxt<'_>) -> u32 {
     tcx.data_layout.pointer_size().bits() as u32
 }
 
+/// Decode a rustc enum tag (`Discr { val, ty }`) into the mathematical integer
+/// it denotes — THE raw-tag boundary for `VariantDef::discriminant` and for
+/// `trust_mir_extract`'s `place_enum_tags` discriminant-membership facts.
+///
+/// `val` is the tag's two's-complement bit pattern at `ty`'s width, so
+/// `#[repr(i8)] A = -1` arrives as `255` and a `repr(Rust)` `A = -1` (tag type
+/// `isize`) as `2^64-1`. `ty` is the discriminant type rustc itself assigned,
+/// which is what makes the decode exact rather than a guess: `isize`/`usize`
+/// resolve through the TARGET's pointer width, never the host's.
+///
+/// This is the extractor's counterpart to `trust_thir_lower`'s
+/// `enum_discriminants`, which already decodes on the THIR PRODUCER side ("the
+/// ONE place general-path discriminants are computed ... so they agree by
+/// construction"). Both sides of the differential now use the same encoding.
+///
+/// Returns `None` when the tag has no `i128` denotation at all: `ty` is neither
+/// `Int` nor `Uint` (rustc does not produce such a discriminant type), the
+/// pattern does not fit the declared width (rustc would have handed us an
+/// unmasked value), or — the real case — `ty` is `u128` and the tag exceeds
+/// `i128::MAX`. A caller that can fail closed MUST (see [`decode_discr_tag_or_raw`]
+/// for the one that structurally cannot).
+pub(crate) fn decode_discr_tag<'tcx>(
+    val: u128,
+    discr_ty: rustc_middle::ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<i128> {
+    let (width, signed) = match discr_ty.kind() {
+        ty::Int(int_ty) => (int_width_from_int_ty(int_ty, tcx), true),
+        ty::Uint(uint_ty) => (uint_width_from_uint_ty(uint_ty, tcx), false),
+        _ => return None,
+    };
+    trust_types::decode_raw_two_complement(val, width, signed)
+}
+
+/// [`decode_discr_tag`] for the ONE caller that has nowhere to fail closed to:
+/// `VariantDef::discriminant` is an `i128` FIELD, so a `#[repr(u128)]` tag above
+/// `i128::MAX` has no representation in it at all.
+///
+/// The fallback is `val as i128`, BYTE-IDENTICAL to the pre-decode behaviour, so
+/// that case is unchanged by this decode: it was a lossy `as` cast before and it
+/// is the same lossy `as` cast now (both `guards`'s and `lower`'s `min_disc >= 0`
+/// gates see the same negative number and decline in both). It is a
+/// representation gap in the `VariantDef` field's TYPE, not a surviving raw
+/// convention — every path that CAN decline does.
+pub(crate) fn decode_discr_tag_or_raw<'tcx>(
+    val: u128,
+    discr_ty: rustc_middle::ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> i128 {
+    decode_discr_tag(val, discr_ty, tcx).unwrap_or(val as i128)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3295,6 +3486,48 @@ mod tests {
         assert_eq!(ctx.produced_nodes, 0);
         assert_eq!(ctx.produced_budget, MAX_TYPE_LOWERING_PRODUCED_NODES);
         assert!(ctx.adt_stack.is_empty());
+    }
+
+    /// The ANCESTOR RE-CHARGE regression, pinned at the charge site.
+    ///
+    /// Until 2026-08-28 `convert_ty_inner` charged `produced_node_count(&lowered, ..)`
+    /// — the size of the WHOLE produced subtree — at every level of its own recursion.
+    /// Each node was therefore billed once for itself and once more for each of its
+    /// ancestors, so the meter measured `sum over nodes of subtree_size(node)` =
+    /// O(nodes x depth) instead of the node count the constant, the field's doc
+    /// comment and the DROP-ONLY soundness argument all claim it measures. The guard
+    /// then degraded types that were comfortably inside its own advertised budget.
+    ///
+    /// MEASURED on `crates/trust-semantics` the day it was fixed, over 20319 traced
+    /// walks: the ONLY type the guard degraded in the whole crate was
+    /// `Result<(), clean_kernel::EnvError>` — charged 8005 against the 8000 budget for
+    /// a walk that materializes 5633 nodes and RETAINS 6. Correcting this one charge
+    /// took the crate's degraded walks 83 -> 0 and its rows 101 -> 104 with ZERO rows
+    /// lost, and made three of the four blocked bodies lower.
+    ///
+    /// This is the same correction `a0f2d05e35` already made to trust-vcgen's sibling
+    /// meter: "T2 — meter PEAK type materialization, not cumulative re-query churn".
+    #[test]
+    fn a_fresh_node_costs_one_regardless_of_its_subtree_size() {
+        let leaf = TrustTy::Bool;
+        // A deliberately fat subtree: what the old charge would have billed here.
+        let mut fat = TrustTy::Bool;
+        for _ in 0..200 {
+            fat = TrustTy::Ref { mutable: false, inner: Box::new(fat) };
+        }
+        assert!(
+            produced_node_count(&fat, usize::MAX) > 100,
+            "fixture must be fat or the assertion below cannot discriminate"
+        );
+        assert_eq!(fresh_node_charge(&leaf), 1);
+        assert_eq!(
+            fresh_node_charge(&fat),
+            1,
+            "a freshly materialized node must cost ONE, independently of the subtree \
+             hanging off it. Charging its subtree size here re-bills every descendant \
+             once per ancestor, making the meter O(nodes x depth) and the effective \
+             allowance budget/average-depth instead of budget."
+        );
     }
 
     /// `produced_node_count` counts EVERY structural node — including each variant
@@ -3490,12 +3723,11 @@ mod tests {
     }
 
     fn cut_labels(edges: &[Vec<usize>], names: &[&str], nodes: &[usize]) -> Vec<String> {
-        let mut picked: Vec<String> = greedy_feedback_vertex_set(edges, &mut |node| {
-            test_key(names[nodes[node]])
-        })
-        .into_iter()
-        .map(|slot| names[nodes[slot]].to_string())
-        .collect();
+        let mut picked: Vec<String> =
+            greedy_feedback_vertex_set(edges, &mut |node| test_key(names[nodes[node]]))
+                .into_iter()
+                .map(|slot| names[nodes[slot]].to_string())
+                .collect();
         picked.sort();
         picked
     }
@@ -3562,7 +3794,8 @@ mod tests {
         // must land on `Tree` — the type the cycle is ABOUT — not on an std
         // container internal, so the marker names something the consumer can
         // recognize.
-        let names = ["xor_all::Tree", "std::sync::Arc", "std::ptr::NonNull", "alloc::sync::ArcInner"];
+        let names =
+            ["xor_all::Tree", "std::sync::Arc", "std::ptr::NonNull", "alloc::sync::ArcInner"];
         let edges = vec![vec![1], vec![2], vec![3], vec![0]];
         let nodes: Vec<usize> = (0..4).collect();
         assert_eq!(cut_labels(&edges, &names, &nodes), vec!["xor_all::Tree".to_string()]);
@@ -3611,11 +3844,8 @@ mod tests {
             let nodes = reachable_from(&edges, &[root]);
             let reachable_names: Vec<String> =
                 nodes.iter().map(|n| names[*n].to_string()).collect();
-            let expected: Vec<String> = global
-                .iter()
-                .filter(|name| reachable_names.contains(name))
-                .cloned()
-                .collect();
+            let expected: Vec<String> =
+                global.iter().filter(|name| reachable_names.contains(name)).cloned().collect();
 
             // Discovery order is whatever order the walk happened to meet the
             // nodes in. Try several, including the reverse, to prove the pick is
@@ -3704,10 +3934,7 @@ mod tests {
         // A generic cut point: the definition is restated under the instantiated
         // key, so it agrees with the marker `canonical_cut_ref` emits.
         let renamed = rename_definition(erased.clone(), "k::Foo<u8>");
-        assert_eq!(
-            trust_types::definitional_datatype_name(&renamed),
-            Some("k::Foo<u8>"),
-        );
+        assert_eq!(trust_types::definitional_datatype_name(&renamed), Some("k::Foo<u8>"),);
         let mut defs = trust_types::DatatypeDefs::new();
         assert!(trust_types::insert_datatype_def(&mut defs, renamed));
         assert!(

@@ -10,7 +10,7 @@
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, CompilerContractBundle, ConstValue, Contract,
-    ContractKind, ContractMetadata, Formula, LoopContractKind, LoopContractSpec, Operand,
+    ContractKind, ContractMetadata, Formula, LoopContractKind, LoopContractSpec, Operand, Place,
     Projection, Rvalue, Sort, SourceSpan, Statement, Symbol, Terminator, Ty, UnOp, VcKind,
     VerifiableFunction, VerificationCondition, parse_spec_expr,
 };
@@ -343,6 +343,7 @@ fn terminator_source_span(term: &Terminator) -> SourceSpan {
     match term {
         Terminator::SwitchInt { span, .. }
         | Terminator::Call { span, .. }
+        | Terminator::TailCall { span, .. }
         | Terminator::Assert { span, .. }
         | Terminator::Drop { span, .. }
         | Terminator::Opaque { span, .. } => span.clone(),
@@ -532,6 +533,10 @@ fn proof_gated_function_digest(function_payload: &str) -> String {
 pub fn prepare_loop_invariant_feedback_validation(
     func: &VerifiableFunction,
 ) -> Option<LoopInvariantFeedbackContext> {
+    // This context participates in proof-gated E4/E5 replacement.  Validate
+    // the source form before applying any semantic projection, matching the
+    // ordinary VC-generation boundary.
+    crate::validate_function(func).ok()?;
     let _work_scope = crate::gen_work_scope();
     let function_payload = serde_json::to_string(func).ok()?;
     // Reconstruct the same production interval environment used by ordinary
@@ -539,7 +544,9 @@ pub fn prepare_loop_invariant_feedback_validation(
     // payload above; only unsafe parsed contract assumptions are removed from
     // abstract interpretation. Otherwise an unrelated unmodeled precondition
     // could make exact production E4 rows impossible to recognize.
-    let arithmetic_safe_func = crate::generate::without_unmodeled_contract_arithmetic(func);
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let arithmetic_safe_func =
+        crate::generate::without_unmodeled_contract_arithmetic(tail_call_expanded.as_ref());
     let interval_environment =
         crate::abstract_interp::merged_interval_environment(arithmetic_safe_func.as_ref());
     if crate::gen_work_tripped() {
@@ -585,7 +592,10 @@ pub fn loop_invariant_feedback_candidate_with_context(
     // machine-arithmetic assumptions before constructing initiation rows. The
     // context remains sealed to `func` above, so this projection cannot
     // be supplied or forged by the caller.
-    let arithmetic_safe_func = crate::generate::without_unmodeled_contract_arithmetic(func);
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let semantic_func = tail_call_expanded.as_ref();
+    let arithmetic_safe_func =
+        crate::generate::without_unmodeled_contract_arithmetic(semantic_func);
     let reconstruction_func = arithmetic_safe_func.as_ref();
     for (contract_index, contract) in reconstruction_func.contracts.iter().enumerate() {
         if !matches!(contract.kind, ContractKind::LoopInvariant) {
@@ -634,7 +644,12 @@ pub fn loop_invariant_feedback_candidate_with_context(
         let parsed = parse_spec_expr(&expr)?;
         let predicate = type_and_validate_loop_formula(reconstruction_func, parsed, Sort::Bool)?;
         return Some(LoopInvariantFeedbackCandidate {
-            function_digest: proof_gated_function_digest(&context.function_payload),
+            // E5 regeneration also uses the shared TailCall semantic view.  Seal
+            // feedback to that exact view while the opaque context above stays
+            // byte-bound to the unmodified source payload.
+            function_digest: proof_gated_function_digest(
+                &serde_json::to_string(semantic_func).ok()?,
+            ),
             function_name: func.name.clone(),
             function_def_path: func.def_path.clone(),
             header_block,
@@ -759,8 +774,66 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
         let kind = match &contract.kind {
             ContractKind::Requires => VcKind::Precondition { callee: func.name.clone() },
             ContractKind::Ensures => VcKind::Postcondition,
+            // A span-only `#[invariant(..)]` is NOT REFUTABLE, so it must not be
+            // minted as a refutable row at all. It is fail-closed here.
+            //
+            // WHAT THIS REPLACES, and why the previous row was worse than no row.
+            // This arm used to mint
+            // `VcKind::ContractInvariant { expression: contract.body.clone() }`
+            // and fall through to the shared tail, which sets
+            // `formula: Formula::Not(parsed)`. That formula is the WHOLE VC:
+            // there is no path condition, no pre-state, no binding of the
+            // clause's free names to the function's locals, because a
+            // function/item-position attribute names no program point to bind
+            // them at (`trust-mir-extract` reads the attribute off
+            // `tcx.hir_attrs` for its span and snippet and never lowers it, and
+            // the real loop machinery is keyed to a loop header — see
+            // `ContractKind::LoopInvariant` below, which is a different variant
+            // and keeps its exact treatment). So the query asked was
+            // `is ¬P unsatisfiable`, i.e. `is P VALID` — a question about the
+            // predicate's text, not about the program.
+            //
+            // A row that means "P is valid" is PROVED exactly when P constrains
+            // NOTHING. MEASURED on the sealed toolchain `trust-e26541e3`, via
+            // the `register_tool` lane, on `fn f(x: u32) -> u32 { x / 2 }`:
+            //
+            //   #[trust::invariant(1 == 1)] -> outcome=proved, solver=clean-kernel-certified
+            //   #[trust::invariant(x == x)] -> outcome=proved, solver=clean-kernel-certified
+            //   #[trust::invariant(x >= 0)] -> unknown   (true for every u32!)
+            //   #[trust::invariant(true)]   -> unknown
+            //   #[trust::invariant(false)]  -> unknown
+            //
+            // Note the direction: the tautologies are the ones that PROVE. The
+            // proved rows carry `kind: "invariant"` and
+            // `ProofLevel::L1Functional`, so each one is a KERNEL-CERTIFIED,
+            // CONTRACT-KIND proof row — the exact rows a ratchet reports as
+            // `proved_by_kind.invariant` and `kernel_certified`. Writing
+            // `#[trust::invariant(1 == 1)]` was therefore a one-line way to
+            // manufacture a headline "first invariant proof" that constrains
+            // nothing. That is a false proof in the strict sense: the artifact
+            // is real and the claim it supports is empty.
+            //
+            // Refusing is the exact answer, not a conservative one. There is no
+            // approximation of "invariant at an unspecified program point" that
+            // is sound; the construct has no meaning to lower, so the row states
+            // that and stays UNPROVABLE (`Formula::Bool(true)` is trivially SAT,
+            // so no solver and no direct caller can report proof).
+            //
+            // The clause stays VISIBLE: one authored clause still mints exactly
+            // one row, so the denominator does not shrink — it moves from
+            // "provable-when-vacuous" to "counted and unproved", which is what
+            // suppresses the enclosing function's verified credit.
             ContractKind::Invariant => {
-                VcKind::Assertion { message: format!("invariant: {}", contract.body) }
+                vcs.push(spec_failure_vc(
+                    func,
+                    contract,
+                    "item-position `invariant` names no program point, so it has no exact \
+                     meaning to lower; a predicate checked in isolation is provable only when \
+                     it is a tautology. Use the first-class loop clause \
+                     `while <cond> invariant <predicate> { .. }`, or `requires`/`ensures` for \
+                     an entry/return condition",
+                ));
+                continue;
             }
             ContractKind::Decreases => {
                 append_loop_decreases_contract_vc(func, contract_index, contract, feedback, vcs);
@@ -1178,38 +1251,55 @@ fn generate_loop_invariant_vcs(
         || formula_contains_machine_encoding(&preservation);
     if machine_required {
         let combined = Formula::And(vec![initiation.clone(), preservation.clone()]);
-        let Some((width, signed)) = uniform_machine_domain(func, &combined) else {
-            vcs.push(loop_contract_unsupported_vc(
+        let scan = machine_domain_scan(func, &combined);
+        // ONE declared domain for the whole formula is the original path and is
+        // untouched. When the leaves disagree, the formula is NOT refused
+        // outright any more: each comparison is translated at its operands' own
+        // domains and widened exactly where they meet
+        // (`machine_faithful_translate_joined`). This is strictly additive —
+        // the joined path runs only where the old code had already given up —
+        // and it widens only at a meeting point, never underneath arithmetic.
+        let translate = |formula: &Formula| match scan.uniform() {
+            Some(domain) => {
+                let (width, signed) = domain.parts();
+                machine_faithful_translate(func, formula, width, signed, true, Polarity::Prop)
+            }
+            // The ambient for a CLOSED atom comes from the COMBINED formula, not
+            // from the half being translated: substituting a loop's entry state
+            // into `i == total` leaves `0 == 0`, whose own scan declares
+            // nothing. The domain that decides it is the one the loop's
+            // variables declare, and `initiation` alone has lost them.
+            None => machine_faithful_translate_joined_under(
                 func,
-                contract,
-                format!(
-                    "e4.machine.mixed-domain: loop invariant `{expr}` does not have one exact declared-width machine domain at bb{header_block}"
-                ),
-            ));
-            return;
+                formula,
+                scan.exact_join(),
+                true,
+            ),
         };
-        let Some(machine_initiation) =
-            machine_faithful_translate(func, &initiation, width, signed, true, Polarity::Prop)
-        else {
-            vcs.push(loop_contract_unsupported_vc(
-                func,
-                contract,
-                format!(
+        let Some(machine_initiation) = translate(&initiation) else {
+            let detail = match scan.uniform() {
+                Some(_) => format!(
                     "e4.machine.initiation-translation: loop invariant `{expr}` initiation is outside the exact declared-width machine fragment"
                 ),
-            ));
+                None => format!(
+                    "e4.machine.mixed-domain: loop invariant `{expr}` initiation has no exact per-operand machine translation at bb{header_block} ({})",
+                    scan.refusal_detail()
+                ),
+            };
+            vcs.push(loop_contract_unsupported_vc(func, contract, detail));
             return;
         };
-        let Some(machine_preservation) =
-            machine_faithful_translate(func, &preservation, width, signed, true, Polarity::Prop)
-        else {
-            vcs.push(loop_contract_unsupported_vc(
-                func,
-                contract,
-                format!(
+        let Some(machine_preservation) = translate(&preservation) else {
+            let detail = match scan.uniform() {
+                Some(_) => format!(
                     "e4.machine.consecution-translation: loop invariant `{expr}` transition is outside the exact declared-width machine fragment"
                 ),
-            ));
+                None => format!(
+                    "e4.machine.mixed-domain: loop invariant `{expr}` transition has no exact per-operand machine translation at bb{header_block} ({})",
+                    scan.refusal_detail()
+                ),
+            };
+            vcs.push(loop_contract_unsupported_vc(func, contract, detail));
             return;
         };
         initiation = machine_initiation;
@@ -1757,6 +1847,9 @@ fn terminator_mentions_local_anywhere(terminator: &Terminator, local: usize) -> 
             place_mentions_local_anywhere(dest, local)
                 || args.iter().any(|operand| operand_mentions_local_anywhere(operand, local))
         }
+        Terminator::TailCall { args, .. } => {
+            local == 0 || args.iter().any(|operand| operand_mentions_local_anywhere(operand, local))
+        }
         Terminator::Assert { cond, .. } => operand_mentions_local_anywhere(cond, local),
         Terminator::Drop { place, .. } => place_mentions_local_anywhere(place, local),
         Terminator::Goto(_)
@@ -2085,6 +2178,18 @@ fn read_only_collection_alias_is_stable(
                     func,
                     args,
                     dest,
+                    *is_foreign,
+                    *is_unsafe_sig,
+                    alias_local,
+                ) {
+                    return false;
+                }
+            }
+            Terminator::TailCall { args, is_foreign, is_unsafe_sig, .. } => {
+                if !safe_shared_collection_call_preserves_local(
+                    func,
+                    args,
+                    &Place::local(0),
                     *is_foreign,
                     *is_unsafe_sig,
                     alias_local,
@@ -2449,7 +2554,7 @@ fn exclusive_mutable_collection_alias_pair_is_stable(
                 return false;
             }
             if matches!(statement, Statement::StorageDead(local) if *local == alias_local)
-                && (!matches!(block.terminator, Terminator::Return)
+                && (!matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. })
                     || block.stmts.iter().skip(statement_index + 1).any(|later| {
                         !matches!(
                             later,
@@ -2524,6 +2629,16 @@ fn exclusive_mutable_collection_alias_pair_is_stable(
         match &block.terminator {
             Terminator::Call { args, dest, .. } => {
                 if [source_local, alias_local].contains(&dest.local)
+                    || args.iter().any(|operand| {
+                        operand_mentions_local_anywhere(operand, source_local)
+                            || operand_mentions_local_anywhere(operand, alias_local)
+                    })
+                {
+                    return false;
+                }
+            }
+            Terminator::TailCall { args, .. } => {
+                if [source_local, alias_local].contains(&0)
                     || args.iter().any(|operand| {
                         operand_mentions_local_anywhere(operand, source_local)
                             || operand_mentions_local_anywhere(operand, alias_local)
@@ -2754,6 +2869,7 @@ fn terminator_edges_to(terminator: &Terminator, target: BlockId) -> usize {
         Terminator::Call { target: candidate, .. } => {
             usize::from(candidate.as_ref() == Some(&target))
         }
+        Terminator::TailCall { .. } => 0,
         Terminator::Assert { target: candidate, .. } => usize::from(*candidate == target),
         Terminator::Opaque { targets, .. } => {
             targets.iter().filter(|candidate| **candidate == target).count()
@@ -2947,6 +3063,13 @@ fn exclusive_mutable_collection_arg_is_stable(func: &VerifiableFunction, local: 
                     return false;
                 }
             }
+            Terminator::TailCall { args, .. } => {
+                if local == 0
+                    || args.iter().any(|operand| operand_mentions_local_anywhere(operand, local))
+                {
+                    return false;
+                }
+            }
             Terminator::SwitchInt { discr, .. }
                 if !operand_uses_collection_only_as_element_read(func, discr, local) =>
             {
@@ -3049,6 +3172,18 @@ fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -
                     return false;
                 }
             }
+            Terminator::TailCall { args, is_foreign, is_unsafe_sig, .. } => {
+                if !safe_shared_collection_call_preserves_local(
+                    func,
+                    args,
+                    &Place::local(0),
+                    *is_foreign,
+                    *is_unsafe_sig,
+                    local,
+                ) {
+                    return false;
+                }
+            }
             Terminator::SwitchInt { discr, .. }
                 if !operand_uses_collection_only_as_element_read(func, discr, local) =>
             {
@@ -3116,6 +3251,14 @@ fn read_only_collection_blocker(func: &VerifiableFunction) -> Option<&'static st
             match &block.terminator {
                 Terminator::Call { args, dest, .. }
                     if dest.local == local
+                        || args
+                            .iter()
+                            .any(|operand| operand_mentions_local_anywhere(operand, local)) =>
+                {
+                    return Some("e45.collection.call-escape");
+                }
+                Terminator::TailCall { args, .. }
+                    if local == 0
                         || args
                             .iter()
                             .any(|operand| operand_mentions_local_anywhere(operand, local)) =>
@@ -3581,11 +3724,8 @@ fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32,
         return None;
     }
     let ty = match field {
-        None => &decl.ty,
-        Some(index) => match &decl.ty {
-            Ty::Tuple(fields) => fields.get(index)?,
-            _ => return None,
-        },
+        None => newtype_carrier_ty(&decl.ty),
+        Some(index) => struct_or_tuple_field_ty(&decl.ty, index)?,
     };
     match ty {
         Ty::Int { width, signed } if rust_machine_width_supported(*width) => {
@@ -3596,7 +3736,110 @@ fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32,
     }
 }
 
-/// Whether the local (or tuple field) behind a variable name is `Bool`-typed.
+/// The declared type of positional field `index` of an aggregate local, for the
+/// ONE-segment `<local>.<i>` projection spelling both the contract surface and
+/// `place_to_var_name` mint for a MIR `Field(i)` place.
+///
+/// WHY THIS EXISTS (return-relation lane, 2026-08-27). The Machine{w} lane is
+/// the only reading of an arithmetic-bearing `ensures` that this codebase will
+/// emit — the mathematical-`Int` spelling of machine arithmetic is the confirmed
+/// `result + 1 > result` false-proof vector. Admission into that lane needs ONE
+/// shared declared `(width, signed)` for every integer variable in the clause,
+/// so a clause naming a field of a STRUCT return had no domain and fell closed:
+/// MEASURED on sealed trust-e26541e3, `ensures ret.0 == var.0 * 2` over
+/// `fn positive(var: Variable) -> Literal { Literal(var.0 * 2) }` reports
+/// `unsupported MIR SpecUnverifiable: ... (contract uses unmodeled fixed-width
+/// machine arithmetic)`, while the byte-identical clause over a `(u32, u32)`
+/// TUPLE return proves. The return-slot RELATION was already exact — the
+/// aggregate pin decomposes `_0 = Literal(move _3)` into `_0.0 == _3` — but no
+/// clause could be read at a width, so nothing could consume it.
+///
+/// SOUNDNESS. This resolves a WIDTH, and a wrong width is a false-proof vector
+/// (an 8-bit reading of a 32-bit computation makes a wrap-dependent claim look
+/// valid). So the type is taken from the extracted `AdtDef`'s own positional
+/// field list, which `trust-mir-extract` fills from `adt_def.all_fields()` in
+/// source-declaration order — the same order MIR `Field(i)` indexes and the same
+/// order `trust_contract_query::push_projected_leaves` numbers the authored
+/// spelling. Everything else DECLINES, and a decline keeps the existing visible
+/// fail-closed row:
+///
+///   * a UNION — its fields alias at offset 0, so `.0` and `.1` name the same
+///     bytes at two types and neither is a sound domain for the other;
+///   * an ENUM — the field view is variant-dependent (`Ty::Adt`'s `fields` is
+///     the union/struct view), so a positional name is ambiguous;
+///   * `adt_kind: None` — a hand-built or pre-W19-serialized `Ty::Adt` whose
+///     kind was never read off a real `AdtDef`. Declining `None` is the same
+///     G-STRUCT-KIND discipline the field-setter frame surface already uses:
+///     never optimistically mint on an un-migrated shape;
+///   * an out-of-range index, and every non-aggregate local.
+///
+/// A multi-segment chain (`_0.0.1`) never reaches here: the callers split on the
+/// FIRST `.` and `"0.1".parse::<usize>()` fails, so nested projections keep
+/// failing closed.
+fn struct_or_tuple_field_ty(ty: &Ty, index: usize) -> Option<&Ty> {
+    match ty {
+        Ty::Tuple(fields) => fields.get(index),
+        Ty::Adt { fields, variants, adt_kind: Some(trust_types::AdtKind::Struct), .. }
+            // `variants.is_empty()` is REDUNDANT with the `Struct` stamp on every
+            // shape `trust-mir-extract` produces (a struct is built with
+            // `variants: Vec::new()`; only `lower_enum_adt` fills it, and that
+            // stamps `Enum`). It is required anyway because the two carriers
+            // could only ever disagree on a shape nobody has authenticated —
+            // a hand-assembled or edited `Ty::Adt` — and a positional field name
+            // over a variant list is exactly the ambiguity this must refuse.
+            // Costs nothing on real input; refuses the inconsistent case.
+            if variants.is_empty() =>
+        {
+            fields.get(index).map(|(_, field_ty)| field_ty)
+        }
+        _ => None,
+    }
+}
+
+/// The type whose machine domain a WHOLE local carries: itself, unless it is a
+/// ONE-field struct, in which case the encoder already models the local and its
+/// single field as THE SAME VALUE and they must share a domain.
+///
+/// This is not an independent claim about layout. It is the domain that matches
+/// an encoding decision this crate already made: `chc::rvalue_to_formula` lowers
+/// a one-operand `Rvalue::Aggregate` — "newtype wrappers, single-variant enums"
+/// — by PROPAGATING THE INNER VALUE (`crates/trust-vcgen/src/chc.rs`, the
+/// `operands.len() == 1` arm), so `_0 = Literal(move _3)` is pinned as
+/// `_0 == _3` beside the aggregate decomposition's `_0.0 == _3`. Both names
+/// denote the one `u32`. Without this the two halves of that same pin get
+/// different answers — `_0.0` resolves to `u32` and `_0` resolves to nothing —
+/// and the assembled VC leaves the declared-width fragment on a conjunct the
+/// encoder itself wrote. MEASURED: with only the field half of this lane in
+/// place, `ensures ret.0 == var.0 * 2` over `Literal(var.0 * 2)` is admitted to
+/// the Machine{w} lane and then falls closed at translation on exactly
+/// `Eq(Var("_0", Int), Var("_3", Int))`.
+///
+/// A struct with TWO OR MORE fields is deliberately excluded: the encoder makes
+/// no such conflation for it (the multi-operand aggregate arm fails closed), so
+/// there is no established carrier whose width this could report, and reporting
+/// one would be a layout claim rather than a restatement of the model.
+fn newtype_carrier_ty(ty: &Ty) -> &Ty {
+    match ty {
+        // `variants.is_empty()`: same redundant-but-required consistency check
+        // as `struct_or_tuple_field_ty`.
+        Ty::Adt { fields, variants, adt_kind: Some(trust_types::AdtKind::Struct), .. }
+            if fields.len() == 1 && variants.is_empty() =>
+        {
+            &fields[0].1
+        }
+        other => other,
+    }
+}
+
+/// Whether the local (or struct/tuple field) behind a variable name is
+/// `Bool`-typed.
+///
+/// This is the twin of [`machine_int_ty_for_var`] and MUST agree with it on
+/// which projections are resolvable: a name this predicate calls `Bool` is
+/// SKIPPED when `uniform_machine_domain` collects the principal width, so
+/// answering `true` for something that is really an integer would let that
+/// integer be translated at another variable's width. Both go through
+/// [`struct_or_tuple_field_ty`], so the two can only ever agree.
 fn var_is_bool_local(func: &VerifiableFunction, name: &str) -> bool {
     let base = name.split('#').next().unwrap_or(name);
     let (local_part, field) = match base.split_once('.') {
@@ -3616,9 +3859,10 @@ fn var_is_bool_local(func: &VerifiableFunction, name: &str) -> bool {
         return false;
     }
     match field {
-        None => matches!(decl.ty, Ty::Bool),
-        Some(index) => matches!(&decl.ty, Ty::Tuple(fields)
-            if matches!(fields.get(index), Some(Ty::Bool))),
+        None => matches!(newtype_carrier_ty(&decl.ty), Ty::Bool),
+        Some(index) => {
+            matches!(struct_or_tuple_field_ty(&decl.ty, index), Some(Ty::Bool))
+        }
     }
 }
 
@@ -3653,14 +3897,33 @@ pub(crate) fn machine_faithful_clause_admissible(
 /// translator validates that RHS separately and fails closed on any malformed
 /// wrapper.
 fn uniform_machine_domain(func: &VerifiableFunction, formula: &Formula) -> Option<(u32, bool)> {
-    let mut domain: Option<(u32, bool)> = None;
-    let mut consistent = true;
-    fn collect(
-        func: &VerifiableFunction,
-        node: &Formula,
-        domain: &mut Option<(u32, bool)>,
-        consistent: &mut bool,
-    ) {
+    machine_domain_scan(func, formula).uniform().map(crate::machine_domain::MachineDomain::parts)
+}
+
+/// The same walk [`uniform_machine_domain`] performs, keeping the FULL ledger
+/// instead of collapsing it to `Option`.
+///
+/// `uniform_machine_domain` is defined as `scan(..).uniform()` and is therefore
+/// unchanged as a predicate — the ledger exists to EXPLAIN a `None`, never to
+/// turn one into a `Some`. Three different things make a formula domainless and
+/// the old diagnostic called all three "mixed-domain":
+///
+///   * two declared domains genuinely disagree (`shift: u32` with `pos: usize`);
+///   * a leaf is not a machine value at all and has no domain to disagree with
+///     (a slice carrier such as `data` in a `Select(data, pos)`, whose element
+///     is a `u8` and whose index is a `usize` — neither of which the ARRAY
+///     variable itself denotes);
+///   * nothing in the formula declares a domain (a closed literal atom).
+///
+/// Reporting which one it is costs nothing and is the difference between a
+/// blocker a reader can act on and one they cannot.
+fn machine_domain_scan(
+    func: &VerifiableFunction,
+    formula: &Formula,
+) -> crate::machine_domain::DomainScan {
+    use crate::machine_domain::{DomainScan, MachineDomain};
+    let mut scan = DomainScan::default();
+    fn collect(func: &VerifiableFunction, node: &Formula, scan: &mut DomainScan) {
         // Rust permits the RHS of a shift to have a different integer width
         // and signedness from the shifted value.  The exact body encoding
         // normalizes that count inside the shift node; it therefore must not
@@ -3671,7 +3934,7 @@ fn uniform_machine_domain(func: &VerifiableFunction, formula: &Formula) -> Optio
         | Formula::BvLShr(value, _, _)
         | Formula::BvAShr(value, _, _) = node
         {
-            collect(func, value, domain, consistent);
+            collect(func, value, scan);
             return;
         }
         let name = match node {
@@ -3682,24 +3945,19 @@ fn uniform_machine_domain(func: &VerifiableFunction, formula: &Formula) -> Optio
         if let Some(name) = name
             && !var_is_bool_local(func, name)
         {
-            match machine_int_ty_for_var(func, name) {
-                Some(var_domain) => match *domain {
-                    None => *domain = Some(var_domain),
-                    Some(existing) if existing == var_domain => {}
-                    Some(_) => *consistent = false,
-                },
-                None => *consistent = false,
+            match machine_int_ty_for_var(func, name)
+                .and_then(|(width, signed)| MachineDomain::new(width, signed))
+            {
+                Some(domain) => scan.observe(domain),
+                None => scan.observe_non_machine(name),
             }
         }
         for child in node.children() {
-            collect(func, child, domain, consistent);
+            collect(func, child, scan);
         }
     }
-    collect(func, formula, &mut domain, &mut consistent);
-    if !consistent {
-        return None;
-    }
-    domain
+    collect(func, formula, &mut scan);
+    scan
 }
 
 /// Whether every node of `formula` lowers into the declared-width machine
@@ -3801,19 +4059,19 @@ fn rust_shift_amount_formula(amount: &Formula, width: u32) -> Option<Box<Formula
     )))
 }
 
-fn resize_shift_amount(amount: Formula, source_width: u32, target_width: u32) -> Option<Formula> {
-    if !rust_machine_width_supported(source_width) || !rust_machine_width_supported(target_width) {
-        return None;
-    }
-    Some(match source_width.cmp(&target_width) {
-        std::cmp::Ordering::Less => {
-            Formula::BvZeroExt(Box::new(amount), target_width - source_width)
-        }
-        std::cmp::Ordering::Greater => {
-            Formula::BvExtract { inner: Box::new(amount), high: target_width - 1, low: 0 }
-        }
-        std::cmp::Ordering::Equal => amount,
-    })
+/// Resize a shift COUNT to the shifted value's width and mask it, through the
+/// single ruled site in [`crate::machine_domain`].
+///
+/// The resize and the mask are one indivisible step there on purpose: the
+/// resize's `Truncate` case is NOT value-preserving, and it is exact only
+/// because the mask that follows discards exactly the bits it dropped. Handing
+/// a caller the bare truncation would hand it the canonical false-proof shape.
+fn resize_and_mask_shift_amount(
+    amount: Formula,
+    source_width: u32,
+    target_width: u32,
+) -> Option<Formula> {
+    crate::machine_domain::shift_amount_resize_and_mask(amount, source_width, target_width)
 }
 
 /// Translate the exact Rust shift-count wrapper emitted by
@@ -3833,7 +4091,7 @@ fn machine_faithful_shift_amount(
         return None;
     }
     let Formula::BvAnd(raw_amount, mask, node_width) = amount else {
-        return None;
+        return unmasked_constant_shift_amount(amount, width);
     };
     if *node_width != width
         || mask.as_ref() != &(Formula::BitVec { value: i128::from(width - 1), width })
@@ -3847,13 +4105,21 @@ fn machine_faithful_shift_amount(
         return None;
     }
 
-    let resized = match source.as_ref() {
-        Formula::Int(value) => {
-            Formula::BitVec { value: rust_shift_literal_pattern(*value as u128, width)?, width }
-        }
-        Formula::UInt(value) => {
-            Formula::BitVec { value: rust_shift_literal_pattern(*value, width)?, width }
-        }
+    match source.as_ref() {
+        // A shift-count LITERAL lost its source width during extraction
+        // (`ConstValue::Int`), and does not need it: only the low
+        // `log2(width)` bits survive the mask, and every two's-complement
+        // representation of one integer agrees on those bits.
+        Formula::Int(value) => resize_and_mask_shift_amount(
+            Formula::BitVec { value: rust_shift_literal_pattern(*value as u128, width)?, width },
+            width,
+            width,
+        ),
+        Formula::UInt(value) => resize_and_mask_shift_amount(
+            Formula::BitVec { value: rust_shift_literal_pattern(*value, width)?, width },
+            width,
+            width,
+        ),
         source => {
             let (source_width, source_signed) = uniform_machine_domain(func, source)?;
             let source = machine_faithful_translate(
@@ -3864,14 +4130,95 @@ fn machine_faithful_shift_amount(
                 allow_div_rem,
                 Polarity::Value,
             )?;
-            resize_shift_amount(source, source_width, width)?
+            resize_and_mask_shift_amount(source, source_width, width)
         }
+    }
+}
+
+/// The shift count spelled WITHOUT the `& (width - 1)` mask, admitted only when
+/// the mask is provably the identity on it: an integer LITERAL `k` with
+/// `0 <= k < width`.
+///
+/// WHY THIS EXISTS. There are TWO emitters of a body shift and they do not
+/// spell the count the same way. `contracts::rust_shift_amount_formula` emits
+/// the masked form `BvAnd(IntToBv(k, w), w - 1, w)`, which
+/// [`machine_faithful_shift_amount`] authenticates. `chc::try_binop_to_formula`
+/// emits the shift as `BvToInt(BvShl(IntToBv(lhs, w), IntToBv(rhs, w), w), w,
+/// signed)` with the count UNMASKED — and that is the spelling a real body's
+/// `_3 = Shl(_4, const 1)` block definition arrives in. The authenticator
+/// therefore refused a body definition that this same crate had written.
+///
+/// MEASURED consequence, before this: `ensures ret.0 == var.0 * 2` over
+/// `ay-proof-common`'s actual `Literal::positive` body (`Literal(var.0 << 1)`)
+/// falls closed at translation on exactly
+/// `Eq(_3, BvToInt(BvShl(IntToBv(_4, 32), IntToBv(1, 32), 32), 32, false))`,
+/// while the same clause over `Literal(var.0 * 2)` proves. Two spellings of one
+/// operation, one of them unreadable.
+///
+/// SOUNDNESS. This admits ONE case and it is an identity, not an
+/// approximation: for a literal `k` in `0..width`, `k & (width - 1) == k`
+/// because every supported Rust integer width is a power of two, so the masked
+/// and unmasked spellings denote the same bitvector. The masked form is
+/// returned regardless, so the emitted translation is byte-identical to what
+/// the authenticated spelling would have produced. Everything else DECLINES and
+/// keeps the existing visible fail-closed row:
+///
+///   * `k >= width` — the count rustc's `Overflow(Shl)` assert rejects. Rust
+///     has no value for that shift, so there is nothing exact to emit;
+///   * a negative literal;
+///   * a NON-literal count. A symbolic count genuinely needs the mask (rustc
+///     masks at runtime), so an unmasked symbolic count is a spelling this
+///     function cannot authenticate and must not guess at.
+///
+/// The strictness this must NOT relax is the one
+/// `rust_shift_counts_are_masked_and_keep_their_independent_integer_domain`
+/// and the `malformed_shift` case pin: a WRONG mask (`& 3` at width 8) is still
+/// a `BvAnd` and still goes down the authenticating path, where it still fails.
+fn unmasked_constant_shift_amount(amount: &Formula, width: u32) -> Option<Formula> {
+    let Formula::IntToBv(source, conversion_width) = amount else {
+        return None;
     };
+    if *conversion_width != width {
+        return None;
+    }
+    let count = match source.as_ref() {
+        Formula::Int(value) => u128::try_from(*value).ok()?,
+        Formula::UInt(value) => *value,
+        _ => return None,
+    };
+    if count >= u128::from(width) {
+        return None;
+    }
+    let pattern = i128::try_from(count).ok()?;
     Some(Formula::BvAnd(
-        Box::new(resized),
+        Box::new(Formula::BitVec { value: pattern, width }),
         Box::new(Formula::BitVec { value: i128::from(width - 1), width }),
         width,
     ))
+}
+
+/// The candidate `(op, lhs, rhs)` of a wrapping modular-`Ite` value node: the
+/// combination term sits in the `Ite`'s innermost else position (one level for
+/// the unsigned single-`Ite` forms, two for the signed two-sided form). This
+/// is only the EXTRACTION half — the caller re-runs the shared constructor on
+/// the extracted operands and demands byte-identity, which is what actually
+/// authenticates the shape (see the `Formula::Ite` arm in
+/// `machine_faithful_translate`).
+fn machine_wrapping_ite_operands(
+    formula: &Formula,
+) -> Option<(trust_types::BinOp, &Formula, &Formula)> {
+    let Formula::Ite(_, _, els) = formula else {
+        return None;
+    };
+    let s = match els.as_ref() {
+        Formula::Ite(_, _, inner) => inner.as_ref(),
+        other => other,
+    };
+    match s {
+        Formula::Add(x, y) => Some((trust_types::BinOp::Add, x, y)),
+        Formula::Sub(x, y) => Some((trust_types::BinOp::Sub, x, y)),
+        _ => None,
+    }
 }
 
 /// Translate a formula into pure declared-width QF_BV, `None` on any node
@@ -4056,6 +4403,34 @@ fn machine_faithful_translate(
                 let (a, b) = value_pair(a, b)?;
                 Formula::BvMul(a, b, width)
             }
+            // Trust (2026-08-20, bare-BinaryOp wrapping): the modular-`Ite`
+            // value definition the shared wrapping constructor mints
+            // (`generate::wrapping_binop_modular_ite`) for a bare
+            // `Rvalue::BinaryOp(Add|Sub)` body statement — the -O /
+            // overflow-checks-off form. In the pure declared-width reading the
+            // reduction IS the BV operation: every BV assignment denotes an
+            // in-range machine value, for which `bvadd`/`bvsub` equals the
+            // Int-domain mod-2^w reduction EXACTLY (both signednesses — the
+            // two-sided signed form is two's-complement wrap by construction).
+            // Recognition is CONSTRUCTOR-VERIFIED: the node must be
+            // byte-identical to what the shared constructor returns for the
+            // extracted operands at THIS declared domain, so no other `Ite`
+            // shape can launder into the fragment, and the recognizer can
+            // never drift from the encoding (there is exactly one spelling).
+            Formula::Ite(..) => {
+                let (op, x, y) = machine_wrapping_ite_operands(formula)?;
+                if crate::generate::wrapping_binop_modular_ite(op, x, y, width, signed).as_ref()
+                    != Some(formula)
+                {
+                    return None;
+                }
+                let (a, b) = value_pair(x, y)?;
+                match op {
+                    trust_types::BinOp::Add => Formula::BvAdd(a, b, width),
+                    trust_types::BinOp::Sub => Formula::BvSub(a, b, width),
+                    _ => return None,
+                }
+            }
             // Two's-complement negation: `0 - x` at the declared width.
             Formula::Neg(a) => Formula::BvSub(
                 Box::new(Formula::BitVec { value: 0, width }),
@@ -4073,6 +4448,220 @@ fn machine_faithful_translate(
             _ => return None,
         }),
     }
+}
+
+/// Translate a proposition whose leaves declare MORE THAN ONE machine domain,
+/// by giving every operand its own domain and widening EXACTLY where two of
+/// them meet.
+///
+/// [`machine_faithful_translate`] imposes one `(width, signed)` on a whole
+/// formula, so a proposition mixing a `u32` and a `u64` had no translation at
+/// all and the clause was refused whole. That refusal was correct but far wider
+/// than it needed to be: a comparison of two integers is a question about their
+/// VALUES, and two values of different machine types have an exact common
+/// domain whenever one widens into the other without loss.
+///
+/// THE RULE, and the line it does not cross:
+///
+///   * An OPERAND is translated at ITS OWN uniform declared domain, by the
+///     unchanged [`machine_faithful_translate`]. So `i + 1` for a `u32` `i`
+///     still wraps at `2^32` — the widening happens strictly ABOVE the
+///     arithmetic, never inside it. Evaluating that same sum in a joined 64-bit
+///     domain would make `i + 1 > i` valid where the machine falsifies it at
+///     `u32::MAX`; the fixture
+///     `machine_domain::tests::widening_under_wrapping_arithmetic_would_flip_the_answer`
+///     is that witness.
+///   * The two operands then meet at
+///     [`crate::machine_domain::join`]'s domain, each carrying the
+///     [`crate::machine_domain::ValueConversion`] the rule table hands out —
+///     zero extension for an unsigned source, sign extension for a signed one,
+///     and NOTHING for a narrowing or a signedness change, which stay refused.
+///   * Only comparison and equality get a join. Every other node keeps the
+///     single-domain discipline, because every other node's meaning depends on
+///     the width it is evaluated at.
+///   * A CLOSED atom — one with no domain-declaring leaf at all — is translated
+///     at the WHOLE formula's exact join. That is exact and not a domain of
+///     convenience: `machine_literal_pattern` range-checks every literal
+///     against the chosen domain and refuses one that does not fit, and a
+///     comparison of two literals that both fit a domain has the same truth
+///     value there as over the integers. The case is not exotic — substituting
+///     a loop's entry state into `i == total` yields `0 == 0`, and refusing
+///     THAT would refuse every initiation obligation of a loop entered at
+///     constants. It does mean a clause the user wrote closed (`1 == 1`)
+///     translates here exactly as it already does on a single-domain loop; the
+///     vacuity table in
+///     `tests/mixed_domain_vacuity_table.rs` measures both and reports them
+///     separately.
+///
+/// `None` on anything else, which is most things: quantifiers, collection
+/// selects, float facts, an operand whose own leaves disagree, an operand
+/// containing a leaf with no machine domain at all, and any closed atom when
+/// the formula around it has no exact join either.
+#[cfg(test)]
+fn machine_faithful_translate_joined(
+    func: &VerifiableFunction,
+    formula: &Formula,
+    allow_div_rem: bool,
+) -> Option<Formula> {
+    let ambient = machine_domain_scan(func, formula).exact_join();
+    machine_faithful_translate_joined_under(func, formula, ambient, allow_div_rem)
+}
+
+fn machine_faithful_translate_joined_under(
+    func: &VerifiableFunction,
+    formula: &Formula,
+    ambient: Option<crate::machine_domain::MachineDomain>,
+    allow_div_rem: bool,
+) -> Option<Formula> {
+    use crate::machine_domain::{MachineDomain, join};
+
+    let prop = |f: &Formula| {
+        machine_faithful_translate_joined_under(func, f, ambient, allow_div_rem)
+    };
+
+    // Mirrors `machine_faithful_translate`'s `operand_is_prop`: a comparison
+    // operand is a proposition iff it is boolean structure or names a
+    // Bool-typed local.
+    let operand_is_prop = |f: &Formula| -> bool {
+        match f {
+            Formula::Bool(_)
+            | Formula::Not(_)
+            | Formula::And(_)
+            | Formula::Or(_)
+            | Formula::Implies(..)
+            | Formula::Eq(..)
+            | Formula::Lt(..)
+            | Formula::Le(..)
+            | Formula::Gt(..)
+            | Formula::Ge(..) => true,
+            Formula::Var(name, sort) => matches!(sort, Sort::Bool) || var_is_bool_local(func, name),
+            Formula::SymVar(sym, sort) => {
+                matches!(sort, Sort::Bool) || var_is_bool_local(func, sym.as_str())
+            }
+            _ => false,
+        }
+    };
+
+    // Translate one comparison's operands at their own domains and meet them.
+    let meet = |left: &Formula, right: &Formula| -> Option<(Formula, Formula, MachineDomain)> {
+        let (left_scan, right_scan) =
+            (machine_domain_scan(func, left), machine_domain_scan(func, right));
+        // A leaf that is not a machine value at all has no domain to widen
+        // from. Refuse rather than guess what an array carrier "means".
+        if !left_scan.non_machine_leaves.is_empty() || !right_scan.non_machine_leaves.is_empty() {
+            return None;
+        }
+        // An operand with no declared domain is a closed literal expression; it
+        // takes the OTHER operand's domain, and `machine_literal_pattern` still
+        // range-checks every literal against it. A CLOSED atom takes the whole
+        // formula's exact join for the same reason (see the doc comment); with
+        // no join it refuses.
+        let (left_domain, right_domain) = match (left_scan.uniform(), right_scan.uniform()) {
+            (Some(left), Some(right)) => (left, right),
+            (Some(only), None) | (None, Some(only)) => (only, only),
+            // A CLOSED atom borrows the whole formula's join — and borrowing a
+            // domain is only exact if nothing in the atom can WRAP at it.
+            // `255 + 1 == 0` is FALSE in Rust (the sum is `i32` arithmetic and
+            // is 256) and TRUE at a borrowed `u8`, and widening to the join
+            // does not fix it: `u8` joined with `u16` is `u16`, where
+            // `65535 + 1 == 0` reads TRUE just the same. So a closed atom
+            // admits LITERALS ONLY — no arithmetic node can be borrowed into a
+            // domain it was not written at. Substituting a loop's entry state
+            // leaves exactly that shape (`i == total` becomes `0 == 0`), which
+            // is the case this exists to serve; anything richer refuses.
+            //
+            // The channel was found by codex on the sibling per-atom lane and
+            // is pre-existing in the whole-formula gate, which borrows the
+            // ambient domain for a closed atom with no such check.
+            (None, None) => {
+                let is_bare_literal =
+                    |f: &Formula| matches!(f, Formula::Int(_) | Formula::UInt(_));
+                if !is_bare_literal(left) || !is_bare_literal(right) {
+                    return None;
+                }
+                let closed = ambient?;
+                (closed, closed)
+            }
+        };
+        let (joined, from_left, from_right) = join(left_domain, right_domain)?;
+        let translate = |operand: &Formula, domain: MachineDomain| {
+            let (width, signed) = domain.parts();
+            machine_faithful_translate(func, operand, width, signed, allow_div_rem, Polarity::Value)
+        };
+        Some((
+            from_left.apply(translate(left, left_domain)?),
+            from_right.apply(translate(right, right_domain)?),
+            joined,
+        ))
+    };
+
+    Some(match formula {
+        Formula::Bool(value) => Formula::Bool(*value),
+        Formula::Var(name, _) => {
+            if !var_is_bool_local(func, name) {
+                return None;
+            }
+            Formula::Var(name.clone(), Sort::Bool)
+        }
+        Formula::SymVar(sym, _) => {
+            if !var_is_bool_local(func, sym.as_str()) {
+                return None;
+            }
+            Formula::Var(sym.as_str().to_string(), Sort::Bool)
+        }
+        Formula::Not(inner) => Formula::Not(Box::new(prop(inner)?)),
+        Formula::And(parts) => Formula::And(parts.iter().map(prop).collect::<Option<Vec<_>>>()?),
+        Formula::Or(parts) => Formula::Or(parts.iter().map(prop).collect::<Option<Vec<_>>>()?),
+        Formula::Implies(left, right) => {
+            Formula::Implies(Box::new(prop(left)?), Box::new(prop(right)?))
+        }
+        Formula::Eq(left, right) => {
+            if operand_is_prop(left) || operand_is_prop(right) {
+                Formula::Eq(Box::new(prop(left)?), Box::new(prop(right)?))
+            } else {
+                let (left, right, _) = meet(left, right)?;
+                Formula::Eq(Box::new(left), Box::new(right))
+            }
+        }
+        Formula::Lt(left, right) => {
+            let (left, right, domain) = meet(left, right)?;
+            let (left, right) = (Box::new(left), Box::new(right));
+            if domain.signed {
+                Formula::BvSLt(left, right, domain.width)
+            } else {
+                Formula::BvULt(left, right, domain.width)
+            }
+        }
+        Formula::Le(left, right) => {
+            let (left, right, domain) = meet(left, right)?;
+            let (left, right) = (Box::new(left), Box::new(right));
+            if domain.signed {
+                Formula::BvSLe(left, right, domain.width)
+            } else {
+                Formula::BvULe(left, right, domain.width)
+            }
+        }
+        // `a > b` <=> `b < a`; `a >= b` <=> `b <= a`.
+        Formula::Gt(left, right) => {
+            let (left, right, domain) = meet(left, right)?;
+            let (left, right) = (Box::new(left), Box::new(right));
+            if domain.signed {
+                Formula::BvSLt(right, left, domain.width)
+            } else {
+                Formula::BvULt(right, left, domain.width)
+            }
+        }
+        Formula::Ge(left, right) => {
+            let (left, right, domain) = meet(left, right)?;
+            let (left, right) = (Box::new(left), Box::new(right));
+            if domain.signed {
+                Formula::BvSLe(right, left, domain.width)
+            } else {
+                Formula::BvULe(right, left, domain.width)
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// Translate the fully assembled body-aware postcondition VC of a
@@ -4590,7 +5179,10 @@ fn symbolic_paths_from_loop_header_to_target(
                     push_edge(successor, edge_guard, &mut pending);
                 }
             }
-            Terminator::Return | Terminator::Unreachable | Terminator::Resume => {}
+            Terminator::Return
+            | Terminator::TailCall { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
             Terminator::Call { .. } => {
                 return Err(format!("e45.transition.nested-entry-call-effect: bb{}", block.id.0));
             }
@@ -4876,11 +5468,50 @@ fn symbolic_loop_transitions_with_ancestors(
                     push_edge(target, edge_guard, &mut pending);
                 }
             }
-            Terminator::Return | Terminator::Unreachable | Terminator::Resume => {
+            Terminator::Return
+            | Terminator::TailCall { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {
                 // Function exit/divergence does not complete an iteration.
             }
             Terminator::Call { .. } => {
-                return Err(format!("e45.transition.call-effect: bb{}", block.id.0));
+                let frame = exact_call_frame(func, block, header, &in_loop)?;
+                // The modeled effect of the call, and the ONLY one: the
+                // destination receives a FRESH UNCONSTRAINED symbol of its own
+                // sort. Every other state entry is carried across unchanged,
+                // which is exactly what `exact_call_frame` proved admissible.
+                // No fact about the callee is asserted anywhere — not its
+                // return value, not totality, not panic-freedom, not purity.
+                let mut next = path.clone();
+                next.current = frame.target;
+                let dest_name =
+                    crate::place_to_var_name(func, &trust_types::Place::local(frame.dest_local));
+                invalidate_symbolic_local(func, frame.dest_local, &mut next.state);
+                // `#...` is intentionally an SSA-version suffix, the same
+                // convention `summarize_nested_loop` havocs with: the exact
+                // machine translator strips it before resolving the source
+                // local's width and signedness, so a havoced u32 stays u32
+                // rather than becoming an untyped mathematical Int. The name is
+                // keyed on the CALL SITE (`bb{n}`) and not on a running
+                // counter, so two acyclic paths through the same call block
+                // spell the same symbol; sharing a free symbol across the
+                // disjuncts of a formula being checked UNSAT is sound, because
+                // UNSAT of `A(v) or B(v)` is `(forall v. not A(v)) and
+                // (forall v. not B(v))`. One path can never visit the same
+                // block twice (`path.seen`), so no single modeled iteration
+                // reuses a symbol for two distinct dynamic calls.
+                next.state.insert(
+                    dest_name.clone(),
+                    Formula::Var(
+                        format!(
+                            "{dest_name}#{}call_bb{}",
+                            crate::LOOP_TRANSITION_HAVOC_TOKEN_PREFIX,
+                            block.id.0
+                        ),
+                        frame.dest_sort,
+                    ),
+                );
+                pending.push(next);
             }
             Terminator::Drop { .. } => {
                 return Err(format!("e45.transition.drop-effect: bb{}", block.id.0));
@@ -4902,6 +5533,430 @@ fn symbolic_loop_transitions_with_ancestors(
     Ok(transitions)
 }
 
+/// The frame of an admissible in-loop call: the single symbolic-state entry the
+/// callee is able to change, and the block control returns to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactCallFrame {
+    target: BlockId,
+    dest_local: usize,
+    dest_sort: Sort,
+}
+
+/// Decide whether a `Terminator::Call` on a loop transition path has an EXACT
+/// FRAME — whether the set of symbolic-state entries the callee could possibly
+/// write is known exactly — from facts about the CALLER's own MIR and nothing
+/// whatsoever about the callee.
+///
+/// # This is deliberately not a call summary
+///
+/// A callee summary is a TRUSTED ASSUMPTION that every caller inherits, and the
+/// recorded precedent in this tree is an audited "cannot panic" summary that
+/// claimed `Vec::push` is total when it panics on capacity overflow; satisfying
+/// it would have minted a false proof. Nothing here asserts anything about a
+/// callee. The caller models an admitted call by assigning its destination a
+/// FRESH UNCONSTRAINED SYMBOL of the destination's own sort — an
+/// over-approximation of every value the callee could return — and carrying
+/// every other entry across unchanged.
+///
+/// Consequences of modeling the value that way, each of which is the safe
+/// direction:
+///
+/// * A callee that DIVERGES or UNWINDS contributes a modeled iteration that
+///   cannot happen. Adding unreachable behaviour to a formula being checked
+///   UNSAT can only make it harder to discharge, never easier.
+/// * A callee that PANICS is likewise fine: the panic path leaves through the
+///   unwind edge, which condition (2) forces out of the loop, so it completes
+///   no iteration. Panic-freedom is a separate obligation and is not assumed.
+/// * A callee that returns a value the invariant depends on leaves that
+///   invariant UNPROVED rather than falsely proved. That is the honest cost of
+///   refusing to assume a return relation, and it is why this change moves the
+///   `%`-free, value-independent invariants and not the value-dependent ones.
+///
+/// The one thing that must be right is the FRAME. If a callee can write a state
+/// entry that this model carries across the call unchanged, every caller
+/// inherits a false proof with kernel authority. Each numbered condition below
+/// is therefore a caller-side proof that the callee holds no capability to
+/// write anything but `dest`.
+fn exact_call_frame(
+    func: &VerifiableFunction,
+    block: &BasicBlock,
+    header: BlockId,
+    in_loop: &FxHashSet<BlockId>,
+) -> Result<ExactCallFrame, String> {
+    let bb = block.id.0;
+    let Terminator::Call { args, dest, target, atomic, is_foreign, is_unsafe_sig, unwind, .. } =
+        &block.terminator
+    else {
+        return Err(format!("e45.transition.call-effect.not-a-call: bb{bb}"));
+    };
+
+    // (1) Control returns to exactly one in-function block. A `None` target is
+    //     rustc's diverging call; it completes no iteration, but nothing here
+    //     needs that shape and refusing it costs no coverage.
+    let Some(target) = *target else {
+        return Err(format!("e45.transition.call-effect.no-return-target: bb{bb}"));
+    };
+
+    // (2) An unwinding call must not re-enter the loop. `Unreachable`,
+    //     `Continue` and `Terminate` leave the function outright; a `Cleanup`
+    //     block inside the natural loop body could reach the header along a
+    //     path this walk never explores, and an unexplored backedge path is
+    //     exactly how a partial transition model mints authority.
+    if let Some(cleanup) = unwind.cleanup_target() {
+        if cleanup == header || in_loop.contains(&cleanup) {
+            return Err(format!(
+                "e45.transition.call-effect.unwind-into-loop: bb{bb} unwinds to bb{} inside the loop",
+                cleanup.0
+            ));
+        }
+    }
+
+    // (3) Compiler-authenticated identity screens. An atomic intrinsic has a
+    //     memory effect the frame argument below does not cover; a foreign item
+    //     is outside Rust's aliasing rules entirely; an unsafe SIGNATURE means
+    //     the callee's contract, not the type system, is what bounds its
+    //     writes. `is_foreign` / `is_unsafe_sig` are rustc-recorded at
+    //     extraction (`tcx.is_foreign_item`, `fn_sig(..).safety()`), not name
+    //     heuristics.
+    if atomic.is_some() {
+        return Err(format!("e45.transition.call-effect.atomic-intrinsic: bb{bb}"));
+    }
+    if *is_foreign {
+        return Err(format!("e45.transition.call-effect.foreign-callee: bb{bb}"));
+    }
+    if *is_unsafe_sig {
+        return Err(format!("e45.transition.call-effect.unsafe-signature: bb{bb}"));
+    }
+
+    // (4) The destination is one whole scalar local. A projected destination
+    //     writes through a place this model does not track exactly, and a local
+    //     the collection model denotes carries a slice base or a modeled length
+    //     whose identity havocing would silently destroy.
+    if !dest.projections.is_empty() {
+        return Err(format!("e45.transition.call-effect.projected-destination: bb{bb}"));
+    }
+    let Some(decl) = func.body.locals.get(dest.local) else {
+        return Err(format!("e45.transition.call-effect.invalid-destination: bb{bb}"));
+    };
+    if decl.index != dest.local {
+        return Err(format!("e45.transition.call-effect.noncanonical-destination: bb{bb}"));
+    }
+    // Ordered first so the MORE SPECIFIC diagnostic would win. MEASURED: this
+    // screen is unreachable today and is a BACKSTOP, not a live check — a
+    // collection-modeled local is never of by-value scalar type, and a call
+    // that reseats the collection makes `read_only_collection_arg_is_stable`
+    // false so the model is already absent. It is retained because either of
+    // those two facts is a property of a widening lane, not of this one; if
+    // `ty_is_by_value_scalar` or the collection admission ever grows, the reseat
+    // must still be refused here rather than silently havoced. See the
+    // corresponding assertion in
+    // `read_only_collection_lane_rejects_mutation_escape_and_untyped_index_shapes`,
+    // which records the reachable code rather than this one.
+    if exact_collection_model_for_local(func, dest.local).is_some() {
+        return Err(format!(
+            "e45.transition.call-effect.collection-destination: bb{bb} reseats modeled collection _{}",
+            dest.local
+        ));
+    }
+    if !ty_is_by_value_scalar(&decl.ty) {
+        return Err(format!(
+            "e45.transition.call-effect.nonscalar-destination: bb{bb} writes _{} of type {:?}",
+            dest.local, decl.ty
+        ));
+    }
+    let dest_sort = crate::sort_for_ty_in(func, &decl.ty);
+
+    // (5) No argument hands the callee a capability to write into this
+    //     function's frame.
+    for (position, arg) in args.iter().enumerate() {
+        call_argument_carries_no_write_capability(func, arg).map_err(|detail| {
+            format!(
+                "e45.transition.call-effect.arg-capability: bb{bb} argument {position}: {detail}"
+            )
+        })?;
+    }
+
+    // (6) …and no EARLIER code handed one out either. See
+    //     `caller_frame_creates_no_local_pointer`.
+    caller_frame_creates_no_local_pointer(func)
+        .map_err(|detail| format!("e45.transition.call-effect.{detail}: bb{bb}"))?;
+
+    // (7) …and the loop reads no memory the model does not represent, so there
+    //     is nothing outside the state map for a callee to write behind it.
+    //     This covers the capability that ARRIVED — a raw-pointer or reference
+    //     parameter — which (5) and (6) cannot see. See
+    //     `caller_reads_no_untracked_memory`.
+    caller_reads_no_untracked_memory(func)
+        .map_err(|detail| format!("e45.transition.call-effect.{detail}: bb{bb}"))?;
+
+    // (8) A local NAME carrying the `#` version-token separator would let a
+    //     hand-built public Trust IR body spell exactly the havoc symbol this
+    //     model mints (`chunk#e45_call_bb2`), collapsing the pre-state and the
+    //     post-state of a call destination onto one SMT name. rustc never
+    //     produces such an identifier; the public IR boundary accepts any
+    //     string, so screen it rather than assume it.
+    if let Some(decl) = func
+        .body
+        .locals
+        .iter()
+        .find(|decl| decl.name.as_deref().is_some_and(|name| name.contains('#')))
+    {
+        return Err(format!(
+            "e45.transition.call-effect.version-token-in-local-name: bb{bb} local _{} named {:?}",
+            decl.index, decl.name
+        ));
+    }
+
+    // (9) A modeled EXCLUSIVE-MUTABLE collection is the one piece of modeled
+    //     memory whose freedom from aliasing rests on borrowck rather than on
+    //     this function's own MIR. Condition (5) proves this call is handed no
+    //     `&mut`, and (6) proves no raw pointer to it was ever formed here, but
+    //     the argument that no alias reached the callee by some other route is
+    //     not one this walk can make. Refuse loudly instead.
+    if func
+        .body
+        .locals
+        .iter()
+        .filter_map(|decl| exact_collection_model_for_local(func, decl.index))
+        .any(|model| model.is_exclusive_mutable())
+    {
+        return Err(format!(
+            "e45.transition.call-effect.exclusive-mutable-collection-in-scope: bb{bb}"
+        ));
+    }
+
+    Ok(ExactCallFrame { target, dest_local: dest.local, dest_sort })
+}
+
+/// Condition (8): the loop must not READ memory that the model does not
+/// represent as a state entry.
+///
+/// This is the hole an independent review found in an earlier version of this
+/// screen, and it is a real one. `initial_symbolic_state` keys the state by
+/// WHOLE LOCAL (plus exact collection models). A read through a dereference of
+/// anything else — `*p` for a raw-pointer parameter, `*w.0` for a reference
+/// inside an aggregate — lowers through `operand_to_formula` to a name like
+/// `p*` that is NOT a state key, so `substitute_formula_state` leaves it
+/// untouched in BOTH the pre-state and the post-state of the transition. The
+/// model therefore ASSERTS that the iteration left `*p` unchanged.
+///
+/// Before this lane that assertion was true: no admitted statement can write
+/// through a dereference (a projected `Statement::Assign` is declined by
+/// `apply_symbolic_statements` outside the authenticated exclusive-collection
+/// store). Admitting a call breaks it: a safe, zero-argument callee can write
+/// `*p` through a pointer it obtained elsewhere, and `invariant *p == 0` would
+/// then be discharged for a program that violates it. Conditions (5) and (6)
+/// do not cover this, because the capability neither passes through this call's
+/// arguments nor is created in this body — it ARRIVED, as a parameter.
+///
+/// Rather than model untracked memory, refuse to admit any call in a body that
+/// reads it. The one exempt shape is a dereference rooted at an exact
+/// read-only collection model, which carries its own stability proof
+/// (`read_only_collection_arg_is_stable`, which independently re-checks every
+/// `Terminator::Call` in the body via
+/// `safe_shared_collection_call_preserves_local`).
+///
+/// The walk is EXHAUSTIVE by construction: every statement, rvalue and
+/// terminator shape it does not explicitly recognize as place-free is REFUSED,
+/// so a variant added to the IR later fails closed instead of being skipped.
+fn caller_reads_no_untracked_memory(func: &VerifiableFunction) -> Result<(), String> {
+    let check = |place: &trust_types::Place| -> Result<(), String> {
+        if !place.projections.iter().any(|p| matches!(p, Projection::Deref)) {
+            return Ok(());
+        }
+        if exact_collection_model_for_local(func, place.local).is_some() {
+            return Ok(());
+        }
+        Err(format!("untracked-deref._{}", place.local))
+    };
+    let check_operand = |operand: &Operand| -> Result<(), String> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => check(place),
+            Operand::Constant(_) => Ok(()),
+            other => Err(format!("unscreened-operand.{other:?}")),
+        }
+    };
+    let check_rvalue = |rvalue: &Rvalue| -> Result<(), String> {
+        match rvalue {
+            Rvalue::Use(a) | Rvalue::UnaryOp(_, a) | Rvalue::Cast(a, _) | Rvalue::Repeat(a, _) => {
+                check_operand(a)
+            }
+            Rvalue::BinaryOp(_, a, b)
+            | Rvalue::CheckedBinaryOp(_, a, b)
+            | Rvalue::UncheckedBinaryOp(_, a, b) => {
+                check_operand(a)?;
+                check_operand(b)
+            }
+            Rvalue::Aggregate(_, operands) => {
+                operands.iter().try_for_each(|operand| check_operand(operand))
+            }
+            Rvalue::Ref { place, .. }
+            | Rvalue::AddressOf(_, place)
+            | Rvalue::Discriminant(place)
+            | Rvalue::Len(place)
+            | Rvalue::CopyForDeref(place) => check(place),
+            other => Err(format!("unscreened-rvalue.{other:?}")),
+        }
+    };
+    for block in &func.body.blocks {
+        for statement in &block.stmts {
+            match statement {
+                Statement::Assign { place, rvalue, .. } => {
+                    check(place)?;
+                    check_rvalue(rvalue)?;
+                }
+                Statement::SetDiscriminant { place, .. }
+                | Statement::Deinit { place }
+                | Statement::PlaceMention(place)
+                | Statement::Retag { place, .. } => check(place)?,
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                other => return Err(format!("unscreened-statement.{other:?}")),
+            }
+        }
+        match &block.terminator {
+            Terminator::Goto(_)
+            | Terminator::Return
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            Terminator::SwitchInt { discr, .. } => check_operand(discr)?,
+            Terminator::Assert { cond, .. } => check_operand(cond)?,
+            Terminator::Call { args, dest, .. } => {
+                check(dest)?;
+                args.iter().try_for_each(|arg| check_operand(arg))?;
+            }
+            Terminator::TailCall { args, .. } => {
+                args.iter().try_for_each(|arg| check_operand(arg))?;
+            }
+            Terminator::Drop { place, .. } => check(place)?,
+            other => return Err(format!("unscreened-terminator.{other:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// A type Rust passes BY VALUE, so that handing it to a callee copies it and
+/// conveys no reference to the caller's storage.
+fn ty_is_by_value_scalar(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Bool | Ty::Char | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Float { .. } | Ty::Unit
+    )
+}
+
+/// A pointee type through which a SHARED reference conveys no write capability.
+///
+/// This is a syntactic closure over the primitive `Ty` grammar and admits no
+/// named type at all, which is precisely how interior mutability is excluded:
+/// `UnsafeCell`, `Cell`, `RefCell`, `Mutex` and every atomic are `Ty::Datatype`
+/// / ADT spellings and fall out of this recursion. Writing through a `&T` where
+/// `T` transitively contains no `UnsafeCell` is undefined behaviour, which is
+/// the same no-UB footing every other exact model in this file stands on (see
+/// `read_only_collection_element_sort`, which makes the identical Freeze
+/// argument for element reads).
+fn ty_is_write_free_behind_shared_reference(ty: &Ty) -> bool {
+    match ty {
+        Ty::Bool | Ty::Char | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Float { .. } => true,
+        // `str` is the UTF-8 `[u8]` primitive; it has no interior mutability
+        // and no named component.
+        Ty::Str => true,
+        Ty::Slice { elem } | Ty::Array { elem, .. } => {
+            ty_is_write_free_behind_shared_reference(elem)
+        }
+        Ty::Tuple(elems) => elems.iter().all(ty_is_write_free_behind_shared_reference),
+        // Everything else — every ADT/datatype, every nested reference, every
+        // raw pointer, every function pointer, every symbolic-length array —
+        // is refused. A nested `&mut` inside a shared reference is a real
+        // write capability, and any named type could be an `UnsafeCell`.
+        _ => false,
+    }
+}
+
+/// Prove, from the operand alone, that passing it conveys no capability to
+/// write any storage this function's symbolic state models.
+fn call_argument_carries_no_write_capability(
+    func: &VerifiableFunction,
+    arg: &Operand,
+) -> Result<(), String> {
+    match arg {
+        Operand::Constant(value) => match value {
+            ConstValue::Bool(_)
+            | ConstValue::Int(_)
+            | ConstValue::Uint(_, _)
+            | ConstValue::Float(_)
+            | ConstValue::FloatBits { .. }
+            | ConstValue::Unit => Ok(()),
+            // A `CallableItem`, a promoted reference, a byte-string literal, an
+            // opaque payload: none is a scalar this screen has characterized.
+            other => Err(format!("unscreened constant {other:?}")),
+        },
+        Operand::Copy(place) | Operand::Move(place) => {
+            if !place.projections.is_empty() {
+                return Err(format!(
+                    "projected operand _{}{:?} is outside the whole-local screen",
+                    place.local, place.projections
+                ));
+            }
+            let Some(decl) = func.body.locals.get(place.local) else {
+                return Err(format!("_{} has no local declaration", place.local));
+            };
+            if decl.index != place.local {
+                return Err(format!("_{} is not a canonical positional local", place.local));
+            }
+            if ty_is_by_value_scalar(&decl.ty) {
+                return Ok(());
+            }
+            if let Ty::Ref { mutable: false, inner } = &decl.ty {
+                if ty_is_write_free_behind_shared_reference(inner) {
+                    return Ok(());
+                }
+            }
+            Err(format!("_{} of type {:?} may convey a write capability", place.local, decl.ty))
+        }
+        // A lifted symbolic payload and an explicitly unsupported operand both
+        // have no type identity to screen.
+        other => Err(format!("unscreened operand shape {other:?}")),
+    }
+}
+
+/// No pointer to any local of this function is created ANYWHERE in its body.
+///
+/// `call_argument_carries_no_write_capability` proves that THIS call hands the
+/// callee no pointer. On its own that is not enough: an earlier `&mut n` — in
+/// the entry block, outside the loop, never re-examined by this walk — could
+/// have been stashed somewhere a later callee reaches (a `static mut`, a
+/// thread-local, a leaked allocation), and then an argument-free call writes
+/// `n` behind the model's back. The model would carry `n` across the call
+/// unchanged and "prove" `n <= 10` of a program that violates it. That is a
+/// false proof, not a missing one.
+///
+/// A pointer to a local can only come into existence through `Rvalue::Ref` or
+/// `Rvalue::AddressOf`, so refusing every mutable borrow and every raw-pointer
+/// formation in the whole body closes the channel at its source rather than
+/// enumerating the routes out of it. Shared borrows are retained: writing
+/// through a `&T` is undefined behaviour, and the read-only collection lane
+/// depends on exactly that shape.
+fn caller_frame_creates_no_local_pointer(func: &VerifiableFunction) -> Result<(), String> {
+    for block in &func.body.blocks {
+        for statement in &block.stmts {
+            let Statement::Assign { rvalue, .. } = statement else { continue };
+            match rvalue {
+                Rvalue::Ref { mutable: true, place } => {
+                    return Err(format!("mutable-borrow-escape.bb{}._{}", block.id.0, place.local));
+                }
+                Rvalue::AddressOf(_, place) => {
+                    return Err(format!("raw-pointer-escape.bb{}._{}", block.id.0, place.local));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 struct NestedLoopSummary {
     exit: BlockId,
     state: FxHashMap<String, Formula>,
@@ -4914,7 +5969,10 @@ fn modeled_terminator_successors(terminator: &Terminator) -> Result<Vec<BlockId>
         Terminator::SwitchInt { targets, otherwise, .. } => {
             targets.iter().map(|(_, target)| *target).chain(std::iter::once(*otherwise)).collect()
         }
-        Terminator::Return | Terminator::Unreachable | Terminator::Resume => Vec::new(),
+        Terminator::Return
+        | Terminator::TailCall { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => Vec::new(),
         Terminator::Call { .. } => {
             return Err("e45.transition.nested-summary-call-effect".to_string());
         }
@@ -5057,17 +6115,34 @@ fn summarize_nested_loop(
             ));
         }
         for key in keys {
-            let sort = trust_types::check_formula_sort(
-                state.get(&key).expect("key collected from this state"),
-            )
-            .map_err(|error| {
+            // `key` came from `state.keys()` just above, so this lookup cannot
+            // miss — but REFUSE rather than panic if it ever does. This is the
+            // verifier's trusted core; an abort here takes the whole
+            // compilation down mid-proof, while an `Err` is just an
+            // undischarged obligation.
+            let Some(entry) = state.get(&key) else {
+                return Err(format!(
+                    "e45.transition.nested-summary-state-missing: `{key}` vanished from state"
+                ));
+            };
+            let sort = trust_types::check_formula_sort(entry).map_err(|error| {
                 format!("e45.transition.nested-summary-state-sort: `{key}` is ill-sorted: {error}")
             })?;
             // `#...` is intentionally an SSA-version suffix. The exact machine
             // translator strips it before resolving the source local's width
             // and signedness, so a havoced u8 remains u8 rather than becoming
             // an untyped mathematical Int.
-            let fresh = format!("{key}#e45_nested_bb{}_{}", header.0, serial);
+            // The `#e45_` namespace is load-bearing, not cosmetic: it is what
+            // keeps the final `normalize_ssa_version_tokens` pass from
+            // collapsing this HAVOC back onto the bare local and thereby
+            // asserting the inner loop left it unchanged. See
+            // `LOOP_TRANSITION_HAVOC_TOKEN_PREFIX`.
+            let fresh = format!(
+                "{key}#{}nested_bb{}_{}",
+                crate::LOOP_TRANSITION_HAVOC_TOKEN_PREFIX,
+                header.0,
+                serial
+            );
             state.insert(key, Formula::Var(fresh, sort));
         }
     }
@@ -5424,7 +6499,11 @@ fn apply_symbolic_statements(
         if let Some(pair) = raw_metadata_pair {
             let Statement::Assign { rvalue: Rvalue::AddressOf(false, source), .. } = statement
             else {
-                unreachable!("raw metadata pair was recognized from this statement")
+                // Unreachable: `raw_metadata_pair` is `Some` only for exactly
+                // this shape. Refuse the recognition rather than aborting the
+                // compiler — this function already declines with `None` two
+                // lines below, so the caller handles it.
+                return None;
             };
             let model = exact_collection_model_for_local(func, source.local)?;
             current_collection_base(func, &model, state)?;
@@ -5907,9 +6986,119 @@ fn trust_wp_metadata_for_source(source_contract_index: usize) -> ContractMetadat
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_router::{InProcessAyBackend, VerificationBackend};
     use trust_types::{ConstValue, Place};
+
+    use super::*;
+
+    /// DIRECT test of the two field/carrier resolutions, at the helpers rather
+    /// than through an assembled VC — the layer where a wrong answer becomes a
+    /// wrong WIDTH, and a wrong width is how a wrap-dependent claim could be
+    /// read as valid.
+    ///
+    /// The heterogeneous struct is the whole point: `.0` is `u8` and `.1` is
+    /// `u32`, so borrowing one field's domain for the other is observable here
+    /// and nowhere else this cheaply.
+    #[test]
+    fn struct_field_and_newtype_carrier_domains_are_read_per_field() {
+        let packed = Ty::Adt {
+            name: "Packed".to_string(),
+            fields: vec![
+                ("0".to_string(), Ty::Int { width: 8, signed: false }),
+                ("1".to_string(), Ty::Int { width: 32, signed: false }),
+                ("2".to_string(), Ty::Bool),
+            ],
+            variants: Vec::new(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: Some(trust_types::AdtKind::Struct),
+        };
+        assert!(matches!(
+            struct_or_tuple_field_ty(&packed, 0),
+            Some(Ty::Int { width: 8, signed: false })
+        ));
+        assert!(matches!(
+            struct_or_tuple_field_ty(&packed, 1),
+            Some(Ty::Int { width: 32, signed: false })
+        ));
+        assert!(matches!(struct_or_tuple_field_ty(&packed, 2), Some(Ty::Bool)));
+        assert!(struct_or_tuple_field_ty(&packed, 3).is_none(), "out of range declines");
+        // A MULTI-field struct has no single carrier; the whole local keeps its
+        // own (non-integer) type and so has no machine domain.
+        assert!(matches!(newtype_carrier_ty(&packed), Ty::Adt { .. }));
+
+        let with_kind = |kind: Option<trust_types::AdtKind>| {
+            let Ty::Adt { name, fields, variants, .. } = packed.clone() else { unreachable!() };
+            Ty::Adt {
+                name,
+                fields,
+                variants,
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                layout: None,
+                enum_layout: None,
+                adt_kind: kind,
+            }
+        };
+        for kind in [None, Some(trust_types::AdtKind::Union), Some(trust_types::AdtKind::Enum)] {
+            assert!(
+                struct_or_tuple_field_ty(&with_kind(kind), 1).is_none(),
+                "only a stamped Struct resolves a positional field: {kind:?}"
+            );
+        }
+
+        // A ONE-field struct shares its field's domain, because
+        // `chc::rvalue_to_formula` already models the local and the field as one
+        // value. A `Struct` stamp with a non-empty variant list is inconsistent
+        // and declines rather than picking a reading.
+        let newtype = Ty::Adt {
+            name: "Literal".to_string(),
+            fields: vec![("0".to_string(), Ty::Int { width: 32, signed: false })],
+            variants: Vec::new(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: Some(trust_types::AdtKind::Struct),
+        };
+        assert!(matches!(newtype_carrier_ty(&newtype), Ty::Int { width: 32, signed: false }));
+        let inconsistent = {
+            let Ty::Adt { name, fields, .. } = newtype.clone() else { unreachable!() };
+            Ty::Adt {
+                name,
+                fields,
+                variants: vec![trust_types::VariantDef {
+                    name: "V".to_string(),
+                    discriminant: 0,
+                    fields: Vec::new(),
+                }],
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                layout: None,
+                enum_layout: None,
+                adt_kind: Some(trust_types::AdtKind::Struct),
+            }
+        };
+        assert!(
+            matches!(newtype_carrier_ty(&inconsistent), Ty::Adt { .. }),
+            "a Struct stamp over a non-empty variant list must not resolve a carrier"
+        );
+        assert!(
+            struct_or_tuple_field_ty(&inconsistent, 0).is_none(),
+            "a Struct stamp over a non-empty variant list must not resolve a field"
+        );
+
+        // Tuples keep their existing behaviour byte-for-byte.
+        let tuple = Ty::Tuple(vec![Ty::Int { width: 8, signed: false }, Ty::Bool]);
+        assert!(matches!(
+            struct_or_tuple_field_ty(&tuple, 0),
+            Some(Ty::Int { width: 8, signed: false })
+        ));
+        assert!(matches!(struct_or_tuple_field_ty(&tuple, 1), Some(Ty::Bool)));
+        assert!(matches!(newtype_carrier_ty(&tuple), Ty::Tuple(_)));
+    }
 
     fn contract_test_function(contracts: Vec<Contract>) -> VerifiableFunction {
         VerifiableFunction {
@@ -6045,7 +7234,7 @@ mod tests {
                             rvalue: Rvalue::BinaryOp(
                                 BinOp::Gt,
                                 Operand::Copy(Place::local(2)),
-                                Operand::Constant(ConstValue::Int(0)),
+                                Operand::Constant(ConstValue::Uint(0, 32)),
                             ),
                             span: SourceSpan::default(),
                         }],
@@ -6088,6 +7277,34 @@ mod tests {
             postconditions: vec![],
             spec: Default::default(),
         }
+    }
+
+    fn contextual_integer_const(ty: &Ty, value: i128) -> ConstValue {
+        match ty {
+            Ty::Int { signed: true, .. } | Ty::PtrSizedInt { signed: true } => {
+                ConstValue::Int(value)
+            }
+            Ty::Int { width, signed: false } => ConstValue::Uint(
+                u128::try_from(value).expect("test integer literal is non-negative"),
+                *width,
+            ),
+            Ty::PtrSizedInt { signed: false } => ConstValue::Uint(
+                u128::try_from(value).expect("test integer literal is non-negative"),
+                usize::BITS,
+            ),
+            other => panic!("test helper requires a Rust integer type, got {other:?}"),
+        }
+    }
+
+    fn set_feedback_integer_domain(func: &mut VerifiableFunction, ty: Ty) {
+        func.body.locals[1].ty = ty.clone();
+        func.body.locals[2].ty = ty.clone();
+        let Statement::Assign { rvalue: Rvalue::BinaryOp(BinOp::Gt, _, rhs), .. } =
+            &mut func.body.blocks[1].stmts[0]
+        else {
+            panic!("feedback fixture header owns one greater-than comparison")
+        };
+        *rhs = Operand::Constant(contextual_integer_const(&ty, 0));
     }
 
     fn compositional_nested_loop_function() -> VerifiableFunction {
@@ -7227,6 +8444,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert!(read_only_collection_alias_is_stable(&called_alias, 4, 1));
         assert_collection_loop_is_supported(&called_alias);
@@ -7242,6 +8460,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert!(!read_only_collection_arg_is_stable(&overwritten_source, 1));
         assert_collection_loop_is_explicitly_unsupported(&overwritten_source);
@@ -7298,15 +8517,87 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert!(
             read_only_collection_arg_is_stable(&collection_call, 1),
             "the Freeze proof establishes collection stability independently of transition effects",
         );
-        assert_collection_loop_is_explicitly_unsupported(&collection_call);
+        // CHANGED, deliberately, by the exact-call-frame lane. This used to be
+        // a blanket refusal ("a call on the modeled iteration path still needs
+        // an exact transition summary"). `inspect(xs)` takes a shared reference
+        // to a slice of scalars and writes a scalar local that no collection
+        // model denotes, so its frame is exactly `_4` — and `_4` is havoced,
+        // which asserts NOTHING about `inspect`. The loop is now modeled, and
+        // its invariant's non-tautological conjunct (`n == xs.len()`) survives
+        // precisely because the frame proves `inspect` cannot write `n` or
+        // reseat `xs`.
+        assert_collection_loop_is_supported(&collection_call);
+        let frame = exact_call_frame(
+            &collection_call,
+            &collection_call.body.blocks[2],
+            BlockId(1),
+            &[BlockId(1), BlockId(2)].into_iter().collect(),
+        )
+        .expect("shared-slice argument with a scalar destination has an exact frame");
+        assert_eq!(
+            frame,
+            ExactCallFrame { target: BlockId(1), dest_local: 4, dest_sort: Sort::Int },
+        );
+        let transitions = symbolic_loop_transitions(&collection_call, BlockId(1))
+            .expect("an exactly framed call keeps the transition model complete");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].post_state.get("value"),
+            Some(&Formula::Var("value#e45_call_bb2".into(), Sort::Int)),
+            "the destination is a FRESH symbol, never the callee's assumed result",
+        );
+        assert_eq!(
+            transitions[0].post_state.get("n"),
+            Some(&Formula::Var("n".into(), Sort::Int)),
+            "a local outside the frame is carried across unchanged",
+        );
+
+        // Reseating the modeled collection itself is refused by the frame's
+        // own destination screen, ahead of the generic scalar-type screen, so
+        // the diagnostic names the reseat rather than a type mismatch.
+        let mut collection_destination = base();
+        collection_destination.body.blocks[2].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "replace".into(),
+            args: vec![],
+            dest: Place::local(1),
+            target: Some(BlockId(1)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+        };
+        let reseat = exact_call_frame(
+            &collection_destination,
+            &collection_destination.body.blocks[2],
+            BlockId(1),
+            &[BlockId(1), BlockId(2)].into_iter().collect(),
+        )
+        .expect_err("a call destination that reseats the modeled collection has no exact frame");
+        // MEASURED, and recorded rather than wished for: the code that fires is
+        // `nonscalar-destination`, NOT the narrower `collection-destination`.
+        // The collection screen is ordered first, but it cannot fire here —
+        // reseating the collection makes `read_only_collection_arg_is_stable`
+        // false, so `exact_collection_model_for_local` already returns `None` by
+        // the time the frame is computed, and a collection-modeled local is
+        // never of by-value scalar type either. The collection screen is
+        // therefore an unreachable BACKSTOP today, retained only against a
+        // future widening of either of those two, and this assertion states the
+        // reachable truth so nobody reads it as a live check.
         assert!(
-            collection_blocker(&collection_call).contains("e45.transition.call-effect"),
-            "a call on the modeled iteration path still needs an exact transition summary",
+            reseat.contains("e45.transition.call-effect."),
+            "the reseat must be refused by a named frame blocker: {reseat}",
+        );
+        assert!(
+            reseat.contains("nonscalar-destination"),
+            "measured: the reachable code for a reseat is the scalar screen: {reseat}",
         );
 
         let mut foreign_collection_call = base();
@@ -7320,6 +8611,7 @@ mod tests {
             atomic: None,
             is_foreign: true,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert!(!read_only_collection_arg_is_stable(&foreign_collection_call, 1));
         assert_collection_loop_is_explicitly_unsupported(&foreign_collection_call);
@@ -7345,6 +8637,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert!(!read_only_collection_arg_is_stable(&projected_collection_call, 1));
         assert_collection_loop_is_explicitly_unsupported(&projected_collection_call);
@@ -7370,6 +8663,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: true,
+            callee_identity: None,
         };
         assert_collection_loop_is_explicitly_unsupported(&escaping_alias);
         assert!(
@@ -7780,6 +9074,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert_collection_loop_is_explicitly_unsupported(&call_escape);
 
@@ -7935,6 +9230,7 @@ mod tests {
             atomic: None,
             is_foreign: false,
             is_unsafe_sig: false,
+            callee_identity: None,
         };
         assert!(!exclusive_mutable_collection_arg_is_stable(&call_escape, 1));
         assert_collection_loop_is_explicitly_unsupported(&call_escape);
@@ -8219,8 +9515,34 @@ mod tests {
         );
     }
 
+    /// REGRESSION LOCK. A raw `#[invariant(..)]` contract must mint a
+    /// NON-REFUTABLE row, so that no predicate text can be reported proved.
+    ///
+    /// This supersedes a weaker lock that required only "`ContractInvariant`,
+    /// not `Assertion`". That lock was about `has_runtime_fallback` — an
+    /// `Assertion` answers `true` for EVERY check configuration, which
+    /// `classify_runtime_disposition` turns into `RuntimeChecked` and
+    /// `residual_gap_tolerance_denial` turns into an advisory exit code — and
+    /// every one of those asserts is KEPT below, so that property is not lost.
+    ///
+    /// What the old lock did NOT catch is that `ContractInvariant` with
+    /// `formula: Not(parsed)` is still refutable, and that this arm binds none
+    /// of the clause's free names to program state (there is no program point
+    /// to bind them at), so the query degenerates to `is P valid`. MEASURED on
+    /// `trust-e26541e3` through the `register_tool` lane: `invariant(1 == 1)`
+    /// and `invariant(x == x)` reported `proved` with
+    /// `solver: clean-kernel-certified`, while `invariant(x >= 0)` on a `u32`,
+    /// `invariant(true)` and `invariant(false)` reported `unknown`. Proving
+    /// exactly the vacuous predicates is worse than proving none.
+    ///
+    /// Mutation coverage: reverting this arm to either the `Assertion` spelling
+    /// or the `ContractInvariant { .. } + Not(parsed)` spelling fails here. This
+    /// test calls the production `crate::generate_vcs` entry point, and
+    /// `has_runtime_fallback` has no message-text arm that would rescue an
+    /// `Assertion` spelled `"invariant: n > 0"` (deliberately — declining on
+    /// that text would false-FAIL a user's own `assert!(.., "invariant: ..")`).
     #[test]
-    fn test_invariant_generates_assertion_vc() {
+    fn raw_invariant_contract_is_non_refutable_and_never_provable() {
         let func = contract_test_function(vec![Contract {
             kind: ContractKind::Invariant,
             span: SourceSpan::default(),
@@ -8229,13 +9551,102 @@ mod tests {
 
         let vcs = crate::generate_vcs(&func);
 
-        assert_eq!(vcs.len(), 1);
+        assert_eq!(vcs.len(), 1, "the authored clause must stay visible: {vcs:#?}");
         assert!(
-            matches!(&vcs[0].kind, VcKind::Assertion { message } if message == "invariant: n > 0")
+            matches!(&vcs[0].kind, VcKind::UnsupportedMir { kind, .. }
+                if kind == SPEC_UNVERIFIABLE_KIND),
+            "got {:?}",
+            vcs[0].kind
+        );
+        assert!(
+            !matches!(vcs[0].kind, VcKind::ContractInvariant { .. }),
+            "the refutable shape must not come back: {:?}",
+            vcs[0].kind
         );
         assert_eq!(
             vcs[0].formula,
-            Formula::Not(Box::new(parse_spec_expr("n > 0").expect("spec should parse"))),
+            Formula::Bool(true),
+            "a trivially-satisfiable formula is the only shape no solver can report proved",
+        );
+        // MEASURED (stage2, `--emit=llvm-ir`): `#[trust::invariant(x > 0)] fn
+        // inv_fn(x: i32) -> i32 { x }` emits `start: ret i32 %x` — byte-identical
+        // to the unannotated function. There is no guard in ANY configuration.
+        for env in [
+            trust_types::RuntimeCheckEnv::new(false, false),
+            trust_types::RuntimeCheckEnv::new(true, false),
+            trust_types::RuntimeCheckEnv::new(false, true),
+            trust_types::RuntimeCheckEnv::new(true, true),
+        ] {
+            assert!(
+                !vcs[0].kind.has_runtime_fallback_in(env),
+                "a span-only attribute has no runtime check under {env:?}"
+            );
+        }
+        // It answers exactly as its two sibling clauses do.
+        assert!(!VcKind::Postcondition.has_runtime_fallback(true));
+        assert!(!VcKind::Precondition { callee: "f".into() }.has_runtime_fallback(true));
+    }
+
+    /// THE MEASURED BUG, as an executable test, on the raw-contract route.
+    /// Twin of `no_invariant_predicate_can_buy_credit_regardless_of_tautology`
+    /// in `spec_parser.rs`; both mint sites must agree or one spelling of the
+    /// same clause keeps the hole the other lost.
+    #[test]
+    fn no_raw_invariant_predicate_can_buy_credit_regardless_of_tautology() {
+        for body in ["1 == 1", "x == x", "n > 0", "false"] {
+            let func = contract_test_function(vec![Contract {
+                kind: ContractKind::Invariant,
+                span: SourceSpan::default(),
+                body: body.to_string(),
+            }]);
+
+            let vcs = crate::generate_vcs(&func);
+
+            assert_eq!(vcs.len(), 1, "`{body}` must mint exactly one row: {vcs:#?}");
+            assert_eq!(
+                vcs[0].formula,
+                Formula::Bool(true),
+                "`{body}` must be non-refutable; a tautology must not be provable here",
+            );
+        }
+    }
+
+    /// NEGATIVE TEST: the neighbouring clause kinds keep their exact treatment.
+    /// A LOOP invariant is a DIFFERENT `ContractKind` with a real program point,
+    /// and must not be caught by the item-position refusal.
+    #[test]
+    fn refusing_item_invariant_leaves_requires_and_ensures_refutable() {
+        let func = contract_test_function(vec![
+            Contract {
+                kind: ContractKind::Requires,
+                span: SourceSpan::default(),
+                body: "n > 0".to_string(),
+            },
+            Contract {
+                kind: ContractKind::Ensures,
+                span: SourceSpan::default(),
+                body: "result >= 0".to_string(),
+            },
+        ]);
+
+        let vcs = crate::generate_vcs(&func);
+
+        let post: Vec<_> =
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).collect();
+        assert_eq!(post.len(), 1, "`ensures` keeps exactly one Postcondition row: {vcs:#?}");
+        assert_eq!(
+            post[0].formula,
+            Formula::Not(Box::new(parse_spec_expr("result >= 0").expect("spec should parse"))),
+            "the postcondition stays a real refutable obligation",
+        );
+        assert!(
+            vcs.iter().any(|vc| matches!(vc.kind, VcKind::Precondition { .. })),
+            "`requires` keeps its Precondition row: {vcs:#?}",
+        );
+        assert!(
+            !vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+                if kind == SPEC_UNVERIFIABLE_KIND)),
+            "no neighbouring clause may be dragged into the refusal: {vcs:#?}",
         );
     }
 
@@ -8706,6 +10117,47 @@ mod tests {
     }
 
     #[test]
+    fn feedback_candidate_matches_production_for_a_tail_call_exit() {
+        let mut func = feedback_loop_function();
+        func.body.blocks[3].terminator = Terminator::TailCall {
+            func: "test::finish".into(),
+            args: Vec::new(),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+        };
+
+        let (solver_vcs, discharged) = crate::generate_vcs_with_discharge(&func);
+        let mut production = solver_vcs;
+        production.extend(discharged.into_iter().map(|(vc, _)| vc));
+        let (initiation, consecution) = e4_pair(&production);
+        let feedback = loop_invariant_feedback_candidate(&func, &initiation, &consecution)
+            .expect("TailCall source form must reconstruct the exact production E4 pair");
+
+        let (raw, augmented) =
+            crate::regenerate_loop_decreases_with_invariant_feedback_production_variants(
+                &func,
+                std::slice::from_ref(&feedback),
+            )
+            .expect("TailCall source form must reconstruct production E5 variants");
+        assert_eq!(raw.len(), 1);
+        assert_eq!(augmented.len(), 1);
+        let predicate = type_and_validate_loop_formula(
+            &func,
+            parse_spec_expr("n <= 10 && i <= 10").expect("predicate parses"),
+            Sort::Bool,
+        )
+        .expect("predicate types");
+        let machine_predicate =
+            machine_faithful_translate(&func, &predicate, 32, false, true, Polarity::Prop)
+                .expect("feedback predicate has the exact u32 machine reading");
+        assert!(formula_contains(&e5_formula(&raw), &machine_predicate));
+        assert!(formula_contains(&e5_formula(&augmented), &machine_predicate));
+    }
+
+    #[test]
     fn e5_production_variants_match_dispatch_and_sanitize_contract_arithmetic() {
         let func = feedback_loop_function();
         let (raw, augmented) =
@@ -8857,8 +10309,7 @@ mod tests {
         }
 
         let mut authored = feedback_loop_function();
-        authored.body.locals[1].ty = Ty::u8();
-        authored.body.locals[2].ty = Ty::u8();
+        set_feedback_integer_domain(&mut authored, Ty::u8());
         authored.contracts[0].body = "bb1: i + 1 > i".to_string();
         assert_machine_e4(
             &authored,
@@ -8868,14 +10319,13 @@ mod tests {
         );
 
         let mut transition = feedback_loop_function();
-        transition.body.locals[1].ty = Ty::u8();
-        transition.body.locals[2].ty = Ty::u8();
+        set_feedback_integer_domain(&mut transition, Ty::u8());
         transition.body.blocks[2].stmts = vec![Statement::Assign {
             place: Place::local(2),
             rvalue: Rvalue::BinaryOp(
                 BinOp::Add,
                 Operand::Copy(Place::local(2)),
-                Operand::Constant(ConstValue::Int(1)),
+                Operand::Constant(ConstValue::Uint(1, 8)),
             ),
             span: SourceSpan::default(),
         }];
@@ -8933,8 +10383,7 @@ mod tests {
         );
 
         let mut precondition = feedback_loop_function();
-        precondition.body.locals[1].ty = Ty::u8();
-        precondition.body.locals[2].ty = Ty::u8();
+        set_feedback_integer_domain(&mut precondition, Ty::u8());
         let quantified = Symbol::intern("quantified_machine_value");
         precondition.preconditions = vec![Formula::Forall(
             vec![(quantified, Sort::Int)],
@@ -9000,14 +10449,13 @@ mod tests {
             (Ty::usize(), usize::BITS, BinOp::Shr, "a pointer-width logical shift"),
         ] {
             let mut shift = feedback_loop_function();
-            shift.body.locals[1].ty = ty.clone();
-            shift.body.locals[2].ty = ty;
+            set_feedback_integer_domain(&mut shift, ty.clone());
             shift.body.blocks[2].stmts = vec![Statement::Assign {
                 place: Place::local(2),
                 rvalue: Rvalue::BinaryOp(
                     op,
                     Operand::Copy(Place::local(2)),
-                    Operand::Constant(ConstValue::Int(8)),
+                    Operand::Constant(contextual_integer_const(&ty, 8)),
                 ),
                 span: SourceSpan::default(),
             }];
@@ -9032,8 +10480,7 @@ mod tests {
             (Ty::isize(), usize::BITS, "pointer-width integer Not"),
         ] {
             let mut bit_not = feedback_loop_function();
-            bit_not.body.locals[1].ty = ty.clone();
-            bit_not.body.locals[2].ty = ty;
+            set_feedback_integer_domain(&mut bit_not, ty);
             bit_not.body.blocks[2].stmts = vec![Statement::Assign {
                 place: Place::local(2),
                 rvalue: Rvalue::UnaryOp(UnOp::Not, Operand::Copy(Place::local(2))),
@@ -9080,15 +10527,14 @@ mod tests {
 
         for (ty, width, signed, name) in domains {
             let mut func = feedback_loop_function();
-            func.body.locals[1].ty = ty.clone();
-            func.body.locals[2].ty = ty;
+            set_feedback_integer_domain(&mut func, ty.clone());
             func.contracts[0].body = "bb1: i + 1 >= i".to_string();
             func.body.blocks[2].stmts = vec![Statement::Assign {
                 place: Place::local(2),
                 rvalue: Rvalue::BinaryOp(
                     BinOp::Add,
                     Operand::Copy(Place::local(2)),
-                    Operand::Constant(ConstValue::Int(1)),
+                    Operand::Constant(contextual_integer_const(&ty, 1)),
                 ),
                 span: SourceSpan::default(),
             }];
@@ -9281,6 +10727,321 @@ mod tests {
             machine_faithful_translate(&func, &wrong_bridge_sign, 8, false, true, Polarity::Value,)
                 .is_none(),
             "a signed body bridge must never be folded into an unsigned source domain",
+        );
+    }
+
+    /// THE PROVABLE-SET NEUTRALITY PROOF for the domain-ledger lane.
+    ///
+    /// `machine_domain_scan` replaced a walk that collapsed its findings into
+    /// `Option<(u32, bool)>` on the spot. The ledger it keeps instead is what
+    /// lets the refusal name its reason — but a richer diagnostic is worth
+    /// nothing if it also, quietly, admits one formula the old walk refused.
+    /// This reimplements the OLD algorithm verbatim and demands the two agree
+    /// on every formula in a corpus built to hit each branch: agreement,
+    /// disagreement, an unresolvable leaf, an array carrier, a bool local, a
+    /// literal-only formula, and the shift-count exception.
+    ///
+    /// MUTATION-PROVED: making `DomainScan::uniform` return the first observed
+    /// domain instead of demanding a singleton — the natural way to "helpfully"
+    /// widen — fails this test on the disagreement and array-carrier rows.
+    #[test]
+    fn the_domain_ledger_decides_exactly_what_the_old_uniform_walk_decided() {
+        fn legacy(func: &VerifiableFunction, formula: &Formula) -> Option<(u32, bool)> {
+            let mut domain: Option<(u32, bool)> = None;
+            let mut consistent = true;
+            fn collect(
+                func: &VerifiableFunction,
+                node: &Formula,
+                domain: &mut Option<(u32, bool)>,
+                consistent: &mut bool,
+            ) {
+                if let Formula::BvShl(value, _, _)
+                | Formula::BvLShr(value, _, _)
+                | Formula::BvAShr(value, _, _) = node
+                {
+                    collect(func, value, domain, consistent);
+                    return;
+                }
+                let name = match node {
+                    Formula::Var(name, sort) if !matches!(sort, Sort::Bool) => Some(name.as_str()),
+                    Formula::SymVar(sym, sort) if !matches!(sort, Sort::Bool) => Some(sym.as_str()),
+                    _ => None,
+                };
+                if let Some(name) = name
+                    && !var_is_bool_local(func, name)
+                {
+                    match machine_int_ty_for_var(func, name) {
+                        Some(var_domain) => match *domain {
+                            None => *domain = Some(var_domain),
+                            Some(existing) if existing == var_domain => {}
+                            Some(_) => *consistent = false,
+                        },
+                        None => *consistent = false,
+                    }
+                }
+                for child in node.children() {
+                    collect(func, child, domain, consistent);
+                }
+            }
+            collect(func, formula, &mut domain, &mut consistent);
+            if !consistent {
+                return None;
+            }
+            domain
+        }
+
+        // `n` and `i` are the two integer locals, `cond` the bool one.
+        let mut func = feedback_loop_function();
+        func.body.locals[1].ty = Ty::u64();
+        func.body.locals[2].ty = Ty::u32();
+        func.body.locals.push(LocalDecl {
+            index: 4,
+            ty: Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) },
+            name: Some("data".into()),
+        });
+
+        let n = || Formula::Var("n".to_string(), Sort::Int);
+        let i = || Formula::Var("i".to_string(), Sort::Int);
+        let cond = || Formula::Var("cond".to_string(), Sort::Bool);
+        let data = || {
+            Formula::Var("data".to_string(), Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)))
+        };
+
+        let corpus = vec![
+            ("agreeing", Formula::Le(Box::new(n()), Box::new(n()))),
+            ("disagreeing", Formula::Le(Box::new(i()), Box::new(n()))),
+            ("literal only", Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Int(70)))),
+            ("bool leaf", cond()),
+            ("array carrier", Formula::Eq(Box::new(data()), Box::new(n()))),
+            (
+                "array select indexed by another domain",
+                Formula::Eq(
+                    Box::new(Formula::Select(Box::new(data()), Box::new(n()))),
+                    Box::new(Formula::Int(0)),
+                ),
+            ),
+            (
+                "shift count of a foreign domain",
+                Formula::BvShl(
+                    Box::new(Formula::IntToBv(Box::new(n()), 64)),
+                    Box::new(Formula::IntToBv(Box::new(i()), 64)),
+                    64,
+                ),
+            ),
+            (
+                "unknown name",
+                Formula::Le(Box::new(Formula::Var("nowhere".into(), Sort::Int)), Box::new(n())),
+            ),
+            (
+                "nested agreement under a connective",
+                Formula::And(vec![
+                    Formula::Le(Box::new(n()), Box::new(n())),
+                    Formula::Gt(Box::new(n()), Box::new(Formula::Int(3))),
+                ]),
+            ),
+        ];
+
+        let mut saw_some = 0;
+        let mut saw_none = 0;
+        for (label, formula) in &corpus {
+            let ledger = uniform_machine_domain(&func, formula);
+            assert_eq!(ledger, legacy(&func, formula), "{label}: the ledger changed the verdict");
+            if ledger.is_some() { saw_some += 1 } else { saw_none += 1 }
+        }
+        assert!(saw_some >= 3 && saw_none >= 4, "the corpus must exercise both verdicts");
+
+        // …and the ledger really does distinguish the reasons the old `None`
+        // could not.
+        let disagreeing = machine_domain_scan(&func, &corpus[1].1);
+        assert!(disagreeing.non_machine_leaves.is_empty());
+        assert_eq!(disagreeing.domains.len(), 2);
+        let carrier = machine_domain_scan(&func, &corpus[4].1);
+        assert_eq!(carrier.non_machine_leaves, vec!["data".to_string()]);
+        let closed = machine_domain_scan(&func, &corpus[2].1);
+        assert!(closed.domains.is_empty() && closed.non_machine_leaves.is_empty());
+    }
+
+    /// THE PER-OPERAND WIDENING'S BOUNDARY, stated as shapes.
+    ///
+    /// Each row is a comparison of two operands with different declared
+    /// domains. The admitted ones must emit the RIGHT extension node; the
+    /// refused ones must emit nothing at all. A wrong extension here is a false
+    /// proof (`tests/mixed_domain_vacuity_table.rs` carries the executable
+    /// witness); a missing refusal is the same bug one step earlier.
+    ///
+    /// MUTATION-PROVED: making
+    /// `machine_domain::value_preserving_conversion` return `ZeroExtend` for a
+    /// signed source fails the `i32`/`i64` row here and the false-proof fixture
+    /// in the vacuity table; making it admit a narrowing fails the "never
+    /// narrows" assertion.
+    #[test]
+    fn the_joined_translation_widens_exactly_and_refuses_every_inexact_meeting() {
+        let mut func = feedback_loop_function();
+        func.body.locals[1].ty = Ty::u32(); // n
+        func.body.locals[2].ty = Ty::u64(); // i
+        let n = || Box::new(Formula::Var("n".to_string(), Sort::Int));
+        let i = || Box::new(Formula::Var("i".to_string(), Sort::Int));
+        let joined = |formula: &Formula| machine_faithful_translate_joined(&func, formula, true);
+
+        // u32 into u64: ZERO extension, and the comparison happens at 64.
+        assert_eq!(
+            joined(&Formula::Le(n(), i())),
+            Some(Formula::BvULe(
+                Box::new(Formula::BvZeroExt(
+                    Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
+                    32,
+                )),
+                Box::new(Formula::Var("i".into(), Sort::BitVec(64))),
+                64,
+            )),
+        );
+
+        // The widening sits ABOVE the arithmetic: `n + 1` still wraps at 32.
+        assert_eq!(
+            joined(&Formula::Le(Box::new(Formula::Add(n(), Box::new(Formula::Int(1)))), i())),
+            Some(Formula::BvULe(
+                Box::new(Formula::BvZeroExt(
+                    Box::new(Formula::BvAdd(
+                        Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
+                        Box::new(Formula::BitVec { value: 1, width: 32 }),
+                        32,
+                    )),
+                    32,
+                )),
+                Box::new(Formula::Var("i".into(), Sort::BitVec(64))),
+                64,
+            )),
+            "the sum must be computed at ITS OWN width and only then widened — \
+             computing it at 64 would make `n + 1 > n` valid at u32::MAX",
+        );
+
+        // i32 into i64: SIGN extension. Zero extension here is the false proof.
+        let mut signed = func.clone();
+        signed.body.locals[1].ty = Ty::i32();
+        signed.body.locals[2].ty = Ty::i64();
+        assert_eq!(
+            machine_faithful_translate_joined(&signed, &Formula::Le(n(), i()), true),
+            Some(Formula::BvSLe(
+                Box::new(Formula::BvSignExt(
+                    Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
+                    32,
+                )),
+                Box::new(Formula::Var("i".into(), Sort::BitVec(64))),
+                64,
+            )),
+        );
+
+        // u32 into i64: the unsigned source has no sign bit to replicate, and
+        // the target is strictly wider, so ZERO extension into the SIGNED
+        // comparison is the exact one.
+        let mut unsigned_into_signed = func.clone();
+        unsigned_into_signed.body.locals[2].ty = Ty::i64();
+        assert_eq!(
+            machine_faithful_translate_joined(
+                &unsigned_into_signed,
+                &Formula::Le(n(), i()),
+                true,
+            ),
+            Some(Formula::BvSLe(
+                Box::new(Formula::BvZeroExt(
+                    Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
+                    32,
+                )),
+                Box::new(Formula::Var("i".into(), Sort::BitVec(64))),
+                64,
+            )),
+        );
+
+        // REFUSED: equal width, differing signedness (`u32` vs `i32`) — the same
+        // pattern, a different value on the high half.
+        let mut same_width = func.clone();
+        same_width.body.locals[2].ty = Ty::i32();
+        assert_eq!(
+            machine_faithful_translate_joined(&same_width, &Formula::Le(n(), i()), true),
+            None,
+        );
+
+        // REFUSED: signed source into an unsigned target at any widths — `-1`
+        // has no unsigned home.
+        let mut signed_into_unsigned = func.clone();
+        signed_into_unsigned.body.locals[1].ty = Ty::i32();
+        assert_eq!(
+            machine_faithful_translate_joined(
+                &signed_into_unsigned,
+                &Formula::Le(n(), i()),
+                true,
+            ),
+            None,
+        );
+
+        // THE JOIN NEVER NARROWS, so no operand is ever truncated: swapping the
+        // operand order picks the same 64-bit domain, not the 32-bit one.
+        let swapped = joined(&Formula::Le(i(), n())).expect("u64 vs u32 the other way");
+        assert!(
+            matches!(&swapped, Formula::BvULe(_, _, 64)),
+            "the meeting is at the WIDER domain in both orders: {swapped:?}",
+        );
+        let mut extracts = 0;
+        swapped.visit(&mut |node| {
+            if matches!(node, Formula::BvExtract { .. }) {
+                extracts += 1;
+            }
+        });
+        assert_eq!(extracts, 0, "a value meeting must never truncate: {swapped:?}");
+
+        // REFUSED: an operand carrying a leaf with no machine domain at all.
+        let carrier = Formula::Le(
+            Box::new(Formula::Select(
+                Box::new(Formula::Var(
+                    "data".into(),
+                    Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)),
+                )),
+                n(),
+            )),
+            i(),
+        );
+        assert_eq!(joined(&carrier), None, "an array carrier has no domain to widen from");
+
+        // REFUSED: a closed atom with no ambient to decide it.
+        assert_eq!(
+            joined(&Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)))),
+            None,
+            "a closed atom takes the FORMULA's join, and a formula that is itself \
+             closed has none",
+        );
+
+        // ADMITTED: a closed atom of BARE LITERALS, beside a domain-declaring
+        // conjunct that supplies the join. This is what substituting a loop's
+        // entry state leaves behind, and refusing it would refuse every
+        // initiation obligation of a loop entered at constants.
+        let closed_beside_open = Formula::And(vec![
+            Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Int(70))),
+            Formula::Le(n(), i()),
+        ]);
+        assert!(
+            joined(&closed_beside_open).is_some(),
+            "`0 <= 70` beside a u32/u64 comparison must translate at the join",
+        );
+
+        // REFUSED: the same shape with ARITHMETIC in the closed atom.
+        // `255 + 1 == 0` is FALSE in Rust (`i32` arithmetic, the sum is 256)
+        // and TRUE at any borrowed domain narrow enough to wrap it. Borrowing a
+        // domain is exact only for literals, so this must not translate at all.
+        let closed_sum = Formula::And(vec![
+            Formula::Eq(
+                Box::new(Formula::Add(
+                    Box::new(Formula::Int(255)),
+                    Box::new(Formula::Int(1)),
+                )),
+                Box::new(Formula::Int(0)),
+            ),
+            Formula::Le(n(), i()),
+        ]);
+        assert_eq!(
+            joined(&closed_sum),
+            None,
+            "a closed atom may borrow a domain for LITERALS only — an arithmetic \
+             node borrowed into a domain it was not written at is the wrap channel",
         );
     }
 

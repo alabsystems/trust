@@ -9,7 +9,6 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::FxHashMap;
-
 use trust_types::*;
 
 use crate::error::TransvalError;
@@ -224,6 +223,7 @@ fn terminator_discriminant(term: &Terminator) -> u8 {
         Terminator::Assert { .. } => 5,
         Terminator::Drop { .. } => 6,
         Terminator::Opaque { .. } => 7,
+        Terminator::TailCall { .. } => 8,
         _ => 255, // Unknown terminator variant — safe fallback.
     }
 }

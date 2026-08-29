@@ -99,10 +99,21 @@ impl<'tcx> TrustContractBundle<'tcx> {
 #[derive(Clone, Debug, TyEncodable, TyDecodable, StableHash)]
 pub struct TrustContract<'tcx> {
     /// Trust: the parser-canonicalized `by <thm>` citation identity and exact
-    /// authored span (E9). The current kernel result is an advisory statement
-    /// match only: it never discharges or grades a Rust/Trust-IR VC. Authority
-    /// remains hard-blocked until the theorem and typed goal are digest-bound
-    /// to the canonical direct-frontend Trust-IR obligation.
+    /// authored span (E9). Comment corrected 2026-08-27 (IR-4 truth sweep) —
+    /// the lane split matters and the old text collapsed it:
+    ///
+    /// * On the MIR-derived lane the kernel result IS live authority: a
+    ///   `KernelStatementMatchCertified` citation discharges the ensures rows
+    ///   under the sealed `EnsuresCitationDischarge` authority, which
+    ///   `docs/TCB.md` grades `Certified` (one of the two kernel-checked
+    ///   authority rows). "Advisory-only" has been false there since that lane
+    ///   went live.
+    /// * For DIRECT-FRONTEND Trust-IR obligations the old sentence is still
+    ///   true: no digest-binding of the theorem and typed goal to a canonical
+    ///   Trust-IR obligation exists, and no direct-lane authority may be
+    ///   minted until it does. That migration is scheduled work, not a dropped
+    ///   intention: see
+    ///   docs/design/2026-08-27-two-language-direct-to-trust-ir.md §6.6.
     pub citation: Option<TrustContractCitation>,
     /// What semantic role this clause plays.
     pub kind: TrustContractKind,

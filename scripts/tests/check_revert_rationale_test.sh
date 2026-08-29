@@ -265,8 +265,25 @@ cp "$LEDGER" "$E/scripts/revert-rationale-grandfathered.txt"
 cp "$HOOK" "$E/scripts/hooks-pin/pre-push"
 printf '#!/usr/bin/env bash\necho "PIN COHERENCE OK (fixture stub)"\nexit 0\n' \
   >"$E/scripts/check_pin_coherence.sh"
+# Every OTHER lane hooks-pin runs is stubbed green for the same reason the pin
+# lane is: the only thing allowed to decide this push is the lane under test.
+# Each of these is fail-closed on a missing file, so an unstubbed one turns W0
+# RED for a reason that has nothing to do with reverts — which is exactly what
+# happened between 2026-08-25 and 2026-08-27, when the freeze, provenance,
+# bridge and cohort lanes were added to the hook and this fixture was not
+# updated. W0 is the accept control; when it cannot pass, no later verdict here
+# means anything, and W1-W3 never run at all.
+printf '#!/usr/bin/env bash\necho "MEASUREMENT PROVENANCE OK (fixture stub)"\nexit 0\n' \
+  >"$E/scripts/check_measurement_provenance.sh"
+printf '#!/usr/bin/env bash\necho "FREEZE GATE: GREEN (fixture stub)"\nexit 0\n' \
+  >"$E/scripts/check_frozen_files.sh"
+printf '#!/usr/bin/env bash\necho "BRIDGE PIN OK (fixture stub)"\nexit 0\n' \
+  >"$E/scripts/check_bridge_pin.sh"
+printf '#!/usr/bin/env python3\nprint("IR COHORT OK (fixture stub)")\n' \
+  >"$E/scripts/check_ir_cohort.py"
 : >"$E/scripts/hooks-pin/pin-waivers.txt"
-chmod +x "$E"/scripts/*.sh "$E/scripts/hooks-pin/pre-push"
+: >"$E/scripts/hooks-pin/ir-cohort-waivers.txt"
+chmod +x "$E"/scripts/*.sh "$E/scripts/check_ir_cohort.py" "$E/scripts/hooks-pin/pre-push"
 printf 'fn main() {}\n' >"$E/crates/trust-thir-lower/src/lib.rs"
 git -C "$E" add -A
 git -C "$E" commit -qm fixture
@@ -311,14 +328,43 @@ remote_head=$(git --git-dir="$BARE_REMOTE" log -1 --format=%H main)
 ok 'W2  the same revert, with a reason, PUSHES'
 
 # The e2e above stubs the pin lane, so it cannot see a wiring deletion in the
-# OTHER hook. Both are pinned at the source.
-for hook in scripts/hooks-pin/pre-push scripts/hooks/pre-push; do
-  [ -f "$REPO_ROOT/$hook" ] || fail "W3: $hook is missing"
-  grep -q 'check_revert_rationale.sh' "$REPO_ROOT/$hook" \
-    || fail "W3: $hook no longer calls the checker"
-done
+# OTHER hook. Both are pinned at the source — but at DIFFERENT sources, because
+# since 2026-08-27 they are wired differently. hooks-pin names the checker
+# literally. scripts/hooks/pre-push declares NO lanes and derives them from the
+# manifest's `push` profile, so what must be pinned there is the row plus the
+# export the row reads. That is strictly stronger than the old grep: a literal
+# in the hook body only proved a string was present, while the profile listing
+# is the list the hook will actually execute.
+[ -f "$REPO_ROOT/scripts/hooks-pin/pre-push" ] || fail 'W3: scripts/hooks-pin/pre-push is missing'
+grep -q 'check_revert_rationale.sh' "$REPO_ROOT/scripts/hooks-pin/pre-push" \
+  || fail 'W3: scripts/hooks-pin/pre-push no longer calls the checker'
 grep -q 'revert_rc' "$REPO_ROOT/scripts/hooks-pin/pre-push" \
   || fail 'W3: scripts/hooks-pin/pre-push no longer folds the lane verdict into its exit'
-ok 'W3  both pre-push hooks call the checker, and the installed one folds its verdict'
+[ -f "$REPO_ROOT/scripts/hooks/pre-push" ] || fail 'W3: scripts/hooks/pre-push is missing'
+PUSH_LANES="$(cd "$REPO_ROOT" && bash tests/run_trust_comprehensive_harness.sh --list push)" \
+  || fail 'W3: the harness cannot list the push profile the full hook derives its lanes from'
+case "$PUSH_LANES" in
+  *"check_revert_rationale.sh --push-context"*) ;;
+  *) fail 'W3: no `push` manifest row runs the checker with --push-context, so the full hook either skips it or judges history instead of the push' ;;
+esac
+# ANCHORED, not a substring: `#export TRUST_PUSHED_REFS=` satisfied the loose
+# grep while the hook silently widened all three push-context lanes to history —
+# measured 2026-08-27, `fast.pin-regression` then reported PASS on a push
+# carrying a real backward pin move, which is exactly what this guard exists to
+# stop. A guard that its own failure mode slips past is not a guard.
+grep -Eq '^[[:space:]]*export[[:space:]]+TRUST_PUSHED_REFS=' "$REPO_ROOT/scripts/hooks/pre-push" \
+  || fail 'W3: scripts/hooks/pre-push no longer exports the refs --push-context reads; the lane would silently widen to history and still report GREEN'
+# BEHAVIOURAL half: the source text above proves wiring exists, not that it WORKS.
+# Drive the real checker the way the hook drives it and require it to say so.
+# No `| head`: closing the pipe early SIGPIPEs the checker, and under `pipefail`
+# that surfaces as a 141 on a CLEAN tree (measured while writing this).
+W3_OUT="$(TRUST_PUSHED_REFS="refs/heads/main $(git -C "$REPO_ROOT" rev-parse HEAD) refs/heads/main $(git -C "$REPO_ROOT" rev-parse HEAD~1)" \
+  bash "$REPO_ROOT/scripts/check_revert_rationale.sh" --push-context 2>&1 || true)"
+W3_SUBJECT="${W3_OUT%%$'\n'*}"
+case "$W3_SUBJECT" in
+  "SUBJECT: push"*) ;;
+  *) fail "W3: --push-context did not read TRUST_PUSHED_REFS (got: $W3_SUBJECT); the lane would judge history, not the push" ;;
+esac
+ok 'W3  hooks-pin calls the checker and folds its verdict; the full hook derives a --push-context row, exports the refs that row reads, and the checker demonstrably reads them'
 
 printf 'check_revert_rationale_test: %d checks passed\n' "$PASSED"

@@ -250,6 +250,8 @@ pub enum PortError {
     Message(String),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("{} {}: {}", .op, .path.display(), .source)]
+    IoAt { path: PathBuf, op: &'static str, source: io::Error },
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("accounting parse error: {0}")]
@@ -263,9 +265,18 @@ impl PortError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Message(_) | Self::CommandFailed { .. } => 2,
-            Self::Io(_) | Self::Json(_) | Self::Parse(_) => 1,
+            Self::Io(_) | Self::IoAt { .. } | Self::Json(_) | Self::Parse(_) => 1,
         }
     }
+}
+
+/// Maps an `io::Error` onto `PortError::IoAt`, naming the path (or spawned
+/// program) the failing operation touched. A bare "No such file or directory
+/// (os error 2)" is not actionable; the op verb and path are what let the
+/// caller fix it (v7/D3).
+fn io_at(op: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> PortError {
+    let path = path.into();
+    move |source| PortError::IoAt { path, op, source }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -341,6 +352,26 @@ enum PatchStatus {
 enum PatchKind {
     StringReplace,
     AdapterRule,
+    /// Trust: the upstream file is DELETED on purpose and must stay deleted.
+    ///
+    /// Added 2026-08-23. The manifest had no way to express a deletion, and that
+    /// absence had two consequences, both measured:
+    ///
+    ///  * `--apply` re-CREATED deliberately retired tests, because its write
+    ///    phase copies every upstream path unconditionally. `tests/crashes/135122.rs`
+    ///    is the case in point: Trust emits ordinary diagnostics where upstream
+    ///    ICEs, the file was retired through the upstream-sanctioned de-ICE
+    ///    process (`e7aaf758723`) and replaced by a ui regression test, and its
+    ///    waiver was RETIRED because the subject no longer existed. Re-creating
+    ///    it re-opens a failing test with no active exception.
+    ///  * the `ported-overlay-not-applied` validation row counted such paths as
+    ///    missing coverage. That check is a raw set difference
+    ///    (`upstream_path_set - current_paths`) and consulted no ledger, so a
+    ///    decision the project had already made and documented in
+    ///    `divergence-audit.toml` — a file no code reads — surfaced as a gate
+    ///    failure with no way to answer it except `--apply`, which would have
+    ///    reverted the decision.
+    Delete,
 }
 
 fn default_patch_kind() -> PatchKind {
@@ -354,6 +385,12 @@ struct PatchApplicationReport {
     active_patch_ids: Vec<String>,
     inactive_patch_ids: Vec<String>,
     applied_patch_ids: Vec<String>,
+    /// Trust: paths retired by an ACTIVE `kind = "delete"` row.
+    ///
+    /// Collected here rather than re-parsed from the manifest because the loop
+    /// that dispatches already skips inactive rows, so this set is exactly the
+    /// active one — a stale or resolved row cannot hold a coverage claim open.
+    deleted_paths: BTreeSet<String>,
     records: Vec<AuditRecord>,
 }
 
@@ -365,6 +402,7 @@ impl PatchApplicationReport {
             active_patch_ids: Vec::new(),
             inactive_patch_ids: Vec::new(),
             applied_patch_ids: Vec::new(),
+            deleted_paths: BTreeSet::new(),
             records: Vec::new(),
         }
     }
@@ -431,7 +469,8 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
         ));
     }
 
-    let root = options.repo_root.canonicalize()?;
+    let root =
+        options.repo_root.canonicalize().map_err(io_at("canonicalize", &options.repo_root))?;
     let out_dir = root_path(&root, &options.out_dir);
     let imported = out_dir.join("imported");
     let ported = out_dir.join("ported");
@@ -458,9 +497,9 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
             ))
         },
     )?;
-    fs::create_dir_all(&out_dir)?;
+    fs::create_dir_all(&out_dir).map_err(io_at("create dir", &out_dir))?;
     if proof_dir.exists() {
-        fs::remove_dir_all(&proof_dir)?;
+        fs::remove_dir_all(&proof_dir).map_err(io_at("remove dir", &proof_dir))?;
     }
 
     let resolution = resolve_revision_report(
@@ -533,7 +572,7 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
         }
         let copied_log = out_dir.join("execution.log");
         if !same_path(&input_log, &copied_log) {
-            fs::copy(&input_log, &copied_log)?;
+            fs::copy(&input_log, &copied_log).map_err(io_at("copy", &input_log))?;
         }
         execution_log_path = Some(copied_log.clone());
         scorecard_log_path = Some(copied_log);
@@ -713,6 +752,7 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
         options.execute,
         options.max_files,
         &missing_locally,
+        patch_report.as_ref().map(|r| &r.deleted_paths).unwrap_or(&BTreeSet::new()),
     );
     set_object_field(
         &mut scorecard,
@@ -1052,7 +1092,11 @@ fn run_capture(
     args: &[&str],
     check: bool,
 ) -> Result<Vec<u8>, PortError> {
-    let output = Command::new(program).args(args).current_dir(root).output()?;
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(io_at("spawn", program))?;
     if check && !output.status.success() {
         return Err(PortError::CommandFailed {
             command: shell_join(
@@ -1075,7 +1119,8 @@ fn git(root: &Path, args: &[&str]) -> Result<String, PortError> {
 }
 
 fn git_maybe(root: &Path, args: &[&str]) -> Result<(ExitStatus, String, String), PortError> {
-    let output = Command::new("git").args(args).current_dir(root).output()?;
+    let output =
+        Command::new("git").args(args).current_dir(root).output().map_err(io_at("spawn", "git"))?;
     Ok((
         output.status,
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1219,16 +1264,17 @@ fn export_overlay(
     max_files: Option<usize>,
 ) -> Result<Vec<String>, PortError> {
     if destination.exists() {
-        fs::remove_dir_all(destination)?;
+        fs::remove_dir_all(destination).map_err(io_at("remove dir", destination))?;
     }
-    fs::create_dir_all(destination)?;
+    fs::create_dir_all(destination).map_err(io_at("create dir", destination))?;
 
     if max_files.is_none() {
         let mut archive = Command::new("git")
             .args(["archive", "--format=tar", revision, "tests"])
             .current_dir(root)
             .stdout(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .map_err(io_at("spawn", "git"))?;
         let archive_stdout = archive.stdout.take().ok_or_else(|| {
             PortError::Message("failed to capture git archive stdout".to_string())
         })?;
@@ -1236,8 +1282,9 @@ fn export_overlay(
             .args(["-xf", "-", "-C"])
             .arg(destination)
             .stdin(Stdio::from(archive_stdout))
-            .output()?;
-        let archive_status = archive.wait()?;
+            .output()
+            .map_err(io_at("spawn", "tar"))?;
+        let archive_status = archive.wait().map_err(io_at("wait", "git"))?;
         if !archive_status.success() || !extract.status.success() {
             return Err(PortError::Message(format!(
                 "failed to export upstream tests with git archive\ngit archive status: {archive_status}\ntar status: {}\ntar stdout:\n{}\ntar stderr:\n{}",
@@ -1258,33 +1305,34 @@ fn export_overlay(
             .arg("show")
             .arg(format!("{revision}:{}", entry.path))
             .current_dir(root)
-            .output()?;
+            .output()
+            .map_err(io_at("spawn", "git"))?;
         if !output.status.success() {
             continue;
         }
         let target = destination.join(&entry.path);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
         }
-        fs::write(&target, output.stdout)?;
+        fs::write(&target, output.stdout).map_err(io_at("write", &target))?;
         exported.push(entry.path.clone());
     }
     Ok(exported)
 }
 
 fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), PortError> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    fs::create_dir_all(destination).map_err(io_at("create dir", destination))?;
+    for entry in fs::read_dir(source).map_err(io_at("read dir", source))? {
+        let entry = entry.map_err(io_at("read dir", source))?;
+        let file_type = entry.file_type().map_err(io_at("stat", entry.path()))?;
         let target = destination.join(entry.file_name());
         if file_type.is_dir() {
             copy_dir_all(&entry.path(), &target)?;
         } else if file_type.is_file() {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
             }
-            fs::copy(entry.path(), target)?;
+            fs::copy(entry.path(), target).map_err(io_at("copy", entry.path()))?;
         }
     }
     Ok(())
@@ -1296,14 +1344,15 @@ fn adapt_overlay(
     audit_jsonl: &Path,
 ) -> Result<Vec<AuditRecord>, PortError> {
     if ported.exists() {
-        fs::remove_dir_all(ported)?;
+        fs::remove_dir_all(ported).map_err(io_at("remove dir", ported))?;
     }
     copy_dir_all(imported, ported)?;
     if let Some(parent) = audit_jsonl.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
     }
-    let mut audit_writer = BufWriter::new(File::create(audit_jsonl)?);
-    audit_writer.flush()?;
+    let mut audit_writer =
+        BufWriter::new(File::create(audit_jsonl).map_err(io_at("create", audit_jsonl))?);
+    audit_writer.flush().map_err(io_at("write", audit_jsonl))?;
     Ok(Vec::new())
 }
 
@@ -1321,7 +1370,7 @@ fn apply_patch_manifest(
         )));
     }
 
-    let manifest_text = fs::read_to_string(manifest_path)?;
+    let manifest_text = fs::read_to_string(manifest_path).map_err(io_at("read", manifest_path))?;
     let manifest: PatchManifest = toml::from_str(&manifest_text).map_err(|err| {
         PortError::Message(format!(
             "failed to parse upstream patch manifest {}: {err}",
@@ -1332,8 +1381,13 @@ fn apply_patch_manifest(
 
     let mut report =
         PatchApplicationReport::empty(manifest_path.to_path_buf(), manifest.schema_version.clone());
-    let mut audit_writer =
-        BufWriter::new(OpenOptions::new().create(true).append(true).open(audit_jsonl)?);
+    let mut audit_writer = BufWriter::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_jsonl)
+            .map_err(io_at("open", audit_jsonl))?,
+    );
 
     for patch in &manifest.patches {
         match patch.status {
@@ -1351,10 +1405,11 @@ fn apply_patch_manifest(
             PatchKind::AdapterRule => {
                 apply_adapter_rule_patch(ported, patch, &mut report, &mut audit_writer)?
             }
+            PatchKind::Delete => apply_delete_patch(ported, patch, &mut report, &mut audit_writer)?,
         }
     }
 
-    audit_writer.flush()?;
+    audit_writer.flush().map_err(io_at("write", audit_jsonl))?;
     Ok(report)
 }
 
@@ -1408,7 +1463,7 @@ fn apply_string_replace_patch(
 
     let before_digest = sha256_bytes(before.as_bytes());
     let after = before.replace(find, replace);
-    fs::write(&target, after.as_bytes())?;
+    fs::write(&target, after.as_bytes()).map_err(io_at("write", &target))?;
     report.applied_patch_ids.push(patch.id.clone());
 
     for position in positions {
@@ -1441,6 +1496,53 @@ fn apply_string_replace_patch(
     Ok(())
 }
 
+/// Trust: honour a `kind = "delete"` row by REMOVING the path from the imported
+/// overlay, so a later `--apply` cannot resurrect a deliberately retired test.
+///
+/// Fails closed in the direction that matters. If the path is absent from the
+/// overlay the row is stale — upstream deleted the file too — and that is an
+/// error rather than a no-op, because a stale delete row is exactly the
+/// live-looking waiver for a fixed condition that the pin-waiver and
+/// quarantine lanes both refuse. `allow_missing` opts out for a row that is
+/// deliberately tolerant.
+fn apply_delete_patch(
+    ported: &Path,
+    patch: &PatchEntry,
+    report: &mut PatchApplicationReport,
+    audit_writer: &mut dyn Write,
+) -> Result<(), PortError> {
+    let rel = normalize_patch_entry_path(required_patch_path(patch)?)?;
+    let target = ported.join(Path::new(&rel));
+    if !target.exists() {
+        if patch.allow_missing {
+            return Ok(());
+        }
+        return Err(PortError::Message(format!(
+            "active upstream patch '{}' is a delete row but {} is already absent from the \
+             imported overlay; upstream may have deleted it too — drop this row",
+            patch.id, rel
+        )));
+    }
+    let before = fs::read(&target).map_err(io_at("read", &target))?;
+    let before_digest = sha256_bytes(&before);
+    fs::remove_file(&target).map_err(io_at("remove file", &target))?;
+    writeln!(
+        audit_writer,
+        "{}",
+        json!({
+            "patch_id": patch.id,
+            "kind": "delete",
+            "path": rel,
+            "before_digest": before_digest,
+            "after": "absent",
+        })
+    )
+    .map_err(|err| PortError::Message(format!("writing patch audit record: {err}")))?;
+    report.applied_patch_ids.push(patch.id.clone());
+    report.deleted_paths.insert(rel);
+    Ok(())
+}
+
 fn apply_adapter_rule_patch(
     ported: &Path,
     patch: &PatchEntry,
@@ -1465,7 +1567,7 @@ fn apply_adapter_rule_patch(
         if !is_text_path(&rel) {
             continue;
         }
-        let raw = fs::read(&path)?;
+        let raw = fs::read(&path).map_err(io_at("read", &path))?;
         let Ok(text) = String::from_utf8(raw.clone()) else {
             continue;
         };
@@ -1502,7 +1604,7 @@ fn apply_adapter_rule_patch(
             updated.push_str(&current);
         }
         if changed {
-            fs::write(&path, updated.as_bytes())?;
+            fs::write(&path, updated.as_bytes()).map_err(io_at("write", &path))?;
             changed_files.insert(rel.clone());
             let digest_record = AuditRecord {
                 path: rel,
@@ -1609,6 +1711,15 @@ fn validate_patch_manifest(
             )));
         }
         match patch.kind {
+            // Trust: a delete row carries a path and nothing else. Demanding
+            // find/replace would make the kind unusable, and demanding the file
+            // be PRESENT would be backwards — its whole claim is absence. Kept
+            // as an explicit arm rather than an early `continue` so this match
+            // stays wildcard-free: a future kind is then a compile error here
+            // instead of a silently unvalidated row.
+            PatchKind::Delete => {
+                let _ = required_patch_path(patch)?;
+            }
             PatchKind::StringReplace => {
                 let path = required_patch_path(patch)?;
                 if required_patch_find(patch)?.is_empty() {
@@ -1692,10 +1803,10 @@ fn is_yyyy_mm_dd(value: &str) -> bool {
 }
 
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), PortError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in fs::read_dir(dir).map_err(io_at("read dir", dir))? {
+        let entry = entry.map_err(io_at("read dir", dir))?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
+        if entry.file_type().map_err(io_at("stat", &path))?.is_dir() {
             collect_files(&path, files)?;
         } else {
             files.push(path);
@@ -2139,7 +2250,7 @@ fn replace_error_code_urls(line: &str) -> String {
 
 fn write_audit_markdown(path: &Path, audit: &[AuditRecord]) -> Result<(), PortError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
     }
     let mut by_rule = BTreeMap::<&str, usize>::new();
     let mut touched = BTreeSet::<&str>::new();
@@ -2175,7 +2286,7 @@ fn write_audit_markdown(path: &Path, audit: &[AuditRecord]) -> Result<(), PortEr
             pushln(&mut output, format_args!("  - after: {}", markdown_inline_code(after)));
         }
     }
-    fs::write(path, output)?;
+    fs::write(path, output).map_err(io_at("write", path))?;
     Ok(())
 }
 
@@ -2188,7 +2299,7 @@ fn markdown_inline_code(value: &str) -> String {
 }
 
 fn parse_baseline_document(path: &Path) -> Result<CompatibilityBaseline, PortError> {
-    let input = fs::read_to_string(path)?;
+    let input = fs::read_to_string(path).map_err(io_at("read", path))?;
     match document_format(path) {
         DocumentFormat::Json => Ok(parse_baseline_json(&input)?),
         DocumentFormat::Toml => Ok(parse_baseline_toml(&input)?),
@@ -2209,7 +2320,7 @@ fn read_upstream_fix_ledger(path: &Path) -> Result<Value, PortError> {
             "pending_local_actions": [],
         }));
     }
-    let input = fs::read_to_string(path)?;
+    let input = fs::read_to_string(path).map_err(io_at("read", path))?;
     let ledger: UpstreamFixLedger = match document_format(path) {
         DocumentFormat::Json => parse_upstream_fixes_json(&input)?,
         DocumentFormat::Toml => parse_upstream_fixes_toml(&input)?,
@@ -2454,7 +2565,7 @@ fn apply_ported_overlay(
                 "refusing to remove stale upstream directory path: {rel}"
             )));
         }
-        fs::remove_file(&target)?;
+        fs::remove_file(&target).map_err(io_at("remove", &target))?;
         prune_empty_parents(&target, &tests_root)?;
         removed_stale.push(rel.clone());
     }
@@ -2467,9 +2578,9 @@ fn apply_ported_overlay(
         }
         let target = root.join(rel);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
         }
-        fs::copy(source, target)?;
+        fs::copy(&source, target).map_err(io_at("copy", &source))?;
         applied.push(rel.clone());
     }
     Ok((applied, removed_stale))
@@ -2501,7 +2612,7 @@ fn prune_empty_parents(path: &Path, stop: &Path) -> Result<(), PortError> {
             Ok(()) => parent = dir.parent(),
             Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => break,
             Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(io_at("remove dir", dir)(error)),
         }
     }
     Ok(())
@@ -2552,7 +2663,7 @@ fn parse_scorecard(
         }));
     }
 
-    let text = fs::read_to_string(log_path)?;
+    let text = fs::read_to_string(log_path).map_err(io_at("read", log_path))?;
     let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
     let mut failures = BTreeMap::<String, Value>::new();
     for (line_index, line) in lines.iter().enumerate() {
@@ -3269,9 +3380,9 @@ fn write_llm_directives(
     );
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
     }
-    fs::write(path, output)?;
+    fs::write(path, output).map_err(io_at("write", path))?;
     Ok(())
 }
 
@@ -3665,9 +3776,9 @@ fn write_scorecard_markdown(path: &Path, scorecard: &Value) -> Result<(), PortEr
     }
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
     }
-    fs::write(path, output)?;
+    fs::write(path, output).map_err(io_at("write", path))?;
     Ok(())
 }
 
@@ -3750,7 +3861,7 @@ fn proof_artifact_validation(
             artifacts.insert(name.to_string(), Value::Object(record));
             continue;
         }
-        let data = fs::read(&path)?;
+        let data = fs::read(&path).map_err(io_at("read", &path))?;
         record.insert("size_bytes".to_string(), json!(data.len()));
         record.insert("sha256".to_string(), json!(sha256_bytes(&data)));
         if data.is_empty() {
@@ -4054,7 +4165,7 @@ fn read_proof_trust_added_manifest(
         if !path.exists() {
             continue;
         }
-        let data = fs::read_to_string(&path)?;
+        let data = fs::read_to_string(&path).map_err(io_at("read", &path))?;
         let mut record = serde_json::Map::new();
         record.insert("path".to_string(), json!(path.to_string_lossy()));
         record.insert("exists".to_string(), json!(true));
@@ -4110,15 +4221,23 @@ fn append_porting_validation_failures(
     execute: bool,
     max_files: Option<usize>,
     missing_locally: &[String],
+    deliberately_deleted: &BTreeSet<String>,
 ) -> Vec<Value> {
-    if execute && max_files.is_none() && !missing_locally.is_empty() {
+    // Subtract the paths an ACTIVE delete row accounts for. A row that is
+    // `status = "resolved"` or expired stops counting, so the coverage claim
+    // cannot be held open by a stale waiver — the same discipline the pin
+    // waivers and the compiler-check quarantine both enforce.
+    let unaccounted: Vec<&String> =
+        missing_locally.iter().filter(|path| !deliberately_deleted.contains(*path)).collect();
+    if execute && max_files.is_none() && !unaccounted.is_empty() {
         failures.push(json!({
             "kind": "ported-overlay-not-applied",
             "message": format!(
-                "full execution cannot prove latest upstream coverage while {} upstream test paths are missing from tests/; run with --apply or port the missing tests",
-                missing_locally.len()
+                "full execution cannot prove latest upstream coverage while {} upstream test paths are missing from tests/ with no active `kind = \"delete\"` patch row accounting for them; port the missing tests, or add a delete row with an owner and an expiry if the absence is deliberate. Do NOT reach for --apply to silence this: its write phase copies every upstream path unconditionally and will revert local divergences at upstream paths.",
+                unaccounted.len()
             ),
-            "sample": missing_locally.iter().take(20).collect::<Vec<_>>(),
+            "sample": unaccounted.iter().take(20).collect::<Vec<_>>(),
+            "accounted_by_delete_rows": deliberately_deleted.len(),
         }));
     }
     failures
@@ -4290,22 +4409,31 @@ fn execute_suite(
     let execution_command = shell_join(&command);
 
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
     }
-    fs::create_dir_all(&proof_dir)?;
+    fs::create_dir_all(&proof_dir).map_err(io_at("create dir", &proof_dir))?;
     let started_at = current_timestamp();
     let started = Instant::now();
-    let mut log = OpenOptions::new().create(true).write(true).truncate(true).open(&log_path)?;
-    writeln!(log, "$ {execution_command}")?;
-    writeln!(log, "# executor=rust-bootstrap")?;
-    writeln!(log, "# resolved_upstream_revision={resolved_revision}")?;
-    writeln!(log, "# proof_inventory_tests={}", proof_tests.len() + trust_added_test_count)?;
-    writeln!(log, "# upstream_proof_inventory_tests={}", proof_tests.len())?;
-    writeln!(log, "# trust_added_proof_inventory_tests={trust_added_test_count}")?;
-    writeln!(log, "# started_at={started_at}")?;
-    log.flush()?;
-    let stdout = log.try_clone()?;
-    let stderr = log.try_clone()?;
+    let mut log = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .map_err(io_at("open", &log_path))?;
+    writeln!(log, "$ {execution_command}").map_err(io_at("write", &log_path))?;
+    writeln!(log, "# executor=rust-bootstrap").map_err(io_at("write", &log_path))?;
+    writeln!(log, "# resolved_upstream_revision={resolved_revision}")
+        .map_err(io_at("write", &log_path))?;
+    writeln!(log, "# proof_inventory_tests={}", proof_tests.len() + trust_added_test_count)
+        .map_err(io_at("write", &log_path))?;
+    writeln!(log, "# upstream_proof_inventory_tests={}", proof_tests.len())
+        .map_err(io_at("write", &log_path))?;
+    writeln!(log, "# trust_added_proof_inventory_tests={trust_added_test_count}")
+        .map_err(io_at("write", &log_path))?;
+    writeln!(log, "# started_at={started_at}").map_err(io_at("write", &log_path))?;
+    log.flush().map_err(io_at("write", &log_path))?;
+    let stdout = log.try_clone().map_err(io_at("clone", &log_path))?;
+    let stderr = log.try_clone().map_err(io_at("clone", &log_path))?;
     let mut process = Command::new(&command[0]);
     process.args(&command[1..]).current_dir(root);
     process.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
@@ -4322,10 +4450,34 @@ fn execute_suite(
         "TRUST_BOOTSTRAP_NO_VERIFY_TARGET_ONLY",
         "TRUST_BOOTSTRAP_SHIM_NO_VERIFY",
         "TRUST_BOOTSTRAP_SHIM_NO_VERIFY_TARGET_ONLY",
+        // The comment above states the intent; this variable is what actually
+        // carried the violation. This runner is itself launched through `targo
+        // trust domination`, so `TRUST_TARGO_FRONTEND=1` is in OUR environment
+        // and was inherited straight into the bootstrap child — the runner
+        // scrubbed four bootstrap markers and then handed the child the Targo
+        // authority those markers exist to keep out.
+        //
+        // It is not a cosmetic leak. `rustc.rs:108` reads it into
+        // `authenticated_targo_frontend`, and
+        // `cargo_test_no_verify_requested` is `isolation_requested &&
+        // !authenticated_targo_frontend` — so with it set, the shim's
+        // `-Ztrust-verify=off` is withheld EVEN WHEN the bootstrap marker is
+        // present, on the reasoning that a verified Targo frontend has already
+        // scoped verification per unit. That reasoning is sound on the Targo
+        // lane and false here: the child is `x.py test`, whose units Targo's
+        // `trust_unit_verification_enabled` engine never sees.
+        //
+        // Measured 2026-08-23: this is what produced 15 tool build failures —
+        // `object`/`proc-macro2`/`libc`/`serde` build scripts and the
+        // `memchr`/`autocfg`/`shlex` host libs — failing on UNPROVED COVERAGE
+        // inside "Building stage2 compiler artifacts", i.e. exactly the
+        // third-party-code-in-verification-scope accident CLAUDE.md's "Why
+        // targo, not stock cargo?" describes.
+        "TRUST_TARGO_FRONTEND",
     ] {
         process.env_remove(marker);
     }
-    let status = process.status()?;
+    let status = process.status().map_err(io_at("spawn", &command[0]))?;
     let upstream_exit_status = status.code().unwrap_or(-1);
     let trust_added = match trust_added_manifest {
         Some((manifest_path, manifest)) => {
@@ -4336,13 +4488,15 @@ fn execute_suite(
     let execution_exit_status = combined_execution_exit_status(upstream_exit_status, &trust_added);
     let ended_at = current_timestamp();
     let duration_seconds = started.elapsed().as_secs_f64();
-    writeln!(log, "# ended_at={ended_at}")?;
-    writeln!(log, "# duration_seconds={duration_seconds:.3}")?;
-    writeln!(log, "# upstream_exit_status={upstream_exit_status}")?;
-    writeln!(log, "# trust_added_exit_status={}", trust_added_exit_status(&trust_added))?;
-    writeln!(log, "# exit_status={execution_exit_status}")?;
-    log.flush()?;
-    fs::copy(&log_path, &proof_log_path)?;
+    writeln!(log, "# ended_at={ended_at}").map_err(io_at("write", &log_path))?;
+    writeln!(log, "# duration_seconds={duration_seconds:.3}").map_err(io_at("write", &log_path))?;
+    writeln!(log, "# upstream_exit_status={upstream_exit_status}")
+        .map_err(io_at("write", &log_path))?;
+    writeln!(log, "# trust_added_exit_status={}", trust_added_exit_status(&trust_added))
+        .map_err(io_at("write", &log_path))?;
+    writeln!(log, "# exit_status={execution_exit_status}").map_err(io_at("write", &log_path))?;
+    log.flush().map_err(io_at("write", &log_path))?;
+    fs::copy(&log_path, &proof_log_path).map_err(io_at("copy", &log_path))?;
     write_execution_proof_artifacts(
         root,
         &proof_dir,
@@ -4444,24 +4598,39 @@ fn execute_trust_added_manifest(
     manifest: TrustAddedTestManifest,
     release: bool,
 ) -> Result<TrustAddedExecution, PortError> {
-    fs::create_dir_all(proof_dir)?;
+    fs::create_dir_all(proof_dir).map_err(io_at("create dir", proof_dir))?;
     let log_path = proof_dir.join("trust-added.log");
     write_json(&proof_dir.join("trust-added-manifest.json"), &serde_json::to_value(&manifest)?)?;
-    let mut log = OpenOptions::new().create(true).write(true).truncate(true).open(&log_path)?;
-    writeln!(log, "# manifest={}", display_path(&manifest_path, root))?;
+    let mut log = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .map_err(io_at("open", &log_path))?;
+    writeln!(log, "# manifest={}", display_path(&manifest_path, root))
+        .map_err(io_at("write", &log_path))?;
 
     let mut commands = Vec::new();
     for command in &manifest.commands {
         let started_at = current_timestamp();
-        writeln!(log)?;
-        writeln!(log, "# command_id={}", command.id)?;
-        writeln!(log, "# started_at={started_at}")?;
-        writeln!(log, "$ {}", command.command)?;
-        log.flush()?;
+        writeln!(log).map_err(io_at("write", &log_path))?;
+        writeln!(log, "# command_id={}", command.id).map_err(io_at("write", &log_path))?;
+        writeln!(log, "# started_at={started_at}").map_err(io_at("write", &log_path))?;
+        // Trust: run the spelling that matches this run's STRENGTH.
+        //
+        // A release run uses the canonical `command`. A local run uses
+        // `local_command` — the weaker mode each refusal explicitly names as
+        // "runnable for local diagnostics" — so the bundle attests what actually
+        // executed. A command with no local substitute is SKIPPED in a local run
+        // rather than silently downgraded: the bundle then does not cover it,
+        // which is the honest state, and `required` still fails a release proof.
+        let (spelling, spelling_is_release) = trust_added_spelling(command, release);
+        writeln!(log, "$ {spelling}").map_err(io_at("write", &log_path))?;
+        log.flush().map_err(io_at("write", &log_path))?;
 
-        let argv = resolve_trust_added_command(root, release, &command.command)?;
-        let stdout = log.try_clone()?;
-        let stderr = log.try_clone()?;
+        let argv = resolve_trust_added_command(root, release, spelling, spelling_is_release)?;
+        let stdout = log.try_clone().map_err(io_at("clone", &log_path))?;
+        let stderr = log.try_clone().map_err(io_at("clone", &log_path))?;
         let mut process = Command::new(&argv[0]);
         process.args(&argv[1..]);
         process.current_dir(root);
@@ -4469,14 +4638,15 @@ fn execute_trust_added_manifest(
         process.env("TRUST_STRICT", "1");
         process.env("TRUST_RELEASE_GATE", if release { "1" } else { "0" });
         let started = Instant::now();
-        let status = process.status()?;
+        let status = process.status().map_err(io_at("spawn", &argv[0]))?;
         let ended_at = current_timestamp();
         let duration_seconds = started.elapsed().as_secs_f64();
         let exit_status = status.code().unwrap_or(-1);
-        writeln!(log, "# ended_at={ended_at}")?;
-        writeln!(log, "# duration_seconds={duration_seconds:.3}")?;
-        writeln!(log, "# exit_status={exit_status}")?;
-        log.flush()?;
+        writeln!(log, "# ended_at={ended_at}").map_err(io_at("write", &log_path))?;
+        writeln!(log, "# duration_seconds={duration_seconds:.3}")
+            .map_err(io_at("write", &log_path))?;
+        writeln!(log, "# exit_status={exit_status}").map_err(io_at("write", &log_path))?;
+        log.flush().map_err(io_at("write", &log_path))?;
 
         commands.push(TrustAddedCommandExecution { command: command.clone(), exit_status });
     }
@@ -4515,14 +4685,48 @@ fn reject_trust_added_script_launchers(
                 command.id
             ))
         })?;
+        // Trust: a declared local substitute is checked too, at LOCAL strength —
+        // so a manifest cannot smuggle a `--release` command in through the
+        // local field, and cannot declare a malformed one that only fails when
+        // somebody actually runs a local bundle.
+        if let Some(local) = &command.local_command {
+            let local_argv = parse_native_command_line(local).map_err(|message| {
+                PortError::Message(format!(
+                    "Trust-added proof manifest local_command '{}' is not a native argv \
+                     command: {message}",
+                    command.id
+                ))
+            })?;
+            validate_trust_added_argv(&local_argv, false).map_err(|message| {
+                PortError::Message(format!(
+                    "Trust-added proof manifest local_command '{}' is not canonical: {message}",
+                    command.id
+                ))
+            })?;
+        }
     }
     Ok(())
+}
+
+/// The command spelling to run, and whether that spelling is the release one.
+///
+/// A local run prefers `local_command`, but FALLS BACK to the canonical spelling
+/// when no substitute is declared — which is exactly the pre-existing behaviour,
+/// preserved on purpose. Skipping instead would silently drop coverage for any
+/// manifest that has not declared substitutes, and a bundle that quietly covers
+/// less is worse than one that runs a command and records that it refused.
+fn trust_added_spelling(command: &TrustAddedTestCommand, release: bool) -> (&str, bool) {
+    match (release, command.local_command.as_deref()) {
+        (false, Some(local)) => (local, false),
+        _ => (command.command.as_str(), true),
+    }
 }
 
 fn resolve_trust_added_command(
     root: &Path,
     release: bool,
     command: &str,
+    expect_release_spelling: bool,
 ) -> Result<Vec<String>, PortError> {
     let argv = parse_native_command_line(command).map_err(|message| {
         PortError::Message(format!("Trust-added proof manifest command is invalid: {message}"))
@@ -4530,7 +4734,12 @@ fn resolve_trust_added_command(
     let Some(program) = argv.first() else {
         return Err(PortError::Message("Trust-added proof manifest command is empty".to_string()));
     };
-    validate_canonical_trust_added_argv(&argv).map_err(|message| {
+    // Trust: the shape check follows THE SPELLING BEING RUN, not the run's
+    // strength — they differ exactly when a local run falls back to the canonical
+    // command because no substitute was declared. A declared `local_command` is
+    // still rejected if it carries `--release`, which is what stops a bundle
+    // citing a command at a strength it did not execute.
+    validate_trust_added_argv(&argv, expect_release_spelling).map_err(|message| {
         PortError::Message(format!(
             "Trust-added proof manifest command is not canonical: {message}"
         ))
@@ -4548,6 +4757,16 @@ fn resolve_trust_added_command(
 }
 
 fn validate_canonical_trust_added_argv(argv: &[String]) -> Result<(), String> {
+    validate_trust_added_argv(argv, true)
+}
+
+/// Trust: the same canonical-shape check, with the `--release` requirement made
+/// explicit rather than unconditional.
+///
+/// `release_expected` must MATCH the bundle's strength. A release bundle may only
+/// cite a `--release` command, and a local bundle may only cite one without it —
+/// so a bundle can never quote a command at a strength it did not run.
+fn validate_trust_added_argv(argv: &[String], release_expected: bool) -> Result<(), String> {
     let prefix = ["targo", "trust", "domination", "trust-added"];
     if argv.len() < prefix.len() + 1
         || !argv.iter().take(prefix.len()).map(String::as_str).eq(prefix)
@@ -4584,8 +4803,18 @@ fn validate_canonical_trust_added_argv(argv: &[String]) -> Result<(), String> {
     if !is_canonical_trust_added_mode(&mode) {
         return Err(format!("unknown trust-added mode `{mode}`"));
     }
-    if !release_seen {
-        return Err("must contain exactly one pre-mode `--release` flag".to_string());
+    match (release_expected, release_seen) {
+        (true, false) => {
+            return Err("must contain exactly one pre-mode `--release` flag".to_string());
+        }
+        (false, true) => {
+            return Err(
+                "a local-strength command must NOT carry `--release`; a bundle may not cite a \
+                 command at a strength it did not run"
+                    .to_string(),
+            );
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -4607,6 +4836,17 @@ fn is_canonical_trust_added_mode(mode: &str) -> bool {
             | "prepublish"
             | "installed"
             | "installed-default"
+            // Trust: the LOCAL substitutes. Each is the mode a
+            // `blocked_canonical_diagnostic` refusal names as "runnable for
+            // local diagnostics" for the canonical mode it stands in for
+            // (targo-trust/src/rust_vs_trust.rs). A manifest's `local_command`
+            // cites one of these, so they must be recognised here or a
+            // local-strength bundle cannot be expressed at all.
+            | "trust-extra-smoke"
+            | "public-distribution-cull-smoke"
+            | "prepublish-local-surface-smoke"
+            | "local-stage2-surface-smoke"
+            | "stage0-metadata-coherence-smoke"
             | "stage0-lineage"
     )
 }
@@ -4751,7 +4991,7 @@ fn proof_inventory_tests(
         .enumerate()
         .map(|(index, path)| ProofUpstreamTest {
             id: proof_upstream_test_id(index, &path),
-            source_git_blob: upstream_by_path.get(path.as_str()).map(|entry| entry.blob.clone()),
+            source_git_blob: proof_source_git_blob(&upstream_by_path, &path),
             path,
         })
         .collect()
@@ -4943,6 +5183,36 @@ fn proof_command_line(execution_command: &str, trust_added: &TrustAddedExecution
         .collect::<Vec<_>>();
     commands.dedup();
     commands.join(" && ")
+}
+
+/// The pristine upstream blob identifying a proof inventory row.
+///
+/// A direct lookup works for every compiletest suite EXCEPT run-make.
+/// `primary_compiletest_path` deliberately collapses a run-make test to its
+/// DIRECTORY (`tests/run-make/<name>`) — one test is a whole directory there,
+/// not one file — but a directory is not a blob entry in the git tree, so the
+/// direct lookup returned `None` for all 450 of them and the release validator
+/// reported "must record its pristine upstream Git blob" 450 times.
+///
+/// A run-make test's identity is its `rmake.rs` driver: 461 of the 465
+/// directories have one, and it is the file that defines what the test does. So
+/// a directory resolves through it.
+///
+/// FAIL-CLOSED on the remainder: a run-make directory with no `rmake.rs` in the
+/// tree still yields `None` and is still reported. Substituting some other file
+/// in the directory would attest to a blob that does not identify the test.
+fn proof_source_git_blob(
+    upstream_by_path: &BTreeMap<&str, &GitTreeEntry>,
+    path: &str,
+) -> Option<String> {
+    if let Some(entry) = upstream_by_path.get(path) {
+        return Some(entry.blob.clone());
+    }
+    if path.starts_with("tests/run-make/") {
+        let rmake = format!("{path}/rmake.rs");
+        return upstream_by_path.get(rmake.as_str()).map(|entry| entry.blob.clone());
+    }
+    None
 }
 
 fn proof_upstream_test_id(index: usize, path: &str) -> String {
@@ -5147,11 +5417,11 @@ fn current_date_string() -> String {
 
 fn write_json(path: &Path, value: &Value) -> Result<(), PortError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(io_at("create dir", parent))?;
     }
     let mut output = serde_json::to_string_pretty(value)?;
     output.push('\n');
-    fs::write(path, output)?;
+    fs::write(path, output).map_err(io_at("write", path))?;
     Ok(())
 }
 
@@ -5200,6 +5470,45 @@ mod tests {
     };
 
     #[test]
+    fn run_make_directory_resolves_its_blob_through_rmake_rs() {
+        // Trust: `primary_compiletest_path` collapses a run-make test to its
+        // DIRECTORY, which is not a blob entry — so the direct lookup returned
+        // None for all 450 of them and the release validator reported "must
+        // record its pristine upstream Git blob" 450 times.
+        let rmake = GitTreeEntry {
+            path: "tests/run-make/foo/rmake.rs".to_string(),
+            mode: "100644".to_string(),
+            kind: "blob".to_string(),
+            blob: "deadbeef".to_string(),
+            size: Some(10),
+        };
+        let plain = GitTreeEntry {
+            path: "tests/ui/bar.rs".to_string(),
+            mode: "100644".to_string(),
+            kind: "blob".to_string(),
+            blob: "cafebabe".to_string(),
+            size: Some(10),
+        };
+        let map: BTreeMap<&str, &GitTreeEntry> =
+            [(rmake.path.as_str(), &rmake), (plain.path.as_str(), &plain)].into_iter().collect();
+
+        assert_eq!(
+            proof_source_git_blob(&map, "tests/run-make/foo"),
+            Some("deadbeef".to_string()),
+            "a run-make DIRECTORY must resolve through its rmake.rs driver"
+        );
+        assert_eq!(
+            proof_source_git_blob(&map, "tests/ui/bar.rs"),
+            Some("cafebabe".to_string()),
+            "a direct file lookup must keep working"
+        );
+        // FAIL-CLOSED: no rmake.rs means no blob. Substituting another file in
+        // the directory would attest to a blob that does not identify the test.
+        assert_eq!(proof_source_git_blob(&map, "tests/run-make/missing"), None);
+        assert_eq!(proof_source_git_blob(&map, "tests/ui/absent.rs"), None);
+    }
+
+    #[test]
     fn trust_added_executor_requires_exactly_one_pre_mode_release() {
         let argv = |tail: &[&str]| {
             ["targo", "trust", "domination", "trust-added"]
@@ -5210,6 +5519,39 @@ mod tests {
         };
 
         assert_eq!(validate_canonical_trust_added_argv(&argv(&["--release", "quick"])), Ok(()));
+
+        // Trust: a LOCAL spelling must not carry `--release`, and a RELEASE
+        // spelling must. This is the property that stops a bundle citing a
+        // command at a strength it did not execute — the whole point of the
+        // local lane, so it is asserted in both directions rather than assumed.
+        assert_eq!(validate_trust_added_argv(&argv(&["quick"]), false), Ok(()));
+        assert!(
+            validate_trust_added_argv(&argv(&["--release", "quick"]), false)
+                .is_err_and(|e| e.contains("must NOT carry `--release`")),
+            "a local-strength command carrying --release must be refused"
+        );
+        assert!(
+            validate_trust_added_argv(&argv(&["quick"]), true)
+                .is_err_and(|e| e.contains("exactly one pre-mode `--release`")),
+            "a release-strength command without --release must be refused"
+        );
+
+        // The local substitutes the refusals name are canonical modes, so a
+        // manifest can actually cite them.
+        for mode in [
+            "trust-extra-smoke",
+            "public-distribution-cull-smoke",
+            "prepublish-local-surface-smoke",
+            "local-stage2-surface-smoke",
+            "stage0-metadata-coherence-smoke",
+        ] {
+            assert_eq!(
+                validate_trust_added_argv(&argv(&[mode]), false),
+                Ok(()),
+                "{mode} is named by a blocked_canonical_diagnostic refusal as the runnable \
+                 local substitute, so the manifest must be able to cite it"
+            );
+        }
 
         for tail in
             [&["quick"][..], &["--release", "--release", "quick"][..], &["quick", "--release"][..]]
@@ -5225,6 +5567,45 @@ mod tests {
         assert_eq!(ProofMode::Auto.resolved(Some(1)), ProofMode::Smoke);
         assert_eq!(ProofMode::Auto.resolved(None), ProofMode::Full);
         assert_eq!(ProofMode::Full.resolved(Some(1)), ProofMode::Full);
+    }
+
+    #[test]
+    fn io_at_display_names_op_path_and_source() {
+        let error =
+            io_at("open", "/no/such/dir/file.txt")(io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(error.exit_code(), 1, "IoAt must share Io's exit code");
+        let rendered = error.to_string();
+        assert!(
+            rendered.starts_with("open /no/such/dir/file.txt: "),
+            "IoAt display must lead with the op verb and the path: {rendered}"
+        );
+    }
+
+    #[test]
+    fn missing_file_read_error_names_path_and_op() {
+        let path = Path::new("/nonexistent-trust-upstream-compat/baseline.toml");
+        let error = parse_baseline_document(path).expect_err("missing baseline must fail");
+        assert_eq!(error.exit_code(), 1);
+        let rendered = error.to_string();
+        assert!(rendered.starts_with("read "), "op verb missing: {rendered}");
+        assert!(
+            rendered.contains("/nonexistent-trust-upstream-compat/baseline.toml"),
+            "path missing from rendered error: {rendered}"
+        );
+        assert!(rendered.contains("os error"), "underlying os error missing: {rendered}");
+    }
+
+    #[test]
+    fn spawn_of_missing_program_names_the_program() {
+        let error = run_capture(Path::new("."), "trust-no-such-program-io-at", &[], true)
+            .expect_err("spawning a nonexistent program must fail");
+        assert_eq!(error.exit_code(), 1);
+        let rendered = error.to_string();
+        assert!(
+            rendered.starts_with("spawn trust-no-such-program-io-at: "),
+            "spawn failure must name the program: {rendered}"
+        );
+        assert!(rendered.contains("os error"), "underlying os error missing: {rendered}");
     }
 
     #[test]

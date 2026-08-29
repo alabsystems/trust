@@ -6,18 +6,14 @@ use super::*;
 
 /// Trust: locals whose value along any path is an UNCONSTRAINED function input,
 /// so leaving them free in a path-feasibility formula is sound (no spurious SAT).
-/// A local qualifies iff it is a PARAMETER, or it is assigned EXACTLY ONCE by a
-/// pure leaf read — a `Use`/`Copy`/`Move`/`CopyForDeref` of an input-free place
-/// (any projection: a field/element/deref of a free aggregate is itself free) or
-/// a `Discriminant` of one. A local assigned more than once (a control-flow MERGE,
-/// e.g. a clamp `if c {a} else {b}`), via a `Call` terminator, or by any
-/// computation (BinaryOp/UnaryOp/Cast/Aggregate) is EXCLUDED: its value is
-/// functionally constrained, but that definition is NOT in the path-guard formula,
-/// so treating it free would over-approximate and could false-refute.
+/// A local qualifies iff it is an ENTRY-STABLE parameter, or the result of the
+/// narrow single-use payload-extractor admission below. A constant, a copy of an
+/// input, or a discriminant is NOT independently free: its relationship to the
+/// source value must be grounded by an exact definition. Otherwise a formula
+/// mentioning both sides could choose inconsistent values and false-refute a safe
+/// assertion. Any written/mutably escaped parameter is likewise excluded because
+/// its post-write SSA versions no longer denote the bare entry input.
 pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
-    // assignment count per BARE local + the sole rvalue (when assigned exactly once)
-    let mut assign_count: FxHashMap<usize, usize> = FxHashMap::default();
-    let mut sole_rvalue: FxHashMap<usize, &Rvalue> = FxHashMap::default();
     // Read-count per local across EVERY operand/place position, to gate the
     // Call-result-free admission: an argument read ONLY in the allowlisted call
     // cannot decouple the call result from any other constraint.
@@ -28,8 +24,8 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
     let mut unanalyzable = false;
     // Locals taken by `&mut` / `&raw` are NOT input-free: their value can be
     // reassigned through the borrow (`mem::swap(&mut a, ..)`, a setter, `*p = ..`)
-    // WITHOUT a direct `Assign`, so the single-assignment leaf-read rule would
-    // model a STALE pre-mutation value and could false-refute (the `&mut`/AddressOf
+    // WITHOUT a direct `Assign`, so a base-name input exemption could model a
+    // STALE pre-mutation value and false-refute (the `&mut`/AddressOf
     // staleness class — see the hunt-5/7/8 lessons). Exclude their base locals.
     let mut mut_borrowed: FxHashSet<usize> = FxHashSet::default();
     // Allowlisted "free-payload extractor" calls: (dest.local, arg locals). The
@@ -43,16 +39,12 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             if let Statement::Assign { place, rvalue, .. } = stmt {
-                if place.projections.is_empty() {
-                    *assign_count.entry(place.local).or_insert(0) += 1;
-                    sole_rvalue.insert(place.local, rvalue);
-                } else {
+                if !place.projections.is_empty() {
                     // a projected store (`a.0 = ..`, `*a = ..`) mutates the base
                     // local's value WITHOUT a direct assign — exclude it from
                     // input-free outright (covers even a parameter, which the
                     // single-assignment rule would otherwise admit) so the
                     // post-mutation value is never modelled as a free leaf.
-                    *assign_count.entry(place.local).or_insert(0) += 2;
                     mut_borrowed.insert(place.local);
                 }
                 match rvalue {
@@ -71,7 +63,9 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
                         bump(p.local, &mut read_count);
                         mut_borrowed.insert(p.local);
                     }
-                    Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                    Rvalue::BinaryOp(_, a, b)
+                    | Rvalue::CheckedBinaryOp(_, a, b)
+                    | Rvalue::UncheckedBinaryOp(_, a, b) => {
                         for op in [a, b] {
                             if let Operand::Copy(p) | Operand::Move(p) = op {
                                 bump(p.local, &mut read_count);
@@ -92,9 +86,6 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
         }
         match &block.terminator {
             Terminator::Call { func: callee, args, dest, .. } => {
-                // a Call result is a COMPUTED value; never input-free by the
-                // leaf-read rule (admitted only by the allowlist pass below).
-                *assign_count.entry(dest.local).or_insert(0) += 2;
                 for op in args {
                     if let Operand::Copy(p) | Operand::Move(p) = op {
                         bump(p.local, &mut read_count);
@@ -132,56 +123,45 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
             _ => unanalyzable = true,
         }
     }
-    // Parameters (locals 1..=arg_count) are the base input-free set — EXCEPT any
-    // that are `&mut`-borrowed (reassignable through the borrow). Grow to a
-    // fixpoint over single-assignment leaf reads of input-free places, plus
-    // allowlisted Call-result payloads; a `&mut`-borrowed local is never admitted.
-    let mut safe: FxHashSet<usize> =
-        (1..=func.body.arg_count).filter(|l| !mut_borrowed.contains(l)).collect();
-    loop {
-        let mut changed = false;
-        for (&local, &count) in &assign_count {
-            if safe.contains(&local) || count != 1 || mut_borrowed.contains(&local) {
+    // Entry-stable parameters (locals 1..=arg_count) are the base input-free set.
+    // A parameter written anywhere in the body is NOT input-free under its base
+    // name: the bare name denotes the entry value while a post-write `#s...`
+    // version denotes the replacement. Treating every version as an arbitrary
+    // input could make an opaque call destination spuriously SAT and false-refute
+    // a safe assertion. Reuse the repository-wide exact collapse license, which
+    // requires no statement/call-destination write and no mutable escape. The
+    // payload-extractor lane below is the only additional admission.
+    let mut safe: FxHashSet<usize> = (1..=func.body.arg_count)
+        .filter(|&local| local_versions_collapse_to_bare(func, local))
+        .collect();
+    // Call-result-free admission: an allowlisted payload extractor whose every
+    // arg is an input-free PARAMETER read ONLY in this call (so the result's
+    // value is unconstrained elsewhere — no decoupling). A declared precondition
+    // can constrain that otherwise-free argument without contributing a body
+    // read (`requires(i < s.len())` before `s.get(i)`), in which case treating the
+    // result as independent could manufacture a SAT witness. Decline the narrow
+    // admission whenever any gated precondition is present; exact call/path
+    // grounding remains available independently. Never re-admit a formal
+    // parameter as its own post-call replacement; the versioned entry/replacement
+    // relationship requires exact grounding, not a base-name exemption.
+    if !unanalyzable && func.preconditions.is_empty() {
+        for (dest, arg_locals) in &payload_calls {
+            if (1..=func.body.arg_count).contains(dest)
+                || !local_versions_collapse_to_bare(func, *dest)
+                || safe.contains(dest)
+                || mut_borrowed.contains(dest)
+            {
                 continue;
             }
-            let leaf = match sole_rvalue.get(&local) {
-                // a pure read: copy/move of an input-free place (ANY projection —
-                // a field/element/deref of a free aggregate is itself free), a
-                // constant, or a discriminant of an input-free place.
-                Some(Rvalue::Use(Operand::Constant(_))) => true,
-                Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
-                | Some(Rvalue::Discriminant(p))
-                | Some(Rvalue::CopyForDeref(p)) => safe.contains(&p.local),
-                // BinaryOp/UnaryOp/Cast/Aggregate/Ref/Len/… constrain the value.
-                _ => false,
-            };
-            if leaf {
-                safe.insert(local);
-                changed = true;
+            let ok = !arg_locals.is_empty()
+                && arg_locals.iter().all(|&a| {
+                    (1..=func.body.arg_count).contains(&a)
+                        && safe.contains(&a)
+                        && read_count.get(&a).copied().unwrap_or(0) <= 1
+                });
+            if ok {
+                safe.insert(*dest);
             }
-        }
-        // Call-result-free admission: an allowlisted payload extractor whose every
-        // arg is an input-free PARAMETER read ONLY in this call (so the result's
-        // value is unconstrained elsewhere — no decoupling).
-        if !unanalyzable {
-            for (dest, arg_locals) in &payload_calls {
-                if safe.contains(dest) || mut_borrowed.contains(dest) {
-                    continue;
-                }
-                let ok = !arg_locals.is_empty()
-                    && arg_locals.iter().all(|&a| {
-                        (1..=func.body.arg_count).contains(&a)
-                            && safe.contains(&a)
-                            && read_count.get(&a).copied().unwrap_or(0) <= 1
-                    });
-                if ok {
-                    safe.insert(*dest);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
         }
     }
     safe
@@ -193,9 +173,9 @@ pub(super) fn v2_input_free_locals(func: &VerifiableFunction) -> FxHashSet<usize
 /// For each panic-call terminator block, build the path-feasibility formula — the
 /// conjunction of branch guards reaching that block, which (since the block is
 /// entered exactly when the assertion FAILS) IS the violation condition. Emit it
-/// ONLY when every free variable is INPUT-FREE (`v2_input_free_locals`): a
-/// parameter, or a single-assignment leaf read of an input (an enum/struct
-/// payload field, a pinned discriminant). Then an ay SAT verdict is a genuine
+/// ONLY when every free variable is INPUT-FREE (`v2_input_free_locals`): an
+/// entry-stable parameter or a narrowly admitted single-use payload-extractor
+/// result. Then an ay SAT verdict is a genuine
 /// counterexample (a real input drives execution to the panic). A panic site
 /// whose reachability depends on a COMPUTED intermediate (e.g. a `clamp` value
 /// merged across blocks, or a `s.get(i)` call result) is EXCLUDED — its defining
@@ -274,9 +254,7 @@ fn wrapping_carrier_destination(
             Ty::Int { width, signed },
         ) if *width == expected_width && *signed == expected_signed => Some((*width, *signed)),
         (
-            trust_types::RustcWrappingRefutationCarrier::PointerSized {
-                signed: expected_signed,
-            },
+            trust_types::RustcWrappingRefutationCarrier::PointerSized { signed: expected_signed },
             Ty::PtrSizedInt { signed },
         ) if *signed == expected_signed => Some((destination.int_width()?, *signed)),
         // The production verifier extraction lane still carries usize/isize as
@@ -287,9 +265,7 @@ fn wrapping_carrier_destination(
         // width. Faithful serialized IR uses `PtrSizedInt` and is checked by the
         // exact arm above.
         (
-            trust_types::RustcWrappingRefutationCarrier::PointerSized {
-                signed: expected_signed,
-            },
+            trust_types::RustcWrappingRefutationCarrier::PointerSized { signed: expected_signed },
             Ty::Int { width: 64, signed },
         ) if *signed == expected_signed => Some((64, *signed)),
         _ => None,
@@ -338,6 +314,88 @@ fn wrapping_operand_matches_destination(
     }
 }
 
+/// Trust: THE wrapping-arithmetic value encoding — the modular reduction of a
+/// machine `Add`/`Sub` at `width` bits, kept in Int/LIA so ay decides it
+/// directly. This is the ONE constructor of that encoding; every lane that
+/// models a wrapping op routes through it so the same operation can never be
+/// encoded two ways in one solver query (which can manufacture or destroy
+/// models):
+///   * the marker-authenticated `wrapping_{add,sub}` CALL model
+///     (`wrapping_call_assert_model`), and
+///   * the bare `Rvalue::BinaryOp(Add|Sub)` STATEMENT model
+///     (`guards::extract_block_definitions*`) — the form the MIR inliner
+///     leaves at -O when it dissolves the call, and the form all user
+///     arithmetic takes in an overflow-checks-off session. MIR defines the
+///     plain integer binop as wrapping; the extractor keeps the checked
+///     (`CheckedBinaryOp`) and UB (`UncheckedBinaryOp`) forms distinct
+///     (`trust-mir-extract convert_supported_binop`), so a bare `BinaryOp`
+///     IS the wrapping case with no session bit to consult.
+///
+/// Unsigned: single-Ite reduction (`ite(a+b >= 2^w, a+b - 2^w, a+b)` /
+/// `ite(a-b < 0, a-b + 2^w, a-b)`). Signed: two's-complement two-sided wrap
+/// (`ite(s > max, s - 2^w, ite(s < min, s + 2^w, s))` — the sum/difference of
+/// two in-range values wraps AT MOST ONCE past either bound). Both are exact
+/// on in-range operands; callers conjoin the operands' type-range facts so
+/// the refute direction cannot pick an out-of-range operand.
+///
+/// Refusals (`None`, fail-closed — the value stays havocked/ungrounded,
+/// never mis-modeled):
+///   * `Mul` — a single Ite is WRONG for mul (it can wrap many times), and
+///     the full nonlinear modular reduction is not decidable in this lane;
+///     matches the call form's `WrappingMul => None` boundary.
+///   * `width` outside `1..=64` — the modulus `1i128 << width` must stay
+///     within i128; u128/i128 wrapping stays unhandled.
+///   * every op other than `Add`/`Sub`.
+pub(crate) fn wrapping_binop_modular_ite(
+    op: BinOp,
+    lhs_f: &Formula,
+    rhs_f: &Formula,
+    width: u32,
+    signed: bool,
+) -> Option<Formula> {
+    if !(1..=64).contains(&width) {
+        return None;
+    }
+    let modulus = Formula::Int(1i128 << width);
+    let s = match op {
+        BinOp::Add => Formula::Add(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
+        BinOp::Sub => Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
+        _ => return None,
+    };
+    Some(if signed {
+        // Two's-complement wrap into [min, max]: the sum/difference of two in-range
+        // signed values lands in [2*min, 2*max] (add) / [min-max, max-min] (sub),
+        // so it wraps AT MOST ONCE past either bound. `ite(s>max, s-2^w, ite(s<min,
+        // s+2^w, s))` is faithful; range facts (signed) keep both operands in band.
+        let max = crate::range::type_max_formula(width, true);
+        let min = crate::range::type_min_formula(width, true);
+        Formula::Ite(
+            Box::new(Formula::Gt(Box::new(s.clone()), Box::new(max))),
+            Box::new(Formula::Sub(Box::new(s.clone()), Box::new(modulus.clone()))),
+            Box::new(Formula::Ite(
+                Box::new(Formula::Lt(Box::new(s.clone()), Box::new(min))),
+                Box::new(Formula::Add(Box::new(s.clone()), Box::new(modulus))),
+                Box::new(s),
+            )),
+        )
+    } else {
+        // Unsigned single-Ite reduction at the operand width.
+        match op {
+            BinOp::Add => Formula::Ite(
+                Box::new(Formula::Ge(Box::new(s.clone()), Box::new(modulus.clone()))),
+                Box::new(Formula::Sub(Box::new(s.clone()), Box::new(modulus))),
+                Box::new(s),
+            ),
+            // wrapping_sub unsigned: borrow when the difference goes negative.
+            _ => Formula::Ite(
+                Box::new(Formula::Lt(Box::new(s.clone()), Box::new(Formula::Int(0)))),
+                Box::new(Formula::Add(Box::new(s.clone()), Box::new(modulus))),
+                Box::new(s),
+            ),
+        }
+    })
+}
+
 pub(super) fn wrapping_call_assert_model(
     func: &VerifiableFunction,
     callee: &str,
@@ -370,53 +428,10 @@ pub(super) fn wrapping_call_assert_model(
     {
         return None;
     }
-    // width <= 64 covers u8..=u64 / i8..=i64 / usize / isize. The cap keeps the
-    // modulus `1i128 << width` (= 2^width) within i128 (it overflows near width 127);
-    // u128/i128 wrapping stays unhandled (returns None -> dropped, sound).
-    if width > 64 {
-        return None;
-    }
-    let modulus = Formula::Int(1i128 << width);
     let lhs_f = operand_to_formula(func, lhs);
     let rhs_f = operand_to_formula(func, rhs);
     let dest_var = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
-    let s = match op {
-        BinOp::Add => Formula::Add(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-        BinOp::Sub => Formula::Sub(Box::new(lhs_f.clone()), Box::new(rhs_f.clone())),
-        _ => return None,
-    };
-    let ite = if signed {
-        // Two's-complement wrap into [min, max]: the sum/difference of two in-range
-        // signed values lands in [2*min, 2*max] (add) / [min-max, max-min] (sub),
-        // so it wraps AT MOST ONCE past either bound. `ite(s>max, s-2^w, ite(s<min,
-        // s+2^w, s))` is faithful; range facts (signed) keep both operands in band.
-        let max = crate::range::type_max_formula(width, true);
-        let min = crate::range::type_min_formula(width, true);
-        Formula::Ite(
-            Box::new(Formula::Gt(Box::new(s.clone()), Box::new(max))),
-            Box::new(Formula::Sub(Box::new(s.clone()), Box::new(modulus.clone()))),
-            Box::new(Formula::Ite(
-                Box::new(Formula::Lt(Box::new(s.clone()), Box::new(min))),
-                Box::new(Formula::Add(Box::new(s.clone()), Box::new(modulus))),
-                Box::new(s),
-            )),
-        )
-    } else {
-        // Unsigned single-Ite reduction at the operand width.
-        match op {
-            BinOp::Add => Formula::Ite(
-                Box::new(Formula::Ge(Box::new(s.clone()), Box::new(modulus.clone()))),
-                Box::new(Formula::Sub(Box::new(s.clone()), Box::new(modulus))),
-                Box::new(s),
-            ),
-            // wrapping_sub unsigned: borrow when the difference goes negative.
-            _ => Formula::Ite(
-                Box::new(Formula::Lt(Box::new(s.clone()), Box::new(Formula::Int(0)))),
-                Box::new(Formula::Add(Box::new(s.clone()), Box::new(modulus))),
-                Box::new(s),
-            ),
-        }
-    };
+    let ite = wrapping_binop_modular_ite(op, &lhs_f, &rhs_f, width, signed)?;
     let def = Formula::Eq(Box::new(dest_var), Box::new(ite));
     let ranges = vec![
         crate::range::input_range_constraint(&lhs_f, width, signed),
@@ -439,6 +454,20 @@ fn wrapping_result_local_is_stable(
         // manufacture a modular equation for the competing definition and a
         // false SAT counterexample.
         && !crate::guards::value_local_is_unstable(func, dest.local)
+}
+
+fn call_destination_base_locals(func: &VerifiableFunction) -> FxHashSet<usize> {
+    func.body
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            // A projected destination writes part of its base local and is just
+            // as incompatible with a whole-local "stable definition" as a bare
+            // destination. Exclude the base in both cases.
+            Terminator::Call { dest, .. } => Some(dest.local),
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn generate_full_assert_refutation_vcs(
@@ -466,6 +495,12 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
         return vec![malformed_trust_ir_vc(func, &error)];
     }
 
+    // This refutation lane is also a compiler-facing standalone API. Keep its
+    // panic-site, path, and call-result analyses on the same exact TailCall
+    // semantic projection as ordinary VC generation.
+    let tail_call_expanded = func.with_tail_calls_expanded();
+    let func = tail_call_expanded.as_ref();
+
     // verifier-perf: hold the mid-generation work-meter scope; this path materializes
     // declared types via owned place-type queries too (`place_to_var_name`, path
     // defs). Resets on the outermost entry. SOUNDNESS: DROP-ONLY (see the trip
@@ -483,13 +518,18 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func = arithmetic_safe_func.as_ref();
     let sv = StmtVersionCtx::build(func);
-    let guard_paths_map = v2_build_path_guard_map(func);
+    // Refutations need more than the proof-facing path map: a collapsed map
+    // contains an empty guard path that looks exactly like unconditional
+    // reachability, and the ordinary guard lowering may weaken an unmodeled
+    // condition to `true`.  Retain collapse provenance and use the exact
+    // refutation-polarity lowering below; either loss declines the candidate.
+    let guard_analysis = v2_analyze_path_guards(func);
+    let guard_paths_map = &guard_analysis.paths;
     // The formula var names whose value is an UNCONSTRAINED function input, so it
     // is sound to leave them free in a path-feasibility formula (no spurious SAT):
-    // parameters and single-assignment leaf reads of inputs (e.g. an enum/struct
-    // payload field `o.0` or a `Discriminant(o)`). A computed/merged intermediate
-    // (e.g. a clamp `if c {a} else {b}` or a `s.get(i)` call result) is excluded —
-    // its constraining definition is absent from the path-guard formula.
+    // entry-stable parameters plus the narrow single-use payload-extractor lane.
+    // A copy, constant, discriminant, or other computed/merged intermediate is
+    // excluded here and must instead acquire an exact constraining definition.
     let input_free = v2_input_free_locals(func);
     let safe_names: FxHashSet<String> = (0..func.body.locals.len())
         .filter(|local| input_free.contains(local))
@@ -548,8 +588,7 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 func,
                 dest,
                 wrap_call_def_count.get(&dest.local).copied().unwrap_or(0),
-            )
-                && target.is_some()
+            ) && target.is_some()
                 && atomic.is_none()
                 && !*is_foreign
                 && !*is_unsafe_sig
@@ -637,6 +676,12 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
     // `refute_full_assert_obligations` -> `InProcessAyBackend` (Proved only on a
     // strict-checked ay UNSAT-of-negation artifact). This is the same soundness argument
     // as `wrap_models` / path-defs, restricted further by the single-assignment gate.
+    // A normal call destination is not a stable definition merely because it is
+    // written once: without an exact callee model its value is opaque. Keep every
+    // call destination out of the generic statement-definition lane. Authenticated
+    // wrapping calls are grounded independently through `wrap_models`, and the
+    // narrow payload-extractor allowlist is represented explicitly in `safe_names`.
+    let call_dest_locals = call_destination_base_locals(func);
     let single_assign_names: FxHashSet<String> = {
         let mut count: FxHashMap<usize, usize> = FxHashMap::default();
         for b in &func.body.blocks {
@@ -646,11 +691,6 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 {
                     *count.entry(place.local).or_default() += 1;
                 }
-            }
-            if let Terminator::Call { dest, .. } = &b.terminator
-                && dest.projections.is_empty()
-            {
-                *count.entry(dest.local).or_default() += 1;
             }
         }
         count
@@ -667,7 +707,11 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             // refute lane and the proof lane agree on what is reassignable. SOUND:
             // dropping a fact only DROPS a refutation (fail-closed) — it can never
             // manufacture a refutation or a proof.
-            .filter(|(local, c)| *c == 1 && !crate::guards::value_local_is_unstable(func, *local))
+            .filter(|(local, c)| {
+                *c == 1
+                    && !call_dest_locals.contains(local)
+                    && !crate::guards::value_local_is_unstable(func, *local)
+            })
             .map(|(local, _)| {
                 crate::place_to_var_name(func, &Place { local, projections: Vec::new() })
             })
@@ -696,10 +740,54 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
     let def_stable = |d: &Formula| d.free_variables().iter().all(|v| var_stable(v));
     // `(Eq-def, range-facts)` candidates, UNVERSIONED here (renamed per assert site).
     let mut stmt_defs: Vec<(Formula, Vec<Formula>)> = Vec::new();
+    // The refutation path formula versions every branch guard at that guard's
+    // SOURCE block.  A definition renamed only at the eventual panic block can
+    // therefore carry a join token (`x#e_s2_0`) while the exact edge guard reads
+    // the establishing token (`x#s2_0`).  Keep an establish-point-stamped copy of
+    // each stable statement definition as well.  This is not an aliasing guess:
+    // `version_block_def_at_establish` versions rhs reads immediately BEFORE the
+    // defining write and the subject immediately AFTER it, so the equality is a
+    // true fact about that exact snapshot (including self-updates).  Candidate
+    // relevance below still requires an exact token match before consuming it.
+    let mut stmt_defs_at_establish: Vec<(Formula, Vec<Formula>)> = Vec::new();
     for b in &func.body.blocks {
-        for d in guards::extract_block_definitions(func, b) {
-            if matches!(&d, Formula::Eq(..)) && def_stable(&d) {
-                stmt_defs.push((d, Vec::new()));
+        // Trust (2026-08-20, bare-BinaryOp wrapping): partition each block's
+        // definitions into Eq defs and NON-Eq true-fact conjuncts (the bare
+        // wrapping-binop model's operand type-range tautologies, shift/cast
+        // result ranges, `x/c <= x`), attaching the facts to every Eq exactly
+        // like the overflow-flag ranges below — conjoined only when the def is
+        // used. Every non-Eq emission of `extract_block_definitions` is a
+        // true-of-every-execution bound (each documents its own tautology
+        // argument), so the attachment is monotone-sound in both directions;
+        // for the wrapping def the ranges are LOAD-BEARING — without them the
+        // refute direction could pick an out-of-range operand, cross the
+        // modular Ite's branch boundary, and spuriously SAT a valid assert
+        // (the same hazard the wrapping-CALL model's ranges guard against).
+        let block_defs = guards::extract_block_definitions(func, b);
+        let (bd_eqs, bd_facts): (Vec<Formula>, Vec<Formula>) =
+            block_defs.into_iter().partition(|f| matches!(f, Formula::Eq(..)));
+        let bd_facts: Vec<Formula> = bd_facts.into_iter().filter(|r| def_stable(r)).collect();
+        for d in bd_eqs {
+            if def_stable(&d) {
+                let established_ranges = block_def_subject(&d)
+                    .and_then(|subject| {
+                        let base = subject.strip_suffix('*').unwrap_or(&subject);
+                        block_def_establish_stmt(func, b, base, b.stmts.len())
+                    })
+                    .map_or_else(
+                        || bd_facts.clone(),
+                        |k| {
+                            bd_facts
+                                .iter()
+                                .map(|range| version_rename_at(range, &sv, func, b.id, k))
+                                .collect()
+                        },
+                    );
+                stmt_defs_at_establish.push((
+                    version_block_def_at_establish(&sv, func, b, b.stmts.len(), d.clone()),
+                    established_ranges,
+                ));
+                stmt_defs.push((d, bd_facts.clone()));
             }
         }
         // `extract_overflow_flag_semantics` = `[_N.1 <=> overflow, lhs_range,
@@ -712,6 +800,24 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
         let ranges: Vec<Formula> = ranges.into_iter().filter(|r| def_stable(r)).cloned().collect();
         for d in eqs {
             if def_stable(d) {
+                let established_ranges = block_def_subject(d)
+                    .and_then(|subject| {
+                        let base = subject.strip_suffix('*').unwrap_or(&subject);
+                        block_def_establish_stmt(func, b, base, b.stmts.len())
+                    })
+                    .map_or_else(
+                        || ranges.clone(),
+                        |k| {
+                            ranges
+                                .iter()
+                                .map(|range| version_rename_at(range, &sv, func, b.id, k))
+                                .collect()
+                        },
+                    );
+                stmt_defs_at_establish.push((
+                    version_block_def_at_establish(&sv, func, b, b.stmts.len(), d.clone()),
+                    established_ranges,
+                ));
                 stmt_defs.push((d.clone(), ranges.clone()));
             }
         }
@@ -794,8 +900,15 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             continue;
         }
         let Some(paths) = guard_paths_map.get(&block.id) else { continue };
-        let mut formula = v2_formula_with_path_guards(func, &sv, paths, Formula::Bool(true));
-        let mut fv = formula.free_variables();
+        if guard_analysis.degraded.contains(&block.id) {
+            continue;
+        }
+        let Some(mut formula) =
+            v2_formula_with_refutation_path_guards(func, &sv, paths, Formula::Bool(true))
+        else {
+            continue;
+        };
+        let fv = formula.free_variables();
         // A formula var is INPUT-FREE iff its base local (strip the `#sN_M`
         // reaching-def version) is input-free.
         let is_free = |v: &str| safe_names.contains(v.split('#').next().unwrap_or(v));
@@ -805,6 +918,13 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
         // conjoining the def. We only ever ADD defs whose rhs is resolved, so the
         // augmented formula introduces no new unresolved var.
         let mut resolved: FxHashSet<String> = FxHashSet::default();
+        // Definitions are admitted only after all of their dependencies are
+        // input-free or already resolved, so this is a topological order.  We
+        // later substitute Boolean aliases in reverse order (`v -> w`, then
+        // `w -> input`) to expose the exact branch predicate to AY without
+        // weakening either verdict.  Integer/data definitions remain explicit
+        // equalities so counterexample witnesses retain their program values.
+        let mut resolution_order: Vec<String> = Vec::new();
         // For each resolved var, the def that grounded it + its range facts + the
         // def's rhs free vars — so the conjunction can keep ONLY the relevance slice
         // transitively reachable from the formula's free vars (see below).
@@ -883,6 +1003,29 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 }
             }
         }
+        // Exact source-snapshot variants for guards whose read is intentionally
+        // source-versioned.  These formulas already contain their establish/read
+        // tokens; running the target-point rename over them would be a no-op, but
+        // adding them directly makes that invariant explicit.
+        for (vd, vranges) in &stmt_defs_at_establish {
+            if let Formula::Eq(a, b) = vd {
+                if let Some(v) = a.var_name() {
+                    cand.push((
+                        v.to_string(),
+                        b.free_variables().into_iter().collect(),
+                        vd.clone(),
+                        vranges.clone(),
+                    ));
+                } else if let Some(v) = b.var_name() {
+                    cand.push((
+                        v.to_string(),
+                        a.free_variables().into_iter().collect(),
+                        vd.clone(),
+                        vranges.clone(),
+                    ));
+                }
+            }
+        }
         // Trust (derived trivial-setter summary): the setter post-call facts and
         // their copy-chain links (see the `setter_defs` construction above). Emitted
         // UNVERSIONED and version-renamed HERE at the assert use-point — the same
@@ -918,6 +1061,7 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 }
                 if rhs.iter().all(|r| is_free(r) || resolved.contains(r)) {
                     resolved.insert(v.clone());
+                    resolution_order.push(v.clone());
                     resolved_def.insert(v.clone(), (df.clone(), ranges.clone(), rhs.clone()));
                     changed = true;
                 }
@@ -926,33 +1070,14 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 break;
             }
         }
-        // GROUNDED-CONJUNCT SLICE: a path-feasibility formula can be ungrounded ONLY
-        // because a reachability-guard conjunct carries a loop-carried / unresolvable
-        // var (e.g. a `for _ in 0..n` counter `_8` pinned to `Eq(_8, 1)`), while the
-        // assert's OWN fail-condition is already grounded on inputs (e.g. `x == x`'s
-        // `Not(Eq(x, x))` over param `x`). When the top-level violation is an `And`,
-        // slice it to the conjuncts whose vars are ALL grounded and refute THAT.
-        // SOUND: dropping a conjunct WEAKENS the violation, so a refutation of the
-        // slice (weaker) refutes the full violation (stronger) — weaker-UNSAT implies
-        // stronger-UNSAT. FAIL-CLOSED: if the assert's own fail-condition needs the
-        // ungroundable var, the slice loses the contradiction and stays SAT -> the VC
-        // is simply not refuted (never a false refutation). Only fires when we actually
-        // drop an ungroundable conjunct AND the slice keeps a non-trivial atom.
-        let full_grounded = !fv.is_empty() && fv.iter().all(|v| is_free(v) || resolved.contains(v));
-        if !full_grounded && let Formula::And(conjuncts) = &formula {
-            let grounded_conjs: Vec<Formula> = conjuncts
-                .iter()
-                .filter(|c| c.free_variables().iter().all(|v| is_free(v) || resolved.contains(v)))
-                .cloned()
-                .collect();
-            if grounded_conjs.len() < conjuncts.len()
-                && grounded_conjs.iter().any(|c| !matches!(c, Formula::Bool(_)))
-            {
-                formula = Formula::And(grounded_conjs);
-                fv = formula.free_variables();
-            }
-        }
-        // Grounded iff non-trivial AND every free var is input-free or pinned.
+        // BIDIRECTIONAL EXACTNESS: this formula is consumed in both directions —
+        // UNSAT discharges the assertion and SAT reports a real counterexample. We
+        // must therefore keep the complete panic-path violation. In particular,
+        // dropping an ungrounded conjunct would weaken the formula: weaker-UNSAT is
+        // sufficient for the proof direction, but weaker-SAT is not a witness for
+        // the original formula and can false-refute a safe program. Decline the
+        // whole candidate whenever even one free variable remains unresolved.
+        // Grounded iff non-trivial AND every free var is input-free or exactly pinned.
         let grounded = !fv.is_empty() && fv.iter().all(|v| is_free(v) || resolved.contains(v));
         // RELEVANCE SLICE: conjoin ONLY the defs transitively reachable from the
         // formula's free vars. Walk fv -> its grounding def -> that def's rhs vars to
@@ -963,7 +1088,9 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
         // directions — yet conjoining it empirically trips ay's proof production
         // (UNSAT but no strict-checked artifact -> falls back to runtime-checked
         // instead of Proved).
+        let mut relevant_resolved: FxHashSet<String> = FxHashSet::default();
         let mut used_defs: Vec<Formula> = Vec::new();
+        let mut used_ranges: Vec<Formula> = Vec::new();
         if grounded {
             let mut needed: Vec<String> = fv.iter().cloned().collect();
             let mut seen: FxHashSet<String> = needed.iter().cloned().collect();
@@ -972,8 +1099,20 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
                 let v = needed[qi].clone();
                 qi += 1;
                 if let Some((df, ranges, rhs)) = resolved_def.get(&v) {
-                    used_defs.push(df.clone());
-                    used_defs.extend(ranges.iter().cloned());
+                    relevant_resolved.insert(v.clone());
+                    let subject_is_bool = match df {
+                        Formula::Eq(lhs, rhs) => {
+                            (lhs.var_name() == Some(v.as_str())
+                                && lhs.var_sort() == Some(&Sort::Bool))
+                                || (rhs.var_name() == Some(v.as_str())
+                                    && rhs.var_sort() == Some(&Sort::Bool))
+                        }
+                        _ => false,
+                    };
+                    if !subject_is_bool {
+                        used_defs.push(df.clone());
+                    }
+                    used_ranges.extend(ranges.iter().cloned());
                     for r in rhs {
                         if seen.insert(r.clone()) {
                             needed.push(r.clone());
@@ -988,15 +1127,43 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             eprintln!(
                 "[ASSERT_REFUTE] block={:?} grounded={grounded} pinned={} free={fvs:?}\n  formula={formula:?}",
                 block.id,
-                used_defs.len(),
+                relevant_resolved.len(),
             );
         }
         if !grounded {
             continue;
         }
-        if !used_defs.is_empty() {
-            used_defs.push(formula);
-            formula = Formula::And(used_defs);
+        if !relevant_resolved.is_empty() {
+            used_defs.extend(used_ranges);
+            if !used_defs.is_empty() {
+                used_defs.push(formula);
+                formula = Formula::And(used_defs);
+            }
+            // A selected Boolean definition is an exact equality `v == rhs`
+            // whose rhs was already grounded.  Existentially eliminating `v`
+            // by capture-avoiding substitution is equisatisfiable with
+            // conjoining that equality, but leaves AY the input-level branch
+            // predicate instead of a chain of synthetic MIR Boolean aliases.
+            // Preserve non-Boolean definitions above so diagnostic models keep
+            // their program-value bindings.
+            for v in resolution_order.iter().rev() {
+                if !relevant_resolved.contains(v) {
+                    continue;
+                }
+                let Some((definition, _, _)) = resolved_def.get(v) else { continue };
+                let Formula::Eq(lhs, rhs) = definition else { continue };
+                let replacement = if lhs.var_name() == Some(v.as_str())
+                    && lhs.var_sort() == Some(&Sort::Bool)
+                {
+                    rhs.as_ref()
+                } else if rhs.var_name() == Some(v.as_str()) && rhs.var_sort() == Some(&Sort::Bool)
+                {
+                    lhs.as_ref()
+                } else {
+                    continue;
+                };
+                formula = crate::quantifier_tiers::substitute(&formula, v, replacement);
+            }
         }
         // Contract consumption (assume-at-entry): conjoin the function's
         // DECLARED, extraction-GATED preconditions (`func.preconditions` — the
@@ -1029,6 +1196,19 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
             cs.push(formula);
             formula = Formula::And(cs);
         }
+        // Reattach the Rust type invariants erased when fixed-width integers are
+        // lowered to unbounded `Sort::Int`. This lane consumes SAT as a REAL
+        // counterexample, so an out-of-range model is just as unsound as an
+        // ungrounded computed value: without `0 <= value <= 255`, for example,
+        // `assert!(value <= 255)` on a `u8` input is spuriously satisfiable at
+        // `value = 256`. These are true facts at every reached Rust program
+        // point, hence safe in both directions: they remove only impossible SAT
+        // models and cannot hide an executable panic. Apply all three established
+        // range reattachment lanes after preconditions/grounding so fields and
+        // exact computed locals already present in the final formula are covered.
+        formula = conjoin_arg_type_ranges(func, formula);
+        formula = conjoin_local_type_ranges(func, formula);
+        formula = conjoin_datatype_field_ranges(func, formula);
         // ── PER-PATH SPLIT OF THE PANIC-PATH FEASIBILITY FORMULA ─────────────
         // Emit ONE obligation PER CONTROL-FLOW PATH instead of one for the whole
         // `Or`. `split_path_feasibility_disjuncts` performs the exact
@@ -1291,7 +1471,10 @@ pub(crate) fn fmt_template_literal_pieces(bytes: &[u8]) -> Option<String> {
 /// toolchains whose `format_args!` lowers to `Arguments::new_v1` with a
 /// `&[&str; N]` pieces array, extraction lowers that pieces constant to the
 /// content-free `OpaqueConst`, so those messages (soundly) remain unmatched.
-pub(super) fn panic_call_const_str_messages(func: &VerifiableFunction, args: &[Operand]) -> Vec<String> {
+pub(super) fn panic_call_const_str_messages(
+    func: &VerifiableFunction,
+    args: &[Operand],
+) -> Vec<String> {
     let mut msgs: Vec<String> = args.iter().filter_map(operand_str_constant).collect();
     for arg in args {
         let (Operand::Copy(p) | Operand::Move(p)) = arg else { continue };
@@ -1336,7 +1519,10 @@ pub(super) fn panic_call_const_str_messages(func: &VerifiableFunction, args: &[O
 /// `contract_panic_annotations_for` — never a stale cross-function hint), and
 /// a runtime-formatted message can never be message-matched, fail-closed.
 /// Empty payloads never match (extraction already rejects them; belt+braces).
-pub(super) fn contract_panic_annotation_matches(func: &VerifiableFunction, args: &[Operand]) -> bool {
+pub(super) fn contract_panic_annotation_matches(
+    func: &VerifiableFunction,
+    args: &[Operand],
+) -> bool {
     let payloads = crate::contract_panic_annotations_for(&func.def_path);
     if payloads.is_empty() {
         return false;
@@ -1353,7 +1539,11 @@ pub(super) fn contract_panic_annotation_matches(func: &VerifiableFunction, args:
 /// a resulting FAILED transport row — in a survey lane only — into a visible
 /// `contract-panic:` row; an Unknown/Proved row is left untouched, and the
 /// strict default never rewrites at all.
-pub(super) fn v2_panic_call_vc_message(func: &VerifiableFunction, callee: &str, args: &[Operand]) -> String {
+pub(super) fn v2_panic_call_vc_message(
+    func: &VerifiableFunction,
+    callee: &str,
+    args: &[Operand],
+) -> String {
     if contract_panic_annotation_matches(func, args) {
         format!("{}panic call: {callee}", trust_types::assumption::CONTRACT_PANIC_VC_MARKER)
     } else {
@@ -1543,9 +1733,7 @@ pub(crate) fn v2_terminator_targets(terminator: &Terminator) -> Vec<BlockId> {
 
 #[cfg(test)]
 mod wrapping_identity_tests {
-    use trust_types::{
-        BasicBlock, LocalDecl, SourceSpan, Ty, VerifiableBody, VerifiableFunction,
-    };
+    use trust_types::{BasicBlock, LocalDecl, SourceSpan, Ty, VerifiableBody, VerifiableFunction};
 
     use super::*;
 
@@ -1642,10 +1830,8 @@ mod wrapping_identity_tests {
         );
 
         let pointer = binary_func(Ty::PtrSizedInt { signed: false });
-        let pointer_args = vec![
-            Operand::Copy(Place::local(1)),
-            Operand::Constant(ConstValue::Uint(1, 64)),
-        ];
+        let pointer_args =
+            vec![Operand::Copy(Place::local(1)), Operand::Constant(ConstValue::Uint(1, 64))];
         let pointer_marker =
             "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_add";
         assert!(
@@ -1653,12 +1839,11 @@ mod wrapping_identity_tests {
             "a pointer-sized literal is checked against its authenticated destination carrier"
         );
         let legacy_pointer = binary_func(Ty::usize());
-        let legacy_pointer_args = vec![
-            Operand::Copy(Place::local(1)),
-            Operand::Constant(ConstValue::Uint(1, 64)),
-        ];
+        let legacy_pointer_args =
+            vec![Operand::Copy(Place::local(1)), Operand::Constant(ConstValue::Uint(1, 64))];
         assert!(
-            model(&legacy_pointer, pointer_marker, &legacy_pointer_args, &Place::local(0)).is_some(),
+            model(&legacy_pointer, pointer_marker, &legacy_pointer_args, &Place::local(0))
+                .is_some(),
             "the authenticated pointer marker restores identity lost by legacy verifier extraction"
         );
         assert!(
@@ -1667,8 +1852,7 @@ mod wrapping_identity_tests {
         );
 
         let fixed_u32 = binary_func(Ty::u32());
-        let fixed_u32_args =
-            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))];
+        let fixed_u32_args = vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))];
         assert!(
             model(&fixed_u32, pointer_marker, &fixed_u32_args, &Place::local(0)).is_none(),
             "a pointer-sized marker must not authorize an arbitrary fixed-width destination"
@@ -1677,8 +1861,7 @@ mod wrapping_identity_tests {
 
     #[test]
     fn wrapping_result_model_requires_a_whole_function_stable_destination() {
-        let marker =
-            "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add";
+        let marker = "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add";
         let mut func = binary_func(Ty::u64());
         func.body.blocks = vec![
             BasicBlock {
@@ -1686,16 +1869,14 @@ mod wrapping_identity_tests {
                 stmts: Vec::new(),
                 terminator: Terminator::Call {
                     func: marker.into(),
-                    args: vec![
-                        Operand::Copy(Place::local(1)),
-                        Operand::Copy(Place::local(2)),
-                    ],
+                    args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                     dest: Place::local(0),
                     target: Some(BlockId(1)),
                     span: SourceSpan::default(),
                     atomic: None,
                     is_foreign: false,
                     is_unsafe_sig: false,
+                    callee_identity: None,
                     unwind: trust_types::UnwindEdge::Continue,
                 },
             },
@@ -1716,6 +1897,480 @@ mod wrapping_identity_tests {
             !wrapping_result_local_is_stable(&func, &Place::local(0), 1),
             "a competing statement definition must prevent use-point renaming from assigning \
              the wrapping equation to another reaching value"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bidirectional_grounding_tests {
+    use trust_types::{
+        BasicBlock, LocalDecl, SourceSpan, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
+    };
+
+    use super::*;
+
+    /// A guarded `assert!(value == 10)` where `value` is either a real input or
+    /// the result of an unmodeled call. The leading `gate` branch ensures the
+    /// panic formula has one grounded and one potentially ungrounded conjunct —
+    /// the exact shape on which dropping only the ungrounded conjunct used to
+    /// manufacture a satisfiable, guard-only false refutation.
+    fn guarded_assert_fixture(value_is_input: bool) -> VerifiableFunction {
+        let span = SourceSpan::default();
+        VerifiableFunction {
+            name: "guarded_opaque_assert".into(),
+            def_path: "test::guarded_opaque_assert".into(),
+            span: span.clone(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::Bool, name: Some("gate".into()) },
+                    LocalDecl { index: 2, ty: Ty::u64(), name: Some("value".into()) },
+                    LocalDecl { index: 3, ty: Ty::Bool, name: Some("ok".into()) },
+                    LocalDecl { index: 4, ty: Ty::Unit, name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: Vec::new(),
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(1)),
+                            targets: vec![(1, BlockId(1))],
+                            otherwise: BlockId(4),
+                            exhaustive_enum_unreachable: false,
+                            span: span.clone(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: Vec::new(),
+                        terminator: if value_is_input {
+                            Terminator::Goto(BlockId(2))
+                        } else {
+                            Terminator::Call {
+                                func: "external::opaque_u64".into(),
+                                args: Vec::new(),
+                                dest: Place::local(2),
+                                target: Some(BlockId(2)),
+                                span: span.clone(),
+                                atomic: None,
+                                is_foreign: false,
+                                is_unsafe_sig: false,
+                                callee_identity: None,
+                                unwind: UnwindEdge::Unreachable,
+                            }
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(3),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Constant(ConstValue::Uint(10, 64)),
+                            ),
+                            span: span.clone(),
+                        }],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(3)),
+                            targets: vec![(0, BlockId(3))],
+                            otherwise: BlockId(4),
+                            exhaustive_enum_unreachable: false,
+                            span: span.clone(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: Vec::new(),
+                        terminator: Terminator::Call {
+                            func: "core::panicking::assert_failed::<u64, u64>".into(),
+                            args: Vec::new(),
+                            dest: Place::local(4),
+                            target: None,
+                            span: span.clone(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            unwind: UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        stmts: Vec::new(),
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: if value_is_input { 2 } else { 1 },
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn unmodeled_call_result_declines_the_entire_bidirectional_candidate() {
+        let func = guarded_assert_fixture(false);
+        assert!(
+            generate_full_assert_refutation_vcs(&func).is_empty(),
+            "a grounded reachability guard cannot license a SAT query after the assertion's \
+             opaque fail-condition conjunct is removed"
+        );
+    }
+
+    #[test]
+    fn otherwise_identical_input_grounded_assertion_remains_candidate() {
+        let func = guarded_assert_fixture(true);
+        let vcs = generate_full_assert_refutation_vcs(&func);
+        assert!(!vcs.is_empty(), "the all-input dual must remain in the bidirectional lane");
+        assert!(vcs.iter().all(|vc| {
+            vc.formula
+                .free_variables()
+                .iter()
+                .all(|v| matches!(v.split('#').next(), Some("gate" | "value")))
+        }));
+    }
+
+    #[test]
+    fn opaque_call_reassigned_parameter_is_not_an_input_free_version() {
+        let mut func = guarded_assert_fixture(false);
+        // `value` is now a formal parameter, but bb1 overwrites it with the
+        // opaque call result before the assertion. The entry value therefore
+        // cannot license the post-call SSA version as a free input.
+        func.body.arg_count = 2;
+        assert!(
+            !v2_input_free_locals(&func).contains(&2),
+            "a call-destination write must revoke parameter input-freedom"
+        );
+        assert!(
+            generate_full_assert_refutation_vcs(&func).is_empty(),
+            "the opaque post-call parameter version must decline, not false-refute"
+        );
+    }
+
+    #[test]
+    fn copied_input_alias_is_grounded_before_bidirectional_solver_use() {
+        use trust_router::{InProcessAyBackend, VerificationBackend};
+
+        let mut func = guarded_assert_fixture(true);
+        func.body.locals.push(LocalDecl {
+            index: 5,
+            ty: Ty::u64(),
+            name: Some("copied_value".into()),
+        });
+        func.body.blocks[1].stmts.push(Statement::Assign {
+            place: Place::local(5),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+            span: SourceSpan::default(),
+        });
+        let Statement::Assign { rvalue: Rvalue::BinaryOp(BinOp::Eq, lhs, rhs), .. } =
+            &mut func.body.blocks[2].stmts[0]
+        else {
+            unreachable!()
+        };
+        *lhs = Operand::Copy(Place::local(5));
+        *rhs = Operand::Copy(Place::local(2));
+
+        assert!(v2_input_free_locals(&func).contains(&2));
+        assert!(
+            !v2_input_free_locals(&func).contains(&5),
+            "the copy must not become an independent arbitrary input"
+        );
+        let vcs = generate_full_assert_refutation_vcs(&func);
+        assert_eq!(vcs.len(), 1, "the exact alias definition should retain coverage");
+        assert!(
+            matches!(
+                InProcessAyBackend::new().verify(&vcs[0]),
+                trust_types::VerificationResult::Proved { .. }
+            ),
+            "the safe copy-equality violation must be UNSAT after exact grounding"
+        );
+    }
+
+    #[test]
+    fn fixed_width_input_ranges_exclude_impossible_assert_counterexamples() {
+        use trust_router::{InProcessAyBackend, VerificationBackend};
+
+        let mut func = guarded_assert_fixture(true);
+        func.body.locals[2].ty = Ty::u8();
+        func.body.blocks[2].stmts[0] = Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Le,
+                Operand::Copy(Place::local(2)),
+                Operand::Constant(ConstValue::Uint(255, 8)),
+            ),
+            span: SourceSpan::default(),
+        };
+
+        let vcs = generate_full_assert_refutation_vcs(&func);
+        assert_eq!(vcs.len(), 1, "the directly input-grounded assertion remains covered");
+        assert!(
+            matches!(
+                InProcessAyBackend::new().verify(&vcs[0]),
+                trust_types::VerificationResult::Proved { .. }
+            ),
+            "a u8 can never witness the panic path `value > 255`; the generated formula must \
+             carry its declared 0..=255 range"
+        );
+    }
+
+    #[test]
+    fn char_input_range_excludes_values_above_char_max() {
+        use trust_router::{InProcessAyBackend, VerificationBackend};
+
+        let mut func = guarded_assert_fixture(true);
+        func.body.locals[2].ty = Ty::Char;
+        func.body.blocks[2].stmts[0] = Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Le,
+                Operand::Copy(Place::local(2)),
+                Operand::Constant(ConstValue::Uint(char::MAX as u128, 32)),
+            ),
+            span: SourceSpan::default(),
+        };
+
+        let vcs = generate_full_assert_refutation_vcs(&func);
+        assert!(!vcs.is_empty(), "the directly input-grounded char assertion remains covered");
+        assert!(
+            vcs.iter().all(|vc| matches!(
+                InProcessAyBackend::new().verify(vc),
+                trust_types::VerificationResult::Proved { .. }
+            )),
+            "a char can never exceed char::MAX; the generated formula must carry the exact \
+             Unicode scalar range"
+        );
+    }
+
+    #[test]
+    fn char_input_range_excludes_surrogate_code_points() {
+        use trust_router::{InProcessAyBackend, VerificationBackend};
+
+        // Rust cannot spell a surrogate `char` literal, so exercise the exact
+        // mathematical carrier directly. The preceding end-to-end test proves
+        // this is the same helper the assertion lane attaches to an input.
+        let value = Formula::Var("value".into(), trust_types::Sort::Int);
+        let vc = VerificationCondition {
+            kind: VcKind::Assertion { message: "surrogate carrier canary".into() },
+            function: "char_carrier_canary".into(),
+            location: SourceSpan::default(),
+            formula: Formula::And(vec![
+                crate::range::rust_type_range_constraint(&value, &Ty::Char)
+                    .expect("char has an exact scalar carrier"),
+                Formula::Eq(Box::new(value), Box::new(Formula::Int(0xD800))),
+            ]),
+            contract_metadata: None,
+            obligation: None,
+        };
+        assert!(
+            matches!(
+                InProcessAyBackend::new().verify(&vc),
+                trust_types::VerificationResult::Proved { .. }
+            ),
+            "a char can never equal a surrogate code point; the generated formula must exclude \
+             the surrogate interval"
+        );
+    }
+
+    #[test]
+    fn projected_call_destination_excludes_its_whole_base_from_stability() {
+        let mut func = guarded_assert_fixture(false);
+        let Terminator::Call { dest, .. } = &mut func.body.blocks[1].terminator else {
+            unreachable!()
+        };
+        *dest = Place::field(2, 0);
+        assert!(
+            call_destination_base_locals(&func).contains(&2),
+            "a call write through `dest.0` must destabilize the whole `dest` base"
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_free_exactness_tests {
+    use trust_types::{BasicBlock, LocalDecl, SourceSpan, Ty, VerifiableBody, VerifiableFunction};
+
+    use super::*;
+
+    fn single_assignment_fixture(destination: usize, rvalue: Rvalue) -> VerifiableFunction {
+        VerifiableFunction {
+            name: "input_free_exactness".into(),
+            def_path: "test::input_free_exactness".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::u64(), name: Some("input".into()) },
+                    LocalDecl { index: 2, ty: Ty::u64(), name: Some("derived".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(destination),
+                        rvalue,
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn constant_local_requires_its_definition_instead_of_becoming_free() {
+        let func =
+            single_assignment_fixture(2, Rvalue::Use(Operand::Constant(ConstValue::Uint(10, 64))));
+        let safe = v2_input_free_locals(&func);
+        assert!(safe.contains(&1), "the unwritten formal remains a free input");
+        assert!(
+            !safe.contains(&2),
+            "a constant is constrained and must be grounded by its equality"
+        );
+    }
+
+    #[test]
+    fn copied_input_requires_its_alias_definition_instead_of_decoupling() {
+        let func = single_assignment_fixture(2, Rvalue::Use(Operand::Copy(Place::local(1))));
+        let safe = v2_input_free_locals(&func);
+        assert!(safe.contains(&1), "the unwritten formal remains a free input");
+        assert!(!safe.contains(&2), "a copy cannot vary independently of the source input");
+    }
+
+    #[test]
+    fn statement_reassigned_parameter_cannot_reenter_as_a_leaf() {
+        let func =
+            single_assignment_fixture(1, Rvalue::Use(Operand::Constant(ConstValue::Uint(10, 64))));
+        assert!(
+            !v2_input_free_locals(&func).contains(&1),
+            "a body write makes every post-write version distinct from the entry input"
+        );
+    }
+
+    #[test]
+    fn non_assign_value_writes_revoke_static_assignment_authority() {
+        for write in [
+            Statement::SetDiscriminant { place: Place::local(2), variant_index: 1 },
+            Statement::Deinit { place: Place::local(2) },
+        ] {
+            let mut func = single_assignment_fixture(
+                2,
+                Rvalue::Use(Operand::Constant(ConstValue::Uint(10, 64))),
+            );
+            func.body.blocks[0].stmts.push(write);
+            assert!(
+                !is_single_static_assignment(&func, 2),
+                "a modeled non-Assign write must revoke global single-assignment identity"
+            );
+            assert!(
+                crate::guards::value_local_is_unstable(&func, 2),
+                "the shared staleness gate must count every modeled value-write channel"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod unchecked_read_count_tests {
+    use trust_types::{
+        BasicBlock, LocalDecl, SourceSpan, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
+    };
+
+    use super::*;
+
+    #[test]
+    fn unchecked_operands_count_as_reads_for_payload_admission() {
+        let func = VerifiableFunction {
+            name: "unchecked_read_count".into(),
+            def_path: "test::unchecked_read_count".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::u32(), name: Some("input".into()) },
+                    LocalDecl { index: 2, ty: Ty::u32(), name: Some("rhs".into()) },
+                    LocalDecl { index: 3, ty: Ty::u32(), name: Some("sum".into()) },
+                    LocalDecl { index: 4, ty: Ty::u32(), name: Some("payload".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(3),
+                            rvalue: Rvalue::UncheckedBinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(2)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Call {
+                            func: "<u32 as Try>::branch".into(),
+                            args: vec![Operand::Copy(Place::local(1))],
+                            dest: Place::local(4),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            callee_identity: None,
+                            unwind: UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 2,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+
+        let mut control = func.clone();
+        control.body.blocks[0].stmts.clear();
+        assert!(
+            v2_input_free_locals(&control).contains(&4),
+            "the allowlisted single-use payload control must exercise admission"
+        );
+        assert!(
+            !v2_input_free_locals(&func).contains(&4),
+            "the extra unchecked read must prevent decoupling the payload from a reused input"
+        );
+
+        let mut constrained = control.clone();
+        constrained.preconditions.push(Formula::Le(
+            Box::new(Formula::Int(0)),
+            Box::new(Formula::Var("input".into(), Sort::Int)),
+        ));
+        assert!(
+            !v2_input_free_locals(&constrained).contains(&4),
+            "a gated precondition can constrain the extractor input without a body read, so the \
+             result may not be admitted as an independent free value"
+        );
+
+        let mut rewritten = control.clone();
+        rewritten.body.blocks[1].stmts.push(Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            !v2_input_free_locals(&rewritten).contains(&4),
+            "a later destination rewrite must revoke payload-result input-freedom"
         );
     }
 }

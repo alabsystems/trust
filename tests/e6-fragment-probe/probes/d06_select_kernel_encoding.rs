@@ -18,4 +18,6 @@ clean {
 }
 pub fn min2(a: u64, b: u64) -> u64
     ensures result == sel(a, b)
-{ if a < b { a } else { b } }
+{
+    if a < b { a } else { b }
+}

@@ -821,8 +821,8 @@ permanent = true
             .join("../../tests/js262/divergence-audit.toml");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let audit: Js262DivergenceAudit = toml::from_str(&text)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let audit: Js262DivergenceAudit =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         assert!(!audit.entries.is_empty());
         assert!(
             audit.entries.iter().any(|e| e.head == Js262AuditHead::Trace),
@@ -838,8 +838,7 @@ permanent = true
         let back: Js262DivergenceAudit = toml::from_str(&s).expect("reparse");
         assert_eq!(audit, back);
         let head_count = s.matches("\nhead").count();
-        let parse_count =
-            audit.entries.iter().filter(|e| e.head == Js262AuditHead::Parse).count();
+        let parse_count = audit.entries.iter().filter(|e| e.head == Js262AuditHead::Parse).count();
         assert_eq!(head_count, parse_count, "head keys must match parse-lane entries exactly");
     }
 

@@ -54,6 +54,11 @@ pub const TRUST_COMPILER_STABLE_CRATE_ID_METADATA_KEY: &str = "trust.compiler.st
 const UNRESOLVED_COMPATIBILITY_CRATE_NAME: &str = "@trust-unresolved-crate";
 const TRUST_VC_DIGEST_METADATA_KEY: &str = "trust.vc.digest.sha256";
 const TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY: &str = "trust.vc.formula.payload";
+/// Set (to the discarded byte count) when a typed payload lowered successfully but was
+/// dropped for exceeding the transport ceiling. Distinguishes that row from one whose VC
+/// never lowered at all — without it the two are byte-identical.
+pub(crate) const TRUST_VC_FORMULA_PAYLOAD_DROPPED_METADATA_KEY: &str =
+    "trust.vc.formula.payload.dropped_bytes";
 const TRUST_CONTRACT_PREDICATE_DIGEST_METADATA_KEY: &str = "trust.contract.predicate.digest.sha256";
 const TRUST_CONTRACT_TYPED_PROPOSITION_DIGEST_METADATA_KEY: &str =
     "trust.contract.typed_proposition.digest.sha256";
@@ -2101,6 +2106,9 @@ struct VcFormulaPayload {
     schema: String,
     sort: String,
     smtlib: String,
+    /// Byte length of a typed payload that lowered but was dropped at the transport
+    /// ceiling. `None` when nothing was dropped (including when nothing lowered).
+    typed_payload_dropped_bytes: Option<usize>,
     typed_payload: Option<String>,
     /// Exact formula from which `typed_payload` was serialized.
     ///
@@ -2173,6 +2181,25 @@ impl VcFormulaPayload {
             metadata.push(MetadataEntry {
                 key: TRUST_VC_FORMULA_PRUNED_METADATA_KEY.to_string(),
                 value: "true".to_string(),
+            });
+        }
+        if let Some(bytes) = self.typed_payload_dropped_bytes {
+            // RECORD THE DROP. Without this the row is BYTE-IDENTICAL to one whose VC
+            // never lowered to a typed predicate, and nobody — user or maintainer — can
+            // tell "this does not lower" from "this lowered and we discarded a 1 MiB
+            // proof carrier for transport reasons". That is exactly the laundering this
+            // whole fix exists to remove, reintroduced one layer down, and it would have
+            // shipped behind nothing but an eprintln gated on TRUST_FORMULA_DEBUG.
+            //
+            // The discipline is already this file's own, in three places: the temporal
+            // model emits `.serialize_error` rather than silently dropping
+            // ("Serialization failure is recorded loudly"), the MIR-memory unit emits
+            // TRUST_VC_MIR_MEMORY_PROOF_UNIT_UNSUPPORTED_METADATA_KEY with its reason, and
+            // contract_bundle_to_verifier_api records its exclusion in bundle metadata
+            // "never silent". A dropped carrier gets the same treatment.
+            metadata.push(MetadataEntry {
+                key: TRUST_VC_FORMULA_PAYLOAD_DROPPED_METADATA_KEY.to_string(),
+                value: bytes.to_string(),
             });
         }
         metadata
@@ -2845,14 +2872,14 @@ fn vc_formula_payload(kind: &VcKind, formula: &Formula) -> VcFormulaPayload {
         if let Ok(ContractPredicate::TrustIr { schema, value }) =
             predicate.into_contract_predicate()
         {
-            return VcFormulaPayload {
+            return typed_vc_formula_payload_within_transport_limit(
                 schema,
                 sort,
                 smtlib,
-                typed_payload: Some(value.to_string()),
-                selected_formula: Some(formula.clone()),
-                pruned: false,
-            };
+                value.to_string(),
+                formula.clone(),
+                false,
+            );
         }
     }
     // VIOLATION-PRUNING fallback. When the VC does not fully lower to a typed predicate
@@ -2872,24 +2899,117 @@ fn vc_formula_payload(kind: &VcKind, formula: &Formula) -> VcFormulaPayload {
             if let Ok(ContractPredicate::TrustIr { schema, value }) =
                 predicate.into_contract_predicate()
             {
-                return VcFormulaPayload {
-                    schema,
-                    sort,
-                    smtlib,
-                    typed_payload: Some(value.to_string()),
-                    selected_formula: Some(pruned),
-                    pruned: true,
-                };
+                let payload = value.to_string();
+                return typed_vc_formula_payload_within_transport_limit(
+                    schema, sort, smtlib, payload, pruned, true,
+                );
             }
         }
     }
+    untyped_vc_formula_payload(sort, smtlib)
+}
+
+/// The verifier-API transport ceiling for a SINGLE obligation metadata value.
+///
+/// Aliased from the owning vocabulary crate rather than re-spelled: a local
+/// copy could drift from the value `TrustContractBundle::validate` actually
+/// enforces, and the whole point of this guard is that the two agree.
+const MAX_TRANSPORT_METADATA_VALUE_BYTES: usize = trust_verifier_api::MAX_METADATA_VALUE_BYTES;
+
+/// Build the no-typed-payload shape: schema/sort/smtlib only.
+fn untyped_vc_formula_payload_dropped(
+    sort: String,
+    smtlib: String,
+    dropped_bytes: Option<usize>,
+) -> VcFormulaPayload {
+    let mut p = untyped_vc_formula_payload(sort, smtlib);
+    p.typed_payload_dropped_bytes = dropped_bytes;
+    p
+}
+
+fn untyped_vc_formula_payload(sort: String, smtlib: String) -> VcFormulaPayload {
     VcFormulaPayload {
         schema: TRUST_SYMBOLIC_FORMULA_SCHEMA.to_string(),
         sort,
         smtlib,
+        typed_payload_dropped_bytes: None,
         typed_payload: None,
         selected_formula: None,
         pruned: false,
+    }
+}
+
+/// Emit the typed payload only when it FITS the verifier-API transport ceiling;
+/// otherwise fall back to the ordinary no-typed-payload shape.
+///
+/// WHY THIS GUARD EXISTS. `TrustContractBundle::validate` rejects any obligation
+/// metadata value larger than [`MAX_TRANSPORT_METADATA_VALUE_BYTES`] (1 MiB), and
+/// the compiler validates the bundle exactly once — inside
+/// `finalize_trust_mc_public_semantic_contracts`. A rejection there does NOT fail
+/// just the oversized row: it discards the native TrustIr bundle for the WHOLE
+/// function, which makes the exact fresh-VC rekey snapshot unbindable, which
+/// drives EVERY obligation of that function to `unknown` through
+/// `fresh-vc-rekey-integrity` — and the ones whose public `ObligationKind` has no
+/// native `VcKind` reconstruction (`BoundsCheck`, `Assertion`) come back as
+/// `unsupported_mir`, i.e. reported as a coverage gap rather than as the
+/// transport-limit failure they are.
+///
+/// MEASURED (trustc 52e0a7031, 2026-08-22). The whole-function `Unreachable` VC
+/// of a straight-line `?`-chain grows ~79 KB of typed payload per fallible call:
+///
+/// ```text
+///   fallible calls   typed payload   smtlib    bundle
+///        20            838,151       59,681    ok
+///        21            913,854       65,293    ok
+///        22            992,747       71,154    ok      (55,829 under the cap)
+///        23             >1 MiB          —      REJECTED: "verifier obligation
+///                                                metadata value exceeds the byte limit"
+/// ```
+///
+/// a3d's `orient3d_i128` (23 calls) and `incircle_i128` sit past that cliff. Between
+/// them they produced all 34 `unknown` rows of `./scripts/verify.sh` — including 18
+/// bounds checks the Clean kernel had ALREADY discharged (`proof_evidence.status ==
+/// "proved"`, `KernelRechecked`) yet which were reported `unsupported_mir` — plus 64
+/// duplicated legacy rows (358 obligations reported where 294 exist).
+///
+/// SOUND: the typed payload is a proof CARRIER, not a claim. `typed_payload` is
+/// already `Option`, and every consumer treats its absence as "no typed authority
+/// here" and declines — `exact_selected_typed_formula` returns the recorded
+/// `trust-vc MIR memory proof unit omitted …` reason, the identity re-derivation
+/// (`verifier_vc_content_identity*`) calls THIS function, so both sides agree and
+/// the rekey still binds. Dropping it can only make the verifier weaker on that
+/// one row; it can never turn an Unknown into a Proved.
+///
+/// RESIDUAL: `smtlib` is not droppable the same way — the exact fresh-VC identity
+/// requires it present with an exact value — so a formula whose SMT-LIB rendering
+/// alone exceeds 1 MiB still fails the bundle. In the measured corpus the typed
+/// payload is ~14x the SMT-LIB rendering (992,747 vs 71,154 bytes), so this guard
+/// moves the cliff out by roughly an order of magnitude rather than removing it.
+fn typed_vc_formula_payload_within_transport_limit(
+    schema: String,
+    sort: String,
+    smtlib: String,
+    typed_payload: String,
+    selected_formula: Formula,
+    pruned: bool,
+) -> VcFormulaPayload {
+    if typed_payload.len() > MAX_TRANSPORT_METADATA_VALUE_BYTES {
+        if std::env::var_os("TRUST_FORMULA_DEBUG").is_some() {
+            eprintln!(
+                "TRUST_FORMULA_DEBUG: dropping typed payload of {} bytes (transport ceiling {MAX_TRANSPORT_METADATA_VALUE_BYTES}); row keeps schema/sort/smtlib and declines the typed lanes",
+                typed_payload.len()
+            );
+        }
+        return untyped_vc_formula_payload_dropped(sort, smtlib, Some(typed_payload.len()));
+    }
+    VcFormulaPayload {
+        schema,
+        sort,
+        smtlib,
+        typed_payload_dropped_bytes: None,
+        typed_payload: Some(typed_payload),
+        selected_formula: Some(selected_formula),
+        pruned,
     }
 }
 
@@ -4074,6 +4194,24 @@ fn reject_unsupported_trust_vc_memory_terminator(
                 Ok(())
             }
         }
+        Terminator::TailCall { args, atomic, .. } => {
+            if args.iter().any(|operand| operand_has_unsupported_deref(operand, locals))
+                || atomic.as_ref().is_some_and(|atomic| {
+                    place_has_unsupported_deref(&atomic.place, locals)
+                        || atomic
+                            .dest
+                            .as_ref()
+                            .is_some_and(|place| place_has_unsupported_deref(place, locals))
+                })
+            {
+                Err(
+                    "trust-vc MIR memory proof unit omitted because tail-call operands contain dereference projections"
+                        .to_string(),
+                )
+            } else {
+                Ok(())
+            }
+        }
         Terminator::Drop { place, .. } => {
             if place_has_unsupported_deref(place, locals) {
                 Err(
@@ -4938,7 +5076,17 @@ mod tests {
                             rvalue: Rvalue::BinaryOp(
                                 trust_types::BinOp::Gt,
                                 Operand::Copy(Place::local(2)),
-                                Operand::Constant(trust_types::ConstValue::Int(0)),
+                                // Trust: WIDTH-TAGGED, because this is a BINARY-OP
+                                // OPERAND. The audit requires a `BinaryOp`'s operand
+                                // and destination types to match the audited Rust
+                                // operation; an untyped `Int(0)` against a `u32`
+                                // local does not, so `generate_vcs` emitted
+                                // `UnsupportedMir { kind: "MalformedTrustIr" }`
+                                // instead of the E4 rows these tests look for.
+                                //
+                                // `Int(0)` stays correct in `Rvalue::Use`
+                                // assignments — being an OPERAND is the distinction.
+                                Operand::Constant(trust_types::ConstValue::Uint(0, 32)),
                             ),
                             span: SourceSpan::default(),
                         }],
@@ -5033,6 +5181,7 @@ mod tests {
                 unwind: UnwindEdge::Unreachable,
                 span: recursion_span(line),
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 atomic: None,
             },
@@ -5577,7 +5726,7 @@ mod tests {
             body: format!("{LOWERED_COMPILER_CONTRACT_PREFIX}xs.len() > 0"),
         };
         let formula = Formula::Gt(
-            Box::new(Formula::Var("xs_len".to_string(), Sort::Int)),
+            Box::new(Formula::Var("xs__len".to_string(), Sort::Int)),
             Box::new(Formula::Int(0)),
         );
         let compiler_contracts = CompilerContractBundle::new(vec![contract.clone()])
@@ -5587,7 +5736,19 @@ mod tests {
                 body: contract.body.clone(),
                 formula,
                 variable_domains: vec![trust_types::CompilerContractVariableDomain {
-                    name: "xs_len".to_string(),
+                    // Trust: DOUBLE underscore. `map_method_call`
+                    // (trust-types/src/spec_parse.rs) lowers `.len()` to
+                    // `{base}__len`, and `typed_proposition`'s round-trip
+                    // provenance gate REPARSES the retained body
+                    // `"xs.len() > 0"` and requires the domain sidecar to
+                    // cover exactly the leaves that reparse produces. A
+                    // single-underscore `xs_len` is not covered, the
+                    // proposition is dropped as unprovenanced, and lowering
+                    // silently falls through to the UNTYPED source lane —
+                    // which is why this test saw `Unsupported { ".len() has
+                    // no distinct typed verifier payload yet" }` and never
+                    // reached the typed lane it is named for.
+                    name: "xs__len".to_string(),
                     domain: trust_types::CompilerContractValueDomain::PointerSizedInt {
                         width: 64,
                         signed: false,
@@ -5599,7 +5760,14 @@ mod tests {
 
         assert_eq!(bundle.contracts.len(), 1);
         assert_eq!(bundle.obligations.len(), 1);
-        assert!(matches!(bundle.contracts[0].predicate, ContractPredicate::TrustIr { .. }));
+        // Trust: report the predicate we DID get. `assert!(matches!(..))`
+        // discards it, which is how a whole cluster of E4 failures spent six
+        // hypotheses arguing about a reason the value already carried.
+        assert!(
+            matches!(bundle.contracts[0].predicate, ContractPredicate::TrustIr { .. }),
+            "expected a TrustIr predicate, got {:?}",
+            bundle.contracts[0].predicate
+        );
         assert_eq!(bundle.obligations[0].kind, ObligationKind::Precondition);
         assert_eq!(
             metadata_value(&bundle.contracts[0].metadata, "trust.contract.lowering"),
@@ -5659,7 +5827,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_digest_survives_machine_arithmetic_unsupported_marker() {
+    fn typed_digest_survives_machine_arithmetic_lowering() {
         let mut function = test_function();
         function.body.locals = vec![
             LocalDecl { index: 0, ty: Ty::u8(), name: Some("_0".to_string()) },
@@ -5708,12 +5876,33 @@ mod tests {
 
         let bundle = contract_bundle_to_verifier_api(&function, &compiler_contracts);
 
-        assert!(matches!(&bundle.contracts[0].predicate, ContractPredicate::Unsupported { .. }));
-        assert!(matches!(
-            &bundle.obligations[0].kind,
-            ObligationKind::Custom { namespace, name }
-                if namespace == "trust.contract" && name == "unsupported"
-        ));
+        // Trust: machine-width arithmetic in a contract USED to be unmodeled,
+        // and this test pinned that the typed-proposition digest was stamped
+        // anyway, on the way out through the `Unsupported` marker. Production
+        // now MODELS it: `result == x + x` over `u8` locals lowers to a real
+        // width-8 bit-vector proposition and the ensures clause carries a
+        // genuine `Postcondition`, not a `trust.contract / unsupported` row.
+        //
+        // The digest assertions below are what this test was always about and
+        // are unchanged -- they now witness the digest surviving a SUPPORTED
+        // lowering, which is the stronger statement. Coverage of the digest on
+        // the unsupported path is not lost: the shapes that remain unmodeled
+        // still assert the `Unsupported` marker in the tests above.
+        assert!(
+            matches!(&bundle.contracts[0].predicate, ContractPredicate::TrustIr { .. }),
+            "machine-width arithmetic must lower to a typed predicate, got {:?}",
+            bundle.contracts[0].predicate,
+        );
+        assert_eq!(
+            metadata_value(&bundle.contracts[0].metadata, "trust.contract.lowering"),
+            Some("typed_proposition_machine_width"),
+            "the width-aware lowering is what makes this contract supported; a fall back to              the unmodeled marker is a capability regression, not a cosmetic change",
+        );
+        assert!(
+            matches!(&bundle.obligations[0].kind, ObligationKind::Postcondition),
+            "an ensures clause that lowers must carry a real postcondition obligation, got {:?}",
+            bundle.obligations[0].kind,
+        );
         assert_eq!(
             metadata_value(
                 &bundle.contracts[0].metadata,
@@ -5868,12 +6057,10 @@ mod tests {
         // never fall back to a guessed domain.
         let unsupported_sentinels = |bundle: &TrustContractBundle| {
             assert_eq!(bundle.obligations.len(), 2);
-            assert!(
-                bundle.contracts.iter().all(|contract| matches!(
-                    &contract.predicate,
-                    ContractPredicate::Unsupported { .. }
-                ))
-            );
+            assert!(bundle.contracts.iter().all(|contract| matches!(
+                &contract.predicate,
+                ContractPredicate::Unsupported { .. }
+            )));
             assert!(bundle.obligations.iter().all(|obligation| matches!(
                 &obligation.kind,
                 ObligationKind::Custom { namespace, name }
@@ -5897,15 +6084,11 @@ mod tests {
     fn pointer_sized_quantifier_domain_follows_the_supplied_target_width() {
         // The domain is computed from the SUPPLIED target width — never the
         // host, never a hardcoded 64 — and every unknown width stays closed.
-        for (bits, expected_max) in [
-            (16u32, u128::from(u16::MAX)),
-            (32, u128::from(u32::MAX)),
-            (64, u128::from(u64::MAX)),
-        ] {
-            let Some((
-                TrustSpecSort::Int,
-                Some(SpecQuantifierDomain::UnsignedInclusive { max }),
-            )) = spec_quantifier_sort_domain("usize", Some(bits))
+        for (bits, expected_max) in
+            [(16u32, u128::from(u16::MAX)), (32, u128::from(u32::MAX)), (64, u128::from(u64::MAX))]
+        {
+            let Some((TrustSpecSort::Int, Some(SpecQuantifierDomain::UnsignedInclusive { max }))) =
+                spec_quantifier_sort_domain("usize", Some(bits))
             else {
                 panic!("usize must lower at supplied width {bits}");
             };
@@ -7409,6 +7592,77 @@ mod tests {
         assert!(!payload.smtlib.contains("store"));
     }
 
+    /// Build a lowerable path-disjunction whose serialized typed payload is
+    /// larger than the verifier-API transport ceiling while its SMT-LIB
+    /// rendering stays well under it — the exact ratio a3d's whole-function
+    /// `Unreachable` VC has (992,747 bytes of JSON payload against 71,154
+    /// bytes of SMT-LIB). Balanced rather than left-deep so neither the
+    /// lowering nor `serde_json` recurses 8k frames on a test thread.
+    fn oversized_lowerable_violation() -> Formula {
+        // Distinct literals keep the disjuncts distinct; the variable pool stays
+        // small because `validate_trust_spec_predicate` caps declared variables
+        // at `MAX_RECORD_METADATA_ENTRIES` and a predicate over that cap would
+        // decline for the wrong reason.
+        let mut level: Vec<Formula> = (0..16_384i128)
+            .map(|index| {
+                Formula::Eq(
+                    Box::new(Formula::Var(format!("v{}", index % 64), Sort::Int)),
+                    Box::new(Formula::Int(index)),
+                )
+            })
+            .collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| match pair {
+                    [single] => single.clone(),
+                    pair => Formula::Or(pair.to_vec()),
+                })
+                .collect();
+        }
+        level.pop().expect("non-empty disjunction")
+    }
+
+    #[test]
+    fn oversized_typed_payload_is_dropped_instead_of_invalidating_the_bundle() {
+        let formula = oversized_lowerable_violation();
+        assert!(
+            trust_spec_predicate_from_formula(&formula).is_some(),
+            "the fixture must lower; otherwise the test would pass for the wrong reason"
+        );
+
+        let payload = vc_formula_payload(&VcKind::Unreachable, &formula);
+
+        // The row survives with its schema/sort/smtlib carrier...
+        assert_eq!(payload.schema, TRUST_SYMBOLIC_FORMULA_SCHEMA);
+        assert_eq!(payload.sort, "Bool");
+        assert!(!payload.smtlib.is_empty());
+        // ...and drops only the oversized typed payload, so
+        // `TrustContractBundle::validate` cannot reject the whole bundle (and
+        // with it every other obligation of the function).
+        assert_eq!(payload.typed_payload, None);
+        assert_eq!(payload.selected_formula, None);
+        assert!(!payload.pruned);
+        for entry in payload.into_metadata() {
+            assert!(
+                entry.value.len() <= MAX_TRANSPORT_METADATA_VALUE_BYTES,
+                "metadata value for `{}` still exceeds the transport ceiling",
+                entry.key
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_payload_under_the_transport_ceiling_is_still_emitted() {
+        let formula = Formula::Eq(
+            Box::new(Formula::Var("v0".to_string(), Sort::Int)),
+            Box::new(Formula::Int(0)),
+        );
+        let payload = vc_formula_payload(&VcKind::Unreachable, &formula);
+        assert!(payload.typed_payload.is_some());
+        assert_eq!(payload.selected_formula.as_ref(), Some(&formula));
+    }
+
     #[test]
     fn array_read_over_distinct_literal_write_keeps_the_prior_array() {
         let array_sort = Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int));
@@ -8099,6 +8353,12 @@ mod tests {
             schema: TRUST_SYMBOLIC_FORMULA_SCHEMA.to_string(),
             sort: "Bool".to_string(),
             smtlib: "(> x 7)".to_string(),
+            // Nothing lowered here (`typed_payload: None`), so nothing can have been
+            // dropped at the transport ceiling — which is exactly the case the field's
+            // own doc names for `None`. Set deliberately rather than defaulted: the
+            // whole point of this field is that a dropped payload must not be
+            // BYTE-IDENTICAL to one that never lowered.
+            typed_payload_dropped_bytes: None,
             typed_payload: None,
             selected_formula: None,
             pruned: false,

@@ -1,6 +1,6 @@
 use trust_types::{
-    BasicBlock, BinOp, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, SourceSpan,
-    Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    BasicBlock, BinOp, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+    Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{generate_v2_safety_vcs, v2_build_cast_vc, v2_is_value_preserving_widening};
@@ -114,10 +114,7 @@ fn value_preserving_widening_classifier_is_tight() {
 
     // NOT value-preserving — must stay obligations (never silently dropped):
     //   * signed -> unsigned (negative wraps to a huge unsigned value);
-    assert!(!v2_is_value_preserving_widening(
-        &Ty::Int { width: 64, signed: true },
-        &Ty::u128()
-    ));
+    assert!(!v2_is_value_preserving_widening(&Ty::Int { width: 64, signed: true }, &Ty::u128()));
     //   * same-width 128-bit reinterpret (i128 <-> u128 changes value);
     assert!(!v2_is_value_preserving_widening(&Ty::i128(), &Ty::u128()));
     assert!(!v2_is_value_preserving_widening(&Ty::u128(), &Ty::i128()));

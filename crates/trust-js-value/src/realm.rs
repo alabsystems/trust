@@ -11,11 +11,12 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::collections::HashMap;
+
 use crate::env::EnvFrame;
 use crate::heap::Heap;
 use crate::object::{ElemType, ErrKind, FnData, JsObject, ObjKind, PropKey, Property};
 use crate::value::{JsValue, ObjId, SymId, WkSym};
-use std::collections::HashMap;
 
 /// Builtin function identities; dispatch lives in the interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +79,17 @@ pub enum NativeFn {
     ArrayEvery,
     ArraySome,
     ArrayFilter,
-    ArrayFind { last: bool, index: bool },
+    ArrayFind {
+        last: bool,
+        index: bool,
+    },
     ArrayFill,
     ArrayCopyWithin,
     ArrayFlat,
     ArrayFlatMap,
-    ArrayReduce { right: bool },
+    ArrayReduce {
+        right: bool,
+    },
     ArrayReverse,
     ArraySort,
     ArrayAt,
@@ -129,12 +135,21 @@ pub enum NativeFn {
     /// String.prototype.matchAll — dispatch through the argument's @@matchAll,
     /// else RegExpCreate(regexp, "g") then Invoke(@@matchAll) (S1e).
     StringMatchAll,
-    StringCase { upper: bool },
-    StringTrim { start: bool, end: bool },
+    StringCase {
+        upper: bool,
+    },
+    StringTrim {
+        start: bool,
+        end: bool,
+    },
     StringRepeat,
-    StringPad { start: bool },
+    StringPad {
+        start: bool,
+    },
     StringConcat,
-    StringReplace { all: bool },
+    StringReplace {
+        all: bool,
+    },
     StringIsWellFormed,
     StringToWellFormed,
     /// %String.prototype[@@iterator]% (22.1.3.34) — a fresh String Iterator
@@ -277,8 +292,14 @@ pub enum NativeFn {
     DateRealNow,
     DateParse,
     DateUtc,
-    DateGetField { field: DateField, utc: bool },
-    DateSetField { field: DateSetKind, utc: bool },
+    DateGetField {
+        field: DateField,
+        utc: bool,
+    },
+    DateSetField {
+        field: DateSetKind,
+        utc: bool,
+    },
     DateGetTime,
     DateSetTime,
     DateGetTimezoneOffset,
@@ -309,8 +330,12 @@ pub enum NativeFn {
     ProxyRevocable,
     ProxyRevoke,
     // URI handling (fully specified — exact).
-    EncodeUri { component: bool },
-    DecodeUri { component: bool },
+    EncodeUri {
+        component: bool,
+    },
+    DecodeUri {
+        component: bool,
+    },
     // Misc globals.
     JsonParse,
     JsonStringify,
@@ -335,7 +360,9 @@ pub enum NativeFn {
     MathFround,
     /// console.log/info/debug/trace (stderr=false) or warn/error (true) —
     /// the driver's anonymous recorder functions.
-    ConsoleWrite { stderr: bool },
+    ConsoleWrite {
+        stderr: bool,
+    },
     /// The test262 `print` hook the driver installs.
     Print,
     /// %ThrowTypeError%.
@@ -383,7 +410,9 @@ pub enum NativeFn {
     ArrayBufferSlice,
     ArrayBufferResize,
     /// transfer (to_fixed=false) / transferToFixedLength (to_fixed=true).
-    ArrayBufferTransfer { to_fixed: bool },
+    ArrayBufferTransfer {
+        to_fixed: bool,
+    },
     DataViewCtor,
     DataViewBufferGetter,
     DataViewByteLengthGetter,
@@ -514,34 +543,40 @@ pub enum Danger {
     /// A miss refuses iff the name/symbol is engine-real-but-unmodeled.
     /// EMPTY lists still mark the object own-key-ORDER-opaque (full own-key
     /// reflection refuses; misses are safe).
-    Listed {
-        names: &'static [&'static str],
-        syms: &'static [WkSym],
-    },
+    Listed { names: &'static [&'static str], syms: &'static [WkSym] },
 }
 
 // Engine-real own properties NOT modeled, per intrinsic (spec ∪ Node 24 ∪
 // known JSC extras). Modeled properties are present in the heap and never
 // reach the miss path.
-const OBJECT_PROTO_DANGER: &[&str] = &[
-    "__proto__",
-    "__defineGetter__",
-    "__defineSetter__",
-    "__lookupGetter__",
-    "__lookupSetter__",
-];
+const OBJECT_PROTO_DANGER: &[&str] =
+    &["__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"];
 const FUNCTION_PROTO_DANGER: &[&str] = &["arguments", "caller", "toString"];
 const ARRAY_PROTO_DANGER: &[&str] = &["group", "groupToMap", "toLocaleString"];
 // `match`/`search`/`matchAll` are modeled (S1d/S1e); matchAll returns a
 // %RegExpStringIterator% (iterobj.rs). The HTML-wrapper legacy methods and the
 // locale-dependent surface stay danger-listed.
 const STRING_PROTO_DANGER: &[&str] = &[
-    "anchor", "big", "blink", "bold", "fontcolor", "fontsize", "fixed", "italics", "link",
-    "localeCompare", "normalize", "small", "strike", "sub",
-    "substr", "sup", "toLocaleLowerCase", "toLocaleUpperCase",
+    "anchor",
+    "big",
+    "blink",
+    "bold",
+    "fontcolor",
+    "fontsize",
+    "fixed",
+    "italics",
+    "link",
+    "localeCompare",
+    "normalize",
+    "small",
+    "strike",
+    "sub",
+    "substr",
+    "sup",
+    "toLocaleLowerCase",
+    "toLocaleUpperCase",
 ];
-const NUMBER_PROTO_DANGER: &[&str] =
-    &["toExponential", "toFixed", "toPrecision", "toLocaleString"];
+const NUMBER_PROTO_DANGER: &[&str] = &["toExponential", "toFixed", "toPrecision", "toLocaleString"];
 const OBJECT_CTOR_DANGER: &[&str] = &["groupBy"];
 const ARRAY_CTOR_DANGER: &[&str] = &["fromAsync"];
 // `dispose` / `asyncDispose` are now MODELED (explicit resource management),
@@ -554,8 +589,13 @@ const JSON_DANGER: &[&str] = &["rawJSON", "isRawJSON"];
 // ES2025 set-methods surface (union/intersection/...): real on both engines,
 // unmodeled here — any touch refuses.
 const SET_PROTO_DANGER: &[&str] = &[
-    "difference", "intersection", "isDisjointFrom", "isSubsetOf", "isSupersetOf",
-    "symmetricDifference", "union",
+    "difference",
+    "intersection",
+    "isDisjointFrom",
+    "isSubsetOf",
+    "isSupersetOf",
+    "symmetricDifference",
+    "union",
 ];
 const MAP_CTOR_DANGER: &[&str] = &["groupBy"];
 // %IteratorPrototype% own surface. The Iterator Helper methods
@@ -571,17 +611,35 @@ const MAP_CTOR_DANGER: &[&str] = &["groupBy"];
 const ITERATOR_PROTO_DANGER: &[&str] = &[];
 // %Iterator% static iterator-sequencing helpers (unmodeled; any miss refuses).
 const ITERATOR_CTOR_DANGER: &[&str] = &["from", "concat", "zip", "zipKeyed"];
-const DATE_PROTO_DANGER: &[&str] =
-    &["toLocaleString", "toLocaleDateString", "toLocaleTimeString"];
+const DATE_PROTO_DANGER: &[&str] = &["toLocaleString", "toLocaleDateString", "toLocaleTimeString"];
 // Legacy RegExp statics (engine-real on V8 and JSC) + RegExp.escape.
 const REGEXP_CTOR_DANGER: &[&str] = &[
-    "escape", "input", "lastMatch", "lastParen", "leftContext", "rightContext", "multiline",
-    "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "$_", "$&", "$+", "$`", "$'",
+    "escape",
+    "input",
+    "lastMatch",
+    "lastParen",
+    "leftContext",
+    "rightContext",
+    "multiline",
+    "$1",
+    "$2",
+    "$3",
+    "$4",
+    "$5",
+    "$6",
+    "$7",
+    "$8",
+    "$9",
+    "$_",
+    "$&",
+    "$+",
+    "$`",
+    "$'",
 ];
 const MATH_DANGER: &[&str] = &[
     "acos", "acosh", "asin", "asinh", "atan", "atanh", "atan2", "cbrt", "expm1", "clz32", "cos",
-    "cosh", "exp", "fround", "f16round", "hypot", "log", "log1p", "log2", "log10", "random",
-    "sin", "sinh", "sqrt", "tan", "tanh",
+    "cosh", "exp", "fround", "f16round", "hypot", "log", "log1p", "log2", "log10", "random", "sin",
+    "sinh", "sqrt", "tan", "tanh",
 ];
 
 /// Own properties engines materialize on native Error INSTANCES (V8 `stack`;
@@ -836,10 +894,9 @@ impl Intrinsics {
         }
         let d = self.danger.get(&oid)?;
         match d {
-            Danger::All => Some(format!(
-                "own miss `{}` on an opaque host intrinsic",
-                key.describe()
-            )),
+            Danger::All => {
+                Some(format!("own miss `{}` on an opaque host intrinsic", key.describe()))
+            }
             Danger::Listed { names, syms } => match key {
                 PropKey::Str(u) => {
                     let name = crate::units::units_to_lossy(u);
@@ -877,26 +934,18 @@ struct B<'h> {
 
 impl B<'_> {
     fn put(&mut self, oid: ObjId, key: &str, p: Property) {
-        self.heap
-            .obj_mut(oid)
-            .props
-            .insert(PropKey::from_str(key), p);
+        self.heap.obj_mut(oid).props.insert(PropKey::from_str(key), p);
     }
 
     fn put_sym(&mut self, oid: ObjId, sym: WkSym, p: Property) {
-        self.heap
-            .obj_mut(oid)
-            .props
-            .insert(PropKey::Sym(SymId::WellKnown(sym)), p);
+        self.heap.obj_mut(oid).props.insert(PropKey::Sym(SymId::WellKnown(sym)), p);
     }
 
     /// A builtin function object: name/length per builtin convention.
     /// Own-key ORDER is a spec observable (test262 Function/property-order):
     /// CreateBuiltinFunction installs `length` BEFORE `name`.
     fn mk_fn(&mut self, fproto: ObjId, name: &str, len: f64, nf: NativeFn) -> ObjId {
-        let f = self
-            .heap
-            .alloc(JsObject::new(ObjKind::Function(FnData::Native(nf)), Some(fproto)));
+        let f = self.heap.alloc(JsObject::new(ObjKind::Function(FnData::Native(nf)), Some(fproto)));
         self.put(f, "length", Property::with_attrs(JsValue::Num(len), false, false, true));
         self.put(f, "name", Property::with_attrs(JsValue::str_from(name), false, false, true));
         f
@@ -912,11 +961,7 @@ impl B<'_> {
             "constructor",
             Property::with_attrs(JsValue::Obj(f), true, false, true),
         );
-        self.put(
-            f,
-            "prototype",
-            Property::with_attrs(JsValue::Obj(proto_obj), true, false, false),
-        );
+        self.put(f, "prototype", Property::with_attrs(JsValue::Obj(proto_obj), true, false, false));
         f
     }
 }
@@ -1006,11 +1051,7 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     }
     let fn_has_instance =
         b.mk_fn(function_proto, "[Symbol.hasInstance]", 1.0, NativeFn::FunProtoHasInstance);
-    b.put_sym(
-        function_proto,
-        WkSym::HasInstance,
-        Property::frozen(JsValue::Obj(fn_has_instance)),
-    );
+    b.put_sym(function_proto, WkSym::HasInstance, Property::frozen(JsValue::Obj(fn_has_instance)));
 
     // Array.prototype methods.
     for (name, len, nf) in [
@@ -1116,36 +1157,31 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     let string_iterator_fn =
         b.mk_fn(function_proto, "[Symbol.iterator]", 0.0, NativeFn::StringProtoIterator);
     b.put_sym(string_proto, WkSym::Iterator, Property::method(JsValue::Obj(string_iterator_fn)));
-    for (name, nf) in [
-        ("toString", NativeFn::NumberProtoToString),
-        ("valueOf", NativeFn::NumberProtoValueOf),
-    ] {
+    for (name, nf) in
+        [("toString", NativeFn::NumberProtoToString), ("valueOf", NativeFn::NumberProtoValueOf)]
+    {
         let len = if name == "toString" { 1.0 } else { 0.0 };
         let m = b.mk_fn(function_proto, name, len, nf);
         b.put(number_proto, name, Property::method(JsValue::Obj(m)));
     }
-    for (name, nf) in [
-        ("toString", NativeFn::BooleanProtoToString),
-        ("valueOf", NativeFn::BooleanProtoValueOf),
-    ] {
+    for (name, nf) in
+        [("toString", NativeFn::BooleanProtoToString), ("valueOf", NativeFn::BooleanProtoValueOf)]
+    {
         let m = b.mk_fn(function_proto, name, 0.0, nf);
         b.put(boolean_proto, name, Property::method(JsValue::Obj(m)));
     }
     // Symbol.prototype: toString/valueOf/description/@@toPrimitive/@@toStringTag.
-    for (name, nf) in [
-        ("toString", NativeFn::SymbolProtoToString),
-        ("valueOf", NativeFn::SymbolProtoValueOf),
-    ] {
+    for (name, nf) in
+        [("toString", NativeFn::SymbolProtoToString), ("valueOf", NativeFn::SymbolProtoValueOf)]
+    {
         let m = b.mk_fn(function_proto, name, 0.0, nf);
         b.put(symbol_proto, name, Property::method(JsValue::Obj(m)));
     }
-    let desc_get = b.mk_fn(function_proto, "get description", 0.0, NativeFn::SymbolProtoDescription);
-    b.put(
-        symbol_proto,
-        "description",
-        Property::accessor(Some(desc_get), None, false, true),
-    );
-    let sym_to_prim = b.mk_fn(function_proto, "[Symbol.toPrimitive]", 1.0, NativeFn::SymbolToPrimitive);
+    let desc_get =
+        b.mk_fn(function_proto, "get description", 0.0, NativeFn::SymbolProtoDescription);
+    b.put(symbol_proto, "description", Property::accessor(Some(desc_get), None, false, true));
+    let sym_to_prim =
+        b.mk_fn(function_proto, "[Symbol.toPrimitive]", 1.0, NativeFn::SymbolToPrimitive);
     b.put_sym(
         symbol_proto,
         WkSym::ToPrimitive,
@@ -1196,12 +1232,23 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     let boolean_ctor = mk_ctor(&mut b, "Boolean", 1.0, NativeFn::BooleanCtor, boolean_proto);
     let symbol_ctor = mk_ctor(&mut b, "Symbol", 0.0, NativeFn::SymbolCtor, symbol_proto);
     let bigint_ctor = mk_ctor(&mut b, "BigInt", 1.0, NativeFn::BigIntCtor, bigint_proto);
-    let error_ctor = mk_ctor(&mut b, "Error", 1.0, NativeFn::ErrorCtor(ErrKind::Error), error_proto);
+    let error_ctor =
+        mk_ctor(&mut b, "Error", 1.0, NativeFn::ErrorCtor(ErrKind::Error), error_proto);
     let type_error_ctor = mk_ctor_on(
-        &mut b, error_ctor, "TypeError", 1.0, NativeFn::ErrorCtor(ErrKind::Type), type_error_proto,
+        &mut b,
+        error_ctor,
+        "TypeError",
+        1.0,
+        NativeFn::ErrorCtor(ErrKind::Type),
+        type_error_proto,
     );
     let range_error_ctor = mk_ctor_on(
-        &mut b, error_ctor, "RangeError", 1.0, NativeFn::ErrorCtor(ErrKind::Range), range_error_proto,
+        &mut b,
+        error_ctor,
+        "RangeError",
+        1.0,
+        NativeFn::ErrorCtor(ErrKind::Range),
+        range_error_proto,
     );
     let reference_error_ctor = mk_ctor_on(
         &mut b,
@@ -1220,10 +1267,20 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         syntax_error_proto,
     );
     let eval_error_ctor = mk_ctor_on(
-        &mut b, error_ctor, "EvalError", 1.0, NativeFn::ErrorCtor(ErrKind::Eval), eval_error_proto,
+        &mut b,
+        error_ctor,
+        "EvalError",
+        1.0,
+        NativeFn::ErrorCtor(ErrKind::Eval),
+        eval_error_proto,
     );
     let uri_error_ctor = mk_ctor_on(
-        &mut b, error_ctor, "URIError", 1.0, NativeFn::ErrorCtor(ErrKind::Uri), uri_error_proto,
+        &mut b,
+        error_ctor,
+        "URIError",
+        1.0,
+        NativeFn::ErrorCtor(ErrKind::Uri),
+        uri_error_proto,
     );
     let aggregate_error_ctor = mk_ctor_on(
         &mut b,
@@ -1282,11 +1339,7 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         b.put(array_ctor, name, Property::method(JsValue::Obj(m)));
     }
     let species_get = b.mk_fn(function_proto, "get [Symbol.species]", 0.0, NativeFn::SpeciesGetter);
-    b.put_sym(
-        array_ctor,
-        WkSym::Species,
-        Property::accessor(Some(species_get), None, false, true),
-    );
+    b.put_sym(array_ctor, WkSym::Species, Property::accessor(Some(species_get), None, false, true));
     // String statics.
     for (name, len, nf) in [
         ("fromCharCode", 1.0, NativeFn::StringFromCharCode),
@@ -1323,10 +1376,9 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         b.put(number_ctor, name, Property::frozen(JsValue::Num(v)));
     }
     // Symbol statics: for/keyFor + the well-known symbols as frozen values.
-    for (name, len, nf) in [
-        ("for", 1.0, NativeFn::SymbolFor),
-        ("keyFor", 1.0, NativeFn::SymbolKeyFor),
-    ] {
+    for (name, len, nf) in
+        [("for", 1.0, NativeFn::SymbolFor), ("keyFor", 1.0, NativeFn::SymbolKeyFor)]
+    {
         let m = b.mk_fn(function_proto, name, len, nf);
         b.put(symbol_ctor, name, Property::method(JsValue::Obj(m)));
     }
@@ -1352,24 +1404,14 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // "Symbol.asyncDispose": the driver's WELL_KNOWN_SYMBOLS map omits them, so
     // it projects them by description — a User symbol matches that exactly,
     // where a synthetic well-known variant would mis-project as `wk`.
-    let dispose_sym = b
-        .heap
-        .alloc_symbol(Some(crate::units::units_from_str("Symbol.dispose")));
-    let async_dispose_sym = b
-        .heap
-        .alloc_symbol(Some(crate::units::units_from_str("Symbol.asyncDispose")));
+    let dispose_sym = b.heap.alloc_symbol(Some(crate::units::units_from_str("Symbol.dispose")));
+    let async_dispose_sym =
+        b.heap.alloc_symbol(Some(crate::units::units_from_str("Symbol.asyncDispose")));
     b.put(symbol_ctor, "dispose", Property::frozen(JsValue::Sym(dispose_sym)));
-    b.put(
-        symbol_ctor,
-        "asyncDispose",
-        Property::frozen(JsValue::Sym(async_dispose_sym)),
-    );
+    b.put(symbol_ctor, "asyncDispose", Property::frozen(JsValue::Sym(async_dispose_sym)));
 
     // BigInt statics: asIntN / asUintN.
-    for (name, nf) in [
-        ("asIntN", NativeFn::BigIntAsIntN),
-        ("asUintN", NativeFn::BigIntAsUintN),
-    ] {
+    for (name, nf) in [("asIntN", NativeFn::BigIntAsIntN), ("asUintN", NativeFn::BigIntAsUintN)] {
         let m = b.mk_fn(function_proto, name, 2.0, nf);
         b.put(bigint_ctor, name, Property::method(JsValue::Obj(m)));
     }
@@ -1474,11 +1516,7 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     let map_size_get = b.mk_fn(function_proto, "get size", 0.0, NativeFn::MapSizeGetter);
     b.put(map_proto, "size", Property::accessor(Some(map_size_get), None, false, true));
     // Map.prototype[Symbol.iterator] IS %Map.prototype.entries% (identity).
-    b.put_sym(
-        map_proto,
-        WkSym::Iterator,
-        Property::method(JsValue::Obj(map_entries_fn)),
-    );
+    b.put_sym(map_proto, WkSym::Iterator, Property::method(JsValue::Obj(map_entries_fn)));
     b.put_sym(
         map_proto,
         WkSym::ToStringTag,
@@ -1503,11 +1541,7 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     b.put(set_proto, "keys", Property::method(JsValue::Obj(set_values_fn)));
     let set_size_get = b.mk_fn(function_proto, "get size", 0.0, NativeFn::SetSizeGetter);
     b.put(set_proto, "size", Property::accessor(Some(set_size_get), None, false, true));
-    b.put_sym(
-        set_proto,
-        WkSym::Iterator,
-        Property::method(JsValue::Obj(set_values_fn)),
-    );
+    b.put_sym(set_proto, WkSym::Iterator, Property::method(JsValue::Obj(set_values_fn)));
     b.put_sym(
         set_proto,
         WkSym::ToStringTag,
@@ -1584,8 +1618,13 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         WkSym::ToStringTag,
         Property::with_attrs(JsValue::str_from("FinalizationRegistry"), false, false, true),
     );
-    let finreg_ctor =
-        mk_ctor(&mut b, "FinalizationRegistry", 1.0, NativeFn::FinalizationRegistryCtor, finreg_proto);
+    let finreg_ctor = mk_ctor(
+        &mut b,
+        "FinalizationRegistry",
+        1.0,
+        NativeFn::FinalizationRegistryCtor,
+        finreg_proto,
+    );
 
     // -- §27.3 DisposableStack (sync explicit resource management) -----------
     // %DisposableStack.prototype%: proto = %Object.prototype%; own methods
@@ -1594,7 +1633,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // [[DisposeCapability]] live in the interpreter side table, so the object
     // is ordinary and its class tag resolves to "Object" (the prototype is NOT
     // in the driver class-tag list — matches Node 24 / Bun).
-    let disposable_stack_proto = b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
+    let disposable_stack_proto =
+        b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
     for (name, len, nf) in [
         ("use", 1.0, NativeFn::DisposableStackUse),
         ("adopt", 2.0, NativeFn::DisposableStackAdopt),
@@ -1607,11 +1647,12 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     let ds_dispose_fn = b.mk_fn(function_proto, "dispose", 0.0, NativeFn::DisposableStackDispose);
     b.put(disposable_stack_proto, "dispose", Property::method(JsValue::Obj(ds_dispose_fn)));
     // DisposableStack.prototype[@@dispose] IS %DisposableStack.prototype.dispose%.
-    b.heap.obj_mut(disposable_stack_proto).props.insert(
-        PropKey::Sym(dispose_sym),
-        Property::method(JsValue::Obj(ds_dispose_fn)),
-    );
-    let ds_disposed_get = b.mk_fn(function_proto, "get disposed", 0.0, NativeFn::DisposableStackDisposedGetter);
+    b.heap
+        .obj_mut(disposable_stack_proto)
+        .props
+        .insert(PropKey::Sym(dispose_sym), Property::method(JsValue::Obj(ds_dispose_fn)));
+    let ds_disposed_get =
+        b.mk_fn(function_proto, "get disposed", 0.0, NativeFn::DisposableStackDisposedGetter);
     b.put(
         disposable_stack_proto,
         "disposed",
@@ -1622,8 +1663,13 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         WkSym::ToStringTag,
         Property::with_attrs(JsValue::str_from("DisposableStack"), false, false, true),
     );
-    let disposable_stack_ctor =
-        mk_ctor(&mut b, "DisposableStack", 0.0, NativeFn::DisposableStackCtor, disposable_stack_proto);
+    let disposable_stack_ctor = mk_ctor(
+        &mut b,
+        "DisposableStack",
+        0.0,
+        NativeFn::DisposableStackCtor,
+        disposable_stack_proto,
+    );
 
     // -- S1c: Date ----------------------------------------------------------
     // Date.prototype is an ordinary object (no [[DateValue]]).
@@ -1754,11 +1800,9 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         acc(&mut b, "flags", NativeFn::RegexFlagsGetter);
         let ts = b.mk_fn(function_proto, "toString", 0.0, NativeFn::RegexToString);
         b.put(regexp_proto, "toString", Property::method(JsValue::Obj(ts)));
-        for (name, len, tag) in [
-            ("compile", 2.0, "compile"),
-            ("exec", 1.0, "exec"),
-            ("test", 1.0, "test"),
-        ] {
+        for (name, len, tag) in
+            [("compile", 2.0, "compile"), ("exec", 1.0, "exec"), ("test", 1.0, "test")]
+        {
             let m = b.mk_fn(function_proto, name, len, NativeFn::RegexProtoMethod(tag));
             b.put(regexp_proto, name, Property::method(JsValue::Obj(m)));
         }
@@ -1795,10 +1839,12 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // Spec §19.2 order on the global: parse comes before stringify — but the
     // JSON object's own-key ORDER is engine-incidental for reflection (it
     // refuses); insertion order here is not observable.
-    let encode_uri = b.mk_fn(function_proto, "encodeURI", 1.0, NativeFn::EncodeUri { component: false });
+    let encode_uri =
+        b.mk_fn(function_proto, "encodeURI", 1.0, NativeFn::EncodeUri { component: false });
     let encode_uric =
         b.mk_fn(function_proto, "encodeURIComponent", 1.0, NativeFn::EncodeUri { component: true });
-    let decode_uri = b.mk_fn(function_proto, "decodeURI", 1.0, NativeFn::DecodeUri { component: false });
+    let decode_uri =
+        b.mk_fn(function_proto, "decodeURI", 1.0, NativeFn::DecodeUri { component: false });
     let decode_uric =
         b.mk_fn(function_proto, "decodeURIComponent", 1.0, NativeFn::DecodeUri { component: true });
 
@@ -1807,11 +1853,21 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // data props holding name-"" functions WITH a `.prototype`.
     let console = b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
     for name in ["log", "info", "debug", "trace"] {
-        let m = b.mk_driver_fn(function_proto, object_proto, "", NativeFn::ConsoleWrite { stderr: false });
+        let m = b.mk_driver_fn(
+            function_proto,
+            object_proto,
+            "",
+            NativeFn::ConsoleWrite { stderr: false },
+        );
         b.put(console, name, Property::data(JsValue::Obj(m)));
     }
     for name in ["warn", "error"] {
-        let m = b.mk_driver_fn(function_proto, object_proto, "", NativeFn::ConsoleWrite { stderr: true });
+        let m = b.mk_driver_fn(
+            function_proto,
+            object_proto,
+            "",
+            NativeFn::ConsoleWrite { stderr: true },
+        );
         b.put(console, name, Property::data(JsValue::Obj(m)));
     }
 
@@ -1825,7 +1881,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     let print_fn = b.mk_driver_fn(function_proto, object_proto, "print", NativeFn::Print);
 
     // Event-loop globals (onto the reactor's deterministic queues).
-    let queue_microtask_fn = b.mk_fn(function_proto, "queueMicrotask", 1.0, NativeFn::QueueMicrotask);
+    let queue_microtask_fn =
+        b.mk_fn(function_proto, "queueMicrotask", 1.0, NativeFn::QueueMicrotask);
     let set_timeout_fn = b.mk_fn(function_proto, "setTimeout", 2.0, NativeFn::SetTimeout);
     let set_interval_fn = b.mk_fn(function_proto, "setInterval", 2.0, NativeFn::SetInterval);
     let clear_timeout_fn = b.mk_fn(function_proto, "clearTimeout", 1.0, NativeFn::ClearTimer);
@@ -1834,7 +1891,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // -- S1e: iterator + generator prototype graph (§27) --------------------
     // %IteratorPrototype%: proto = %Object.prototype%; own [@@iterator] → this.
     let iterator_proto = b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
-    let iter_self = b.mk_fn(function_proto, "[Symbol.iterator]", 0.0, NativeFn::IteratorProtoIterator);
+    let iter_self =
+        b.mk_fn(function_proto, "[Symbol.iterator]", 0.0, NativeFn::IteratorProtoIterator);
     b.put_sym(iterator_proto, WkSym::Iterator, Property::method(JsValue::Obj(iter_self)));
 
     // §27.1 %Iterator%: the abstract global constructor. `Iterator.prototype`
@@ -1847,8 +1905,10 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // engine. The helper methods (map/filter/...) are MODELED below (iterhelp.rs).
     let iterator_ctor = b.mk_fn(function_proto, "Iterator", 0.0, NativeFn::IteratorCtor);
     b.put(iterator_ctor, "prototype", Property::frozen(JsValue::Obj(iterator_proto)));
-    let iter_ctor_get = b.mk_fn(function_proto, "get constructor", 0.0, NativeFn::IteratorProtoCtorGet);
-    let iter_ctor_set = b.mk_fn(function_proto, "set constructor", 1.0, NativeFn::IteratorProtoCtorSet);
+    let iter_ctor_get =
+        b.mk_fn(function_proto, "get constructor", 0.0, NativeFn::IteratorProtoCtorGet);
+    let iter_ctor_set =
+        b.mk_fn(function_proto, "set constructor", 1.0, NativeFn::IteratorProtoCtorSet);
     b.put(
         iterator_proto,
         "constructor",
@@ -1935,8 +1995,7 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
 
     // The three generator objects, allocated first so constructor/prototype
     // back-links can be installed in spec property order.
-    let generator_proto =
-        b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(iterator_proto)));
+    let generator_proto = b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(iterator_proto)));
     let generator_function_proto =
         b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(function_proto)));
     let generator_function_ctor =
@@ -2021,7 +2080,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         b.put(promise_ctor, name, Property::method(JsValue::Obj(m)));
     }
     // Promise[@@species] — the default accessor returns `this`.
-    let promise_species = b.mk_fn(function_proto, "get [Symbol.species]", 0.0, NativeFn::SpeciesGetter);
+    let promise_species =
+        b.mk_fn(function_proto, "get [Symbol.species]", 0.0, NativeFn::SpeciesGetter);
     b.put_sym(
         promise_ctor,
         WkSym::Species,
@@ -2053,12 +2113,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // -- §27.1.3 %AsyncIteratorPrototype% + §27.6 AsyncGenerator ------------
     let async_iterator_proto =
         b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
-    let async_iter_self = b.mk_fn(
-        function_proto,
-        "[Symbol.asyncIterator]",
-        0.0,
-        NativeFn::AsyncIteratorProtoSelf,
-    );
+    let async_iter_self =
+        b.mk_fn(function_proto, "[Symbol.asyncIterator]", 0.0, NativeFn::AsyncIteratorProtoSelf);
     b.put_sym(
         async_iterator_proto,
         WkSym::AsyncIterator,
@@ -2125,7 +2181,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     );
 
     // -- §25.1 ArrayBuffer --------------------------------------------------
-    let array_buffer_proto = b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
+    let array_buffer_proto =
+        b.heap.alloc(JsObject::new(ObjKind::IntrinsicHost, Some(object_proto)));
     {
         let acc = |b: &mut B<'_>, name: &str, nf: NativeFn| {
             let g = b.mk_fn(function_proto, &format!("get {name}"), 0.0, nf);
@@ -2150,12 +2207,17 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
             Property::with_attrs(JsValue::str_from("ArrayBuffer"), false, false, true),
         );
     }
-    let array_buffer_ctor = mk_ctor(&mut b, "ArrayBuffer", 1.0, NativeFn::ArrayBufferCtor, array_buffer_proto);
+    let array_buffer_ctor =
+        mk_ctor(&mut b, "ArrayBuffer", 1.0, NativeFn::ArrayBufferCtor, array_buffer_proto);
     {
         let m = b.mk_fn(function_proto, "isView", 1.0, NativeFn::ArrayBufferIsView);
         b.put(array_buffer_ctor, "isView", Property::method(JsValue::Obj(m)));
         let sg = b.mk_fn(function_proto, "get [Symbol.species]", 0.0, NativeFn::SpeciesGetter);
-        b.put_sym(array_buffer_ctor, WkSym::Species, Property::accessor(Some(sg), None, false, true));
+        b.put_sym(
+            array_buffer_ctor,
+            WkSym::Species,
+            Property::accessor(Some(sg), None, false, true),
+        );
     }
 
     // -- §25.3 DataView -----------------------------------------------------
@@ -2170,19 +2232,33 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         acc(&mut b, "byteOffset", NativeFn::DataViewByteOffsetGetter);
         use ElemType as E;
         for (name, et) in [
-            ("getBigInt64", E::BigInt64), ("getBigUint64", E::BigUint64),
-            ("getFloat16", E::Float16), ("getFloat32", E::Float32), ("getFloat64", E::Float64),
-            ("getInt8", E::Int8), ("getInt16", E::Int16), ("getInt32", E::Int32),
-            ("getUint8", E::Uint8), ("getUint16", E::Uint16), ("getUint32", E::Uint32),
+            ("getBigInt64", E::BigInt64),
+            ("getBigUint64", E::BigUint64),
+            ("getFloat16", E::Float16),
+            ("getFloat32", E::Float32),
+            ("getFloat64", E::Float64),
+            ("getInt8", E::Int8),
+            ("getInt16", E::Int16),
+            ("getInt32", E::Int32),
+            ("getUint8", E::Uint8),
+            ("getUint16", E::Uint16),
+            ("getUint32", E::Uint32),
         ] {
             let m = b.mk_fn(function_proto, name, 1.0, NativeFn::DataViewGet(et));
             b.put(data_view_proto, name, Property::method(JsValue::Obj(m)));
         }
         for (name, et) in [
-            ("setBigInt64", E::BigInt64), ("setBigUint64", E::BigUint64),
-            ("setFloat16", E::Float16), ("setFloat32", E::Float32), ("setFloat64", E::Float64),
-            ("setInt8", E::Int8), ("setInt16", E::Int16), ("setInt32", E::Int32),
-            ("setUint8", E::Uint8), ("setUint16", E::Uint16), ("setUint32", E::Uint32),
+            ("setBigInt64", E::BigInt64),
+            ("setBigUint64", E::BigUint64),
+            ("setFloat16", E::Float16),
+            ("setFloat32", E::Float32),
+            ("setFloat64", E::Float64),
+            ("setInt8", E::Int8),
+            ("setInt16", E::Int16),
+            ("setInt32", E::Int32),
+            ("setUint8", E::Uint8),
+            ("setUint16", E::Uint16),
+            ("setUint32", E::Uint32),
         ] {
             let m = b.mk_fn(function_proto, name, 2.0, NativeFn::DataViewSet(et));
             b.put(data_view_proto, name, Property::method(JsValue::Obj(m)));
@@ -2254,7 +2330,8 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
         b.put(typed_array_proto, "values", Property::method(JsValue::Obj(ta_values_fn)));
         b.put(typed_array_proto, "toString", Property::method(array_to_string_fn));
         b.put_sym(typed_array_proto, WkSym::Iterator, Property::method(JsValue::Obj(ta_values_fn)));
-        let tag_get = b.mk_fn(function_proto, "get [Symbol.toStringTag]", 0.0, NativeFn::TaToStringTagGetter);
+        let tag_get =
+            b.mk_fn(function_proto, "get [Symbol.toStringTag]", 0.0, NativeFn::TaToStringTagGetter);
         b.put_sym(
             typed_array_proto,
             WkSym::ToStringTag,
@@ -2266,15 +2343,18 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     b.put(typed_array_ctor, "prototype", Property::frozen(JsValue::Obj(typed_array_proto)));
     b.put(typed_array_proto, "constructor", Property::method(JsValue::Obj(typed_array_ctor)));
     {
-        for (name, len, nf) in [
-            ("from", 1.0, NativeFn::TypedArrayFrom),
-            ("of", 0.0, NativeFn::TypedArrayOf),
-        ] {
+        for (name, len, nf) in
+            [("from", 1.0, NativeFn::TypedArrayFrom), ("of", 0.0, NativeFn::TypedArrayOf)]
+        {
             let m = b.mk_fn(function_proto, name, len, nf);
             b.put(typed_array_ctor, name, Property::method(JsValue::Obj(m)));
         }
         let sg = b.mk_fn(function_proto, "get [Symbol.species]", 0.0, NativeFn::SpeciesGetter);
-        b.put_sym(typed_array_ctor, WkSym::Species, Property::accessor(Some(sg), None, false, true));
+        b.put_sym(
+            typed_array_ctor,
+            WkSym::Species,
+            Property::accessor(Some(sg), None, false, true),
+        );
     }
     // Concrete constructors: [[Prototype]] = %TypedArray%; .prototype's
     // [[Prototype]] = %TypedArray%.prototype.
@@ -2354,11 +2434,7 @@ pub fn create_realm(heap: &mut Heap) -> Realm {
     // The driver installs its Date wrapper with defineProperty
     // {value, writable: true, configurable: true} — non-enumerable, like the
     // builtin it replaces.
-    b.put(
-        global,
-        "Date",
-        Property::with_attrs(JsValue::Obj(date_wrapper_ctor), true, false, true),
-    );
+    b.put(global, "Date", Property::with_attrs(JsValue::Obj(date_wrapper_ctor), true, false, true));
     // Binary-data globals: ArrayBuffer, DataView, and each concrete typed
     // array constructor (%TypedArray% itself is intentionally not a global).
     b.put(global, "ArrayBuffer", Property::method(JsValue::Obj(array_buffer_ctor)));
@@ -2571,32 +2647,21 @@ mod tests {
         let realm = create_realm(&mut heap);
         let intr = &realm.intr;
         // Modeled props are present and never on the miss path.
-        assert!(heap
-            .obj(intr.object_proto)
-            .props
-            .contains_key(&PropKey::from_str("hasOwnProperty")));
-        assert!(heap
-            .obj(intr.array_proto)
-            .props
-            .contains_key(&PropKey::from_str("reduce")));
-        assert!(heap
-            .obj(intr.function_proto)
-            .props
-            .contains_key(&PropKey::Sym(SymId::WellKnown(WkSym::HasInstance))));
+        assert!(
+            heap.obj(intr.object_proto).props.contains_key(&PropKey::from_str("hasOwnProperty"))
+        );
+        assert!(heap.obj(intr.array_proto).props.contains_key(&PropKey::from_str("reduce")));
+        assert!(
+            heap.obj(intr.function_proto)
+                .props
+                .contains_key(&PropKey::Sym(SymId::WellKnown(WkSym::HasInstance)))
+        );
         // Danger classification: unmodeled engine-real names refuse.
-        assert!(intr
-            .miss_danger(intr.array_proto, &PropKey::from_str("toLocaleString"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.function_proto, &PropKey::from_str("toString"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.object_proto, &PropKey::from_str("__proto__"))
-            .is_some());
+        assert!(intr.miss_danger(intr.array_proto, &PropKey::from_str("toLocaleString")).is_some());
+        assert!(intr.miss_danger(intr.function_proto, &PropKey::from_str("toString")).is_some());
+        assert!(intr.miss_danger(intr.object_proto, &PropKey::from_str("__proto__")).is_some());
         // Non-real names fall through soundly.
-        assert!(intr
-            .miss_danger(intr.array_proto, &PropKey::from_str("noSuchThing"))
-            .is_none());
+        assert!(intr.miss_danger(intr.array_proto, &PropKey::from_str("noSuchThing")).is_none());
         // Symbol dangers: @@iterator is now a MODELED own prop on
         // Array.prototype (identity === values), so its lookup is a HIT, not a
         // danger miss; @@unscopables remains an unmodeled danger-listed symbol.
@@ -2607,54 +2672,32 @@ mod tests {
                 .and_then(Property::data_value),
             Some(JsValue::Obj(o)) if *o == intr.array_values_fn
         ));
-        assert!(intr
-            .miss_danger(
-                intr.array_proto,
-                &PropKey::Sym(SymId::WellKnown(WkSym::Unscopables))
-            )
-            .is_some());
-        assert!(intr
-            .miss_danger(
+        assert!(
+            intr.miss_danger(intr.array_proto, &PropKey::Sym(SymId::WellKnown(WkSym::Unscopables)))
+                .is_some()
+        );
+        assert!(
+            intr.miss_danger(
                 intr.object_proto,
                 &PropKey::Sym(SymId::WellKnown(WkSym::ToPrimitive))
             )
-            .is_none());
+            .is_none()
+        );
         // User symbols never trip danger lists.
-        assert!(intr
-            .miss_danger(intr.array_proto, &PropKey::Sym(SymId::User(0)))
-            .is_none());
+        assert!(intr.miss_danger(intr.array_proto, &PropKey::Sym(SymId::User(0))).is_none());
         // console is fully opaque.
-        assert!(intr
-            .miss_danger(intr.console, &PropKey::from_str("anything"))
-            .is_some());
+        assert!(intr.miss_danger(intr.console, &PropKey::from_str("anything")).is_some());
         // S1c danger coherence: engine-real unmodeled surfaces refuse.
-        assert!(intr
-            .miss_danger(intr.set_proto, &PropKey::from_str("union"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.set_proto, &PropKey::from_str("isSubsetOf"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.date_proto, &PropKey::from_str("toLocaleString"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.regexp_ctor, &PropKey::from_str("$1"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.regexp_ctor, &PropKey::from_str("escape"))
-            .is_some());
-        assert!(intr
-            .miss_danger(intr.map_ctor, &PropKey::from_str("groupBy"))
-            .is_some());
+        assert!(intr.miss_danger(intr.set_proto, &PropKey::from_str("union")).is_some());
+        assert!(intr.miss_danger(intr.set_proto, &PropKey::from_str("isSubsetOf")).is_some());
+        assert!(intr.miss_danger(intr.date_proto, &PropKey::from_str("toLocaleString")).is_some());
+        assert!(intr.miss_danger(intr.regexp_ctor, &PropKey::from_str("$1")).is_some());
+        assert!(intr.miss_danger(intr.regexp_ctor, &PropKey::from_str("escape")).is_some());
+        assert!(intr.miss_danger(intr.map_ctor, &PropKey::from_str("groupBy")).is_some());
         // Proxy's own surface (length/name/revocable) is fully modeled: no
         // danger set, and `revocable` reads as a real method.
-        assert!(intr
-            .miss_danger(intr.proxy_ctor, &PropKey::from_str("revocable"))
-            .is_none());
-        assert!(heap
-            .obj(intr.proxy_ctor)
-            .props
-            .contains_key(&PropKey::from_str("revocable")));
+        assert!(intr.miss_danger(intr.proxy_ctor, &PropKey::from_str("revocable")).is_none());
+        assert!(heap.obj(intr.proxy_ctor).props.contains_key(&PropKey::from_str("revocable")));
         // Modeled S1c surfaces are present (never on the miss path).
         for (oid, name) in [
             (intr.map_proto, "getOrInsertComputed"),
@@ -2691,10 +2734,7 @@ mod tests {
         let rp = get(intr.date_real_ctor, PropKey::from_str("parse"));
         assert!(matches!((wp, rp), (Some(JsValue::Obj(a)), Some(JsValue::Obj(b))) if a == b));
         // Proxy has no `prototype` own property (28.2.2).
-        assert!(!heap
-            .obj(intr.proxy_ctor)
-            .props
-            .contains_key(&PropKey::from_str("prototype")));
+        assert!(!heap.obj(intr.proxy_ctor).props.contains_key(&PropKey::from_str("prototype")));
         // NativeError constructors inherit from %Error% (spec 20.5.6.2).
         let te = heap
             .obj(intr.error_proto_for(ErrKind::Type))
@@ -2767,8 +2807,9 @@ mod tests {
         assert!(intr.danger.contains_key(&i8));
         // transferToImmutable is absent at this pin and NOT danger-listed
         // (reads undefined, matching Node 24.5).
-        assert!(intr
-            .miss_danger(intr.array_buffer_proto, &PropKey::from_str("transferToImmutable"))
-            .is_none());
+        assert!(
+            intr.miss_danger(intr.array_buffer_proto, &PropKey::from_str("transferToImmutable"))
+                .is_none()
+        );
     }
 }

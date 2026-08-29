@@ -99,6 +99,47 @@ pub(crate) fn input_range_constraint(var: &Formula, width: u32, signed: bool) ->
     ])
 }
 
+/// The exact mathematical carrier of a Rust scalar lowered to `Sort::Int`.
+///
+/// `char` must remain distinct from `u32`: its valid values stop at
+/// `char::MAX` and exclude the surrogate interval. Treating it as an ordinary
+/// 32-bit unsigned integer is conservative for proof attempts but is unsound
+/// for bidirectional lanes that consume SAT as an executable counterexample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustScalarRange {
+    Integer { width: u32, signed: bool },
+    Char,
+}
+
+#[must_use]
+pub(crate) fn rust_scalar_range(ty: &Ty) -> Option<RustScalarRange> {
+    if matches!(ty, Ty::Char) {
+        return Some(RustScalarRange::Char);
+    }
+    Some(RustScalarRange::Integer { width: ty.int_width()?, signed: ty.is_signed() })
+}
+
+/// Constrain an integer-sorted value to the exact Rust scalar carrier.
+#[must_use]
+pub(crate) fn rust_scalar_range_constraint(var: &Formula, range: RustScalarRange) -> Formula {
+    match range {
+        RustScalarRange::Integer { width, signed } => input_range_constraint(var, width, signed),
+        RustScalarRange::Char => Formula::And(vec![
+            Formula::Le(Box::new(Formula::Int(0)), Box::new(var.clone())),
+            Formula::Le(Box::new(var.clone()), Box::new(Formula::Int(char::MAX as i128))),
+            Formula::Or(vec![
+                Formula::Le(Box::new(var.clone()), Box::new(Formula::Int(0xD7FF))),
+                Formula::Ge(Box::new(var.clone()), Box::new(Formula::Int(0xE000))),
+            ]),
+        ]),
+    }
+}
+
+#[must_use]
+pub(crate) fn rust_type_range_constraint(var: &Formula, ty: &Ty) -> Option<Formula> {
+    Some(rust_scalar_range_constraint(var, rust_scalar_range(ty)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +257,22 @@ mod tests {
     fn test_signed_min_max_i128() {
         assert_eq!(signed_min(128), i128::MIN);
         assert_eq!(signed_max(128), i128::MAX);
+    }
+
+    #[test]
+    fn char_range_is_not_the_u32_range() {
+        let c = Formula::Var("c".into(), Sort::Int);
+        assert_eq!(
+            rust_type_range_constraint(&c, &Ty::Char),
+            Some(Formula::And(vec![
+                Formula::Le(Box::new(Formula::Int(0)), Box::new(c.clone())),
+                Formula::Le(Box::new(c.clone()), Box::new(Formula::Int(char::MAX as i128)),),
+                Formula::Or(vec![
+                    Formula::Le(Box::new(c.clone()), Box::new(Formula::Int(0xD7FF))),
+                    Formula::Ge(Box::new(c), Box::new(Formula::Int(0xE000))),
+                ]),
+            ]))
+        );
     }
 
     #[test]

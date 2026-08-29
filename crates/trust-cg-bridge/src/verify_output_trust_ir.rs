@@ -431,26 +431,21 @@ fn overflow_flag_formula(
     wrapped: &Formula,
 ) -> Result<Formula, String> {
     let xor = |x: &Formula, y: &Formula| Formula::BvXor(b(x.clone()), b(y.clone()), width);
-    let sign_bit_set = |f: Formula| {
-        Formula::BvSLt(b(f), b(Formula::BitVec { value: 0, width }), width)
-    };
+    let sign_bit_set =
+        |f: Formula| Formula::BvSLt(b(f), b(Formula::BitVec { value: 0, width }), width);
     Ok(match (op, signed) {
         (OverflowOp::AddOverflow, false) => {
             Formula::BvULt(b(wrapped.clone()), b(lhs.clone()), width)
         }
-        (OverflowOp::SubOverflow, false) => {
-            Formula::BvULt(b(lhs.clone()), b(rhs.clone()), width)
-        }
+        (OverflowOp::SubOverflow, false) => Formula::BvULt(b(lhs.clone()), b(rhs.clone()), width),
         (OverflowOp::AddOverflow, true) => sign_bit_set(Formula::BvAnd(
             b(Formula::BvNot(b(xor(lhs, rhs)), width)),
             b(xor(lhs, wrapped)),
             width,
         )),
-        (OverflowOp::SubOverflow, true) => sign_bit_set(Formula::BvAnd(
-            b(xor(lhs, rhs)),
-            b(xor(lhs, wrapped)),
-            width,
-        )),
+        (OverflowOp::SubOverflow, true) => {
+            sign_bit_set(Formula::BvAnd(b(xor(lhs, rhs)), b(xor(lhs, wrapped)), width))
+        }
         (OverflowOp::MulOverflow, _) => {
             return Err(format!(
                 "checked MULTIPLY at {width} bits: the lowering computes its flag through a \
@@ -514,11 +509,7 @@ enum SigPosition {
 /// Narrow integers are the opposite case: `arg_ext: None` means they DO reach
 /// the F1 path — measured, a `-> u8` function compiles and emits through
 /// `-Ztrust-cg-frontend=trust-ir`.)
-fn signature_reg_width(
-    module: &Module,
-    ty: &IrTy,
-    position: SigPosition,
-) -> Result<u32, String> {
+fn signature_reg_width(module: &Module, ty: &IrTy, position: SigPosition) -> Result<u32, String> {
     if matches!(ty, IrTy::Bool) && position == SigPosition::Parameter {
         return Err(
             "`bool` in PARAMETER position: its carrier is an i8 the CALLER wrote, and while \
@@ -731,9 +722,9 @@ fn eval_ir_block(
     // provably cannot distinguish from the one that produced the entry.
     let memo_key = ev.key_for(id.index(), env);
     if let Some(key) = &memo_key {
-        if let Some(hit) = ev.memo.get(&id.index()).and_then(|entries| {
-            entries.iter().find(|e| e.key == *key)
-        }) {
+        if let Some(hit) =
+            ev.memo.get(&id.index()).and_then(|entries| entries.iter().find(|e| e.key == *key))
+        {
             return Ok(IrOutcome { value: hit.value.clone(), reach: hit.reach.clone() });
         }
     }
@@ -1062,10 +1053,7 @@ fn eval_ir_inst(
                 }
                 other => return Err(format!("constant {other:?} is not modeled (fail-closed)")),
             };
-            Ok(IrValue {
-                f: Formula::BitVec { value: literal, width },
-                width,
-            })
+            Ok(IrValue { f: Formula::BitVec { value: literal, width }, width })
         }
         Inst::Copy { ty, operand } => {
             let width = scalar_reg_width(ty)?;
@@ -1111,9 +1099,7 @@ fn eval_ir_inst(
                 // `Bnot` -> `MVN`: bitwise complement at the register width.
                 IrUnOp::Not => Formula::BvNot(b(v), width),
                 // `Ineg` -> `NEG`: wrapping `0 - x`.
-                IrUnOp::Neg => {
-                    Formula::BvSub(b(Formula::BitVec { value: 0, width }), b(v), width)
-                }
+                IrUnOp::Neg => Formula::BvSub(b(Formula::BitVec { value: 0, width }), b(v), width),
                 other => {
                     return Err(format!("unary op {other:?} is not modeled (fail-closed)"));
                 }
@@ -1166,10 +1152,7 @@ fn eval_ir_inst(
                 b(c.f),
                 b(Formula::BitVec { value: 0, width: c.width }),
             )));
-            Ok(IrValue {
-                f: Formula::Ite(b(taken), b(t), b(e)),
-                width,
-            })
+            Ok(IrValue { f: Formula::Ite(b(taken), b(t), b(e)), width })
         }
         other => Err(format!(
             "instruction `{}` is outside the modeled fragment (fail-closed)",
@@ -1182,11 +1165,7 @@ fn eval_ir_inst(
 /// silently widen or truncate: an unexpected width means the IR is outside the
 /// shape this interpreter claims to model, and guessing would be exactly the
 /// kind of quiet fixup that fabricates a proof.
-fn operand_at(
-    env: &HashMap<ValueId, IrValue>,
-    id: ValueId,
-    width: u32,
-) -> Result<Formula, String> {
+fn operand_at(env: &HashMap<ValueId, IrValue>, id: ValueId, width: u32) -> Result<Formula, String> {
     let v = lookup(env, id)?;
     if v.width != width {
         return Err(format!(
@@ -1382,10 +1361,8 @@ fn live_in_sets(blocks: &HashMap<u32, &trust_ir::Block>) -> Option<HashMap<u32, 
         }
         r.extend(modeled_operands(&terminator.inst)?);
         d.extend(terminator.results.iter().copied());
-        let s: Vec<u32> = modeled_successors(&terminator.inst)?
-            .into_iter()
-            .map(|b| b.index())
-            .collect();
+        let s: Vec<u32> =
+            modeled_successors(&terminator.inst)?.into_iter().map(|b| b.index()).collect();
         // A successor the function lacks is a malformed CFG; the evaluator
         // reports it precisely, so bail out of the analysis rather than
         // silently treating it as a leaf.
@@ -1471,12 +1448,7 @@ struct SpecEval {
 
 impl SpecEval {
     fn new(blocks: &HashMap<u32, &trust_ir::Block>) -> Self {
-        SpecEval {
-            live_in: live_in_sets(blocks),
-            memo: HashMap::new(),
-            evals: 0,
-            side: Vec::new(),
-        }
+        SpecEval { live_in: live_in_sets(blocks), memo: HashMap::new(), evals: 0, side: Vec::new() }
     }
 
     /// The memo key for `id` under `env`, or `None` when `id` is not memoizable
@@ -1590,10 +1562,7 @@ pub fn verify_trust_ir_output_preserved(
     let obj = match backend.emit_object(&[lir]) {
         Ok(obj) => obj,
         Err(e) => {
-            return (
-                OutputVerdict::Unknown { reason: format!("emit_object failed: {e:?}") },
-                None,
-            );
+            return (OutputVerdict::Unknown { reason: format!("emit_object failed: {e:?}") }, None);
         }
     };
 
@@ -1733,8 +1702,7 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
     // A failure here is `Unknown`, NEVER `Refuted`: it means the gate could not
     // justify its own model of the IR, which is not evidence against the bytes.
     for (index, condition) in spec_side_conditions.iter().enumerate() {
-        let implication =
-            Formula::Or(vec![Formula::Not(b(spec_reach.clone())), condition.clone()]);
+        let implication = Formula::Or(vec![Formula::Not(b(spec_reach.clone())), condition.clone()]);
         match discharge_valid(&implication) {
             Discharge::Proven => {}
             Discharge::CounterExample => {
@@ -1766,10 +1734,8 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
         // `spec_reach -> machine_reach`, spelled as `NOT spec_reach OR
         // machine_reach` because that is the connective set `formula_to_term`
         // lowers into ay. Same claim, no new translator surface.
-        let implication = Formula::Or(vec![
-            Formula::Not(b(spec_reach.clone())),
-            machine_reach.clone(),
-        ]);
+        let implication =
+            Formula::Or(vec![Formula::Not(b(spec_reach.clone())), machine_reach.clone()]);
         match discharge_valid(&implication) {
             Discharge::Proven => {}
             Discharge::CounterExample => {
@@ -1871,8 +1837,7 @@ pub fn emit_trust_ir_module_object_verified(
                 // proved. Under StrictProvenOnly it is therefore REFUSED on the
                 // same footing as [VALIDATED] — a citation must never ship where
                 // only kernel-[PROVED] may.
-                ProvenEvidence::StructuralCitation { .. }
-                | ProvenEvidence::AyValidated => {
+                ProvenEvidence::StructuralCitation { .. } | ProvenEvidence::AyValidated => {
                     if policy == EmitPolicy::StrictProvenOnly {
                         return Err(VerifyError::Unknown {
                             function: source.symbol.clone(),
@@ -1890,10 +1855,7 @@ pub fn emit_trust_ir_module_object_verified(
             }
             OutputVerdict::Unknown { reason } => {
                 if policy == EmitPolicy::StrictProvenOnly {
-                    return Err(VerifyError::Unknown {
-                        function: source.symbol.clone(),
-                        reason,
-                    });
+                    return Err(VerifyError::Unknown { function: source.symbol.clone(), reason });
                 }
                 report.unknown += 1;
             }
@@ -1903,8 +1865,7 @@ pub fn emit_trust_ir_module_object_verified(
             None => {
                 return Err(VerifyError::EmitFailed {
                     function: source.symbol.clone(),
-                    reason: "verification emission produced no shippable object bytes"
-                        .to_string(),
+                    reason: "verification emission produced no shippable object bytes".to_string(),
                 });
             }
         }
@@ -2892,10 +2853,7 @@ mod tests_ptr_carrier_and_shift_range {
         let source = build(&[Ty::FatPtr(FatPtrKind::Str)], Ty::U64, Vec::new(), ValueId::new(0));
         let err = trust_ir_function_semantics(&source.module, source.func_id)
             .expect_err("a fat pointer must not derive a spec");
-        assert!(
-            err.contains("outside the modeled scalar fragment"),
-            "unexpected reason: {err}"
-        );
+        assert!(err.contains("outside the modeled scalar fragment"), "unexpected reason: {err}");
     }
 
     /// `fn(x: u8, n: u8) -> u8 { x << n }`, with the IR's shift-overflow assert
@@ -3011,11 +2969,9 @@ mod tests_ptr_carrier_and_shift_range {
     /// mod-width masking already IS the hardware's reduction.
     #[test]
     fn side_conditions_are_emitted_only_where_the_width_needs_them() {
-        let narrow = trust_ir_function_semantics(
-            &narrow_shift(true).module,
-            narrow_shift(true).func_id,
-        )
-        .expect("narrow spec");
+        let narrow =
+            trust_ir_function_semantics(&narrow_shift(true).module, narrow_shift(true).func_id)
+                .expect("narrow spec");
         assert_eq!(narrow.side_conditions.len(), 1, "an 8-bit shift owes one range obligation");
 
         let wide = build(
@@ -3123,8 +3079,7 @@ mod tests_checked_arithmetic {
             } else {
                 Formula::BvSub(b(ext(&a)), b(ext(&c)), W + 1)
             };
-            let definitional =
-                Formula::Not(b(Formula::Eq(b(ext(&wrapped)), b(wide))));
+            let definitional = Formula::Not(b(Formula::Eq(b(ext(&wrapped)), b(wide))));
 
             match discharge_valid(&iff(shipped, definitional)) {
                 Discharge::Proven => {}

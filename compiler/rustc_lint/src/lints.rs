@@ -308,16 +308,20 @@ pub(crate) struct BuiltinTypeAliasBounds<'hir> {
 
 impl<'a> Diagnostic<'a, ()> for BuiltinTypeAliasBounds<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
-        let mut diag = Diag::new(dcx, level, if self.in_where_clause {
-            msg!("where clauses on type aliases are not enforced")
-        } else {
-            msg!("bounds on generic parameters in type aliases are not enforced")
-        })
-            .with_span_label(self.label, msg!("will not be checked at usage sites of the type alias"))
-            .with_note(msg!(
-                "this is a known limitation of the type checker that may be lifted in a future edition.
+        let mut diag = Diag::new(
+            dcx,
+            level,
+            if self.in_where_clause {
+                msg!("where clauses on type aliases are not enforced")
+            } else {
+                msg!("bounds on generic parameters in type aliases are not enforced")
+            },
+        )
+        .with_span_label(self.label, msg!("will not be checked at usage sites of the type alias"))
+        .with_note(msg!(
+            "this is a known limitation of the type checker that may be lifted in a future edition.
                 see issue #112792 for more information"
-            ));
+        ));
         if self.enable_feat_help {
             diag.help(msg!("add `#![feature(lazy_type_alias)]` to the crate attributes to enable the desired semantics"));
         }
@@ -1019,9 +1023,7 @@ pub(crate) enum InvalidReferenceCastingDiag<'tcx> {
     #[diag(
         "casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`"
     )]
-    #[note(
-        "for more information, see the Trust Book's interior mutability chapter"
-    )]
+    #[note("for more information, see the Trust Book's interior mutability chapter")]
     BorrowAsMut {
         #[label("casting happened here")]
         orig_cast: Option<Span>,
@@ -1031,9 +1033,7 @@ pub(crate) enum InvalidReferenceCastingDiag<'tcx> {
         ty_has_interior_mutability: bool,
     },
     #[diag("assigning to `&T` is undefined behavior, consider using an `UnsafeCell`")]
-    #[note(
-        "for more information, see the Trust Book's interior mutability chapter"
-    )]
+    #[note("for more information, see the Trust Book's interior mutability chapter")]
     AssignToRef {
         #[label("casting happened here")]
         orig_cast: Option<Span>,
@@ -2312,9 +2312,7 @@ pub(crate) enum UnpredictableFunctionPointerComparisons<'a, 'tcx> {
     #[note(
         "furthermore, different functions could have the same address after being merged together"
     )]
-    #[note(
-        "for more information, see the Trust core pointer documentation for `fn_addr_eq`"
-    )]
+    #[note("for more information, see the Trust core pointer documentation for `fn_addr_eq`")]
     Suggestion {
         #[subdiagnostic]
         sugg: UnpredictableFunctionPointerComparisonsSuggestion<'a, 'tcx>,
@@ -2326,9 +2324,7 @@ pub(crate) enum UnpredictableFunctionPointerComparisons<'a, 'tcx> {
     #[note(
         "furthermore, different functions could have the same address after being merged together"
     )]
-    #[note(
-        "for more information, see the Trust core pointer documentation for `fn_addr_eq`"
-    )]
+    #[note("for more information, see the Trust core pointer documentation for `fn_addr_eq`")]
     Warn,
 }
 
@@ -2669,9 +2665,7 @@ pub(crate) struct UnitBindingsDiag {
 pub(crate) enum InvalidAsmLabel {
     #[diag("avoid using named labels in inline assembly")]
     #[help("only local labels of the form `<number>:` should be used in inline asm")]
-    #[note(
-        "see the Trust By Example inline assembly labels section for more information"
-    )]
+    #[note("see the Trust By Example inline assembly labels section for more information")]
     Named {
         #[note("the label may be declared in the expansion of a macro")]
         missing_precise_span: bool,
@@ -2679,9 +2673,7 @@ pub(crate) enum InvalidAsmLabel {
     #[diag("avoid using named labels in inline assembly")]
     #[help("only local labels of the form `<number>:` should be used in inline asm")]
     #[note("format arguments may expand to a non-numeric value")]
-    #[note(
-        "see the Trust By Example inline assembly labels section for more information"
-    )]
+    #[note("see the Trust By Example inline assembly labels section for more information")]
     FormatArg {
         #[note("the label may be declared in the expansion of a macro")]
         missing_precise_span: bool,

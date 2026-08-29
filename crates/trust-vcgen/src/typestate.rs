@@ -367,22 +367,31 @@ pub fn extract_enum_step_machine(
     /// Follow at most a few `Goto`s from `block_id`, returning the field-less enum
     /// `Aggregate` variant assigned to the return slot `_0`, if any.
     fn output_variant(body: &trust_types::VerifiableBody, mut block_id: BlockId) -> Option<usize> {
+        let mut output = None;
         for _ in 0..8 {
             let block = body.blocks.iter().find(|b| b.id == block_id)?;
             for stmt in &block.stmts {
-                if let Statement::Assign {
-                    place,
-                    rvalue: Rvalue::Aggregate(AggregateKind::Adt { variant, .. }, _),
-                    ..
-                } = stmt
-                    && place.local == 0
-                    && place.projections.is_empty()
-                {
-                    return Some(*variant);
+                let Statement::Assign { place, rvalue, .. } = stmt else { continue };
+                if place.local != 0 || !place.projections.is_empty() {
+                    continue;
+                }
+                // The result slot must have one exact enum definition on the
+                // followed arm.  Returning immediately on the first matching
+                // assignment used to hide a later Call/TailCall (which can
+                // overwrite `_0`, panic, or diverge) and later `_0` writes.
+                let Rvalue::Aggregate(AggregateKind::Adt { variant, .. }, _) = rvalue else {
+                    return None;
+                };
+                if output.replace(*variant).is_some() {
+                    return None;
                 }
             }
             match &block.terminator {
                 Terminator::Goto(next) => block_id = *next,
+                Terminator::Return => return output,
+                // In particular, a TailCall returns the callee's result to the
+                // original caller; it does not return the `_0` aggregate above.
+                Terminator::TailCall { .. } => return None,
                 _ => return None,
             }
         }
@@ -773,6 +782,26 @@ mod tests {
         // Switch values {0, 2} are not contiguous from 0 → decline (sound).
         let func = enum_step_func(&[(0, 0), (2, 2)]);
         assert!(extract_enum_step_machine(&func).is_none());
+    }
+
+    #[test]
+    fn test_extract_enum_step_declines_an_arm_that_tail_calls_after_assigning_result() {
+        use trust_types::{SourceSpan, Terminator};
+
+        let mut func = enum_step_func(&[(0, 0)]);
+        func.body.blocks[2].terminator = Terminator::TailCall {
+            func: "step::replacement".into(),
+            args: Vec::new(),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+        };
+        assert!(
+            extract_enum_step_machine(&func).is_none(),
+            "a TailCall returns its callee result, not the stale `_0` assignment"
+        );
     }
 
     #[test]

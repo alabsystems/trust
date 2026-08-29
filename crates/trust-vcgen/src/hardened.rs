@@ -211,11 +211,12 @@ pub fn profile_enables_hardened(profile: Option<&str>) -> bool {
 pub(crate) fn generate_hardened_vcs(
     func: &VerifiableFunction,
     enabled: bool,
+    summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> Vec<VerificationCondition> {
     if !enabled {
         return Vec::new();
     }
-    generate_hardened_vcs_for_profile(func)
+    generate_hardened_vcs_for_profile_with_summaries(func, summaries)
 }
 
 /// The function's preconditions that mention a capability predicate
@@ -247,6 +248,50 @@ fn formula_mentions_pred(f: &Formula) -> bool {
 
 pub(crate) fn generate_hardened_vcs_for_profile(
     func: &VerifiableFunction,
+) -> Vec<VerificationCondition> {
+    generate_hardened_vcs_for_profile_with_summaries(func, None)
+}
+
+/// Summary-aware [`generate_hardened_vcs_for_profile`].
+///
+/// Trust (B2 — the hardened twin was DEAF to postcondition composition): the
+/// hardened panic-boundary lane is a TWIN of the per-statement arithmetic/bounds
+/// lane — same asserts, same blocks — and every fact channel this file threads
+/// (block defs, cross-block reaching defs, slice-yield guards, global invariant
+/// facts, preconditions, dominating path guards, arg type ranges) exists because
+/// the two lanes must carry IDENTICAL hypotheses or the twin over-refutes code
+/// the primary lane proves. The SEMANTIC GUARD MAP — the channel that carries
+/// stdlib total-call dest facts AND each proved callee's rebound `ensures` — was
+/// the one channel never threaded here, and `summaries` was not even a parameter,
+/// so the fact could not reach this lane at all.
+///
+/// Measured consequence (`use_gppre`, `requires x > 0` + `ensures result > 0`):
+/// `--no-hardened` FULLY VERIFIED, the default `unix_hardened` profile FAILED
+/// with `mir_assert::Overflow(Mul)` and the counterexample `x = 1,
+/// y = -715827883` — a witness that VIOLATES the composed postcondition, i.e.
+/// the twin was refuting with a state the callee's proved contract excludes.
+/// Since `targo trust check` enables `unix_hardened` BY DEFAULT while the UI
+/// fixtures run with no profile at all, composition worked in the tests and not
+/// in production.
+///
+/// SOUNDNESS: this is the same monotone direction as every other channel above.
+/// A hardened VC is a REFUTATION query (SAT ⇒ the boundary can panic), so
+/// conjoining hypotheses can only shrink the model set — turning a spurious
+/// refutation into a proof, never a real panic into one. It cannot weaken what
+/// the twin can refute beyond the facts' own truth, and the facts' truth is
+/// exactly what the summary lane already gates: `build_semantic_guard_map_with_
+/// summaries` threads a callee's `ensures` only when the summary carries the
+/// reuse bit, which the compiler sets only after discharging that callee's OWN
+/// postcondition obligation in this same compilation, and it threads a
+/// preconditioned callee's clause as the IMPLICATION `requires -> ensures` the
+/// callee actually proved. So a callee with a false `ensures` contributes
+/// nothing, and a callee called out of contract contributes a vacuous
+/// implication — both negative halves are pinned by fixtures under the DEFAULT
+/// hardened profile (`hardened_composition_needs_proved_ensures.rs`,
+/// `hardened_composition_needs_discharge.rs`).
+pub(crate) fn generate_hardened_vcs_for_profile_with_summaries(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> Vec<VerificationCondition> {
     let calls = collect_calls(func);
     let mut vcs = Vec::new();
@@ -341,7 +386,7 @@ pub(crate) fn generate_hardened_vcs_for_profile(
         }
     }
 
-    append_assert_panic_vcs(func, &mut vcs);
+    append_assert_panic_vcs(func, summaries, &mut vcs);
     append_permission_window_vcs(func, &calls, &mut vcs);
     append_trust_boundary_order_vcs(func, &calls, &mut vcs);
     append_unclassified_opaque_vcs(func, &mut vcs);
@@ -353,7 +398,8 @@ fn collect_calls(func: &VerifiableFunction) -> Vec<CallSite> {
     let mut calls = Vec::new();
     for block in &func.body.blocks {
         match &block.terminator {
-            Terminator::Call { func: callee, span, .. } => {
+            Terminator::Call { func: callee, span, .. }
+            | Terminator::TailCall { func: callee, span, .. } => {
                 calls.push(CallSite {
                     ordinal: block.id.0,
                     callee: callee.clone(),
@@ -542,7 +588,11 @@ fn is_trust_domain_late_effect(callee: &str) -> bool {
         || call_matches(callee, "dlopen")
 }
 
-fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<VerificationCondition>) {
+fn append_assert_panic_vcs(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
+    vcs: &mut Vec<VerificationCondition>,
+) {
     // Trust: drop a precondition at any assert whose block may have reassigned one
     // of the precondition's free variables on the way in — an entry contract
     // `lo <= hi` is stale after `hi = big` and would vacuously discharge a real
@@ -603,32 +653,27 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
     // assert's own index/length qualifies; an unguarded index stays refutable).
     let bounds_yield_skip = crate::generate::v2_boundscheck_index_in_range_skip_set(func);
 
+    // Trust (B2): the per-block semantic guard map — the SAME map, built the SAME
+    // way, that `generate_v2_safety_vcs_impl_with_origins` conjoins onto every
+    // per-statement safety VC (`safety.rs`, `let semantic_guards = match summaries
+    // {..}`). It carries the stdlib total-call dest facts AND, when a summary
+    // database is present, each PROVED callee's `ensures` rebound to this call site
+    // (formals→actuals, `_0`→dest) and version-pinned to the dest's post-call SSA
+    // token. Without it the hardened twin refutes `y * 3` with a `y` the callee's
+    // proved postcondition forbids. See the soundness note on
+    // `generate_hardened_vcs_for_profile_with_summaries`.
+    let semantic_guards = match summaries {
+        Some(s) => crate::generate::build_semantic_guard_map_with_summaries(func, s),
+        None => crate::generate::build_semantic_guard_map(func),
+    };
+
     for block in &func.body.blocks {
         // `unwind: _`: hardened panic-boundary VC uses only the assert's own fields;
         // the cleanup successor is an unguarded CFG edge handled elsewhere.
-        let Terminator::Assert { cond, expected, msg, span, target, unwind: _ } =
-            &block.terminator
+        let Terminator::Assert { cond, expected, msg, span, target, unwind: _ } = &block.terminator
         else {
             continue;
         };
-
-        // Trust #soundness: a DivisionByZero/RemainderByZero assert whose divisor is
-        // a nonzero CONSTANT (e.g. `len % 3`, `len / 4`, `len / 2`) can NEVER panic
-        // at runtime, so there is no panic boundary to harden. The per-statement
-        // Div/Rem safety VC is already suppressed for this case
-        // (generate::v2_divisor_is_nonzero_constant; see generate.rs Div/Rem arms),
-        // which leaves the hardened twin with NO proved sibling to subsume it — it
-        // then surfaces spuriously as a DESIGN-REQUIREMENT. Skip emitting the twin
-        // when the divisor is a nonzero constant, mirroring the per-statement skip.
-        // Sound: dropping an obligation for an operation that is provably panic-free
-        // can never mask a real panic; a SYMBOLIC or zero divisor does NOT match
-        // (fail-closed) and still gets its twin (and a real div-by-zero stays
-        // refutable).
-        if matches!(msg, AssertMessage::DivisionByZero | AssertMessage::RemainderByZero)
-            && crate::generate::v2_block_divrem_divisor_is_nonzero_constant(func, block)
-        {
-            continue;
-        }
 
         // Trust #soundness: a BoundsCheck assert whose index is PROVABLY in range —
         // a `for i in 0..s.len()` range-yield bound or a `for (i, _) in
@@ -677,7 +722,9 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
         // unguarded operand carries none, so a real overflow stays SAT/refutable.
         // Widths <= 64 stay on the Int path (the native i64-LIA decides them losslessly
         // AND the Int path keeps the conjoined guards/defs the BV core would drop).
-        if let Some(bv_formula) = hardened_signed_bv_overflow_formula(func, block, msg, *target) {
+        if let Some(bv_formula) =
+            hardened_signed_bv_overflow_formula(func, block, msg, cond, *expected, *target)
+        {
             vcs.push(hardened_vc_with_formula(
                 func,
                 span,
@@ -697,35 +744,43 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
         // operand-based no-overflow condition instead (the same precise encoding
         // the per-statement arithmetic-safety VC proves with): `extract_assert_
         // passed_semantics` returns `[in_range, result_def, lhs_range, rhs_range,
-        // ..]` (operand ranges source-width-tightened), so the violation is
-        // `NOT in_range` under those hypotheses — a safe op discharges, while a
-        // genuinely-overflowing one (`u32 + u32`) still fails (its operands are not
-        // cast-narrowed, so `in_range` is violable).
+        // ..]` (operand ranges source-width-tightened), so the violation is the
+        // NEGATION of `in_range` under those hypotheses — a safe op discharges,
+        // while a genuinely-overflowing one (`u32 + u32`) still fails (its operands
+        // are not cast-narrowed, so `in_range` is violable). That negation is
+        // SPELLED as the canonical `r < min ∨ r > max` disjunction, not as
+        // `Not(in_range)`; see the `#222` note at the push below for why the
+        // syntax — not just the proposition — is load-bearing.
         let checked_facts = guards::extract_assert_passed_semantics(func, block);
-        // Trust #soundness: a SHIFT-overflow assert (`Overflow(Shl)`/`Overflow(Shr)`)
-        // takes the dedicated, lowerable shift VIOLATION (`amount >= width`) as its
-        // base, NOT the generic operand-range encoding from
-        // `extract_assert_passed_semantics`. That generic encoding is built for
-        // arithmetic CheckedBinaryOp asserts; for a shift the native typed-CHC lane
-        // cannot lower it, so the hardened twin carried no publishable proof evidence
-        // (a3d-kernel `octree_node_count`'s `1u64 << exp` — the lone 84/85 hardened
-        // gate miss). The violation is the SAME formula the per-statement
-        // `ShiftOverflow` VC proves; the block-def / reaching-def / dominating-guard /
-        // precondition conjoining below then supplies the `amount < width` guard, so a
-        // guarded shift PROVES and an unguarded one still REFUTES. Falls back to the
-        // generic path if the shift operands can't be recovered.
-        let shift_violation = match msg {
-            AssertMessage::Overflow(op @ (BinOp::Shl | BinOp::Shr)) => {
-                crate::generate::v2_assert_shift_violation_formula(func, block, *target, *op)
-            }
-            _ => None,
-        };
-        let mut formula = match shift_violation {
-            Some(violation) => violation,
-            None => match checked_facts.split_first() {
+        let mut formula = if matches!(msg, AssertMessage::Overflow(BinOp::Shl | BinOp::Shr)) {
+            // A caller-controlled message and unique target shift do not bind
+            // the runtime condition to that operation. Preserve the exact
+            // assertion failure; the target shift has its own safety VC.
+            assert_failure_formula(func, cond, *expected)
+        } else {
+            match checked_facts.split_first() {
                 Some((in_range, hyps)) => {
                     let mut conj = Vec::with_capacity(hyps.len() + 1);
-                    conj.push(Formula::Not(Box::new(in_range.clone())));
+                    // Trust (#222, 2026-08-27): emit the violation in the CANONICAL
+                    // disjunctive spelling `r < min ∨ r > max` — the same term the
+                    // per-statement `[arithmetic_overflow_*]` row emits and the same
+                    // term the Clean kernel's `noOverflow` reflection names. This
+                    // used to be the hand-rolled De Morgan dual
+                    // `Not(And([Le(min,r), Le(r,max)]))`, which is the SAME
+                    // proposition but is invisible to
+                    // `certify_disjunctive_contradiction` — that recognizer builds
+                    // its kernel proof by case-splitting a `Formula::Or`, so the
+                    // negated conjunction was never handed to it and the interval
+                    // solver's `Proved` was dropped as lacking proof authority. The
+                    // fix belongs here, not in the certifier: the recognizer stays
+                    // as narrow as it is and the twin carries its primary's syntax.
+                    // Falls back to the old dual only where the canonical
+                    // constructor declines, which `guards`' biconditional test
+                    // proves cannot happen once `split_first` succeeded.
+                    conj.push(
+                        guards::checked_binop_out_of_range_violation(func, block)
+                            .unwrap_or_else(|| Formula::Not(Box::new(in_range.clone()))),
+                    );
                     // `extract_assert_passed_semantics` also carries the
                     // success-only `_N.0 ==` unbounded-result equation. MIR's
                     // value field wraps on overflow, so that Eq is false on the
@@ -738,7 +793,7 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
                     Formula::And(conj)
                 }
                 None => assert_failure_formula(func, cond, *expected),
-            },
+            }
         };
         formula = formula_with_block_definitions(func, block, formula);
 
@@ -847,6 +902,43 @@ fn append_assert_panic_vcs(func: &VerifiableFunction, vcs: &mut Vec<Verification
         // unguarded operand carries no bound, so a real overflow/underflow stays
         // SAT/refutable.
         formula = conjoin_dominating_path_guards(func, block.id, formula);
+        // Trust (B2): conjoin this block's semantic guards — stdlib total-call dest
+        // facts plus each proved callee's rebound `ensures`. Placed HERE, after the
+        // version rename (`conjoin_preconditions_versioned`) and after the
+        // dominating path guards, so the map's own version-pinned tokens are
+        // EXEMPT from the rename — byte-identical ordering to the per-statement
+        // lane, which applies path guards then semantic guards after its own rename
+        // (`safety.rs`, the two `for (block_id, vc) in &mut block_vcs` passes under
+        // the "Trust S2c (exemption)" comment). The push is `And([facts.., formula])`
+        // with the facts FIRST, the same shape that lane uses. Empty for every block
+        // with no such fact, so this is a no-op outside the composition/stdlib case.
+        //
+        // Trust #soundness: filtered by `killed`, exactly like the cross-block
+        // reaching defs above and UNLIKE the per-statement lane, which conjoins
+        // this map unfiltered. The unfiltered form is defensible on the S2c
+        // name-disjointness argument (a fact is version-pinned at its establish
+        // point, so it names a different SMT symbol than a reassigned read), and it
+        // is what the primary lane relies on. But it also re-admits the shape
+        // `hardened_panic_boundary_drops_stale_dominating_guard` exists to refuse:
+        // a bool def `c == (hi <= 1000)` surviving alongside `c` in a block that
+        // reassigned `hi`. That test caught the unfiltered version. Keeping the
+        // filter costs nothing the composition case needs — a call dest that the
+        // block does not reassign is not in `killed`, so a proved callee's `ensures`
+        // survives — and it keeps this refuting lane strictly more conservative than
+        // the lane it twins. DROP-ONLY: dropping a hypothesis can only turn a PROVE
+        // into a FAIL, never the reverse.
+        if let Some(sem_guards) = semantic_guards.get(&block.id) {
+            let live: Vec<Formula> = sem_guards
+                .iter()
+                .filter(|g| crate::generate::formula_survives_redefs(g, killed))
+                .cloned()
+                .collect();
+            if !live.is_empty() {
+                let mut conj = live;
+                conj.push(formula);
+                formula = Formula::And(conj);
+            }
+        }
         // Trust: bound every integer parameter to its type range, exactly as the
         // per-statement arithmetic-safety overflow VC does. Without this the
         // hardened MIR-assert boundary OVER-REFUTES a provably-safe widened add
@@ -919,9 +1011,13 @@ fn hardened_signed_bv_overflow_formula(
     func: &VerifiableFunction,
     block: &BasicBlock,
     msg: &AssertMessage,
+    cond: &Operand,
+    expected: bool,
     target: BlockId,
 ) -> Option<Formula> {
-    crate::generate::v2_hardened_signed_bv_overflow_formula(func, block, msg, target)
+    crate::generate::v2_hardened_signed_bv_overflow_formula(
+        func, block, msg, cond, expected, target,
+    )
 }
 
 fn formula_with_block_definitions(
@@ -993,10 +1089,9 @@ fn hardened_vc_with_formula(
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Sort, SourceSpan,
-        Statement, Terminator, Ty, VerifiableBody,
+        Statement, Terminator, Ty, UnwindEdge, VerifiableBody,
     };
 
     use super::*;
@@ -1008,6 +1103,7 @@ mod tests {
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
+                callee_identity: None,
                 is_foreign: false,
                 func: callee.to_string(),
                 args: vec![Operand::Constant(ConstValue::Unit)],
@@ -1596,6 +1692,119 @@ mod tests {
         );
     }
 
+    /// Caller: `let v = pick(41, 7);` then a panic boundary in the successor
+    /// block — the shape the hardened twin refutes and the per-statement lane
+    /// proves. `pick`'s summary pins `_0 == a0`, so a threaded summary makes the
+    /// value of `v` KNOWN (41) at the boundary.
+    fn caller_of_pick_then_boundary() -> VerifiableFunction {
+        VerifiableFunction {
+            name: "caller".to_string(),
+            def_path: "test::caller".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::usize(), name: Some("v".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            unwind: UnwindEdge::Unreachable,
+                            is_unsafe_sig: false,
+                            is_foreign: false,
+                            callee_identity: None,
+                            func: "pick".to_string(),
+                            args: vec![
+                                Operand::Constant(ConstValue::Uint(41, 64)),
+                                Operand::Constant(ConstValue::Uint(7, 64)),
+                            ],
+                            dest: Place::local(1),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![],
+                        terminator: Terminator::Assert {
+                            unwind: UnwindEdge::Unreachable,
+                            cond: Operand::Constant(ConstValue::Bool(false)),
+                            expected: true,
+                            msg: AssertMessage::Custom("boundary".into()),
+                            target: BlockId(2),
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    /// Trust (B2): the hardened panic-boundary twin must receive the SAME
+    /// call-site postcondition assumption the per-statement lane receives.
+    ///
+    /// Before the fix this lane took no `SummaryDatabase` at all, so the fact
+    /// could not reach it in principle: the twin refuted `v * 3` with a `v` the
+    /// callee's PROVED `ensures` forbids, and because `targo trust check` turns
+    /// `unix_hardened` on by default while the UI fixtures pass no profile, the
+    /// gap was invisible to the test suite. Pinned in BOTH directions so the
+    /// test cannot pass by the channel merely existing.
+    #[test]
+    fn hardened_panic_boundary_receives_callee_postcondition() {
+        use crate::modular::{FunctionSummary, SummaryDatabase};
+
+        let func = caller_of_pick_then_boundary();
+        let post = Formula::Eq(
+            Box::new(Formula::var("_0", Sort::Int)),
+            Box::new(Formula::var("a0", Sort::Int)),
+        );
+        let mut db = SummaryDatabase::new();
+        db.insert(
+            FunctionSummary::new("pick")
+                .with_param_names(vec!["a0".to_string(), "a1".to_string()])
+                .with_definitional_postcondition(post),
+        );
+
+        let with_summaries =
+            generate_hardened_vcs_for_profile_with_summaries(&func, Some(&db)).into_iter();
+        let with_smt = hardened_vc_for_category(
+            &with_summaries.collect::<Vec<_>>(),
+            HardenedVcCategory::PanicBoundary,
+        )
+        .formula
+        .to_smtlib();
+
+        // WITH the database the rebound clause `dest == 41` reaches the twin.
+        assert!(
+            with_smt.contains("41"),
+            "the hardened panic-boundary twin must carry the callee's rebound \
+             postcondition (`dest == 41`); got {with_smt}"
+        );
+
+        // WITHOUT it the twin carries no such fact — so the assertion above is
+        // testing the SUMMARY channel, not some other conjunct that mentions 41.
+        let without = generate_hardened_vcs_for_profile(&func);
+        let without_smt = hardened_vc_for_category(&without, HardenedVcCategory::PanicBoundary)
+            .formula
+            .to_smtlib();
+        assert!(
+            !without_smt.contains("41"),
+            "control: with no summary database the twin must NOT carry the \
+             postcondition fact; got {without_smt}"
+        );
+    }
+
     #[test]
     fn hardened_panic_boundary_conjoins_parameter_type_ranges() {
         // Regression for the panic_boundary OVER-REFUTATION: the hardened MIR-assert
@@ -1631,7 +1840,9 @@ mod tests {
     /// the primary lane proves — `d = discriminant(r); if d == Ok { r.unwrap() }`
     /// on a MODELED std `Result` receiver.
     fn guarded_unwrap_fixture(guarded: bool) -> VerifiableFunction {
-        let result_ty = Ty::Adt { adt_kind: None, layout: None, 
+        let result_ty = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "core::result::Result".into(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -1651,7 +1862,9 @@ mod tests {
                 },
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
         let unwrap_call = |target: usize| Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             func: "core::result::Result::<T, E>::unwrap".into(),
@@ -1661,6 +1874,7 @@ mod tests {
             span: SourceSpan::default(),
             atomic: None,
             is_unsafe_sig: false,
+            callee_identity: None,
             is_foreign: false,
         };
         let blocks = if guarded {
@@ -2349,7 +2563,13 @@ mod tests {
             name: "hash_bytes_nested_guard".to_string(),
             def_path: "crate::hash_bytes_nested_guard".to_string(),
             span: SourceSpan::default(),
-            body: VerifiableBody { locals, blocks, arg_count: 1, return_ty: Ty::Unit, datatype_defs: Default::default() },
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count: 1,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
             contracts: vec![],
             preconditions: vec![],
             postconditions: vec![],
@@ -2578,11 +2798,10 @@ mod tests {
 // ===========================================================================
 #[cfg(test)]
 mod hardened_signed_128_overflow_tests {
-    use trust_types::UnwindEdge;
     use trust_types::{
         AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Formula, HardenedVcCategory,
         LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan, Statement, Terminator, Ty,
-        VcKind, VerifiableBody, VerifiableFunction,
+        UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
     };
 
     use super::generate_hardened_vcs_for_profile;
@@ -2724,6 +2943,86 @@ mod hardened_signed_128_overflow_tests {
                 )
             })
             .unwrap_or_else(|| panic!("expected a hardened PanicBoundary VC matching {msg_needle:?}"))
+    }
+
+    #[test]
+    fn inverse_checked_overflow_assert_never_borrows_the_signed_bv_proof() {
+        let func = VerifiableFunction {
+            name: "inverse_checked_overflow".to_string(),
+            def_path: "test::inverse_checked_overflow".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: Some("return".into()) },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Tuple(vec![Ty::i128(), Ty::Bool]),
+                        name: Some("checked".into()),
+                    },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            1,
+                            Rvalue::CheckedBinaryOp(
+                                BinOp::Sub,
+                                Operand::Constant(ConstValue::Int(1)),
+                                Operand::Constant(ConstValue::Int(1)),
+                            ),
+                        )],
+                        // This deliberately inverted public assertion FAILS for
+                        // the safe subtraction above: the overflow flag is false,
+                        // while the terminator requires it to be true.
+                        terminator: Terminator::Assert {
+                            unwind: UnwindEdge::Unreachable,
+                            cond: Operand::Copy(Place::field(1, 1)),
+                            expected: true,
+                            msg: AssertMessage::Overflow(BinOp::Sub),
+                            target: BlockId(1),
+                            span: SourceSpan::binary_address(0x5a10),
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+
+        assert!(
+            crate::generate::v2_hardened_signed_bv_overflow_formula(
+                &func,
+                &func.body.blocks[0],
+                &AssertMessage::Overflow(BinOp::Sub),
+                &Operand::Copy(Place::field(1, 1)),
+                true,
+                BlockId(1),
+            )
+            .is_none(),
+            "expected=true is not the canonical rustc overflow assertion and must not mint BV authority"
+        );
+
+        let vc =
+            hardened_panic_vc(&generate_hardened_vcs_for_profile(&func), "Overflow(Sub)").clone();
+        assert!(
+            vc.formula.children().into_iter().chain(std::iter::once(&vc.formula)).any(|node| {
+                matches!(node, Formula::Not(inner)
+                    if matches!(inner.as_ref(), Formula::Var(name, trust_types::Sort::Bool)
+                        if name.contains("checked.1")))
+            }) || vc.formula.to_smtlib().contains("(not checked.1"),
+            "the hardened row must retain the actual inverse flag failure: {:?}",
+            vc.formula
+        );
+        assert!(
+            !vc.formula.to_smtlib().contains("__trust_ovf_bv_"),
+            "the safe subtraction's UNSAT BV overflow proposition would false-prove the inverted assertion"
+        );
     }
 
     /// `signed_max`'s trailing `_5 - 1`: bb0 guards `width <= 127`; bb1 computes

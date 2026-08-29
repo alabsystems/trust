@@ -357,7 +357,9 @@ fn call_chain_function() -> VerifiableFunction {
                 BasicBlock {
                     id: BlockId(0),
                     stmts: vec![],
-                    terminator: Terminator::Call { is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        is_unsafe_sig: false,
+                        is_foreign: false,
                         func: "complex::max".to_string(),
                         args: vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
                         dest: Place::local(5),
@@ -365,13 +367,16 @@ fn call_chain_function() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
+                        callee_identity: None,
                     },
                 },
                 // bb1: call clamp(max_result, lo, hi)
                 BasicBlock {
                     id: BlockId(1),
                     stmts: vec![],
-                    terminator: Terminator::Call { is_unsafe_sig: false, is_foreign: false,
+                    terminator: Terminator::Call {
+                        is_unsafe_sig: false,
+                        is_foreign: false,
                         func: "complex::clamp".to_string(),
                         args: vec![
                             Operand::Copy(Place::local(5)),
@@ -383,6 +388,7 @@ fn call_chain_function() -> VerifiableFunction {
                         span: SourceSpan::default(),
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
+                        callee_identity: None,
                     },
                 },
                 // bb2: return

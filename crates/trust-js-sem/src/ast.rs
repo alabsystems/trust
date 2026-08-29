@@ -5,8 +5,9 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
-use crate::value::Units;
 use std::rc::Rc;
+
+use crate::value::Units;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
@@ -181,17 +182,8 @@ pub enum MethodKind {
 /// One class element (besides the constructor, which lives on ClassLit).
 #[derive(Debug, Clone)]
 pub enum ClassMember {
-    Method {
-        stat: bool,
-        key: ClassKey,
-        mk: MethodKind,
-        lit: Rc<FuncLit>,
-    },
-    Field {
-        stat: bool,
-        key: ClassKey,
-        init: Option<Rc<Expr>>,
-    },
+    Method { stat: bool, key: ClassKey, mk: MethodKind, lit: Rc<FuncLit> },
+    Field { stat: bool, key: ClassKey, init: Option<Rc<Expr>> },
 }
 
 /// A class declaration/expression body.

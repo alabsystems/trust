@@ -11,7 +11,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use trust_js_sem::{evaluate_case, evaluate_case_opts, SemOutcome};
+
+use trust_js_sem::{SemOutcome, evaluate_case, evaluate_case_opts};
 use trust_js_trace::{explain_divergence, extract_trace, traces_equal};
 
 // Default corpus root: <repo>/build/js262/test262-<pinned rev>. Derived from
@@ -264,10 +265,7 @@ fn bootstrap_differential_vs_node() {
         let body_path = tmp.path().join(format!("{}.body.js", case.name));
         std::fs::write(&body_path, case.body).expect("write body");
         let includes_json: Vec<String> = if case.with_harness {
-            vec![
-                assert_path.display().to_string(),
-                sta_path.display().to_string(),
-            ]
+            vec![assert_path.display().to_string(), sta_path.display().to_string()]
         } else {
             Vec::new()
         };
@@ -280,8 +278,7 @@ fn bootstrap_differential_vs_node() {
         });
         let manifest_path = tmp.path().join(format!("{}.manifest.json", case.name));
         let mut mf = std::fs::File::create(&manifest_path).expect("create manifest");
-        mf.write_all(manifest.to_string().as_bytes())
-            .expect("write manifest");
+        mf.write_all(manifest.to_string().as_bytes()).expect("write manifest");
         drop(mf);
 
         let out = Command::new(&node)
@@ -314,11 +311,7 @@ fn bootstrap_differential_vs_node() {
         }
     }
 
-    assert!(
-        failures.is_empty(),
-        "bootstrap differential failures:\n{}",
-        failures.join("\n")
-    );
+    assert!(failures.is_empty(), "bootstrap differential failures:\n{}", failures.join("\n"));
 }
 
 /// Corpus cases from the 2026-07 calibration where the sem head previously
@@ -415,10 +408,7 @@ const GATE_S1B_REGRESSION_CASES: &[(&str, bool)] = &[
     // assignment-target and heritage early errors); the four acceptance
     // cases run to completion (super in method param defaults, escaped
     // `await` class name, escaped function names).
-    (
-        "test/language/expressions/assignmenttargettype/direct-arrowfunction-1.js",
-        true,
-    ),
+    ("test/language/expressions/assignmenttargettype/direct-arrowfunction-1.js", true),
     (
         "test/language/expressions/assignmenttargettype/parenthesized-primaryexpression-objectliteral.js",
         true,
@@ -431,17 +421,11 @@ const GATE_S1B_REGRESSION_CASES: &[(&str, bool)] = &[
         "test/language/expressions/class/elements/syntax/early-errors/class-heritage-array-literal-arrow-heritage.js",
         true,
     ),
-    (
-        "test/language/expressions/object/method-definition/name-super-prop-param.js",
-        true,
-    ),
+    ("test/language/expressions/object/method-definition/name-super-prop-param.js", true),
     ("test/language/statements/class/class-name-ident-await-escaped.js", true),
     ("test/language/statements/function/S14_A5_T1.js", true),
     ("test/language/statements/function/S14_A5_T2.js", true),
-    (
-        "test/built-ins/Function/prototype/Symbol.hasInstance/this-val-poisoned-prototype.js",
-        false,
-    ),
+    ("test/built-ins/Function/prototype/Symbol.hasInstance/this-val-poisoned-prototype.js", false),
     ("test/language/statements/for-of/head-decl-no-expr.js", true),
     ("test/language/statements/for-of/head-expr-no-expr.js", true),
     ("test/language/statements/for-of/head-var-no-expr.js", true),
@@ -477,11 +461,7 @@ fn gate_s1b_regression_cases_vs_node() {
             .unwrap_or_else(|e| panic!("read gate case {rel}: {e}"));
         for &strict in case_modes(&body) {
             let mode = if strict { "strict" } else { "bare" };
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let sem = evaluate_case_opts(&[&assert_src, &sta_src], &sem_body, false);
             let sem_trace = match sem {
                 SemOutcome::Trace(t) => t,
@@ -511,8 +491,7 @@ fn gate_s1b_regression_cases_vs_node() {
             });
             let manifest_path = tmp.path().join(format!("gate-{ci}.{mode}.manifest.json"));
             let mut mf = std::fs::File::create(&manifest_path).expect("create manifest");
-            mf.write_all(manifest.to_string().as_bytes())
-                .expect("write manifest");
+            mf.write_all(manifest.to_string().as_bytes()).expect("write manifest");
             drop(mf);
 
             let out = Command::new(&node)
@@ -526,9 +505,8 @@ fn gate_s1b_regression_cases_vs_node() {
             let node_trace = match extract_trace(&out.stdout) {
                 Ok(t) => t,
                 Err(e) => {
-                    failures.push(format!(
-                        "{rel} [{mode}]: node driver trace extraction failed: {e}"
-                    ));
+                    failures
+                        .push(format!("{rel} [{mode}]: node driver trace extraction failed: {e}"));
                     continue;
                 }
             };
@@ -542,11 +520,7 @@ fn gate_s1b_regression_cases_vs_node() {
         }
     }
 
-    assert!(
-        failures.is_empty(),
-        "s1b gate regression failures:\n{}",
-        failures.join("\n")
-    );
+    assert!(failures.is_empty(), "s1b gate regression failures:\n{}", failures.join("\n"));
 }
 
 /// Modes a case runs in, from its frontmatter flags (mirrors the calibration
@@ -557,10 +531,7 @@ fn case_modes(body: &str) -> &'static [bool] {
         .split_once("/*---")
         .and_then(|(_, rest)| rest.split_once("---*/"))
         .map_or("", |(fm, _)| fm);
-    let flags = fm
-        .lines()
-        .find(|l| l.trim_start().starts_with("flags:"))
-        .unwrap_or("");
+    let flags = fm.lines().find(|l| l.trim_start().starts_with("flags:")).unwrap_or("");
     if flags.contains("onlyStrict") {
         &[true]
     } else if flags.contains("noStrict") || flags.contains("raw") {
@@ -610,11 +581,7 @@ fn corpus_soundness_cases_vs_node() {
         // off).
         for &strict in case_modes(&body) {
             let mode = if strict { "strict" } else { "bare" };
-            let sem_body = if strict {
-                format!("\"use strict\";\n{body}")
-            } else {
-                body.clone()
-            };
+            let sem_body = if strict { format!("\"use strict\";\n{body}") } else { body.clone() };
             let sem = evaluate_case_opts(&[&assert_src, &sta_src], &sem_body, false);
             let sem_trace = match sem {
                 SemOutcome::Trace(t) => t,
@@ -638,8 +605,7 @@ fn corpus_soundness_cases_vs_node() {
             });
             let manifest_path = tmp.path().join(format!("case-{ci}.{mode}.manifest.json"));
             let mut mf = std::fs::File::create(&manifest_path).expect("create manifest");
-            mf.write_all(manifest.to_string().as_bytes())
-                .expect("write manifest");
+            mf.write_all(manifest.to_string().as_bytes()).expect("write manifest");
             drop(mf);
 
             let out = Command::new(&node)

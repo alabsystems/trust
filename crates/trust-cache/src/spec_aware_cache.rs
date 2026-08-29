@@ -570,10 +570,7 @@ mod tests {
         let spec_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         mgr.cache_mut().store("f", sample_entry("h1", spec_hash));
 
-        assert!(matches!(
-            mgr.lookup_with_spec_check("f", "h1", spec_hash, ""),
-            CacheLookup::Miss
-        ));
+        assert!(matches!(mgr.lookup_with_spec_check("f", "h1", spec_hash, ""), CacheLookup::Miss));
 
         // A zero-obligation record is itself the claim that there was nothing
         // to prove, so it is proof-bearing too.
@@ -581,10 +578,7 @@ mod tests {
         empty.total_obligations = 0;
         empty.unknown = 0;
         mgr.cache_mut().store("g", empty);
-        assert!(matches!(
-            mgr.lookup_with_spec_check("g", "h2", spec_hash, ""),
-            CacheLookup::Miss
-        ));
+        assert!(matches!(mgr.lookup_with_spec_check("g", "h2", spec_hash, ""), CacheLookup::Miss));
     }
 
     #[test]

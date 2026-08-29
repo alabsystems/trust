@@ -182,12 +182,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                         ),
                     ));
                 } else {
-                    ungrounded_posts.push((
-                        ungrounded,
-                        origin,
-                        span,
-                        source_contract_index,
-                    ));
+                    ungrounded_posts.push((ungrounded, origin, span, source_contract_index));
                 }
             }
             continue;
@@ -234,7 +229,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
     }
 
     for block in &func.body.blocks {
-        if !matches!(block.terminator, Terminator::Return) {
+        if !matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. }) {
             continue;
         }
 
@@ -373,10 +368,7 @@ pub(super) fn generate_v2_contract_vcs_impl(
                             Ok(rformula) => {
                                 let sort = crate::place_sort(func, place).unwrap_or(Sort::Int);
                                 let ret_def = Formula::Eq(
-                                    Box::new(Formula::var_owned(
-                                        format!("_{}", place.local),
-                                        sort,
-                                    )),
+                                    Box::new(Formula::var_owned(format!("_{}", place.local), sort)),
                                     Box::new(rformula),
                                 );
                                 formula = Formula::And(vec![ret_def, formula]);
@@ -506,8 +498,8 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 // shapes, whose `_0__value*` terms the gate keeps UNGROUNDED so
                 // they never reach this refutable lane) — is sound (a free var
                 // only adds SAT/refute, never manufactures UNSAT/proof).
-                let enum_return_pin =
-                    resolve_enum_return_aggregate(func, *vc_block, block).map(|(kind, variant, ops)| {
+                let enum_return_pin = resolve_enum_return_aggregate(func, *vc_block, block).map(
+                    |(kind, variant, ops)| {
                         // Parser-convention model discriminant (Result INVERTED).
                         let discr = std_enum_model_discr(kind, variant);
                         let payload = if variant == std_enum_payload_variant(kind)
@@ -521,7 +513,8 @@ pub(super) fn generate_v2_contract_vcs_impl(
                             None
                         };
                         (discr, payload)
-                    });
+                    },
+                );
                 if let Some((discr, payload)) = enum_return_pin {
                     let discr_def = Formula::Eq(
                         Box::new(Formula::var_owned("_0__discr".to_string(), Sort::Int)),
@@ -1083,12 +1076,8 @@ pub(super) fn generate_v2_contract_vcs_impl(
                 let clause_written_out_params: Vec<String> = {
                     let mut names: Vec<String> = formula_var_sorts(&post)
                         .into_iter()
-                        .map(|(name, _)| {
-                            name.split('#').next().unwrap_or(&name).to_string()
-                        })
-                        .filter(|base| {
-                            out_param_store_sorts.get(base).is_some_and(Option::is_some)
-                        })
+                        .map(|(name, _)| name.split('#').next().unwrap_or(&name).to_string())
+                        .filter(|base| out_param_store_sorts.get(base).is_some_and(Option::is_some))
                         .collect();
                     names.extend(unpinned_out_params.iter().cloned());
                     names.sort();
@@ -1096,15 +1085,11 @@ pub(super) fn generate_v2_contract_vcs_impl(
                     names
                 };
                 let unconstrained_out_param = clause_written_out_params.iter().find(|subject| {
-                    let versioned = match sv.version_token_at(
-                        func,
-                        block.id,
-                        block.stmts.len(),
-                        subject,
-                    ) {
-                        Some(tok) => format!("{subject}#{tok}"),
-                        None => (*subject).clone(),
-                    };
+                    let versioned =
+                        match sv.version_token_at(func, block.id, block.stmts.len(), subject) {
+                            Some(tok) => format!("{subject}#{tok}"),
+                            None => (*subject).clone(),
+                        };
                     !formula_pins_var_name(&formula, &versioned)
                 });
                 if let Some(subject) = unconstrained_out_param {
@@ -1427,7 +1412,9 @@ pub(super) fn formula_pins_var_name(formula: &Formula, name: &str) -> bool {
         // through that arm alone. Without this arm the test answered `false`
         // for every multi-path VC, which would fire the tripwire on rows whose
         // post-state is fully constrained.
-        Formula::Or(arms) => !arms.is_empty() && arms.iter().all(|a| formula_pins_var_name(a, name)),
+        Formula::Or(arms) => {
+            !arms.is_empty() && arms.iter().all(|a| formula_pins_var_name(a, name))
+        }
         // Trust: a SELF-equality is not a pin. `x == x` constrains nothing, yet
         // it would satisfy the shape test and silently suppress the
         // silent-weakening tripwire — converting the VISIBLE fail-closed row
@@ -1458,8 +1445,8 @@ pub(super) fn formula_has_complete_return_projection_pins(
         let mut found = false;
         formula.visit(&mut |node| {
             if let Formula::Var(name, _) = node {
-                found |= name.starts_with("__trust_unsupported_operand_")
-                    || name == "__unknown_operand";
+                found |=
+                    name.starts_with("__trust_unsupported_operand_") || name == "__unknown_operand";
             }
         });
         found
@@ -1816,6 +1803,51 @@ fn return_edge_guard(
 /// block through SOME predecessor, and that predecessor's own row still captures
 /// it with its own pins — which is why the false twin of every ladder rung still
 /// refutes, from the body's genuine stored value rather than from havoc.
+/// The plain locals this return block stores into the RETURN SLOT's fields
+/// through a single `_0 = Aggregate(..)` statement, with their sorts.
+///
+/// These are subjects a clause can reach ONLY through the field pin: it names
+/// `_0.0`, never the temp feeding it, so `clause_sorts` can never see them and
+/// the `&mut`-parameter population never contains them. Without a merge pin
+/// their reaching-def JOIN name (`c#s1_0_s2_0`) is free, and a TRUE clause over
+/// the field is refuted by havoc -- see `aggregate_field_join_version_tests`.
+///
+/// Deliberately narrow: the store must target the bare return slot, and each
+/// operand must be a projection-free local, so the pin can only ever talk about
+/// a value one named local holds.
+fn return_slot_aggregate_operand_sorts(
+    func: &VerifiableFunction,
+    ret: &trust_types::BasicBlock,
+) -> FxHashMap<String, Option<Sort>> {
+    let mut sorts: FxHashMap<String, Option<Sort>> = FxHashMap::default();
+    for stmt in &ret.stmts {
+        let Statement::Assign { place, rvalue: Rvalue::Aggregate(_, operands), .. } = stmt else {
+            continue;
+        };
+        if place.local != 0 || !place.projections.is_empty() {
+            continue;
+        }
+        for op in operands {
+            let (Operand::Copy(operand_place) | Operand::Move(operand_place)) = op else {
+                continue;
+            };
+            if !operand_place.projections.is_empty() {
+                continue;
+            }
+            let Some(sort) = crate::place_sort(func, operand_place) else { continue };
+            sorts
+                .entry(crate::place_to_var_name(func, operand_place))
+                .and_modify(|slot| {
+                    if slot.as_ref() != Some(&sort) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(sort));
+        }
+    }
+    sorts
+}
+
 fn return_edge_merge_pins(
     func: &VerifiableFunction,
     sv: &StmtVersionCtx,
@@ -1824,7 +1856,10 @@ fn return_edge_merge_pins(
     post: &Formula,
     out_params: &FxHashMap<String, Option<Sort>>,
 ) -> (Vec<Formula>, Vec<Formula>) {
-    if out_params.is_empty() {
+    // Subjects reached only through a return-slot FIELD pin: the clause never
+    // names them, so they must be collected from the aggregate store itself.
+    let agg_operands = return_slot_aggregate_operand_sorts(func, ret);
+    if out_params.is_empty() && agg_operands.is_empty() {
         return (Vec::new(), Vec::new());
     }
     // Gate 2: anything the predecessor's TERMINATOR can write is off limits.
@@ -1845,19 +1880,29 @@ fn return_edge_merge_pins(
             .or_insert(Some(sort));
     }
 
-    let mut subjects: Vec<&String> = clause_sorts.keys().collect();
-    subjects.sort();
+    let mut subject_set: std::collections::BTreeSet<&String> = clause_sorts.keys().collect();
+    subject_set.extend(agg_operands.keys());
+    let subjects: Vec<&String> = subject_set.into_iter().collect();
 
     let mut pins = Vec::new();
     let mut grounds = Vec::new();
     for subject in subjects {
-        let Some(Some(clause_sort)) = clause_sorts.get(subject) else { continue };
-        // Only a place this body actually STORES TO through a `&mut` parameter,
-        // at a sort that agrees with the clause's reading of it.
-        let Some(Some(place_sort)) = out_params.get(subject) else { continue };
-        if place_sort != clause_sort {
-            continue;
-        }
+        // Two disjoint populations. An OUT-PARAMETER subject is a place the body
+        // stores to through a `&mut` parameter AND that the clause reads, at an
+        // agreeing sort -- the original discipline, unchanged. An AGGREGATE-FIELD
+        // subject is a projection-free local feeding the return slot's aggregate
+        // store; the clause cannot name it, so no clause-sort agreement exists to
+        // check and none is required.
+        let (place_sort, plain_local) = match out_params.get(subject) {
+            Some(Some(place_sort)) if clause_sorts.get(subject) == Some(&Some(place_sort.clone())) => {
+                (place_sort.clone(), false)
+            }
+            _ => match agg_operands.get(subject) {
+                Some(Some(sort)) => (sort.clone(), true),
+                _ => continue,
+            },
+        };
+        let place_sort = &place_sort;
         if term_defs.iter().any(|d| place_names_overlap(d, subject)) {
             continue; // gate 2
         }
@@ -1893,7 +1938,7 @@ fn return_edge_merge_pins(
         // today's fail-closed behaviour.
         let ground = match &pred_tok {
             None => None,
-            Some(tok) => match out_param_store_at_token(func, sv, subject, tok) {
+            Some(tok) => match store_at_token(func, sv, subject, tok, plain_local) {
                 Some(fact) => Some(fact),
                 None => continue,
             },
@@ -1937,11 +1982,12 @@ fn return_edge_merge_pins(
 /// token that is not a single statement establish token, a statement that does
 /// not store `subject`, a `CheckedBinaryOp` or array-theory store (owned by
 /// their own encodings), or an rvalue the encoder cannot lower.
-fn out_param_store_at_token(
+fn store_at_token(
     func: &VerifiableFunction,
     sv: &StmtVersionCtx,
     subject: &str,
     token: &str,
+    plain_local: bool,
 ) -> Option<Formula> {
     let (block_part, stmt_part) = token.strip_prefix('s')?.split_once('_')?;
     let block_idx: usize = block_part.parse().ok()?;
@@ -1949,7 +1995,13 @@ fn out_param_store_at_token(
     let block = func.body.blocks.get(block_idx).filter(|b| b.id.0 == block_idx)?;
     let stmt = block.stmts.get(stmt_idx)?;
     let Statement::Assign { place, rvalue, .. } = stmt else { return None };
-    if !is_out_param_place(func, place) || crate::place_to_var_name(func, place) != subject {
+    if crate::place_to_var_name(func, place) != subject {
+        return None;
+    }
+    // An out-parameter subject keeps the original place gate. An aggregate-field
+    // subject is a projection-free local instead -- still a single named place
+    // whose store this equation reproduces, never a deref or a field write.
+    if !if plain_local { place.projections.is_empty() } else { is_out_param_place(func, place) } {
         return None;
     }
     if matches!(rvalue, Rvalue::CheckedBinaryOp(..))
@@ -2056,10 +2108,8 @@ fn with_out_param_pins(
             if !pinned.insert(versioned.clone()) {
                 continue;
             }
-            let pin = Formula::Eq(
-                Box::new(Formula::var_owned(versioned, place_sort)),
-                Box::new(value),
-            );
+            let pin =
+                Formula::Eq(Box::new(Formula::var_owned(versioned, place_sort)), Box::new(value));
             formula = Formula::And(vec![pin, formula]);
             pinned_bases.insert(subject.clone());
         }

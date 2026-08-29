@@ -16,8 +16,6 @@ use trust_types::{
     SolverQuerySemantics, VerificationResult,
 };
 
-use crate::input_limits::{MAX_BINARY_ARTIFACT_BYTES, read_bounded_file};
-
 use super::{
     DispatchCanonicalBinding, EXACT_REPLAY_BYTE_RANGE_FACT_DIAGNOSTIC_PREFIX,
     EXACT_REPLAY_CONTROL_FLOW_FACT_DIAGNOSTIC_PREFIX,
@@ -33,6 +31,7 @@ use super::{
     EXACT_REPLAY_WITNESS_MEMORY_EFFECT_DIAGNOSTIC, EXACT_REPLAY_WITNESS_SELECTED_IMAGE_DIAGNOSTIC,
     canonical_vc_bytes, is_canonical_sha256_hex, stable_json_sha256, stable_model_json_sha256,
 };
+use crate::input_limits::{MAX_BINARY_ARTIFACT_BYTES, read_bounded_file};
 use crate::vc_kind_key;
 #[cfg(test)]
 use crate::{
@@ -619,7 +618,9 @@ fn derive_exact_replay_transcript_artifact_digest(record: &SolverDispatchRecord)
             instruction_size,
             encoding: origin.encoding,
             instruction_bytes: origin.instruction_bytes.clone(),
-            instruction_bytes_sha256: trust_types::digest::stable_sha256_hex(&origin.instruction_bytes),
+            instruction_bytes_sha256: trust_types::digest::stable_sha256_hex(
+                &origin.instruction_bytes,
+            ),
         },
         executed_range,
         control_flow_capability_evidence: ExactReplayTranscriptBindingEvidence {
@@ -632,7 +633,9 @@ fn derive_exact_replay_transcript_artifact_digest(record: &SolverDispatchRecord)
         memory_effect_attestation: ExactReplayTranscriptBindingEvidence {
             accepted: true,
             diagnostic: EXACT_REPLAY_WITNESS_MEMORY_EFFECT_DIAGNOSTIC,
-            diagnostic_sha256: trust_types::digest::stable_sha256_hex(EXACT_REPLAY_WITNESS_MEMORY_EFFECT_DIAGNOSTIC.as_bytes()),
+            diagnostic_sha256: trust_types::digest::stable_sha256_hex(
+                EXACT_REPLAY_WITNESS_MEMORY_EFFECT_DIAGNOSTIC.as_bytes(),
+            ),
         },
         byte_range_facts,
         control_flow_facts,
@@ -662,7 +665,8 @@ fn exact_replay_transcript_fact_set(
         .collect::<Vec<_>>();
     facts.sort();
     facts.dedup();
-    let facts_sha256 = stable_json_sha256(&facts).unwrap_or_else(|| trust_types::digest::stable_sha256_hex(b"[]"));
+    let facts_sha256 =
+        stable_json_sha256(&facts).unwrap_or_else(|| trust_types::digest::stable_sha256_hex(b"[]"));
     ExactReplayTranscriptFactSet { diagnostic_prefix, count: facts.len(), facts, facts_sha256 }
 }
 

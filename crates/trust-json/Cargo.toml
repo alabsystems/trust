@@ -1,0 +1,90 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-json — the Trust-owned JSON data format (RFC 8259).
+#
+# WHY THIS CRATE EXISTS.
+# `serde_json` is the single most-used third-party unit in this tree: 2677
+# `Value` mentions across 75 files, 1454 `json!` invocations, 590 `from_str`
+# sites. The verified lane reports it `dependency-policy-excluded`, so every
+# proof that names a proof-bundle digest, a certificate, a scorecard row or a
+# release manifest is conditional on a compilation unit Trust does not own —
+# and on `zmij`, `itoa`, `memchr` and `serde_core` behind it.
+#
+# BYTE-EXACTNESS IS THE ACCEPTANCE CRITERION, NOT "VALID JSON".
+# `crates/trust-types/src/digest.rs` hashes serialized JSON and
+# `crates/trust-types/src/json_digest.rs` re-serializes wide integers to make
+# two feature configurations agree byte-for-byte. A replacement that emits
+# equally-valid-but-differently-spelled JSON silently changes every digest in
+# the tree. Every observable in `tests/differential_json.rs` is therefore a
+# BYTE comparison against the incumbent, not a semantic one.
+#
+# THE EMPTY DEPENDENCY LIST IS THE POINT.
+# A dependency here is another excluded unit and defeats the purpose. There is
+# no `[features]` table that could add one. The only entry below is a
+# DEV-dependency: the incumbent, linked by the differential test binary and by
+# nothing else.
+
+[package]
+name = "trust-json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Trust-owned JSON (RFC 8259) with byte-identical output to the incumbent serde_json. Zero dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]
+# NONE, by design. Read the header before adding one.
+#
+# In particular: NOT `serde`. The serde `Serialize`/`Deserialize` glue is a
+# separate layer that plugs into the `Formatter` trait this crate exports —
+# see the `ser` module docs and lib.rs's "SEAM" section. Putting the trait
+# dependency here would make the byte-exactness gate depend on a third-party
+# unit, and would couple this crate's landing to the serde replacement, which
+# the phase-2 plan explicitly defers.
+
+[dev-dependencies]
+# TEST-ONLY. The acceptance gate is a byte differential against the incumbent,
+# so the incumbent must be linkable by the test binary and by nothing else.
+# Delete this line on the day the rename lands and the incumbent leaves the
+# graph.
+#
+## NOT `workspace = true`, and RENAMED. The workspace `serde_json` entry will
+## eventually resolve to THIS crate; inheriting it at that moment would make
+## the differential compare this crate against itself — a gate that passes
+## unconditionally, which is exactly the `[patch.crates-io]` failure the
+## phase-2 plan records. The rename makes that impossible to do by accident:
+## the test writes `incumbent_serde_json::`, which can only ever name the
+## registry crate.
+##
+## Version is `"1"`, deliberately NOT pinned to `=1.0.151`. The oracle must be
+## whatever this workspace actually resolves, because that is the code whose
+## bytes ship today. `tests/differential_json.rs::oracle_identity` prints the
+## incumbent's rendering of the four sentinel floats that discriminate the
+## float backends (serde_json swapped `ryu` -> `zmij` in the 1.0.15x line, and
+## the two DISAGREE on notation: `1e30` vs `1e+30`), so a backend change under
+## us fails loudly with the reason on screen rather than silently.
+incumbent-serde-json = { package = "serde_json", version = "1", features = [
+    "unbounded_depth",
+] }
+
+## The incumbent TRAIT crate, with its derive, renamed for the same reason.
+##
+## WHY IT IS HERE, given that the shipped crate deliberately does not depend on
+## serde: the acceptance gate has to answer a question the tree alone cannot,
+## namely "does a `#[derive(Deserialize)]` reach the same verdict when it is
+## driven by OUR tree instead of the incumbent's?". `serde_json::from_value`
+## makes that a real differential — one derive, two trees, compare the
+## `Result` — and it is the only way to exercise the brief's typed cases
+## (`Option::None` vs a missing field, a missing required field, an unknown
+## field, a wrong scalar type) before the serde layer itself exists.
+##
+## This is a DEV-dependency and `cargo tree -p trust-json -e normal` still
+## prints `trust-json v0.1.0` and nothing else. It costs the shipped closure
+## nothing; it costs the TEST closure `serde_derive`, `syn`, `quote` and
+## `proc-macro2`, which is the correct place to pay for an oracle.
+incumbent-serde = { package = "serde", version = "1", features = ["derive"] }

@@ -1,0 +1,89 @@
+error: creusot contract attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_creusot_spec_sugar_fixable.rs:15:1
+   |
+LL | #[creusot_contracts::ensures(result >= lo && old(lo) <= hi)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the rewrite carries no verdict: the native clause is proved, or refused, by `targo trust check`; its translation fidelity is gated by the blob-equivalence harness (targo-trust/tests/creusot_spec_equivalence.rs), which byte-compares compiler-emitted goals for the proposed clause against an independently authored native clause — the lint never renders a goal
+   = note: `-D clippy::trust-creusot-spec-sugar` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::trust_creusot_spec_sugar)]`
+help: migrate the predicate into the signature (zero-authority proposal)
+   |
+LL + 
+LL |
+LL ~ fn floor_at(lo: u64, hi: u64) -> u64 ensures result >= lo && lo <= hi {
+   |
+
+error: creusot contract attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_creusot_spec_sugar_fixable.rs:21:1
+   |
+LL | #[creusot_contracts::requires(x > 0 && x % 2 == 0)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the rewrite carries no verdict: the native clause is proved, or refused, by `targo trust check`; its translation fidelity is gated by the blob-equivalence harness (targo-trust/tests/creusot_spec_equivalence.rs), which byte-compares compiler-emitted goals for the proposed clause against an independently authored native clause — the lint never renders a goal
+help: migrate the predicate into the signature (zero-authority proposal)
+   |
+LL + 
+LL |
+LL ~ fn half(x: u32) -> u32 requires x > 0 && x % 2 == 0 {
+   |
+
+error: creusot contract attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_creusot_spec_sugar_fixable.rs:29:1
+   |
+LL | #[creusot_contracts::requires(lo <= hi)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the rewrite carries no verdict: the native clause is proved, or refused, by `targo trust check`; its translation fidelity is gated by the blob-equivalence harness (targo-trust/tests/creusot_spec_equivalence.rs), which byte-compares compiler-emitted goals for the proposed clause against an independently authored native clause — the lint never renders a goal
+help: migrate the predicate into the signature (zero-authority proposal)
+   |
+LL + 
+LL |
+LL + 
+LL ~ fn clamp_hi(x: u64, lo: u64, hi: u64) -> u64 requires lo <= hi ensures result <= hi {
+   |
+
+error: creusot contract attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_creusot_spec_sugar_fixable.rs:45:5
+   |
+LL |     #[creusot_contracts::ensures(result == n * n)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the rewrite carries no verdict: the native clause is proved, or refused, by `targo trust check`; its translation fidelity is gated by the blob-equivalence harness (targo-trust/tests/creusot_spec_equivalence.rs), which byte-compares compiler-emitted goals for the proposed clause against an independently authored native clause — the lint never renders a goal
+help: migrate the predicate into the signature (zero-authority proposal)
+   |
+LL ~     
+LL |
+LL ~     fn square(n: u16) -> u16 ensures result == n * n {
+   |
+
+error: creusot contract attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_creusot_spec_sugar_fixable.rs:56:1
+   |
+LL | #[creusot_contracts::ensures(x >= x)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the rewrite carries no verdict: the native clause is proved, or refused, by `targo trust check`; its translation fidelity is gated by the blob-equivalence harness (targo-trust/tests/creusot_spec_equivalence.rs), which byte-compares compiler-emitted goals for the proposed clause against an independently authored native clause — the lint never renders a goal
+help: migrate the predicate into the signature (zero-authority proposal)
+   |
+LL + 
+LL |
+LL ~ fn observe(x: u64) -> u64 ensures x >= x {
+   |
+
+error: creusot contract attribute; Trust supports first-class signature clauses
+  --> tests/ui/trust_creusot_spec_sugar_fixable.rs:62:1
+   |
+LL | #[creusot_contracts::ensures(old(lo) <= lo)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the rewrite carries no verdict: the native clause is proved, or refused, by `targo trust check`; its translation fidelity is gated by the blob-equivalence harness (targo-trust/tests/creusot_spec_equivalence.rs), which byte-compares compiler-emitted goals for the proposed clause against an independently authored native clause — the lint never renders a goal
+help: migrate the predicate into the signature (zero-authority proposal)
+   |
+LL + 
+LL |
+LL ~ fn keep(lo: u64) -> u64 ensures lo <= lo {
+   |
+
+error: aborting due to 6 previous errors
+

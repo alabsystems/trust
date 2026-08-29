@@ -6,14 +6,16 @@
 // Author: Andrew Yates
 // Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
 
+use std::rc::Rc;
+
+use trust_js_value::{
+    ErrKind, JsBigInt, JsValue, NativeFn, ObjId, ObjKind, PropKey, Property, SymId, Units,
+    WrapperPrim, as_int_n, as_uint_n, bigint_to_decimal, bigint_to_radix, f64_to_bigint_exact,
+    to_int32, to_integer_or_infinity, to_uint32, units_from_str,
+};
+
 use crate::interp::{Abrupt, ERes, Interp};
 use crate::props::PartialDesc;
-use std::rc::Rc;
-use trust_js_value::{
-    as_int_n, as_uint_n, bigint_to_decimal, bigint_to_radix, f64_to_bigint_exact,
-    to_integer_or_infinity, to_int32, to_uint32, units_from_str, ErrKind, JsBigInt, JsValue,
-    NativeFn, ObjId, ObjKind, PropKey, Property, SymId, Units, WrapperPrim,
-};
 
 impl Interp {
     /// thisSymbolValue: symbol primitives and Symbol wrapper objects.
@@ -62,11 +64,7 @@ impl Interp {
     fn bigint_as_n(&mut self, signed: bool, bits_v: &JsValue, big_v: &JsValue) -> ERes {
         let bits = self.to_index(bits_v)? as u64;
         let b = self.to_bigint(big_v)?;
-        let out = if signed {
-            as_int_n(bits, &b)
-        } else {
-            as_uint_n(bits, &b)
-        };
+        let out = if signed { as_int_n(bits, &b) } else { as_uint_n(bits, &b) };
         match out {
             Some(v) => Ok(JsValue::bigint(v)),
             None => Err(Abrupt::Fatal(
@@ -77,7 +75,11 @@ impl Interp {
     }
 
     /// InstallErrorCause (20.5.8.1).
-    pub(crate) fn install_error_cause(&mut self, oid: ObjId, options: &JsValue) -> Result<(), Abrupt> {
+    pub(crate) fn install_error_cause(
+        &mut self,
+        oid: ObjId,
+        options: &JsValue,
+    ) -> Result<(), Abrupt> {
         if let JsValue::Obj(opts) = options {
             if self.has_property(*opts, &PropKey::from_str("cause"))? {
                 let cause =
@@ -124,10 +126,10 @@ impl Interp {
             .map_err(|_| Abrupt::Fatal("AggregateError errors cap exceeded".to_string()))?;
         let arr = self.new_array(len32)?;
         for (i, v) in list.into_iter().enumerate() {
-            self.heap.obj_mut(arr).props.insert(
-                PropKey::Str(units_from_str(&i.to_string())),
-                Property::data(v),
-            );
+            self.heap
+                .obj_mut(arr)
+                .props
+                .insert(PropKey::Str(units_from_str(&i.to_string())), Property::data(v));
         }
         let ok = self.define_own(
             oid,
@@ -217,12 +219,10 @@ impl Interp {
                     }
                 }
             }
-            N::NumberIsFinite => Ok(JsValue::Bool(
-                matches!(arg(0), JsValue::Num(n) if n.is_finite()),
-            )),
-            N::NumberIsNaN => Ok(JsValue::Bool(
-                matches!(arg(0), JsValue::Num(n) if n.is_nan()),
-            )),
+            N::NumberIsFinite => {
+                Ok(JsValue::Bool(matches!(arg(0), JsValue::Num(n) if n.is_finite())))
+            }
+            N::NumberIsNaN => Ok(JsValue::Bool(matches!(arg(0), JsValue::Num(n) if n.is_nan()))),
             N::NumberIsInteger => Ok(JsValue::Bool(
                 matches!(arg(0), JsValue::Num(n) if n.is_finite() && n.trunc() == n),
             )),
@@ -291,11 +291,7 @@ fn js_math_round(x: f64) -> f64 {
         return -0.0;
     }
     let floor = x.floor();
-    if x - floor >= 0.5 {
-        floor + 1.0
-    } else {
-        floor
-    }
+    if x - floor >= 0.5 { floor + 1.0 } else { floor }
 }
 
 /// parseInt (19.2.5), exact: `Err(reason)` = beyond exact accumulation
@@ -305,8 +301,8 @@ fn parse_int_exact(units: &Units, radix: i32) -> Result<f64, String> {
     let is_ws = |c: u16| {
         matches!(
             c,
-            0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028
-                | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+            0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000
+                ..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
         )
     };
     let mut i = 0;
@@ -350,11 +346,7 @@ fn parse_int_exact(units: &Units, radix: i32) -> Result<f64, String> {
             _ => return None,
         };
         #[allow(clippy::cast_sign_loss)]
-        if d < r as u32 {
-            Some(d)
-        } else {
-            None
-        }
+        if d < r as u32 { Some(d) } else { None }
     };
     let start = i;
     let mut digits: Vec<u32> = Vec::new();
@@ -373,10 +365,8 @@ fn parse_int_exact(units: &Units, radix: i32) -> Result<f64, String> {
     }
     if r == 10 {
         // Correctly rounded via decimal parse (arbitrary length).
-        let text: String = digits
-            .iter()
-            .map(|&d| char::from_digit(d, 10).expect("decimal digit"))
-            .collect();
+        let text: String =
+            digits.iter().map(|&d| char::from_digit(d, 10).expect("decimal digit")).collect();
         let mag: f64 = text.parse().map_err(|e| format!("parseInt decimal parse: {e}"))?;
         if mag == 0.0 {
             return Ok(if sign < 0.0 { -0.0 } else { 0.0 });
@@ -389,7 +379,9 @@ fn parse_int_exact(units: &Units, radix: i32) -> Result<f64, String> {
         acc = acc
             .checked_mul(u128::from(r as u32))
             .and_then(|a| a.checked_add(u128::from(d)))
-            .ok_or_else(|| format!("parseInt radix-{r} literal beyond exact 128-bit accumulation"))?;
+            .ok_or_else(|| {
+                format!("parseInt radix-{r} literal beyond exact 128-bit accumulation")
+            })?;
     }
     #[allow(clippy::cast_precision_loss)]
     let mag = acc as f64;
@@ -404,8 +396,8 @@ fn parse_float_exact(units: &Units) -> f64 {
     let is_ws = |c: u16| {
         matches!(
             c,
-            0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028
-                | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+            0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000
+                ..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
         )
     };
     let mut i = 0;
@@ -414,11 +406,7 @@ fn parse_float_exact(units: &Units) -> f64 {
     }
     // The remaining prefix must be ASCII to matter; scan the longest valid
     // StrDecimalLiteral shape.
-    let b: Vec<u8> = units[i..]
-        .iter()
-        .take_while(|&&c| c < 0x80)
-        .map(|&c| c as u8)
-        .collect();
+    let b: Vec<u8> = units[i..].iter().take_while(|&&c| c < 0x80).map(|&c| c as u8).collect();
     let mut j = 0usize;
     let mut sign = 1.0f64;
     if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
@@ -477,8 +465,9 @@ fn parse_float_exact(units: &Units) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_js_value::units_from_str as u;
+
+    use super::*;
 
     #[test]
     fn parse_int_vectors() {

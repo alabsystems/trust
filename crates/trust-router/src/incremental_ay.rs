@@ -642,7 +642,7 @@ impl IncrementalAYSession {
         }
 
         let result = self.verify_vc_solved(vc);
-        self.relax_if_unknown(vc, result)
+        self.relax_if_undecided(vc, result)
     }
 
     /// The core solve for a VC (incremental session, with per-process fallback).
@@ -706,17 +706,29 @@ impl IncrementalAYSession {
     /// (QF_NIA incompleteness) — e.g. `s[n % s.len()]`, whose bound
     /// `s.len() != 0 ⟹ n % s.len() < s.len()` is linear once the `mod` is dropped.
     ///
-    /// Purely additive: only fires on `Unknown`, and only ever UPGRADES it to
-    /// `Proved` (when the relaxation is UNSAT) — a `sat`/`unknown`/timeout
-    /// relaxation leaves the original `Unknown` untouched. So it can never change a
-    /// `Proved` or `Failed` verdict, and is sound regardless of the abstraction's
-    /// precision.
-    fn relax_if_unknown(
+    /// Purely additive: fires only on an UNDECIDED original — `Unknown` or
+    /// `Timeout` — and only ever UPGRADES it to `Proved` (when the relaxation is
+    /// UNSAT); a `sat`/`unknown`/timeout relaxation leaves the original verdict
+    /// untouched. So it can never change a `Proved` or `Failed` verdict, and is
+    /// sound regardless of the abstraction's precision.
+    ///
+    /// `Timeout` is included because the soundness argument — relaxed UNSAT ⟹
+    /// original UNSAT — does not depend on WHY the original query went
+    /// undecided, and "the solver could not decide this nonlinear query within
+    /// its budget" is exactly the condition the relaxation exists to recover.
+    /// Keying on `Unknown` alone silently lost those proofs on any host where
+    /// the QF_NIA query exhausts the deadline instead of returning `unknown`
+    /// (measured: the `s[n % s.len()]` bounds VC times out here on both the
+    /// installed and a freshly built `ay`, so the recovery never ran).
+    fn relax_if_undecided(
         &self,
         vc: &VerificationCondition,
         result: VerificationResult,
     ) -> VerificationResult {
-        if !matches!(result, VerificationResult::Unknown { .. }) {
+        if !matches!(
+            result,
+            VerificationResult::Unknown { .. } | VerificationResult::Timeout { .. }
+        ) {
             return result;
         }
         // A nonlinear relaxation still needs the same unavailable admission
@@ -751,7 +763,8 @@ impl IncrementalAYSession {
                     native_proof_envelope: None,
                 }
             }
-            // relaxation sat / unknown / timeout: no sound conclusion — keep Unknown.
+            // relaxation sat / unknown / timeout: no sound conclusion — keep the
+            // original undecided verdict exactly as it stood.
             _ => result,
         }
     }
@@ -761,7 +774,7 @@ impl IncrementalAYSession {
     /// per-process fallback semantics as [`Self::verify_vc_solved`].
     ///
     /// Behaviorally equivalent to `self.verify_per_process(vc)` for the purpose
-    /// of [`Self::relax_if_unknown`]: it returns a `Proved` exactly when the
+    /// of [`Self::relax_if_undecided`]: it returns a `Proved` exactly when the
     /// solver finds the VC `unsat`. The push/pop balance is maintained by
     /// [`Self::verify_incremental`] (every branch pops its scope before
     /// returning `Ok`; on `Err` the process is killed and rebuilt fresh), so a
@@ -2166,7 +2179,7 @@ fn is_constant_formula(f: &Formula) -> bool {
 ///
 /// SOUND RELAXATION: each fresh variable is unconstrained, so the relaxed formula
 /// has a superset of the original's satisfying assignments; therefore
-/// `relaxed UNSAT ⟹ original UNSAT`. See [`IncrementalAYSession::relax_if_unknown`].
+/// `relaxed UNSAT ⟹ original UNSAT`. See [`IncrementalAYSession::relax_if_undecided`].
 fn abstract_nonlinear(formula: &Formula) -> Option<Formula> {
     let mut counter: usize = 0;
     let mut fresh = |sort: Sort| {
@@ -2924,8 +2937,7 @@ mod tests {
             std::fs::create_dir_all(&base).expect("create incremental-memory test root");
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
                 .expect("make incremental-memory test root private");
-            let directory =
-                base.join(format!("{}-{nonce:x}", std::process::id()));
+            let directory = base.join(format!("{}-{nonce:x}", std::process::id()));
             std::fs::create_dir(&directory).expect("create private token fixture");
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
                 .expect("make token fixture private");

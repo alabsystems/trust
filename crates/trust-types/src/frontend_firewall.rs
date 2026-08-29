@@ -247,10 +247,7 @@ impl std::error::Error for FirewallRejection {}
 ///
 /// [`FirewallRejection::RoleForbidden`] when frontend-derived material is
 /// offered in any role but [`ProofRole::Goal`].
-pub fn admit_role(
-    provenance: ClaimProvenance,
-    role: ProofRole,
-) -> Result<(), FirewallRejection> {
+pub fn admit_role(provenance: ClaimProvenance, role: ProofRole) -> Result<(), FirewallRejection> {
     match provenance {
         ClaimProvenance::Authoritative => Ok(()),
         ClaimProvenance::Frontend(language) => {
@@ -341,7 +338,11 @@ impl<T> FrontendProposal<T> {
     /// a false verdict.
     #[must_use]
     pub fn into_goal(self) -> ProofGoal<T> {
-        ProofGoal { provenance: self.origin.provenance(), origin: Some(self.origin), payload: self.payload }
+        ProofGoal {
+            provenance: self.origin.provenance(),
+            origin: Some(self.origin),
+            payload: self.payload,
+        }
     }
 
     /// Admit the proposal in a role chosen at runtime.
@@ -605,15 +606,13 @@ impl FidelityManifest {
         axis: FidelityAxis,
         name: &str,
     ) -> Result<&FidelityEntry, FirewallRejection> {
-        self.file
-            .entries
-            .iter()
-            .find(|e| e.axis == axis && e.name == name)
-            .ok_or_else(|| FirewallRejection::EvidenceNarrowed {
+        self.file.entries.iter().find(|e| e.axis == axis && e.name == name).ok_or_else(|| {
+            FirewallRejection::EvidenceNarrowed {
                 language: self.file.language,
                 requested: format!("{axis}:{name}"),
                 manifest: self.file.id.clone(),
-            })
+            }
+        })
     }
 
     /// The single admissible selection on an axis, when the manifest fixes
@@ -685,12 +684,9 @@ mod tests {
 
     #[test]
     fn authoritative_material_keeps_every_role() {
-        for role in [
-            ProofRole::Goal,
-            ProofRole::Hypothesis,
-            ProofRole::Axiom,
-            ProofRole::DefiningEquation,
-        ] {
+        for role in
+            [ProofRole::Goal, ProofRole::Hypothesis, ProofRole::Axiom, ProofRole::DefiningEquation]
+        {
             assert!(admit_role(ClaimProvenance::Authoritative, role).is_ok());
         }
         assert!(ClaimProvenance::Authoritative.grants_proof_authority());
@@ -713,11 +709,8 @@ mod tests {
     }
 
     fn manifest_json(entries: &[FidelityEntry], tamper_digest: bool) -> String {
-        let digest = if tamper_digest {
-            "0".repeat(64)
-        } else {
-            FidelityManifest::digest_of(entries)
-        };
+        let digest =
+            if tamper_digest { "0".repeat(64) } else { FidelityManifest::digest_of(entries) };
         serde_json::json!({
             "schema": FIDELITY_MANIFEST_SCHEMA,
             "id": "test.manifest",

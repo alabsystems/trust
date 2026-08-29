@@ -44,26 +44,19 @@ impl Mutation {
 
     pub fn apply(self, effects: Vec<Effect>) -> Vec<Effect> {
         fn plus_one(f: Formula) -> Formula {
-            Formula::BvAdd(
-                Box::new(f),
-                Box::new(Formula::BitVec { value: 1, width: 64 }),
-                64,
-            )
+            Formula::BvAdd(Box::new(f), Box::new(Formula::BitVec { value: 1, width: 64 }), 64)
         }
         match self {
             Mutation::None => effects,
-            Mutation::DropFlagUpdate => effects
-                .into_iter()
-                .filter(|e| !matches!(e, Effect::FlagUpdate { .. }))
-                .collect(),
-            Mutation::DropMemWrite => effects
-                .into_iter()
-                .filter(|e| !matches!(e, Effect::MemWrite { .. }))
-                .collect(),
-            Mutation::DropPcUpdate => effects
-                .into_iter()
-                .filter(|e| !matches!(e, Effect::PcUpdate { .. }))
-                .collect(),
+            Mutation::DropFlagUpdate => {
+                effects.into_iter().filter(|e| !matches!(e, Effect::FlagUpdate { .. })).collect()
+            }
+            Mutation::DropMemWrite => {
+                effects.into_iter().filter(|e| !matches!(e, Effect::MemWrite { .. })).collect()
+            }
+            Mutation::DropPcUpdate => {
+                effects.into_iter().filter(|e| !matches!(e, Effect::PcUpdate { .. })).collect()
+            }
             Mutation::PerturbRegValue => effects
                 .into_iter()
                 .map(|e| match e {

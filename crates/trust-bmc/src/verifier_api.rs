@@ -440,9 +440,9 @@ const TRUST_IR_OBLIGATION_SOURCE_FORMULA_SCHEMA: &str = "trust.trust_ir.obligati
 use trust_verifier_api::TRUST_VC_HARDENED_OBLIGATION_NAMESPACE as TRUST_VC_HARDENED_NAMESPACE;
 const TRUST_VC_HARDENED_WILDCARD: &str = "*";
 
-/// E4/E5 are trust-mc reachability obligations only when the compiler supplied
-/// the exact typed violation formula. A bare `LoopInvariant` or `Termination`
-/// claim remains trust-wp-owned; metadata key presence alone is insufficient.
+/// Recognize the exact typed E4/E5 violation envelope consumed by the native
+/// reachability lane. Every E4/E5 row is TrustMC-owned; rows without this
+/// envelope decline fail-closed rather than changing owners.
 fn is_typed_body_aware_e4_e5_obligation(obligation: &TrustObligation) -> bool {
     matches!(obligation.kind, ObligationKind::LoopInvariant | ObligationKind::Termination)
         && typed_spec_predicate_envelope(obligation).is_some()
@@ -453,8 +453,7 @@ fn is_typed_body_aware_e4_e5_obligation(obligation: &TrustObligation) -> bool {
 ///
 /// The discriminator is a deliberate scoping decision: a postcondition whose
 /// clause never mentions the post-state does not constrain the body — it is
-/// a ∀-params statement that belongs to the tautology/kernel lanes
-/// (trust-wp fully proves that class today), and the E9
+/// a ∀-params statement that belongs to the tautology/kernel lanes, and the E9
 /// citation-undischarged tripwires pin exactly such clauses (`x >= x`) as
 /// NOT dischargeable without a kernel citation. Admitting them here would
 /// flip a load-bearing sealed-authority pin.
@@ -614,6 +613,25 @@ fn has_current_compiler_vc_origin(obligation: &TrustObligation) -> bool {
 fn is_trust_mc_owned_obligation(obligation: &TrustObligation) -> bool {
     is_trust_mc_owned_obligation_kind(&obligation.kind)
         || is_typed_body_aware_e4_e5_obligation(obligation)
+}
+
+/// Preserve kind-stable v6/D3 ownership without widening direct proof input.
+///
+/// Loop/termination rows belong to TrustMC even when malformed or incomplete,
+/// but only the compiler's current, validated Bool violation envelope may
+/// enter a direct solve. A caller-supplied typed contract cannot replace that
+/// public producer-authenticated formula.
+fn owned_e4_e5_pre_solve_rejection(obligation: &TrustObligation) -> Option<String> {
+    if matches!(obligation.kind, ObligationKind::LoopInvariant | ObligationKind::Termination)
+        && !is_typed_body_aware_e4_e5_obligation(obligation)
+    {
+        Some(format!(
+            "trust-mc owns {:?} obligations under v6/D3, but this row is missing one current compiler-authenticated E4/E5 Bool formula envelope; rejected before direct solving and refusing any caller-supplied typed contract",
+            obligation.kind
+        ))
+    } else {
+        None
+    }
 }
 
 /// Metadata key for serialized trust-mc-core `FullVerificationVerdict` diagnostics.
@@ -1250,21 +1268,29 @@ impl TrustMcVerifierApiAdapter {
     ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
         // Trust: ownership is a property of the authenticated public VC, not
         // of a caller-supplied native bundle or direct contract. Record every
-        // unowned row before inspecting either input so an invalid native
-        // inventory cannot mask (or bypass) the E4/E5 authority rejection.
+        // unowned row and every owned-but-payloadless E4/E5 row before
+        // inspecting either input so an invalid native inventory cannot mask
+        // (or bypass) the direct-solve admission rejection.
         let mut direct_by_id = obligations
             .iter()
-            .filter(|obligation| !is_trust_mc_owned_obligation(obligation))
-            .map(|obligation| {
+            .filter_map(|obligation| {
+                let rejection = if !is_trust_mc_owned_obligation(obligation) {
+                    Some(format!(
+                        "native trust_mc TrustIr bundle input rejected before direct solving for unowned {:?} obligation",
+                        obligation.kind
+                    ))
+                } else {
+                    owned_e4_e5_pre_solve_rejection(obligation)
+                }?;
                 let mut evidence = self.unsupported_evidence(bundle, obligation);
-                evidence.diagnostics.push(format!(
-                    "native trust_mc TrustIr bundle input rejected before direct solving for unowned {:?} obligation",
-                    obligation.kind
-                ));
-                (obligation.obligation_id.clone(), evidence)
+                evidence.diagnostics.push(rejection);
+                Some((obligation.obligation_id.clone(), evidence))
             })
             .collect::<BTreeMap<_, _>>();
-        if obligations.iter().all(|obligation| !is_trust_mc_owned_obligation(obligation)) {
+        if obligations.iter().all(|obligation| {
+            !is_trust_mc_owned_obligation(obligation)
+                || owned_e4_e5_pre_solve_rejection(obligation).is_some()
+        }) {
             return obligations
                 .iter()
                 .map(|obligation| {
@@ -1392,10 +1418,10 @@ impl TrustMcVerifierApiAdapter {
         let mut fresh_exact_direct_receipts = BTreeMap::new();
         for obligation in obligations {
             // Trust: this public low-level entrypoint may be called without the
-            // router's `supports` filter.  Apply the same payload-aware
-            // ownership gate before inspecting a supplied direct contract: a
-            // bare E4/E5 kind is not trust-mc-owned, and an otherwise valid
-            // typed CHC contract must not be able to manufacture ownership.
+            // router's `supports` filter. Apply the same pre-solve admission
+            // gate before inspecting a supplied direct contract: a bare E4/E5
+            // row remains TrustMC-owned, but an otherwise valid typed CHC
+            // contract cannot manufacture the compiler's missing formula.
             if direct_by_id.contains_key(&obligation.obligation_id) {
                 continue;
             }
@@ -2432,6 +2458,9 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         obligation: &TrustObligation,
         contract_indices: Option<&BTreeMap<String, Vec<usize>>>,
     ) -> Result<Option<DirectTypedChcPdrInput>, String> {
+        if let Some(rejection) = owned_e4_e5_pre_solve_rejection(obligation) {
+            return Err(rejection);
+        }
         // Compiler-native CHC input is a derived transport contract. It must
         // not replace the canonical public `contract_id` after the TrustIr
         // module has committed the public claim. Validate that diagnostic
@@ -3907,7 +3936,15 @@ enum TrustMcTypedChcBinaryOpInput {
     Add,
     Sub,
     Mul,
+    /// Rust integer division: quotient truncated toward zero.
+    TruncDiv,
+    /// Rust integer remainder: sign follows the dividend.
+    TruncRem,
+    /// Legacy v1 spelling.  Deserialized so stale artifacts get a precise
+    /// fail-closed diagnostic, but never admitted as proof input: historical
+    /// MIR producers used this spelling for Rust truncating division.
     Div,
+    /// Legacy v1 spelling.  See [`Self::Div`].
     Mod,
     Eq,
     Ne,
@@ -4048,8 +4085,32 @@ fn trust_mc_typed_chc_binary_expr(
         TrustMcTypedChcBinaryOpInput::Add => lhs.try_int_add(rhs),
         TrustMcTypedChcBinaryOpInput::Sub => lhs.try_int_sub(rhs),
         TrustMcTypedChcBinaryOpInput::Mul => lhs.try_int_mul(rhs),
-        TrustMcTypedChcBinaryOpInput::Div => lhs.try_int_div(rhs),
-        TrustMcTypedChcBinaryOpInput::Mod => lhs.try_int_mod(rhs),
+        // Rust's signed `/` and `%` truncate toward zero, whereas ay's Int
+        // `div`/`mod` are Euclidean.  This is the same construction used by
+        // `trust_types::ay_bridge`: the remainder takes the dividend's sign,
+        // then division uses the exact identity a = b*q + r.  Keeping these as
+        // distinct wire ops prevents a historical typed-CHC artifact that
+        // explicitly requested Euclidean `div`/`mod` from silently changing
+        // meaning.
+        TrustMcTypedChcBinaryOpInput::TruncRem => trust_mc_typed_chc_truncating_remainder(lhs, rhs),
+        TrustMcTypedChcBinaryOpInput::TruncDiv => {
+            trust_mc_typed_chc_truncating_remainder(lhs.clone(), rhs.clone())
+                .and_then(|remainder| lhs.try_int_sub(remainder))
+                .and_then(|numerator| numerator.try_int_div(rhs))
+        }
+        // `div`/`mod` existed in schema v1 before the transport distinguished
+        // Rust truncating arithmetic from SMT/ay Euclidean arithmetic.  Every
+        // historical proof-grade producer used those spellings for Rust MIR,
+        // so interpreting them as Euclidean can reproduce the exact
+        // false-PROVE this lane fixes.  The schema version did not change;
+        // accept the tags during deserialization only so stale payloads fail
+        // here with an actionable diagnostic instead of being trusted under an
+        // invented meaning.  Current producers emit `trunc_div`/`trunc_rem`.
+        TrustMcTypedChcBinaryOpInput::Div | TrustMcTypedChcBinaryOpInput::Mod => {
+            return Err(format!(
+                "legacy typed trust_mc CHC/PDR binary {op:?} is semantically ambiguous: schema v1 producers used `div`/`mod` for Rust truncating arithmetic; regenerate the payload with explicit `trunc_div`/`trunc_rem`"
+            ));
+        }
         TrustMcTypedChcBinaryOpInput::Eq => lhs.try_eq(rhs),
         TrustMcTypedChcBinaryOpInput::Ne => lhs.try_eq(rhs).map(Expr::not),
         TrustMcTypedChcBinaryOpInput::Lt => lhs.try_int_lt(rhs),
@@ -4078,6 +4139,32 @@ fn trust_mc_typed_chc_binary_expr(
         TrustMcTypedChcBinaryOpInput::BvSle => lhs.try_bvsle(rhs),
     }
     .map_err(|err| format!("typed trust_mc CHC/PDR binary {op:?} sort error: {err}"))
+}
+
+/// Exact Rust signed-remainder identity over mathematical integers.
+///
+/// ay's `int_mod` is Euclidean.  Negating the dividend before `mod` and the
+/// result afterwards is what restores Rust's dividend-signed remainder for a
+/// negative dividend.  The branches coincide for every non-negative value, so
+/// this is also exact for unsigned source integers represented in `Sort::Int`.
+///
+/// This helper is deliberately a VALUE relation, not a definedness proof.
+/// Rust's `rhs == 0` panic and the signed `MIN / -1` and `MIN % -1` overflow
+/// panics are authenticated by separate Level-0 MIR obligations, and a body
+/// value definition reaches a postcondition only under the corresponding
+/// passed-assert path guards.  The structural CHC lane independently rejects
+/// machine `Div`/`Rem` when those guards are absent.  Consequently, callers
+/// must never use successful construction of this expression as authority that
+/// the source operation returns; it states the returned value only on executions
+/// for which the independent safety obligations permit the operation to return.
+fn trust_mc_typed_chc_truncating_remainder(
+    lhs: Expr,
+    rhs: Expr,
+) -> Result<Expr, ay_bindings::SortError> {
+    let nonnegative = lhs.clone().try_int_ge(Expr::int_const(0))?;
+    let positive = lhs.clone().try_int_mod(rhs.clone())?;
+    let negative = lhs.try_int_neg()?.try_int_mod(rhs)?.try_int_neg()?;
+    Expr::try_ite(nonnegative, positive, negative)
 }
 
 fn trust_mc_typed_chc_input_from_contract(
@@ -7698,6 +7785,19 @@ fn validate_native_trust_ir_public_claim_binding(
     Ok(())
 }
 
+/// The exact inverse of the compiler's `native_trust_ir_route_for_api_obligation`,
+/// restricted to the rows it hands to the trust-mc suite. A pairing this table
+/// accepts is one the producer could itself have emitted for this public row —
+/// nothing wider.
+///
+/// Binding is IDENTITY reconciliation, never proof authority: it only decides
+/// that a native proof unit is the one minted for this public obligation. Every
+/// row admitted here still has to clear
+/// `validate_native_trust_ir_public_formula_binding` (a formula-less row must
+/// carry the exact source envelope and may not reference contract/proof-item
+/// data) and, in the caller, the direct/transport gates — of which
+/// `obligation_is_whole_function_panic_freedom` is the only door to the N:1
+/// transport proof and admits `Assertion` alone.
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 fn trust_mc_public_native_obligation_kind_matches(
     public: &TrustObligation,
@@ -7712,10 +7812,43 @@ fn trust_mc_public_native_obligation_kind_matches(
             ObligationKind::Precondition | ObligationKind::Postcondition,
             trust_ir::ObligationKind::PanicFreedom,
         ) => obligation_metadata_value(public, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY).is_some(),
+        // v6/D3 (`79558a8f2e`, "retire TrustWP verdict authority") moved the
+        // payload-less half of Precondition/Postcondition and the
+        // envelope-less half of LoopInvariant/Termination from trust-wp to
+        // trust-mc WITHOUT changing the native kinds they project onto. This
+        // table was written on 2026-07-14, while those four rows were still
+        // trust-wp-owned, and was not extended — so the producer emitted
+        // pairings the consumer could not accept and the row died at the
+        // identity gate reading `kind Postcondition does not match native
+        // proof obligation 0 kind Postcondition`. That is drift, not a
+        // decision: `native_trust_ir_obligation_cause_projection` right below
+        // already projects these three native kinds, and the sibling trust-vc
+        // lane shares ONE mapping function between emission and validation
+        // exactly so this cannot happen
+        // (`trust_vc_native_trust_ir_kind_for_public_obligation`).
+        //
+        // The guards are the exact NEGATION of the two arms above, using the
+        // same predicates, so each public kind still admits exactly ONE native
+        // kind and no pairing outside the producer's own routing becomes
+        // bindable. In particular a payload-BEARING precondition/postcondition
+        // must still bind to `PanicFreedom`, and an E4/E5 row carrying the
+        // typed envelope must still bind to `PanicFreedom`.
+        //
+        // These rows carry no formula, so nothing downstream can credit them:
+        // they reach the `Ok(None)` fallthrough and record Unsupported. What
+        // changes is that the refusal now names the real reason.
+        (ObligationKind::Precondition, trust_ir::ObligationKind::Precondition)
+        | (ObligationKind::Postcondition, trust_ir::ObligationKind::Postcondition) => {
+            obligation_metadata_value(public, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY).is_none()
+        }
         (
             ObligationKind::LoopInvariant | ObligationKind::Termination,
             trust_ir::ObligationKind::PanicFreedom,
         ) => is_typed_body_aware_e4_e5_obligation(public),
+        (ObligationKind::LoopInvariant, trust_ir::ObligationKind::LoopInvariant)
+        | (ObligationKind::Termination, trust_ir::ObligationKind::TranslationValidation) => {
+            !is_typed_body_aware_e4_e5_obligation(public)
+        }
         (
             ObligationKind::Invariant | ObligationKind::Protocol,
             trust_ir::ObligationKind::TranslationValidation,
@@ -8371,6 +8504,8 @@ pub fn trust_mc_owned_obligation_kinds() -> Vec<ObligationKind> {
     let mut kinds = vec![
         ObligationKind::Precondition,
         ObligationKind::Postcondition,
+        ObligationKind::LoopInvariant,
+        ObligationKind::Termination,
         ObligationKind::Assertion,
         ObligationKind::ArithmeticSafety,
         ObligationKind::Invariant,
@@ -8391,8 +8526,7 @@ pub fn is_trust_mc_owned_obligation_kind(kind: &ObligationKind) -> bool {
             | ObligationKind::Protocol
             // Trust (P1.2): a body-aware `#[ensures]` VC reaches the trust-mc
             // adapter as a `Postcondition` obligation carrying a typed CHC
-            // (`¬postcond ∧ body_defs`) — the router only dispatches the VC (never
-            // the claim-based marker, which stays on trust-wp) to trust-mc. A
+            // (`¬postcond ∧ body_defs`). A
             // Postcondition WITHOUT a typed CHC payload fails closed to Unsupported
             // in `trust_mc_typed_chc_lowering`, so owning the kind never fabricates
             // a proof.
@@ -8400,9 +8534,14 @@ pub fn is_trust_mc_owned_obligation_kind(kind: &ObligationKind) -> bool {
             // Trust (P1.2 precedent, extended to preconditions): the call-site
             // `#[requires]` VC is the same payload shape (`¬precond ∧ body_defs`)
             // and reaches the adapter only when the router's payload-aware route
-            // dispatched it (the def-site marker stays on trust-wp); a
-            // Precondition without a typed CHC payload fails closed identically.
+            // dispatched it; a Precondition without a typed CHC payload stays
+            // TrustMC-owned and fails closed identically.
             | ObligationKind::Precondition
+            // v6/D3: body-aware loop/termination VCs carry the same typed CHC
+            // violation envelope. Payload-less rows remain owned but decline
+            // fail-closed in the lowering gate.
+            | ObligationKind::LoopInvariant
+            | ObligationKind::Termination
     ) || is_hardened_custom_obligation_kind(kind)
 }
 
@@ -8500,9 +8639,8 @@ pub fn doctor_smoke_bundle() -> (TrustContractBundle, TrustObligation) {
         "trust_ir-native-trust_mc-request-{DOCTOR_SMOKE_NATIVE_REQUEST_ID}-proof-{DOCTOR_SMOKE_PROOF_OBLIGATION_ID}"
     );
     let marker_contract_id = format!("contract:trust-mc-typed-chc:{native_obligation_id}");
-    let canonical_contract_id = format!(
-        "contract:trust-mc-typed-chc-public:{DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID}"
-    );
+    let canonical_contract_id =
+        format!("contract:trust-mc-typed-chc-public:{DOCTOR_SMOKE_PUBLIC_OBLIGATION_ID}");
 
     // Trivially safe typed CHC: entry(false); error :- entry(ok), ok.
     let ok_var = serde_json::json!({ "kind": "var", "name": "ok", "sort": { "kind": "bool" } });
@@ -8591,11 +8729,11 @@ pub fn doctor_smoke_bundle() -> (TrustContractBundle, TrustObligation) {
             unsupported_modes: Vec::new(),
         },
     );
-    marker_value["native_metadata"] = serde_json::to_value(native_metadata)
-        .expect("doctor smoke native metadata serializes");
+    marker_value["native_metadata"] =
+        serde_json::to_value(native_metadata).expect("doctor smoke native metadata serializes");
 
-    let synthetic_digest = trust_mc_typed_chc_value_digest(&marker_value)
-        .expect("doctor smoke typed CHC digests");
+    let synthetic_digest =
+        trust_mc_typed_chc_value_digest(&marker_value).expect("doctor smoke typed CHC digests");
     let binding = serde_json::json!({
         "schema_version": TRUST_MC_TYPED_CHC_BINDING_SCHEMA_VERSION,
         "typed_chc_schema": TRUST_MC_TYPED_CHC_OBLIGATION_SCHEMA_VERSION,
@@ -8669,8 +8807,7 @@ pub fn doctor_smoke_bundle() -> (TrustContractBundle, TrustObligation) {
         contract_id: Some(canonical_contract_id),
         proof_item_id: None,
         source: SourceLocation::default(),
-        description: "targo-trust doctor in-process trust-mc canonical typed-CHC smoke"
-            .to_string(),
+        description: "targo-trust doctor in-process trust-mc canonical typed-CHC smoke".to_string(),
         required_strength: None,
         summary_facts: Vec::new(),
         metadata: [
@@ -8706,10 +8843,7 @@ pub fn doctor_smoke_bundle() -> (TrustContractBundle, TrustObligation) {
 
     let mut bundle = TrustContractBundle::empty(
         "targo-trust-doctor-trust-mc-smoke-bundle",
-        BundleSubject::Artifact {
-            name: "trust-mc".to_string(),
-            kind: "doctor-smoke".to_string(),
-        },
+        BundleSubject::Artifact { name: "trust-mc".to_string(), kind: "doctor-smoke".to_string() },
     );
     bundle.contracts = vec![canonical, marker];
     bundle.obligations = vec![obligation.clone()];
@@ -11196,6 +11330,8 @@ mod tests {
         for kind in [
             ObligationKind::Precondition,
             ObligationKind::Postcondition,
+            ObligationKind::LoopInvariant,
+            ObligationKind::Termination,
             ObligationKind::Assertion,
             ObligationKind::ArithmeticSafety,
             ObligationKind::Invariant,
@@ -11347,14 +11483,18 @@ mod tests {
     }
 
     #[test]
-    fn e4_e5_are_dynamic_trust_mc_lanes_only_with_a_valid_typed_vc_formula() {
+    fn e4_e5_ownership_is_stable_while_missing_or_invalid_payloads_fail_closed() {
         let adapter = TrustMcVerifierApiAdapter::default();
         for kind in [ObligationKind::LoopInvariant, ObligationKind::Termination] {
             let bare = obligation(kind.clone(), "bare-e4-e5");
             assert!(
-                !adapter.supports(&bare).is_supported(),
-                "a payload-less authored claim stays outside trust-mc"
+                adapter.supports(&bare).is_supported(),
+                "v6/D3 ownership must not depend on payload presence"
             );
+            let bare_bundle = bundle_with(vec![bare]);
+            let evidence = adapter.verify(&bare_bundle, &bare_bundle.obligations);
+            assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+            assert!(evidence[0].proof_strength.is_none());
 
             let mut typed = obligation(kind, "typed-e4-e5");
             add_typed_body_aware_vc_formula(&mut typed);
@@ -11414,15 +11554,42 @@ mod tests {
             Vec::new(),
         ))
         .expect("over-limit fixture serializes");
-        assert!(
-            !adapter.supports(&over_limit_obligation).is_supported(),
-            "deep parsing must not widen the public semantic-depth limit"
-        );
+        assert!(adapter.supports(&over_limit_obligation).is_supported());
+        let over_limit_bundle = bundle_with(vec![over_limit_obligation]);
+        let evidence = adapter.verify(&over_limit_bundle, &over_limit_bundle.obligations);
+        assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+        assert!(evidence[0].proof_strength.is_none());
     }
 
     #[test]
     fn malformed_or_ambiguous_e4_e5_formula_metadata_cannot_acquire_trust_mc_authority() {
         let adapter = TrustMcVerifierApiAdapter::default();
+        let assert_canonical_but_declined = |obligation: TrustObligation| {
+            assert!(adapter.supports(&obligation).is_supported());
+            let bundle = bundle_with(vec![obligation]);
+            bundle
+                .validate_requested_obligations(&bundle.obligations)
+                .expect("semantic refusal fixture must cross the canonical request boundary");
+            let evidence = adapter.verify(&bundle, &bundle.obligations);
+            assert_eq!(evidence.len(), 1, "canonical fixture must reach the adapter");
+            assert_eq!(evidence[0].status, EvidenceStatus::Unsupported);
+            assert!(evidence[0].proof_strength.is_none());
+        };
+        let assert_ambiguous_envelope_rejected = |obligation: TrustObligation| {
+            assert!(adapter.supports(&obligation).is_supported());
+            let bundle = bundle_with(vec![obligation]);
+            let rejection = bundle
+                .validate_requested_obligations(&bundle.obligations)
+                .expect_err("duplicate metadata must fail the canonical request boundary");
+            assert!(
+                rejection.contains("duplicate metadata key"),
+                "unexpected public-boundary rejection: {rejection}"
+            );
+            assert!(
+                adapter.verify(&bundle, &bundle.obligations).is_empty(),
+                "an invalid public request must not reach the adapter"
+            );
+        };
         let mut malformed = obligation(ObligationKind::LoopInvariant, "forged-e4");
         add_typed_body_aware_vc_formula(&mut malformed);
         let payload = malformed
@@ -11431,7 +11598,7 @@ mod tests {
             .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
             .expect("payload metadata");
         payload.value = "{}".to_string();
-        assert!(!adapter.supports(&malformed).is_supported());
+        assert_canonical_but_declined(malformed);
 
         let mut structurally_invalid =
             obligation(ObligationKind::LoopInvariant, "invalid-typed-e4");
@@ -11449,10 +11616,7 @@ mod tests {
             .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
             .expect("payload metadata")
             .value = serde_json::to_string(&undeclared).expect("invalid fixture serializes");
-        assert!(
-            !adapter.supports(&structurally_invalid).is_supported(),
-            "schema/root checks cannot grant E4 authority without full predicate validation"
-        );
+        assert_canonical_but_declined(structurally_invalid);
 
         let mut ambiguous = obligation(ObligationKind::Termination, "forged-e5");
         add_typed_body_aware_vc_formula(&mut ambiguous);
@@ -11460,7 +11624,7 @@ mod tests {
             key: TRUST_VC_FORMULA_SCHEMA_METADATA_KEY.to_string(),
             value: trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
         });
-        assert!(!adapter.supports(&ambiguous).is_supported());
+        assert_ambiguous_envelope_rejected(ambiguous);
 
         let mut wrong_origin = obligation(ObligationKind::LoopInvariant, "wrong-origin-e4");
         add_typed_body_aware_vc_formula(&mut wrong_origin);
@@ -11479,7 +11643,7 @@ mod tests {
         )
         .to_metadata_entry()
         .expect("wrong-origin context should serialize");
-        assert!(!adapter.supports(&wrong_origin).is_supported());
+        assert_canonical_but_declined(wrong_origin);
 
         let mut duplicate_context = obligation(ObligationKind::Termination, "duplicate-context-e5");
         add_typed_body_aware_vc_formula(&mut duplicate_context);
@@ -11490,7 +11654,7 @@ mod tests {
             .expect("obligation context metadata")
             .clone();
         duplicate_context.metadata.push(duplicate);
-        assert!(!adapter.supports(&duplicate_context).is_supported());
+        assert_ambiguous_envelope_rejected(duplicate_context);
     }
 
     #[test]
@@ -11954,9 +12118,12 @@ mod tests {
             "unexpected doctor smoke evidence status: {:?}",
             result.evidence[0].diagnostics
         );
-        assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("constructed typed trust_mc ChcVc")
-        }));
+        assert!(
+            result.evidence[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("constructed typed trust_mc ChcVc") })
+        );
     }
 
     /// Without the native solver the doctor smoke request must fail closed
@@ -11974,9 +12141,11 @@ mod tests {
 
         assert_eq!(result.evidence.len(), 1);
         assert_eq!(result.evidence[0].status, EvidenceStatus::Unsupported);
-        assert!(result.evidence[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("native typed CHC/PDR solving is disabled")
-        }));
+        assert!(
+            result.evidence[0].diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("native typed CHC/PDR solving is disabled")
+            })
+        );
     }
 
     #[test]
@@ -15566,6 +15735,143 @@ mod tests {
         );
     }
 
+    /// Build the compiler-style public/native pair for ONE explicit
+    /// public-kind/native-kind pairing, so a kind-binding test states the
+    /// pairing under test and nothing else. The compiler-fact cause is taken
+    /// from the same kind projection the producer uses
+    /// (`trust_ir_bridge::native_request`), so the cause gate never masks the
+    /// kind gate.
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn compiler_style_kind_pair_fixture(
+        public_kind: ObligationKind,
+        native_kind: trust_ir::ObligationKind,
+        typed_formula_payload: bool,
+    ) -> (TrustContractBundle, trust_ir::NativeVerificationBundle) {
+        let mut bundle = compiler_style_safe_public_bundle();
+        bundle.obligations[0].kind = public_kind;
+        if typed_formula_payload {
+            bundle.obligations[0].metadata.extend([
+                MetadataEntry {
+                    key: TRUST_VC_FORMULA_SCHEMA_METADATA_KEY.to_string(),
+                    value: "trust.vc.formula.canonical-json.v1".to_string(),
+                },
+                MetadataEntry {
+                    key: TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY.to_string(),
+                    value: r#"{"assertion":"body-aware"}"#.to_string(),
+                },
+            ]);
+        }
+        let mut native_bundle =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let proof_id = canonical_u32_metadata_value(
+            obligation_metadata_value(
+                &bundle.obligations[0],
+                TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
+            )
+            .expect("kind-pair fixture proof id"),
+        )
+        .expect("canonical kind-pair fixture proof id");
+        let cause = native_trust_ir_obligation_cause_projection(&native_kind);
+        native_bundle
+            .module
+            .proof_obligations
+            .iter_mut()
+            .find(|proof| proof.id.index() == proof_id)
+            .expect("kind-pair fixture proof obligation")
+            .kind = native_kind;
+        native_bundle
+            .compiler_facts
+            .obligation_sources
+            .iter_mut()
+            .find(|source| source.obligation.index() == proof_id)
+            .expect("kind-pair fixture compiler-fact source")
+            .cause = cause;
+        let module_digest = native_bundle.module.stable_digest();
+        native_bundle.trust_ir_module_digest = module_digest;
+        for node in &mut native_bundle.lineage.nodes {
+            node.target_module = module_digest;
+        }
+        native_bundle
+            .validate()
+            .unwrap_or_else(|errors| panic!("kind-pair fixture must validate: {errors:#?}"));
+        (bundle, native_bundle)
+    }
+
+    /// v6/D3 (`79558a8f2e`) re-routed the payload-less halves of
+    /// Precondition/Postcondition and the envelope-less halves of
+    /// LoopInvariant/Termination from trust-wp to trust-mc, keeping their
+    /// native kinds. Every pairing the compiler's
+    /// `native_trust_ir_route_for_api_obligation` can hand the trust-mc suite
+    /// must reconcile here, or the row dies at the identity gate with a
+    /// message that reads like a typo (`kind Postcondition does not match
+    /// native proof obligation 0 kind Postcondition`).
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_public_claim_binding_accepts_payloadless_v6_d3_native_kinds() {
+        for (public_kind, native_kind) in [
+            (ObligationKind::Precondition, trust_ir::ObligationKind::Precondition),
+            (ObligationKind::Postcondition, trust_ir::ObligationKind::Postcondition),
+            (ObligationKind::LoopInvariant, trust_ir::ObligationKind::LoopInvariant),
+            (ObligationKind::Termination, trust_ir::ObligationKind::TranslationValidation),
+        ] {
+            let (bundle, native_bundle) =
+                compiler_style_kind_pair_fixture(public_kind.clone(), native_kind.clone(), false);
+            validate_compiler_style_public_claim_for_test(&bundle, &native_bundle, 0)
+                .unwrap_or_else(|reason| {
+                    panic!(
+                        "the compiler's own {public_kind:?} -> {native_kind:?} trust-mc route must bind: {reason}"
+                    )
+                });
+        }
+    }
+
+    /// The identity arms must not turn the table into "accept anything". Each
+    /// row below is a pairing the producer CANNOT emit for that public
+    /// obligation, and each must still fail closed at the identity gate rather
+    /// than reaching the formula/marker checks.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_public_claim_binding_still_rejects_mismatched_native_kinds() {
+        let cases: Vec<(ObligationKind, trust_ir::ObligationKind, bool)> = vec![
+            // A postcondition proof unit may never answer a precondition row,
+            // nor the converse: the identity arms are pairwise, not a group.
+            (ObligationKind::Precondition, trust_ir::ObligationKind::Postcondition, false),
+            (ObligationKind::Postcondition, trust_ir::ObligationKind::Precondition, false),
+            // The payload-BEARING half of these kinds is routed to
+            // PanicFreedom; the identity pairing belongs to the payload-less
+            // half alone, so the guards stay exact complements.
+            (ObligationKind::Precondition, trust_ir::ObligationKind::Precondition, true),
+            (ObligationKind::Postcondition, trust_ir::ObligationKind::Postcondition, true),
+            // ...and symmetrically, a payload-LESS row may not claim the
+            // PanicFreedom proof unit that carries the body-aware CHC.
+            (ObligationKind::Precondition, trust_ir::ObligationKind::PanicFreedom, false),
+            (ObligationKind::Postcondition, trust_ir::ObligationKind::PanicFreedom, false),
+            // Termination projects onto TranslationValidation and
+            // LoopInvariant onto itself; the two may not be swapped.
+            (ObligationKind::Termination, trust_ir::ObligationKind::LoopInvariant, false),
+            (ObligationKind::LoopInvariant, trust_ir::ObligationKind::TranslationValidation, false),
+            // An unrelated native kind, and a public kind trust-mc does not
+            // own at all, both remain unbindable.
+            (ObligationKind::Assertion, trust_ir::ObligationKind::Postcondition, false),
+            (ObligationKind::MemorySafety, trust_ir::ObligationKind::MemorySafety, false),
+        ];
+        for (public_kind, native_kind, typed_formula_payload) in cases {
+            let (bundle, native_bundle) = compiler_style_kind_pair_fixture(
+                public_kind.clone(),
+                native_kind.clone(),
+                typed_formula_payload,
+            );
+            let reason = validate_compiler_style_public_claim_for_test(&bundle, &native_bundle, 0)
+                .expect_err(&format!(
+                    "{public_kind:?} -> {native_kind:?} (typed payload {typed_formula_payload}) is not a producer route and must fail closed"
+                ));
+            assert!(
+                reason.contains("does not match native proof obligation"),
+                "{public_kind:?} -> {native_kind:?} must be refused by the identity gate, got: {reason}"
+            );
+        }
+    }
+
     #[test]
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     fn native_trust_ir_public_claim_binding_rejects_contract_and_marker_semantic_mutations() {
@@ -16042,16 +16348,15 @@ mod tests {
 
     #[test]
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
-    fn native_bundle_entrypoint_rejects_unowned_e4_e5_before_direct_typed_solve() {
+    fn owned_payloadless_e4_e5_rejects_supplied_contract_before_direct_solve() {
         let adapter = TrustMcVerifierApiAdapter::new(
             TrustMcConfig::new().with_proof_mode(TrustMcProofMode::Chc).with_timeout(10_000),
         );
 
-        // The low-level native-bundle entrypoint is public and can be invoked
-        // without the router's `supports` filter.  A supplied, directly
-        // provable typed contract must not grant ownership to a bare E4/E5
-        // obligation: ownership requires the current compiler VC context and
-        // exact Bool formula payload as well as the kind.
+        // v6/D3 makes E4/E5 ownership kind-stable, including at the public
+        // low-level native-bundle entrypoint. Proof admission is narrower: a
+        // directly provable caller-supplied contract cannot replace the
+        // compiler's missing current Bool violation envelope.
         for kind in [ObligationKind::LoopInvariant, ObligationKind::Termination] {
             let native_bundle = compiler_style_safe_tmir_bundle();
             let obligation_id = native_typed_chc_obligation_id(7, 0);
@@ -16067,41 +16372,124 @@ mod tests {
             );
 
             assert!(
-                !is_trust_mc_owned_obligation(&bundle.obligations[0]),
-                "a bare {kind:?} plus a supplied typed contract must remain unowned"
+                is_trust_mc_owned_obligation(&bundle.obligations[0])
+                    && adapter.supports(&bundle.obligations[0]).is_supported(),
+                "a payloadless {kind:?} remains TrustMC-owned under v6/D3"
             );
 
-            let evidence = adapter.evidence_from_native_trust_ir_bundle(
+            let public_evidence = adapter.verify(&bundle, &bundle.obligations);
+            let native_evidence = adapter.evidence_from_native_trust_ir_bundle(
                 &bundle,
                 &bundle.obligations,
                 &native_bundle,
             );
 
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(
-                evidence[0].status,
-                EvidenceStatus::Unsupported,
-                "an unowned {kind:?} must be rejected before its supplied direct contract is solved: {:#?}",
-                evidence[0].diagnostics,
-            );
-            assert!(evidence[0].proof_strength.is_none());
-            assert!(!evidence[0].is_unbounded_proof());
-            assert!(evidence[0].artifacts.is_empty());
-            assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
-                diagnostic.contains("does not own") && diagnostic.contains(&format!("{kind:?}"))
-            }));
-            assert!(
-                evidence[0].diagnostics.iter().any(|diagnostic| {
-                    diagnostic.contains("rejected before direct solving")
+            for (entrypoint, evidence) in
+                [("ordinary verifier-api", public_evidence), ("native-bundle", native_evidence)]
+            {
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(
+                    evidence[0].status,
+                    EvidenceStatus::Unsupported,
+                    "{entrypoint} must reject payloadless {kind:?} before solving the supplied contract: {:#?}",
+                    evidence[0].diagnostics,
+                );
+                assert!(evidence[0].proof_strength.is_none());
+                assert!(!evidence[0].is_unbounded_proof());
+                assert!(evidence[0].artifacts.is_empty());
+                assert!(evidence[0].diagnostics.iter().any(|diagnostic| {
+                    diagnostic.contains("trust-mc owns")
                         && diagnostic.contains(&format!("{kind:?}"))
-                }),
-                "missing explicit pre-solve ownership rejection: {:#?}",
-                evidence[0].diagnostics
-            );
-            assert!(evidence[0].diagnostics.iter().all(|diagnostic| {
-                !diagnostic.contains("native trust_mc typed CHC/PDR proof transport accepted")
-            }));
+                        && diagnostic.contains("current compiler-authenticated E4/E5 Bool formula")
+                        && diagnostic.contains("rejected before direct solving")
+                }));
+                assert!(evidence[0].diagnostics.iter().all(|diagnostic| {
+                    !diagnostic.contains("typed CHC/PDR proof transport accepted")
+                        && !diagnostic.contains("typed CHC/PDR input artifact")
+                }));
+            }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn payloadless_e4_pre_rejection_does_not_suppress_valid_native_sibling() {
+        let path = "demo::f";
+        let panic_freedom_id = format!(
+            "vc:{}:assertion:panic-freedom:0",
+            trust_types::canonical_artifact_id_component(path)
+        );
+        let payloadless_id = native_typed_chc_obligation_id(8, 1);
+        let mut bundle = compiler_style_public_bundle(&[
+            (panic_freedom_id.as_str(), 7, 0, 18, 13, COMPILER_STYLE_SAFE_NORMALIZED_INPUT_DIGEST),
+            (payloadless_id.as_str(), 8, 1, 42, 9, COMPILER_STYLE_FAILING_NORMALIZED_INPUT_DIGEST),
+        ]);
+        let panic_context = trust_verifier_api::ObligationContext::new(
+            trust_verifier_api::ObligationProducer::CompilerMirExtract,
+            trust_verifier_api::ObligationOrigin::VerificationCondition {
+                vc_kind: "panic_freedom".to_string(),
+                vc_index: 0,
+                formula_schema: None,
+            },
+        )
+        .with_function(trust_verifier_api::FunctionContext {
+            crate_name: "demo".to_string(),
+            path: path.to_string(),
+        });
+        bundle.obligations[0].metadata.extend([
+            panic_context.to_metadata_entry().expect("panic context serializes"),
+            MetadataEntry {
+                key: TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY.to_string(),
+                value: "enabled".to_string(),
+            },
+            MetadataEntry { key: "trust.vc.kind".to_string(), value: "panic_freedom".to_string() },
+        ]);
+        assert!(obligation_is_whole_function_panic_freedom(&bundle, &bundle.obligations[0]));
+
+        bundle.obligations[1].kind = ObligationKind::LoopInvariant;
+        bundle.obligations[1].contract_id = Some("contract-payloadless-e4".to_string());
+        bundle.obligations[1].metadata.retain(|entry| {
+            !matches!(
+                entry.key.as_str(),
+                TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY
+            )
+        });
+        push_typed_chc_contract(
+            &mut bundle,
+            typed_chc_contract("contract-payloadless-e4", &payloadless_id, false),
+        );
+        let native_bundle = bind_compiler_style_native_bundle_to_public(
+            compiler_style_mixed_tmir_bundle(),
+            &bundle,
+        );
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+
+        let evidence = adapter.evidence_from_native_trust_ir_bundle(
+            &bundle,
+            &bundle.obligations,
+            &native_bundle,
+        );
+
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(
+            evidence[0].status,
+            EvidenceStatus::Proved,
+            "the exact safe panic-freedom sibling must still consume its native proof: {:#?}",
+            evidence[0].diagnostics,
+        );
+        assert!(evidence[0].is_unbounded_proof());
+        assert_eq!(evidence[1].status, EvidenceStatus::Unsupported);
+        assert!(evidence[1].proof_strength.is_none());
+        assert!(evidence[1].artifacts.is_empty());
+        assert!(evidence[1].diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("trust-mc owns LoopInvariant")
+                && diagnostic.contains("rejected before direct solving")
+        }));
     }
 
     #[test]
@@ -16744,9 +17132,9 @@ mod tests {
     }
 
     #[test]
-    fn proof_grade_native_evidence_is_rejected_for_unowned_obligation_kind() {
-        // A bare Termination claim remains trust-wp-owned. Only an E5 row with
-        // the compiler's valid typed violation formula enters trust-mc.
+    fn proof_grade_native_evidence_for_payloadless_termination_fails_closed() {
+        // A bare Termination claim is TrustMC-owned, but lacks the compiler's
+        // valid typed violation formula and therefore cannot admit proof.
         let adapter = TrustMcVerifierApiAdapter::default();
         let obligation_id = native_typed_chc_obligation_id(43, 1);
         let bundle = bundle_with(vec![obligation(ObligationKind::Termination, &obligation_id)]);
@@ -16761,9 +17149,7 @@ mod tests {
 
         assert_eq!(evidence.status, EvidenceStatus::Unsupported);
         assert_eq!(evidence.proof_strength, None);
-        assert!(evidence.diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("rejected for unowned Termination obligation")
-        }));
+        assert!(!evidence.diagnostics.is_empty());
     }
 
     #[test]
@@ -16842,9 +17228,7 @@ mod tests {
         assert_eq!(rejected.status, EvidenceStatus::Unsupported);
         assert!(rejected.proof_strength.is_none());
         assert!(rejected.artifacts.is_empty());
-        assert!(rejected.diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("rejected for unowned Termination obligation")
-        }));
+        assert!(!rejected.diagnostics.is_empty());
     }
 
     #[test]
@@ -17307,6 +17691,146 @@ mod tests {
                 .checked_mul(eval_exact_uint(rhs))
                 .expect("Horner intermediate stays within u128"),
             other => panic!("unexpected node in wide-int literal tree: {other:?}"),
+        }
+    }
+
+    /// Evaluate the small, closed Int/Bool expression fragment emitted by the
+    /// truncating division/remainder lowering.  The primitive Int operations
+    /// deliberately use Euclidean semantics, matching ay/SMT-LIB; the expected
+    /// values in the tests use Rust `/` and `%`.
+    fn eval_closed_truncating_arithmetic(expr: &Expr) -> i128 {
+        use ay_bindings::ExprValue;
+
+        match expr.value() {
+            ExprValue::IntConst(value) => {
+                value.to_string().parse::<i128>().expect("test integer fits i128")
+            }
+            ExprValue::IntSub(lhs, rhs) => {
+                eval_closed_truncating_arithmetic(lhs) - eval_closed_truncating_arithmetic(rhs)
+            }
+            ExprValue::IntDiv(lhs, rhs) => eval_closed_truncating_arithmetic(lhs)
+                .div_euclid(eval_closed_truncating_arithmetic(rhs)),
+            ExprValue::IntMod(lhs, rhs) => eval_closed_truncating_arithmetic(lhs)
+                .rem_euclid(eval_closed_truncating_arithmetic(rhs)),
+            ExprValue::IntNeg(inner) => -eval_closed_truncating_arithmetic(inner),
+            ExprValue::Ite { cond, then_expr, else_expr } => {
+                if eval_closed_truncating_condition(cond) {
+                    eval_closed_truncating_arithmetic(then_expr)
+                } else {
+                    eval_closed_truncating_arithmetic(else_expr)
+                }
+            }
+            other => panic!("unexpected truncating-arithmetic node: {other:?}"),
+        }
+    }
+
+    fn eval_closed_truncating_condition(expr: &Expr) -> bool {
+        use ay_bindings::ExprValue;
+
+        match expr.value() {
+            ExprValue::BoolConst(value) => *value,
+            ExprValue::IntGe(lhs, rhs) => {
+                eval_closed_truncating_arithmetic(lhs) >= eval_closed_truncating_arithmetic(rhs)
+            }
+            other => panic!("unexpected truncating-arithmetic condition: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_chc_truncating_division_and_remainder_match_rust_signed_semantics() {
+        let binary = super::trust_mc_typed_chc_binary_expr;
+
+        for dividend in -7_i128..=7 {
+            for divisor in -4_i128..=4 {
+                if divisor == 0 {
+                    continue;
+                }
+
+                let remainder = binary(
+                    TrustMcTypedChcBinaryOpInput::TruncRem,
+                    Expr::int_const(dividend),
+                    Expr::int_const(divisor),
+                )
+                .expect("well-sorted truncating remainder must lower");
+                let division = binary(
+                    TrustMcTypedChcBinaryOpInput::TruncDiv,
+                    Expr::int_const(dividend),
+                    Expr::int_const(divisor),
+                )
+                .expect("well-sorted truncating division must lower");
+
+                assert_eq!(
+                    eval_closed_truncating_arithmetic(&remainder),
+                    dividend % divisor,
+                    "remainder mismatch for {dividend} % {divisor}"
+                );
+                assert_eq!(
+                    eval_closed_truncating_arithmetic(&division),
+                    dividend / divisor,
+                    "division mismatch for {dividend} / {divisor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_chc_legacy_division_and_modulus_fail_closed() {
+        let binary = super::trust_mc_typed_chc_binary_expr;
+        let int = Expr::int_const;
+
+        for (op, wire_op) in
+            [(TrustMcTypedChcBinaryOpInput::Div, "div"), (TrustMcTypedChcBinaryOpInput::Mod, "mod")]
+        {
+            let error = binary(op, int(-3_i128), int(2_i128))
+                .expect_err("ambiguous legacy arithmetic must not become proof input");
+            assert!(error.contains("semantically ambiguous"), "unexpected error: {error}");
+            assert!(error.contains("trunc_div") && error.contains("trunc_rem"));
+
+            // Even where both meanings happen to agree (including the entire
+            // unsigned/non-negative source domain), accepting the legacy tag
+            // would make admission depend on an unauthenticated range invariant
+            // that schema v1 did not carry.
+            assert!(binary(op, int(7_i128), int(3_i128)).is_err());
+
+            let stale: TrustMcTypedChcExprInput = serde_json::from_value(serde_json::json!({
+                "kind": "binary",
+                "op": wire_op,
+                "lhs": { "kind": "int_const", "value": "7" },
+                "rhs": { "kind": "int_const", "value": "3" },
+            }))
+            .expect("legacy v1 tag should deserialize for a precise diagnostic");
+            let error = stale
+                .to_trust_mc_expr(&BTreeMap::new())
+                .expect_err("stale v1 payload must fail closed before proof admission");
+            assert!(error.contains("semantically ambiguous"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn typed_chc_truncating_ops_deserialize_and_fail_closed_on_sort_mismatch() {
+        use serde_json::json;
+
+        for op in ["trunc_div", "trunc_rem"] {
+            let input: TrustMcTypedChcExprInput = serde_json::from_value(json!({
+                "kind": "binary",
+                "op": op,
+                "lhs": { "kind": "int_const", "value": "-3" },
+                "rhs": { "kind": "int_const", "value": "2" },
+            }))
+            .expect("producer truncating op must deserialize");
+            let expr = input
+                .to_trust_mc_expr(&BTreeMap::new())
+                .expect("producer truncating op must lower");
+            assert_eq!(expr.sort(), &Sort::int());
+        }
+
+        let bool_expr = || Expr::var("b".to_string(), Sort::bool());
+        for op in [TrustMcTypedChcBinaryOpInput::TruncDiv, TrustMcTypedChcBinaryOpInput::TruncRem] {
+            assert!(
+                super::trust_mc_typed_chc_binary_expr(op, bool_expr(), Expr::int_const(2_i128),)
+                    .is_err(),
+                "truncating op {op:?} must reject a Bool operand"
+            );
         }
     }
 

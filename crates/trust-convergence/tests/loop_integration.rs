@@ -365,8 +365,7 @@ fn test_loop_full_orchestration_to_completion() {
         }
 
         current = if stagnation.is_stagnant() {
-            let strengthen_output =
-                trust_strengthen::run(&current, &StrengthenConfig::default());
+            let strengthen_output = trust_strengthen::run(&current, &StrengthenConfig::default());
             assert!(strengthen_output.has_proposals);
             crate_result(
                 "orchestrated",

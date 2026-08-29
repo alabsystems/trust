@@ -295,8 +295,9 @@ pub fn recheck_zero_add(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_ir::ProofEvidence;
+
+    use super::*;
 
     /// THE MILESTONE: a genuinely inductive functional-correctness property of a
     /// real kernel-registered operation (`Nat.add` left identity) is minted as a

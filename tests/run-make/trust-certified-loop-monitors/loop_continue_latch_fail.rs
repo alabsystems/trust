@@ -1,6 +1,9 @@
 fn bad_continue_latch(mut n: u32) {
     let mut first = true;
-    while n > 0 invariant n <= 2 decreases n {
+    while n > 0
+        invariant n <= 2
+        decreases n
+    {
         if first {
             // This is one of two distinct latches in the loop. It does not
             // decrease and must be checked independently of the fallthrough

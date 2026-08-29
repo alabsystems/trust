@@ -17,21 +17,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use trust_js_trace::{
-    explain_divergence, normalize_async_completion_markers, trace_driver_sha256, traces_equal,
-    ObservableTrace,
+    ObservableTrace, explain_divergence, normalize_async_completion_markers, trace_driver_sha256,
+    traces_equal,
 };
 
-use crate::cases::{prepare_case, PreparedCase};
+use crate::cases::{PreparedCase, prepare_case};
 use crate::heads::{
-    write_driver, BunHead, EngineHead, HeadResult, NodeHead, RunMode, SemHead, TrustJsHead,
+    BunHead, EngineHead, HeadResult, NodeHead, RunMode, SemHead, TrustJsHead, write_driver,
 };
 use crate::model::{
-    DivergenceRow, Js262AuditEntry, Js262Classification, Scorecard, ScorecardCorpus,
-    ScorecardEngine, ScorecardEngines, ScorecardGate, ScorecardTotals, SCORECARD_SCHEMA,
+    DivergenceRow, Js262AuditEntry, Js262Classification, SCORECARD_SCHEMA, Scorecard,
+    ScorecardCorpus, ScorecardEngine, ScorecardEngines, ScorecardGate, ScorecardTotals,
 };
-use crate::slice::{derive, load_slice, verify_derived, SliceKind};
-use crate::util::{git_head, now_utc_iso, probe_engine, validation_date, Engine, ProbedEngine};
-use crate::validate::{audit_entry_is_active, load_audit, load_test_exceptions, test_exception_is_active, validate_ledgers};
+use crate::slice::{SliceKind, derive, load_slice, verify_derived};
+use crate::util::{Engine, ProbedEngine, git_head, now_utc_iso, probe_engine, validation_date};
+use crate::validate::{
+    audit_entry_is_active, load_audit, load_test_exceptions, test_exception_is_active,
+    validate_ledgers,
+};
 
 pub struct CalibrateOpts {
     pub corpus: PathBuf,
@@ -158,7 +161,10 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
         for f in &loaded.findings {
             eprintln!("calibrate: slice manifest finding: {}", f.render());
         }
-        anyhow::bail!("slice manifest {} failed its internal consistency check", opts.slice.display());
+        anyhow::bail!(
+            "slice manifest {} failed its internal consistency check",
+            opts.slice.display()
+        );
     }
     // The slice self-declares its kind (S0 vs S-async); re-derivation and the
     // dashboard label both follow it.
@@ -204,9 +210,8 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
     let corpus_pkg = opts.corpus.join("package.json");
     match slice_kind {
         SliceKind::SModule => {
-            std::fs::write(&corpus_pkg, "{\"type\":\"module\"}\n").map_err(|e| {
-                anyhow::anyhow!("module goal needs {}: {e}", corpus_pkg.display())
-            })?;
+            std::fs::write(&corpus_pkg, "{\"type\":\"module\"}\n")
+                .map_err(|e| anyhow::anyhow!("module goal needs {}: {e}", corpus_pkg.display()))?;
         }
         SliceKind::S0 | SliceKind::SAsync => {
             if corpus_pkg.exists() {
@@ -227,11 +232,8 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
     let (ledger_findings, _summary) = validate_ledgers(&opts.ledgers, &vdate);
     let audit = load_audit(&opts.ledgers);
     let exceptions = load_test_exceptions(&opts.ledgers);
-    let active_exceptions: Vec<&crate::model::Js262TestException> = exceptions
-        .exceptions
-        .iter()
-        .filter(|e| test_exception_is_active(e, &vdate))
-        .collect();
+    let active_exceptions: Vec<&crate::model::Js262TestException> =
+        exceptions.exceptions.iter().filter(|e| test_exception_is_active(e, &vdate)).collect();
     let active_waivers: Vec<&Js262AuditEntry> = audit
         .entries
         .iter()
@@ -299,10 +301,8 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
                     .map_err(|e| format!("worker {worker}: node slot: {e}"))?;
                 let bun_head = BunHead::new(bun_path, driver.clone(), slot_root.join("bun"))
                     .map_err(|e| format!("worker {worker}: bun slot: {e}"))?;
-                let sem_head = aux_cache
-                    .as_ref()
-                    .filter(|_| sem_on)
-                    .map(|c| SemHead::new(Arc::clone(c)));
+                let sem_head =
+                    aux_cache.as_ref().filter(|_| sem_on).map(|c| SemHead::new(Arc::clone(c)));
                 let trustjs_head = aux_cache
                     .as_ref()
                     .filter(|_| trustjs_on)
@@ -329,17 +329,14 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
                             ),
                             _ => (None, None),
                         };
-                        records
-                            .lock()
-                            .map_err(|_| "records poisoned")?
-                            .push(RunRecord {
-                                path: case.rel_path.clone(),
-                                mode,
-                                node: node_res,
-                                bun: bun_res,
-                                sem: sem_res,
-                                trustjs: trustjs_res,
-                            });
+                        records.lock().map_err(|_| "records poisoned")?.push(RunRecord {
+                            path: case.rel_path.clone(),
+                            mode,
+                            node: node_res,
+                            bun: bun_res,
+                            sem: sem_res,
+                            trustjs: trustjs_res,
+                        });
                     }
                 }
                 Ok(())
@@ -358,7 +355,9 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
         .map_err(|_| anyhow::anyhow!("records still shared"))?
         .into_inner()
         .map_err(|_| anyhow::anyhow!("records poisoned"))?;
-    records.sort_by(|a, b| (a.path.as_str(), a.mode.as_str()).cmp(&(b.path.as_str(), b.mode.as_str())));
+    records.sort_by(|a, b| {
+        (a.path.as_str(), a.mode.as_str()).cmp(&(b.path.as_str(), b.mode.as_str()))
+    });
 
     // --- async-failure-marker normalization ---
     // The test262 async harness reports a failure by printing
@@ -472,7 +471,8 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
 
     totals.divergent_cases = divergent_paths.len() as u64;
     totals.unclassified_divergent_cases = unclassified_paths.len() as u64;
-    totals.classified_divergent_cases = totals.divergent_cases - totals.unclassified_divergent_cases;
+    totals.classified_divergent_cases =
+        totals.divergent_cases - totals.unclassified_divergent_cases;
     totals.tool_failures = totals.harness_errors;
     totals.sem_cases = sem_audit.cases;
     totals.sem_covered = sem_audit.covered;
@@ -488,11 +488,8 @@ pub fn run_calibrate(opts: &CalibrateOpts) -> anyhow::Result<i32> {
         totals.unclassified_divergent_cases + totals.sem_divergent + totals.trustjs_divergent;
 
     // --- gate ---
-    let ratio = if totals.runs > 0 {
-        totals.trace_equal_runs as f64 / totals.runs as f64
-    } else {
-        1.0
-    };
+    let ratio =
+        if totals.runs > 0 { totals.trace_equal_runs as f64 / totals.runs as f64 } else { 1.0 };
     // The design doc's >=99.9% Node==Bun agreement figure is a HYPOTHESIS the
     // calibration measures and reports — it is not a pass condition. The gate
     // passes when the apparatus is calibrated: every divergence classified
@@ -612,11 +609,7 @@ fn engine_json(p: &ProbedEngine) -> ScorecardEngine {
 
 /// Exit 1 if tool_failures != 0 or failed != 0 or !gate.pass.
 pub fn scorecard_exit_code(s: &Scorecard) -> i32 {
-    if s.totals.tool_failures != 0 || s.totals.failed != 0 || !s.gate.pass {
-        1
-    } else {
-        0
-    }
+    if s.totals.tool_failures != 0 || s.totals.failed != 0 || !s.gate.pass { 1 } else { 0 }
 }
 
 fn render_dashboard(
@@ -635,7 +628,10 @@ fn render_dashboard(
         out.push_str("**PARTIAL RUN (`--limit`): this scorecard never claims the gate.**\n\n");
     }
     out.push_str(&format!("- Generated: {}\n", s.generated_at));
-    out.push_str(&format!("- Corpus: `{}` (slice sha256 `{}`)\n", s.corpus.revision, s.corpus.slice_sha256));
+    out.push_str(&format!(
+        "- Corpus: `{}` (slice sha256 `{}`)\n",
+        s.corpus.revision, s.corpus.slice_sha256
+    ));
     // Version + binary digest, never the install path: the dashboard is the
     // published conformance record, and a reader on another box has to be able
     // to check they are running the same engine, which an absolute path from
@@ -721,10 +717,7 @@ fn render_head_section(
         }
     }
     if !audit.divergence_notes.is_empty() {
-        out.push_str(&format!(
-            "\n{} divergences (gate-fatal):\n\n",
-            capitalize(head)
-        ));
+        out.push_str(&format!("\n{} divergences (gate-fatal):\n\n", capitalize(head)));
         for line in audit.divergence_notes.iter().take(25) {
             out.push_str(&format!("- {line}\n"));
         }
@@ -754,7 +747,10 @@ fn render_divergence_section(
     if !unclassified.is_empty() {
         out.push_str("\nTop unclassified divergences:\n\n");
         for d in unclassified.iter().take(25) {
-            out.push_str(&format!("- `{}` [{}] fp `{}`: {}\n", d.path, d.mode, d.fingerprint, d.explain));
+            out.push_str(&format!(
+                "- `{}` [{}] fp `{}`: {}\n",
+                d.path, d.mode, d.fingerprint, d.explain
+            ));
         }
     }
     if !harness_errors.is_empty() {
@@ -823,7 +819,7 @@ mod tests {
 
     // --- HeadAudit: the trustjs/sem totals audit equation ---
 
-    use trust_js_trace::{Completion, ThrownProjection, SCHEMA_VERSION};
+    use trust_js_trace::{Completion, SCHEMA_VERSION, ThrownProjection};
 
     fn normal_trace() -> ObservableTrace {
         ObservableTrace {
@@ -982,7 +978,10 @@ mod tests {
         let t = &scorecard.totals;
         eprintln!(
             "env_gated_trustjs_calibrate_smoke: trustjs cases={} covered={} equal={} divergent={} no_coverage={}",
-            t.trustjs_cases, t.trustjs_covered, t.trustjs_equal, t.trustjs_divergent,
+            t.trustjs_cases,
+            t.trustjs_covered,
+            t.trustjs_equal,
+            t.trustjs_divergent,
             t.trustjs_no_coverage
         );
         assert_eq!(t.cases, 100);

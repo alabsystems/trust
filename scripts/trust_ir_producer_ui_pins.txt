@@ -58,15 +58,69 @@
 # classification; with them listed the sampling population is 6983 again —
 # re-measured, not assumed. The 2000-file sample identity itself was NOT
 # re-measured on this merge; it follows from the population being unchanged.
+#
+# UPDATED 2026-08-27. 21 files classified, restoring `--check-ui-pins` to OK
+# (it had been exiting 1, so NO sweep could start at all). Every one of the 21
+# was created after the 2026-07-01 baseline — measured, `git log --diff-filter=A`:
+# the earliest is e9_multi_clause_undischarged at 2026-07-16, the rest run
+# 2026-08-21 to 2026-08-27 — so the default classification applies to all of
+# them and none required a judgement call. They are the Clean-origin wf/rec
+# wave (9), the postcondition/hardened composition-at-call-site wave (5), the
+# R1 caller-closure key-space wave (4), and three singles.
+#
+# THE INVARIANT IS BROKEN, AND CLASSIFICATION CANNOT REPAIR IT. The population
+# is now 6985, not 6983, and 6983 is UNREACHABLE by any edit to this file:
+#
+#     6983  reference (2026-08-19)
+#       +4  newly eligible under tests/ui/contracts/ — contract_assoc_const_-
+#           resolves_exactly, contract_truncating_cast_stays_refused,
+#           contract_unevaluable_const_refuses, contract_widening_cast_lowers
+#       -2  assoc_const_projection_no_ice (2026-08-22) and assumed_total_key_-
+#           alias_write_fmt_recovery (2026-08-24) each GAINED a `//~`
+#           annotation, so the content filters now keep them out
+#     ----
+#     6985
+#
+# Excluding those four would give 6981, not 6983, so it would sacrifice corpus
+# honesty AND still not restore comparability. The next sweep is therefore a
+# NEW BASELINE and no delta against any recorded sweep is meaningful. Say so
+# wherever its number is quoted.
+#
+# THE ENFORCEMENT GAP THIS EXPOSES, which is the durable lesson: this manifest
+# governs `tests/ui/trust/` only, and the scorecard HARD FAILS only on an
+# unclassified file under that prefix. But the sampling population is all of
+# `tests/ui`, so a test landing ANYWHERE ELSE moves it silently — which is
+# exactly what those four contracts/ files did, with nothing firing. The gate
+# that exists to stop the sample drifting cannot see most of the tree it
+# samples from. Widening it is a real change to what the corpus means and is
+# left to the owner rather than taken here.
 
 [excluded]
+# 2026-08-27 (totality-baseline sweep): two campaign pins minted after the
+# baseline by concurrent sessions — slice regression tests, not corpus.
+tests/ui/trust/clean_origin_wf_rec_gcd_direct.rs
+tests/ui/trust/contract_inlined_call_ensures_proves.rs
+# 2026-08-28: cross-crate source-scope ICE regression, absent from the fresh
+# totality baseline and therefore excluded rather than admitted retroactively.
+tests/ui/trust/cross_crate_inlined_loop.rs
 tests/ui/trust/assumption-rows/async_exhibit_does_not_certify.rs
 tests/ui/trust/clean_origin_call_parity.rs
+tests/ui/trust/clean_origin_composed.rs
 tests/ui/trust/clean_origin_const_ctfe.rs
+tests/ui/trust/clean_origin_constant.rs
 tests/ui/trust/clean_origin_nat_projection.rs
 tests/ui/trust/clean_origin_parity_collision.rs
 tests/ui/trust/clean_origin_parity_no_collision.rs
+tests/ui/trust/clean_origin_run_raw_binop.rs
+tests/ui/trust/clean_origin_run_select.rs
+tests/ui/trust/clean_origin_run_select_literal.rs
+tests/ui/trust/clean_origin_select_operands.rs
+tests/ui/trust/clean_origin_structural_rec.rs
 tests/ui/trust/clean_origin_verify_on.rs
+tests/ui/trust/clean_origin_wf_rec.rs
+tests/ui/trust/clean_origin_wf_rec_arity.rs
+tests/ui/trust/clean_origin_wf_rec_gcd.rs
+tests/ui/trust/clean_origin_wf_rec_mul.rs
 tests/ui/trust/clean_origin_wrapping_binop.rs
 tests/ui/trust/clean_unit_call_parity.rs
 tests/ui/trust/clean_unit_cfg_off.rs
@@ -76,6 +130,18 @@ tests/ui/trust/dyn_dispatch_reliance_field_held_dyn_root_stays_closed.rs
 tests/ui/trust/dyn_dispatch_reliance_field_held_dyn_variant_carrier_stays_closed.rs
 tests/ui/trust/dyn_dispatch_reliance_open_sink_poison_direction.rs
 tests/ui/trust/dyn_dispatch_reliance_recursive_field_carrier_discharges.rs
+tests/ui/trust/e9_multi_clause_undischarged.rs
+tests/ui/trust/hardened_composition_at_call_site.rs
+tests/ui/trust/native_loop_clause_positions.rs
+tests/ui/trust/postcondition_composition_at_call_site.rs
+tests/ui/trust/postcondition_composition_attribute_at_call_site.rs
+tests/ui/trust/postcondition_composition_preconditioned_at_call_site.rs
+tests/ui/trust/r1/caller_closure_key_space_collision.rs
+tests/ui/trust/r1/caller_closure_key_space_no_collision.rs
+tests/ui/trust/r1/generic_mono_caller_closure_collision.rs
+tests/ui/trust/r1/generic_mono_caller_closure_is_live.rs
+tests/ui/trust/safe_intrinsic_no_safety_comment_demand.rs
+tests/ui/trust/static_str_write_fmt_assumed_total_second_pointer_hop_control.rs
 tests/ui/trust/trust_ir_array_first_class_spelling.rs
 tests/ui/trust/trust_ir_array_slot_value_model.rs
 tests/ui/trust/trust_ir_const_param_column.rs
@@ -83,11 +149,15 @@ tests/ui/trust/trust_ir_enum_oracle_first_class_alignment.rs
 tests/ui/trust/trust_ir_fat_bytes_const_marshalling.rs
 tests/ui/trust/trust_ir_fat_reborrow_passthrough.rs
 tests/ui/trust/trust_ir_linked_call_width_and_admission.rs
+tests/ui/trust/trust_ir_lower_nonlocal_const_no_havoc.rs
+tests/ui/trust/trust_ir_lower_static_ctfe_no_cycle.rs
 tests/ui/trust/trust_ir_overwritten_lane_zero.rs
 tests/ui/trust/trust_ir_promoted_global_paired_admission.rs
 tests/ui/trust/trust_ir_unsize_dyn_data_lane.rs
 tests/ui/trust/trust_ir_vtable_faithful_principal_key.rs
 tests/ui/trust/trust_ir_vtable_nominal_principal_key.rs
+tests/ui/trust/trust_spec_emit_citation.rs
+tests/ui/trust/wrapping_intrinsic_is_modular.rs
 
 [in-pool]
 tests/ui/trust/assoc_const_projection_no_ice.rs

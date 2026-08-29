@@ -9,11 +9,7 @@ fn branch_allows_division(enabled: bool, den: u32) -> bool {
 }
 
 fn summarized_ratio(num: u32, den: u32, enabled: bool) -> u32 {
-    if branch_allows_division(enabled, den) {
-        num / den
-    } else {
-        0
-    }
+    if branch_allows_division(enabled, den) { num / den } else { 0 }
 }
 
 fn main() {

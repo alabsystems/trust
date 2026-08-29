@@ -253,15 +253,16 @@ mod bridge {
 
 #[cfg(feature = "ny")]
 pub use bridge::{
-    certify_farkas, constraint_denominator_lcm, farkas_to_violation,
-    linear_constraint_to_formula, rat_to_i128, scale_rat_to_i128,
+    certify_farkas, constraint_denominator_lcm, farkas_to_violation, linear_constraint_to_formula,
+    rat_to_i128, scale_rat_to_i128,
 };
 
 #[cfg(all(test, feature = "ny"))]
 mod tests {
-    use super::*;
     use ny_cert::{ConstraintKind, FarkasCertificate, LinearConstraint, Rat};
     use trust_types::Formula;
+
+    use super::*;
 
     fn int(n: i128) -> Rat {
         Rat::from_int(n)
@@ -378,11 +379,8 @@ mod tests {
         let le = ConstraintKind::Le;
 
         // mip-46963-000012: x0 ≤ 1 ; 2·x0 − x1 ≥ −3 ; x1 ≥ 10.
-        let c000012: Vec<C> = vec![
-            (le, 1, &[("x0", 1)]),
-            (ge, -3, &[("x0", 2), ("x1", -1)]),
-            (ge, 10, &[("x1", 1)]),
-        ];
+        let c000012: Vec<C> =
+            vec![(le, 1, &[("x0", 1)]), (ge, -3, &[("x0", 2), ("x1", -1)]), (ge, 10, &[("x1", 1)])];
         // mip-46963-000021: x1 ≤ 1 ; x5 ≤ 1 ; x1 − x3 ≥ 0 ; x3 + x5 − x8 ≥ 0 ; x8 ≥ 10.
         let c000021: Vec<C> = vec![
             (le, 1, &[("x1", 1)]),
@@ -414,8 +412,7 @@ mod tests {
             let constraints: Vec<LinearConstraint> = system
                 .iter()
                 .map(|(kind, k, terms)| {
-                    let ts: Vec<(&str, Rat)> =
-                        terms.iter().map(|(v, a)| (*v, int(*a))).collect();
+                    let ts: Vec<(&str, Rat)> = terms.iter().map(|(v, a)| (*v, int(*a))).collect();
                     LinearConstraint::with_kind(*kind, &ts, int(*k))
                 })
                 .collect();
@@ -424,12 +421,16 @@ mod tests {
             let multipliers = vec![Rat::ONE; constraints.len()];
             let cert = FarkasCertificate { constraints, multipliers };
 
-            let evidence = certify_farkas(&cert)
-                .unwrap_or_else(|| panic!("{name}: real corpus Farkas cert must certify as CleanCic"));
+            let evidence = certify_farkas(&cert).unwrap_or_else(|| {
+                panic!("{name}: real corpus Farkas cert must certify as CleanCic")
+            });
             match evidence {
                 trust_ir::ProofEvidence::CleanCic { term, context, lineage, .. } => {
                     assert!(!term.is_empty(), "{name}: CleanCic term bytes must be non-empty");
-                    assert!(!context.is_empty(), "{name}: CleanCic context bytes must be non-empty");
+                    assert!(
+                        !context.is_empty(),
+                        "{name}: CleanCic context bytes must be non-empty"
+                    );
                     assert_ne!(
                         lineage,
                         trust_ir::ProofDigest::zero(),
@@ -529,7 +530,10 @@ mod tests {
         assert_eq!(constraint_denominator_lcm(&c), None, "den > u128 must fail closed");
         assert!(linear_constraint_to_formula(&c).is_none(), "translation must fail closed");
         let cert = FarkasCertificate {
-            constraints: vec![c, LinearConstraint::with_kind(ConstraintKind::Ge, &[("x", int(1))], int(2))],
+            constraints: vec![
+                c,
+                LinearConstraint::with_kind(ConstraintKind::Ge, &[("x", int(1))], int(2)),
+            ],
             multipliers: vec![Rat::ONE, Rat::ONE],
         };
         assert!(certify_farkas(&cert).is_none(), "certify_farkas must fail closed");
@@ -615,10 +619,7 @@ mod tests {
             ),
         );
         // …and the certificate is rejected on its (lack of) merits: SAT.
-        assert!(
-            certify_farkas(&cert).is_none(),
-            "a satisfiable cleared system must never certify"
-        );
+        assert!(certify_farkas(&cert).is_none(), "a satisfiable cleared system must never certify");
     }
 
     /// `rat_to_i128` accepts exact integers (including negatives and reduced

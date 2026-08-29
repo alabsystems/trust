@@ -1,8 +1,9 @@
 //! External E6 facet summaries.
 //!
 //! This is an authority boundary, not a diagnostic name matcher.  The current
-//! [`Terminator::Call`](crate::Terminator::Call) model carries only a printable
-//! callee path; it does not carry the rustc `DefId`/`Instance`, monomorphized
+//! [`Terminator::Call`](crate::Terminator::Call) and
+//! [`Terminator::TailCall`](crate::Terminator::TailCall) models carry only a
+//! printable callee path; they do not carry the rustc `DefId`/`Instance`, monomorphized
 //! signature, or argument/result types needed to prove that a call denotes a
 //! particular primitive operation.  Consequently the authority allowlist is
 //! deliberately EMPTY.  A suffix such as `wrapping_add` or `::len` is never

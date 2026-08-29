@@ -216,6 +216,9 @@ impl ConcreteExecutor {
             Terminator::Call { func, .. } => Err(unsupported(format!(
                 "call terminator requires a function summary before concrete symex: {func}"
             ))),
+            Terminator::TailCall { func, .. } => Err(unsupported(format!(
+                "tail-call terminator requires a function summary before concrete symex: {func}"
+            ))),
             Terminator::Drop { place, .. } => Err(unsupported(format!(
                 "drop terminator requires drop semantics before concrete symex: {}",
                 place_to_name(place)
@@ -374,9 +377,9 @@ fn const_to_concolic(cv: &ConstValue) -> Result<ConcolicValue, SymexError> {
         // Trust: #783 — two's complement cast preserves bitvector semantics.
         ConstValue::Uint(n, _) => Ok(ConcolicValue::concrete(*n as i128)),
         ConstValue::Unit => Ok(ConcolicValue::concrete(0)),
-        ConstValue::CallableItem { .. } => Err(unsupported(
-            "callable-item constants require identity-aware concrete semantics",
-        )),
+        ConstValue::CallableItem { .. } => {
+            Err(unsupported("callable-item constants require identity-aware concrete semantics"))
+        }
         ConstValue::Float(_) | ConstValue::FloatBits { .. } => {
             Err(unsupported("floating-point constants require float semantics in concrete symex"))
         }
@@ -478,8 +481,7 @@ pub(crate) fn run_concrete(
 
 #[cfg(test)]
 mod tests {
-    use trust_types::UnwindEdge;
-    use trust_types::{BlockId, Place, SourceSpan, Statement};
+    use trust_types::{BlockId, Place, SourceSpan, Statement, UnwindEdge};
 
     use super::*;
 
@@ -494,8 +496,7 @@ mod tests {
             kind: trust_types::CallableKind::FnDef,
             def_path_hash: trust_types::CallableDefPathHash::new(1, 1),
         };
-        let error =
-            const_to_concolic(&value).expect_err("concrete values cannot encode callables");
+        let error = const_to_concolic(&value).expect_err("concrete values cannot encode callables");
         assert!(matches!(
             error,
             SymexError::UnsupportedOperation(message)

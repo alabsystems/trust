@@ -1,10 +1,8 @@
-use std::env;
 use std::ffi::OsStr;
-use std::fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs, io};
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 

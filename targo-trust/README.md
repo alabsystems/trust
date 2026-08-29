@@ -19,8 +19,10 @@ explicit form `build/<host>/stage2/bin/targo trust ...`.
 including Trust-preferred `targo`, `targo-trust`, `trustc`, `trustd`, `trustdoc`,
 `trustfmt`, `targo-fmt`, `tippy`, `targo-tippy`, `tippy-driver`,
 `trust-analyzer`, and optional `trust-miri`/`targo-miri` when Miri ships. A
-complete Trust sysroot retains only the `cargo` and `rustc` compatibility
-entrypoints. Ambient external Rust-named binaries are not Trust evidence.
+complete Trust sysroot retains three compatibility entrypoints as byte-identical
+copies: `rustc` and `cargo`, which rustup's proxies require, and `rustdoc`, which
+cargo spawns by name for doctests. Ambient external Rust-named binaries are not
+Trust evidence.
 
 The public verifier commands to optimize around today are:
 

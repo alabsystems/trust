@@ -9,9 +9,10 @@ use trust_types::*;
 use trust_vcgen::generate_vcs;
 
 fn has_len_tie(name: &str) -> bool {
-    let f: VerifiableFunction =
-        serde_json::from_str(&std::fs::read_to_string(format!("tests/fixtures/{name}.json")).unwrap())
-            .unwrap();
+    let f: VerifiableFunction = serde_json::from_str(
+        &std::fs::read_to_string(format!("tests/fixtures/{name}.json")).unwrap(),
+    )
+    .unwrap();
     generate_vcs(&f).iter().any(|vc| {
         let d = format!("{:?}", vc.formula);
         d.contains("Eq(Var(\"_8\", Int), Var(\"_10\", Int))")
@@ -38,9 +39,10 @@ fn wrong_index_stays_refutable() {
     // SOUNDNESS: the tie unifies the two `v[i]` LENGTHS only — it must NOT bound the index.
     // `if …j<v[i].len() { v[i][k] }` (access uses `k`, guard is on `j`) has the tie present
     // yet stays refutable, since `k` is unconstrained (validated end-to-end: refutes [slice]).
-    let f: VerifiableFunction =
-        serde_json::from_str(&std::fs::read_to_string("tests/fixtures/nest_wrongidx.json").unwrap())
-            .unwrap();
+    let f: VerifiableFunction = serde_json::from_str(
+        &std::fs::read_to_string("tests/fixtures/nest_wrongidx.json").unwrap(),
+    )
+    .unwrap();
     let inner = generate_vcs(&f).into_iter().any(|vc| {
         matches!(vc.kind, VcKind::IndexOutOfBounds | VcKind::SliceBoundsCheck)
             && format!("{:?}", vc.formula).contains("Ge(Var(\"k\"")

@@ -50,9 +50,7 @@ fn main() {
         let entry = entry.expect("read MIR dump directory entry");
         let json = rfs::read_to_string(entry.path());
         for line in json.lines() {
-            if line.contains("\"func\":")
-                && line.trim().ends_with("::contracted\",")
-            {
+            if line.contains("\"func\":") && line.trim().ends_with("::contracted\",") {
                 direct_keys.insert(line.trim().to_string());
             }
         }
@@ -188,9 +186,7 @@ fn main() {
     );
 
     assert!(
-        mono_paths
-            .iter()
-            .all(|path| !path.contains("shared::contracted_generic")),
+        mono_paths.iter().all(|path| !path.contains("shared::contracted_generic")),
         "a foreign generic with a non-empty Trust contract bundle must be excluded: {mono_paths:#?}"
     );
 
@@ -215,10 +211,8 @@ fn top_level_def_paths(directory: &str) -> Vec<String> {
     for entry in rfs::read_dir(directory) {
         let entry = entry.expect("read MIR dump directory entry");
         let json = rfs::read_to_string(entry.path());
-        let line = json
-            .lines()
-            .find(|line| line.starts_with("  \"def_path\": "))
-            .unwrap_or_else(|| {
+        let line =
+            json.lines().find(|line| line.starts_with("  \"def_path\": ")).unwrap_or_else(|| {
                 panic!("MIR dump has no top-level def_path: {}", entry.path().display())
             });
         let path = line

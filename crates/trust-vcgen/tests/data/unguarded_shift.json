@@ -1,0 +1,228 @@
+{
+ "name": "unguarded_shift",
+ "def_path": "shift_arms::unguarded_shift",
+ "span": {
+  "file": "crates/trust-vcgen/tests/data/shift_arms.rs",
+  "line_start": 42,
+  "col_start": 0,
+  "line_end": 44,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "x"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "s"
+   },
+   {
+    "index": 3,
+    "ty": "Bool",
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Lt",
+         {
+          "Copy": {
+           "local": 2,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            32,
+            32
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "crates/trust-vcgen/tests/data/shift_arms.rs",
+        "line_start": 43,
+        "col_start": 4,
+        "line_end": 43,
+        "col_end": 4
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 3,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": {
+       "Overflow": "Shl"
+      },
+      "target": 1,
+      "span": {
+       "file": "crates/trust-vcgen/tests/data/shift_arms.rs",
+       "line_start": 43,
+       "col_start": 4,
+       "line_end": 43,
+       "col_end": 4
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Shl",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 2,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "crates/trust-vcgen/tests/data/shift_arms.rs",
+        "line_start": 43,
+        "col_start": 4,
+        "line_end": 43,
+        "col_end": 4
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "x",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "s",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "s",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

@@ -16,7 +16,7 @@
 use crate::ast::*;
 use crate::generated::emoji_strings::string_property;
 use crate::generated::gc_tables::gc_ranges;
-use crate::generated::property_tables::{binary_property, P_ID_CONTINUE, P_ID_START};
+use crate::generated::property_tables::{P_ID_CONTINUE, P_ID_START, binary_property};
 use crate::generated::script_tables::{script_ext_ranges, script_ranges};
 use crate::unicode::{self, in_ranges};
 use crate::{CompileError, Flags};
@@ -50,11 +50,7 @@ pub(crate) fn parse(src: &[u16], flags: Flags) -> Result<Parsed, CompileError> {
     }
     p.check_duplicate_names()?;
     p.resolve_refs(&mut root)?;
-    Ok(Parsed {
-        root,
-        n_groups: p.n_groups,
-        group_names: p.group_names,
-    })
+    Ok(Parsed { root, n_groups: p.n_groups, group_names: p.group_names })
 }
 
 struct Parser<'a> {
@@ -86,21 +82,53 @@ enum EscCtx {
 fn is_syntax_char(c: u32) -> bool {
     matches!(
         c,
-        0x5E | 0x24 | 0x5C | 0x2E | 0x2A | 0x2B | 0x3F | 0x28 | 0x29 | 0x5B | 0x5D | 0x7B
-            | 0x7D | 0x7C
+        0x5E | 0x24
+            | 0x5C
+            | 0x2E
+            | 0x2A
+            | 0x2B
+            | 0x3F
+            | 0x28
+            | 0x29
+            | 0x5B
+            | 0x5D
+            | 0x7B
+            | 0x7D
+            | 0x7C
     ) // ^ $ \ . * + ? ( ) [ ] { } |
 }
 
 /// ClassSetReservedPunctuator (v-mode).
 fn is_v_reserved_punct(c: u32) -> bool {
-    matches!(c as u8 as char, '&' | '-' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>'
-        | '@' | '`' | '~') && c < 0x80
+    matches!(
+        c as u8 as char,
+        '&' | '-' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>' | '@' | '`' | '~'
+    ) && c < 0x80
 }
 
 /// First char of a ClassSetReservedDoublePunctuator pair.
 fn is_v_double_punct(c: u32) -> bool {
-    matches!(c as u8 as char, '&' | '!' | '#' | '$' | '%' | '*' | '+' | ',' | '.' | ':' | ';'
-        | '<' | '=' | '>' | '?' | '@' | '^' | '`' | '~') && c < 0x80
+    matches!(
+        c as u8 as char,
+        '&' | '!'
+            | '#'
+            | '$'
+            | '%'
+            | '*'
+            | '+'
+            | ','
+            | '.'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '^'
+            | '`'
+            | '~'
+    ) && c < 0x80
 }
 
 /// ClassSetSyntaxCharacter (v-mode): never a literal.
@@ -201,11 +229,7 @@ impl<'a> Parser<'a> {
         }
         self.path.pop();
         self.depth -= 1;
-        Ok(if alts.len() == 1 {
-            alts.pop().unwrap()
-        } else {
-            Node::Alternation(alts)
-        })
+        Ok(if alts.len() == 1 { alts.pop().unwrap() } else { Node::Alternation(alts) })
     }
 
     fn parse_alternative(&mut self) -> Result<Node, CompileError> {
@@ -276,11 +300,7 @@ impl<'a> Parser<'a> {
             '(' if c < 0x80 => self.parse_group(),
             '[' if c < 0x80 => {
                 self.bump();
-                let cls = if self.v {
-                    self.parse_vclass()?
-                } else {
-                    self.parse_simple_class()?
-                };
+                let cls = if self.v { self.parse_vclass()? } else { self.parse_simple_class()? };
                 self.maybe_quantify(Node::Class(cls))
             }
             '.' if c < 0x80 => {
@@ -320,12 +340,7 @@ impl<'a> Parser<'a> {
 
     fn maybe_quantify(&mut self, atom: Node) -> Result<Node, CompileError> {
         match self.parse_quantifier_opt()? {
-            Some((min, max, greedy)) => Ok(Node::Quant {
-                min,
-                max,
-                greedy,
-                body: Box::new(atom),
-            }),
+            Some((min, max, greedy)) => Ok(Node::Quant { min, max, greedy, body: Box::new(atom) }),
             None => Ok(atom),
         }
     }
@@ -424,10 +439,7 @@ impl<'a> Parser<'a> {
             let index = self.next_group_index()?;
             let body = self.parse_disjunction()?;
             self.expect_close_paren()?;
-            return self.maybe_quantify(Node::Group {
-                index,
-                body: Box::new(body),
-            });
+            return self.maybe_quantify(Node::Group { index, body: Box::new(body) });
         }
         // Match on the full code point, NOT `c as u8 as char`: a truncating
         // low-byte compare would misroute a non-ASCII first char whose low
@@ -446,11 +458,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let body = self.parse_disjunction()?;
                 self.expect_close_paren()?;
-                let node = Node::Look {
-                    behind: false,
-                    negative,
-                    body: Box::new(body),
-                };
+                let node = Node::Look { behind: false, negative, body: Box::new(body) };
                 // Annex B: lookahead is quantifiable in non-Unicode mode.
                 let save = self.pos;
                 if self.parse_quantifier_opt()?.is_some() {
@@ -473,28 +481,17 @@ impl<'a> Parser<'a> {
                             return Err(self.syntax("quantified lookbehind"));
                         }
                         self.pos = save;
-                        Ok(Node::Look {
-                            behind: true,
-                            negative,
-                            body: Box::new(body),
-                        })
+                        Ok(Node::Look { behind: true, negative, body: Box::new(body) })
                     }
                     _ => {
                         // Named capturing group; bad names are SyntaxErrors
                         // in both grammars.
                         let name = self.parse_group_name(true)?;
                         let index = self.next_group_index()?;
-                        self.group_names.push(GroupName {
-                            name,
-                            index,
-                            path: self.path.clone(),
-                        });
+                        self.group_names.push(GroupName { name, index, path: self.path.clone() });
                         let body = self.parse_disjunction()?;
                         self.expect_close_paren()?;
-                        self.maybe_quantify(Node::Group {
-                            index,
-                            body: Box::new(body),
-                        })
+                        self.maybe_quantify(Node::Group { index, body: Box::new(body) })
                     }
                 }
             }
@@ -526,11 +523,7 @@ impl<'a> Parser<'a> {
         }
         let body = self.parse_disjunction()?;
         self.expect_close_paren()?;
-        self.maybe_quantify(Node::ModGroup {
-            add,
-            remove,
-            body: Box::new(body),
-        })
+        self.maybe_quantify(Node::ModGroup { add, remove, body: Box::new(body) })
     }
 
     fn parse_mod_list(&mut self) -> Result<ModFlags, CompileError> {
@@ -561,11 +554,7 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_close_paren(&mut self) -> Result<(), CompileError> {
-        if self.eat_ascii(')') {
-            Ok(())
-        } else {
-            Err(self.syntax("unterminated group"))
-        }
+        if self.eat_ascii(')') { Ok(()) } else { Err(self.syntax("unterminated group")) }
     }
 
     // -- escapes -----------------------------------------------------------
@@ -615,22 +604,18 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.parse_property(c == 'P' as u32)
             }
-            'c' if c < 0x80 => {
-                match self.peek2() {
-                    Some(l) if (0x41..=0x5A).contains(&l) || (0x61..=0x7A).contains(&l) => {
-                        self.bump();
-                        self.bump();
-                        Ok(EscOut::Ch(l % 32))
-                    }
-                    _ => Err(self.lax("\\c must be followed by a control letter")),
+            'c' if c < 0x80 => match self.peek2() {
+                Some(l) if (0x41..=0x5A).contains(&l) || (0x61..=0x7A).contains(&l) => {
+                    self.bump();
+                    self.bump();
+                    Ok(EscOut::Ch(l % 32))
                 }
-            }
+                _ => Err(self.lax("\\c must be followed by a control letter")),
+            },
             '0' if c < 0x80 => {
                 self.bump();
                 match self.cur() {
-                    Some(d) if (0x30..=0x39).contains(&d) => {
-                        Err(self.lax("legacy octal escape"))
-                    }
+                    Some(d) if (0x30..=0x39).contains(&d) => Err(self.lax("legacy octal escape")),
                     _ => Ok(EscOut::Ch(0)),
                 }
             }
@@ -776,32 +761,20 @@ impl<'a> Parser<'a> {
             if !self.eat_ascii('}') {
                 return Err(self.syntax("unterminated \\p{...}"));
             }
-            return Ok(EscOut::Cls(EscClass::Property {
-                negate,
-                chars,
-                strings: &[],
-            }));
+            return Ok(EscOut::Cls(EscClass::Property { negate, chars, strings: &[] }));
         }
         if !self.eat_ascii('}') {
             return Err(self.syntax("unterminated \\p{...}"));
         }
         if let Some(chars) = binary_property(&name).or_else(|| gc_ranges(&name)) {
-            return Ok(EscOut::Cls(EscClass::Property {
-                negate,
-                chars,
-                strings: &[],
-            }));
+            return Ok(EscOut::Cls(EscClass::Property { negate, chars, strings: &[] }));
         }
         if self.v {
             if let Some((chars, strings)) = string_property(&name) {
                 if negate {
                     return Err(self.syntax("\\P cannot name a property of strings"));
                 }
-                return Ok(EscOut::Cls(EscClass::Property {
-                    negate: false,
-                    chars,
-                    strings,
-                }));
+                return Ok(EscOut::Cls(EscClass::Property { negate: false, chars, strings }));
             }
         }
         Err(self.syntax("invalid property name"))
@@ -840,11 +813,7 @@ impl<'a> Parser<'a> {
             let Some(cp) = self.read_name_char(strict)? else {
                 return Err(self.name_err(strict, "invalid group name"));
             };
-            let ok = if first {
-                is_id_start_cp(cp)
-            } else {
-                is_id_continue_cp(cp)
-            };
+            let ok = if first { is_id_start_cp(cp) } else { is_id_continue_cp(cp) };
             if !ok {
                 return Err(self.name_err(strict, "invalid group name character"));
             }
@@ -854,11 +823,7 @@ impl<'a> Parser<'a> {
     }
 
     fn name_err(&self, strict: bool, msg: &str) -> CompileError {
-        if strict {
-            self.syntax(msg)
-        } else {
-            self.lax(msg)
-        }
+        if strict { self.syntax(msg) } else { self.lax(msg) }
     }
 
     /// One RegExpIdentifierName character: a `\u` escape (always full
@@ -1031,13 +996,8 @@ impl<'a> Parser<'a> {
         };
         if c == '[' as u32 {
             self.bump();
-            let ClassAst::VMode { negate, expr } = self.parse_vclass()? else {
-                unreachable!()
-            };
-            return Ok(VOperand::Nested {
-                negate,
-                expr: Box::new(expr),
-            });
+            let ClassAst::VMode { negate, expr } = self.parse_vclass()? else { unreachable!() };
+            return Ok(VOperand::Nested { negate, expr: Box::new(expr) });
         }
         if c == '\\' as u32 {
             if self.peek2() == Some('q' as u32) {
@@ -1113,11 +1073,8 @@ impl<'a> Parser<'a> {
                 if a.name != b.name {
                     continue;
                 }
-                let disjoint = a
-                    .path
-                    .iter()
-                    .zip(b.path.iter())
-                    .any(|(x, y)| x.0 == y.0 && x.1 != y.1);
+                let disjoint =
+                    a.path.iter().zip(b.path.iter()).any(|(x, y)| x.0 == y.0 && x.1 != y.1);
                 if !disjoint {
                     return Err(self.syntax("duplicate capture group name"));
                 }
@@ -1135,12 +1092,8 @@ impl<'a> Parser<'a> {
                 }
             }
             Node::NamedBackrefRaw(name) => {
-                let groups: Vec<u32> = self
-                    .group_names
-                    .iter()
-                    .filter(|g| g.name == *name)
-                    .map(|g| g.index)
-                    .collect();
+                let groups: Vec<u32> =
+                    self.group_names.iter().filter(|g| g.name == *name).map(|g| g.index).collect();
                 if groups.is_empty() {
                     return Err(if self.group_names.is_empty() && !self.unicode {
                         // Annex B: with no named groups at all, \k is an

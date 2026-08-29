@@ -42,8 +42,7 @@
 // Scope (honest): aarch64-apple-darwin Mach-O object emission ONLY (the triple is
 // forced regardless of host). The ELF writer and x86_64 emit path are NOT exercised.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Command;
 
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
@@ -133,7 +132,9 @@ fn make_caller(name: &str, callee: &str) -> VerifiableFunction {
                     id: BlockId(0),
                     stmts: vec![],
                     terminator: Terminator::Call {
-                        is_unsafe_sig: false, is_foreign: false,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
                         func: callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
                         dest: Place::local(2),
@@ -185,19 +186,12 @@ fn emit_suite() -> BTreeMap<String, Vec<u8>> {
     let be = backend();
     let mut out = BTreeMap::new();
     for module in [module_caller_helper(), module_chain()] {
-        let lir = be
-            .lower_module(&module)
-            .unwrap_or_else(|e| panic!("lower_module failed: {e:?}"));
-        let objects = be
-            .emit_objects(&lir)
-            .unwrap_or_else(|e| panic!("emit_objects failed: {e:?}"));
+        let lir = be.lower_module(&module).unwrap_or_else(|e| panic!("lower_module failed: {e:?}"));
+        let objects =
+            be.emit_objects(&lir).unwrap_or_else(|e| panic!("emit_objects failed: {e:?}"));
         for (name, bytes) in objects {
             assert!(!bytes.is_empty(), "{name}: emitted object must be non-empty");
-            assert_eq!(
-                &bytes[..4],
-                &[0xCF, 0xFA, 0xED, 0xFE],
-                "{name}: must be 64-bit LE Mach-O"
-            );
+            assert_eq!(&bytes[..4], &[0xCF, 0xFA, 0xED, 0xFE], "{name}: must be 64-bit LE Mach-O");
             assert!(out.insert(name.clone(), bytes).is_none(), "duplicate fn name {name}");
         }
     }
@@ -339,10 +333,7 @@ fn multisym_object_has_multiple_symbols_and_relocations() {
         checked += 1;
     }
     assert_eq!(checked, callers.len(), "all caller objects must be checked");
-    println!(
-        "anti-vacuity: {} caller objects each have >=2 symbols and >=1 relocation",
-        checked
-    );
+    println!("anti-vacuity: {} caller objects each have >=2 symbols and >=1 relocation", checked);
 }
 
 // --------------------------------------------------------------------------

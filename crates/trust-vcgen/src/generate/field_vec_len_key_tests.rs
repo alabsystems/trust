@@ -1,7 +1,6 @@
-use trust_types::UnwindEdge;
 use trust_types::{
     BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
-    Statement, Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction,
+    Statement, Terminator, Ty, UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
 use super::{collection_abstract_len_with_base_opts, generate_vcs};
@@ -14,10 +13,7 @@ fn vec_u32() -> Ty {
 /// `struct T { history: Vec<u32>, other: Vec<u32> }` — field 0 is `history`,
 /// field 1 is `other`.
 fn t_struct() -> Ty {
-    Ty::adt(
-        "test::T",
-        vec![("history".to_string(), vec_u32()), ("other".to_string(), vec_u32())],
-    )
+    Ty::adt("test::T", vec![("history".to_string(), vec_u32()), ("other".to_string(), vec_u32())])
 }
 
 /// `&((*_1).<f>)` — the field place a reborrow temp borrows.
@@ -55,6 +51,7 @@ fn field_vec_func(
         span: SourceSpan::default(),
         atomic: None,
         is_unsafe_sig: false,
+        callee_identity: None,
         is_foreign: false,
     };
     VerifiableFunction {
@@ -171,9 +168,7 @@ fn field_index_vc_reads_place_keyed_len() {
         vcs.iter().any(|vc| matches!(vc.kind, VcKind::SliceBoundsCheck)
             && vc.formula.to_smtlib().contains("self*.0")),
         "the scalar-index VC must reference coll_len(self*.0); got {:#?}",
-        vcs.iter()
-            .map(|vc| (vc.kind.description(), vc.formula.to_smtlib()))
-            .collect::<Vec<_>>()
+        vcs.iter().map(|vc| (vc.kind.description(), vc.formula.to_smtlib())).collect::<Vec<_>>()
     );
 }
 

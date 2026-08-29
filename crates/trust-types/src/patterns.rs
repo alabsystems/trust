@@ -410,8 +410,7 @@ fn operand_ty_hint(body: &VerifiableBody, op: &Operand) -> crate::model::Ty {
         }
         Operand::Constant(crate::model::ConstValue::Bool(_)) => crate::model::Ty::Bool,
         Operand::Constant(
-            crate::model::ConstValue::Unit
-            | crate::model::ConstValue::CallableItem { .. },
+            crate::model::ConstValue::Unit | crate::model::ConstValue::CallableItem { .. },
         ) => crate::model::Ty::Unit,
         // a `&str` literal has no numeric type and never feeds an
         // arithmetic/bounds VC; the neutral `Unit` hint keeps it out of sort
@@ -478,7 +477,13 @@ mod tests {
         blocks: Vec<BasicBlock>,
         arg_count: usize,
     ) -> VerifiableBody {
-        VerifiableBody { locals, blocks, arg_count, return_ty: Ty::Unit, datatype_defs: Default::default() }
+        VerifiableBody {
+            locals,
+            blocks,
+            arg_count,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        }
     }
 
     fn local(index: usize, ty: Ty, name: Option<&str>) -> LocalDecl {

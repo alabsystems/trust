@@ -4,4 +4,6 @@ fn bad(a: &[u32; 4], n: usize, i: usize) -> u32 {
     let x = a[i];
     if n > 0 { bad(a, n - 1, i + 1) } else { x }
 }
-pub fn go() -> u32 { bad(&[1, 2, 3, 4], 10, 0) }
+pub fn go() -> u32 {
+    bad(&[1, 2, 3, 4], 10, 0)
+}

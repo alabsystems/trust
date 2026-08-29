@@ -393,6 +393,13 @@ fn verify_output_preserved_capturing_env_with_backend(
     env: &CalleeEnv,
     backend: &TrustCgCodegenBackend,
 ) -> (OutputVerdict, Option<Vec<u8>>) {
+    // Keep emission, source semantics, divisor assumptions, and machine-output
+    // decoding on one exact semantic view. TailCall has no MIR continuation,
+    // but at this boundary it is equivalent to a direct call writing local 0
+    // followed by Return; the source object itself remains unchanged.
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
+
     // Emit FIRST with the exact production backend. Unsupported verifier shapes
     // and decoder gaps must not discard a successfully produced candidate:
     // AllowUnknown is explicitly allowed to ship those bytes as uncertified.
@@ -1274,8 +1281,7 @@ pub fn emit_objects_verified_reported_with_backend(
                 // kernel-[PROVED] functions, so a [VALIDATED] function is REFUSED
                 // (not silently treated as covered). Under AllowUnknown it ships
                 // and is COUNTED as the [VALIDATED] (uncertified-by-kernel) surface.
-                ProvenEvidence::StructuralCitation { .. }
-                | ProvenEvidence::AyValidated => {
+                ProvenEvidence::StructuralCitation { .. } | ProvenEvidence::AyValidated => {
                     if policy == EmitPolicy::StrictProvenOnly {
                         return Err(VerifyError::Unknown {
                             function: func.name.clone(),
@@ -1404,8 +1410,7 @@ pub fn emit_module_object_verified_reported_with_backend(
     // isolation, its exact candidate bytes captured, and the determinism
     // re-emission run over those bytes. A Refuted function returns Err here and
     // NOTHING below runs.
-    let (verified, report) =
-        emit_objects_verified_reported_with_backend(funcs, policy, backend)?;
+    let (verified, report) = emit_objects_verified_reported_with_backend(funcs, policy, backend)?;
 
     if !linkage.is_empty() && linkage.len() != funcs.len() {
         return Err(VerifyError::ModuleEmitFailed {
@@ -1490,16 +1495,19 @@ pub(crate) fn assert_merged_object_preserves_verified_text(
     };
 
     let (merged_text, merged_base) =
-        extract_text_from_object(&emitted.bytes).map_err(|reason| VerifyError::ModuleEmitFailed {
-            reason: format!("merged module object has no readable text section: {reason}"),
+        extract_text_from_object(&emitted.bytes).map_err(|reason| {
+            VerifyError::ModuleEmitFailed {
+                reason: format!("merged module object has no readable text section: {reason}"),
+            }
         })?;
-    let merged_symbols = object_text_symbol_offsets(&emitted.bytes, merged_base).ok_or_else(
-        || VerifyError::ModuleEmitFailed {
-            reason: "merged module object has no readable symbol table; the byte-preservation \
+    let merged_symbols =
+        object_text_symbol_offsets(&emitted.bytes, merged_base).ok_or_else(|| {
+            VerifyError::ModuleEmitFailed {
+                reason: "merged module object has no readable symbol table; the byte-preservation \
                      obligation cannot be discharged, so nothing ships"
-                .to_string(),
-        },
-    )?;
+                    .to_string(),
+            }
+        })?;
 
     let mut preserved = Vec::with_capacity(verified.len());
     for (name, verified_object) in verified {
@@ -2427,7 +2435,7 @@ fn derive_callee_pure(callee: &VerifiableFunction) -> Option<CalleePure> {
                 _ => return None,
             }
         }
-        if matches!(block.terminator, Terminator::Call { .. }) {
+        if matches!(block.terminator, Terminator::Call { .. } | Terminator::TailCall { .. }) {
             return None;
         }
     }
@@ -2516,6 +2524,8 @@ pub fn trust_ir_semantics(func: &VerifiableFunction) -> Result<Formula, String> 
 /// `env` is composed (the callee's pure output substituted at the call site).
 /// With an EMPTY env this is byte-for-byte the original single-function behavior.
 fn trust_ir_semantics_env(func: &VerifiableFunction, env: &CalleeEnv) -> Result<Formula, String> {
+    let expanded = func.with_tail_calls_expanded();
+    let func = expanded.as_ref();
     let body = &func.body;
     if body.blocks.is_empty() {
         return Err("function has no basic blocks".into());
@@ -3839,11 +3849,11 @@ pub(crate) fn symbolic_machine_outcome_traps(
     out_is_float: bool,
 ) -> Result<PathOutcome, String> {
     static EMPTY_ENV: std::sync::OnceLock<CalleeEnv> = std::sync::OnceLock::new();
-    static EMPTY_RELOCS: std::sync::OnceLock<HashMap<u64, BranchReloc>> = std::sync::OnceLock::new();
+    static EMPTY_RELOCS: std::sync::OnceLock<HashMap<u64, BranchReloc>> =
+        std::sync::OnceLock::new();
     let env = EMPTY_ENV.get_or_init(CalleeEnv::empty);
     let relocs = EMPTY_RELOCS.get_or_init(HashMap::new);
-    let mut exec =
-        PathMergingExecutor::new_traps(code, base, out_width, out_is_float, env, relocs);
+    let mut exec = PathMergingExecutor::new_traps(code, base, out_width, out_is_float, env, relocs);
     let state = MachineState::symbolic();
     exec.run(base, state, Vec::new(), 0)
 }
@@ -4240,8 +4250,17 @@ pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
         Err(e) => return Discharge::Unknown(format!("ay Solver::try_new failed: {e:?}")),
     };
     let term = formula_to_term(&mut solver, f);
-    let neg = solver.try_not(term).expect("not");
-    solver.try_assert_term(neg).expect("assert");
+    // Fail CLOSED to Unknown on a solver error, exactly as `Solver::try_new`
+    // above already does. These were `.expect()` — a panic inside the verifier's
+    // trusted core, aborting the compiler mid-proof rather than reporting that
+    // the obligation could not be discharged.
+    let neg = match solver.try_not(term) {
+        Ok(t) => t,
+        Err(e) => return Discharge::Unknown(format!("ay try_not failed: {e:?}")),
+    };
+    if let Err(e) = solver.try_assert_term(neg) {
+        return Discharge::Unknown(format!("ay try_assert_term failed: {e:?}"));
+    }
     let result = solver.check_sat();
     if result.is_unsat() {
         Discharge::Proven
@@ -4648,10 +4667,7 @@ fn bvexpr_width(e: &ay_proof::BvExpr) -> Option<u32> {
 fn mul_width(e: &ay_proof::BvExpr) -> u32 {
     use ay_proof::BvExpr;
     match e {
-        BvExpr::Mul(l, r) => bvexpr_width(l)
-            .unwrap_or(0)
-            .max(mul_width(l))
-            .max(mul_width(r)),
+        BvExpr::Mul(l, r) => bvexpr_width(l).unwrap_or(0).max(mul_width(l)).max(mul_width(r)),
         BvExpr::Add(l, r)
         | BvExpr::Sub(l, r)
         | BvExpr::Or(l, r)
@@ -8519,6 +8535,7 @@ mod tests {
                             unwind: trust_types::UnwindEdge::Unreachable,
                             is_foreign,
                             is_unsafe_sig: false,
+                            callee_identity: None,
                         },
                     },
                     BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -8913,28 +8930,22 @@ mod tests {
         let funcs = merge_module();
 
         // Verify both functions the normal way.
-        let (verified, _report) = emit_objects_verified_reported_with_backend(
-            &funcs,
-            EmitPolicy::AllowUnknown,
-            &backend,
-        )
-        .expect("both functions are provable");
+        let (verified, _report) =
+            emit_objects_verified_reported_with_backend(&funcs, EmitPolicy::AllowUnknown, &backend)
+                .expect("both functions are provable");
         assert_eq!(verified.len(), 2);
 
         // Build a "merged" object that only ever contained the FIRST function.
         let only_first = CompiledModule {
             name: "merge.partial".to_string(),
-            lir_functions: vec![
-                backend.lower_function(&funcs[0]).expect("first function lowers"),
-            ],
+            lir_functions: vec![backend.lower_function(&funcs[0]).expect("first function lowers")],
             object_path: None,
             function_count: 1,
             source_functions: Some(vec![funcs[0].clone()]),
             linkage: vec![FunctionLinkage::External],
         };
-        let partial = backend
-            .emit_module_object(&only_first)
-            .expect("single-function module emits");
+        let partial =
+            backend.emit_module_object(&only_first).expect("single-function module emits");
         let partial = EmittedModuleObject {
             artifact_name: partial.artifact_name,
             bytes: partial.bytes,
@@ -8948,9 +8959,9 @@ mod tests {
                     "the missing function is the one the obligation must name"
                 );
             }
-            other => panic!(
-                "a merged object missing a verified function MUST be refused, got {other:?}"
-            ),
+            other => {
+                panic!("a merged object missing a verified function MUST be refused, got {other:?}")
+            }
         }
     }
 
@@ -8962,12 +8973,9 @@ mod tests {
         let backend = default_verification_backend();
         let funcs = merge_module();
 
-        let (verified, _report) = emit_objects_verified_reported_with_backend(
-            &funcs,
-            EmitPolicy::AllowUnknown,
-            &backend,
-        )
-        .expect("both functions are provable");
+        let (verified, _report) =
+            emit_objects_verified_reported_with_backend(&funcs, EmitPolicy::AllowUnknown, &backend)
+                .expect("both functions are provable");
 
         let module = build_merged_module(&funcs, &[FunctionLinkage::External; 2], &backend)
             .expect("module lowers");
@@ -9005,7 +9013,8 @@ mod tests {
         if needle.is_empty() || needle.len() > haystack.len() {
             return None;
         }
-        (0..=haystack.len() - needle.len()).find(|start| &haystack[*start..start + needle.len()] == needle)
+        (0..=haystack.len() - needle.len())
+            .find(|start| &haystack[*start..start + needle.len()] == needle)
     }
 
     // =======================================================================
@@ -9561,11 +9570,7 @@ mod tests {
 
         // (2) store-then-load at the SAME address: inside the fragment today.
         let roundtrip = Formula::Select(
-            Box::new(Formula::Store(
-                Box::new(mem.clone()),
-                Box::new(addr.clone()),
-                Box::new(val),
-            )),
+            Box::new(Formula::Store(Box::new(mem.clone()), Box::new(addr.clone()), Box::new(val))),
             Box::new(addr.clone()),
         );
         assert!(
@@ -9584,9 +9589,7 @@ mod tests {
             )),
             Box::new(Formula::Var("Q".to_string(), Sort::BitVec(64))),
         );
-        let alias_err = reflect_formula(&aliased)
-            .err()
-            .expect("an aliased read must be refused");
+        let alias_err = reflect_formula(&aliased).err().expect("an aliased read must be refused");
         assert!(
             alias_err.contains("address mismatch") || alias_err.contains("aliasing"),
             "expected the aliasing refusal, got: {alias_err}"
@@ -9684,11 +9687,8 @@ mod tests {
         //     is decided by the kernel and not by reduction.
         let other_addr = read(mem(), q());
         assert!(
-            crate::verify_output_instantiate::try_o1_instantiation_discharge(
-                &machine,
-                &other_addr
-            )
-            .is_none(),
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&machine, &other_addr)
+                .is_none(),
             "reads at DIFFERENT addresses must not discharge"
         );
         let other_mem = read(Formula::Var("MEM2".to_string(), Sort::BitVec(64)), p());
@@ -11237,8 +11237,8 @@ mod tests {
                     // if the effect is dropped the executor falls through and
                     // derives the fall-through arm alone.
                     let body = words(&[*word, 0xD65F_03C0, 0x5280_00A0, 0xD65F_03C0]);
-                    let derived = symbolic_machine_output(&body, 0, 32, false)
-                        .unwrap_or_else(|e| {
+                    let derived =
+                        symbolic_machine_output(&body, 0, 32, false).unwrap_or_else(|e| {
                             panic!("{variant}: `{asm}` two-way body must be modeled: {e}")
                         });
                     assert!(

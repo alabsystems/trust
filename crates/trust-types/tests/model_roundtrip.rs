@@ -359,7 +359,9 @@ fn test_ty_all_variants_roundtrip() {
         Ty::Slice { elem: Box::new(Ty::u32()) },
         Ty::Array { elem: Box::new(Ty::Bool), len: 10 },
         Ty::Tuple(vec![Ty::i32(), Ty::Bool, Ty::usize()]),
-        Ty::Adt { adt_kind: None, layout: None, 
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
             variants: Vec::new(),
             name: "MyStruct".into(),
             fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::Bool)],
@@ -368,7 +370,9 @@ fn test_ty_all_variants_roundtrip() {
             // 11598e13fe, leaving `cargo test -p trust-types` uncompilable (E0063)
             // since B3-1 — masked because the suite was not run. `None` = the
             // historical flattened-struct semantics.
-            faithful_enum_repr: None, enum_layout: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+        },
     ];
     for ty in &types {
         let json = serde_json::to_string(ty).expect("serialize");

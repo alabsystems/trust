@@ -8,10 +8,9 @@
 // ModR/M byte layout: [mod:2][reg:3][rm:3]
 // SIB byte layout:    [scale:2][index:3][base:3]
 
+use super::prefix::Prefixes;
 use crate::error::DisasmError;
 use crate::operand::{MemoryOperand, Operand, Register};
-
-use super::prefix::Prefixes;
 
 /// Decoded ModR/M byte.
 #[derive(Debug, Clone, Copy)]

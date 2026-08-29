@@ -165,6 +165,21 @@ fn type_will_always_be_passed_directly(ty: Ty<'_>) -> bool {
     )
 }
 
+/// Trust (wall A, instance flip seam): the SAME deduction the query performs, run on an
+/// arbitrary body instead of on `optimized_mir`.
+///
+/// The instance flip installs its body at `codegen_mir`, AFTER `fn_abi_of_instance` has already
+/// published `deduced_param_attrs` computed from the incumbent. Re-running the identical
+/// analysis on the derived body is the only way to check that codegen's `readonly` /
+/// `captures(none)` claims stay true of the code actually emitted; comparing against the
+/// published slice is the caller's job. Deliberately shares `DeduceParamAttrs` with the query
+/// rather than reimplementing it — a private copy could drift and the drift would be silent.
+pub(crate) fn deduce_for_body<'tcx>(body: &Body<'tcx>) -> Vec<DeducedParamAttrs> {
+    let mut deduce = DeduceParamAttrs::new(body);
+    deduce.visit_body(body);
+    deduce.usage.into_iter().map(|usage| DeducedParamAttrs { usage }).collect()
+}
+
 /// Returns the deduced parameter attributes for a function.
 ///
 /// Deduced parameter attributes are those that can only be soundly determined by examining the

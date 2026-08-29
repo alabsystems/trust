@@ -56,7 +56,7 @@ fn trust_version_json_binds_distinct_tool_identities() {
     assert!(stderr.is_empty(), "version JSON should stay on stdout");
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("parse version json");
-    assert_eq!(json["schema_version"], "trust.version.v2");
+    assert_eq!(json["schema_version"], trust_version::VERSION_SCHEMA);
     assert_eq!(json["product"], "Trust");
     assert_eq!(json["candidate_command"], "targo trust version --json");
     assert_eq!(json["tools"]["frontend"]["name"], "targo");
@@ -117,13 +117,13 @@ fn trust_version_json_binds_full_canonical_surface_from_one_trust_root() {
         "targo-tippy",
         "tippy-driver",
         "trust-analyzer",
-        "trustd",
         "trust-miri",
         "targo-miri",
     ] {
         write_version_tool(&bin_dir.join(tool), tool);
     }
     write_trustc_tool(&bin_dir.join("trustc"));
+    write_trustd_tool(&bin_dir.join("trustd"));
 
     let output = Command::new(targo_trust)
         .args(["trust", "version", "--format=json", "--repo-root"])
@@ -176,12 +176,11 @@ fn trust_version_json_accepts_same_sysroot_rust_compatible_aliases() {
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("create fake Trust bin dir");
     let targo_trust = install_targo_trust_binary(&bin_dir);
-    for tool in
-        ["targo", "trustdoc", "tippy", "targo-tippy", "tippy-driver", "trust-analyzer", "trustd"]
-    {
+    for tool in ["targo", "trustdoc", "tippy", "targo-tippy", "tippy-driver", "trust-analyzer"] {
         write_version_tool(&bin_dir.join(tool), tool);
     }
     write_trustc_tool(&bin_dir.join("trustc"));
+    write_trustd_tool(&bin_dir.join("trustd"));
     write_version_tool(&bin_dir.join("trustfmt"), "trustfmt");
     write_version_tool(&bin_dir.join("rustfmt"), "rustfmt");
 
@@ -246,6 +245,47 @@ fn write_trustc_tool(path: &std::path::Path) {
     )
     .unwrap_or_else(|error| panic!("write fake trustc {}: {error}", path.display()));
     make_executable(path);
+}
+
+/// `trustd` is the one tool on this surface whose `--version` is an identity
+/// BLOCK rather than a version line: `targo trust version` binds the daemon only
+/// when it names itself, states the coordinator status protocol, and carries one
+/// canonical commit that its legacy alias agrees with, and reports
+/// `invalid-trustd-identity` otherwise. A fixture that echoes a bare version
+/// line is not a stand-in for a Trust daemon, so this writes the shape the
+/// shipped `trustd` actually prints — `trust.package` included, to keep the
+/// binding honest about tolerating lines it does not consume.
+#[cfg(unix)]
+fn write_trustd_tool(path: &std::path::Path) {
+    let release = rust_compat_release_for_repo();
+    let protocol = trust_router::coordinator::STATUS_VERSION;
+    let commit = "abcdef1234567890abcdef1234567890abcdef12";
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\ncat <<'TRUSTD_IDENTITY'\ntrustd {release}\ntrust.identity=trustd\n\
+             trust.package=trust-router\ntrust.protocol={protocol}\ncommit-hash: {commit}\n\
+             trust-repo-commit-hash: {commit}\nTRUSTD_IDENTITY\n"
+        ),
+    )
+    .unwrap_or_else(|error| panic!("write fake trustd {}: {error}", path.display()));
+    make_executable(path);
+}
+
+/// The `--version` release string every tool in this checkout reports, spelled
+/// from the same two files the product reads. `src/rust-compat-version` is the
+/// Rust release the `-V` protocol reports; `src/version` (Trust's own version)
+/// is deliberately a different number and must not be used here.
+#[cfg(unix)]
+fn rust_compat_release_for_repo() -> String {
+    let root = repo_root();
+    let read = |relative: &str| {
+        fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"))
+            .trim()
+            .to_string()
+    };
+    trust_version::rust_compat_release(&read("src/rust-compat-version"), &read("src/ci/channel"))
 }
 
 #[cfg(unix)]

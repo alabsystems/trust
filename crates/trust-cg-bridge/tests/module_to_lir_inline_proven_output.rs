@@ -42,15 +42,14 @@ use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
 use trust_cg_bridge::lower_trust_ir_function_to_lir;
 use trust_disasm::{Opcode, decode_aarch64};
-use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
-use trust_types::{Formula, Sort};
-
 use trust_ir::inst::{BinOp, Inst};
 use trust_ir::interpret::{InterpretValue, Interpreter};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
 use trust_ir::{Block, Constant, Function as IrFunction, Module};
+use trust_machine_sem::{Aarch64Semantics, MachineState, Semantics};
+use trust_types::{Formula, Sort};
 
 // ---------------------------------------------------------------------------
 // Build a trust_ir::Module for caller(a,b) = add(a,b) + k, where `add` is a
@@ -254,7 +253,8 @@ fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
                 panic!("unsupported array sort for Var {name}: {sort:?}");
             };
-            solver.declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            solver
+                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
         }
         other => panic!("unexpected Var sort in machine output for {name}: {other:?}"),
     }
@@ -400,9 +400,8 @@ fn interpret_caller(module: &Module, a: i128, b: i128) -> i128 {
         InterpretValue::int(Ty::I32, a).expect("arg a"),
         InterpretValue::int(Ty::I32, b).expect("arg b"),
     ];
-    let outcome = interp
-        .execute_func(FuncId::new(0), args)
-        .expect("interpreter execute_func failed");
+    let outcome =
+        interp.execute_func(FuncId::new(0), args).expect("interpreter execute_func failed");
     outcome.returns[0].as_int().expect("integer return").as_signed()
 }
 

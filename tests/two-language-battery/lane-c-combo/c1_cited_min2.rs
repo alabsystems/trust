@@ -41,13 +41,23 @@ clean {
 }
 
 /// Ordinary Rust. The Lean theorem above is its proof.
-pub fn min2(a: u64, b: u64) -> u64 { if a < b { a } else { b } }
+pub fn min2(a: u64, b: u64) -> u64 {
+    if a < b { a } else { b }
+}
 
 /// The combo: a Rust postcondition discharged by a Lean case-split proof.
-pub fn pick_min(x: u64, y: u64) -> u64 ensures min2(x, y) <= x by min2_le_left { min2(x, y) }
+pub fn pick_min(x: u64, y: u64) -> u64
+    ensures min2(x, y) <= x by min2_le_left
+{
+    min2(x, y)
+}
 
 /// A second mode: the result bound to the defining equation.
-pub fn keep(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
+pub fn keep(x: u64) -> u64
+    ensures result >= x by u64_ge_refl
+{
+    x
+}
 
 fn main() {
     let (a, b) = (41u64, 7u64);

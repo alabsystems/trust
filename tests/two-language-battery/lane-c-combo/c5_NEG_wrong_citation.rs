@@ -85,7 +85,11 @@ clean {
 /// `c1_cited_min2.rs:45` and `tests/ui/trust/e9_result_binding_discharge.rs:20`,
 /// which are check-pass fixtures. If THIS one fails, the file has measured
 /// something other than what it claims and its rejection must not be scored.
-pub fn keep(x: u64) -> u64 ensures result >= x by u64_ge_refl { x }
+pub fn keep(x: u64) -> u64
+    ensures result >= x by u64_ge_refl
+{
+    x
+}
 
 /// THE CONTROL — same island, same signature, same body, same clause; the only
 /// change is the cited theorem.

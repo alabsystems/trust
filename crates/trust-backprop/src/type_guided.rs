@@ -422,14 +422,21 @@ fn hint_to_suggestion(hint: &FormulaHint, kind: &str) -> SpecSuggestion {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use trust_types::{LocalDecl, Ty, VerifiableBody};
+
+    use super::*;
 
     fn make_body(params: Vec<LocalDecl>, return_ty: Ty) -> VerifiableBody {
         let arg_count = params.len();
         let mut locals = vec![LocalDecl { index: 0, ty: return_ty, name: Some("_return".into()) }];
         locals.extend(params);
-        VerifiableBody { locals, blocks: vec![], arg_count, return_ty: Ty::Unit, datatype_defs: Default::default() }
+        VerifiableBody {
+            locals,
+            blocks: vec![],
+            arg_count,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        }
     }
 
     fn make_param(index: usize, name: &str, ty: Ty) -> LocalDecl {
@@ -473,7 +480,11 @@ mod tests {
             name: "Option<u32>".into(),
             fields: vec![],
             disc_index_safe: false,
-         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None };
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
         let patterns = match_patterns(&ty);
         assert_eq!(patterns.len(), 1);
         assert!(matches!(
@@ -520,7 +531,11 @@ mod tests {
             name: "Vec<i32>".into(),
             fields: vec![],
             disc_index_safe: false,
-         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None };
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
         let patterns = match_patterns(&ty);
         assert_eq!(patterns.len(), 1);
         assert!(matches!(
@@ -567,7 +582,11 @@ mod tests {
             name: "Option<String>".into(),
             fields: vec![],
             disc_index_safe: false,
-         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None };
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+        };
         let formula = infer_nullability("val", &ty);
         assert!(formula.is_some());
     }
@@ -641,7 +660,11 @@ mod tests {
                     name: "Option<u32>".into(),
                     fields: vec![],
                     disc_index_safe: false,
-                 faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None },
+                    faithful_enum_repr: None,
+                    layout: None,
+                    enum_layout: None,
+                    adt_kind: None,
+                },
             )],
             Ty::Unit,
         );
@@ -690,7 +713,11 @@ mod tests {
                         name: "Option<u8>".into(),
                         fields: vec![],
                         disc_index_safe: false,
-                     faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None },
+                        faithful_enum_repr: None,
+                        layout: None,
+                        enum_layout: None,
+                        adt_kind: None,
+                    },
                 ),
             ],
             Ty::Int { width: 8, signed: false },

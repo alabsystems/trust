@@ -20,17 +20,12 @@ pub struct Registry {
 impl Registry {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            domains: RwLock::new(HashMap::new()),
-        }
+        Self { domains: RwLock::new(HashMap::new()) }
     }
 
     /// `.write()` — terminal path segment collides with POSIX write(2).
     pub fn register(&self, key: u32, value: u32) {
-        let mut guard = self
-            .domains
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.domains.write().unwrap_or_else(PoisonError::into_inner);
         guard.insert(key, value);
     }
 

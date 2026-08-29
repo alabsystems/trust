@@ -31,15 +31,9 @@ fn add_multi_limb_with_full_carry_propagation() {
 #[test]
 fn sub_multi_limb_with_full_borrow_propagation() {
     // 2^128 - 1: the borrow must ripple through two zero limbs.
-    assert_eq!(
-        nat(TWO_128).sub(&Nat::from_u64(1)),
-        Nat::from_limbs(vec![u64::MAX, u64::MAX])
-    );
+    assert_eq!(nat(TWO_128).sub(&Nat::from_u64(1)), Nat::from_limbs(vec![u64::MAX, u64::MAX]));
     // 2^128 - 2^64 = [0, MAX] by the limb layout definition.
-    assert_eq!(
-        nat(TWO_128).sub(&nat(TWO_64)),
-        Nat::from_limbs(vec![0, u64::MAX])
-    );
+    assert_eq!(nat(TWO_128).sub(&nat(TWO_64)), Nat::from_limbs(vec![0, u64::MAX]));
     // Truncation with multi-limb operands on BOTH sides.
     assert_eq!(nat(TWO_64).sub(&nat(TWO_128)), Nat::ZERO);
     assert_eq!(nat(TWO_64).checked_sub(&nat(TWO_128)), None);
@@ -113,8 +107,6 @@ fn decimal_round_trip_multi_limb() {
     assert_eq!(n.limbs().len(), 6, "a 100-digit value is six limbs");
     // Round trip composes with arithmetic: (n * 10^19 + 7) renders as the
     // digits of n followed by eighteen zeros and a 7.
-    let shifted = n
-        .mul(&nat("10000000000000000000"))
-        .add(&Nat::from_u64(7));
+    let shifted = n.mul(&nat("10000000000000000000")).add(&Nat::from_u64(7));
     assert_eq!(shifted.to_decimal(), format!("{hundred_digits}0000000000000000007"));
 }
