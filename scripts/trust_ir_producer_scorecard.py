@@ -1377,6 +1377,23 @@ def aggregate(results):
             "total": len(bs),
             "lowered_clean": len(clean),
             "lowered_clean_pct": round(100.0 * len(clean) / len(bs), 1) if bs else None,
+            # Trust (fragment honesty, 2026-08-29): a coroutine BODY (the desugared async/gen
+            # state machine itself, tagged `ClosureEnv(coroutine body)`) is OUT OF FRAGMENT by
+            # architecture -- retiring the family means implementing the await/poll state
+            # machine (roadmap B5), not adjusting a gate. The scouted census (2026-08-28)
+            # measured this family owning 158/158 Match(generic/opaque scrutinee), 36/36
+            # Yield, and 122/123 UpvarRef(non-Fn env) corpus-wide. These two rows separate
+            # architectural refusal from coverage debt; the headline `lowered_clean_pct`
+            # NEVER moves because of them -- the in-fragment rate is an ADDITIONAL line, and
+            # replacing the headline with it would be metric-gaming.
+            "bodies_out_of_fragment": sum(
+                1 for x in bs if "ClosureEnv(coroutine body)" in x.get("reasons", [])),
+            "lowered_clean_in_fragment_pct": (
+                round(100.0 * len(clean) / (len(bs) - sum(
+                    1 for x in bs if "ClosureEnv(coroutine body)" in x.get("reasons", []))), 1)
+                if bs and len(bs) > sum(
+                    1 for x in bs if "ClosureEnv(coroutine body)" in x.get("reasons", []))
+                else None),
             # Trust (measurement honesty): split the clean population. A SYMBOLIC clean body
             # lowered without a fail-closed tag but carries an opaque, value-less placeholder,
             # so it is refused by the executable SPLICE (`crate_module.rs`: `symbolic` gates
@@ -1575,6 +1592,12 @@ def render_markdown(data):
         out.append(f"- bodies reached (in files that fully compiled under the flag): **{b['total']}**")
         out.append(f"- lowered clean (0 unsupported shapes): **{b['lowered_clean']}"
                    f" ({b['lowered_clean_pct']}%)**")
+        if b.get("bodies_out_of_fragment"):
+            out.append(
+                f"- in-fragment rate (excluding {b['bodies_out_of_fragment']} coroutine bodies"
+                f" -- out of fragment by architecture, roadmap B5):"
+                f" **{b['lowered_clean_in_fragment_pct']}%** (secondary; the headline above"
+                f" is the rate of record)")
         if b.get("lowered_clean_symbolic") is not None:
             unm = b.get("lowered_clean_class_unmeasured", 0)
             unm_s = f" · class-unmeasured {unm}" if unm else ""

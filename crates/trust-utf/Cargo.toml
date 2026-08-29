@@ -1,0 +1,29 @@
+# trust-utf: total, verified UTF-8 and UTF-16 scalar arithmetic.
+#
+# The third `crates/`-resident component written to PASS the authenticated
+# strict lane rather than to be retrofitted onto it, on the same discipline as
+# `trust-ratio` and `trust-hex`: no dependencies, `#![no_std]`, no `derive`, no
+# `impl Display`, no allocation, no loops, no slices, and a grammar `ensures`
+# clause on every public function that can carry one.
+#
+# It exists because the surrogate and continuation-byte arithmetic on Trust's
+# untrusted-input paths is open-coded with side conditions nobody discharges:
+# `crates/trust-json/src/de.rs:440` subtracts `0xD800` from a `u16` that only a
+# range pattern above it constrains, and `crates/trust-js-interp/src/`
+# `builtins_uri.rs:139` and `crates/trust-js-sem/src/builtins.rs:2177` each
+# reassemble a surrogate pair behind a `u16::try_from(..).expect(..)`.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-utf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,5 @@
+# The verification crates in upstream Rust build on a stock nightly (pinned
+# for reproducibility). Trust-language crates (grammar contracts) and the
+# compiler-internals family need the Trust toolchain itself — see INSTALL.md.
+[toolchain]
+channel = "nightly-2026-04-20"

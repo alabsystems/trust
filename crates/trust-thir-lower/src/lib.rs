@@ -2189,6 +2189,21 @@ pub struct PendingConst {
     /// keeps `_0 = const names::NAME` UNEVALUATED — a manufactured comparator DISAGREE. The
     /// `Constant::PhantomData` metadata sentinel makes that recognizer fail by its OWN predicate.
     pub str_global: Option<trust_ir::value::GlobalId>,
+    /// Trust (wave-SD): `Some(global)` iff this record defers a LOCAL STATIC's initializer.
+    /// Then `value` is the (real, non-sentinel) `GlobalAddr` node's result — recorded for
+    /// attribution, never patched — and `global` is the scalar global whose PLACEHOLDER
+    /// initializer (`Constant::PhantomData`) the finalizer rewrites from
+    /// `eval_static_initializer`, which is SAFE at the seam: `run_required_analyses` has
+    /// already forced `mir_built` for every body owner, so the CTFE reachability set that
+    /// makes the same eval an E0391 inside `mir_built` (the `library/core` wake.rs cycle,
+    /// see `lower_static_ref`) is fully built. The scalar shape fields (`is_bool`/`signed`/
+    /// `bits`) carry the PRODUCER's view for the finalizer's re-derive cross-check;
+    /// `eval_pending_const` is never called for the record. A non-empty `pending_consts` is
+    /// what the derived-MIR differential and the flip registry read to refuse the body, so
+    /// a deferred static inherits both refusals with zero edits there; the interpretation
+    /// differential re-adjudicates at the seam AFTER the patch (slice 20), so a patched
+    /// static global is a real value the body can then be sampled against.
+    pub static_global: Option<trust_ir::value::GlobalId>,
 }
 
 /// Trust: the identity behind one DefIndex-derived callee `FuncId` (see `Lowered::callees`).
@@ -2669,6 +2684,125 @@ impl Drop for LoweringBodyGuard {
 
 /// True iff evaluating `def_id`'s body would re-enter a `mir_built` already on this thread's
 /// producer stack. Callers MUST decline rather than issue the query.
+/// Trust (wave-SD): evaluate a STATIC's initializer and decode it as the scalar the mapped
+/// `Ty` claims — the ONE spelling shared by the producer's eager non-local leg
+/// (`eval_nonlocal_static_scalar` delegates its tail here) and the crate-finalize seam's
+/// deferred LOCAL leg (`crate_module::resolve_pending_consts`' static branch). At the seam the
+/// eval is safe for local defs because `run_required_analyses` has already forced `mir_built`
+/// for every body owner; inside `mir_built` the caller must have established non-locality
+/// first (the E0391 CTFE-reachability argument at `lower_static_ref`).
+///
+/// Fail-closed on: eval error, a non-int/bool rustc type, a bool byte that is neither 0 nor 1,
+/// provenance in the read range (a pointer-valued static is an address this decode does not
+/// model), and any width the mapped `Ty` cannot name.
+pub(crate) fn eval_static_scalar_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    rty: RustcTy<'tcx>,
+    mapped: &Ty,
+    def_id: rustc_span::def_id::DefId,
+) -> Option<Constant> {
+    let alloc = tcx.eval_static_initializer(def_id).ok()?;
+    let inner = alloc.inner();
+    // Trust (wave-SD2): the COMPOSITE leg — an all-scalar struct/tuple static decodes by an
+    // ALLOCATION + LAYOUT walk (the valtree route is const-only: `const_eval_resolve_for_
+    // typeck` takes an UnevaluatedConst, and a `static` is a place, not a const). Each field
+    // is read at rustc's own `layout.fields.offset(i)` — the same authority
+    // `field_byte_offset` cites — and decoded by the ONE scalar decode below; the aggregate
+    // is assembled in DECLARATION order, which is the order the registered trust-ir
+    // struct/tuple carries. `read_scalar(.., false)` errors on provenance, so a
+    // pointer-bearing field fails the whole decode closed. Nesting and enums are refused
+    // (`scalar_static_leaf` admits Bool/Int/Uint only).
+    if matches!(rty.kind(), ty::Adt(..) | ty::Tuple(_)) {
+        let field_rtys: Vec<RustcTy<'tcx>> = match rty.kind() {
+            ty::Adt(adt, args) if adt.is_struct() => adt
+                .non_enum_variant()
+                .fields
+                .iter()
+                .map(|f| f.ty(tcx, args).skip_normalization())
+                .collect(),
+            ty::Tuple(elems) => elems.iter().collect(),
+            _ => return None,
+        };
+        let te = ty::TypingEnv::fully_monomorphized();
+        let layout = tcx.layout_of(te.as_query_input(rty)).ok()?;
+        if layout.fields.count() != field_rtys.len() {
+            return None;
+        }
+        let mut elems = Vec::with_capacity(field_rtys.len());
+        for (i, frty) in field_rtys.iter().enumerate() {
+            let (bits, signed, is_bool) = scalar_static_leaf(tcx, *frty)?;
+            let off = layout.fields.offset(i);
+            let size = rustc_abi::Size::from_bits(u64::from(bits));
+            let scalar = inner
+                .read_scalar(
+                    &tcx,
+                    rustc_middle::mir::interpret::alloc_range(off, size),
+                    false,
+                )
+                .ok()?;
+            let raw = scalar.to_bits(size).discard_err()?;
+            elems.push(if is_bool {
+                match raw {
+                    0 => Constant::Bool(false),
+                    1 => Constant::Bool(true),
+                    _ => return None,
+                }
+            } else {
+                integer_constant_from_bits(raw, signed, bits)
+            });
+        }
+        return Some(Constant::Aggregate(elems));
+    }
+    let bits = match rty.kind() {
+        ty::Bool => 8u32,
+        ty::Int(_) | ty::Uint(_) => int_scalar_bits(mapped)?.0,
+        _ => return None,
+    };
+    let size = rustc_abi::Size::from_bits(u64::from(bits));
+    let scalar = inner
+        .read_scalar(
+            &tcx,
+            rustc_middle::mir::interpret::alloc_range(rustc_abi::Size::ZERO, size),
+            false,
+        )
+        .ok()?;
+    let raw = scalar.to_bits(size).discard_err()?;
+    match rty.kind() {
+        ty::Bool => match raw {
+            0 => Some(Constant::Bool(false)),
+            1 => Some(Constant::Bool(true)),
+            _ => None,
+        },
+        ty::Int(_) | ty::Uint(_) => {
+            let signed = matches!(rty.kind(), ty::Int(_));
+            Some(integer_constant_from_bits(raw, signed, bits))
+        }
+        _ => None,
+    }
+}
+
+/// Trust (wave-SD2): a composite static FIELD's scalar shape — Bool/Int/Uint only (the same
+/// admitted leaf set the whole static lane models). `None` refuses the whole decode.
+fn scalar_static_leaf<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    frty: RustcTy<'tcx>,
+) -> Option<(u32, bool, bool)> {
+    match frty.kind() {
+        ty::Bool => Some((8, false, true)),
+        ty::Int(it) => Some((
+            it.bit_width().unwrap_or_else(|| tcx.data_layout.pointer_size().bits()) as u32,
+            true,
+            false,
+        )),
+        ty::Uint(ut) => Some((
+            ut.bit_width().unwrap_or_else(|| tcx.data_layout.pointer_size().bits()) as u32,
+            false,
+            false,
+        )),
+        _ => None,
+    }
+}
+
 fn would_reenter_lowering(def_id: rustc_span::def_id::DefId) -> bool {
     LOWERING_BODIES.with(|s| s.borrow().contains(&def_id))
 }
@@ -4540,6 +4674,38 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // this is a value-less opaque carrier, never a modelled value.
                     self.param_opaque = true;
                     return Ty::Struct(self.mint_alias_opaque_struct());
+                }
+                // Trust (wave-PO2): a ZERO-ARG (or erased-lifetime-only) UNREVEALED Opaque —
+                // `async fn`'s return, RPIT, TAIT — is NAMED, never revealed. The #201 comment
+                // above declined this case on two grounds; both are answered, not overridden:
+                //
+                //   * "the oracle fails those closed with a DIFFERENT detail" — true and
+                //     UNCHANGED (this touches nothing on the oracle side; its pin test keeps
+                //     passing). The asymmetry is safe because these bodies are NEVER COMPARED:
+                //     `differential::compare` answers `DiffMode::NotRun` on
+                //     `mir.has_opaque_types()` before any signature check, and the scorecard
+                //     files them under `clean-skip-unrevealed-opaque`. Coverage, never Agreed.
+                //   * "revealing one here would mean asking for a hidden type from inside
+                //     `mir_built`" — the E0391 hazard lives in the REVEAL (`type_of` ->
+                //     borrowck of the defining body). Minting the shared zero-field symbol is
+                //     query-free: no `type_of`, no normalize, no `layout_of`.
+                //
+                // Same sort-not-gap argument as #201: the zero-field struct carries no
+                // interpreted equality and no arith sort, so no VC can discharge off it, and
+                // `param_opaque` marks the body SYMBOLIC (splice refused). The gate admits only
+                // an `AliasTyKind::Opaque` whose args are ALL regions (zero-arg or
+                // erased-lifetime-only — 199 of the 201 censused rows); an opaque nested
+                // INSIDE another type, an infer var, or escaping bound vars keep the
+                // fail-closed tag below.
+                if let ty::Alias(_, a) = ty.kind() {
+                    if matches!(a.kind, ty::AliasTyKind::Opaque { .. })
+                        && a.args.iter().all(|g| g.as_region().is_some())
+                        && !ty.has_non_region_infer()
+                        && !ty.has_escaping_bound_vars()
+                    {
+                        self.param_opaque = true;
+                        return Ty::Struct(self.mint_alias_opaque_struct());
+                    }
                 }
                 // Trust (#48): `free_alias_reaches_opaque` for the SAME reason it guards
                 // `cycle_safe_normalize` — `pub type X = impl Tr;` carries
@@ -7228,8 +7394,21 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if !cargs.as_closure().upvar_tys().is_empty() {
             return None;
         }
-        // G5.
-        if !self.is_drop_free_zst(expr_ty) {
+        // G5, with the wave-ZG structural fallback. `is_drop_free_zst` answers through a
+        // layout query gated by `layout_query_is_reentrant_safe`, which refuses whenever the
+        // closure type carries the ENCLOSING fn's generics or an alias in its own signature
+        // (`ClosureArgs` embeds both) — `inside(|| {})` inside `outside<A, B>()`, the measured
+        // #1 residue of the wave-ZC lane. In exactly that refusal case, G1-G4 have ALREADY
+        // proved the fact G5 exists to check: capture-freedom by TWO independent witnesses
+        // (`c.upvars.is_empty()` from THIR and `upvar_tys().is_empty()` from rustc's capture
+        // analysis) plus G3's non-coroutine — a capture-free non-coroutine closure's layout IS
+        // its empty upvar tuple: zero-sized, no drop glue, independently of the parent's
+        // generics. The fallback covers ONLY the query-unavailable case, never a query that
+        // answered "no". Oracle parity is exact: trust-ir-bridge maps empty-upvar closures
+        // with NO layout query at all (lower.rs:3571). The existing `zst_closure_arg` flag
+        // (set at the call site below) keeps refusing splice and seam for the widened
+        // population unchanged — coverage, never Agreed.
+        if !self.is_drop_free_zst(expr_ty) && layout_query_is_reentrant_safe(expr_ty) {
             return None;
         }
         let v = self.fresh();
@@ -16193,25 +16372,80 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // soundness argument is UNCHANGED from the scalar case above: the
                         // ptr enters `borrow_ptrs` only, escape guards fail closed, and the
                         // only non-failing use round-trips the exact stored value.
-                        if matches!(
-                            arg_ty,
-                            Ty::Bool
-                                | Ty::I8
-                                | Ty::I16
-                                | Ty::I32
-                                | Ty::I64
-                                | Ty::I128
-                                | Ty::U8
-                                | Ty::U16
-                                | Ty::U32
-                                | Ty::U64
-                                | Ty::U128
-                                | Ty::Isize
-                                | Ty::Usize
-                                | Ty::Char
-                                | Ty::F32
-                                | Ty::F64
-                        ) || self.snapshotable_aggregate_pointee(&arg_ty)
+                        // Trust (wave-ZU / wave-AR): three pointee classes join the same list on
+                        // the same argument, each previously excluded by omission rather than by
+                        // a stated reason:
+                        //   * `Ty::Unit` — `&()`. The fieldless-struct arm of
+                        //     `snapshotable_aggregate_pointee` already admits the ZERO-FIELD
+                        //     store/load round-trip ("trivially"); the bare unit type is the
+                        //     same fact under a different spelling.
+                        //   * `Ty::Array(..)` — `&[0u8; 4]`. The value lanes are element-op
+                        //     native over `Ty::Array` (slice-15), and the Deref side's
+                        //     `pointee_ok` has admitted struct/tuple aggregates unconditionally
+                        //     since B4.3 — this closes the Load/Store asymmetry for arrays.
+                        //   * `Ty::FatPtr(_)` — `&"hello"` (a `&&str` borrow: the pointee is the
+                        //     FAT value). `pointee_ok` admits every `FatPtrKind` on the Load
+                        //     side already; the snapshot stores the same two-lane value the
+                        //     Deref would read back.
+                        // Trust (wave-ZU sweep ICE): `foo() == foo()` with `foo() -> !` — the
+                        // operand's ty is already DEFAULTED TO `()` at typeck (the test's own
+                        // comment says so), so a never-TYPE check sees nothing; the divergence
+                        // hides under the `NeverToAny` coercion node THIR wraps the call in.
+                        // Admitting Unit pointees therefore admitted a DIVERGING operand, and
+                        // emitting the Alloca/Store after the diverging call's terminator
+                        // double-seals the block ("seal_with cannot seal the same block twice",
+                        // caught by the sweep's flag_induced_ice lane on binop-fail-3.rs).
+                        // Peel Scope/Use and refuse a NeverToAny-wrapped (or never-typed)
+                        // operand: `&<diverging>` keeps the pre-wave fail-closed tag.
+                        let arg_diverges = {
+                            let mut e = arg;
+                            loop {
+                                match &self.thir.exprs[e].kind {
+                                    ExprKind::Scope { value, .. } => e = *value,
+                                    ExprKind::Use { source } => e = *source,
+                                    ExprKind::NeverToAny { .. } => break true,
+                                    _ => break self.thir.exprs[e].ty.is_never(),
+                                }
+                            }
+                        };
+                        if !arg_diverges
+                            && (matches!(
+                                arg_ty,
+                                Ty::Bool
+                                    | Ty::I8
+                                    | Ty::I16
+                                    | Ty::I32
+                                    | Ty::I64
+                                    | Ty::I128
+                                    | Ty::U8
+                                    | Ty::U16
+                                    | Ty::U32
+                                    | Ty::U64
+                                    | Ty::U128
+                                    | Ty::Isize
+                                    | Ty::Usize
+                                    | Ty::Char
+                                    | Ty::F32
+                                    | Ty::F64
+                                    | Ty::Array(..)
+                                    // Trust (wave-AR2 tightening): kind-gated to what the
+                                    // Deref read side takes back (B2-3 excludes
+                                    // TraitObject: "admitting it would only ever Load
+                                    // garbage"). The blanket `FatPtr(_)` of the first
+                                    // draft could snapshot a dyn fat value nothing reads.
+                                    | Ty::FatPtr(
+                                        trust_ir::FatPtrKind::Slice(_)
+                                            | trust_ir::FatPtrKind::Str
+                                            | trust_ir::FatPtrKind::ContainerLen
+                                    )
+                            )
+                                // Trust (wave-AR2 tightening): `Ty::Unit` is ALSO the
+                                // opaque-collapse spelling — admit it only when the operand
+                                // is GROUND-TRUTH unit-typed, so a collapsed live value can
+                                // never be snapshotted as a silently-unit pointee.
+                                || (matches!(arg_ty, Ty::Unit)
+                                    && self.thir.exprs[arg].ty.is_unit())
+                                || self.snapshotable_aggregate_pointee(&arg_ty))
                         {
                             if let Some(cval) = self.lower_expr(arg) {
                                 if !self.is_borrow_ptr(cval) {
@@ -16226,6 +16460,48 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                     );
                                     self.push_node(InstrNode::new(Inst::Store {
                                         ty: arg_ty,
+                                        ptr,
+                                        value: cval,
+                                        volatile: false,
+                                        align: None,
+                                    }));
+                                    self.borrow_ptrs.push(ptr);
+                                    return Some(ptr);
+                                }
+                            }
+                        } else if matches!(arg_ty, Ty::Ptr) {
+                            // Trust (wave-DB): the DOUBLE BORROW `&&place`. rustc's derive(Debug)
+                            // passes the LAST field of every struct as `&&self.fK`
+                            // (rustc_builtin_macros/src/deriving/debug.rs — one extra addr_of on
+                            // the final field only), so this is one mechanical shape, 43 fully
+                            // recoverable bodies measured. The INNER borrow lowers via the
+                            // existing lanes to a LEDGER-REGISTERED borrow ptr; the outer borrow
+                            // snapshots that POINTER VALUE into a `Ty::Ptr` slot — exactly the
+                            // scalar snapshot argument with the scalar being an address.
+                            //
+                            // The read-side contract is deliberately UNCHANGED: `Ty::Ptr` is NOT
+                            // added to the Deref `pointee_ok` list, so `**x` through this slot
+                            // still fails closed. In the measured population the outer pointer is
+                            // unsize-coerced to `&dyn Debug` and handed to core::fmt — never
+                            // deref'd in-body — and those bodies end in the extern seam
+                            // (clean-skip, NotRun), never interpreted. The slot enters
+                            // `borrow_ptrs` ONLY: every escape guard fails closed as for every
+                            // other snapshot. Gated on the inner value being ledger-registered —
+                            // an arbitrary `Ty::Ptr`-typed value (a raw-ptr cast, a call result)
+                            // keeps the fail-closed tag below.
+                            if let Some(cval) = self.lower_expr(arg) {
+                                if self.is_borrow_ptr(cval) {
+                                    let ptr = self.fresh();
+                                    self.push_node(
+                                        InstrNode::new(Inst::Alloca {
+                                            ty: Ty::Ptr,
+                                            count: None,
+                                            align: None,
+                                        })
+                                        .with_result(ptr),
+                                    );
+                                    self.push_node(InstrNode::new(Inst::Store {
+                                        ty: Ty::Ptr,
                                         ptr,
                                         value: cval,
                                         volatile: false,
@@ -16325,6 +16601,20 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // admitted F32/F64 from the start; the local arm never did,
                     // an asymmetry with no argument behind it.
                     || matches!(pointee_ty, Ty::F32 | Ty::F64)
+                    // Trust (wave-AR2): arrays and the three READABLE FatPtr kinds — the
+                    // same Load/Store-parity argument the wave-AR rvalue arm states, on a
+                    // list exactly as narrow as the Deref read side's (Slice/Str/
+                    // ContainerLen; TraitObject stays excluded per B2-3 — "no legitimate
+                    // dyn fat value can reach memory yet").
+                    || matches!(
+                        pointee_ty,
+                        Ty::Array(..)
+                            | Ty::FatPtr(
+                                trust_ir::FatPtrKind::Slice(_)
+                                    | trust_ir::FatPtrKind::Str
+                                    | trust_ir::FatPtrKind::ContainerLen
+                            )
+                    )
                     || self.snapshotable_aggregate_pointee(&pointee_ty))
                 {
                     self.unsupported.push((format!("{expr_span:?}"), "Borrow(non-scalar pointee)"));
@@ -17087,6 +17377,36 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // mismatch, or a capture operand that itself fails to lower.
             ExprKind::Closure(closure) => {
                 let upvar_ids: Vec<ExprId> = closure.upvars.iter().copied().collect();
+                // Trust (wave-PO2b): a COROUTINE literal in value position — the `async fn`
+                // shell's tail (`async fn f()` desugars to `fn f() -> impl Future { <literal> }`)
+                // and the `let fut = async { .. }` binding. Its VALUE is the same fact-free
+                // symbol wave-PO2 minted for its unrevealed-opaque TYPE: the shared zero-field
+                // `opaque_alias` sort, as a `Const` aggregate. This types the shell's `Return`
+                // against the PO2-mapped signature (both sides the same `Ty::Struct`), and the
+                // 142-body sole-blocker class this retires is exactly the shells whose Ty half
+                // PO2 cleared.
+                //
+                // The capture operands are deliberately NOT lowered — an elision, and here is
+                // why it is sound rather than convenient: `param_opaque` marks the body
+                // SYMBOLIC, so it never splices; the interpreter never runs it (symbolic is
+                // refused before sampling); and the MIR-side oracle fails closed on
+                // `ty::Coroutine` (no `to_mir` spelling exists), so the differential answers
+                // NotRun for every body this arm touches. A zero-field struct carries no
+                // interpreted equality and no arith sort — no VC can discharge off it. Every
+                // channel that could observe the elided captures is structurally closed.
+                if matches!(closure.args, ty::UpvarArgs::Coroutine(_)) {
+                    self.param_opaque = true;
+                    let sid = self.mint_alias_opaque_struct();
+                    let v = self.fresh();
+                    self.push_node(
+                        InstrNode::new(Inst::Const {
+                            ty: Ty::Struct(sid),
+                            value: Constant::Aggregate(vec![]),
+                        })
+                        .with_result(v),
+                    );
+                    return Some(v);
+                }
                 let ty::Closure(_, cargs) = expr_ty.kind() else {
                     self.unsupported.push((format!("{expr_span:?}"), "Closure(value position)"));
                     return None;
@@ -18319,13 +18639,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // patches its bytes global (`crate_module::resolve_pending_consts` + the positive
         // `check_str_global_ledger` tripwire that stops an unpatched placeholder reading as a real
         // value). Until that lands, a local static read is an honest, tagged gap.
-        if def_id.is_local() {
-            self.unsupported.push((
-                format!("{span:?}"),
-                "StaticRef(local static: CTFE deferral not implemented)",
-            ));
-            return None;
-        }
+        // Trust (wave-SD): the local case no longer declines here — it DEFERS, below, after
+        // the same pointee/freeze gates every static read passes. The FOLLOW-UP this replaces
+        // said exactly how: "defer to `resolve_pending_consts` and patch the global's
+        // initializer at the seam, exactly as the wave-SC `str_global` leg patches its bytes
+        // global" — that is what the `static_global` branch below does.
+        let is_local_static = def_id.is_local();
         // The read below uses `eval_static_initializer`, which is the query
         // designed for statics — NOT `const_eval_poly`, which asserts against statics outright
         // ("statics are conceptually places, not values -- so what we do here could break
@@ -18356,11 +18675,38 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
         // Const-evaluate the initializer through the SAME scalar decoder the non-local const
         // lane uses — no separate value path, so the admitted set can never drift.
-        let (gty, init) = match self.eval_nonlocal_static_scalar(span, pointee, def_id) {
-            Some(v) => v,
-            None => {
+        let (gty, init) = if is_local_static {
+            // Trust (wave-SD): a LOCAL static cannot CTFE here (the E0391 reachability
+            // argument above), so the global is minted with a PLACEHOLDER initializer and a
+            // `PendingConst { static_global }` record; `resolve_pending_consts` evaluates and
+            // patches it at the crate-finalize seam, where every body owner's `mir_built` is
+            // already forced. Only the scalar fragment defers (the same admitted set the
+            // eager leg decodes); a non-scalar local static keeps the precise tag.
+            let mapped = self.map_ty(pointee);
+            let scalar_ok = matches!(pointee.kind(), ty::Bool)
+                || (matches!(pointee.kind(), ty::Int(_) | ty::Uint(_))
+                    && int_scalar_bits(&mapped).is_some());
+            // Trust (wave-SD2): registered all-scalar struct/tuple statics join the deferral —
+            // the seam decodes them by the allocation+layout walk in
+            // `eval_static_scalar_value`'s composite leg. Enums stay refused (a discriminant+
+            // payload byte decode is not written), so the gate is the two aggregate arms of
+            // the snapshotable set, not the whole predicate.
+            let composite_ok = matches!(&mapped, Ty::Struct(_) | Ty::Tuple(_))
+                && self.snapshotable_aggregate_pointee(&mapped)
+                && matches!(pointee.kind(), ty::Adt(..) | ty::Tuple(_));
+            if !(scalar_ok || composite_ok) {
                 self.unsupported.push((format!("{span:?}"), "StaticRef(initializer not scalar)"));
                 return None;
+            }
+            (mapped, Constant::PhantomData)
+        } else {
+            match self.eval_nonlocal_static_scalar(span, pointee, def_id) {
+                Some(v) => v,
+                None => {
+                    self.unsupported
+                        .push((format!("{span:?}"), "StaticRef(initializer not scalar)"));
+                    return None;
+                }
             }
         };
         let idx = self.pending_globals.len();
@@ -18370,7 +18716,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         ));
         self.pending_globals.push(Global {
             name,
-            ty: gty,
+            ty: gty.clone(),
             mutable: false,
             initializer: Some(init),
             linkage: Linkage::Internal,
@@ -18386,6 +18732,37 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // still fails closed on it.
         self.borrow_ptrs.push(ptr);
         self.global_ptrs.push(ptr);
+        if is_local_static {
+            // Trust (wave-SD): the deferral record. The scalar shape fields carry the
+            // producer's view for the seam's re-derive cross-check; `value` is the REAL
+            // `GlobalAddr` result (attribution only — the static branch never patches an
+            // instruction, and `GlobalAddr` is not a const sentinel, so the leftover-sentinel
+            // scan is unaffected). A non-empty `pending_consts` refuses the flip and the
+            // derived-MIR differential automatically.
+            let composite = matches!(&gty, Ty::Struct(_) | Ty::Tuple(_));
+            let (signed, is_bool) = match pointee.kind() {
+                ty::Bool => (false, true),
+                ty::Int(_) => (true, false),
+                _ => (false, false),
+            };
+            let bits = if is_bool || composite {
+                if is_bool { 8 } else { 0 }
+            } else {
+                int_scalar_bits(&gty).map(|(b, _)| b).unwrap_or(0)
+            };
+            self.pending_consts.push(PendingConst {
+                value: ptr,
+                def_id,
+                span,
+                is_bool,
+                is_float: false,
+                signed,
+                bits,
+                composite,
+                str_global: None,
+                static_global: Some(global),
+            });
+        }
         Some(ptr)
     }
 
@@ -18617,6 +18994,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     composite: false,
                     // Not the wave-SC str lane (a scalar const has no backing bytes global).
                     str_global: None,
+                    static_global: None,
                 });
                 return Some(res);
             }
@@ -18852,6 +19230,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             bits: 64,
             composite: false,
             str_global: Some(global),
+            static_global: None,
         });
         let fat = self.fresh();
         self.push_node(
@@ -18959,6 +19338,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     composite: true,
                     // Not the wave-SC str lane (a composite const decodes in place, no bytes global).
                     str_global: None,
+                    static_global: None,
                 });
                 return Some(res);
             }
@@ -19411,41 +19791,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if def_id.is_local() {
             return None;
         }
-        let alloc = self.tcx.eval_static_initializer(def_id).ok()?;
-        let inner = alloc.inner();
         let ty = self.map_ty(rty);
-        let bits = match rty.kind() {
-            ty::Bool => 8u32,
-            ty::Int(_) | ty::Uint(_) => int_scalar_bits(&ty)?.0,
-            // Floats, pointers, aggregates and str are outside this slice's admitted set.
-            _ => return None,
-        };
-        let size = rustc_abi::Size::from_bits(u64::from(bits));
-        // `read_provenance: false` — a scalar static holds plain bytes. A POINTER-valued static
-        // reads back with provenance and errors here, which is the correct fail-close: its value
-        // is an address this lane does not model.
-        let scalar = inner
-            .read_scalar(
-                &self.tcx,
-                rustc_middle::mir::interpret::alloc_range(rustc_abi::Size::ZERO, size),
-                false,
-            )
-            .ok()?;
-        let raw = scalar.to_bits(size).discard_err()?;
-        match rty.kind() {
-            // A `bool` byte that is neither 0 nor 1 is not a value we may invent.
-            ty::Bool => match raw {
-                0 => Some((Ty::Bool, Constant::Bool(false))),
-                1 => Some((Ty::Bool, Constant::Bool(true))),
-                _ => None,
-            },
-            ty::Int(_) | ty::Uint(_) => {
-                let signed = matches!(rty.kind(), ty::Int(_));
-                // The SAME shared decode the const lane's tail uses — one spelling only.
-                Some((ty, integer_constant_from_bits(raw, signed, bits)))
-            }
-            _ => None,
-        }
+        // Trust (wave-SD): the eval+decode tail moved to the shared free fn so the seam's
+        // deferred-local leg and this eager non-local leg can never drift — the same doctrine
+        // this helper already cites for sharing the integer decode with the const lane.
+        let c = eval_static_scalar_value(self.tcx, rty, &ty, def_id)?;
+        Some((ty, c))
     }
 
     fn eval_nonlocal_scalar_const(

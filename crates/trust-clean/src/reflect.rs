@@ -2334,6 +2334,44 @@ pub fn reflect_struct_reasoned(ty: &Ty) -> Result<AdtCarrier, &'static str> {
     })
 }
 
+/// MEASUREMENT ONLY — which field type makes [`reflect_struct_reasoned`] return
+/// `"a field TYPE has no carrier at all"`.
+///
+/// That decline is the single largest GENUINE carrier gap in the corpus (757
+/// uncovered authored bodies, measured 2026-08-28 — the 588 known-container / 75
+/// Prod-floor / 24 field-less / 4 known-map declines beside it are deliberate
+/// floors, not gaps). A count alone cannot say whether it is one addressable head
+/// or a 700-type tail, and this campaign has repeatedly paid for building against
+/// a population before reading its composition.
+///
+/// This REPLICATES the skip-order of the field loop above — dyn-sink, bare type
+/// var, parameterized composite, then `reflect_ty` — because those three arms
+/// handle a field BEFORE it can reach the decline, so a naive "first field whose
+/// `reflect_ty` fails" would attribute the gap to fields that never blocked
+/// anything. Keep it adjacent to that loop: if the loop gains an arm, this must
+/// gain it too, and being three lines away is what makes the drift visible.
+///
+/// Returns `None` when no field reaches the decline (the struct declined for one
+/// of the other reasons, or built fine).
+pub(crate) fn first_uncarriable_field(ty: &Ty) -> Option<(String, Ty)> {
+    let Ty::Adt { fields, .. } = ty else { return None };
+    for (fname, fty) in fields {
+        if is_nested_dyn_field(fty) {
+            continue;
+        }
+        if bare_type_var(fty).is_some() {
+            continue;
+        }
+        if parameterized_composite_field(fty).is_some() {
+            continue;
+        }
+        if reflect_ty(fty).is_err() {
+            return Some((fname.clone(), fty.clone()));
+        }
+    }
+    None
+}
+
 /// GOAL-ITEM #3 — reflect an IEEE-754 float type of `width` bits into a REAL
 /// single-constructor Clean inductive carrier ([`AdtCarrier`]) decomposing the bit
 /// layout into NAMED fields, or `None` for an unsupported width (the caller then

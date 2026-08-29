@@ -2360,8 +2360,26 @@ fn convert_rvalue<'tcx>(
                 // (unconstrained, never falsely proved): `(ptr as usize) % a == 0` gets an opaque
                 // bool, and a later deref of a recovered opaque pointer fails closed. Unblocks the
                 // common `(ptr as usize).is_multiple_of(align)` alignment-check idiom.
-                mir::CastKind::PointerExposeProvenance
-                | mir::CastKind::PointerWithExposedProvenance => {
+                // Trust: the two directions are NOT the same lowering. `ptr as usize`
+                // (expose) produces an INTEGER whose width/signedness are right here in
+                // `ty`; `usize as *T` (recover) produces a POINTER. Collapsing both to
+                // `OpaqueConst` threw the integer's type away, and `OpaqueConst` lowers
+                // to a fat-pointer `Undef` -- by its own doc "the wrong SORT for
+                // arithmetic/indexing", which is precisely what the idiom above needs.
+                // `OpaqueScalar` is the variant that exists for this: equally
+                // unconstrained (never falsely proved) but INTEGER-SORTED, so a consumer
+                // mints a fresh integer instead of an ill-sorted pointer.
+                mir::CastKind::PointerExposeProvenance => {
+                    match convert_ty_with_env(tcx, typing_env, *ty) {
+                        Ty::Int { width, signed } => Rvalue::Use(Operand::Constant(
+                            ConstValue::OpaqueScalar { width, signed },
+                        )),
+                        // Anything else keeps the conservative lowering -- this arm may
+                        // only ever REPLACE an opaque with a better-typed opaque.
+                        _ => Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst)),
+                    }
+                }
+                mir::CastKind::PointerWithExposedProvenance => {
                     Rvalue::Use(Operand::Constant(ConstValue::OpaqueConst))
                 }
                 // `&[T; N] -> &[T]` (array→slice unsize): the bridge's

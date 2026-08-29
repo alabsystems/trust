@@ -2456,9 +2456,22 @@ fn supported_hyps_from_atoms(atoms: &[Atom<'_>]) -> Option<Vec<Hyp>> {
     Some(hyps)
 }
 
+/// Structural identity of a normalized atom: the relation plus both operand
+/// terms. Two atoms with the same key are the SAME hypothesis, spelled twice.
+fn atom_identity_key<'a>(atom: &Atom<'a>) -> (bool, &'a Formula, &'a Formula) {
+    match atom {
+        Atom::Lt(a, b) => (true, a, b),
+        Atom::Le(a, b) => (false, a, b),
+    }
+}
+
 fn collect_supported_atoms<'a>(conjuncts: &[&'a Formula]) -> (Vec<Atom<'a>>, BTreeSet<String>) {
     let mut atoms: Vec<Atom<'a>> = Vec::new();
     let mut var_names: BTreeSet<String> = BTreeSet::new();
+    // Structural keys of the atoms already kept, parallel to `atoms`, so a
+    // repeated conjunct contributes its atom exactly once. See the duplicate
+    // note on the loop below.
+    let mut kept_keys: Vec<(bool, &'a Formula, &'a Formula)> = Vec::new();
     for &c in conjuncts {
         let Some(normalized) = normalize_atom(c) else {
             continue;
@@ -2469,7 +2482,38 @@ fn collect_supported_atoms<'a>(conjuncts: &[&'a Formula]) -> (Vec<Atom<'a>>, BTr
         let mut local_vars = BTreeSet::new();
         if normalized.iter().all(|a| collect_int_vars(a, &mut local_vars)) {
             var_names.extend(local_vars);
-            atoms.extend(normalized);
+            // DEDUPLICATE by structural identity. `∧` is idempotent, so a
+            // conjunct that appears twice states one hypothesis, not two — but
+            // `supported_hyps_from_atoms` is 1:1 with this vector, so a repeat
+            // used to become two distinct hypotheses `h_i`/`h_j` carrying the
+            // SAME assertion. ay's zero-trust reconstruction then cannot bind
+            // its premise to one exact hypothesis and the whole certification
+            // declines, even though the identical single-copy obligation
+            // certifies. Measured 2026-08-29 on
+            // `fn clamp_upper(v: u32, hi: u32) -> u32 ensures result <= hi`:
+            // any build with `-C debuginfo != 0` (i.e. every cargo/targo `dev`
+            // profile build) emits the return-slot definition `_0#s1_0 = hi`
+            // twice and the row lost its kernel certificate; with one copy it
+            // certifies. A constant-bounded twin (`_0 = 15`) was unaffected,
+            // which is exactly why constant bounds kept publishing while
+            // parameter bounds stopped.
+            //
+            // SOUNDNESS: this is the ∧-elimination argument above, applied to
+            // the strongest possible subset — the kept set is IDENTICAL as a
+            // set of propositions, so nothing is weakened. Producer and
+            // consumer both reach it through this one function, so the kernel
+            // still re-checks the term against the same context.
+            for atom in normalized {
+                let key = atom_identity_key(&atom);
+                if kept_keys
+                    .iter()
+                    .any(|kept| kept.0 == key.0 && kept.1 == key.1 && kept.2 == key.2)
+                {
+                    continue;
+                }
+                kept_keys.push(key);
+                atoms.push(atom);
+            }
         }
     }
     (atoms, var_names)

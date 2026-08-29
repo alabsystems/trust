@@ -310,9 +310,57 @@ t_unwrapped_conflicts_seen() {
   [ "$rc" -eq 3 ] && grep -q "BUILD" <<<"$out"
 }
 
+# T10 — THE DEFAULT HOLDER MUST OUTLIVE `acquire`. Deliberately the one case that
+# does NOT pass `--pid`: every other case supplies it, which is exactly why this
+# hole survived. Until 2026-08-29 `acquire` defaulted the holder to `$$` — the
+# lock script's own pid — and the script exits the instant it prints the token, so
+# the lock was stale from birth and the next acquirer walked through it without
+# waiting. Measured in a scratch root that day: holder pid DEAD one instant after
+# acquire, second acquirer issued a token immediately. It cost a measurement
+# (`E0463: can't find crate for 'core'`) when a build took the tree.
+#
+# The assertion is in two halves because either alone is satisfiable by accident:
+# the recorded holder must still be ALIVE after acquire returns, AND a second
+# acquirer must still be REFUSED.
+t_default_holder_durable() {
+  local lock=$1 root rc hp
+  root=$(fresh_root)
+  TRUST_REPO="$root" sh "$lock" acquire --kind measurement \
+      --purpose "T10 batch with no --pid" >/dev/null 2>&1 || return 1
+  hp=$(sed -n 's/^pid=//p' "$root/.trust-build-lock/info" 2>/dev/null | head -1)
+  [ -n "$hp" ] || return 1
+  ps -p "$hp" >/dev/null 2>&1 || return 1        # born stale
+  TRUST_REPO="$root" sh "$lock" acquire --kind build --purpose "T10 heir" \
+      --pid $$ >/dev/null 2>&1; rc=$?
+  rm -rf "$root/.trust-build-lock"
+  [ "$rc" -eq 3 ]                                 # self-released if 0
+}
+
+# T11 — A STALE-HOLDER TAKEOVER MUST LEAVE A DURABLE RECORD, not just a line on
+# stderr. Reclaiming a dead holder is correct, but every acquiring caller in the
+# tree redirects this script's stderr (`call_summary_census.sh` with
+# `2>/dev/null`, x.py through a pipe), so a stderr-only notice is invisible in
+# exactly the runs where a lane discovers its lock was taken. The heir here
+# suppresses stderr on purpose — that is the shape that hid it.
+t_takeover_recorded() {
+  local lock=$1 root rc holder
+  root=$(fresh_root); holder=$(spawn_keepalive)
+  TRUST_REPO="$root" sh "$lock" acquire --kind measurement --purpose "T11 crashed lane" \
+      --pid "$holder" >/dev/null 2>&1 || return 1
+  kill -9 "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+  TRUST_REPO="$root" sh "$lock" acquire --kind build --purpose "T11 heir" \
+      --pid $$ >/dev/null 2>/dev/null; rc=$?
+  rm -rf "$root/.trust-build-lock"
+  [ "$rc" -eq 0 ] || return 1
+  [ -f "$root/.trust-build-lock.breaks" ] || return 1
+  grep -q "STALE-TAKEOVER" "$root/.trust-build-lock.breaks" || return 1
+  # and it must name WHO was displaced, not merely that something was.
+  grep -q "T11 crashed lane" "$root/.trust-build-lock.breaks"
+}
+
 CASES=(refuse_while_held reclaim_stale build_blocks_sweep sweep_blocks_build
        trap_releases race_one_winner foreign_release_refused pid_reuse_detected
-       unwrapped_conflicts_seen)
+       unwrapped_conflicts_seen default_holder_durable takeover_recorded)
 
 # Runs every case against $1; echoes the space-separated names that FAILED.
 # Progress goes to stderr as it happens: a suite that prints nothing for minutes
@@ -417,6 +465,22 @@ add_mutant M6 "the two pgrep predicates that reported clear against a live proce
     sub(/pgrep -f .trust_ir_producer_scorecar\[d\]\\\.py. 2>\/dev\/null/,
         "pgrep -f " q "python.*trust_ir_producer_scorecard" q " 2>/dev/null")
     print }'
+
+# M7/M8 model the TWO defects measured on 2026-08-29, the day after this suite's
+# first six were written. Both had to be added by hand: the suite was green
+# throughout, because every existing case supplies `--pid` and every existing case
+# reads stderr.
+add_mutant M7 "the pre-2026-08-29 default: the holder pid is the lock script itself" '
+  /^  KIND=..; PURPOSE=.unspecified.; HOLD_PID=..; WAIT=/ {
+    print "  KIND=\"\"; PURPOSE=\"unspecified\"; HOLD_PID=$$; WAIT=${TRUST_BUILD_LOCK_WAIT:-0}"
+    next }
+  { print }'
+
+add_mutant M8 "a stale takeover announces itself on stderr only, leaving no record" '
+  /^loud_takeover\(\) \{$/ { intake = 1 }
+  intake && /^  \} >> "\$BREAKS" 2>\/dev\/null$/ {
+    print "  } >> /dev/null 2>&1   # MUTANT M8"; intake = 0; next }
+  { print }'
 
 printf '\n=== mutation proof: each mutant must break a DIFFERENT set of cases\n'
 ok=1

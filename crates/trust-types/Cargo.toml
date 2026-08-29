@@ -23,7 +23,7 @@ workspace = true
 # Stable-only consumers (e.g. the `clean` workspace) depend with
 # `default-features = false` to drop the nightly requirement; the `Discharge`
 # type and all its combinators remain available on stable, only `?`-sugar is off.
-default = ["try-sugar"]
+default = []
 try-sugar = []
 test-utils = []
 # trust #571: ay-bindings for Formula->Expr conversion bridge.

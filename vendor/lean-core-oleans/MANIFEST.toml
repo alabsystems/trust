@@ -177,7 +177,7 @@ root_module = "TrustIr.Semantics.Arith"
 
 [platforms."aarch64-apple-darwin"]
 lean_version = "Lean (version 4.8.0, aarch64-apple-darwin, commit df668f00e6c0, Release)"
-built_on = "2026-08-28"
+built_on = "2026-08-29"
 [platforms."aarch64-apple-darwin".files]
 "Init/Data/UInt/Basic.olean" = "85e22edce2ceded19edc43e98360ebf4504df93aeb385145252cce3e0259cc07"
 "Init/Prelude.olean" = "a3447433f295b911382761e36c02c77e72c77636b8cc9ee37bd9bc026845ac4e"

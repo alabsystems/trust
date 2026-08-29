@@ -279,17 +279,17 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
  "ay-allsat",
  "ay-chc",
- "ay-core",
+ "ay-core 0.22.0",
  "ay-count",
- "ay-dpll",
- "ay-frontend",
+ "ay-dpll 0.22.0",
+ "ay-frontend 0.22.0",
  "ay-milp",
- "ay-proof",
- "ay-sat",
+ "ay-proof 0.22.0",
+ "ay-sat 0.22.0",
  "ay-translate",
  "num-bigint",
  "num-rational",
@@ -299,29 +299,39 @@ dependencies = [
 
 [[package]]
 name = "ay-allsat"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-sat",
+ "ay-sat 0.22.0",
  "tracing",
 ]
 
 [[package]]
 name = "ay-arrays"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "num-bigint",
+ "tracing",
+]
+
+[[package]]
+name = "ay-arrays"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "num-bigint",
  "tracing",
 ]
 
 [[package]]
 name = "ay-bindings"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-core",
- "ay-dpll",
- "ay-frontend",
- "ay-sys",
+ "ay-core 0.22.0",
+ "ay-dpll 0.22.0",
+ "ay-frontend 0.22.0",
+ "ay-sys 0.22.0",
  "ay-translate",
  "num-bigint",
  "num-traits",
@@ -332,9 +342,21 @@ dependencies = [
 [[package]]
 name = "ay-bv"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-sys",
+ "ay-core 0.19.0",
+ "ay-sys 0.19.0",
+ "num-bigint",
+ "stacker",
+ "tracing",
+]
+
+[[package]]
+name = "ay-bv"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-sys 0.22.0",
  "num-bigint",
  "stacker",
  "tracing",
@@ -342,19 +364,19 @@ dependencies = [
 
 [[package]]
 name = "ay-chc"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-arrays",
- "ay-bv",
- "ay-core",
+ "ay-arrays 0.22.0",
+ "ay-bv 0.22.0",
+ "ay-core 0.22.0",
  "ay-dispatch",
- "ay-dpll",
- "ay-euf",
- "ay-frontend",
- "ay-jit",
- "ay-lia",
- "ay-sat",
- "ay-sys",
+ "ay-dpll 0.22.0",
+ "ay-euf 0.22.0",
+ "ay-frontend 0.22.0",
+ "ay-jit 0.22.0",
+ "ay-lia 0.22.0",
+ "ay-sat 0.22.0",
+ "ay-sys 0.22.0",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -371,8 +393,25 @@ dependencies = [
 [[package]]
 name = "ay-core"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-sys",
+ "ay-sys 0.19.0",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "serde",
+ "stacker",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ay-core"
+version = "0.22.0"
+dependencies = [
+ "ay-sys 0.22.0",
  "foldhash 0.1.5",
  "hashbrown 0.15.5",
  "num-bigint",
@@ -386,11 +425,11 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-core",
- "ay-sat",
- "ay-sys",
+ "ay-core 0.22.0",
+ "ay-sat 0.22.0",
+ "ay-sys 0.22.0",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -401,6 +440,16 @@ dependencies = [
 [[package]]
 name = "ay-diff-logic"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
+dependencies = [
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
+name = "ay-diff-logic"
+version = "0.22.0"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -409,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "ay-dispatch"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
@@ -417,30 +466,70 @@ dependencies = [
 [[package]]
 name = "ay-dpll"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-arrays",
- "ay-bv",
- "ay-core",
- "ay-diff-logic",
- "ay-drat-check",
- "ay-dt",
- "ay-euf",
- "ay-fp",
- "ay-frontend",
- "ay-jit",
- "ay-lia",
- "ay-lra",
- "ay-map",
- "ay-model-check",
- "ay-multiset",
- "ay-nia",
- "ay-nra",
- "ay-proof",
- "ay-sat",
- "ay-seq",
- "ay-set",
- "ay-strings",
- "ay-sys",
+ "ay-arrays 0.19.0",
+ "ay-bv 0.19.0",
+ "ay-core 0.19.0",
+ "ay-diff-logic 0.19.0",
+ "ay-drat-check 0.19.0",
+ "ay-dt 0.19.0",
+ "ay-euf 0.19.0",
+ "ay-fp 0.19.0",
+ "ay-frontend 0.19.0",
+ "ay-jit 0.19.0",
+ "ay-lia 0.19.0",
+ "ay-lra 0.19.0",
+ "ay-map 0.19.0",
+ "ay-model-check 0.19.0",
+ "ay-multiset 0.19.0",
+ "ay-nia 0.19.0",
+ "ay-nra 0.19.0",
+ "ay-proof 0.19.0",
+ "ay-sat 0.19.0",
+ "ay-seq 0.19.0",
+ "ay-set 0.19.0",
+ "ay-strings 0.19.0",
+ "ay-sys 0.19.0",
+ "libc",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "serde_json",
+ "sha2 0.10.9",
+ "stacker",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "ay-dpll"
+version = "0.22.0"
+dependencies = [
+ "ay-arrays 0.22.0",
+ "ay-bv 0.22.0",
+ "ay-core 0.22.0",
+ "ay-diff-logic 0.22.0",
+ "ay-drat-check 0.22.0",
+ "ay-dt 0.22.0",
+ "ay-euf 0.22.0",
+ "ay-fp 0.22.0",
+ "ay-frontend 0.22.0",
+ "ay-jit 0.22.0",
+ "ay-lia 0.22.0",
+ "ay-lra 0.22.0",
+ "ay-map 0.22.0",
+ "ay-model-check 0.22.0",
+ "ay-multiset 0.22.0",
+ "ay-nia 0.22.0",
+ "ay-nra 0.22.0",
+ "ay-proof 0.22.0",
+ "ay-sat 0.22.0",
+ "ay-seq 0.22.0",
+ "ay-set 0.22.0",
+ "ay-strings 0.22.0",
+ "ay-sys 0.22.0",
  "libc",
  "num-bigint",
  "num-integer",
@@ -456,9 +545,20 @@ dependencies = [
 [[package]]
 name = "ay-drat-check"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-proof-common",
- "ay-sys",
+ "ay-proof-common 0.19.0",
+ "ay-sys 0.19.0",
+ "rustc-hash 2.1.2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ay-drat-check"
+version = "0.22.0"
+dependencies = [
+ "ay-proof-common 0.22.0",
+ "ay-sys 0.22.0",
  "rustc-hash 2.1.2",
  "thiserror 2.0.20",
 ]
@@ -466,27 +566,48 @@ dependencies = [
 [[package]]
 name = "ay-dt"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-euf",
+ "ay-core 0.19.0",
+ "ay-euf 0.19.0",
+ "tracing",
+]
+
+[[package]]
+name = "ay-dt"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-euf 0.22.0",
  "tracing",
 ]
 
 [[package]]
 name = "ay-encode"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
  "ay-bindings",
  "ay-chc",
- "ay-core",
+ "ay-core 0.22.0",
  "serde_json",
 ]
 
 [[package]]
 name = "ay-euf"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "hashbrown 0.15.5",
+ "num-bigint",
+ "tracing",
+]
+
+[[package]]
+name = "ay-euf"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "hashbrown 0.15.5",
  "num-bigint",
  "tracing",
@@ -495,8 +616,20 @@ dependencies = [
 [[package]]
 name = "ay-fp"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "tracing",
+]
+
+[[package]]
+name = "ay-fp"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "num-bigint",
  "num-rational",
  "num-traits",
@@ -506,8 +639,22 @@ dependencies = [
 [[package]]
 name = "ay-frontend"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "logos",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "stacker",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ay-frontend"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "logos",
  "num-bigint",
  "num-rational",
@@ -519,8 +666,19 @@ dependencies = [
 [[package]]
 name = "ay-intsat"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "ay-intsat"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -529,8 +687,18 @@ dependencies = [
 [[package]]
 name = "ay-jit"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ay-jit"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "serde",
  "thiserror 2.0.20",
 ]
@@ -538,10 +706,25 @@ dependencies = [
 [[package]]
 name = "ay-lia"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-intsat",
- "ay-lra",
+ "ay-core 0.19.0",
+ "ay-intsat 0.19.0",
+ "ay-lra 0.19.0",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "tracing",
+]
+
+[[package]]
+name = "ay-lia"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-intsat 0.22.0",
+ "ay-lra 0.22.0",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -552,9 +735,25 @@ dependencies = [
 [[package]]
 name = "ay-lra"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-jit",
+ "ay-core 0.19.0",
+ "ay-jit 0.19.0",
+ "hashbrown 0.15.5",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "smallvec",
+ "tracing",
+]
+
+[[package]]
+name = "ay-lra"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-jit 0.22.0",
  "hashbrown 0.15.5",
  "num-bigint",
  "num-integer",
@@ -567,19 +766,27 @@ dependencies = [
 [[package]]
 name = "ay-map"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+]
+
+[[package]]
+name = "ay-map"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-dpll",
- "ay-lra",
+ "ay-dpll 0.22.0",
+ "ay-lra 0.22.0",
  "ay-pb-core",
- "ay-sat",
- "ay-sys",
+ "ay-sat 0.22.0",
+ "ay-sys 0.22.0",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -594,8 +801,20 @@ dependencies = [
 [[package]]
 name = "ay-model-check"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
+name = "ay-model-check"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -605,19 +824,45 @@ dependencies = [
 [[package]]
 name = "ay-multiset"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+]
+
+[[package]]
+name = "ay-multiset"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
 ]
 
 [[package]]
 name = "ay-nia"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-lia",
- "ay-lra",
- "ay-nonlinear-common",
- "ay-sys",
+ "ay-core 0.19.0",
+ "ay-lia 0.19.0",
+ "ay-lra 0.19.0",
+ "ay-nonlinear-common 0.19.0",
+ "ay-sys 0.19.0",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "stacker",
+ "tracing",
+]
+
+[[package]]
+name = "ay-nia"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-lia 0.22.0",
+ "ay-lra 0.22.0",
+ "ay-nonlinear-common 0.22.0",
+ "ay-sys 0.22.0",
  "num-bigint",
  "num-integer",
  "num-rational",
@@ -629,6 +874,15 @@ dependencies = [
 [[package]]
 name = "ay-nonlinear-common"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
+dependencies = [
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
+name = "ay-nonlinear-common"
+version = "0.22.0"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -637,10 +891,27 @@ dependencies = [
 [[package]]
 name = "ay-nra"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-lra",
- "ay-nonlinear-common",
+ "ay-core 0.19.0",
+ "ay-lra 0.19.0",
+ "ay-nonlinear-common 0.19.0",
+ "hashbrown 0.15.5",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "stacker",
+ "tracing",
+]
+
+[[package]]
+name = "ay-nra"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-lra 0.22.0",
+ "ay-nonlinear-common 0.22.0",
  "hashbrown 0.15.5",
  "num-bigint",
  "num-integer",
@@ -652,11 +923,11 @@ dependencies = [
 
 [[package]]
 name = "ay-pb-core"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-core",
- "ay-sat",
- "ay-sys",
+ "ay-core 0.22.0",
+ "ay-sat 0.22.0",
+ "ay-sys 0.22.0",
  "libc",
  "num-bigint",
  "num-rational",
@@ -672,13 +943,32 @@ dependencies = [
 [[package]]
 name = "ay-prefetch"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
+
+[[package]]
+name = "ay-prefetch"
+version = "0.22.0"
 
 [[package]]
 name = "ay-proof"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-sat",
+ "ay-core 0.19.0",
+ "ay-sat 0.19.0",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ay-proof"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-sat 0.22.0",
  "num-bigint",
  "num-rational",
  "num-traits",
@@ -689,6 +979,14 @@ dependencies = [
 [[package]]
 name = "ay-proof-common"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ay-proof-common"
+version = "0.22.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -696,14 +994,38 @@ dependencies = [
 [[package]]
 name = "ay-sat"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
- "ay-drat-check",
- "ay-jit",
- "ay-prefetch",
- "ay-proof-common",
- "ay-sat-congruence-core",
- "ay-sys",
+ "ay-core 0.19.0",
+ "ay-drat-check 0.19.0",
+ "ay-prefetch 0.19.0",
+ "ay-proof-common 0.19.0",
+ "ay-sat-congruence-core 0.19.0",
+ "ay-sys 0.19.0",
+ "bytemuck",
+ "fixedbitset",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
+ "libc",
+ "parking_lot",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "ay-sat"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
+ "ay-drat-check 0.22.0",
+ "ay-jit 0.22.0",
+ "ay-prefetch 0.22.0",
+ "ay-proof-common 0.22.0",
+ "ay-sat-congruence-core 0.22.0",
+ "ay-sys 0.22.0",
  "bytemuck",
  "fixedbitset",
  "foldhash 0.1.5",
@@ -720,27 +1042,59 @@ dependencies = [
 [[package]]
 name = "ay-sat-congruence-core"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
+
+[[package]]
+name = "ay-sat-congruence-core"
+version = "0.22.0"
 
 [[package]]
 name = "ay-seq"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "num-bigint",
+]
+
+[[package]]
+name = "ay-seq"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "num-bigint",
 ]
 
 [[package]]
 name = "ay-set"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+]
+
+[[package]]
+name = "ay-set"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
 ]
 
 [[package]]
 name = "ay-strings"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
 dependencies = [
- "ay-core",
+ "ay-core 0.19.0",
+ "num-bigint",
+ "tracing",
+]
+
+[[package]]
+name = "ay-strings"
+version = "0.22.0"
+dependencies = [
+ "ay-core 0.22.0",
  "num-bigint",
  "tracing",
 ]
@@ -748,6 +1102,15 @@ dependencies = [
 [[package]]
 name = "ay-sys"
 version = "0.19.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=bd3a01f15cbc683b433467abcea21553e6b810ec#bd3a01f15cbc683b433467abcea21553e6b810ec"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "ay-sys"
+version = "0.22.0"
 dependencies = [
  "libc",
  "windows-sys",
@@ -755,10 +1118,10 @@ dependencies = [
 
 [[package]]
 name = "ay-translate"
-version = "0.19.0"
+version = "0.22.0"
 dependencies = [
- "ay-core",
- "ay-dpll",
+ "ay-core 0.22.0",
+ "ay-dpll 0.22.0",
 ]
 
 [[package]]
@@ -1299,13 +1662,13 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-auto"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "ay",
- "ay-core",
- "ay-dpll",
- "ay-proof",
+ "ay-core 0.22.0",
+ "ay-dpll 0.22.0",
+ "ay-proof 0.22.0",
  "ay-translate",
  "bincode 2.0.1",
  "blake3",
@@ -1327,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "clean-cake"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "clean-kernel",
@@ -1337,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "clean-compiler"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -1351,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "clean-elab"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clean-auto",
@@ -1377,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "clean-kernel"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1406,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "clean-olean"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1426,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "clean-parser"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "clean-kernel",
  "serde",
@@ -1436,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "clean-reflect"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "clean-cake",
  "clean-kernel",
@@ -7550,7 +7913,7 @@ dependencies = [
 
 [[package]]
 name = "trust-backprop"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7568,7 +7931,7 @@ dependencies = [
 
 [[package]]
 name = "trust-binary-parse"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-types",
@@ -7576,7 +7939,7 @@ dependencies = [
 
 [[package]]
 name = "trust-bmc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ay-bindings",
  "ay-chc",
@@ -7598,7 +7961,7 @@ dependencies = [
 
 [[package]]
 name = "trust-buildcache"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "fs2",
  "proptest",
@@ -7612,7 +7975,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cache"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "fs2",
  "proptest",
@@ -7634,7 +7997,7 @@ dependencies = [
 
 [[package]]
 name = "trust-certify"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-auto",
@@ -7654,10 +8017,10 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-bridge"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ay",
- "ay-proof",
+ "ay-proof 0.22.0",
  "clean-auto",
  "clean-kernel",
  "serde_json",
@@ -7771,7 +8134,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-carrier"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clean-kernel",
  "trust-symbols",
@@ -7780,7 +8143,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-ir"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clean-kernel",
  "trust-certify",
@@ -7792,7 +8155,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-origin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clean-auto",
  "clean-kernel",
@@ -7805,7 +8168,7 @@ dependencies = [
 
 [[package]]
 name = "trust-convergence"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7817,7 +8180,7 @@ dependencies = [
 
 [[package]]
 name = "trust-decompile"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7845,14 +8208,14 @@ dependencies = [
 
 [[package]]
 name = "trust-disasm"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "trust-ed25519"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ed25519-dalek",
  "trust-sha2",
@@ -7860,7 +8223,7 @@ dependencies = [
 
 [[package]]
 name = "trust-hmac"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hmac",
  "sha2 0.10.9",
@@ -7869,7 +8232,7 @@ dependencies = [
 
 [[package]]
 name = "trust-integration-tests"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -7894,7 +8257,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -7904,7 +8267,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-bridge"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.20",
@@ -7918,7 +8281,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -7928,7 +8291,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-conformance"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "trust-ir",
  "trust-ir-build",
@@ -7936,7 +8299,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-contract"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -7944,14 +8307,14 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
 name = "trust-lift"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ay",
  "serde_json",
@@ -7964,7 +8327,7 @@ dependencies = [
 
 [[package]]
 name = "trust-loop"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-convergence",
@@ -7973,7 +8336,7 @@ dependencies = [
 
 [[package]]
 name = "trust-machine-sem"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-disasm",
@@ -7982,7 +8345,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "home",
@@ -8032,7 +8395,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-core"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "ay-bindings",
  "num-bigint",
@@ -8043,13 +8406,13 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-driver"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "ay",
  "ay-bindings",
  "ay-chc",
  "ay-encode",
- "ay-frontend",
+ "ay-frontend 0.22.0",
  "serde",
  "serde_json",
  "trust-ir",
@@ -8109,7 +8472,7 @@ dependencies = [
 
 [[package]]
 name = "trust-os"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -8118,9 +8481,9 @@ dependencies = [
 
 [[package]]
 name = "trust-proof-cert"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
- "ay-proof-common",
+ "ay-proof-common 0.22.0",
  "bincode 1.3.3",
  "proptest",
  "serde",
@@ -8136,7 +8499,7 @@ dependencies = [
 
 [[package]]
 name = "trust-rand"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
@@ -8144,7 +8507,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ratio"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "trust-release"
@@ -8155,7 +8518,7 @@ dependencies = [
 
 [[package]]
 name = "trust-report"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8167,11 +8530,11 @@ dependencies = [
 
 [[package]]
 name = "trust-router"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ay",
  "ay-bindings",
- "ay-core",
+ "ay-core 0.22.0",
  "clean-auto",
  "clean-kernel",
  "libc",
@@ -8205,7 +8568,7 @@ dependencies = [
 
 [[package]]
 name = "trust-semantics"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clean-kernel",
  "trust-types",
@@ -8213,7 +8576,7 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -8236,7 +8599,7 @@ dependencies = [
 
 [[package]]
 name = "trust-strengthen"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8249,14 +8612,14 @@ dependencies = [
 
 [[package]]
 name = "trust-symbols"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "trust-types",
 ]
 
 [[package]]
 name = "trust-symex"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8269,7 +8632,7 @@ dependencies = [
 
 [[package]]
 name = "trust-temporal"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "tla-mc-core",
  "trust-types",
@@ -8299,7 +8662,7 @@ dependencies = [
 
 [[package]]
 name = "trust-toml"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -8307,7 +8670,7 @@ dependencies = [
 
 [[package]]
 name = "trust-transval"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proptest",
  "serde",
@@ -8320,7 +8683,7 @@ dependencies = [
 
 [[package]]
 name = "trust-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ay-bindings",
  "bincode 1.3.3",
@@ -8338,7 +8701,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-bridge"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8355,9 +8718,9 @@ dependencies = [
 name = "trust-vc-core"
 version = "0.4.0"
 dependencies = [
- "ay-core",
- "ay-dpll",
- "ay-sys",
+ "ay-core 0.19.0",
+ "ay-dpll 0.19.0",
+ "ay-sys 0.19.0",
  "inventory",
  "num-bigint",
  "proc-macro-crate",
@@ -8408,7 +8771,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vcgen"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proptest",
  "serde",
@@ -8424,7 +8787,7 @@ dependencies = [
 
 [[package]]
 name = "trust-verifier-api"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -8445,7 +8808,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wasm-bridge"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.20",
@@ -8473,7 +8836,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8491,8 +8854,8 @@ dependencies = [
 name = "trust-wp-ay"
 version = "0.3.0"
 dependencies = [
- "ay-core",
- "ay-dpll",
+ "ay-core 0.22.0",
+ "ay-dpll 0.22.0",
  "libc",
  "num-bigint",
  "num-rational",

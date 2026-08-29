@@ -43,13 +43,19 @@ and both have a documented substitute:
   self-hosting build: without it the compiler can die with SIGBUS inside LLVM's
   ScalarEvolution while compiling itself. Full instructions:
   [patches/README.md](patches/README.md).
-- **The nine first-party backend repositories** under `first-party/`. They are
-  submodules, and not all of them have been published yet. Until they are, a
-  `git clone --recurse-submodules` of this snapshot cannot complete, and no
-  command that loads either Cargo workspace (`cargo metadata`, `cargo test`,
-  `x.py build`) can run from the snapshot alone. This is a publication-ordering
-  boundary, not a missing-file bug; the compiler and verification sources
-  themselves are all here.
+- **The nine first-party backend repositories** under `first-party/`. All nine
+  are published. The public snapshot cannot carry submodule gitlinks, so it
+  ships `first-party/PINS.txt` — each sibling pinned at a ledger-attested
+  public release — and a materializer:
+
+  ```bash
+  scripts/fetch-first-party.sh   # clones the nine siblings at their pinned revisions
+  ```
+
+  Run it once after cloning; afterwards both Cargo workspaces load
+  (`cargo metadata`, `cargo check --manifest-path crates/Cargo.toml`,
+  `cargo test`, `x.py build`). In a development checkout (real submodules),
+  use `git submodule update --init` instead.
 
 ```bash
 # with an LLVM built and patched per patches/README.md

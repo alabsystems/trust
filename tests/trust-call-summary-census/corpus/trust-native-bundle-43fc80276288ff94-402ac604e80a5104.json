@@ -1,0 +1,1040 @@
+{
+  "schema_version": 6,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          216,
+          223,
+          27,
+          31,
+          57,
+          62,
+          152,
+          115,
+          110,
+          96,
+          244,
+          168,
+          7,
+          168,
+          25,
+          216,
+          253,
+          239,
+          4,
+          3,
+          94,
+          53,
+          123,
+          67,
+          21,
+          73,
+          199,
+          127,
+          133,
+          91,
+          145,
+          160
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.6.0",
+    "source_language": "Rust",
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        216,
+        223,
+        27,
+        31,
+        57,
+        62,
+        152,
+        115,
+        110,
+        96,
+        244,
+        168,
+        7,
+        168,
+        25,
+        216,
+        253,
+        239,
+        4,
+        3,
+        94,
+        53,
+        123,
+        67,
+        21,
+        73,
+        199,
+        127,
+        133,
+        91,
+        145,
+        160
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.6.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 6,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      130,
+      43,
+      224,
+      47,
+      24,
+      222,
+      109,
+      132,
+      220,
+      24,
+      181,
+      146,
+      130,
+      215,
+      43,
+      142,
+      137,
+      101,
+      16,
+      7,
+      51,
+      24,
+      252,
+      171,
+      40,
+      11,
+      253,
+      200,
+      100,
+      198,
+      19,
+      238
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "from",
+        "symbol": "from",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            43,
+            87,
+            169,
+            111,
+            110,
+            90,
+            216,
+            99,
+            71,
+            151,
+            11,
+            183,
+            21,
+            84,
+            5,
+            38,
+            58,
+            227,
+            28,
+            78,
+            243,
+            3,
+            68,
+            15,
+            57,
+            216,
+            23,
+            233,
+            183,
+            15,
+            5,
+            92
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "vc:h0_proc_umacro2__imp___x3cimpl_x20core__convert__From_x3cproc_umacro__Span_x3e_x20for_x20proc_umacro2__Span_x3e__from:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 532,
+          "col": 4
+        },
+        "assertion_id": 1801747715,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "proc_macro2::imp::<impl core::convert::From<proc_macro::Span> for proc_macro2::Span>::from",
+    "functions": [
+      {
+        "id": 0,
+        "name": "from",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                {
+                  "Struct": 3
+                }
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  3
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 5
+                    }
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 5
+                    },
+                    "aggregate": 4,
+                    "field": 0,
+                    "value": 3
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 5
+                    },
+                    "aggregate": 5,
+                    "field": 1,
+                    "value": 0
+                  }
+                },
+                "results": [
+                  6
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Call": {
+                    "callee": 1,
+                    "args": [
+                      6
+                    ]
+                  }
+                },
+                "results": [
+                  7
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 1,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      7
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null
+      },
+      {
+        "id": 1,
+        "name": "_new",
+        "ty": 1,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                {
+                  "Struct": 5
+                }
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 7
+                    }
+                  }
+                },
+                "results": [
+                  2
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 8
+                    }
+                  }
+                },
+                "results": [
+                  3
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 8
+                    },
+                    "aggregate": 3,
+                    "field": 0,
+                    "value": 0
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 8
+                    },
+                    "aggregate": 4,
+                    "field": 1,
+                    "value": 2
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      5
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null
+      }
+    ],
+    "structs": [
+      {
+        "id": 0,
+        "name": "core::num::niche_types::NonZeroU32Inner",
+        "fields": [
+          {
+            "name": "0",
+            "ty": "U32",
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 1,
+        "name": "core::num::nonzero::NonZero",
+        "fields": [
+          {
+            "name": "0",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 2,
+        "name": "proc_macro::bridge::client::Span",
+        "fields": [
+          {
+            "name": "handle",
+            "ty": {
+              "Struct": 1
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 3,
+        "name": "proc_macro::Span",
+        "fields": [
+          {
+            "name": "0",
+            "ty": {
+              "Struct": 2
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 4,
+        "name": "proc_macro2::fallback::Span",
+        "fields": [],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 5,
+        "name": "proc_macro2::imp::Span",
+        "fields": [
+          {
+            "name": "__tag",
+            "ty": "I64",
+            "offset": null
+          },
+          {
+            "name": "__v0_0",
+            "ty": {
+              "Struct": 3
+            },
+            "offset": null
+          },
+          {
+            "name": "__v1_0",
+            "ty": {
+              "Struct": 4
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 6,
+        "name": "core::marker::PhantomData",
+        "fields": [],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 7,
+        "name": "proc_macro2::marker::ProcMacroAutoTraits",
+        "fields": [
+          {
+            "name": "0",
+            "ty": {
+              "Struct": 6
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 8,
+        "name": "proc_macro2::Span",
+        "fields": [
+          {
+            "name": "inner",
+            "ty": {
+              "Struct": 5
+            },
+            "offset": null
+          },
+          {
+            "name": "_marker",
+            "ty": {
+              "Struct": 7
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      }
+    ],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          {
+            "Struct": 3
+          }
+        ],
+        "returns": [
+          {
+            "Struct": 8
+          }
+        ],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          {
+            "Struct": 5
+          }
+        ],
+        "returns": [
+          {
+            "Struct": 8
+          }
+        ],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:h0_proc_umacro2__imp___x3cimpl_x20core__convert__From_x3cproc_umacro__Span_x3e_x20for_x20proc_umacro2__Span_x3e__from:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:h0_proc_umacro2__imp___x3cimpl_x20core__convert__From_x3cproc_umacro__Span_x3e_x20for_x20proc_umacro2__Span_x3e__from:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:h0_proc_umacro2__imp___x3cimpl_x20core__convert__From_x3cproc_umacro__Span_x3e_x20for_x20proc_umacro2__Span_x3e__from:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 532,
+            "start_col": 4,
+            "end_line": 534,
+            "end_col": 5
+          },
+          "public": {
+            "obligation_id": "vc:h0_proc_umacro2__imp___x3cimpl_x20core__convert__From_x3cproc_umacro__Span_x3e_x20for_x20proc_umacro2__Span_x3e__from:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                204,
+                105,
+                215,
+                166,
+                198,
+                126,
+                241,
+                189,
+                15,
+                115,
+                185,
+                146,
+                124,
+                98,
+                4,
+                30,
+                37,
+                77,
+                231,
+                155,
+                71,
+                217,
+                139,
+                29,
+                104,
+                126,
+                18,
+                228,
+                188,
+                212,
+                15,
+                115
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "NativeC"
+    },
+    "files": [
+      "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/wrapper.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            216,
+            223,
+            27,
+            31,
+            57,
+            62,
+            152,
+            115,
+            110,
+            96,
+            244,
+            168,
+            7,
+            168,
+            25,
+            216,
+            253,
+            239,
+            4,
+            3,
+            94,
+            53,
+            123,
+            67,
+            21,
+            73,
+            199,
+            127,
+            133,
+            91,
+            145,
+            160
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            130,
+            43,
+            224,
+            47,
+            24,
+            222,
+            109,
+            132,
+            220,
+            24,
+            181,
+            146,
+            130,
+            215,
+            43,
+            142,
+            137,
+            101,
+            16,
+            7,
+            51,
+            24,
+            252,
+            171,
+            40,
+            11,
+            253,
+            200,
+            100,
+            198,
+            19,
+            238
+          ]
+        },
+        "obligations": [
+          0
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              133,
+              133,
+              19,
+              194,
+              144,
+              91,
+              10,
+              117,
+              3,
+              29,
+              138,
+              122,
+              219,
+              1,
+              18,
+              34,
+              111,
+              104,
+              95,
+              45,
+              116,
+              46,
+              182,
+              116,
+              220,
+              235,
+              133,
+              224,
+              79,
+              24,
+              190,
+              96
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                245,
+                91,
+                168,
+                170,
+                89,
+                40,
+                167,
+                42,
+                2,
+                44,
+                14,
+                209,
+                82,
+                149,
+                252,
+                11,
+                224,
+                216,
+                95,
+                202,
+                250,
+                50,
+                169,
+                52,
+                191,
+                19,
+                165,
+                42,
+                82,
+                187,
+                170,
+                208
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 1801747715,
+                "span": {
+                  "file": 0,
+                  "line": 532,
+                  "col": 4
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

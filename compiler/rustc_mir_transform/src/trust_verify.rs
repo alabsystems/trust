@@ -27550,6 +27550,30 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
     // (the relower then churned on phantom evictions and fail-soft kept the
     // poisoned module — measured: memory_safe/demote_explicit_lowering_gap).
     let mut current: Vec<trust_types::VerifiableFunction> = lowered_members;
+    // Trust (#224 census): the PRE-POISON population. A member aggregate that
+    // exists here and not at the synthesizer was destroyed by EVICTION, not by
+    // the synthesizer's first-wins rule — two different defects with two
+    // different fixes, which the post-loop census alone cannot tell apart.
+    // `FuncId == index` into `current` (see the comment above), so the owner
+    // resolves to a def_path here.
+    if member_panic_census_enabled() {
+        for obligation in &module.proof_obligations {
+            if obligation.kind != trust_ir::ObligationKind::PanicFreedom {
+                continue;
+            }
+            let owner_path = obligation
+                .function
+                .and_then(|id| current.get(id.index() as usize))
+                .map_or("<unresolved>", |vf| vf.def_path.as_str());
+            eprintln!(
+                "[MPC_PRE] root={} owner_path={} member={} src={}",
+                func.def_path,
+                owner_path,
+                if owner_path == func.def_path { "no" } else { "YES" },
+                member_panic_census_source_id(obligation)
+            );
+        }
+    }
     loop {
         let root_name = trust_ir_functions[0].def_path.as_str();
         let mut poisoned: FxHashSet<String> = FxHashSet::default();
@@ -27569,6 +27593,20 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
         }
         if poisoned.is_empty() {
             break;
+        }
+        // Trust (#224 census): the poison loop is the only place a member that
+        // WOULD carry a panic aggregate can leave the bundle before the
+        // synthesizer sees it, so an empty member census downstream is evidence
+        // of an empty SOURCE only once this is known to be empty too.
+        if member_panic_census_enabled() {
+            let mut evicting: Vec<&str> = poisoned.iter().map(String::as_str).collect();
+            evicting.sort_unstable();
+            eprintln!(
+                "[MPC_POISON] root={} current={} evicting={:?}",
+                func.def_path,
+                current.len(),
+                evicting
+            );
         }
         let retained: Vec<trust_types::VerifiableFunction> = current
             .iter()
@@ -27730,7 +27768,6 @@ fn build_native_trust_ir_bundle_from_verifiable_functions(
         &mut module,
         bundle,
         &bindings,
-        function_id,
         &public_semantic_digests,
     )?;
 
@@ -27806,11 +27843,20 @@ fn canonical_native_public_semantic_digest_index(
     bundle.canonical_obligation_semantic_digest_index_sha256(&requested)
 }
 
+/// Attach each bound row's public source identity.
+///
+/// Trust (bundled-member identity): this function takes NO `FuncId`. Owner
+/// attribution belongs to `append_verifier_api_obligations_to_native_trust_ir`,
+/// which resolves it per row from the row's own typed `FunctionContext`; this
+/// pass runs afterwards and may only READ that decision. Threading a root
+/// `FuncId` in here is what let the previous version overwrite every owner with
+/// the root — so the parameter is deliberately absent rather than asserted
+/// against, which makes the defect unrepresentable instead of merely detected,
+/// and leaves nothing to delete when member scopes make non-root owners legal.
 fn populate_native_trust_ir_proof_sources(
     module: &mut trust_ir::Module,
     bundle: &trust_verifier_api::TrustContractBundle,
     bindings: &[PendingNativeTrustIrBinding],
-    function_id: trust_ir::FuncId,
     semantic_digests: &trust_verifier_api::CanonicalObligationSemanticDigestIndex,
 ) -> Result<(), String> {
     let mut proof_positions = FxHashMap::default();
@@ -27868,7 +27914,27 @@ fn populate_native_trust_ir_proof_sources(
                 )
             })?;
         let proof_obligation = &mut module.proof_obligations[position];
-        proof_obligation.function = Some(function_id);
+        // Trust (bundled-member identity): READ the owner the append loop
+        // resolved from this row's own typed context; never re-stamp it.
+        //
+        // This used to assign the scalar ROOT `function_id` unconditionally,
+        // which ran AFTER the append and therefore OVERWROTE
+        // `.with_function(owner.function_id)` for every row — making the
+        // owner-resolution seam dead code and silently re-asserting exactly the
+        // assumption that seam removed. The overwrite was invisible while the
+        // scope table held only the root (both values are the root), so the
+        // conservation measurement that shipped it could not have distinguished
+        // the seam from a no-op.
+        //
+        // Attribution is now decided in ONE place. This function is not given a
+        // `FuncId` at all, so it has nothing to overwrite with, and an
+        // unattributed row is refused rather than laundered into a root row.
+        if proof_obligation.function.is_none() {
+            return Err(format!(
+                "native TrustIr proof obligation {} reached source population with no owning body",
+                binding.proof_obligation_id.index()
+            ));
+        }
         proof_obligation.source = Some(source);
     }
     Ok(())
@@ -29603,6 +29669,57 @@ fn default_trust_mc_function_obligation_digest(
     Ok(domain_length_bound_sha256_hex("trustc.default-trust-mc-function-obligation.v2", &bytes))
 }
 
+/// Trust (#224 measurement facility, `TRUST_MEMBER_PANIC_CENSUS=1`).
+///
+/// Where the bundled-member panic-freedom aggregates ACTUALLY are. Purely
+/// observational: every caller is an `eprintln!` behind this flag, and nothing
+/// here reads or writes a verdict.
+///
+/// It exists because two seams of this pipeline disagree about that population
+/// by 143 rows, and a slice can be scoped against either number without
+/// anything in the tree saying which one it read. The bridge emits one
+/// `mir-assertions:{def_path}:panic-freedom` aggregate PER LOWERED BODY
+/// (`trust-ir-bridge/src/lower.rs:22004` for a diverging panic `Call`,
+/// `:22140` for a body owning an assumption-marked obligation), so a
+/// multi-body module is full of member-owned aggregates when it is first
+/// lowered. The MODEL-EXACT bundle-poison drop then evicts every non-root
+/// member owning a `[trust-absent-callee-assumption]` row — which is very
+/// nearly the same predicate as the `:22140` emit condition — so by the time
+/// `synthesize_native_panic_freedom_to_verifier_api_obligations` runs, the
+/// member aggregates are gone.
+///
+/// MEASURED 2026-08-29 at `db0aae95b2`, stage1 driver, `targo trust check`
+/// (`crates/` dev profile), over trust-sha2 + trust-ratio + trust-hex:
+///
+/// * PRE-poison  — 143 member-owned aggregates over 41 roots, 17 distinct
+///   bodies (`core::panicking::panic_fmt` x20, `core::result::unwrap_failed`
+///   x18, `core::fmt::Formatter::<'_>::write_str` x13, ...), all in trust-sha2.
+/// * AT the synthesizer — **0**, across all 117 bundles that reach it, and
+///   every one of the 14 surviving `PanicFreedom` rows is owned by `FuncId 0`.
+/// * 33 of those 41 roots never reach the synthesizer at all; the other 8
+///   arrive with every member aggregate already evicted.
+///
+/// So a change to the synthesizer's first-wins `get_or_insert_with` mints
+/// exactly nothing. Re-run this before scoping any member-obligation work; the
+/// seam that owns the population is the poison loop, not the synthesizer.
+fn member_panic_census_enabled() -> bool {
+    env_flag_enabled("TRUST_MEMBER_PANIC_CENSUS")
+}
+
+/// The bridge-minted `source_id` of a proof obligation, for the census only.
+/// Never fail-closed and never authoritative: an unreadable payload prints a
+/// placeholder rather than changing any decision.
+fn member_panic_census_source_id(obligation: &trust_ir::ProofObligation) -> String {
+    obligation
+        .formula
+        .as_ref()
+        .and_then(|formula| serde_json::from_str::<serde_json::Value>(&formula.payload).ok())
+        .and_then(|payload| {
+            payload.get("source_id").and_then(|value| value.as_str()).map(str::to_owned)
+        })
+        .unwrap_or_else(|| "<no-source-id>".to_owned())
+}
+
 fn native_trust_ir_function_id(
     module: &trust_ir::Module,
     func: &trust_types::VerifiableFunction,
@@ -29723,6 +29840,47 @@ fn synthesize_native_panic_freedom_to_verifier_api_obligations(
                 ));
             }
             function_level_source_id.get_or_insert_with(|| source_id.to_string());
+            // Trust (#224 census): the MINTING SOURCE this function would have
+            // to read to mint one row per bundled body. `get_or_insert_with`
+            // keeps the FIRST aggregate and silently discards every later one,
+            // so the member-scoped opportunity is exactly the set of
+            // `function_path`s here that are not the bundle root. Measured 0.
+            if member_panic_census_enabled() {
+                eprintln!(
+                    "[MPC_AGG] root={} aggregate={} member={}",
+                    func.def_path,
+                    function_path,
+                    if function_path == func.def_path { "no" } else { "YES" }
+                );
+            }
+        }
+    }
+    // Trust (#224 census): the DENOMINATOR the scan above cannot supply on its
+    // own. A bundle with no member aggregate and a bundle with no members at
+    // all print identically there, and only the second is evidence that the
+    // source is empty. `panic_source_function_paths` is the PRE-filter member
+    // list, so this also exposes members the poison loop has since evicted.
+    if member_panic_census_enabled() {
+        let mut paths: Vec<&str> =
+            panic_source_function_paths.iter().map(String::as_str).collect();
+        paths.sort_unstable();
+        eprintln!(
+            "[MPC_BUNDLE] root={} members={} paths={:?}",
+            func.def_path,
+            panic_source_function_paths.len(),
+            paths
+        );
+        for obligation in &module.proof_obligations {
+            if obligation.kind != trust_ir::ObligationKind::PanicFreedom {
+                continue;
+            }
+            eprintln!(
+                "[MPC_PF] root={} owner={:?} src={} desc={}",
+                func.def_path,
+                obligation.function.map(trust_ir::FuncId::index),
+                member_panic_census_source_id(obligation),
+                obligation.description.chars().take(90).collect::<String>()
+            );
         }
     }
 

@@ -196,3 +196,4 @@ required_action = "Precision follow-ups scheduled BEHIND the soundness fix, neve
 # If upstream already reads the way rustc is suggesting, the code is fine and
 # the PIN is stale — and a waiver would suppress the gate for a week over
 # something already fixed.
+

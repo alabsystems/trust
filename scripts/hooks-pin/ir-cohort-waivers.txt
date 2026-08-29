@@ -80,3 +80,4 @@
 # An empty waiver list is the intended steady state. If rows accumulate here
 # again and merely expire rather than being burned down, the honest reading is
 # that the gate has become paperwork and should be deleted rather than tolerated.
+trust-ir | 4c4a31cb9236 | 2026-09-05 | wave-SD lane | The cohort head moved to 07371ecf34b6 (gitlink 9004c473) by the 08-29 origin advance while all 15 sibling declarations still consume 4c4a31cb9236@4803c40d -- an in-flight constellation walk by another session, not this lane's to bump. v38+ is additive so consumers keep decoding; expires with the walk.

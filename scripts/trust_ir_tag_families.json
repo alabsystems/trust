@@ -12,6 +12,19 @@
   "prints a per-head breakdown inside every family so any alternative boundary can be",
   "recomputed from the printed table instead of argued."
  ],
+ "gate_scope": [
+  "WHAT `--check` GREEN MEANS, measured 2026-08-29 by mutation. The gate enforces TOTALITY and",
+  "HYGIENE, never CORRECTNESS: (1) every tag the scan can reach has SOME family, (2) the named",
+  "family exists in `families`, (3) no `head_rules`/`tag_overrides`/`not_a_tag` entry is stale,",
+  "(4) UNCLASSIFIED is non-empty, (5) with --artifact, the scan explains every OBSERVED tag.",
+  "It CANNOT tell a right family from a wrong one. Measured: with `PendingStatic` filed as CONST",
+  "the gate exits 0, and it also exits 0 with it filed as MEMORY, PATTERN, CLOSURE, TY,",
+  "PRODUCER-INTERNAL, UNCLASSIFIED or ENUM; it exits 1 only when the head is ABSENT or names a",
+  "family that does not exist. That is the design — this file IS the decision and the gate only",
+  "proves a decision was made — but it means a green here is exactly as good as the derivation",
+  "recorded in `boundary_notes`. Adding a head to silence the lane without deriving the family",
+  "passes the gate and files the tag wrong, which is the failure this map exists to prevent."
+ ],
  "scan_roots": [
   {
    "path": "crates/trust-thir-lower/src/lib.rs",
@@ -84,7 +97,7 @@
   "CONST": {
    "label": "constants, statics, CTFE, the deferred-const finalizer",
    "b_items": ["B7"],
-   "definition": "A refusal about constant DATA: named consts, const blocks, const params, literals, statics and thread-locals, and the pending-const/pending-str finalizer that patches deferred placeholders."
+   "definition": "A refusal about constant DATA: named consts, const blocks, const params, literals, statics and thread-locals, and the pending-const/pending-str/pending-static finalizer that patches deferred placeholders."
   },
   "AGGREGATE": {
    "label": "aggregate construction — struct / tuple / array / slice / union",
@@ -164,6 +177,7 @@
   "ZstLiteral": "CONST",
   "PendingConst": "CONST",
   "PendingStr": "CONST",
+  "PendingStatic": "CONST",
 
   "Adt": "AGGREGATE",
   "Tuple": "AGGREGATE",
@@ -229,7 +243,8 @@
   "StaticRef/ThreadLocalRef -> CONST, not MEMORY. wave-SR2 established that static reads are PLACES, which argues for MEMORY; the tags themselves are about admitting static DATA (initializer not scalar, mutable, interior-mutable, foreign), which is CONST work. Moving them costs the printed StaticRef/ThreadLocalRef rows in CONST.",
   "VarRef -> MEMORY. `VarRef(unbound)` and `VarRef(promoted slot missing)` are both slot-model failures; there is no separate 'variable' lane.",
   "Ty spans B1/B2/B8 and is NOT one rankable lane. Rank a B-item off the detail split, never off the TY family total.",
-  "The borrow-pointer-VALUE cluster (Deref(non-borrow ptr), Deref(non-scalar pointee), Assign(*r=...), Reborrow) is INSIDE MEMORY under this map — see lane_probes.L10 and the report's DOUBLE-COUNTING section."
+  "The borrow-pointer-VALUE cluster (Deref(non-borrow ptr), Deref(non-scalar pointee), Assign(*r=...), Reborrow) is INSIDE MEMORY under this map — see lane_probes.L10 and the report's DOUBLE-COUNTING section.",
+  "PendingStatic -> CONST, not PRODUCER-INTERNAL and not MEMORY (added 2026-08-29 for wave-SD, 6d4e53fbd6). The head is the deferred-LOCAL-STATIC leg of the SAME finalizer that already owns PendingConst and PendingStr: all three are emitted by `bump_unsupported` inside `resolve_pending_consts` (crate_module.rs:3147-3282), all three are recorded on the SAME `PendingConst` struct (the leg is selected by its `static_global` field, crate_module.rs:3162), and all three are consumed identically — a row on the record's `unsupported` vector, which makes `splice_ok` refuse the body and coverage.json record why. PRODUCER-INTERNAL is the nearest alternative and is rejected for CONSISTENCY, not because the reading is silly: 4 of the 5 details (global not found / shape disagreement / global patch conflict / global not patched) ARE internal-invariant tripwires in the sense PRODUCER-INTERNAL describes, and only `eval failed at finalize` is a coverage decline. But `PendingStr(global patch conflict)`, `PendingStr(global not patched)`, `PendingConst(placeholder not found)` and `PendingConst(sentinel leak)` are the identical shapes and are already CONST, and family assignment is keyed on the HEAD, so splitting PendingStatic by detail would need `tag_overrides` and would leave its two twins unsplit — the map would then partition one finalizer three ways, which is the exact unfalsifiability this file exists to remove. If the finalizer's internal tripwires should be PRODUCER-INTERNAL, move all THREE heads together and say so here. MEMORY is closed by the StaticRef/ThreadLocalRef note above: a static's DATA is CONST work under this map even though a static read is a place. Numeric cost of the choice TODAY: zero — no Pending* tag is live in any corpus artifact (checked sd-static-deferral-0829 and postbuild-v38-simd-2026-08-28, 7256 bodies each, 0 events), so this moves no family total and no rank; it is a forward-looking boundary, not a recount."
  ],
  "pending_dependencies": {
   "detail-channel (reason_details / at=)": {

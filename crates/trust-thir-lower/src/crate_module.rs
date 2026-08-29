@@ -3149,6 +3149,53 @@ fn resolve_pending_consts(tcx: TyCtxt<'_>, records: &mut [BodyRecord]) {
         if r.pending_consts.is_empty() {
             continue;
         }
+        // Trust (wave-SD): the LOCAL-STATIC leg — evaluate each deferred static's initializer
+        // (safe here: `run_required_analyses` has forced `mir_built` for every body owner, so
+        // the CTFE reachability set that cycles inside `mir_built` is fully built) and patch
+        // the scalar global's `Constant::PhantomData` placeholder. Runs before the scalar/
+        // composite loop for the same reason the str leg does: it patches a GLOBAL and must
+        // never reach `eval_pending_const`'s shape tripwire. Fail-closed rows for: eval/decode
+        // failure, a producer/finalizer shape disagreement (the re-derive cross-check), a
+        // missing slot, and a patch conflict.
+        for i in 0..r.pending_consts.len() {
+            let pc = r.pending_consts[i].clone();
+            let Some(gid) = pc.static_global else { continue };
+            let rty = tcx.type_of(pc.def_id).skip_binder();
+            let Some(g) = r.globals.get_mut(gid.as_usize()) else {
+                bump_unsupported(&mut r.unsupported, "PendingStatic(global not found)");
+                continue;
+            };
+            let Some(constant) = crate::eval_static_scalar_value(tcx, rty, &g.ty, pc.def_id)
+            else {
+                bump_unsupported(&mut r.unsupported, "PendingStatic(eval failed at finalize)");
+                continue;
+            };
+            // Re-derive cross-check: the finalizer's view of the shape must match the
+            // producer's recorded one (mirrors `eval_pending_const`'s width tripwire).
+            let shape_ok = match (&constant, pc.is_bool) {
+                (Constant::Bool(_), true) => true,
+                (Constant::Int(_), false) => pc.bits > 0,
+                // Trust (wave-SD2): a composite static decodes to an Aggregate; the record
+                // carries composite=true with the scalar shape fields zeroed.
+                (Constant::Aggregate(_), false) => pc.composite && pc.bits == 0 && !pc.signed,
+                _ => false,
+            };
+            if !shape_ok {
+                bump_unsupported(&mut r.unsupported, "PendingStatic(shape disagreement)");
+                continue;
+            }
+            match &g.initializer {
+                Some(Constant::PhantomData) => {
+                    g.initializer = Some(constant);
+                }
+                Some(existing) if *existing == constant => {
+                    // Benign repeated record for the same deduped global.
+                }
+                _ => {
+                    bump_unsupported(&mut r.unsupported, "PendingStatic(global patch conflict)");
+                }
+            }
+        }
         // Trust (wave-SC): the `&str`-const leg runs FIRST and per record, because it patches a
         // GLOBAL as well as the placeholder node and must never reach `eval_pending_const`'s
         // scalar/composite shape tripwire (a `&str` type matches none of its arms). Split out so
@@ -3185,8 +3232,8 @@ fn resolve_pending_consts(tcx: TyCtxt<'_>, records: &mut [BodyRecord]) {
             }
         }
         for pc in &r.pending_consts {
-            // Trust (wave-SC): the str leg above already handled (and reported on) this record.
-            if pc.str_global.is_some() {
+            // Trust (wave-SC/SD): the str and static legs above already handled these records.
+            if pc.str_global.is_some() || pc.static_global.is_some() {
                 continue;
             }
             // Trust (B7): a composite pending const decodes against the PLACEHOLDER node's
@@ -3229,6 +3276,36 @@ fn resolve_pending_consts(tcx: TyCtxt<'_>, records: &mut [BodyRecord]) {
         // have produced a patched one, so a record whose patch was skipped for any reason (missing
         // slot, conflict, an early `continue`) is caught by its own claim.
         check_str_global_ledger(&r.globals, &r.pending_consts, &mut r.unsupported);
+        // Trust (wave-SD): the static twin of the str ledger, and REQUIRED for the same
+        // reason: an unpatched `Constant::PhantomData` initializer is not an instruction, so
+        // the sentinel scan cannot see it, and a placeholder global must never splice as a
+        // real value. Every record CLAIMING a static global must have produced a patched one.
+        check_static_global_ledger(&r.globals, &r.pending_consts, &mut r.unsupported);
+    }
+}
+
+/// Trust (wave-SD): has `g` been rewritten from the `Constant::PhantomData` placeholder into a
+/// REAL scalar initializer? Positive predicate, mirroring `str_global_patched`.
+fn static_global_patched(g: &Global) -> bool {
+    matches!(
+        &g.initializer,
+        Some(Constant::Bool(_)) | Some(Constant::Int(_)) | Some(Constant::Aggregate(_))
+    )
+}
+
+/// Trust (wave-SD): the positive-LEDGER tripwire for deferred-static globals — every
+/// `PendingConst` that claims one must have produced a patched, real-scalar initializer.
+fn check_static_global_ledger(
+    globals: &[Global],
+    pending: &[PendingConst],
+    unsupported: &mut Vec<(String, u64)>,
+) {
+    for pc in pending {
+        let Some(gid) = pc.static_global else { continue };
+        let ok = globals.get(gid.as_usize()).is_some_and(static_global_patched);
+        if !ok {
+            bump_unsupported(unsupported, "PendingStatic(global not patched)");
+        }
     }
 }
 
@@ -7859,6 +7936,7 @@ mod str_const_finalize_tests {
             bits: 64,
             composite: false,
             str_global: global,
+            static_global: None,
         }
     }
 

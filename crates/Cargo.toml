@@ -227,6 +227,23 @@ members = [
     # percentage arithmetic is open-coded ~30 times with `.max(1)` denominators
     # that silently substitute a population nobody chose.
     "trust-ratio",
+    # Sibling of `trust-ratio` on the same discipline: total, `no_std`,
+    # zero-dependency ASCII hex codec primitives, written to PASS the
+    # authenticated strict lane rather than to be retrofitted onto it. It exists
+    # because the nibble arithmetic under every `format!("{b:02x}")` in this tree
+    # is open-coded with two unproved side conditions — that `byte >> 4` is a
+    # valid index into a 16-entry table, and that `b - b'a' + 10` cannot
+    # underflow. Both are machine-checked here.
+    "trust-hex",
+    # Third component on the `trust-ratio`/`trust-hex` discipline: total,
+    # `no_std`, zero-dependency UTF-8 and UTF-16 scalar arithmetic, written to
+    # PASS the authenticated strict lane. It exists because the surrogate and
+    # continuation-byte arithmetic on this tree's untrusted-input paths carries
+    # side conditions nobody discharges — `trust-json`'s `\uXXXX` reader
+    # subtracts `0xD800` from a code unit that only a range pattern constrains,
+    # and the two JS `String.fromCodePoint`/`decodeURIComponent` reassemblers
+    # each hide the same arithmetic behind `u16::try_from(..).expect(..)`.
+    "trust-utf",
     "trust-clean",
     # I4 (docs/design/2026-08-04-two-language-compiler-architecture.md): Clean
     # type -> Rust carrier. The ONLY sound producer of `CarrierEvidence::Total`,
@@ -469,6 +486,8 @@ trust-json = { path = "trust-json" }
 # `rand`, because it is not a drop-in — see the note at the `rand` entry below.
 trust-rand = { path = "trust-rand" }
 trust-ratio = { path = "trust-ratio" }
+trust-hex = { path = "trust-hex" }
+trust-utf = { path = "trust-utf" }
 trust-convergence = { path = "trust-convergence" }
 trust-temporal = { path = "trust-temporal" }
 trust-proof-cert = { path = "trust-proof-cert" }

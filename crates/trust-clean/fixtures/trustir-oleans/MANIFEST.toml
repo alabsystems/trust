@@ -1,14 +1,14 @@
 schema = "trust.trust-clean.trustir-oleans.manifest.v2"
 
 [provenance]
-trustir_commit = "e936914015c33f78c612c31eeb0d6ab2a85ff47c"
+trustir_commit = "9004c473bec637cca4aa462cc19a6ec6e7d4c5ec"
 # The first-party/clean revision these bytes are staged against — the olean
 # reader that decodes them and the kernel that admits the decoded declarations
 # both live there, so a clean pin bump changes what "the bridge replays" means
 # just as surely as a trust-ir bump changes what it replays. Kept equal to the
 # indexed gitlink by scripts/check_bridge_pin.sh; the replay itself is
 # validated by crates/trust-clean/tests/lean_clean_bridge.rs.
-clean_commit = "2cd0ef016c08f97f3b105271655478c5a7293372"
+clean_commit = "ea2f71bb9e588546bb8292c2fe73cc01a3175564"
 lean_toolchain = "leanprover/lean4:v4.8.0"
 root_module = "TrustIr.Semantics.Arith"
 source_subdir = "lean/trust_ir-semantics"
@@ -56,7 +56,7 @@ build_command = "lake build (unmodified sources at trustir_commit; toolchain pin
 
 [platforms."aarch64-apple-darwin"]
 lean_version = "Lean (version 4.8.0, aarch64-apple-darwin, commit df668f00e6c0, Release)"
-built_on = "2026-08-28"
+built_on = "2026-08-29"
 
 [platforms."aarch64-unknown-linux-gnu"]
 lean_version = "Lean (version 4.8.0, aarch64-unknown-linux-gnu, commit df668f00e6c0, Release)"

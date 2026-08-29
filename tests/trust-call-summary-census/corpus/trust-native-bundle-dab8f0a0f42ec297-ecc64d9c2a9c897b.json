@@ -1,0 +1,850 @@
+{
+  "schema_version": 6,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          218,
+          229,
+          51,
+          192,
+          67,
+          86,
+          103,
+          177,
+          54,
+          180,
+          198,
+          109,
+          164,
+          205,
+          155,
+          11,
+          242,
+          128,
+          184,
+          191,
+          198,
+          28,
+          86,
+          10,
+          238,
+          197,
+          185,
+          120,
+          97,
+          218,
+          8,
+          14
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.6.0",
+    "source_language": "Rust",
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        218,
+        229,
+        51,
+        192,
+        67,
+        86,
+        103,
+        177,
+        54,
+        180,
+        198,
+        109,
+        164,
+        205,
+        155,
+        11,
+        242,
+        128,
+        184,
+        191,
+        198,
+        28,
+        86,
+        10,
+        238,
+        197,
+        185,
+        120,
+        97,
+        218,
+        8,
+        14
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.6.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 6,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      52,
+      243,
+      1,
+      234,
+      111,
+      4,
+      157,
+      252,
+      68,
+      70,
+      28,
+      93,
+      160,
+      191,
+      63,
+      148,
+      57,
+      158,
+      18,
+      246,
+      20,
+      37,
+      109,
+      234,
+      105,
+      252,
+      114,
+      133,
+      154,
+      170,
+      186,
+      255
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "into_deserializer",
+        "symbol": "into_deserializer",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            169,
+            204,
+            18,
+            64,
+            108,
+            192,
+            85,
+            72,
+            96,
+            118,
+            182,
+            203,
+            20,
+            226,
+            185,
+            82,
+            5,
+            115,
+            137,
+            66,
+            1,
+            232,
+            94,
+            14,
+            104,
+            173,
+            73,
+            71,
+            159,
+            125,
+            187,
+            106
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "vc:h0_serde_ucore__de__value___x3cimpl_x20serde_ucore__de__IntoDeserializer_x3c_x27de_x2c_x20E_x3e_x20for_x20f32_x3e__into_udeserializer:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 271,
+          "col": 12
+        },
+        "assertion_id": 3091528570,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "serde_core::de::value::<impl serde_core::de::IntoDeserializer<'de, E> for f32>::into_deserializer",
+    "functions": [
+      {
+        "id": 0,
+        "name": "into_deserializer",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "F32"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Call": {
+                    "callee": 1,
+                    "args": [
+                      0
+                    ]
+                  }
+                },
+                "results": [
+                  2
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 1,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      2
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null
+      },
+      {
+        "id": 1,
+        "name": "new",
+        "ty": 1,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "F32"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": {
+                      "Struct": 0
+                    },
+                    "value": {
+                      "Aggregate": []
+                    }
+                  }
+                },
+                "results": [
+                  2
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 1
+                    }
+                  }
+                },
+                "results": [
+                  3
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 1
+                    },
+                    "aggregate": 3,
+                    "field": 0,
+                    "value": 0
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 1
+                    },
+                    "aggregate": 4,
+                    "field": 1,
+                    "value": 2
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      5
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null
+      }
+    ],
+    "structs": [
+      {
+        "id": 0,
+        "name": "core::marker::PhantomData",
+        "fields": [],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 1,
+        "name": "serde_core::de::value::F32Deserializer",
+        "fields": [
+          {
+            "name": "value",
+            "ty": "F32",
+            "offset": null
+          },
+          {
+            "name": "marker",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      }
+    ],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          "F32"
+        ],
+        "returns": [
+          {
+            "Struct": 1
+          }
+        ],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          "F32"
+        ],
+        "returns": [
+          {
+            "Struct": 1
+          }
+        ],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:h0_serde_ucore__de__value___x3cimpl_x20serde_ucore__de__IntoDeserializer_x3c_x27de_x2c_x20E_x3e_x20for_x20f32_x3e__into_udeserializer:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:h0_serde_ucore__de__value___x3cimpl_x20serde_ucore__de__IntoDeserializer_x3c_x27de_x2c_x20E_x3e_x20for_x20f32_x3e__into_udeserializer:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:h0_serde_ucore__de__value___x3cimpl_x20serde_ucore__de__IntoDeserializer_x3c_x27de_x2c_x20E_x3e_x20for_x20f32_x3e__into_udeserializer:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 271,
+            "start_col": 12,
+            "end_line": 273,
+            "end_col": 13
+          },
+          "public": {
+            "obligation_id": "vc:h0_serde_ucore__de__value___x3cimpl_x20serde_ucore__de__IntoDeserializer_x3c_x27de_x2c_x20E_x3e_x20for_x20f32_x3e__into_udeserializer:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                5,
+                149,
+                122,
+                64,
+                77,
+                58,
+                173,
+                23,
+                226,
+                165,
+                12,
+                187,
+                230,
+                16,
+                59,
+                198,
+                24,
+                178,
+                94,
+                11,
+                135,
+                194,
+                234,
+                83,
+                160,
+                121,
+                113,
+                86,
+                90,
+                113,
+                16,
+                31
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "NativeC"
+    },
+    "files": [
+      "<cargo-home>/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/de/value.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            218,
+            229,
+            51,
+            192,
+            67,
+            86,
+            103,
+            177,
+            54,
+            180,
+            198,
+            109,
+            164,
+            205,
+            155,
+            11,
+            242,
+            128,
+            184,
+            191,
+            198,
+            28,
+            86,
+            10,
+            238,
+            197,
+            185,
+            120,
+            97,
+            218,
+            8,
+            14
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            52,
+            243,
+            1,
+            234,
+            111,
+            4,
+            157,
+            252,
+            68,
+            70,
+            28,
+            93,
+            160,
+            191,
+            63,
+            148,
+            57,
+            158,
+            18,
+            246,
+            20,
+            37,
+            109,
+            234,
+            105,
+            252,
+            114,
+            133,
+            154,
+            170,
+            186,
+            255
+          ]
+        },
+        "obligations": [
+          0
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              229,
+              80,
+              86,
+              235,
+              164,
+              34,
+              172,
+              203,
+              25,
+              69,
+              192,
+              195,
+              151,
+              20,
+              85,
+              128,
+              116,
+              196,
+              9,
+              113,
+              134,
+              52,
+              246,
+              226,
+              182,
+              241,
+              35,
+              87,
+              127,
+              35,
+              252,
+              40
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                47,
+                80,
+                101,
+                148,
+                67,
+                213,
+                231,
+                132,
+                95,
+                59,
+                147,
+                127,
+                88,
+                203,
+                54,
+                68,
+                167,
+                75,
+                36,
+                135,
+                53,
+                69,
+                170,
+                239,
+                176,
+                143,
+                200,
+                0,
+                111,
+                206,
+                26,
+                89
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 3091528570,
+                "span": {
+                  "file": 0,
+                  "line": 271,
+                  "col": 12
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

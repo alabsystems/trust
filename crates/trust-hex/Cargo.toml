@@ -1,0 +1,11 @@
+[package]
+name = "trust-hex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

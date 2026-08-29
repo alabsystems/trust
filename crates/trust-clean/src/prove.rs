@@ -47258,6 +47258,1017 @@ mod vc_kind_formula_hash_domain_tripwire {
         }
     }
 
+    /// Trust: WHICH FIELD TYPES BLOCK THE CARRIER — composition of the largest genuine gap.
+    ///
+    /// `"a field TYPE has no carrier at all"` is the biggest REAL carrier decline
+    /// (757 uncovered authored bodies on the closed corpus, 2026-08-28; the 588
+    /// known-container / 75 Prod-floor / 24 field-less / 4 known-map declines beside
+    /// it are deliberate floors, not gaps). A count cannot say whether that is one
+    /// addressable head or a 700-type tail, and this campaign has repeatedly paid for
+    /// building against a population before reading its composition.
+    ///
+    /// NO CERTIFICATION FIXPOINT, deliberately. The first version of this instrument
+    /// ran the 8-round fixpoint to restrict to UNCOVERED bodies and was killed after
+    /// 26 minutes at 6.9 GB RSS. That work was irrelevant: whether a return type's
+    /// carrier builds is a property of the TYPE, not of the body's verdict, and
+    /// covered bodies are ~6.9% of the corpus — far too few to move a distribution.
+    /// Streaming the files instead of collecting them keeps RSS flat.
+    ///
+    /// The counts here are therefore over ALL authored Adt-returning bodies that hit
+    /// this decline, not the uncovered subset, and this corpus is the NON-closed
+    /// harvest — so do not compare the absolute number to the 757. The SHAPE is the
+    /// question.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn which_field_types_block_the_carrier() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use trust_types::Ty;
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default"))
+        }
+        /// Collapse the VERSION multiplicity this corpus carries. The versioned
+        /// harvest compiles `bytes` at 1.11.1, 1.12.0 and 1.12.1, so one shape --
+        /// `bytes::Vtable` -- appears three times at 36 each and reads as 23% of the
+        /// gap when it is really 7.8% of one struct. Strip a trailing `_<d>(_<d>)*`
+        /// from the CRATE segment only; inner path segments are left alone.
+        fn devers(name: &str) -> String {
+            let Some((head, rest)) = name.split_once("::") else { return name.to_string() };
+            let mut seg = head;
+            while let Some((base, tail)) = seg.rsplit_once('_') {
+                if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                    seg = base;
+                } else {
+                    break;
+                }
+            }
+            format!("{seg}::{rest}")
+        }
+        /// The FAMILY of a blocking field type, not its spelling. `Vec<Foo>` and
+        /// `Vec<Bar>` are ONE target (the sequence carrier); two unrelated named
+        /// structs are two. Bucketing by spelling would manufacture a flat tail out
+        /// of what may be a small number of real shapes.
+        fn family(t: &Ty) -> String {
+            match t {
+                Ty::Float { width } => format!("Float{{{width}}}"),
+                Ty::Char => "Char".into(),
+                Ty::Str => "Str".into(),
+                Ty::Never => "Never".into(),
+                Ty::Dynamic { .. } => "dyn Trait".into(),
+                Ty::FnPtr { .. } => "fn pointer".into(),
+                Ty::Closure { .. } => "closure".into(),
+                Ty::RawPtr { .. } => "raw pointer".into(),
+                Ty::Ref { mutable, inner } =>
+                    format!("&{}{}", if *mutable { "mut " } else { "" }, family(inner)),
+                Ty::Tuple(elems) => format!("tuple/{}", elems.len()),
+                Ty::Array { elem, .. } => format!("[{}; N]", family(elem)),
+                Ty::SymArray { elem, .. } => format!("[{}; sym]", family(elem)),
+                Ty::Slice { elem } => format!("[{}]", family(elem)),
+                Ty::Adt { name, .. } => format!("Adt {}", devers(name)),
+                Ty::Datatype { name, .. } => format!("Datatype {}", devers(name)),
+                Ty::Coroutine { .. } => "coroutine".into(),
+                Ty::FnDef { .. } => "fn def".into(),
+                Ty::Unsupported { kind, .. } => format!("Unsupported/{kind}"),
+                other => format!("{other:?}").chars().take(40).collect::<String>(),
+            }
+        }
+        let mut tally: BTreeMap<String, usize> = Default::default();
+        let mut gap = 0usize;
+        let mut unattributed = 0usize;
+        let mut authored_adt = 0usize;
+        let mut scanned = 0usize;
+        for p in &files {
+            let Ok(b) = std::fs::read(p) else { continue };
+            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
+                continue;
+            };
+            scanned += 1;
+            if !authored(&f.def_path) { continue; }
+            let carrier = match &f.body.return_ty {
+                Ty::Ref { mutable: false, inner } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(carrier, Ty::Adt { .. }) { continue; }
+            authored_adt += 1;
+            if crate::reflect::reflect_struct_reasoned(carrier)
+                != Err("a field TYPE has no carrier at all") { continue; }
+            gap += 1;
+            match crate::reflect::first_uncarriable_field(carrier) {
+                Some((_, fty)) => *tally.entry(family(&fty)).or_default() += 1,
+                // The walk must attribute every one. Nonzero here means it has
+                // DRIFTED from the loop it replicates -- report, never under-count.
+                None => unattributed += 1,
+            }
+        }
+        println!("\n=== scanned {scanned} bodies; {authored_adt} authored with an Adt return ===");
+        println!("=== {gap} hit 'a field TYPE has no carrier at all', by BLOCKING FIELD FAMILY ===");
+        let mut v: Vec<_> = tally.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let mut cum = 0usize;
+        for (k, c) in v.iter().take(25) {
+            cum += *c;
+            println!("  {c:5} ({:5.1}%)  cum {:5.1}%   {k}",
+                100.0 * *c as f64 / gap.max(1) as f64,
+                100.0 * cum as f64 / gap.max(1) as f64);
+        }
+        println!("  ---");
+        println!("  distinct families: {}", v.len());
+        if unattributed > 0 {
+            println!("  !! {unattributed} UNATTRIBUTED — first_uncarriable_field has DRIFTED");
+        }
+    }
+
+    /// Trust: WHY DO THE SCALAR-RETURN BODIES FAIL — the biggest UNEXAMINED population.
+    ///
+    /// The final coverage table splits uncovered authored bodies by return-type carrier
+    /// status, and the second-largest row is 7,091 (31.9%) "scalar/unit return — no
+    /// carrier needed". That row says only what does NOT block them. Nothing in this
+    /// campaign has ever asked what DOES.
+    ///
+    /// They are the simplest bodies in the corpus -- an `i64`/`bool`/`()` return needs
+    /// none of the carrier, reflection or ADT machinery that every other row is about --
+    /// so whatever stops them is in the BODY recognizer, and that is the one place a
+    /// single fix has ever moved coverage here (+41 and +264, the only two wins).
+    ///
+    /// Single pass, no certification fixpoint: the interprocedural frontier was measured
+    /// at 96 bodies, so an empty callee map barely perturbs this, and the fixpoint is
+    /// what made the previous instrument take 26 minutes. Callee-shaped declines are
+    /// tallied separately so that assumption stays visible rather than buried.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn why_do_the_scalar_return_bodies_fail() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use trust_types::Ty;
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default"))
+        }
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        let empty: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
+        let mut decline: BTreeMap<String, usize> = Default::default();
+        let mut lane_reached: BTreeMap<&'static str, usize> = Default::default();
+        let (mut scalar, mut covered, mut uncovered) = (0usize, 0usize, 0usize);
+        for p in &files {
+            let Ok(b) = std::fs::read(p) else { continue };
+            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
+                continue;
+            };
+            if !authored(&f.def_path) { continue; }
+            let rt = match &f.body.return_ty {
+                Ty::Ref { mutable: false, inner } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(rt, Ty::Int { .. } | Ty::Bool | Ty::PtrSizedInt { .. } | Ty::Unit) {
+                continue;
+            }
+            scalar += 1;
+            let d = crate::prove::diagnose_fully_faithful_gate_with_bodies(&f, &empty, &bodies);
+            if d.fully_faithful { covered += 1; continue; }
+            uncovered += 1;
+            // 99.3% report NO expr_fold_decline, i.e. they never reach a lane at all --
+            // they die in the two-condition early return at the TOP of the gate. Split
+            // it: neither half has ever been decomposed, and between them they refuse
+            // nearly every simple body in the corpus.
+            let vcgen_err = trust_vcgen::validate_function(&f).err();
+            let assign_ok = crate::assignment_types::all_assignments_match(&f.body);
+            let key = match (&vcgen_err, assign_ok) {
+                (Some(e), false) => format!("BOTH: vcgen({e:?}) + assignment mismatch"),
+                (Some(e), true) => format!("vcgen::validate_function: {e:?}"),
+                (None, false) => {
+                    // `first_assignment_mismatch_kind` already carries the FINE-GRAINED
+                    // shape (which cast, which pointer direction). Prefer it -- the
+                    // coarse reason lumps 276 casts into one bucket that cannot be built
+                    // against, and this is a one-line upgrade for the same reason the
+                    // coarse variant was a one-line upgrade over a bare bool.
+                    match crate::assignment_types::first_assignment_mismatch_kind(&f.body) {
+                        Some(k) => format!("assign: {k}"),
+                        None => format!(
+                            "all_assignments_match: {}",
+                            crate::assignment_types::all_assignments_match_reason(&f.body)
+                        ),
+                    }
+                }
+                (None, true) => d
+                    .expr_fold_decline
+                    .unwrap_or("(passed the early gate; no expr_fold_decline)")
+                    .to_string(),
+            };
+            *decline.entry(key).or_default() += 1;
+            // WHICH lanes did it even reach? A body that fails every shape gate is a
+            // different problem from one that passes shape and fails safety.
+            if d.via_ir_shape { *lane_reached.entry("ir shape OK").or_default() += 1; }
+            if d.via_ir_safety { *lane_reached.entry("ir safety OK").or_default() += 1; }
+            if d.via_mirsem_shape { *lane_reached.entry("mirsem shape OK").or_default() += 1; }
+            if d.via_mirsem_straight_line_shape {
+                *lane_reached.entry("mirsem straight-line shape OK").or_default() += 1;
+            }
+            if d.via_mirsem_loop_shape {
+                *lane_reached.entry("mirsem loop shape OK").or_default() += 1;
+            }
+            if d.via_mirsem_call_requires {
+                *lane_reached.entry("mirsem call-requires OK").or_default() += 1;
+            }
+        }
+        println!("\n=== {scalar} authored scalar/unit-return bodies: {covered} covered, {uncovered} NOT ===");
+        println!("=== the {uncovered} uncovered, by expr_fold_decline ===");
+        let mut v: Vec<_> = decline.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let mut cum = 0usize;
+        for (k, c) in v.iter().take(22) {
+            cum += *c;
+            println!("  {c:5} ({:5.1}%)  cum {:5.1}%   {k}",
+                100.0 * *c as f64 / uncovered.max(1) as f64,
+                100.0 * cum as f64 / uncovered.max(1) as f64);
+        }
+        println!("  ---  distinct decline reasons: {}", v.len());
+        println!("\n=== how far each got (lanes reached, not exclusive) ===");
+        let mut l: Vec<_> = lane_reached.into_iter().collect();
+        l.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &l {
+            println!("  {c:5} ({:5.1}%)  {k}", 100.0 * *c as f64 / uncovered.max(1) as f64);
+        }
+    }
+
+    /// Trust: WHAT DOES THE `USE` MISMATCH ACTUALLY COMPARE?
+    ///
+    /// `USE into a scalar/other place` is the largest NAMED decline among uncovered
+    /// scalar-return bodies (551). A `Use` is the simplest assignment there is --
+    /// `_dst = _src` -- so a type mismatch on one is either a real modelling gap or two
+    /// spellings of one rustc type comparing unequal. The label cannot tell those apart,
+    /// and `first_assignment_mismatch_kind` returns `&'static str`, so it never could:
+    /// the doc comment above it promises "the two type spellings that the first failing
+    /// assignment actually compares" and the return type makes that impossible.
+    ///
+    /// This reports the PAIR. A concentrated pair is a fix; a scatter is not.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn what_does_the_use_mismatch_compare() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use trust_types::{Operand, Rvalue, Statement, Ty};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default"))
+        }
+        /// Enough of the type to see a PATTERN, not so much that every ADT is its own
+        /// bucket. Widths and signs are kept -- an `i32`/`u32` confusion is exactly the
+        /// kind of thing this is looking for and collapsing them would hide it.
+        fn fam(t: &Ty) -> String {
+            match t {
+                Ty::Int { width, signed } =>
+                    format!("{}{}", if *signed { "i" } else { "u" }, width),
+                Ty::PtrSizedInt { signed } =>
+                    format!("{}size", if *signed { "i" } else { "u" }),
+                Ty::Bool => "bool".into(),
+                Ty::Unit => "()".into(),
+                Ty::Char => "char".into(),
+                Ty::Str => "str".into(),
+                Ty::Float { width } => format!("f{width}"),
+                Ty::Ref { mutable, inner } =>
+                    format!("&{}{}", if *mutable { "mut " } else { "" }, fam(inner)),
+                Ty::RawPtr { .. } => "*ptr".into(),
+                Ty::Tuple(e) => format!("tuple/{}", e.len()),
+                Ty::Slice { .. } => "slice".into(),
+                Ty::Array { .. } => "array".into(),
+                Ty::Adt { variants, .. } if variants.is_empty() => "Adt(struct)".into(),
+                Ty::Adt { .. } => "Adt(enum)".into(),
+                Ty::Datatype { .. } => "Datatype(marker)".into(),
+                Ty::Unsupported { kind, .. } => format!("Unsupported/{kind}"),
+                Ty::Bv(w) => format!("Bv{w}"),
+                other => format!("{other:?}").chars().take(28).collect::<String>(),
+            }
+        }
+        let mut pairs: BTreeMap<String, usize> = Default::default();
+        let mut hit = 0usize;
+        for p in &files {
+            let Ok(b) = std::fs::read(p) else { continue };
+            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
+                continue;
+            };
+            if !authored(&f.def_path) { continue; }
+            if crate::assignment_types::first_assignment_mismatch_kind(&f.body)
+                != Some("USE into a scalar/other place") { continue; }
+            hit += 1;
+            // Re-find the offending statement and report the PAIR it compares.
+            let mut found = false;
+            for st in f.body.blocks.iter().flat_map(|b| &b.stmts) {
+                let Statement::Assign { place, rvalue, .. } = st else { continue };
+                if crate::assignment_types::assignment_types_match_for_test(&f.body, place, rvalue) {
+                    continue;
+                }
+                let Rvalue::Use(op) = rvalue else { continue };
+                let dst = crate::assignment_types::place_type(&f.body, place)
+                    .map_or("?dst".to_string(), |t| fam(&t));
+                let srcs = match op {
+                    Operand::Copy(pl) | Operand::Move(pl) => crate::assignment_types::place_type(
+                        &f.body, pl,
+                    )
+                    .map_or("?src".to_string(), |t| fam(&t)),
+                    // Name the CONSTANT KIND. "const" lumps a dozen ConstValue
+                    // variants that constant_matches_type treats completely
+                    // differently, and ~75% of this population is constants.
+                    Operand::Constant(cv) => {
+                        let s = format!("{cv:?}");
+                        let head = s.split(['(', ' ', '{']).next().unwrap_or("?").to_string();
+                        format!("const:{head}")
+                    }
+                    _ => "const:?".to_string(),
+                };
+                *pairs.entry(format!("{srcs}  ->  {dst}")).or_default() += 1;
+                found = true;
+                break;
+            }
+            if !found { *pairs.entry("(no Use stmt re-found)".into()).or_default() += 1; }
+        }
+        println!("\n=== {hit} bodies whose first mismatch is `USE into a scalar/other place` ===");
+        println!("=== the pair it compares (src -> dst) ===");
+        let mut v: Vec<_> = pairs.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let mut cum = 0usize;
+        for (k, c) in v.iter().take(20) {
+            cum += *c;
+            println!("  {c:5} ({:5.1}%)  cum {:5.1}%   {k}",
+                100.0 * *c as f64 / hit.max(1) as f64,
+                100.0 * cum as f64 / hit.max(1) as f64);
+        }
+        println!("  ---  distinct pairs: {}", v.len());
+    }
+
+    /// Trust: WHAT SHAPE ARE THE 14,219 — the bodies no lane recognizes.
+    ///
+    /// 90.9% of uncovered scalar-return bodies pass the early gate, reach no lane, and
+    /// record nothing. `via_trustir_shape_witnessed_with_bodies` is a disjunction of ~20
+    /// `*_fully_faithful_via_trustir` recognizers, so the "reason" those bodies decline
+    /// is inherently "none of twenty matched" -- true, and useless.
+    ///
+    /// The actionable question is what SHAPE they are, and that is a property of the
+    /// DUMP, so it is read off the corpus directly rather than derived through a gate.
+    /// (This report's own rule: if the premise is a fact about the dump, read it off the
+    /// whole dump -- it costs seconds and settled five of seven questions once.)
+    ///
+    /// A recognizer covers a shape. Naming the shapes nothing covers names the
+    /// recognizers that do not exist yet.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn what_shape_are_the_unrecognized_bodies() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use trust_types::{Rvalue, Statement, Terminator, Ty};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default"))
+        }
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        // REAL CALLEE MAP. The previous run used an EMPTY map to dodge a fixpoint that
+        // took 26 minutes on a 57,803-body corpus -- and that made the dominant bucket
+        // (a body whose only content is one call) decline BY THE METHOD, so its true
+        // size was unmeasurable. On a dependency-CLOSED corpus a fifth the size the
+        // fixpoint is affordable, and it is the only way the delegation shape gets an
+        // honest verdict.
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            if let Ok(b) = std::fs::read(p)
+                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
+            { funcs.push(f); }
+        }
+        let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
+        for _ in 0..8 {
+            let before = certified.len();
+            for f in &funcs {
+                if certified.contains_key(&f.def_path) { continue; }
+                if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                    .fully_faithful
+                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+            }
+            if certified.len() == before { break; }
+        }
+        let empty = certified;
+        println!("\n=== fixpoint: {} of {} bodies certified ===", empty.len(), funcs.len());
+        let mut shape: BTreeMap<String, usize> = Default::default();
+        let mut total = 0usize;
+        let mut samples = 0usize;
+        let mut authored_scalar = 0usize;
+        let mut authored_scalar_covered = 0usize;
+        for p in &files {
+            let Ok(b) = std::fs::read(p) else { continue };
+            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
+                continue;
+            };
+            if !authored(&f.def_path) { continue; }
+            let rt = match &f.body.return_ty {
+                Ty::Ref { mutable: false, inner } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(rt, Ty::Int { .. } | Ty::Bool | Ty::PtrSizedInt { .. } | Ty::Unit) {
+                continue;
+            }
+            authored_scalar += 1;
+            // The exact population: uncovered, PAST the early gate, and no lane recorded
+            // anything. Anything the early gate or a reason field already explains is
+            // another population and is excluded here.
+            if trust_vcgen::validate_function(&f).is_err()
+                || !crate::assignment_types::all_assignments_match(&f.body) { continue; }
+            let d = crate::prove::diagnose_fully_faithful_gate_with_bodies(&f, &empty, &bodies);
+            if d.fully_faithful { authored_scalar_covered += 1; }
+            if d.fully_faithful || d.expr_fold_decline.is_some() { continue; }
+            if d.via_ir_shape || d.via_mirsem_shape { continue; }
+            total += 1;
+            let nblocks = f.body.blocks.len();
+            let nstmts: usize = f.body.blocks.iter().map(|b| b.stmts.len()).sum();
+            let has_call = f.body.blocks.iter().any(|b| {
+                matches!(b.terminator, Terminator::Call { .. } | Terminator::TailCall { .. })
+            });
+            let has_switch =
+                f.body.blocks.iter().any(|b| matches!(b.terminator, Terminator::SwitchInt { .. }));
+            // A back-edge is the honest loop test: an edge to a block at or before the
+            // source in program order. Keyed on the block's OWN id, not its index --
+            // `all_block_ids_unique` is a separate gate and ids need not be positional.
+            // `BlockId` is not `Ord` (it comes from trust-ir-contract), and block
+            // counts here are small, so position by linear scan rather than a map.
+            let ids: Vec<_> = f.body.blocks.iter().map(|b| &b.id).collect();
+            let has_backedge = f.body.blocks.iter().enumerate().any(|(i, b)| {
+                let to = |t: &_| ids.iter().position(|id| *id == t).is_some_and(|j| j <= i);
+                match &b.terminator {
+                    Terminator::Goto(t) => to(t),
+                    Terminator::SwitchInt { targets, otherwise, .. } => {
+                        targets.iter().any(|(_, t)| to(t)) || to(otherwise)
+                    }
+                    Terminator::Call { target: Some(t), .. } => to(t),
+                    _ => false,
+                }
+            });
+            let has_unsupported_rv = f.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s, Statement::Assign { rvalue: Rvalue::Unsupported { .. }, .. })
+            });
+            // A Unit-returning body with ZERO statements is a compiler-generated
+            // MARKER, not authored code: `assert_fields_are_eq` (the `derive(Eq)`
+            // no-op), `zeroize_or_on_drop`, and friends. Proving one is vacuous --
+            // this campaign's own witness discipline says a `Unit` no-op asserts
+            // nothing and is deliberately not harvested. Separate them: they are
+            // contaminating the `authored` denominator, not waiting to be covered.
+            if matches!(f.body.return_ty, Ty::Unit) && nstmts == 0 {
+                *shape.entry(format!(
+                    "EMPTY MARKER (Unit return, 0 stmts) e.g. {}",
+                    f.def_path.rsplit("::").next().unwrap_or("?")
+                )).or_default() += 1;
+                continue;
+            }
+            let k = format!(
+                "{}{}{}{}  blocks={}  stmts={}",
+                if has_call { "CALL " } else { "" },
+                if has_switch { "SWITCH " } else { "" },
+                if has_backedge { "LOOP " } else { "" },
+                if has_unsupported_rv { "UNSUP-RV " } else { "" },
+                match nblocks { 1 => "1".into(), 2..=3 => "2-3".into(),
+                    4..=8 => "4-8".into(), _ => "9+".to_string() },
+                match nstmts { 0..=2 => "0-2".into(), 3..=8 => "3-8".into(),
+                    9..=25 => "9-25".into(), _ => "26+".to_string() },
+            );
+            *shape.entry(k.clone()).or_default() += 1;
+            // Print a few of the SIMPLEST shape verbatim. 1,800 single-block bodies of
+            // <=2 statements with no call and no branch are the easiest things in the
+            // corpus; if nothing recognizes them, the example says why far faster than
+            // any further bucketing.
+            if k.starts_with("  blocks=1") && samples < 6 {
+                samples += 1;
+                println!("\n--- sample {samples}: {} ---", f.def_path);
+                println!("    return_ty : {:?}", f.body.return_ty);
+                println!("    arg_count : {}  locals: {}", f.body.arg_count, f.body.locals.len());
+                for (i, l) in f.body.locals.iter().enumerate().take(5) {
+                    println!("    local[{i}]  : {:?}", l.ty);
+                }
+                for st in f.body.blocks.iter().flat_map(|b| &b.stmts) {
+                    println!("    stmt      : {st:?}");
+                }
+                println!("    term      : {:?}", f.body.blocks[0].terminator);
+            }
+        }
+        println!(
+            "\n=== {authored_scalar} authored scalar/unit-return: {authored_scalar_covered} COVERED ==="
+        );
+        println!("=== {total} bodies that pass the early gate and reach NO lane, by SHAPE ===");
+        let mut v: Vec<_> = shape.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let mut cum = 0usize;
+        for (k, c) in v.iter().take(22) {
+            cum += *c;
+            println!("  {c:5} ({:5.1}%)  cum {:5.1}%   {k}",
+                100.0 * *c as f64 / total.max(1) as f64,
+                100.0 * cum as f64 / total.max(1) as f64);
+        }
+        println!("  ---  distinct shapes: {}", v.len());
+    }
+
+    /// Trust: THE LAST MILE — bodies a lane ALREADY recognizes that still fail.
+    ///
+    /// On the closed corpus: 2,238 authored scalar/unit-return bodies, 213 covered, 1,702
+    /// reaching no lane at all. The remainder — roughly 320 — are the interesting ones:
+    /// **a shape gate ACCEPTED them** and the verdict is still no.
+    ///
+    /// Every other population this report has chased needed a recognizer that does not
+    /// exist. This one does not: the recognition already happened. What fails after it is
+    /// safety-VC discharge, call-requires, the fold-delegate bar, or the ptr-offset gate —
+    /// each a named, separable condition rather than "none of twenty matched".
+    ///
+    /// That makes it the only remaining population where a single fix has a real path to
+    /// coverage, so it is worth knowing which condition is refusing them.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn the_last_mile_bodies_a_lane_already_recognizes() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use trust_types::Ty;
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default")
+                // XXXVI: derive-generated EMPTY MARKERS contaminate every `authored`
+                // count in this report by ~8%. Proving one is vacuous.
+                || dp.ends_with("::assert_fields_are_eq")
+                || dp.ends_with("::zeroize_or_on_drop"))
+        }
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            if let Ok(b) = std::fs::read(p)
+                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
+            { funcs.push(f); }
+        }
+        let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
+        // IS THE CASCADE STARVED OR SATURATED? XL concluded coverage is limited by call-
+        // graph closure. If the fixpoint is still GROWING when the round cap stops it,
+        // the closure is starved and more rounds buy coverage. If it converges early,
+        // the ground genuinely runs out. Printing per-round growth distinguishes them,
+        // and the round cap was an assumption nobody had checked.
+        let mut rounds = 0usize;
+        for _ in 0..32 {
+            let before = certified.len();
+            for f in &funcs {
+                if certified.contains_key(&f.def_path) { continue; }
+                if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                    .fully_faithful
+                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+            }
+            rounds += 1;
+            println!("  fixpoint round {rounds:2}: {} certified (+{})",
+                certified.len(), certified.len() - before);
+            if certified.len() == before { break; }
+        }
+        println!("  converged after {rounds} round(s); the standing cap is 8");
+        let mut why: BTreeMap<String, usize> = Default::default();
+        let mut lastmile = 0usize;
+        for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+            let rt = match &f.body.return_ty {
+                Ty::Ref { mutable: false, inner } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(rt, Ty::Int { .. } | Ty::Bool | Ty::PtrSizedInt { .. } | Ty::Unit) {
+                continue;
+            }
+            let d = crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies);
+            if d.fully_faithful { continue; }
+            // A lane accepted the SHAPE and the verdict is still no.
+            if !(d.via_ir_shape || d.via_mirsem_shape) { continue; }
+            lastmile += 1;
+            // Name the condition that refused, in the production gate's own order.
+            let k = if d.via_ir_shape && !d.via_ir_safety {
+                "IR shape OK -> safety VCs NOT faithful via trustir"
+            } else if d.via_ir_shape && d.via_ir_safety && !d.via_ir {
+                "IR shape+safety OK -> FOLD-DELEGATE bar"
+            } else if d.via_mirsem_straight_line_shape
+                && !d.via_mirsem_straight_line_safety_discharged
+            {
+                "mirsem straight-line shape OK -> safety VCs NOT all discharged"
+            } else if d.via_mirsem_straight_line_safety_discharged && !d.via_mirsem_call_requires {
+                "mirsem shape+safety OK -> CALL-REQUIRES not established"
+            } else if d.via_mirsem_loop_shape && !d.via_mirsem_loop_full {
+                "mirsem LOOP shape OK -> loop not fully faithful"
+            } else if (d.via_ir || d.via_mirsem)
+                && !crate::prove::function_ptr_offsets_all_discharged(f)
+            {
+                "lane PASSED -> PTR-OFFSET gate refused"
+            } else if d.via_mirsem || d.via_mirsem_loop_full {
+                "mirsem lane OK -> FOLD-DELEGATE bar"
+            } else {
+                "shape OK, refused by an unclassified conjunct"
+            };
+            *why.entry(k.to_string()).or_default() += 1;
+        }
+        // THE LARGEST UNRECOGNIZED SHAPE, asked directly: a one-call delegation
+        // (`_0 = f(args); return`) with 2-3 blocks and <=2 statements. If its callee is
+        // CERTIFIED and it still reaches no lane, that is a real recognizer gap on the
+        // biggest remaining bucket. If the callee is absent or uncertified, the shape is
+        // blocked TRANSITIVELY and no recognizer would help it.
+        let mut deleg = 0usize;
+        let mut callee_state: BTreeMap<&str, usize> = Default::default();
+        for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+            let rt = match &f.body.return_ty {
+                Ty::Ref { mutable: false, inner } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(rt, Ty::Int { .. } | Ty::Bool | Ty::PtrSizedInt { .. } | Ty::Unit) {
+                continue;
+            }
+            if f.body.blocks.len() > 3 { continue; }
+            if f.body.blocks.iter().map(|b| b.stmts.len()).sum::<usize>() > 2 { continue; }
+            let calls: Vec<&String> = f.body.blocks.iter().filter_map(|b| {
+                match &b.terminator { trust_types::Terminator::Call { func, .. } => Some(func),
+                    _ => None }
+            }).collect();
+            if calls.len() != 1 { continue; }
+            let d = crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies);
+            if d.fully_faithful || d.via_ir_shape || d.via_mirsem_shape { continue; }
+            deleg += 1;
+            let callee = calls[0];
+            let k = if certified.contains_key(callee.as_str()) {
+                "callee IS CERTIFIED -> real recognizer gap"
+            } else if funcs.iter().any(|g| g.def_path == **callee) {
+                "callee present in corpus but NOT certified -> transitive"
+            } else {
+                "callee ABSENT from corpus -> transitive, unfixable here"
+            };
+            *callee_state.entry(k).or_default() += 1;
+        }
+        println!("\n=== {deleg} one-call delegations that reach NO lane, by CALLEE state ===");
+        let mut cv: Vec<_> = callee_state.into_iter().collect();
+        cv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &cv {
+            println!("  {c:5} ({:5.1}%)  {k}", 100.0 * *c as f64 / deleg.max(1) as f64);
+        }
+        // THE LEAF POPULATION, measured directly. XXXIX concluded the frontier is leaf
+        // bodies -- those that do not delegate -- because a delegation lights up for free
+        // once its callee is covered. That conclusion is only actionable if the leaves
+        // are actually UNCOVERED and actually numerous. Both are measurable, and
+        // inferring either instead of reading it is the error this report has recorded
+        // six times.
+        let (mut leaf, mut leaf_cov, mut nonleaf, mut nonleaf_cov) = (0usize, 0usize, 0, 0);
+        for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+            let rt = match &f.body.return_ty {
+                Ty::Ref { mutable: false, inner } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(rt, Ty::Int { .. } | Ty::Bool | Ty::PtrSizedInt { .. } | Ty::Unit) {
+                continue;
+            }
+            let has_call = f.body.blocks.iter().any(|b| {
+                matches!(b.terminator, trust_types::Terminator::Call { .. }
+                    | trust_types::Terminator::TailCall { .. })
+            });
+            let cov = crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                .fully_faithful;
+            if has_call {
+                nonleaf += 1;
+                if cov { nonleaf_cov += 1; }
+            } else {
+                leaf += 1;
+                if cov { leaf_cov += 1; }
+            }
+        }
+        println!("\n=== LEAF vs DELEGATING (authored, scalar/unit return) ===");
+        println!("  LEAF  (no call)  : {leaf:5} total, {leaf_cov:5} covered ({:5.1}%)",
+            100.0 * leaf_cov as f64 / leaf.max(1) as f64);
+        println!("  DELEGATING       : {nonleaf:5} total, {nonleaf_cov:5} covered ({:5.1}%)",
+            100.0 * nonleaf_cov as f64 / nonleaf.max(1) as f64);
+        println!("\n=== {lastmile} bodies a lane RECOGNIZED that still fail ===");
+        let mut v: Vec<_> = why.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &v {
+            println!("  {c:5} ({:5.1}%)  {k}", 100.0 * *c as f64 / lastmile.max(1) as f64);
+        }
+    }
+
+    /// Trust: HOW OFTEN DOES THE VALUE AXIS MINT? — the reach of `ret_model`.
+    ///
+    /// `CalleeFact::ret_model` (POSTCONDITION TRANSPORT, 2026-08-27) is the value axis:
+    /// without it every call result the kernel sees is a Pi-bound stand-in asserting
+    /// nothing, which is why delegating bodies sit at 1.5% coverage (XLII) while being
+    /// 88% of the population.
+    ///
+    /// Its minting gate `pure_scalar_ret_model` is deliberately narrow — an ALL-SCALAR
+    /// signature standing in for a purity analysis nobody has, a closed scalar term, and
+    /// depth 1. So the question that bounds the whole delegation route is not "is there a
+    /// lane" but **how many bodies can mint a model at all**.
+    ///
+    /// NO FIXPOINT: minting is a pure function of the body, so this is one streaming pass
+    /// rather than the 36-minute certified-closure run. Measuring the CEILING, not the
+    /// achieved rate — a body that mints is only useful if it is also certified.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn how_often_does_the_value_axis_mint() {
+        use std::path::{Path, PathBuf};
+        use trust_types::Ty;
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
+        let (mut n, mut all_scalar_sig, mut mints) = (0usize, 0usize, 0usize);
+        let mut called: std::collections::BTreeSet<String> = Default::default();
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            let Ok(b) = std::fs::read(p) else { continue };
+            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
+                continue;
+            };
+            for blk in &f.body.blocks {
+                if let trust_types::Terminator::Call { func, .. } = &blk.terminator {
+                    called.insert(func.clone());
+                }
+            }
+            funcs.push(f);
+        }
+        // Of the bodies that are actually CALLED by something, how many could mint?
+        // That is the population whose models would ever be transported.
+        let (mut called_n, mut called_mints) = (0usize, 0usize);
+        for f in &funcs {
+            n += 1;
+            let sig_ok = scalar(&f.body.return_ty)
+                && (1..=f.body.arg_count)
+                    .all(|i| f.body.locals.get(i).is_some_and(|l| scalar(&l.ty)));
+            if sig_ok { all_scalar_sig += 1; }
+            let m = crate::prove::pure_scalar_ret_model(f).is_some();
+            if m { mints += 1; }
+            if called.contains(&f.def_path) {
+                called_n += 1;
+                if m { called_mints += 1; }
+            }
+        }
+        println!("\n=== the reach of the VALUE AXIS (ret_model minting ceiling) ===");
+        println!("  bodies in corpus                : {n}");
+        println!("  ALL-SCALAR signature (G2 alone) : {all_scalar_sig:6} ({:5.1}%)",
+            100.0 * all_scalar_sig as f64 / n.max(1) as f64);
+        println!("  MINT a ret_model (G1+G2+G4)     : {mints:6} ({:5.1}%)",
+            100.0 * mints as f64 / n.max(1) as f64);
+        println!("  --");
+        println!("  bodies that are CALLED by something : {called_n}");
+        println!("  of those, MINT a ret_model          : {called_mints:6} ({:5.1}%)",
+            100.0 * called_mints as f64 / called_n.max(1) as f64);
+    }
+
+    /// Trust: WHAT WOULD AN EFFECT ANALYSIS BUY? — sizing the G2 widening BEFORE building.
+    ///
+    /// XLIII: the delegation route is capped at 0.5% of called bodies because
+    /// `pure_scalar_ret_model`'s G2 demands an ALL-SCALAR signature — a stand-in for the
+    /// purity/effect analysis the compiler lacks — and that stand-in costs 99% of the
+    /// corpus. The obvious widening is to admit a callee whose signature DOES carry
+    /// references, provided it provably never writes through them.
+    ///
+    /// This report's whole content is that a population must be sized before it is built
+    /// against, and eleven candidates died for skipping that. So: size it. A CONSERVATIVE
+    /// syntactic proxy for "no write reaches a caller-visible pointee":
+    ///
+    ///   * every parameter is a scalar OR a SHARED reference (`&T`, never `&mut`),
+    ///   * no `Assign` whose destination place has a `Deref` projection,
+    ///   * no raw pointer anywhere in the signature,
+    ///   * no call to anything (depth 1, matching the existing increment).
+    ///
+    /// This is a CEILING for that widening, not a claim it is sound as written — a real
+    /// analysis must also handle interior mutability (`UnsafeCell`) and reborrows, both of
+    /// which this proxy ignores and both of which can only SHRINK the number.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn what_would_an_effect_analysis_buy() {
+        use std::path::{Path, PathBuf};
+        use trust_types::{Rvalue, Statement, Terminator, Ty};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
+        let mut called: std::collections::BTreeSet<String> = Default::default();
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            let Ok(b) = std::fs::read(p) else { continue };
+            let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b) else {
+                continue;
+            };
+            for blk in &f.body.blocks {
+                if let Terminator::Call { func, .. } = &blk.terminator { called.insert(func.clone()); }
+            }
+            funcs.push(f);
+        }
+        let (mut g2, mut widened, mut g2_called, mut widened_called) = (0usize, 0, 0usize, 0);
+        for f in &funcs {
+            let is_called = called.contains(&f.def_path);
+            let params: Vec<&Ty> = (1..=f.body.arg_count)
+                .filter_map(|i| f.body.locals.get(i).map(|l| &l.ty))
+                .collect();
+            let all_scalar = scalar(&f.body.return_ty) && params.iter().all(|t| scalar(t));
+            if all_scalar { g2 += 1; if is_called { g2_called += 1; } }
+            // The WIDENED gate.
+            if !scalar(&f.body.return_ty) { continue; }
+            let sig_ok = params.iter().all(|t| match t {
+                t if scalar(t) => true,
+                Ty::Ref { mutable: false, inner } => !matches!(**inner, Ty::RawPtr { .. }),
+                _ => false,
+            });
+            if !sig_ok { continue; }
+            let writes_through_deref = f.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s, Statement::Assign { place, .. }
+                    if place.projections.iter().any(|pr| {
+                        matches!(pr, trust_types::Projection::Deref)
+                    }))
+            });
+            if writes_through_deref { continue; }
+            let has_call = f.body.blocks.iter().any(|b| {
+                matches!(b.terminator, Terminator::Call { .. } | Terminator::TailCall { .. })
+            });
+            if has_call { continue; }
+            let has_raw = f.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s, Statement::Assign { rvalue: Rvalue::AddressOf(..), .. })
+            });
+            if has_raw { continue; }
+            widened += 1;
+            if is_called { widened_called += 1; }
+        }
+        println!("\n=== sizing the G2 widening (CEILING; interior mutability ignored) ===");
+        println!("  bodies in corpus              : {}", funcs.len());
+        println!("  G2 today   (all-scalar sig)   : {g2:6}   called: {g2_called}");
+        println!("  WIDENED    (+ shared refs,      {widened:6}   called: {widened_called}");
+        println!("               no deref-write)");
+        println!("  --");
+        println!("  multiplier on the CALLED population: {:.1}x",
+            widened_called as f64 / g2_called.max(1) as f64);
+    }
+
+    /// Trust: THE HEADLINE NUMBER, on the complete dependency-closed corpus.
+    ///
+    /// Every coverage figure quoted in this report — 6.85% authored, 8.13% aggregate —
+    /// came from the 31k partial/versioned corpora. The complete dependency-closed corpus
+    /// (37,612 bodies, 42.2% instantiations) is the best surface that exists, and the
+    /// campaign's own metric should be read off it rather than inherited.
+    ///
+    /// Reports ALL authored bodies, not just the scalar/unit-return slice every other
+    /// instrument here restricts to — that restriction was for shape analysis and has been
+    /// silently shaping the denominators.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn the_headline_number_on_the_complete_corpus() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default")
+                // XXXVI: derive-generated markers are ~8% of the old denominators.
+                || dp.ends_with("::assert_fields_are_eq")
+                || dp.ends_with("::zeroize_or_on_drop"))
+        }
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            if let Ok(b) = std::fs::read(p)
+                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
+            { funcs.push(f); }
+        }
+        let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
+        for _ in 0..8 {
+            let before = certified.len();
+            for f in &funcs {
+                if certified.contains_key(&f.def_path) { continue; }
+                if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                    .fully_faithful
+                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+            }
+            if certified.len() == before { break; }
+        }
+        let total = funcs.len();
+        let auth: Vec<&trust_types::VerifiableFunction> =
+            funcs.iter().filter(|f| authored(&f.def_path)).collect();
+        let auth_cov = auth.iter().filter(|f| certified.contains_key(&f.def_path)).count();
+        println!("\n=== HEADLINE, complete dependency-closed corpus ===");
+        println!("  all bodies      : {total:6}   certified {:6} ({:5.2}%)",
+            certified.len(), 100.0 * certified.len() as f64 / total.max(1) as f64);
+        println!("  AUTHORED bodies : {:6}   certified {auth_cov:6} ({:5.2}%)",
+            auth.len(), 100.0 * auth_cov as f64 / auth.len().max(1) as f64);
+    }
+
     /// Trust: THE MULTI-BLOCKER CENSUS — how many INDEPENDENT gates refuse each body?
     ///
     /// This is the instrument every wasted experiment in this campaign needed and did not

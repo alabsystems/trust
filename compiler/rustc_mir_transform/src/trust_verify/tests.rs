@@ -24598,6 +24598,128 @@ fn root_owned_absent_callee_rows_counts_only_the_root_through_its_own_member_lis
 }
 
 // ---------------------------------------------------------------------------
+// Bundled-member identity: source population READS the owner, never re-stamps it.
+// ---------------------------------------------------------------------------
+
+/// One bound row whose owner the caller chooses, plus the exact three inputs
+/// `populate_native_trust_ir_proof_sources` takes beside the module.
+///
+/// The row's `FuncId` is deliberately NOT the root's: the whole question these
+/// tests ask is whether a non-root attribution survives this pass.
+fn native_proof_source_population_fixture(
+    owner: Option<u32>,
+) -> (
+    trust_ir::Module,
+    trust_verifier_api::TrustContractBundle,
+    Vec<PendingNativeTrustIrBinding>,
+    trust_verifier_api::CanonicalObligationSemanticDigestIndex,
+) {
+    let mut module = trust_ir::Module::new("demo");
+    let mut proof_obligation = trust_ir::ProofObligation::new(
+        trust_ir::ProofId::new(0),
+        trust_ir::ObligationKind::PanicFreedom,
+        trust_ir::ProofStatus::Pending,
+        "a bundled member's own assertion (public verifier obligation vc:demo:member:0)",
+    );
+    if let Some(owner) = owner {
+        proof_obligation = proof_obligation.with_function(trust_ir::FuncId::new(owner));
+    }
+    module.proof_obligations.push(proof_obligation);
+
+    let mut bundle = trust_verifier_api::TrustContractBundle::empty(
+        "bundle-member-owner",
+        trust_verifier_api::BundleSubject::Function {
+            crate_name: "demo".to_string(),
+            path: "demo::root".to_string(),
+        },
+    );
+    bundle.obligations.push(trust_verifier_api::TrustObligation {
+        obligation_id: "vc:demo:member:0".to_string(),
+        kind: trust_verifier_api::ObligationKind::Assertion,
+        contract_id: None,
+        proof_item_id: None,
+        source: native_trust_ir_test_source_location(11),
+        description: "a bundled member's own assertion".to_string(),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: Vec::new(),
+    });
+    let requested = bundle.obligations.clone();
+    let semantic_digests = bundle
+        .canonical_obligation_semantic_digest_index_sha256(&requested)
+        .expect("fixture bundle must digest");
+
+    let bindings = vec![PendingNativeTrustIrBinding {
+        obligation_index: 0,
+        verifier_suite: "trust-mc",
+        proof_obligation_id: trust_ir::ProofId::new(0),
+    }];
+    (module, bundle, bindings, semantic_digests)
+}
+
+/// FAIL-CLOSED (bundled-member identity): source population may READ the owner
+/// the append seam resolved from the row's own typed context. It may never
+/// re-stamp it.
+///
+/// This is the coverage whose absence let that seam ship as DEAD CODE.
+/// `populate_native_trust_ir_proof_sources` took a scalar root `FuncId` and
+/// assigned it to every bound row unconditionally, and it runs AFTER the append
+/// loop — so `.with_function(owner.function_id)` was overwritten for every row
+/// on every compilation. With only the root scope constructed today both values
+/// are equal, which is exactly why the seam's conservation result
+/// (LOST=0/GAINED=0) could not distinguish a working seam from a no-op: no
+/// measurement over root-only input can. Only a row carrying a NON-root owner
+/// discriminates, which is what this test supplies.
+///
+/// Mutation control: restoring the overwrite must turn this red.
+#[test]
+fn native_proof_source_population_preserves_the_append_seam_owner() {
+    let (mut module, bundle, bindings, semantic_digests) =
+        native_proof_source_population_fixture(Some(1));
+
+    populate_native_trust_ir_proof_sources(&mut module, &bundle, &bindings, &semantic_digests)
+        .expect("an attributed row must populate its source identity");
+
+    let row = &module.proof_obligations[0];
+    // The row was really VISITED. Without this the owner assertion below would
+    // pass just as well on a population pass that skipped the row entirely —
+    // which is the same class of mistake as reading a no-op as a green.
+    let source = row.source.as_ref().expect("source population must have run on this row");
+    assert_eq!(
+        source.public.as_ref().map(|public| public.obligation_id.as_str()),
+        Some("vc:demo:member:0"),
+        "the visited row must carry its own public identity"
+    );
+    assert_eq!(
+        row.function,
+        Some(trust_ir::FuncId::new(1)),
+        "source population must READ the append seam's owner, never overwrite it with the root"
+    );
+}
+
+/// FAIL-CLOSED (bundled-member identity): a bound row that reached source
+/// population with no owning body is REFUSED.
+///
+/// The overwrite this replaces made every such row a ROOT row silently. An
+/// unattributed row is an unresolved owner, not a root one, and publishing it
+/// under the subject's identity is the exact laundering slice 0 removes.
+#[test]
+fn native_proof_source_population_refuses_an_unattributed_row() {
+    let (mut module, bundle, bindings, semantic_digests) =
+        native_proof_source_population_fixture(None);
+
+    let err =
+        populate_native_trust_ir_proof_sources(&mut module, &bundle, &bindings, &semantic_digests)
+            .expect_err("a row with no owning body must be refused, not silently rooted");
+    assert!(err.contains("no owning body"), "{err}");
+    assert!(err.contains("proof obligation 0"), "{err}");
+
+    let row = &module.proof_obligations[0];
+    assert!(row.function.is_none(), "the refusal must not attribute the row to anything");
+    assert!(row.source.is_none(), "the refusal must precede this row's source write");
+}
+
+// ---------------------------------------------------------------------------
 // Bundled-member Assert admission: private rows may not disappear at reset.
 // ---------------------------------------------------------------------------
 

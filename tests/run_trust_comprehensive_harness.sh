@@ -198,6 +198,8 @@ fast.trust-ir-tag-families-selftest|fast,push,release|drift|true|2026-08-27|pyth
 fast.trust-ir-seam-blockers|fast,push,release|drift|true|2026-08-27|python3 scripts/trust_ir_producer_scorecard.py --check-seam-blockers
 fast.trust-ir-seam-blockers-selftest|fast,push,release|drift|true|2026-08-27|python3 scripts/trust_ir_producer_scorecard.py --selftest-seam-blockers
 fast.mir-transform-ratchet-selftest|fast,push,release|drift|true|2026-08-27|bash scripts/check_trust_verify_suite_ratchet.sh --selftest
+fast.call-summary-labels|fast,push|drift|true|2026-08-29|python3 scripts/check_call_summary_labels.py
+fast.call-summary-labels-selftest|fast,push|drift|true|2026-08-29|python3 scripts/check_call_summary_labels.py --selftest
 fast.pin-coherence|fast,push|supply-chain|true|2026-08-27|bash scripts/check_pin_coherence.sh
 fast.oracle-freeze|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh
 fast.oracle-freeze-selftest|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh --selftest
@@ -211,6 +213,8 @@ fast.cargo-manifest-alignment|fast|supply-chain|true|never|python3 scripts/check
 fast.submodule-remote-reachability|fast,push|supply-chain|true|2026-08-28|python3 scripts/check_submodule_remote_reachability.py
 fast.doc-counts|fast|docs|true|never|bash scripts/check_doc_counts.sh
 slow.frontier-ratchet|slow|frontier|true|never|bash scripts/check_frontier_ratchet.sh
+slow.call-summary-census|slow|frontier|true|2026-08-29|bash scripts/call_summary_census.sh --out reports/call-summary-census-gate
+slow.call-summary-census-aggregator|slow|frontier|true|2026-08-29|bash scripts/call_summary_census.sh --selftest
 slow.upstream-rust-test-toolchain|slow|upstream|true|never|bash scripts/check_upstream_rust_test_toolchain.sh
 release.ay-projection-certificate|release|supply-chain|true|never|bash scripts/check_ay_projection_certificate.sh
 release.trust-mir-extract|release|compile|true|never|bash scripts/check_trust_mir_extract.sh
@@ -350,6 +354,8 @@ release.spec-surface-parity|release|soundness|true|2026-08-27|python3 scripts/ch
 fast.raw-enum-tag-fixtures|fast,release|soundness|true|2026-08-27|python3 scripts/regen_raw_enum_tag_fixtures.py --check
 fast.trust-ir-corpus-lock|fast,release|supply-chain|true|2026-08-27|python3 scripts/trust_ir_corpus_lock.py --check
 release.ratio-strict|release|soundness|true|never|bash scripts/trust_ratio_strict_gate.sh
+release.hex-strict|release|soundness|true|never|bash scripts/trust_hex_strict_gate.sh
+release.utf-strict|release|soundness|true|never|bash scripts/trust_utf_strict_gate.sh
 release.strict-pass-frontier|release|soundness|true|never|bash scripts/trust_strict_pass_frontier.sh
 fast.kernel-authority-vacuity|fast,release|soundness|true|2026-08-28|python3 scripts/check_kernel_authority_vacuity.py
 release.check-all|release|harness|true|never|bash scripts/check_all.sh

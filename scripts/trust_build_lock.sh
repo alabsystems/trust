@@ -79,6 +79,39 @@
 #                           form and no config-file route: an override that can be
 #                           set without typing a sentence is an override that gets
 #                           set once and left on.
+#
+# THE HOLDER PID MUST OUTLIVE THE CRITICAL SECTION, AND THE DEFAULT USED NOT TO.
+# ------------------------------------------------------------------------------
+# `--pid` names the process whose liveness IS the lock's validity: when it dies the
+# lock is stale and the next acquirer reclaims it automatically. The default was
+# `$$` — this script's own pid — and this script exits the instant it prints the
+# token. Measured 2026-08-29 in a scratch root, acquiring exactly the way
+# `call_summary_census.sh` did before it was given `--pid $$`:
+#
+#     token recorded, holder pid 46945, `ps -p 46945` -> DEAD one instant later
+#     a second acquirer with stderr suppressed: token issued, no wait, no message
+#
+# So the lock was BORN STALE and self-released, while `status` still printed HELD.
+# That is the worst failure a guard can have: it reads as protection. It cost a
+# measurement on 2026-08-29 (`E0463: can't find crate for 'core'` after a build
+# took the tree out from under it) and it was the SECOND lock defect that day.
+#
+# The 2026-08-29 fix for the first one was applied at the CALL SITE (census gained
+# `--pid $$`), which leaves every future caller one forgotten flag away from the
+# same silent hole. The durable fix is here:
+#
+#   * the default holder is the lock script's PARENT — the process that invoked
+#     acquire and normally spans the batch. Measured on this host, `$PPID` through
+#     `TOK=$(bash lock.sh acquire ...)` resolves to the CALLER shell, not to a
+#     transient command-substitution subshell, under both sh and bash;
+#   * an unusable `$PPID` (absent, 0, 1, or already dead) REFUSES with the fix
+#     rather than silently falling back to `$$` — a lock that cannot name a
+#     durable holder must not be issued;
+#   * a holder that is already dead at acquire time refuses for the same reason;
+#   * and a stale-holder TAKEOVER is now appended to `.trust-build-lock.breaks`
+#     as well as printed, because every acquiring caller in this tree redirects
+#     the lock's stderr, so a stderr-only notice is invisible exactly when it
+#     matters. Displacing somebody leaves a record whichever route it took.
 set -u
 
 # --------------------------------------------------------------------------
@@ -338,10 +371,56 @@ loud_break() {
 }
 
 # --------------------------------------------------------------------------
+# A takeover is a DISPLACEMENT, so it leaves the same durable trace a hand break
+# does. Reclaiming a dead holder is correct — a crashed lane must not wedge the
+# tree forever — but until 2026-08-29 it announced itself on stderr ONLY, and
+# every acquiring caller in this tree redirects the lock's stderr (the census
+# with `2>/dev/null`, x.py through a pipe). So the one event that says "the lock
+# you thought you held is gone" was invisible precisely where it mattered, and a
+# self-releasing lock looked identical to a lock nobody ever took.
+#
+# `.trust-build-lock.breaks` survives the redirect and is the file a post-mortem
+# already reads. `reason=STALE-TAKEOVER` distinguishes it from a hand break: this
+# one is legitimate, it just must not be silent.
+# --------------------------------------------------------------------------
+loud_takeover() {
+  _why=$1
+  _info=${2:-}
+  err "  ------------------------------------------------------------------"
+  err "  STALE-HOLDER TAKEOVER — $_why"
+  err "  (this is the event scripts/tests/trust_build_lock_test.sh T2 pins)"
+  if [ -n "$_info" ]; then
+    describe_holder "$_info"
+  else
+    err "    holder      (no readable info: malformed, or killed inside the"
+    err "                 one-syscall publish window)"
+  fi
+  err "    taken by    pid $$  ($(id -un 2>/dev/null))"
+  err "    recorded    $BREAKS"
+  err "  If that lane is in fact still running, it is now UNPROTECTED: stop this"
+  err "  one, and give the survivor a --pid that outlives it."
+  err "  ------------------------------------------------------------------"
+  {
+    printf 'when=%s pid=%s user=%s reason=STALE-TAKEOVER (%s)\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$(id -un 2>/dev/null)" "$_why"
+    if [ -n "$_info" ]; then
+      printf '%s\n' "$_info" | sed 's/^/    displaced: /'
+    else
+      printf '    displaced: (no readable holder info)\n'
+    fi
+    printf '\n'
+  } >> "$BREAKS" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
 # acquire
 # --------------------------------------------------------------------------
 cmd_acquire() {
-  KIND=''; PURPOSE='unspecified'; HOLD_PID=$$; WAIT=${TRUST_BUILD_LOCK_WAIT:-0}
+  # HOLD_PID is deliberately left EMPTY here, not defaulted to `$$`. See the
+  # "THE HOLDER PID MUST OUTLIVE THE CRITICAL SECTION" note in the header: `$$` is
+  # this script, which exits milliseconds later, so that default minted a lock that
+  # was stale from birth. It is resolved and validated below, after re-entrancy.
+  KIND=''; PURPOSE='unspecified'; HOLD_PID=''; WAIT=${TRUST_BUILD_LOCK_WAIT:-0}
   BREAK_REASON=${TRUST_BUILD_LOCK_BREAK:-}
   CONTRACT='the build tree is exclusive: do not run x.py or a sweep against it'
   while [ $# -gt 0 ]; do
@@ -373,6 +452,48 @@ cmd_acquire() {
       err "trust-build-lock: already held by this process tree (nested; not re-acquired)"
       return 0
     fi
+  fi
+
+  # ---- Resolve and VALIDATE the holder. A lock is only as good as this pid. ----
+  #
+  # Placed after the re-entrancy check on purpose: a nested acquire that is merely
+  # naming a lock its parent already holds must not be refused over a pid it never
+  # needed. Refusals here carry the fix and the options (design ruling v7/D3).
+  if [ -z "$HOLD_PID" ]; then
+    HOLD_PID=${PPID:-}
+    case "$HOLD_PID" in
+      ''|*[!0-9]*|0|1)
+        err ""
+        err "  TRUST-BUILD-LOCK: REFUSING to issue a lock with no durable holder."
+        err ""
+        err "    --pid was not given and this shell reports no usable parent"
+        err "    (PPID='${PPID:-}'). Defaulting to this script's own pid is what"
+        err "    made the lock self-release on 2026-08-29, so it is not done."
+        err ""
+        err "  Options:"
+        err "    state it   acquire ... --pid \$\$    <- from the process that holds"
+        err "               the tree for the whole batch (the sweep, x.py, the census)"
+        err "    check      the caller must be a long-lived process; a pid that exits"
+        err "               when acquire returns cannot protect anything"
+        err ""
+        return 2 ;;
+    esac
+    err "trust-build-lock: --pid not given; holder inferred as the caller (pid $HOLD_PID)."
+    err "                  Pass --pid \$\$ explicitly from the process that spans the batch."
+  fi
+  if ! pid_is_live "$HOLD_PID" ""; then
+    err ""
+    err "  TRUST-BUILD-LOCK: REFUSING — the named holder pid $HOLD_PID is already dead."
+    err ""
+    err "    A lock whose holder is gone is reclaimed automatically by the next"
+    err "    acquirer, so issuing this one would protect nothing while reading as"
+    err "    protection. Refused at birth instead."
+    err ""
+    err "  Options:"
+    err "    fix        pass --pid \$\$ from the live process that will hold the tree"
+    err "    inspect    ps -p $HOLD_PID"
+    err ""
+    return 2
   fi
 
   TOKEN=$(nonce)
@@ -446,8 +567,8 @@ cmd_acquire() {
       # died inside the one-syscall publish window, or somebody hand-made the
       # directory. Both are reclaimable; say so rather than deadlocking on it.
       if [ -d "$LOCKDIR" ]; then
-        err "trust-build-lock: RECLAIMING a lock with no holder info (malformed or"
-        err "                  killed inside the publish window)"
+        loud_takeover "the lock carries no holder info (malformed, or the winner was\
+ killed inside the one-syscall publish window)" ""
         reclaim || :
       fi
       continue
@@ -456,8 +577,7 @@ cmd_acquire() {
     _hp=$(info_field "$_info" pid)
     _hs=$(info_field "$_info" pstart)
     if ! pid_is_live "$_hp" "$_hs"; then
-      err "trust-build-lock: RECLAIMING a stale lock — holder pid $_hp is gone"
-      err "                  (kind=$(info_field "$_info" kind), purpose=$(info_field "$_info" purpose))"
+      loud_takeover "RECLAIMING a stale lock: holder pid $_hp is gone" "$_info"
       reclaim || err "trust-build-lock: another lane reclaimed it first; retrying"
       continue
     fi
