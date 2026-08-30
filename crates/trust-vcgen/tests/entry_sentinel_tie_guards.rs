@@ -18,16 +18,30 @@
 //! on a cleanup consumer the mint-side clause ("no block of this function could
 //! have minted a `#e` that is not the entry value") and the consumer-side clause
 //! ("this block versions the base, so the tie's bare side is not the subject")
-//! both fire, so deleting either ALONE changes nothing — measured. They are one
-//! guard with two independent reasons, kept apart because they close different
-//! halves (which block minted the symbol vs. what bare means where it is read),
-//! and a shape that defeats one is not thereby licensed by the other.
+//! both fire, so deleting either ALONE changes nothing on THAT shape — measured.
+//! They are one guard with two independent reasons, kept apart because they close
+//! different halves (which block minted the symbol vs. what bare means where it is
+//! read), and a shape that defeats one is not thereby licensed by the other.
+//!
+//! CORRECTED 2026-08-29. This header previously said the consumer-side clause was
+//! "not independently falsifiable" and `entry_sentinel_tie_is_sound`'s doc block
+//! called it "provably dead" with "no fixture isolating it". Both were FALSE:
+//! `no_pin_when_the_defs_gen_key_is_not_its_subject` below isolates it, and on the
+//! clean tree that fixture made the production `debug_assert!` fire — mint side
+//! passing while the consumer side decided. The subsumption argument's step (3)
+//! silently assumed a def's version GEN-KEY is its PIN SUBJECT, which
+//! `block_def_subject`'s split at '#' makes false.
+//!
+//! The clause is therefore KEPT, and what makes it dead is now an ENFORCED
+//! invariant rather than an assumed one: `pin_in_place_update_reads` refuses to pin
+//! any def whose `formula_def_name` is not its subject. That mint-site guard, not
+//! the clause, is what the new fixture tests.
 //!
 //! `mint_side_subsumes_consumer_side` below pins WHY deleting the consumer-side
-//! clause alone changes nothing: the mint side already implies it. That is the
-//! testable claim; the clause itself is not independently falsifiable, and the
-//! shapes that fail to isolate it are the negative controls in
-//! `src/generate/entry_sentinel_tie_subsumption_tests.rs`.
+//! clause alone changes nothing GIVEN that invariant. The shapes that fail to
+//! isolate it are the negative controls in
+//! `src/generate/entry_sentinel_tie_subsumption_tests.rs` — and the reason they all
+//! failed is that the escape is a NAME-SPACE gap, not a control-flow one.
 
 use trust_types::*;
 
@@ -172,8 +186,16 @@ fn cleanup_consumer() -> VerifiableFunction {
 ///
 /// There is NO in-place update here on purpose: the pin's own mint fails closed on
 /// the collision, so if the tie emitter only saw pin-minted symbols this fixture
-/// would be empty. The point is that the emitter scans the FORMULA, where the
-/// colliding local's own reads put `n#e` regardless of what the pin did.
+/// would be empty.
+///
+/// CORRECTED 2026-08-29. This previously claimed "the emitter scans the FORMULA,
+/// where the colliding local's own reads put `n#e` regardless of what the pin did".
+/// That is FALSE, and measured so: a declared local whose name contains '#' COLLAPSES
+/// to its base before any VC ships, so `n#e` never reaches a formula under its own
+/// spelling — it arrives as bare `n`. This fixture therefore passes because the
+/// symbol is absent, not because a refusal fired on it. See
+/// `versioned_param_type_range_guards.rs`, which pins that collapse as a premise and
+/// records the separate pre-existing aliasing hazard it implies.
 fn colliding_local() -> VerifiableFunction {
     func(
         "colliding_local",
@@ -212,6 +234,152 @@ fn colliding_local() -> VerifiableFunction {
             },
         ],
     )
+}
+
+/// A def whose VERSION GEN-KEY is not its PIN SUBJECT.
+///
+/// `pin_in_place_update_reads` rebinds the subject to BARE `subj`, while every kill
+/// and version token keyed on the def uses `formula_def_name` — the WHOLE lhs name.
+/// `block_def_subject` SPLITS that name at '#', so the two disagree exactly when the
+/// lhs name contains '#'. A def of a local named `n#x` then gens the token for `n#x`
+/// and ships a fact whose subject is `n`, a name the entry-version dataflow never saw
+/// written. The COLLISION check refuses only the exact spelling `n#e`, so this
+/// near-miss walked straight past it.
+///
+/// Second ingredient: `block_def_establish_stmt` scans STATEMENTS while the gen-set is
+/// built from DEFS, and `extract_block_definitions_until_impl`'s "skip complex rvalues"
+/// arm emits no def for `CopyForDeref`. So `n = CopyForDeref(c)` establishes `n` and
+/// versions nothing.
+///
+/// * bb1 (WRITER): `n#x = n / 3` — the def the pin fires on, subject splitting to `n` —
+///   then `n = CopyForDeref(c)`, `n`'s establish point, which emits no def. bb1's
+///   version gen-set is `{n#x}`: it never versions `n`.
+/// * bb2 (SIBLING, not an ancestor of the consumer): `n = 7`, purely so `n` lands in
+///   `all_names` and is TRACKED in every block's entry map — which is what makes the
+///   MINT-SIDE clause pass.
+/// * bb3 (CONSUMER): `out = 100 / n`. Entry map TRACKS `n` (mint side passes) with the
+///   value `{e}` (consumer side would refuse).
+///
+/// This is the first fixture in the crate that plants a violation of the pin's
+/// gen-key/subject invariant, and it is why that invariant is now enforced at the
+/// mint site rather than assumed.
+fn split_subject_escape() -> VerifiableFunction {
+    let u32_local = |index: usize, name: &str| LocalDecl {
+        index,
+        ty: Ty::u32(),
+        name: Some(name.into()),
+    };
+    VerifiableFunction {
+        name: "split_subject_escape".into(),
+        def_path: "tie_guard::split_subject_escape".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            return_ty: Ty::u32(),
+            locals: vec![
+                u32_local(0, "__ret"),
+                u32_local(1, "n"),
+                u32_local(2, "c"),
+                u32_local(3, "out"),
+                // Literally named with a '#'. NOT `n#e` — the COLLISION check
+                // refuses only that exact spelling.
+                u32_local(4, "n#x"),
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(2)),
+                        targets: vec![(0, BlockId(1))],
+                        otherwise: BlockId(2),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Div,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(3, 32)),
+                            ),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(1),
+                            rvalue: Rvalue::CopyForDeref(Place::local(2)),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(1),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 32))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(4)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Div,
+                            Operand::Constant(ConstValue::Uint(100, 32)),
+                            Operand::Copy(Place::local(1)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 2,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+/// The MINT-SITE invariant: a def may be pinned only where its gen-key IS its subject.
+///
+/// PLANTED AND WATCHED: delete the `formula_def_name(&def) != Some(subj.as_str())`
+/// guard from `pin_in_place_update_reads` and this fails on the production oracle —
+///
+/// ```text
+/// panicked at trust-vcgen/src/generate/path_defs.rs:1627:5:
+/// `split_subject_escape`: mint-side passed yet `n` still renders BARE at
+/// BlockId(3)/1 — the consumer-side clause is LIVE again
+/// ```
+///
+/// — i.e. the mint side passes while the consumer side DECIDES, which is exactly the
+/// implication `entry_sentinel_tie_is_sound`'s argument rests on.
+#[test]
+fn no_pin_when_the_defs_gen_key_is_not_its_subject() {
+    assert!(
+        cfg!(debug_assertions),
+        "the production `debug_assert!` oracle is inert without debug assertions; \
+         run this in the dev profile"
+    );
+    let f = split_subject_escape();
+    trust_vcgen::validate_function(&f).expect("the fixture must be VALID TrustIR");
+    let vcs = trust_vcgen::generate_vcs(&f);
+    assert!(
+        !vcs.iter().any(|vc| vc.formula.free_variables().iter().any(|v| v.ends_with("#e"))),
+        "the pin minted `#e` for a def whose gen-key it does not own; the shipped \
+         bare subject names a place the entry-version dataflow never saw written, \
+         leaving the consumer-side clause as the only refusal standing"
+    );
+    assert!(ties(&vcs).is_empty(), "{:?}", ties(&vcs));
 }
 
 #[test]
@@ -291,6 +459,7 @@ fn mint_side_subsumes_consumer_side() {
     for (label, func) in corpus().into_iter().chain([
         ("cleanup_consumer".to_string(), cleanup_consumer()),
         ("colliding_local".to_string(), colliding_local()),
+        ("split_subject_escape".to_string(), split_subject_escape()),
     ]) {
         if !ties(&trust_vcgen::generate_vcs(&func)).is_empty() {
             tied.push(label);
@@ -304,7 +473,11 @@ fn mint_side_subsumes_consumer_side() {
     tied.sort();
     assert_eq!(
         tied,
-        vec!["entry_block_in_place_update", "join_weakened_entry_sentinel"],
+        vec![
+            "entry_block_in_place_update",
+            "entry_sentinel_unranged_overflow_tied_control",
+            "join_weakened_entry_sentinel",
+        ],
         "the corpus no longer exercises the tie where it was measured; re-anchor \
          this list or the subsumption guard is running over nothing"
     );

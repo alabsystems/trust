@@ -2,7 +2,7 @@ rustdoc [options] <input>
 
 Options:
     -h, --help          show this help message
-    -V, --version       print rustdoc's version
+    -V, --version       print this documentation tool's version
     -v, --verbose       use verbose output
     -w, --output-format [html]
                         the output type to write
@@ -16,10 +16,10 @@ Options:
                         for the compiler to emit
     -L, --library-path DIR
                         directory to add to crate search path
-        --cfg           pass a --cfg to rustc
-        --check-cfg     pass a --check-cfg to rustc
+        --cfg           pass a --cfg to trustc
+        --check-cfg     pass a --check-cfg to trustc
         --extern NAME[=PATH]
-                        pass an --extern to rustc
+                        pass an --extern to trustc
         --extern-html-root-url NAME=URL
                         base URL to use for dependencies; for example,
                         "std=/doc" links std::vec::Vec to
@@ -28,7 +28,7 @@ Options:
                         give precedence to `--extern-html-root-url`, not
                         `html_root_url`
     -C, --codegen OPT[=VALUE]
-                        pass a codegen option to rustc
+                        pass a codegen option to trustc
         --document-private-items 
                         document private items
         --document-hidden-items 
@@ -66,7 +66,7 @@ Options:
     -e, --extend-css PATH
                         To add some CSS rules with a given file to generate
                         doc with your own theme. However, your theme might
-                        break if the rustdoc's generated HTML changes, so be
+                        break if trustdoc's generated HTML changes, so be
                         careful!
     -Z FLAG             unstable / perma-unstable options (only on nightly
                         build)
@@ -89,7 +89,7 @@ Options:
                         themes, and the rustdoc built-in default, are not
                         stable.
         --default-setting SETTING[=VALUE]
-                        Default value for a rustdoc setting (used when
+                        Default value for a trustdoc setting (used when
                         "rustdoc-SETTING" is absent from web browser Local
                         Storage). If VALUE is not supplied, "true" is used.
                         Supported SETTINGs and VALUEs are not documented and
@@ -145,21 +145,21 @@ Options:
         --test-runtool-arg One argument (of possibly many) to pass to the runtool
                         
         --test-builder PATH
-                        The rustc-like binary to use as the test builder
+                        The trustc-like binary to use as the test builder
         --test-builder-wrapper PATH
                         Wrapper program to pass test-builder and arguments
-        --check         Run rustdoc checks
+        --check         Run trustdoc checks
         --generate-redirect-map 
                         Generate JSON file at the top level instead of
                         generating HTML redirection files
         --emit [html-static-files,html-non-static-files,dep-info]
-                        Comma separated list of types of output for rustdoc to
-                        emit
+                        Comma separated list of types of output for trustdoc
+                        to emit
         --no-run        Compile doctests without running them
         --merge-doctests yes|no|auto
                         Force all doctests to be compiled as a single binary,
                         instead of one binary per test. If merging fails,
-                        rustdoc will emit a hard error.
+                        trustdoc will emit a hard error.
         --remap-path-scope [macro,diagnostics,debuginfo,coverage,object,all]
                         Defines which scopes of paths should be remapped by
                         `--remap-path-prefix`
@@ -206,23 +206,13 @@ Options:
                         code pages
         --plugin-path DIR
                         removed, see issue #44136
-                        <https://github.com/rust-lang/rust/issues/44136> for
-                        more information
         --passes PASSES removed, see issue #44136
-                        <https://github.com/rust-lang/rust/issues/44136> for
-                        more information
         --plugins PLUGINS
                         removed, see issue #44136
-                        <https://github.com/rust-lang/rust/issues/44136> for
-                        more information
         --no-defaults   removed, see issue #44136
-                        <https://github.com/rust-lang/rust/issues/44136> for
-                        more information
     -r, --input-format [rust]
                         removed, see issue #44136
-                        <https://github.com/rust-lang/rust/issues/44136> for
-                        more information
 
     @path               Read newline separated options from `path`
 
-More information available at https://doc.rust-lang.org/$CHANNEL/rustdoc/what-is-rustdoc.html
+More information is shipped with this toolchain's documentation for rustdoc.

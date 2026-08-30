@@ -201,6 +201,7 @@ fast.mir-transform-ratchet-selftest|fast,push,release|drift|true|2026-08-27|bash
 fast.call-summary-labels|fast,push|drift|true|2026-08-29|python3 scripts/check_call_summary_labels.py
 fast.call-summary-labels-selftest|fast,push|drift|true|2026-08-29|python3 scripts/check_call_summary_labels.py --selftest
 fast.pin-coherence|fast,push|supply-chain|true|2026-08-27|bash scripts/check_pin_coherence.sh
+fast.dependency-constellation|fast,push,release|supply-chain|true|never|if test -f docs/audits/first-party-constellation-v2.json; then scripts/check_dependency_cycle_anchor.py; else scripts/check_dependency_cycle_anchor.py --print-receipt >/dev/null; fi
 fast.oracle-freeze|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh
 fast.oracle-freeze-selftest|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh --selftest
 fast.revert-rationale|fast,push|soundness|true|never|bash scripts/check_revert_rationale.sh --push-context
@@ -356,6 +357,16 @@ fast.trust-ir-corpus-lock|fast,release|supply-chain|true|2026-08-27|python3 scri
 release.ratio-strict|release|soundness|true|never|bash scripts/trust_ratio_strict_gate.sh
 release.hex-strict|release|soundness|true|never|bash scripts/trust_hex_strict_gate.sh
 release.utf-strict|release|soundness|true|never|bash scripts/trust_utf_strict_gate.sh
+release.endian-strict|release|soundness|true|never|bash scripts/trust_endian_strict_gate.sh
+release.varint-strict|release|soundness|true|never|bash scripts/trust_varint_strict_gate.sh
+release.index-strict|release|soundness|true|never|bash scripts/trust_index_strict_gate.sh
+release.checksum-strict|release|soundness|true|never|bash scripts/trust_checksum_strict_gate.sh
+release.radix64-strict|release|soundness|true|never|bash scripts/trust_radix64_strict_gate.sh
+release.align-strict|release|soundness|true|never|bash scripts/trust_align_strict_gate.sh
+release.fixed-strict|release|soundness|true|never|bash scripts/trust_fixed_strict_gate.sh
+release.interval-strict|release|soundness|true|never|bash scripts/trust_interval_strict_gate.sh
+release.timearith-strict|release|soundness|true|never|bash scripts/trust_timearith_strict_gate.sh
+release.bits-strict|release|soundness|true|never|bash scripts/trust_bits_strict_gate.sh
 release.strict-pass-frontier|release|soundness|true|never|bash scripts/trust_strict_pass_frontier.sh
 fast.kernel-authority-vacuity|fast,release|soundness|true|2026-08-28|python3 scripts/check_kernel_authority_vacuity.py
 release.check-all|release|harness|true|never|bash scripts/check_all.sh
@@ -540,6 +551,7 @@ def as_date(value):
 
 divergences, ledger_errors = load_ledger(ledger_path)
 today = date.today()
+UNQUARANTINABLE_GATE_IDS = {"fast.dependency-constellation"}
 
 rows: list[dict] = []
 non_evidence_categories = {"non-evidence-regression-diagnostic"}
@@ -564,6 +576,9 @@ with results_path.open("r", encoding="utf-8", newline="") as fh:
 
 def matching_divergences(row: dict) -> list[dict]:
     if row["exit_code"] == 0:
+        return []
+    if row["gate_id"] in UNQUARANTINABLE_GATE_IDS:
+        # Dependency authority cannot be replaced by a divergence ledger row.
         return []
     matches: list[dict] = []
     for divergence in divergences:
@@ -656,6 +671,7 @@ report = {
         "upstream_per_test_ledger": "tests/upstream-rust/test-exceptions.toml",
         "trust_added_compiletest_ledger": "tests/trust-added/compiletest-exceptions.toml",
         "command_divergence_ledger": rel(str(ledger_path)),
+        "unquarantinable_gate_ids": sorted(UNQUARANTINABLE_GATE_IDS),
     },
     "summary": {
         "total": len(rows),

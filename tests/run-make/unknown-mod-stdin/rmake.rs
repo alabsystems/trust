@@ -23,5 +23,10 @@ fn main() {
         .actual_text("actual-stderr", out.stderr_utf8())
         .expected_file("unknown-mod.stderr")
         .normalize(r#"\\"#, "/")
+        // Trust: the `--explain` hint names the driver that was INVOKED
+        // (`trustc` branded, `rustc` under `--trust-vanilla`), and one
+        // snapshot is compared by both lanes. Fold it here so the snapshot
+        // stays upstream-pristine.
+        .normalize(r"trustc --explain", "rustc --explain")
         .run();
 }

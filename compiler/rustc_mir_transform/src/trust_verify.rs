@@ -20225,16 +20225,51 @@ fn rekey_verified_assert_refutations_onto_unknown_duplicates(
 /// Soundness: the substituted result comes from a real `ay` solve. A vacuous
 /// proof is still rejected downstream by `apply_vacuity_gate`, and obligations
 /// `ay` cannot decide remain unknown and fail closed. Postconditions and user
-/// assertions accept only strict Proved results because their generic VCs may
-/// over-approximate body values: UNSAT of an over-approximation is a proof, but
-/// SAT need not be an executable trace. Assertion refutations are owned by
-/// [`refute_full_assert_obligations`], whose bidirectional and per-path lanes
-/// independently establish exact grounding. For every other kind, a Failed
-/// result crosses the bridge only when the formula's free values are stable
-/// source parameters or are functionally pinned by its own top-level
-/// definitions. This is the same fail-closed entry-grounding gate used by the
-/// call-site replay lane; a free opaque call result can therefore cost a
-/// refutation, never invent one.
+/// assertions accept only strict Proved results; preconditions and L0 safety
+/// obligations retain symmetric Proved/Failed substitution. The two asymmetries
+/// are KIND-based and are argued at their arms below.
+///
+/// WHY THERE IS NO ENTRY-GROUNDING GATE HERE (2026-08-29, measured).
+/// `bc65b2ca7d` + `017a2a2af5` made every arm of this predicate additionally
+/// require `trust_vcgen::composed_formula_is_caller_entry_grounded`. That
+/// predicate belongs to the CALL-SITE REPLAY lane, where the formula is
+/// assembled out of caller ENTRY state plus block defs, so "every free var is an
+/// entry-stable parameter or `Eq`-pinned" is a standard a well-formed candidate
+/// can meet. An ORDINARY body VC cannot meet it even in principle: its free
+/// variables are the function's own modelled state — MIR temps (`_7`), versioned
+/// SSA reads of reassigned locals (`remain#s0_3_s4_0`), discriminant model vars
+/// (`__trust_mir__discr__6`), `__slice_len` companions of non-parameter locals
+/// (`_4__slice_len#s0_1`), the BV companions of an integer parameter
+/// (`__trust_ovf_bv_lhs_a`) and projections of all of these. What makes those
+/// denote a real execution is the path condition and block defs already
+/// conjoined into the VC, not an `Eq` pin the predicate can find. Widening the
+/// predicate to accept those shapes is the same thing as not applying it.
+///
+/// MEASURED (`TRUST_GROUND_DEBUG=1`, frozen 154-fixture mutant corpus, gate
+/// predicates copied from `scripts/trust_falsification_gate.sh`): the grounding
+/// requirement cost 88 fixtures that refuted at `70a7534fd1` — 152 refuted / 2
+/// incomplete became 64 / 90 — and protected NONE of the four `BRwitness`
+/// controls it was written for. `w1_dynfn_dest_unguarded` reaches the predicate
+/// with `free=[]`, `verdict=true`; `w1_opaque_dest_precond` and
+/// `w3_extern_dest_unguarded` refuted THROUGH the gate anyway; and
+/// `w2_dynfn_dest_guarded`, which must PROVE, was over-rejected by it. Dropping
+/// the requirement and keeping only the kind polarity gives 143 refuted / 11
+/// incomplete with all four controls exactly as `origin/main` has them and the
+/// 134-fixture `proved/` lane unchanged at 126 proved / 8 incomplete / 0
+/// refuted.
+///
+/// The refutation-side protection those commits wanted for a HAVOC'D CALL
+/// DESTINATION is implemented, narrowly and at the right seam, by
+/// `trust_vcgen::generate::havoc_decline` (landed `b4fd4c0e43`, two days
+/// earlier): an obligation whose subject's ONLY value source is an unmodelled
+/// callee's `Call` destination, which nothing in the hypotheses pins and whose
+/// truth FLIPS as that value moves over its declared type range, is
+/// reclassified to `VcKind::UnsupportedMir` before it ever reaches a solver.
+/// That is a property of the MIR, checked once, and it cannot cost a decision
+/// the verifier can actually make. It is not quite complete — it demotes the
+/// `trust.vc` row for `w1`'s index check but not the sibling `assert` row that
+/// restates the same violation — which is why the `Assertion` arm below is
+/// load-bearing and stays.
 ///
 /// Native `ArithmeticSafety` Unsupported rows are deliberately included. A
 /// complete canonical VC is the primary bridge identity when it occurs exactly
@@ -20254,29 +20289,60 @@ fn rekey_verified_assert_refutations_onto_unknown_duplicates(
 /// VCs are never bridge endpoints. They are excluded from match population,
 /// re-keying, solving, and substitution; their dedicated sealed discharge lanes
 /// remain the only way they can acquire authority.
-fn bridge_ay_verdict_is_admissible(
-    kind: &VcKind,
-    result: &VerificationResult,
-    refutation_is_entry_grounded: bool,
-) -> bool {
+fn bridge_ay_verdict_is_admissible(kind: &VcKind, result: &VerificationResult) -> bool {
     match kind {
-        // These generic formulas can over-approximate body values. UNSAT is
-        // monotone-safe; SAT is not a source execution. Assertions have their
-        // own exact-grounding refutation lanes later in the full pipeline.
+        // Trust (contract-completeness inc-1): a `VcKind::Postcondition` is admitted to
+        // ay to PROVE a self-contained body-fact-conjoined violation goal by strict
+        // UNSAT — but its formula can be SATisfiable for a *valid* contract whose body
+        // facts the formula under-approximates (e.g. the
+        // `postcondition_references_mutated_param` fail-closed shape emits `Not(post)`
+        // over FREE params). An ay `Failed` there is NOT a sound refutation of the
+        // contract, so for `Postcondition` bridge ONLY an ay `Proved` (a strict-checked
+        // ∀-inputs UNSAT proof); a SAT/Unknown stays fail-closed (Unknown), which the
+        // downstream reclassify handles and which a genuinely-false contract also lands
+        // in (never a false PROVE).
+        //
+        // A user `Assertion` is proof-only here for a DIFFERENT and MEASURED
+        // reason (2026-08-29). Its generic body formula can range over a value
+        // the body does not constrain — the `BRwitness/w1_dynfn_dest_unguarded`
+        // shape, `let j = p(i); a[j]` through a `dyn Fn`. `havoc_decline`
+        // demotes the `trust.vc` row for that index check to `UnsupportedMir`,
+        // but the SIBLING `assert` row carries the same violation formula and
+        // would cross this bridge as `ay-in-process` FAILED — a counterexample
+        // over a value the unmodelled callee chooses, not one any execution
+        // produces. Assertion REFUTATION is owned by
+        // `refute_full_assert_obligations`, whose bidirectional and per-path
+        // lanes establish exact grounding themselves. MEASURED on the frozen
+        // 154-fixture mutant corpus: this arm alone is what keeps `w1` at
+        // `incomplete`; its cost is 5 fixtures that refute without it
+        // (`external_call_guarded`, `match_exhaustive_enum`,
+        // `modulo_unreachable`, `try_convert_from_panic`,
+        // `user_ord_btreemap_get`), each of which stays a build ERROR, just a
+        // fail-closed one rather than a counterexample.
         VcKind::Postcondition | VcKind::Assertion { .. } => {
             matches!(result, VerificationResult::Proved { .. })
         }
-        // Proofs for this kind are deliberately owned by the structural dead-
-        // trap lane; only a concrete reachability witness crosses this bridge.
-        VcKind::Unreachable => {
-            refutation_is_entry_grounded
-                && matches!(result, VerificationResult::Failed { .. })
-        }
-        _ => {
-            matches!(result, VerificationResult::Proved { .. })
-                || (refutation_is_entry_grounded
-                    && matches!(result, VerificationResult::Failed { .. }))
-        }
+        // Trust (falsification regression 2026-08-13): REFUTE-ONLY, the mirror
+        // image of the `Postcondition` asymmetry above. ay SAT on an unreachable
+        // trap's reachability formula is a REAL counterexample (a concrete input
+        // reaches `unreachable_unchecked` — UB), so `Failed` substitutes. An ay
+        // `Proved` is NOT substituted: a dead trap is discharged by
+        // `promote_structurally_dead_unreachable` on the propositional-UNSAT
+        // evidence it already requires, and routing proof authority for this kind
+        // through the bridge would add a trust edge for no gain. Fail-closed:
+        // Unknown/Timeout keep the existing verdict.
+        VcKind::Unreachable => matches!(result, VerificationResult::Failed { .. }),
+        // A caller-side `Precondition`'s formula is the negated precondition with
+        // the call's ACTUAL arguments substituted (`Not(P[σ])`), a grounded goal
+        // where ay SAT IS a real counterexample (a caller input violates the
+        // callee's assumed precondition — #5-PRE-A). Suppressing that `Failed`
+        // would let an unmet precondition (a latent callee L0 panic) ship green,
+        // so `Precondition` keeps the full `definitive` substitution (both Proved
+        // and Failed). Likewise every L0 safety kind.
+        _ => matches!(
+            result,
+            VerificationResult::Proved { .. } | VerificationResult::Failed { .. }
+        ),
     }
 }
 
@@ -20292,7 +20358,6 @@ fn demote_inadmissible_generic_refutation(result: &mut VerificationResult, reaso
 }
 
 fn bridge_v1_ay_proofs_into_native_results(
-    func: &trust_types::VerifiableFunction,
     per_vc_timeout_ms: u64,
     deadline: Option<std::time::Instant>,
     solver_vcs: &[VerificationCondition],
@@ -20395,28 +20460,14 @@ fn bridge_v1_ay_proofs_into_native_results(
     let is_bridgeable_result_row = |index: usize, vc: &VerificationCondition| {
         !catalog_marker_rows.contains(&index) && is_semantically_bridgeable(vc)
     };
-    // The native composite can already carry a definitive child SAT verdict
-    // before this bridge runs.  Applying the polarity gate only to freshly
-    // solved `by_key` entries leaves that preexisting verdict untouched (and,
-    // for assertions, turns an over-approximating body formula into a public
-    // counterexample even though its nested proof evidence was demoted to
-    // Unknown).  Normalize every generic bridge row at the ingress seam.  This
-    // is classification-only and fail-closed: strict verification still rejects
-    // Unknown, but no unsupported SAT model is accused of being a source trace.
-    for (index, (vc, result)) in results.iter_mut().enumerate() {
-        if !is_bridgeable_result_row(index, vc)
-            || !matches!(result, VerificationResult::Failed { .. })
-        {
-            continue;
-        }
-        let grounded = trust_vcgen::composed_formula_is_caller_entry_grounded(func, &vc.formula);
-        if !bridge_ay_verdict_is_admissible(&vc.kind, result, grounded) {
-            demote_inadmissible_generic_refutation(
-                result,
-                "generic full-verifier SAT was not admissible as a source refutation; the exact specialized producer-fidelity lane must establish reachability",
-            );
-        }
-    }
+    // NOTE (2026-08-29): `017a2a2af5` ran an ingress-seam demotion loop here that
+    // rewrote every PREEXISTING native `Failed` on a bridgeable row to `Unknown`
+    // whenever the entry-grounding gate rejected its formula. Measured, that gate
+    // rejects essentially every ordinary body VC (see
+    // `bridge_ay_verdict_is_admissible`), so the loop demoted 25 further genuine
+    // refutations on the frozen corpus (51 -> 26) without protecting any witness.
+    // It is removed with the gate; the polarity asymmetries that remain are
+    // applied where they always were, to results this bridge itself produces.
     let mut solver_vc_count_by_key: FxHashMap<LocKey, usize> = FxHashMap::default();
     let mut solver_vc_count_by_exact: FxHashMap<String, usize> = FxHashMap::default();
     for vc in solver_vcs.iter().filter(|vc| is_semantically_bridgeable(vc)) {
@@ -20481,14 +20532,15 @@ fn bridge_v1_ay_proofs_into_native_results(
             && exact_semantic_match(&entry.0, vc)
         {
             // A generic native label can be permissive while the precise v1
-            // replacement reveals proof-only semantics (most importantly an
-            // Assertion/Postcondition).  Re-keying must not carry the old SAT
-            // verdict across that semantic boundary.  Demote first; the normal
-            // bridge solve below may still recover an admissible proof.
-            let replacement_grounded =
-                trust_vcgen::composed_formula_is_caller_entry_grounded(func, &vc.formula);
+            // replacement reveals proof-only semantics (most importantly a
+            // Postcondition).  Re-keying must not carry the old SAT verdict
+            // across that semantic boundary.  Demote first; the normal bridge
+            // solve below may still recover an admissible proof.  This is the
+            // one seam of `017a2a2af5` that survives the entry-grounding
+            // revert: it now fires ONLY on the kind-polarity asymmetry, never
+            // on a grounding judgement about an ordinary body VC.
             if matches!(&entry.1, VerificationResult::Failed { .. })
-                && !bridge_ay_verdict_is_admissible(&vc.kind, &entry.1, replacement_grounded)
+                && !bridge_ay_verdict_is_admissible(&vc.kind, &entry.1)
             {
                 demote_inadmissible_generic_refutation(
                     &mut entry.1,
@@ -20649,13 +20701,7 @@ fn bridge_v1_ay_proofs_into_native_results(
             .next()
             && definitive(&res)
         {
-            let refutation_is_entry_grounded =
-                trust_vcgen::composed_formula_is_caller_entry_grounded(func, &vc.formula);
-            if bridge_ay_verdict_is_admissible(
-                &vc.kind,
-                &res,
-                refutation_is_entry_grounded,
-            ) {
+            if bridge_ay_verdict_is_admissible(&vc.kind, &res) {
                 by_key.entry(candidate_key).or_insert((vc, res, None));
                 continue;
             }
@@ -20679,21 +20725,16 @@ fn bridge_v1_ay_proofs_into_native_results(
         else {
             continue;
         };
-        // Postconditions and assertions remain proof-only at this generic seam;
-        // their specialized lanes own refutation. Preconditions and L0 safety
-        // kinds retain SAT/refutation behavior only after the exact formula
-        // passes the caller-entry grounding gate below. Thus `Not(P[σ])` over
-        // stable actuals can still expose an unmet precondition, while the same
-        // shape over a havoc'd call destination stays Unknown. `Unreachable`
-        // remains refute-only and is subject to the same gate; its proof
-        // direction stays owned by `promote_structurally_dead_unreachable`.
-        let refutation_is_entry_grounded =
-            trust_vcgen::composed_formula_is_caller_entry_grounded(func, &vc.formula);
-        let accept = bridge_ay_verdict_is_admissible(
-            &vc.kind,
-            &res,
-            refutation_is_entry_grounded,
-        );
+        // Postconditions remain proof-only at this generic seam and
+        // `Unreachable` remains refute-only (its proof direction stays owned by
+        // `promote_structurally_dead_unreachable`). Preconditions and every L0
+        // safety kind keep symmetric Proved/Failed substitution: `Not(P[σ])`
+        // over the call's actuals is a grounded goal whose SAT is a real
+        // caller-side counterexample, and an L0 body VC's SAT is the ordinary
+        // refutation this whole lane exists to deliver. The havoc'd-call-dest
+        // shape is declined upstream by `trust_vcgen`'s `havoc_decline`, not
+        // here.
+        let accept = bridge_ay_verdict_is_admissible(&vc.kind, &res);
         if !accept {
             continue;
         }
@@ -20778,21 +20819,11 @@ fn bridge_v1_ay_proofs_into_native_results(
                 continue;
             }
             // Central backstop for every producer above, including specialized
-            // seeds inserted directly into `by_key`: no SAT result crosses the
-            // generic bridge unless the exact replacement formula is
-            // entry-grounded. Keeping this at the substitution seam prevents a
-            // future backend branch from accidentally bypassing the polarity
-            // gate.
-            let refutation_is_entry_grounded =
-                trust_vcgen::composed_formula_is_caller_entry_grounded(
-                    func,
-                    &bridged_vc.formula,
-                );
-            if !bridge_ay_verdict_is_admissible(
-                &bridged_vc.kind,
-                bridged_res,
-                refutation_is_entry_grounded,
-            ) {
+            // seeds inserted directly into `by_key`: the kind-polarity
+            // asymmetry (proof-only `Postcondition`, refute-only `Unreachable`)
+            // holds at the substitution seam too, so a future backend branch
+            // cannot bypass it by seeding `by_key` directly.
+            if !bridge_ay_verdict_is_admissible(&bridged_vc.kind, bridged_res) {
                 continue;
             }
             if !result_bindings[index].as_mut().is_some_and(|binding| {
@@ -22136,7 +22167,6 @@ fn collect_full_verification_artifacts_once<'tcx>(
     // the artifact-backed in-process ay backend discharge what it left unproved.
     let (mut results, _bridged_proved, _bridged_failed, mut revalidation_eligibilities) =
         bridge_v1_ay_proofs_into_native_results(
-            func,
             vc_timeout_ms(tcx.sess),
             context.deadline,
             solver_vcs,
@@ -30171,12 +30201,121 @@ impl<'a> NativeObligationScopes<'a> {
     }
 }
 
+/// The safety class of an obligation, recovered from its description.
+///
+/// Both lanes derive their description from the SAME MIR `AssertMessage`, so
+/// this is a shared key rather than a coincidence of wording. It exists because
+/// a range alone is ambiguous: `let d = a / b` mints TWO obligations at the
+/// identical span (the divisor-nonzero check and the signed `MIN / -1` overflow
+/// check), and only the class tells them apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeTrustIrSafetyClass {
+    DivisionByZero,
+    Overflow,
+    Bounds,
+}
+
+fn native_trust_ir_safety_class(description: &str) -> Option<NativeTrustIrSafetyClass> {
+    if description.contains("division by zero") || description.contains("remainder by zero") {
+        Some(NativeTrustIrSafetyClass::DivisionByZero)
+    } else if description.contains("arithmetic overflow") || description.contains("overflow on") {
+        Some(NativeTrustIrSafetyClass::Overflow)
+    } else if description.contains("array bounds check")
+        || description.contains("index out of bounds")
+    {
+        Some(NativeTrustIrSafetyClass::Bounds)
+    } else {
+        None
+    }
+}
+
+/// One bridge-established `(range, class) -> site` binding, captured before the
+/// bridge's private inventory is cleared.
+struct NativeTrustIrCapturedSite {
+    range: trust_ir::ProofObligationSourceRange,
+    class: NativeTrustIrSafetyClass,
+    site: trust_ir::ObligationSite,
+}
+
+/// Resolve the `ObligationSite` for a public obligation row by INHERITING the
+/// binding the MIR bridge already established, rather than re-deriving it.
+///
+/// # Why this is not a span lookup over the body
+///
+/// It was, and that was wrong — measured, not reasoned. On this lane every
+/// `InstrNode` ships `span: None` (0 of 39 nodes in the three-op fixture carry
+/// one), so a resolver that walks the body looking for an assert at the row's
+/// span matches nothing and every row ships site-less. The span data that DOES
+/// exist on this lane lives on the obligations, not on the instructions.
+///
+/// The direct THIR lane is the opposite: its asserts carry `#loc:` and its
+/// nodes are matchable. A resolver written against that lane's shape does not
+/// transfer here, which is precisely the assumption that produced the dead
+/// first version of this function.
+///
+/// # Why inheriting is sounder than re-deriving
+///
+/// The bridge binds a site at EMISSION — `add_obligation_for_last_inst`, the
+/// instruction it just pushed — so the binding is structural, not a match. That
+/// inventory is then deliberately dropped by
+/// [`reset_native_trust_ir_proof_inventory_to_public_bundle`] because bridge
+/// rows are not public proof units. Only the ID scaffolding needs dropping,
+/// though; the `(range, class) -> site` fact is lane-independent and is what
+/// this recovers.
+///
+/// # Fail closed
+///
+/// A non-UNIQUE match returns `None` and the row ships site-less, following the
+/// rule the bridge states for the same problem — "a site invented from the
+/// function alone would claim a binding the bridge did not establish". A wrong
+/// site is worse than no site: it binds a verifier to the wrong solver
+/// condition while looking correct in review.
+///
+/// A site names an INSTRUCTION. It is not a claim of 1:1 correspondence with
+/// solver conditions — the CHC translator emits error rules of its own for
+/// `sdiv` (measured: 4 asserts -> 6 error rules), so any consumer that assumes
+/// a bijection is wrong independently of this function.
+fn native_trust_ir_obligation_site(
+    captured: &[NativeTrustIrCapturedSite],
+    function_id: trust_ir::FuncId,
+    file: u32,
+    source: &trust_verifier_api::SourceLocation,
+    description: &str,
+) -> Option<trust_ir::ObligationSite> {
+    // Built from the SAME fields, in the same order, that the public row's own
+    // `ProofObligationSourceRange` is built from further down this pass. If that
+    // construction ever changes, this must change with it or the key silently
+    // stops matching -- which shows up as every row losing its site, the exact
+    // failure this function's first version shipped.
+    let start_line = source.line?;
+    let start_col = source.column?;
+    let end_line = source.end_line.unwrap_or(start_line);
+    let end_col = source.end_column.unwrap_or(start_col);
+    let class = native_trust_ir_safety_class(description)?;
+    let mut hits = captured.iter().filter(|candidate| {
+        candidate.class == class
+            && candidate.range.file == file
+            && candidate.range.start_line == start_line
+            && candidate.range.start_col == start_col
+            && candidate.range.end_line == end_line
+            && candidate.range.end_col == end_col
+            && candidate.site.function == function_id
+    });
+    let first = hits.next()?;
+    // A second hit means the key did not separate two distinct instructions.
+    // Ship site-less rather than pick one.
+    if hits.next().is_some() {
+        return None;
+    }
+    Some(first.site)
+}
+
 fn append_verifier_api_obligations_to_native_trust_ir(
     module: &mut trust_ir::Module,
     scopes: &NativeObligationScopes<'_>,
     bundle: &mut trust_verifier_api::TrustContractBundle,
 ) -> Result<Vec<PendingNativeTrustIrBinding>, String> {
-    reset_native_trust_ir_proof_inventory_to_public_bundle(module);
+    let captured_sites = reset_native_trust_ir_proof_inventory_to_public_bundle(module);
     let mut next_proof_id = 0;
     // Freeze exact compiler-owned source bindings before this planner adds any
     // transport annotations. A public row can nominate a VC index, but only a
@@ -30334,6 +30473,39 @@ fn append_verifier_api_obligations_to_native_trust_ir(
             // the root for every row, exactly as the scalar parameter was.
             .with_function(owner.function_id),
         );
+        // Bind the row to the exact instruction it is about, by inheriting the
+        // binding the bridge established at emission. `None` leaves the row
+        // site-less rather than guessing.
+        //
+        // The file is looked up WITHOUT interning, deliberately. `intern_file`
+        // appends on a miss, and a miss is reachable here: a function whose
+        // every assert was discharged at the bridge mints no bridge obligation,
+        // so nothing interned its file — while vcgen still ships the public
+        // row. Interning would then grow `module.files`, a SERIALIZED table,
+        // as a side effect of what is a guaranteed-failed match (a file absent
+        // from the table cannot equal any captured range's index), moving the
+        // sealed module's stable digest and leaving an entry that no range or
+        // span points at. Absence from the table simply means "no site".
+        let obligation_file = obligation
+            .source
+            .file
+            .as_deref()
+            .filter(|file| !file.is_empty())
+            .and_then(|file| module.files.iter().position(|known| known == file))
+            .map(|index| index as u32);
+        if let Some(site) = obligation_file.and_then(|file| {
+            native_trust_ir_obligation_site(
+                &captured_sites,
+                owner.function_id,
+                file,
+                &obligation.source,
+                &obligation.description,
+            )
+        }) {
+            if let Some(row) = module.proof_obligations.last_mut() {
+                *row = row.clone().with_site(site);
+            }
+        }
         bindings.push(PendingNativeTrustIrBinding {
             obligation_index,
             verifier_suite,
@@ -30376,7 +30548,27 @@ fn append_verifier_api_obligations_to_native_trust_ir(
 /// Drop every side table and back-reference tied to the bridge-local IDs, while
 /// preserving semantic instruction/function annotations (`NoOverflow`,
 /// `NoPanic`, `Wrapping`, and so on) and the lowered executable IR itself.
-fn reset_native_trust_ir_proof_inventory_to_public_bundle(module: &mut trust_ir::Module) {
+fn reset_native_trust_ir_proof_inventory_to_public_bundle(
+    module: &mut trust_ir::Module,
+) -> Vec<NativeTrustIrCapturedSite> {
+    // Capture the one fact in this inventory that is NOT bridge-local before
+    // dropping it. Every reason the doc comment gives for the reset is about
+    // IDENTITY -- bridge rows lack a `public_obligation_id`, their numeric
+    // `ProofId`s can collide with public rows, they are not public proof units.
+    // None of that applies to `(range, class) -> site`, which is a statement
+    // about the LOWERED IR and stays true no matter who owns the row.
+    let captured = module
+        .proof_obligations
+        .iter()
+        .filter_map(|obligation| {
+            Some(NativeTrustIrCapturedSite {
+                range: obligation.source.as_ref()?.range.as_ref()?.clone(),
+                class: native_trust_ir_safety_class(&obligation.description)?,
+                site: obligation.site?,
+            })
+        })
+        .collect();
+
     module.proof_obligations.clear();
     module.proof_certificates.clear();
     module.obligation_diagnostics.clear();
@@ -30399,6 +30591,8 @@ fn reset_native_trust_ir_proof_inventory_to_public_bundle(module: &mut trust_ir:
             }
         }
     }
+
+    captured
 }
 
 /// What the planner learns about a trust-vc-routed obligation before the native

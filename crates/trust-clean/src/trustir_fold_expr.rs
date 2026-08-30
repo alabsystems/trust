@@ -5360,7 +5360,9 @@ fn ty_can_carry_folder_alias(ty: &Ty) -> bool {
 /// reference. Runtime bookkeeping hidden inside immutable std containers
 /// (Arc refcounts, collection allocation state) is not a mutation of the
 /// logical payload; direct Cell/UnsafeCell/atomic/lock channels are.
-fn has_exposed_interior_mutability(defs: &DatatypeDefs, ty: &Ty) -> bool {
+/// (`pub(crate)` for Trust: EFHT — `prove::pure_scalar_ret_model` and its consumer apply
+/// it to every HANDLE slot as a belt-and-braces fence beside the read-only allow-list.)
+pub(crate) fn has_exposed_interior_mutability(defs: &DatatypeDefs, ty: &Ty) -> bool {
     has_exposed_interior_mutability_fueled(defs, ty, P_ACYC_WALK_FUEL)
 }
 

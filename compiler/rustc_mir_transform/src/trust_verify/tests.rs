@@ -15102,7 +15102,6 @@ fn v1_bridge_does_not_turn_sat_user_assertion_approximation_into_a_refutation() 
     let mut bindings = vec![test_binding_for_obligation(0, &assertion, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&assertion),
@@ -15117,13 +15116,18 @@ fn v1_bridge_does_not_turn_sat_user_assertion_approximation_into_a_refutation() 
     );
 }
 
+/// A child SAT verdict that arrived BEFORE bridge dispatch must still meet the
+/// kind-polarity gate when the row is re-keyed onto its precise v1 VC.
+/// `017a2a2af5` enforced this at an ingress seam as well, but that seam ran the
+/// entry-grounding predicate over every bridgeable row and demoted 25 further
+/// genuine refutations on the frozen corpus; the re-key seam is where the
+/// semantic boundary actually is.
 #[test]
 fn v1_bridge_demotes_preexisting_generic_assertion_sat_before_rekey() {
     let mut assertion = test_vc(338);
     assertion.kind = VcKind::Assertion { message: "generic native assertion".to_string() };
-    // Deliberately entry-grounded: assertions are still proof-only at the
-    // generic seam.  Ground variables do not attest that every body producer
-    // relation was encoded.
+    // The formula is deliberately over a declared parameter name: the demotion
+    // must come from the KIND, not from any judgement about its free variables.
     assertion.formula = Formula::Eq(
         Box::new(Formula::Var("input".to_string(), Sort::Int)),
         Box::new(Formula::Int(0)),
@@ -15137,7 +15141,6 @@ fn v1_bridge_demotes_preexisting_generic_assertion_sat_before_rekey() {
     };
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&assertion),
@@ -15162,7 +15165,6 @@ fn v1_bridge_retains_unsat_user_assertion_proof_direction() {
     let mut bindings = vec![test_binding_for_obligation(0, &assertion, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&assertion),
@@ -15174,8 +15176,24 @@ fn v1_bridge_retains_unsat_user_assertion_proof_direction() {
     assert!(matches!(bridged[0].1, VerificationResult::Proved { .. }));
 }
 
+/// REGRESSION (2026-08-29). `bc65b2ca7d` required
+/// `composed_formula_is_caller_entry_grounded` of every L0 SAT crossing this
+/// bridge. That predicate is the CALL-SITE REPLAY lane's, and an ordinary body
+/// VC cannot satisfy it: its free variables are MIR temps, versioned SSA reads,
+/// discriminant/`__slice_len`/BV companion vars — none of them entry-stable
+/// parameters, none of them `Eq`-pinned. The measured cost on the frozen
+/// 154-fixture mutant corpus was 88 genuine refutations (152 -> 64), so the gate
+/// is gone from this seam. This test pins the direction it took away: an L0
+/// safety formula whose free var is NOT a declared parameter still bridges
+/// its SAT as a refutation.
+///
+/// This is not the loss of a soundness check. The shape it was aimed at — a
+/// value whose ONLY source is an unmodelled callee's `Call` destination — is
+/// declined upstream by `trust_vcgen::generate::havoc_decline`, which reads the
+/// MIR rather than guessing from the formula's variable names, and demotes the
+/// row to `VcKind::UnsupportedMir` before any solver sees it.
 #[test]
-fn v1_bridge_does_not_turn_sat_ungrounded_l0_approximation_into_a_refutation() {
+fn v1_bridge_bridges_generic_l0_refutation_without_an_entry_grounding_gate() {
     let mut safety = test_vc(336);
     safety.formula = Formula::Eq(
         Box::new(Formula::Var("opaque_call_result".to_string(), Sort::Int)),
@@ -15185,7 +15203,6 @@ fn v1_bridge_does_not_turn_sat_ungrounded_l0_approximation_into_a_refutation() {
     let mut bindings = vec![test_binding_for_obligation(0, &safety, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&safety),
@@ -15193,10 +15210,10 @@ fn v1_bridge_does_not_turn_sat_ungrounded_l0_approximation_into_a_refutation() {
         vec![(safety.clone(), bridge_test_unknown())],
     );
 
-    assert_eq!((proved, failed), (0, 0));
+    assert_eq!((proved, failed), (0, 1));
     assert!(
-        matches!(bridged[0].1, VerificationResult::Unknown { .. }),
-        "a generic L0 model over a free computed value is not a source counterexample"
+        matches!(bridged[0].1, VerificationResult::Failed { .. }),
+        "an ordinary L0 body VC's SAT is the refutation this lane exists to deliver"
     );
 }
 
@@ -15211,7 +15228,6 @@ fn v1_bridge_retains_entry_grounded_l0_refutation_direction() {
     let mut bindings = vec![test_binding_for_obligation(0, &safety, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&safety),
@@ -15221,6 +15237,32 @@ fn v1_bridge_retains_entry_grounded_l0_refutation_direction() {
 
     assert_eq!((proved, failed), (0, 1));
     assert!(matches!(bridged[0].1, VerificationResult::Failed { .. }));
+}
+
+/// The `Postcondition` asymmetry that PREDATES the reverted commits and stays:
+/// a SAT over an under-approximated body-fact conjunction is not a sound
+/// contract refutation, so only a strict UNSAT crosses.
+#[test]
+fn v1_bridge_keeps_postcondition_proof_only() {
+    let mut postcondition = test_vc(339);
+    postcondition.kind = VcKind::Postcondition;
+    postcondition.formula = Formula::Eq(
+        Box::new(Formula::Var("input".to_string(), Sort::Int)),
+        Box::new(Formula::Int(0)),
+    );
+    let obligation = authority_test_native_obligation("bridge:postcondition-sat", 339, 339);
+    let mut bindings = vec![test_binding_for_obligation(0, &postcondition, &obligation)];
+
+    let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
+        5_000,
+        None,
+        std::slice::from_ref(&postcondition),
+        &mut bindings,
+        vec![(postcondition.clone(), bridge_test_unknown())],
+    );
+
+    assert_eq!((proved, failed), (0, 0));
+    assert!(matches!(bridged[0].1, VerificationResult::Unknown { .. }));
 }
 
 #[test]
@@ -15251,7 +15293,6 @@ fn v1_bridge_requires_exact_bound_semantics_not_just_span() {
     let mut bindings = vec![test_binding_for_obligation(0, &native_placeholder, &obligation)];
 
     let (bridged, proved, failed, eligibilities) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&precise),
@@ -15720,7 +15761,6 @@ fn v1_bridge_cannot_reseal_two_swapped_valid_bindings() {
     let before_bindings = swapped.clone();
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         &[precise_a, precise_b],
@@ -15752,19 +15792,6 @@ fn bridge_test_unknown() -> VerificationResult {
     }
 }
 
-fn bridge_test_function() -> trust_types::VerifiableFunction {
-    let mut function = native_trust_ir_panic_function(false);
-    function.name = "f".to_string();
-    function.def_path = "test::f".to_string();
-    function.body.locals.push(trust_types::LocalDecl {
-        index: 1,
-        ty: trust_types::Ty::u32(),
-        name: Some("input".to_string()),
-    });
-    function.body.arg_count = 1;
-    function
-}
-
 #[test]
 fn v1_bridge_disambiguates_distinct_exact_vcs_at_one_source_span() {
     let mut initiation = test_vc(39);
@@ -15790,7 +15817,6 @@ fn v1_bridge_disambiguates_distinct_exact_vcs_at_one_source_span() {
     ];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         &solver_vcs,
@@ -15819,7 +15845,6 @@ fn v1_bridge_rejects_duplicate_exact_vcs_even_with_valid_row_bindings() {
     ];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         &[vc.clone(), vc.clone()],
@@ -15840,7 +15865,6 @@ fn v1_bridge_rejects_duplicate_exact_solver_carrier_only() {
     let mut bindings = vec![test_binding_for_obligation(0, &vc, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         &[vc.clone(), vc.clone()],
@@ -15865,7 +15889,6 @@ fn v1_bridge_rejects_duplicate_exact_result_carrier_only() {
     ];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&vc),
@@ -15889,7 +15912,6 @@ fn v1_bridge_does_not_solve_unsupported_capability_sentinels() {
     let mut bindings = vec![test_binding_for_obligation(0, &unsupported, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&unsupported),
@@ -15934,7 +15956,6 @@ fn v1_bridge_rejects_ambiguous_same_span_arithmetic_fallback() {
     let mut bindings = vec![test_binding_for_obligation(0, &native_placeholder, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         &[add_overflow, mul_overflow],
@@ -15977,7 +15998,6 @@ fn v1_bridge_rejects_unique_same_span_with_different_formula() {
     let mut bindings = vec![test_binding_for_obligation(0, &native, &obligation)];
 
     let (bridged, proved, failed, _) = bridge_v1_ay_proofs_into_native_results(
-        &bridge_test_function(),
         5_000,
         None,
         std::slice::from_ref(&neighboring),
@@ -19047,14 +19067,8 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
         &[],
         &snapshot,
     );
-    let (results, _, _, _) = bridge_v1_ay_proofs_into_native_results(
-        &function,
-        500,
-        None,
-        &[],
-        &mut bindings,
-        legacy_results,
-    );
+    let (results, _, _, _) =
+        bridge_v1_ay_proofs_into_native_results(500, None, &[], &mut bindings, legacy_results);
     let cleancic = (0..results.len()).map(|_| None).collect::<Vec<_>>();
     let authorities =
         build_result_proof_authorities(&results, &bindings, Some(&full_result), &cleancic);

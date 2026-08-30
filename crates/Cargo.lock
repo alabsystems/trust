@@ -4102,6 +4102,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-align"
+version = "0.1.0"
+
+[[package]]
 name = "trust-backprop"
 version = "0.1.0"
 dependencies = [
@@ -4144,6 +4148,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "trust-bits"
+version = "0.1.0"
 
 [[package]]
 name = "trust-bmc"
@@ -4341,6 +4349,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-checksum"
+version = "0.1.0"
+
+[[package]]
 name = "trust-clean"
 version = "0.1.0"
 dependencies = [
@@ -4452,6 +4464,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-endian"
+version = "0.1.0"
+
+[[package]]
+name = "trust-fixed"
+version = "0.1.0"
+
+[[package]]
 name = "trust-hex"
 version = "0.1.0"
 
@@ -4463,6 +4483,10 @@ dependencies = [
  "sha2 0.10.9",
  "trust-sha2",
 ]
+
+[[package]]
+name = "trust-index"
+version = "0.1.0"
 
 [[package]]
 name = "trust-integration-tests"
@@ -4488,6 +4512,10 @@ dependencies = [
  "trust-types",
  "trust-vcgen",
 ]
+
+[[package]]
+name = "trust-interval"
+version = "0.1.0"
 
 [[package]]
 name = "trust-ir"
@@ -4708,7 +4736,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "home",
@@ -4758,7 +4786,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ay-bindings",
  "num-bigint",
@@ -4769,7 +4797,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mc-driver"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ay",
  "ay-bindings",
@@ -4867,6 +4895,10 @@ dependencies = [
  "trust-sha2",
  "trust-types",
 ]
+
+[[package]]
+name = "trust-radix64"
+version = "0.1.0"
 
 [[package]]
 name = "trust-rand"
@@ -5010,6 +5042,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-timearith"
+version = "0.1.0"
+
+[[package]]
 name = "trust-toml"
 version = "0.1.0"
 dependencies = [
@@ -5075,6 +5111,10 @@ dependencies = [
 
 [[package]]
 name = "trust-utf"
+version = "0.1.0"
+
+[[package]]
+name = "trust-varint"
 version = "0.1.0"
 
 [[package]]

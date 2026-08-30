@@ -8,7 +8,7 @@ trustir_commit = "9004c473bec637cca4aa462cc19a6ec6e7d4c5ec"
 # just as surely as a trust-ir bump changes what it replays. Kept equal to the
 # indexed gitlink by scripts/check_bridge_pin.sh; the replay itself is
 # validated by crates/trust-clean/tests/lean_clean_bridge.rs.
-clean_commit = "ea2f71bb9e588546bb8292c2fe73cc01a3175564"
+clean_commit = "96d4ce6b8d01c28a964c6e7dfdc5f5f3f0920242"
 lean_toolchain = "leanprover/lean4:v4.8.0"
 root_module = "TrustIr.Semantics.Arith"
 source_subdir = "lean/trust_ir-semantics"

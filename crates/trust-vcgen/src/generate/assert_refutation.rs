@@ -233,6 +233,13 @@ fn authenticated_wrapping_call(
     let op = match method.op {
         trust_types::RustcWrappingRefutationOp::Add => BinOp::Add,
         trust_types::RustcWrappingRefutationOp::Sub => BinOp::Sub,
+        // Full nonlinear mod is outside this Int/LIA model — exactly the
+        // `WrappingMul(_) => None` decision the total-marker arm above already
+        // records. A mul-marked callee's destination stays ungrounded and the
+        // obligation is dropped as such (sound: runtime-checked, never
+        // mis-decided). The TrustIr bridge, not this lane, carries mul's
+        // defining modular semantics.
+        trust_types::RustcWrappingRefutationOp::Mul => return None,
     };
     Some((op, method.carrier))
 }

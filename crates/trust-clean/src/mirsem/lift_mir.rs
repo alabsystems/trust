@@ -39,6 +39,24 @@ pub(crate) fn deref_write_exists(body: &trust_types::VerifiableBody, local: usiz
             && source_ty.eq_ignoring_disc_index_safe(destination_ty)
     };
 
+    // Trust (D2, 2026-08-29): the closure used to follow ONLY whole-local shared-ref
+    // `Use` copies, so two in-tree escapes laundered a write past it: (a) a shared
+    // REBORROW `_2 = &(*_1)` / `&raw const (*_1)` is a fresh handle to the SAME
+    // referent (neither a write nor a `Use`), and (b) `p as *const u8 as *mut u8` is a
+    // bare `Rvalue::Cast` (`CastKind::PtrToPtr` never goes through `AddressOf`), so a
+    // `*mut` to the referent needs no address-of at all. Now (i) the destination of a
+    // shared `Ref`/`AddressOf(false)` rooted at an alias JOINS the alias set.
+    //
+    // Escape (b) is deliberately NOT closed HERE. An arm that answered `true` for any
+    // `Cast`/`CopyForDeref` of an alias was landed and REVERTED the same day: this
+    // predicate has ~20 consumers, and the ptr-offset lane's `into_iter` fixture
+    // legitimately threads `AddressOf(*s)` through `*[T] -> NonNull -> *const T` casts
+    // under its own discipline (`clean_ground::slice_base_formula_at`) — the arm broke 12
+    // pinned tests there (bisected: HEAD + this hunk alone reproduces). The lane that
+    // needs (b) closed is model transport, and it is fenced by the AFFIRMATIVE allow-list
+    // `prove::body_is_read_only`, which refuses every non-scalar `Cast` by name with no
+    // alias analysis to launder. This predicate stays a deny-list; do not make a
+    // transport soundness argument rest on it.
     let mut aliases = HashSet::from([local]);
     let mut pending = VecDeque::from([local]);
     let mut processed = 0usize;
@@ -53,6 +71,19 @@ pub(crate) fn deref_write_exists(body: &trust_types::VerifiableBody, local: usiz
             let Statement::Assign { place: destination, rvalue, .. } = statement else {
                 continue;
             };
+            match rvalue {
+                Rvalue::Ref { mutable: false, place: source_place }
+                | Rvalue::AddressOf(false, source_place)
+                    if source_place.local == source && destination.projections.is_empty() =>
+                {
+                    // (i) a shared reborrow / const raw address is a fresh handle to
+                    // the same referent.
+                    if aliases.insert(destination.local) {
+                        pending.push_back(destination.local);
+                    }
+                }
+                _ => {}
+            }
             let Rvalue::Use(Operand::Copy(source_place) | Operand::Move(source_place)) = rvalue
             else {
                 continue;

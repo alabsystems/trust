@@ -781,6 +781,22 @@ pub(crate) struct NestedVariantTest {
     pub(crate) binds: Vec<(LocalVarId, u32, Option<u64>)>,
 }
 
+/// Trust (wave-LP): ONE accepted LITERAL payload test — `E::A(true)`, `List::Cons(10, _)` —
+/// as the emitter consumes it. The refutable test the arm's entry block owes is a plain
+/// `ExtractField` + `ICmp Eq` + `CondBr` (hit -> body, miss -> the SAME shared fallthrough the
+/// guard-false and nested-miss routes use); no address is derived, no offset table consulted,
+/// and the compared field is typed by the def's own canonical field `Ty`, so no soundness line
+/// (wave-SG/DA agreement, immediate-deref-only, #191) is anywhere near this lane.
+#[derive(Debug, Clone)]
+pub(crate) struct PayloadLiteralTest {
+    /// Payload field index in the variant — the `1 + field` aggregate slot.
+    pub(crate) field: u32,
+    /// The field's canonical mapped type (Bool or a fixed-width int).
+    pub(crate) field_ty: Ty,
+    /// The expected constant, already normalized to the field's width/signedness.
+    pub(crate) expected: Constant,
+}
+
 /// Trust (wave-OR3): ONE bound payload local of ONE or-pattern alternative, as
 /// [`or_alt_binds_reject`] reads it. The agreement WITNESS — deliberately richer than the
 /// `(local, field, offset)` triple `classify_enum_payload_binds` returns, because the triple
@@ -2971,6 +2987,7 @@ fn lower_module_inner<'tcx>(
         interior_ptrs: Vec::new(),
         promoted: Vec::new(),
         promote_wanted: Vec::new(),
+        ptr_slot_contents: Vec::new(),
         promoted_slots: Vec::new(),
         promoted_tys: Vec::new(),
         mut_borrow_ptrs: Vec::new(),
@@ -3835,6 +3852,15 @@ struct LowerCx<'a, 'tcx> {
     /// behaves exactly pre-wave. A wanted local that DOES slot at its `let`/param joins
     /// `promoted` at that moment and is memory-backed from then on.
     promote_wanted: Vec<LocalVarId>,
+    /// Trust (wave-TR3/R1): the wave-DB double-borrow slots' STATICALLY-KNOWN contents —
+    /// `(slot ptr, stored inner ptr)`. A DB slot is created with exactly ONE Store of a
+    /// ledger-registered pointer and enters `borrow_ptrs` only (immutable, no aliasing write
+    /// channel exists), so `*slot` is the stored pointer BY CONSTRUCTION and the Deref arm
+    /// may FORWARD it as a pure value instead of refusing the `Ty::Ptr` pointee — which is
+    /// what lets derive(Debug)'s `&&self.fK -> &dyn Debug` unsize chain (the reborrow-
+    /// through-deref THIR shape) flow. `**x` composes soundly: the forwarded inner is itself
+    /// ledgered, so the SECOND Deref takes the ordinary gated Load path.
+    ptr_slot_contents: Vec<(ValueId, ValueId)>,
     /// Trust: promoted local → its `Alloca` slot `ValueId` (a `Ty::Ptr`), recorded once when the local's
     /// `let`/param emits the slot. Reads/writes/`&mut` of the local resolve their slot here.
     promoted_slots: Vec<(LocalVarId, ValueId)>,
@@ -4947,15 +4973,40 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // has resume type `()` → params `[Unit, Unit]` reach the signature comparison and would
             // record a NEW `MirOracle` divergence (`Unit` vs `Struct`). All corpus coroutine bodies
             // are async, so this restriction costs 0 yield and closes that hole fail-closed.
-            let is_async = matches!(
-                self.tcx.coroutine_kind(def.to_def_id()),
-                Some(rustc_hir::CoroutineKind::Desugared(rustc_hir::CoroutineDesugaring::Async, _))
-            );
-            if yield_free && non_capturing && is_async {
-                return Some(Ty::Unit);
+            // Trust (B5 stage 1a): sign the env as a REGISTERED ZERO-FIELD STRUCT named
+            // `coroutine::{def_path}` — the ORACLE'S OWN spelling (trust-ir-bridge lower.rs,
+            // the `Ty::Coroutine` frame marker), whose prefix `SYNTHETIC_STRUCT_PREFIXES`
+            // already tolerates by name. This RETIRES the load-bearing accident the block
+            // above documents: the ~40-45 `clean-skip-sig-incomparable` rows stop hiding
+            // behind the G0 spelling-split quarantine and become HONEST signature
+            // agreements (zero-field struct vs zero-field struct). With both sides signing
+            // the same shape, the `Unit`-vs-`Struct` divergence hazard that motivated the
+            // async-only restriction is gone, so the carve-out extends to non-async
+            // coroutines (`gen {}`, bare `#[coroutine]`) on the same yield-free +
+            // non-capturing gates. Capturing/suspending bodies keep the fail-closed tag —
+            // their env is signed uniformly, but the tag records that the BODY's frame
+            // semantics (upvar reads, suspend states) are not yet modeled; B5 stages 1b-3
+            // (upvar-typed frames — pending the native-lane SetDiscriminant handler audit —
+            // then CoroSuspend, then await/poll) retire it.
+            let idx = self.pending_structs.len();
+            let name = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
+                "coroutine::{}",
+                self.tcx.def_path_str(def.to_def_id())
+            ));
+            self.pending_structs.push(trust_ir::StructDef {
+                id: trust_ir::StructId::new(idx as u32),
+                name,
+                fields: Vec::new(),
+                size: None,
+                align: None,
+                repr: trust_ir::StructRepr::Rust,
+            });
+            let env_ty = Ty::Struct(trust_ir::StructId::new(idx as u32));
+            if yield_free && non_capturing {
+                return Some(env_ty);
             }
             self.unsupported.push(("body".to_string(), "ClosureEnv(coroutine body)"));
-            return Some(Ty::Unit);
+            return Some(env_ty);
         }
         let Some(env) = self.thir.params.iter().next().filter(|p| p.pat.is_none()) else {
             self.unsupported.push(("body".to_string(), "ClosureEnv(missing THIR env param)"));
@@ -8116,7 +8167,18 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         header: ty::FnHeader<TyCtxt<'tcx>>,
     ) -> Option<Ty> {
         // Trust: rust 1.99 — `FnHeader.c_variadic`/`.abi` are now accessor methods, not fields.
-        if header.c_variadic() || header.abi() != rustc_abi::ExternAbi::Rust {
+        // Trust (wave-FC): `extern "C" { unwind: false }` joins `extern "Rust"` — the IR
+        // carries the convention per CALL EDGE (`CallIndirect.calling_conv`, cross-checked by
+        // `validate_module` where provenance is visible), the callee ledger already records
+        // honest ABI (#190), and the MIR-side oracle converts C-ABI fn-ptr sigs
+        // unconditionally, so this moves TOWARD differential-signature parity. `FuncTy`
+        // deliberately carries no conv, so the edge and the declaration are the only carriers
+        // and `validate_module` remains the wall.
+        let abi_ok = matches!(
+            header.abi(),
+            rustc_abi::ExternAbi::Rust | rustc_abi::ExternAbi::C { unwind: false }
+        );
+        if header.c_variadic() || !abi_ok {
             return None;
         }
         let sig = sig_tys.skip_binder();
@@ -13993,9 +14055,19 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                 callee: callee_val,
                                 sig,
                                 args: arg_vals,
-                                // The fragment admits only `extern "Rust"` fn-ptr sigs
-                                // (`map_fn_ptr_ty` gates on the header ABI).
-                                calling_conv: trust_ir::CallingConv::Rust,
+                                // Trust (wave-FC): the edge conv is DERIVED from the callee
+                                // type's own header — the fragment admits Rust and
+                                // C{unwind:false} (`map_fn_ptr_ty`), and hardcoding either
+                                // here is exactly the abi-pinning breach the ratification
+                                // warns about.
+                                calling_conv: if matches!(
+                                    fun_rty.fn_sig(self.tcx).skip_binder().abi(),
+                                    rustc_abi::ExternAbi::C { unwind: false }
+                                ) {
+                                    trust_ir::CallingConv::C
+                                } else {
+                                    trust_ir::CallingConv::Rust
+                                },
                             },
                             expr_ty,
                         )
@@ -14496,6 +14568,106 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // discipline: a slot never holds an address). Every gate failure keeps the
                 // pre-wave `Assign(non-local place)` tag.
                 if let Some((fvar, ffield, fbase)) = self.place_field_base(lhs) {
+                    // Trust (wave-AW, W1): `a.b = v` on an UNPROMOTED, SSA-bound local of
+                    // registered `Ty::Struct` — the VarRef-base counterpart of the `(*p).field`
+                    // chain arm, single-level, transplanting its three leaf postures verbatim
+                    // onto value surgery (`InsertField` + `set_local`; no Load, no Store, no
+                    // address anywhere):
+                    //   * scalar leaf  -> real InsertField of the lowered non-borrow-ptr RHS;
+                    //   * opaque Unit leaf -> opaque InsertField (ctor RHS deliberately not
+                    //     lowered — the pre-wave opaque-arm drop);
+                    //   * real non-scalar leaf -> wave-ER whole-value replacement: RHS lowered
+                    //     for EFFECTS, value discarded, `undef <lane ty>` committed with
+                    //     `contains_call` FORCED (eager-UB undef must never be interpreted —
+                    //     CLEAN-ONLY, structurally NotRun).
+                    // The union-lane refusal (REFUSAL 5) applies before any posture: a union
+                    // lane written here would put a placeholder over real bytes.
+                    if !self.is_promoted(fvar) {
+                        if let (Some(cur), Some(Ty::Struct(sid))) =
+                            (self.local_value(fvar), self.local_ty(fvar))
+                        {
+                            if self.is_borrow_ptr(cur) {
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "Assign(non-local place)"));
+                                return None;
+                            }
+                            let Some(fts) = self.registered_struct_field_tys(sid) else {
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "Assign(non-local place)"));
+                                return None;
+                            };
+                            let Some(leaf_ty) = fts.get(ffield as usize).cloned() else {
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "Assign(non-local place)"));
+                                return None;
+                            };
+                            if union_lane_registered(&self.union_lanes, sid, ffield) {
+                                self.unsupported
+                                    .push((format!("{expr_span:?}"), "UnionLane(field store)"));
+                                return None;
+                            }
+                            let _ = fbase;
+                            let newv = if is_scalar_ty(&leaf_ty)
+                                || matches!(leaf_ty, Ty::F32 | Ty::F64)
+                            {
+                                let v = match self.lower_expr(rhs) {
+                                    Some(v) => v,
+                                    None => {
+                                        self.unsupported.push((
+                                            format!("{expr_span:?}"),
+                                            "Assign(non-local place)",
+                                        ));
+                                        return None;
+                                    }
+                                };
+                                if self.is_borrow_ptr(v) {
+                                    self.unsupported.push((
+                                        format!("{expr_span:?}"),
+                                        "Assign(non-local place)",
+                                    ));
+                                    return None;
+                                }
+                                v
+                            } else if matches!(leaf_ty, Ty::Unit) {
+                                let u = self.fresh();
+                                self.push_node(
+                                    InstrNode::new(Inst::Const {
+                                        ty: Ty::Unit,
+                                        value: Constant::PhantomData,
+                                    })
+                                    .with_result(u),
+                                );
+                                u
+                            } else {
+                                if self.lower_expr(rhs).is_none() {
+                                    self.unsupported.push((
+                                        format!("{expr_span:?}"),
+                                        "Assign(non-local place)",
+                                    ));
+                                    return None;
+                                }
+                                self.contains_call = true;
+                                let u = self.fresh();
+                                self.push_node(
+                                    InstrNode::new(Inst::Undef { ty: leaf_ty.clone() })
+                                        .with_result(u),
+                                );
+                                u
+                            };
+                            let agg = self.fresh();
+                            self.push_node(
+                                InstrNode::new(Inst::InsertField {
+                                    ty: Ty::Struct(sid),
+                                    aggregate: cur,
+                                    field: ffield,
+                                    value: newv,
+                                })
+                                .with_result(agg),
+                            );
+                            self.set_local(fvar, agg, Ty::Struct(sid));
+                            return None;
+                        }
+                    }
                     if self.is_promoted(fvar) && self.promoted_slot(fvar).is_some() {
                         let rv = match self.lower_expr(rhs) {
                             Some(v) => v,
@@ -16508,6 +16680,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                         align: None,
                                     }));
                                     self.borrow_ptrs.push(ptr);
+                                    // Trust (wave-TR3/R1): record the slot's statically-known
+                                    // content for the Deref arm's pure forward.
+                                    self.ptr_slot_contents.push((ptr, cval));
                                     return Some(ptr);
                                 }
                             }
@@ -16736,8 +16911,29 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // Ty::Enum values through memory (B3-1's pinned tests), so the
                     // Load is executable. Excluding it regressed 15 clean bodies.
                     | Ty::Enum(_)
+                    // Trust (wave-TR3/R2): `Ty::Array` — Load/Store PARITY, the exact
+                    // wave-FD/AR2 argument one more time: the Borrow side already
+                    // Stores scalar-element arrays through slots (wave-AR2), and the
+                    // interpreter is element-op native over Ty::Array (slice-15). The
+                    // shim fails closed on every aggregate Load, so this is clean-rate
+                    // only, never a flip.
+                    | Ty::Array(..)
                 ) || matches!(pointee_ty, Ty::Struct(_) | Ty::Tuple(_));
                 if !pointee_ok {
+                    // Trust (wave-TR3/R1): `*slot` where `slot` is a wave-DB double-borrow
+                    // slot — the content is the ONE ledger-registered pointer stored at
+                    // creation (immutable slot, borrow_ptrs only, no write channel), so the
+                    // deref is a pure FORWARD of that pointer: no Load, no instruction, and
+                    // the `Ty::Ptr`-pointee refusal below never fires for it. This is what
+                    // lets derive(Debug)'s `&&self.fK -> &dyn Debug` unsize chain flow;
+                    // every other unregistered-pointee shape keeps the tag.
+                    if matches!(pointee_ty, Ty::Ptr) {
+                        if let Some((_, inner)) =
+                            self.ptr_slot_contents.iter().find(|(s2, _)| *s2 == ptr)
+                        {
+                            return Some(*inner);
+                        }
+                    }
                     self.unsupported.push((format!("{expr_span:?}"), "Deref(non-scalar pointee)"));
                     return None;
                 }
@@ -17295,6 +17491,63 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     "NamedConst(eval failed)",
                     "NamedConst(local, deferred)",
                 )
+            }
+            // Trust (wave-TL): a THREAD-LOCAL address. The oracle's ratified model
+            // (trust-ir-bridge lower.rs ~26008): Trust does not model TLS storage identity, so
+            // the value is a FRESH SYMBOLIC POINTER per occurrence — no TLS-identity and no
+            // dereferenceability assumption, and no manufactured equality between two
+            // occurrences (each thread has its own address; even one thread's two reads are
+            // deliberately left unrelated at this abstraction). The producer's spelling: a
+            // fresh value-less external global marked `tls: Some(LocalExec)`, its
+            // `GlobalAddr` as the `&T` value directly (ThreadLocalRef IS the address — no
+            // Load), registered in `symbolic_consts` so the body is SYMBOLIC (splice
+            // auto-refused, never sampled — coverage only, exactly the oracle's own
+            // fail-closed interpreter posture on the dialect op). The ptr joins
+            // `borrow_ptrs`/`global_ptrs` so the enclosing Deref/reborrow lanes flow; a Load
+            // through it can never execute (no initializer, symbolic body).
+            // The StaticRef value-materializing lane below keeps REFUSING TLS
+            // (`StaticRef(thread-local)`): one address per thread is not one global value.
+            ExprKind::ThreadLocalRef(def_id) => {
+                let pointee = match expr_ty.kind() {
+                    ty::RawPtr(inner, _) => *inner,
+                    ty::Ref(_, inner, _) => *inner,
+                    _ => {
+                        self.unsupported.push((format!("{expr_span:?}"), "ThreadLocalRef"));
+                        return None;
+                    }
+                };
+                let ty = self.map_ty(pointee);
+                if matches!(ty, Ty::Unit) {
+                    // map_ty pushed its own tag (or the pointee is genuinely unit, which no
+                    // TLS read cares about) — keep the family tag for the census.
+                    self.unsupported.push((format!("{expr_span:?}"), "ThreadLocalRef"));
+                    return None;
+                }
+                let idx = self.pending_globals.len();
+                let name = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
+                    "__trust_tls_{idx}__{}",
+                    self.tcx.def_path_str(*def_id)
+                ));
+                self.pending_globals.push(Global {
+                    name,
+                    ty,
+                    mutable: false,
+                    initializer: None,
+                    linkage: Linkage::External,
+                    tls: Some(trust_ir::TlsModel::LocalExec),
+                    align: None,
+                });
+                let global = GlobalId::new(idx as u32);
+                self.symbolic_consts.push((
+                    rustc_span::def_id::CRATE_DEF_ID.to_def_id(),
+                    ty::List::empty(),
+                    global,
+                ));
+                let ptr = self.fresh();
+                self.push_node(InstrNode::new(Inst::GlobalAddr { global }).with_result(ptr));
+                self.borrow_ptrs.push(ptr);
+                self.global_ptrs.push(ptr);
+                return Some(ptr);
             }
             // Trust (wave-SR2): a `static` READ. `ExprKind::StaticRef` is a LITERAL holding the
             // ADDRESS of a `static` item (rustc thir.rs: "A literal containing the address of a
@@ -21334,6 +21587,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         // NESTED payload test against, borrowed here for the same reason as the param-lane probe.
         let registered_enums = &self.pending_enums;
         let mut nested_tests: Vec<NestedVariantTest> = Vec::new();
+        let mut literal_tests: Vec<PayloadLiteralTest> = Vec::new();
         let binds = match Self::classify_enum_payload_binds(
             self.tcx,
             registered_enums,
@@ -21345,6 +21599,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             vfields,
             &|v, f| enum_param_lane_registered(param_lanes, eid, v, f),
             &mut nested_tests,
+            &mut literal_tests,
         ) {
             Ok(b) => b,
             Err(tag) => {
@@ -21352,6 +21607,13 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 return None;
             }
         };
+        // Trust (wave-LP): the same single-branch-point argument refuses a literal payload
+        // test here — its miss would also need the ELSE route this pair does not model.
+        if !literal_tests.is_empty() {
+            self.unsupported
+                .push((format!("{span:?}"), "EnumMatch(literal payload in if-let)"));
+            return None;
+        }
         // Trust (wave-NP): this lane decides ONE variant with a single `ICmp` against one
         // discriminant and has no second branch point to hang a nested tag test on — a nested
         // miss would have to reach the ELSE arm, which the then/else block pair here does not
@@ -24528,6 +24790,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         vfields: &[Ty],
         param_lane: &dyn Fn(u32, u32) -> bool,
         nested_out: &mut Vec<NestedVariantTest>,
+        literal_out: &mut Vec<PayloadLiteralTest>,
     ) -> Result<Vec<(LocalVarId, u32, Option<u64>)>, &'static str> {
         let mut binds: Vec<(LocalVarId, u32, Option<u64>)> = Vec::new();
         for sp in subpatterns {
@@ -24946,7 +25209,31 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         binds: nested_binds,
                     });
                 }
-                // other by-ref / `@` / literal payload patterns — not modeled.
+                // Trust (wave-LP): a LITERAL payload test on a Bool / fixed-width-int field —
+                // `BoolNiche::A(true)`, `List::Cons(10, _)`. The classifier only RECORDS the
+                // test (out-channel discipline, exactly `nested_out`'s); the main arm emits it
+                // as its refutable entry, and the or-alternative / `if let` lanes refuse a
+                // non-empty channel with their own tags. The literal is normalized against the
+                // DEF's canonical field type, not the pattern's spelling.
+                PatKind::Constant { value } => {
+                    let fty = vfields[sp.field.as_u32() as usize].clone();
+                    let expected = if matches!(fty, Ty::Bool) {
+                        value.try_to_bool().map(Constant::Bool)
+                    } else {
+                        int_scalar_bits(&fty).and_then(|(bits, signed)| {
+                            const_pat_int(tcx, *value, signed, bits).map(|v| Constant::Int(v as i128))
+                        })
+                    };
+                    match expected {
+                        Some(expected) => literal_out.push(PayloadLiteralTest {
+                            field: sp.field.as_u32(),
+                            field_ty: fty,
+                            expected,
+                        }),
+                        None => return Err("EnumMatch(non-binding payload subpattern)"),
+                    }
+                }
+                // other by-ref / `@` payload patterns — not modeled.
                 _ => {
                     return Err("EnumMatch(non-binding payload subpattern)");
                 }
@@ -25048,10 +25335,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // lowering). At most ONE per arm — a second one would need a second branch point and
             // therefore a second block in the chain, which this wave does not build
             // (`EnumMatch(multiple nested payload tests)`).
+            // Trust (wave-LP): the `Option<PayloadLiteralTest>` is the arm's LITERAL payload
+            // test (`E::A(true)`, `Cons(10, _)`); at most ONE per arm, never combined with a
+            // guard or a nested test (each combination would need an ordering the one-entry
+            // one-body arm shape does not model).
             Variant(
                 usize,
                 Vec<(LocalVarId, u32, Option<u64>)>,
                 Option<NestedVariantTest>,
+                Option<PayloadLiteralTest>,
                 Option<ExprId>,
                 ExprId,
             ),
@@ -25135,6 +25427,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // cannot drift from `match`. See that function for why sharing matters
                         // more than readability on the by-REF offset lane.
                         let mut nested_tests: Vec<NestedVariantTest> = Vec::new();
+                        let mut literal_tests: Vec<PayloadLiteralTest> = Vec::new();
                         match Self::classify_enum_payload_binds(
                             tcx,
                             registered_enums,
@@ -25146,6 +25439,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             vfields,
                             &|v, f| enum_param_lane_registered(param_lanes, eid, v, f),
                             &mut nested_tests,
+                            &mut literal_tests,
                         ) {
                             Ok(binds) => {
                                 // Trust (wave-NP): the two shape refusals this lane owns, both
@@ -25168,7 +25462,23 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                         "EnumMatch(nested payload with guard)",
                                     );
                                 }
-                                ArmClass::Variant(vidx, binds, nested, arm_guard, arm.body)
+                                // Trust (wave-LP): the same one-entry-block discipline. A single
+                                // literal test is the arm's refutable entry; more than one would
+                                // need an AND chain (unbuilt, refused for now), and combining
+                                // with a guard or a nested test would need an ordering this arm
+                                // shape does not model.
+                                if literal_tests.len() > 1 {
+                                    return ArmClass::Reject(
+                                        "EnumMatch(multiple literal payload tests)",
+                                    );
+                                }
+                                let literal = literal_tests.pop();
+                                if literal.is_some() && (arm_guard.is_some() || nested.is_some()) {
+                                    return ArmClass::Reject(
+                                        "EnumMatch(literal payload with guard or nested)",
+                                    );
+                                }
+                                ArmClass::Variant(vidx, binds, nested, literal, arm_guard, arm.body)
                             }
                             Err(tag) => ArmClass::Reject(tag),
                         }
@@ -25244,6 +25554,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                         return ArmClass::Reject("EnumMatch(variant index OOB)");
                                     };
                                     let mut nested_tests: Vec<NestedVariantTest> = Vec::new();
+                                    let mut literal_tests: Vec<PayloadLiteralTest> = Vec::new();
                                     let binds = match Self::classify_enum_payload_binds(
                                         tcx,
                                         registered_enums,
@@ -25255,6 +25566,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                         vfields,
                                         &|v, f| enum_param_lane_registered(param_lanes, eid, v, f),
                                         &mut nested_tests,
+                                        &mut literal_tests,
                                     ) {
                                         Ok(b) => b,
                                         Err(tag) => return ArmClass::Reject(tag),
@@ -25266,6 +25578,12 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                                     // the same arm — an ordering this expansion does not model.
                                     // Refused, which is the verdict this shape already had; only
                                     // the tag moves (from the classifier's non-binding catch-all).
+                                    // Trust (wave-LP): same per-alternative-expansion argument.
+                                    if !literal_tests.is_empty() {
+                                        return ArmClass::Reject(
+                                            "EnumMatch(literal payload in or-pattern alternative)",
+                                        );
+                                    }
                                     if !nested_tests.is_empty() {
                                         return ArmClass::Reject(
                                             "EnumMatch(nested payload in or-pattern alternative)",
@@ -25308,6 +25626,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             usize,
             Vec<(LocalVarId, u32, Option<u64>)>,
             Option<NestedVariantTest>,
+            Option<PayloadLiteralTest>,
             Option<ExprId>,
             ExprId,
         )> = Vec::new();
@@ -25331,7 +25650,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                     wild_body = Some(body);
                 }
-                ArmClass::Variant(v, b, nested, guard, body) => {
+                ArmClass::Variant(v, b, nested, literal, guard, body) => {
                     if wild_body.is_some() {
                         self.unsupported
                             .push((format!("{span:?}"), "EnumMatch(arm after wildcard)"));
@@ -25345,7 +25664,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         self.unsupported.push((format!("{span:?}"), tag));
                         return None;
                     }
-                    variant_arms.push((v, b, nested, guard, body));
+                    variant_arms.push((v, b, nested, literal, guard, body));
                 }
                 // Trust (wave-OR2): expand an OR-pattern arm into one `Variant` entry per
                 // alternative, all routing to the SHARED body. DEDUP here is LOAD-BEARING
@@ -25384,7 +25703,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         if seen.insert(v) {
                             // Trust (wave-NP): `None` nested test — an or-alternative carrying one
                             // was already refused at classify, so this is a fact, not a default.
-                            variant_arms.push((v, binds, None, None, body));
+                            variant_arms.push((v, binds, None, None, None, body));
                         }
                     }
                 }
@@ -25424,8 +25743,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         if !self.promoted.is_empty() {
             // Arm counts are small (bounded by the enum's variant count), so the pairwise scan
             // is cheaper than hashing and needs only `PartialEq` on `ExprId`.
-            let duplicated = variant_arms.iter().enumerate().any(|(i, (_, _, _, _, b))| {
-                variant_arms[..i].iter().any(|(_, _, _, _, previous)| previous == b)
+            let duplicated = variant_arms.iter().enumerate().any(|(i, (_, _, _, _, _, b))| {
+                variant_arms[..i].iter().any(|(_, _, _, _, _, previous)| previous == b)
             });
             if duplicated {
                 let tag = "EnumMatch(or-arm body duplicated with promoted local)";
@@ -25495,6 +25814,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             usize,
             Vec<(LocalVarId, u32, Option<u64>)>,
             Option<NestedVariantTest>,
+            Option<PayloadLiteralTest>,
             Option<ExprId>,
             ExprId,
         )>;
@@ -25522,7 +25842,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // failed guard would have no fallback (Rust places the unguarded catch-all
                 // last, so this is unreachable for valid Rust; fail closed defensively). The
                 // legacy path's identical guard (lib.rs "guarded arm as exhaustive default").
-                if last.3.is_some() {
+                if last.4.is_some() {
                     self.unsupported.push((
                         format!("{span:?}"),
                         "EnumMatch(guarded arm as exhaustive default)",
@@ -25541,7 +25861,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     ));
                     return None;
                 }
-                default_arm = (last.1, Some(last.0), last.4);
+                // Trust (wave-LP): a literal-test arm is refutable for exactly the nested
+                // reason — its miss must not route into a different variant's block.
+                if last.3.is_some() {
+                    self.unsupported.push((
+                        format!("{span:?}"),
+                        "EnumMatch(literal payload as exhaustive default)",
+                    ));
+                    return None;
+                }
+                default_arm = (last.1, Some(last.0), last.5);
                 case_arms = va;
             }
         }
@@ -25563,17 +25892,21 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             usize,
             Vec<(LocalVarId, u32, Option<u64>)>,
             Option<NestedVariantTest>,
+            Option<PayloadLiteralTest>,
             Option<ExprId>,
             ExprId,
         )> = Vec::with_capacity(case_arms.len());
-        for (vidx, binds, nested, guard, body) in case_arms {
+        for (vidx, binds, nested, literal, guard, body) in case_arms {
             let Some(disc) = discriminants.get(vidx).copied().flatten() else {
                 self.unsupported.push((format!("{span:?}"), "EnumMatch(missing discriminant)"));
                 return None;
             };
             let entry = self.fresh_block_id();
-            let body_blk = (guard.is_some() || nested.is_some()).then(|| self.fresh_block_id());
-            case_blocks.push((disc, entry, body_blk, vidx, binds, nested, guard, body));
+            // Trust (wave-LP): a literal-test arm is refutable like a guarded/nested one and
+            // gets the same two-block shape.
+            let body_blk = (guard.is_some() || nested.is_some() || literal.is_some())
+                .then(|| self.fresh_block_id());
+            case_blocks.push((disc, entry, body_blk, vidx, binds, nested, literal, guard, body));
         }
         let default_id = self.fresh_block_id();
         let join_id = self.fresh_block_id();
@@ -25590,8 +25923,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let mut seen_discr: std::collections::HashSet<i128> = std::collections::HashSet::new();
         let cases: Vec<SwitchCase> = case_blocks
             .iter()
-            .filter(|&&(d, _, _, _, _, _, _, _)| seen_discr.insert(d))
-            .map(|&(d, entry, _, _, _, _, _, _)| SwitchCase {
+            .filter(|&&(d, _, _, _, _, _, _, _, _)| seen_discr.insert(d))
+            .map(|&(d, entry, _, _, _, _, _, _, _)| SwitchCase {
                 value: Constant::Int(d),
                 target: entry,
                 args: vec![],
@@ -25615,7 +25948,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         //    local is a fresh per-arm `LocalVarId`, never part of the cross-join merge.
         let pre_locals = self.locals.clone();
         let mut captured: Vec<CapturedArm> = Vec::new();
-        for (i, &(discr, entry, body_blk, vidx, ref binds, ref nested, guard, body)) in
+        for (i, &(discr, entry, body_blk, vidx, ref binds, ref nested, ref literal, guard, body)) in
             case_blocks.iter().enumerate()
         {
             // Trust (wave-NP): THE MISS EDGE, bound ONCE for the whole arm.
@@ -25633,7 +25966,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             //
             // Computed only for a refutable arm: the fail-closed push below is about a MISSING
             // fallback, and a flat arm never needs one.
-            let fallthrough_id = if guard.is_some() || nested.is_some() {
+            let fallthrough_id = if guard.is_some() || nested.is_some() || literal.is_some() {
                 match case_blocks[i + 1..].iter().find(|c| c.0 == discr) {
                     Some(c) => c.1,
                     None => {
@@ -25771,6 +26104,61 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         args: vec![],
                     }],
                     exhaustive_enum_unreachable: false,
+                });
+            }
+            // Trust (wave-LP): a LITERAL-payload arm — its entry block is the equality test the
+            // outer Switch case still owes: `ExtractField` the tested field out of the
+            // committed variant's aggregate slot (`1 + field`, typed by the def's canonical
+            // field ty), `Const` the expected value at the same type, `ICmp Eq`, and `CondBr`
+            // hit -> body / miss -> the SAME shared fallthrough the guard-false and nested-miss
+            // routes use. Mutually exclusive with guard and nested by classification, so the
+            // three refutable entries can never contend for the one entry block.
+            if let Some(lt) = literal {
+                let hit_blk = match body_blk {
+                    Some(b) => b,
+                    None => {
+                        self.unsupported
+                            .push((format!("{span:?}"), "EnumMatch(refutable arm block desync)"));
+                        self.start_block(entry, vec![]);
+                        self.seal_with(Inst::Unreachable);
+                        continue;
+                    }
+                };
+                self.locals = pre_locals.clone();
+                self.start_block(entry, vec![]);
+                let fieldv = self.fresh();
+                self.push_node(
+                    InstrNode::new(Inst::ExtractField {
+                        ty: lt.field_ty.clone(),
+                        aggregate: scrut_val,
+                        field: 1 + lt.field,
+                    })
+                    .with_result(fieldv),
+                );
+                let expectedv = self.fresh();
+                self.push_node(
+                    InstrNode::new(Inst::Const {
+                        ty: lt.field_ty.clone(),
+                        value: lt.expected.clone(),
+                    })
+                    .with_result(expectedv),
+                );
+                let eq = self.fresh();
+                self.push_node(
+                    InstrNode::new(Inst::ICmp {
+                        op: ICmpOp::Eq,
+                        ty: lt.field_ty.clone(),
+                        lhs: fieldv,
+                        rhs: expectedv,
+                    })
+                    .with_result(eq),
+                );
+                self.seal_with(Inst::CondBr {
+                    cond: eq,
+                    then_target: hit_blk,
+                    then_args: vec![],
+                    else_target: fallthrough_id,
+                    else_args: vec![],
                 });
             }
             // Emit the arm BODY: a flat unguarded arm's entry IS its body; a guarded or
@@ -32899,8 +33287,10 @@ mod str_match_lane_tests {
         // moves, someone widened the strict rule or routed string bytes through it.
         assert_eq!(
             code.matches(&format!("{}(tcx,", "const_pat_int")).count(),
-            2,
-            "`const_pat_int` must keep exactly its two pre-existing callers",
+            3,
+            "`const_pat_int` has its two pre-existing callers plus wave-LP's literal-payload \
+             classifier arm (int-gated by `int_scalar_bits` before the call, so the strict \
+             Int|Uint|Char rule still holds at every caller)",
         );
         assert!(
             !lane.contains(&format!("{}(", "const_pat_int")),
@@ -33252,8 +33642,12 @@ mod nested_payload_lane_tests {
         let lane = fn_span(&code, "lower_enum_match_general", "lower_enum_match_arm_general");
 
         // (1) ONE binding, and it is a per-arm CHOICE (`if …`), not an alias of the default.
-        let binding =
-            format!("let {} = if guard.is_some() || nested.is_some() {{", "fallthrough_id");
+        // Trust (wave-LP): the refutable set is now guard | nested | literal; the pin keeps
+        // its meaning (ONE binding, refutability-keyed) at the widened spelling.
+        let binding = format!(
+            "let {} = if guard.is_some() || nested.is_some() || literal.is_some() {{",
+            "fallthrough_id"
+        );
         assert_eq!(
             lane.matches(binding.as_str()).count(),
             1,
@@ -33268,14 +33662,16 @@ mod nested_payload_lane_tests {
              default",
         );
 
-        // (2) BOTH refutable tests read that one binding.
-        for (use_site, why) in [
-            (format!("else_target: {},", "fallthrough_id"), "the guard-false edge (B3-2b G1)"),
-            (format!("default: {},", "fallthrough_id"), "the nested tag test's miss edge"),
+        // (2) ALL refutable tests read that one binding. Trust (wave-LP): the else_target
+        // spelling now has TWO users — the guard-false CondBr and the literal-test miss
+        // CondBr — each the sole miss edge of its own mutually-exclusive refutable entry.
+        for (use_site, expect, why) in [
+            (format!("else_target: {},", "fallthrough_id"), 2, "the guard-false + literal-miss edges"),
+            (format!("default: {},", "fallthrough_id"), 1, "the nested tag test's miss edge"),
         ] {
             assert_eq!(
                 lane.matches(use_site.as_str()).count(),
-                1,
+                expect,
                 "{why} must read the shared binding",
             );
         }
@@ -33334,17 +33730,21 @@ mod nested_payload_lane_tests {
 
         // The test hangs on the arm's ENTRY block and branches to the reserved BODY block; a
         // nested-test arm must therefore reserve one, exactly as a guarded arm does.
-        let reserve =
-            format!("(guard.is_some() || nested.is_some()).then(|| self.{}())", "fresh_block_id");
+        let reserve = format!(
+            "(guard.is_some() || nested.is_some() || literal.is_some())\n                .then(|| self.{}())",
+            "fresh_block_id"
+        );
         assert_eq!(
             lane.matches(reserve.as_str()).count(),
             1,
             "the body block must be reserved for EITHER refutable shape, not for guards alone",
         );
+        // Trust (wave-LP): `then_target: hit_blk` contains this substring, so the literal
+        // entry's hit edge counts too — two refutable entries, one hit edge each.
         assert_eq!(
             lane.matches(format!("target: {},", "hit_blk").as_str()).count(),
-            1,
-            "the nested HIT edge targets the reserved body block",
+            2,
+            "each refutable entry's HIT edge targets its reserved body block",
         );
     }
 

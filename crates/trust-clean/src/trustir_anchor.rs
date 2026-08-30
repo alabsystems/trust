@@ -1753,7 +1753,9 @@ impl IrBody {
     /// first-appearance order. These are the `Int` binders the body refinement
     /// universally quantifies over; the assigned SSA temps are NOT binders (they are
     /// inlined by the env-threading reduction).
-    fn param_indices(&self) -> Vec<u64> {
+    /// (`pub(crate)` for Trust: EFHT — `prove::transported_call_return_fully_faithful_via_trustir`'s
+    /// G-BINDER gate reads the substituted body's binder set to refuse a leaked callee temp.)
+    pub(crate) fn param_indices(&self) -> Vec<u64> {
         let assigned: std::collections::HashSet<u64> = self.stmts.iter().map(|s| s.idx).collect();
         let mut all = Vec::new();
         for s in &self.stmts {
@@ -1770,7 +1772,9 @@ impl IrBody {
 
     /// `true` IFF every rvalue in the body is grounder-connected (so the inlined
     /// return formula is live-groundable). A `Not` anywhere makes the body model-only.
-    fn is_grounder_connected(&self) -> bool {
+    /// (`pub(crate)` for Trust: EFHT — the transport lane DERIVES its evidence tier from
+    /// the term at both ends, never from a stored tag; see `prove::ret_model_kernel_verdict`.)
+    pub(crate) fn is_grounder_connected(&self) -> bool {
         self.stmts.iter().all(|s| s.rvalue.is_grounder_connected())
     }
 

@@ -138,6 +138,11 @@ NON_SUITE_TEST_DIRS = {
     # `tests/self-proof/certified-scoreboard.baseline`, which contains the
     # directory path. A silent green is the failure this whole file exists to
     # catch, so the exemption is stated rather than collected.
+    # A committed CONTROL CORPUS (four native-bundle dumps), not a compiletest
+    # suite: `slow.call-summary-census` runs the script that reads it, and that
+    # script fails on zero summaries or zero declines, so the corpus is guarded
+    # by a rowed lane rather than by being one.
+    "trust-call-summary-census",
     "self-proof",
     # Script collections and ledgers, not compiletest suites — `x.py test <dir>`
     # is meaningless for all five. Each RUNNER is rowed instead (`suites.*`), so
@@ -284,6 +289,7 @@ TOOLING_ROLES: tuple[tuple[str, str], ...] = (
     ("scripts/build-", "build drivers and memory governors, not verdict-bearing"),
     ("scripts/__init__.py", "package marker"),
     ("scripts/harvest_mir_corpus.sh", "builds a measurement corpus; produces no verdict"),
+    ("scripts/fetch-first-party.sh", "materializes sibling repos for a standalone clone; no verdict"),
     ("scripts/harvest_mir_corpus_closed.sh", "corpus builder; produces no verdict"),
     ("scripts/trust_ir_b4_classifier.py", "takes a data_json argument; classifies a wave, judges nothing"),
     # --- classified 2026-08-26, from the catch-all sweep ---

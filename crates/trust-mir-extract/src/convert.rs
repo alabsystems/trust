@@ -6747,7 +6747,7 @@ fn tcx_marked_unsigned_wrapping_primitive_path(
     trust_types::RustcTotalPrimitiveMethod::classify(&marked).map(|_| marked)
 }
 
-/// Mark an exact inherent `core` integer wrapping add/sub method for the
+/// Mark an exact inherent `core` integer wrapping add/sub/mul method for the
 /// refutation-only modular call model.
 ///
 /// The E6 marker above intentionally excludes signed, pointer-sized, and
@@ -6756,13 +6756,25 @@ fn tcx_marked_unsigned_wrapping_primitive_path(
 /// `wrapping_add` suffix lets a user lookalike manufacture a false
 /// counterexample. This second closed marker preserves that existing
 /// refutation precision without widening E6 proof authority.
+///
+/// `wrapping_mul` joined the marked set 2026-08-29 (verified-sysroot §5 step 1
+/// slice: `targo trust check -p rustc-hash` measured 16 of 18 absent-callee
+/// panic rows naming `<impl usize>::wrapping_mul` / `<impl u128>::wrapping_mul`).
+/// The op set widens, the authority does not: every consumer decides per op —
+/// the TrustIr bridge lowers all three to the defining modular `BinOp`
+/// (`core_int_arith_intrinsic`), the LIA assert-refutation model still declines
+/// `Mul` as nonlinear (`authenticated_wrapping_call`), and the E6 facet /
+/// admissible-body lanes fail closed on this whole marker namespace.
 fn tcx_marked_wrapping_refutation_path(
     tcx: TyCtxt<'_>,
     def_id: DefId,
     path: &str,
 ) -> Option<String> {
     let self_ty = tcx_authenticated_core_integer_wrapping_self_ty(tcx, def_id)?;
-    if !matches!(tcx.item_name(def_id).as_str(), "wrapping_add" | "wrapping_sub") {
+    if !matches!(
+        tcx.item_name(def_id).as_str(),
+        "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+    ) {
         return None;
     }
     let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
@@ -8174,6 +8186,10 @@ pub fn excluded_wrapping_i8_add(x: i8, y: i8) -> i8 { x.wrapping_add(y) }
 pub fn excluded_wrapping_i16_sub(x: i16, y: i16) -> i16 { x.wrapping_sub(y) }
 #[inline(never)]
 pub fn excluded_wrapping_i32_mul(x: i32, y: i32) -> i32 { x.wrapping_mul(y) }
+#[inline(never)]
+pub fn excluded_wrapping_usize_mul(x: usize, y: usize) -> usize { x.wrapping_mul(y) }
+#[inline(never)]
+pub fn excluded_wrapping_u128_mul(x: u128, y: u128) -> u128 { x.wrapping_mul(y) }
 #[inline(never)]
 pub fn excluded_wrapping_i64_add(x: i64, y: i64) -> i64 { x.wrapping_add(y) }
 #[inline(never)]
@@ -10419,6 +10435,8 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             "excluded_wrapping_i8_add",
             "excluded_wrapping_i16_sub",
             "excluded_wrapping_i32_mul",
+            "excluded_wrapping_usize_mul",
+            "excluded_wrapping_u128_mul",
             "excluded_wrapping_i64_add",
             "excluded_wrapping_i128_add",
             "excluded_wrapping_ptr_add",
@@ -10444,19 +10462,21 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             "excluded_wrapping_usize_add",
             "excluded_wrapping_i8_add",
             "excluded_wrapping_i16_sub",
+            "excluded_wrapping_i32_mul",
+            "excluded_wrapping_usize_mul",
+            "excluded_wrapping_u128_mul",
             "excluded_wrapping_i64_add",
             "excluded_wrapping_i128_add",
         ] {
             let extracted = callees.get(caller).expect("refutation wrapping caller extracted");
             assert!(
                 trust_types::RustcWrappingRefutationMethod::classify(&extracted[0]).is_some(),
-                "an exact non-E6 core wrapping add/sub must retain sealed refutation identity: \
-                 {caller}: {extracted:?}"
+                "an exact non-E6 core wrapping add/sub/mul must retain sealed refutation \
+                 identity: {caller}: {extracted:?}"
             );
         }
 
         for caller in [
-            "excluded_wrapping_i32_mul",
             "excluded_wrapping_ptr_add",
             "excluded_wrapping_add_signed",
             "excluded_wrapping_add_unsigned",

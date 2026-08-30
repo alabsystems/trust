@@ -14036,6 +14036,13 @@ fn core_int_arith_intrinsic(
         (None, Some(method)) => match method.op {
             RustcWrappingRefutationOp::Add => BinOp::Add,
             RustcWrappingRefutationOp::Sub => BinOp::Sub,
+            // Same defining modular semantics as Add/Sub: `wrapping_mul` at
+            // width w IS `mul mod 2^w`, which is exactly the Wrapping-tagged
+            // `BinOp::Mul` this lane emits. The carrier/type gates below are
+            // op-independent. (Verified-sysroot §5 step 1 slice, 2026-08-29 —
+            // discharges the `<impl usize>::wrapping_mul` / `<impl u128>::
+            // wrapping_mul` absent-callee rows measured on rustc-hash.)
+            RustcWrappingRefutationOp::Mul => BinOp::Mul,
         },
         (None, None) => return Ok(None),
     };
@@ -33860,6 +33867,53 @@ mod obligation_site_tests {
             matches!(inst, Inst::Assert { .. }),
             "the site must name the `Assert`, not the `Unreachable` terminator \
              pushed after it: got {inst:?}"
+        );
+    }
+
+    /// Trust: the bridge stamps NO source span on any instruction it emits, so
+    /// an obligation cannot be resolved to an instruction by matching spans.
+    ///
+    /// This is pinned as a MEASUREMENT because a plan currently depends on the
+    /// opposite. `docs/design/DIRECT-LANE-PROOF-AUTHORITY.md`'s re-scoped Step 1
+    /// proposes resolving the production mint's obligations to instructions by
+    /// `(span, is_assert, kind)`. That rule cannot be implemented against
+    /// `InstrNode.span` while this test passes: the field is `None` on every
+    /// node, so the first component selects nothing.
+    ///
+    /// `vcgen_proto.rs` states the same fact in prose — "the lowering does not
+    /// call `.with_span()` on the assert" — and names the fix: "(ii) have the
+    /// lowering also stamp the span onto the assert node". The span IS in scope
+    /// at every assert site here (it is already passed to
+    /// `ObligationSourceMetadata::for_mir_assert`), so the work is stamping plus
+    /// interning the file through `module.intern_file`, not recovering
+    /// information the bridge lacks.
+    ///
+    /// **If this test starts failing, that fix has landed and the re-scoped Step
+    /// 1 is unblocked — delete this test rather than repairing it.**
+    #[test]
+    fn no_emitted_instruction_carries_a_span_so_spans_cannot_resolve_an_obligation() {
+        let mut nodes = 0usize;
+        let mut spanned = 0usize;
+        for func in
+            [build_asserting_function(), build_diverging_ub_call(), build_absent_callee_call()]
+        {
+            let module = lower_to_trust_ir(&func).expect("fixture must lower");
+            for function in &module.functions {
+                for block in &function.blocks {
+                    for node in &block.body {
+                        nodes += 1;
+                        if node.span.is_some() {
+                            spanned += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(nodes > 0, "the fixtures must emit instructions for this to measure anything");
+        assert_eq!(
+            spanned, 0,
+            "{spanned} of {nodes} emitted instructions carry a span; if the lowering now stamps \
+             spans, span-keyed obligation resolution is possible and this pin is obsolete"
         );
     }
 

@@ -1,0 +1,23 @@
+# trust-fixed: total, verified fixed-point / scaled-integer arithmetic.
+#
+# Tenth `crates/`-resident component written to PASS the authenticated strict
+# lane rather than to be retrofitted onto it, on the same discipline as
+# `trust-ratio`, `trust-hex`, `trust-utf`, `trust-endian`, `trust-index`,
+# `trust-varint`, `trust-checksum`, `trust-radix64` and `trust-align`: no
+# dependencies, `#![no_std]`, no `derive`, no `impl Display`, no allocation, no
+# loops, no mutable slices.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-fixed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

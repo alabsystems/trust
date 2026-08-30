@@ -244,6 +244,111 @@ members = [
     # and the two JS `String.fromCodePoint`/`decodeURIComponent` reassemblers
     # each hide the same arithmetic behind `u16::try_from(..).expect(..)`.
     "trust-utf",
+    # Fourth component on the same discipline: total, `no_std`, zero-dependency
+    # byte-order (endian) assembly, written to PASS the authenticated strict
+    # lane. It exists because every binary reader in this tree assembles a word
+    # out of bytes and then bounds it by hand: `trust-js-sem`'s DataView decoder
+    # shifts by `8 * i` with the shift-overflow side condition discharged only
+    # by a comment, and the object readers reach the same value through
+    # `try_into().expect(..)` — a panic site standing in for an arithmetic fact.
+    "trust-endian",
+    # Fifth component on the same discipline: total, `no_std`, zero-dependency
+    # bounded-index, ring and slice-range arithmetic, written to PASS the
+    # authenticated strict lane. It is the `usize` lane `trust-ratio` (u32-only)
+    # leaves open, plus the two families it has none of — ring wrap-around and
+    # slices. It exists because indexing is the most common panicking operation
+    # in this tree and its side condition is almost never a proved proposition:
+    # `trust-convergence/src/termination.rs:702` discharges eight arithmetic
+    # facts with one comment that names itself as a proof, and
+    # `trust-ts-strip/src/erase.rs:40` clamps one end of a range so that the
+    # other end inverts it.
+    "trust-index",
+    # Sixth component on the same discipline: total, `no_std`, zero-dependency
+    # LEB128 / varint / length-prefix decoding, written to PASS the
+    # authenticated strict lane. It exists because a decoded varint is treated
+    # as two facts nobody checks: `trust-binary-parse/src/dwarf/line.rs:267`
+    # and `:290` size a `Vec::with_capacity` from a ULEB128 count bounded only
+    # by `usize::try_from`, which on 64-bit rejects nothing; `symbol.rs:87` and
+    # `relocation.rs:41` compute `start + count * elem` and check the bound
+    # AFTER the multiply that can wrap it; and `line.rs:470` subtracts
+    # `opcode_base` from an attacker-controlled byte with the only guard a
+    # `continue` 346 lines away in a different function.
+    "trust-varint",
+    # Seventh component on the same discipline: total, `no_std`, zero-dependency
+    # checksum / rolling-hash / parity arithmetic.
+    "trust-checksum",
+    # Also on the same discipline: total, `no_std`, zero-dependency base64 /
+    # base32 / radix-64 codec arithmetic, written to PASS the authenticated
+    # strict lane. It exists because the encoded-length formula in this tree is
+    # `Option`-typed and then unwrapped:
+    # `first-party/ty/crates/tla-base64/src/encode.rs:101` returns `None` when
+    # `complete_input_chunks.checked_mul(4)` overflows, and `encode.rs:89-91`
+    # spends the `Option` on `.expect("usize overflow when calculating b64
+    # length")`. Taking the QUANTUM count as a `u32` and returning `u64` deletes
+    # that conversion instead of discharging it. `encode.rs:118-123` carries the
+    # remainder fact (`bytes_len % 3 <= 2`) in a comment above a `_` arm, and
+    # `display.rs:55` / `alphabet.rs:133` assert the alphabet's ASCII-ness with
+    # `.expect` / `.unwrap`.
+    "trust-radix64",
+    # Tenth component on the same discipline: total, `no_std`, zero-dependency
+    # fixed-point / scaled-integer arithmetic, written to PASS the authenticated
+    # strict lane. It exists because every scaled ratio in this tree TRUNCATES
+    # and none of them says so: `trust-ratio/src/lib.rs:197,219,234` offer one
+    # rounding mode because `/` does, and `trust-clean-origin/src/table.rs:2347`
+    # floors `covered * 10_000 / DEMANDS.len()` — an unbounded multiply — which
+    # `tests/table_controls.rs:949-950` then prints as `{}.{:02}%`, so 99.995%
+    # coverage publishes as `99.99%`. `trust-router/src/memory_jobserver.rs:485`
+    # scales a memory budget through a `u128` multiply, which has no verifiable
+    # lane at all. This crate is the rounded / ceilinged / half-to-even half,
+    # with the multiply proved and the rounding chosen.
+    "trust-fixed",
+    # Eleventh component on the same discipline: total, `no_std`, zero-dependency
+    # interval / range algebra, written to PASS the authenticated strict lane.
+    # It exists because a range is two numbers and the side condition relating
+    # them is written down rather than discharged:
+    # `first-party/trust-cg/crates/trust-cg-regalloc/src/liveness.rs:33` carries
+    # `debug_assert!(start < end)` as the SOLE guarantor of `contains` (`:39`)
+    # and `overlaps` (`:44`) — compiled out of the shipping build, where an
+    # inverted `LiveRange` makes two disjoint ranges report as interfering.
+    # `crates/trust-ts-strip/src/erase.rs:40` clamps one end and not the other,
+    # so the clamp MANUFACTURES the `s > en` that `:41` then panics on.
+    # `crates/trust-disasm/src/aarch64/decode.rs:22` computes `hi - lo + 1` for
+    # a documented-inclusive range with no `hi >= lo` anywhere, and
+    # `crates/trust-types/src/smt_logic.rs` spells that same expression BOTH
+    # ways in one file — guarded at `:222-225`, unguarded at `:746`.
+    "trust-interval",
+    "trust-timearith",
+    # Thirteenth component on the same discipline: total, `no_std`,
+    # zero-dependency word-level bit manipulation, written to PASS the
+    # authenticated strict lane. It exists because a shift amount and a mask
+    # width are the two numbers in this tree least likely to be checked:
+    # `x << n` for `n >= 32` panics with debug assertions on and is MASKED to
+    # `n % 32` without them, so `1u32 << 32` is `1`. That shipped a miscompile
+    # — `crates/trust-disasm/src/aarch64/decode.rs:227-235` records `1u64 <<
+    # esize` with `esize == 64` decoding EVERY 64-bit logical immediate with a
+    # non-zero rotate as `#0`, certified `Proven` against an identity spec, 27
+    # words across a 599-crate corpus — and the repair there is a local
+    # closure in one function. `decode.rs:21`'s
+    # `(val >> lo) & ((1 << (hi - lo + 1)) - 1)` carries three undischarged
+    # conditions and is copy-pasted verbatim into
+    # `harness/native-invariant/src/attribute.rs:16`;
+    # `crates/trust-spec-elab/src/lib.rs:183-192` guards one of three adjacent
+    # helpers over the same `bits`; and
+    # `compiler/rustc_index/src/bit_set.rs:1751` computes
+    # `WORD_BITS - 1 - word.leading_zeros()`, which underflows at zero.
+    "trust-bits",
+    # Ninth component on the same discipline: total, `no_std`, zero-dependency
+    # alignment / padding / layout-offset arithmetic, written to PASS the
+    # authenticated strict lane. It exists because the round-up-to-a-power-of-two
+    # formula in this tree carries TWO side conditions and discharges neither:
+    # `trust-cg-bridge/src/module_to_lir.rs:1115` and
+    # `compiler/rustc_arena/src/lib.rs:334,340` both write
+    # `debug_assert!(align.is_power_of_two())` above `(value + align - 1) &
+    # !(align - 1)` — an assertion that is compiled out of the shipping build,
+    # over an addition nothing bounds. `trust-js-sem/src/typedarray.rs:339`
+    # decides every typed-array bound check with `byte_offset + length * elem`
+    # on JS-supplied values, where a wrap makes the check read small and pass.
+    "trust-align",
     "trust-clean",
     # I4 (docs/design/2026-08-04-two-language-compiler-architecture.md): Clean
     # type -> Rust carrier. The ONLY sound producer of `CarrierEvidence::Total`,
@@ -488,6 +593,16 @@ trust-rand = { path = "trust-rand" }
 trust-ratio = { path = "trust-ratio" }
 trust-hex = { path = "trust-hex" }
 trust-utf = { path = "trust-utf" }
+trust-endian = { path = "trust-endian" }
+trust-varint = { path = "trust-varint" }
+trust-index = { path = "trust-index" }
+trust-checksum = { path = "trust-checksum" }
+trust-align = { path = "trust-align" }
+trust-radix64 = { path = "trust-radix64" }
+trust-fixed = { path = "trust-fixed" }
+trust-interval = { path = "trust-interval" }
+trust-timearith = { path = "trust-timearith" }
+trust-bits = { path = "trust-bits" }
 trust-convergence = { path = "trust-convergence" }
 trust-temporal = { path = "trust-temporal" }
 trust-proof-cert = { path = "trust-proof-cert" }

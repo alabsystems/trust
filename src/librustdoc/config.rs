@@ -506,12 +506,12 @@ impl Options {
             (None | Some(OutputFormat::Html), false, _) => {}
             (Some(OutputFormat::Json), false, false) => {
                 dcx.fatal(
-                    "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see issue #76578)",
+                    "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see https://github.com/rust-lang/rust/issues/76578)",
                 );
             }
             (Some(OutputFormat::Doctest), false, false) => {
                 dcx.fatal(
-                    "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see issue #134529)",
+                    "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see https://github.com/rust-lang/rust/issues/134529)",
                 );
             }
         }

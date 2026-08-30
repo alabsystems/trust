@@ -176,6 +176,21 @@ format_gate_list() {
     printf '%s' "${gates_csv//,/ }"
 }
 
+# PROGRESS GOES TO STDERR, NEVER STDOUT. The readiness matrix on stdout is a
+# machine-readable surface; anything printed there would change what a consumer
+# parses. stderr is free, and without it this script is INDISTINGUISHABLE FROM A
+# HANG: every gate's output is redirected into a per-gate log file and the matrix
+# is printed only after the last gate returns, so a run that legitimately takes
+# many minutes — each gate here executes a whole suite — emits ZERO BYTES the
+# entire time. Measured 2026-08-29: 420 s with line buffering forced via
+# `stdbuf -oL -eL`, still 0 bytes, so it was not a buffering artifact. A
+# reporting lane you cannot distinguish from a hang gets killed by whoever is
+# watching it, which is how this one came to be recorded as "hung, produced
+# nothing" rather than "slow".
+progress() {
+    printf '[gate-status] %s\n' "$*" >&2
+}
+
 record_gate() {
     local name="$1"
     local code="$2"
@@ -185,6 +200,7 @@ record_gate() {
     gate_codes+=("$code")
     gate_statuses+=("$(status_for_code "$code")")
     gate_logs+=("$log")
+    progress "$(status_for_code "$code")  $name  (exit $code)"
 }
 
 run_gate() {
@@ -194,6 +210,7 @@ run_gate() {
     local code
     local -a gate_env=()
     suite="$(suite_for_gate "$gate")"
+    progress "running $gate .."
 
     # These names are canonical trust-added release inventory IDs. The legacy
     # shell suites expose only weaker local diagnostics, so never execute them

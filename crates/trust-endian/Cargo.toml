@@ -1,0 +1,21 @@
+# trust-endian: total, verified byte-order (endian) assembly.
+#
+# Fourth `crates/`-resident component written to PASS the authenticated strict
+# lane rather than to be retrofitted onto it, on the same discipline as
+# `trust-ratio`, `trust-hex` and `trust-utf`: no dependencies, `#![no_std]`, no
+# `derive`, no `impl Display`, no allocation, no loops, no slices.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-endian"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

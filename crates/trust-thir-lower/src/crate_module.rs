@@ -242,6 +242,13 @@ struct DerivedMirEvidence {
 /// One recorded body: everything the finalizer needs, snapshotted at the hook (THIR/`tcx` query
 /// results are reduced to plain owned data so the registry is `'static`).
 struct BodyRecord {
+    /// Trust (wave-FC): is this body's declared ABI a Rust one? Read off `tcx.fn_sig` at
+    /// record-build time (const/static initializers have no fn sig and default `true`). The
+    /// splice stamp consumes it: a spliced `extern "C"` LOCAL body must not be stamped
+    /// `CallingConv::Rust` — that false claim would either trip `validate_module`'s
+    /// edge-vs-target conv cross-check on a reified C target, or silently mis-state the ABI
+    /// the #180/#190 honesty rows exist to keep true.
+    rust_abi: bool,
     /// `def.to_def_id().index.as_u32()` — the sort key AND the intra-crate callee-mapping key
     /// (the producer's `admit_callee` derives callee `FuncId`s from exactly this index).
     def_index: u32,
@@ -1161,7 +1168,25 @@ pub fn record(
         ));
     }
 
+    // Trust (wave-FC): the body's real ABI, for the splice stamp.
+    let rust_abi = match body_kind {
+        // Trust (wave-FC hardening): `fn_sig` ICEs on any def that is not literally a
+        // fn/assoc-fn (measured: a `global_asm!` anon item classified BodyKind::Fn —
+        // "unexpected sort of node in fn_sig()"), so gate on DEF KIND, not body kind, and
+        // default `true` for everything sig-less (closures are Rust-ABI by construction).
+        BodyKind::Fn => match tcx.def_kind(def.to_def_id()) {
+            rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn => matches!(
+                tcx.fn_sig(def.to_def_id()).skip_binder().skip_binder().abi(),
+                rustc_abi::ExternAbi::Rust
+                    | rustc_abi::ExternAbi::RustCall
+                    | rustc_abi::ExternAbi::RustCold
+            ),
+            _ => true,
+        },
+        _ => true,
+    };
     let rec = BodyRecord {
+        rust_abi,
         def_index,
         kind: body_kind,
         symbolic,
@@ -4163,12 +4188,18 @@ fn assemble(crate_name: &str, records: &[BodyRecord]) -> Assembled {
             BodyKind::StaticInit => format!("{}::{{static-init}}", r.def_path),
         };
         f.ty = intern_func_ty(&mut module, func_ty.clone());
-        // Trust (#180): a SPLICED body is a Rust function, so say so. `Function::new` defaults
+        // Trust (#180): a SPLICED body carries its REAL ABI. `Function::new` defaults
         // `calling_conv` to `C`, and leaving it there would make every call from this body to a
         // now-correctly-Rust-ABI declaration read as a CROSS-CONVENTION CALL EDGE
         // (`Module::first_ffi_boundary`'s second scan) — trading one false FFI boundary for
         // another. The declaration and definition halves have to move together.
-        f.calling_conv = trust_ir::CallingConv::Rust;
+        // Trust (wave-FC): "is a Rust function, so say so" was a false claim for a spliced
+        // LOCAL `extern "C"` body; the record now carries the ground truth.
+        f.calling_conv = if r.rust_abi {
+            trust_ir::CallingConv::Rust
+        } else {
+            trust_ir::CallingConv::C
+        };
         // (EnumDefs/StructDefs/types were interned and every embedded `EnumId`/`StructId`/`TyId`
         // remapped in pass 1 — `prepare_body_tables`; `f`/`func_ty` here are the pre-remapped
         // clones.)
@@ -6624,6 +6655,7 @@ mod authority_tests {
                 .expect("the minimal per-body mini-module must digest");
         let function = module.functions.remove(0);
         BodyRecord {
+            rust_abi: true,
             def_index,
             kind: BodyKind::Fn,
             symbolic: false,
@@ -8163,6 +8195,7 @@ mod str_const_finalize_tests {
     /// Minimal `BodyRecord` for the pure splice-gate probes above.
     fn minimal_record() -> BodyRecord {
         BodyRecord {
+            rust_abi: true,
             def_index: 0,
             kind: BodyKind::Fn,
             symbolic: false,

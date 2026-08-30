@@ -1856,7 +1856,15 @@ pub use generate::generate_bounded_reduction_bmc_refutation_candidates;
 pub use generate::generate_full_assert_refutation_vcs;
 pub use generate::{
     all_callsites_precondition_dominated, call_dest_fact_token, derive_float_result_range,
-    composed_formula_is_caller_entry_grounded, generate_callsite_l0_replay_candidates,
+    // NOTE: `composed_formula_is_caller_entry_grounded` is deliberately NOT
+    // re-exported. It is the CALL-SITE REPLAY lane's own admission gate, and an
+    // ordinary body VC cannot satisfy it (its free vars are MIR temps, versioned
+    // SSA reads and model companion vars, not entry-stable parameters).
+    // Exporting it in `bc65b2ca7d` is what let it be applied to every generic L0
+    // obligation at the v1/ay bridge, costing 88 genuine refutations on the
+    // frozen mutant corpus. Keep it crate-private so the mistake is not
+    // repeatable by import.
+    generate_callsite_l0_replay_candidates,
     generate_callsite_precondition_vcs,
     generate_callsite_precondition_vcs_attributed,
     generate_full_assert_refutation_vcs_with_context, generate_vcs,

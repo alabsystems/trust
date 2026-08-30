@@ -12656,6 +12656,60 @@ fn test_wrapping_refutation_markers_lower_signed_and_pointer_sized_binops() {
     assert_single_wrapping_binop(&legacy_pointer_sized, TrustIrBinOp::Add, TrustIrTy::U64);
 }
 
+/// Verified-sysroot §5 step 1 slice (2026-08-29): `wrapping_mul` joined the
+/// refutation marker's op set so its call sites inherit the SAME defining
+/// modular `BinOp` lowering as add/sub. The carriers pinned here are exactly
+/// the two the rustc-hash measurement named as absent callees (`usize` in both
+/// its faithful and legacy spellings, and `u128`), plus a signed fixed-width
+/// control. Each assertion is falsifying: it fails if the definition emits the
+/// wrong op, the wrong carrier type, or any obligation residue.
+#[test]
+fn test_wrapping_refutation_marker_lowers_mul_carriers() {
+    let faithful_usize = Ty::PtrSizedInt { signed: false };
+    let pointer_sized = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_mul",
+        vec![faithful_usize.clone(), faithful_usize.clone()],
+        faithful_usize,
+    ))
+    .expect("authenticated faithful usize wrapping_mul must lower");
+    assert_single_wrapping_binop(&pointer_sized, TrustIrBinOp::Mul, TrustIrTy::Usize);
+
+    let legacy_pointer_sized = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_mul",
+        vec![Ty::usize(), Ty::usize()],
+        Ty::usize(),
+    ))
+    .expect("authenticated legacy usize wrapping_mul must lower");
+    assert_single_wrapping_binop(&legacy_pointer_sized, TrustIrBinOp::Mul, TrustIrTy::U64);
+
+    let wide = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl u128>::wrapping_mul",
+        vec![Ty::u128(), Ty::u128()],
+        Ty::u128(),
+    ))
+    .expect("authenticated u128 wrapping_mul must lower");
+    assert_single_wrapping_binop(&wide, TrustIrBinOp::Mul, TrustIrTy::U128);
+
+    let signed = lower_to_trust_ir(&typed_absent_call(
+        "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_mul",
+        vec![Ty::i32(), Ty::i32()],
+        Ty::i32(),
+    ))
+    .expect("authenticated i32 wrapping_mul must lower");
+    assert_single_wrapping_binop(&signed, TrustIrBinOp::Mul, TrustIrTy::I32);
+
+    // The widened op inherits every existing fail-closed gate: a carrier
+    // mismatch must keep the honest absent-callee obligation.
+    assert_wrapping_call_fails_closed(
+        typed_absent_call(
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl u128>::wrapping_mul",
+            vec![Ty::u64(), Ty::u64()],
+            Ty::u64(),
+        ),
+        "carrier-mismatched mul marker",
+    );
+}
+
 fn assert_wrapping_call_fails_closed(function: VerifiableFunction, label: &str) {
     match lower_to_trust_ir(&function) {
         Ok(module) => {

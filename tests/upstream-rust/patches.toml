@@ -255,16 +255,16 @@ allow_missing = true
 id = "trust.naming.run-make-version-prefix"
 status = "active"
 owner = "@trust-release"
-reason = "Trust's public compiler version output uses the `trustc` entrypoint name instead of the inherited upstream `rustc` name."
+reason = "RESCOPED 2026-08-29. The original premise was wrong: the version line's leading token is `rustc` in BOTH toolchains and always was -- deliberately, because build scripts machine-parse it. What actually diverges is a trailing IDENTITY parenthetical, ` (trustc <ver>)`, which upstream does not emit. Suppressing it under RUSTC_OVERRIDE_VERSION_STRING was implemented and REVERTED: that variable overrides the VERSION, while the parenthetical is the tool's identity, and since the variable is settable by anyone in the environment, honouring it there would hand out a verifying compiler reporting as stock rustc. With the leading token hardcoded to `rustc` and the version operator-supplied, the parenthetical is the last remaining signal of what the binary is. The test therefore parses it off, asserts the overridden version verbatim, AND asserts the identity is still present."
 issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
-reviewed_on = "2026-07-23"
-expires_on = "2026-10-23"
+reviewed_on = "2026-08-29"
+expires_on = "2026-11-29"
 path = "tests/run-make/version-check/rmake.rs"
 kind = "string-replace"
-find = "    let version = rustc_out.strip_prefix(\"rustc \").unwrap().trim_end();"
-replace = "    let version = rustc_out.strip_prefix(\"trustc \").unwrap().trim_end();"
+find = "    assert_eq!(version, signalled_version);"
+replace = "    let (version, brand) = match version.split_once(\" (\") {\n        Some((version, brand)) => (version, Some(brand.trim_end_matches(')'))),\n        None => (version, None),\n    };\n    assert_eq!(version, signalled_version, \"the overridden version must be reported verbatim\");\n    let brand = brand.expect(\"Trust must still identify itself under RUSTC_OVERRIDE_VERSION_STRING\");\n    assert!(brand.starts_with(\"trustc \"), \"identity parenthetical must name the Trust driver, got `{brand}`\");"
 expected_replacements = 1
-allow_missing = true
+allow_missing = false
 
 [[patches]]
 id = "trust.vanilla.rustc-dev-remap-remap-unremap-ast-ir"
@@ -1090,6 +1090,51 @@ replace = '''
                         * thin-link-bitcode - CRATE_NAME.indexing.o
                         * trust-ir - CRATE_NAME.trust-ir.bin
 '''
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.sysroot-stable-trust-bignum"
+status = "active"
+owner = "@trust-compiler"
+reason = "Trust ships a 28th sysroot crate upstream does not have: `trust_bignum`, the I6 bignum carrier runtime backing Clean/Lean `Nat`. Upstream's list of stable sysroot crates is therefore incomplete for this fork, and the test reports the gap as `command unexpectedly succeeded`. The crate declares its surface stable deliberately (crates/trust-bignum/src/lib.rs cites `Plan step 8 as amended by review defect 4`), and twelve in-tree `clean_origin_*` ui tests name it with no feature gate. NOT decided here, and worth a look when this row is reviewed: `since = \"1.0.0\"` on a compiler reporting 1.99.0-dev / trust 0.1.0 -- the in-tree idiom for a real stabilization is `CURRENT_RUSTC_VERSION`."
+issue = "local:docs/design/2026-08-04-two-language-compiler-architecture.md"
+reviewed_on = "2026-08-29"
+expires_on = "2026-11-29"
+path = "tests/run-make/sysroot-crates-are-unstable/rmake.rs"
+kind = "string-replace"
+find = "    matches!(name, \"std\" | \"alloc\" | \"core\" | \"proc_macro\")"
+replace = "    matches!(name, \"std\" | \"alloc\" | \"core\" | \"proc_macro\" | \"trust_bignum\")"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.rustdoc-help-tool-names"
+status = "active"
+owner = "@trust-compiler"
+reason = "`src/librustdoc/lib.rs` renames the tools it NAMES in its own help text: the compiler it forwards flags to is `trustc` (`pass a --cfg to trustc`), the tool it describes is `trustdoc` (`Run trustdoc checks`), and `-V` was de-branded to `print this documentation tool's version`. These are STATIC strings -- identical in the branded and `--trust-vanilla` lanes, measured -- so unlike the usage line and the trailing `documentation for <tool>` line (both invocation-derived, folded in the recipe with `diff().normalize(..)`) they belong in the snapshot rather than in a fold. They were shipped unledgered: the source was rebranded and the expectation was never updated, so this test failed in BOTH lanes and no ledger row explained why."
+issue = "local:docs/upstream-rust-test-refresh-and-divergence-status.md#reasonable-divergences"
+reviewed_on = "2026-08-29"
+expires_on = "2026-11-29"
+path = "tests/run-make/rustdoc-default-output/output-default.stdout"
+kind = "string-replace"
+find = "pass a --cfg to rustc"
+replace = "pass a --cfg to trustc"
+expected_replacements = 1
+allow_missing = false
+
+[[patches]]
+id = "trust.divergence.emit-help-trust-ir-rustc-help-v-diff"
+status = "active"
+owner = "@trust-compiler"
+reason = "The FOURTH file the same divergence touches, and the one the other three missed. `help-v.diff` is the diff BETWEEN help.stdout and help-v.stdout, so the `trust-ir` EMIT_HELP row the two rows above insert into both shifts this file's hunk header down by exactly one line (@@ -65 -> @@ -66). Nothing about the diff BODY changes -- the inserted line sits above the hunk, not inside it -- which is why this surfaced as a one-line header mismatch rather than as content drift, and why it was missed when the sibling rows landed 2026-08-23. Ledgered with them so the same divergence cannot resurface as a `new` failure in a third place."
+issue = "local:docs/DESIGN_PHILOSOPHY.md#5-trust-ir-is-the-canonical-universal-ir"
+reviewed_on = "2026-08-29"
+expires_on = "2026-11-23"
+path = "tests/run-make/rustc-help/help-v.diff"
+kind = "string-replace"
+find = "@@ -65,10 +65,31 @@"
+replace = "@@ -66,10 +66,31 @@"
 expected_replacements = 1
 allow_missing = false
 

@@ -1,21 +1,27 @@
 # Install Trust
 
-> **Boundary as last reviewed 2026-07-20:** Trust has a private seed-first
-> source-build path for `aarch64-apple-darwin`. It does not have an authorized
-> public package or a demonstrated Linux/Windows install. A produced Stage2
-> sysroot is usable only after current-commit inventory and acceptance gates
-> pass; this document does not assert that those gates have passed.
+> **Boundary as last reviewed 2026-08-29:** Trust has public, ledger-attested
+> source releases (signed `SHA256SUMS`/`SHA256SUMS.sig`) with an anonymous
+> public build lane — `scripts/fetch-first-party.sh` plus a stock-nightly check
+> scoped to the upstream-Rust crates — and a private seed-first source-build
+> path for `aarch64-apple-darwin`. The self-hosting toolchain build remains
+> that private/self-hosted lane; there is no packaged binary install and no
+> demonstrated Linux/Windows install. A produced Stage2 sysroot is usable only
+> after current-commit inventory and acceptance gates pass; this document does
+> not assert that those gates have passed.
 
 Trust descends from `rust-lang/rust`, but its canonical tool names are
 `trustc`, `targo`, `targo-trust`, `trustd`, `trustdoc`, `trustfmt`, `tippy`, and
 `trust-analyzer`. Same-sysroot Rust-compatible names are compatibility surface,
 not independent Trust evidence.
 
-No workflow is authorized to publish automatically. Local dist and install
-rehearsals may prepare and validate artifacts, but changing repository
-visibility, uploading artifacts, creating a public release, or updating a
-production channel requires explicit owner authorization after the evidence is
-reviewed.
+Publishing is gated by credential, not by a human in the loop: releases are
+promoted by automation that holds the separate release credential and names
+`PUBLISH_RELEASE_REMOTE` explicitly, with the content guards
+(forbidden-content, private-refs, gitleaks) passing in every release mode.
+Local dist and install rehearsals may prepare and validate artifacts, but
+nothing reaches the release tier without that credential and that explicit
+remote.
 
 ## Authoritative references
 
@@ -52,10 +58,17 @@ and both have a documented substitute:
   scripts/fetch-first-party.sh   # clones the nine siblings at their pinned revisions
   ```
 
-  Run it once after cloning; afterwards both Cargo workspaces load
-  (`cargo metadata`, `cargo check --manifest-path crates/Cargo.toml`,
-  `cargo test`, `x.py build`). In a development checkout (real submodules),
-  use `git submodule update --init` instead.
+  Run it once after cloning; afterwards both Cargo workspaces resolve
+  (`cargo metadata`, a `--locked` re-lock), and the stock nightly pinned at
+  the snapshot root checks the 50 upstream-Rust crates — the release gate's
+  scoped `-p` list, recorded in the internal `publish/config.sh`. Two crate
+  families build only through the self-hosted lane below: `trust-hex`,
+  `trust-ratio`, and `trust-utf` are Trust-language source (grammar `ensures`
+  clauses stock rustc cannot parse), and
+  `trust-mir-extract`/`trust-thir-lower`/`trust-witness` plus their 11
+  dependents link the fork's own compiler internals. `x.py build`
+  additionally needs the external patched LLVM above. In a development
+  checkout (real submodules), use `git submodule update --init` instead.
 
 ```bash
 # with an LLVM built and patched per patches/README.md

@@ -3084,9 +3084,14 @@ pub struct CalleeFact {
     /// which per CLAUDE.md's recorded hazard "never [means] that the callee is
     /// pure, deterministic, or side-effect-free". See
     /// [`crate::prove::pure_scalar_ret_model`] for the gates that make a model
-    /// transportable, and in particular why an all-SCALAR signature is what keeps
-    /// the untimed-`idx_elem` hazard out: with no handle crossing the boundary, a
-    /// call on this lane cannot mutate a pointee the caller also reads.
+    /// transportable. Trust: EFHT (2026-08-29) — this doc used to say an all-SCALAR
+    /// signature was what kept the untimed-`idx_elem` hazard out. It was not, and
+    /// the signature is now widened to `&T` handles: what keeps H2 out is the LEAF
+    /// SET (only the depth-1 selectors `Len`/`Discr`/`Field` over a HANDLE slot, no
+    /// `Index`) together with the read-only allow-list FENCE on BOTH bodies
+    /// (`prove::body_is_read_only`), and what keeps H1 out is that same fence on the
+    /// callee — never registry membership, never the signature. The evidence tier
+    /// is derived from the term at both ends, so this field carries no tier tag.
     pub ret_model: Option<crate::trustir_anchor::IrBody>,
 }
 
@@ -8151,6 +8156,7 @@ mod safety_overflow;
 mod safety_signed;
 mod semantics_env;
 mod termination;
+mod transport_lift;
 mod vc_faithful;
 
 pub use adequacy::*;
@@ -8174,6 +8180,9 @@ pub use safety_overflow::*;
 pub use safety_signed::*;
 pub use semantics_env::*;
 pub use termination::*;
+// Trust: EFHT-T (2026-08-29) — the transport lane's OWN recognizer entry; the shared
+// call recognizers above are byte-unchanged by it.
+pub(crate) use transport_lift::*;
 pub use vc_faithful::*;
 
 /// Trust: OPAQUE-CHAIN ADT-RETURN reduced test fixtures. These preserve the

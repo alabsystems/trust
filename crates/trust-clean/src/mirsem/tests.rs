@@ -3422,6 +3422,110 @@ fn sem_operand_of_mir_recognizes_deref_self_and_declines_others() {
 }
 
 #[test]
+fn deref_write_exists_flags_a_shared_ref_reborrow_write() {
+    // NEGATIVE CONTROL (D2): a shared REBORROW `_2 = &(*_1)` is neither a write nor a
+    // `Use` copy, so the old `Use`-only alias closure never saw `_2`, and `(*_2) = 9`
+    // wrote through the referent unnoticed. Twin without the write must stay FALSE.
+    use trust_types::{
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
+        Statement, Terminator, Ty, VerifiableBody,
+    };
+    let u8_ty = || Ty::Int { width: 8, signed: false };
+    let shared_ref = || Ty::Ref { mutable: false, inner: Box::new(u8_ty()) };
+    let body_with = |stmts| VerifiableBody {
+        locals: vec![
+            LocalDecl { index: 0, ty: u8_ty(), name: None },
+            LocalDecl { index: 1, ty: shared_ref(), name: Some("p".into()) },
+            LocalDecl { index: 2, ty: shared_ref(), name: Some("reborrow".into()) },
+        ],
+        blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
+        arg_count: 1,
+        return_ty: u8_ty(),
+        datatype_defs: Default::default(),
+    };
+    let reborrow = Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Ref {
+            mutable: false,
+            place: Place { local: 1, projections: vec![Projection::Deref] },
+        },
+        span: SourceSpan::default(),
+    };
+    let write_through = Statement::Assign {
+        place: Place { local: 2, projections: vec![Projection::Deref] },
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+        span: SourceSpan::default(),
+    };
+    assert!(
+        deref_write_exists(&body_with(vec![reborrow.clone(), write_through]), 1),
+        "a write through a shared reborrow of the referent must be flagged"
+    );
+    assert!(
+        !deref_write_exists(&body_with(vec![reborrow]), 1),
+        "tightness: the same reborrow WITHOUT a write is not a deref write"
+    );
+}
+
+#[test]
+fn raw_exposure_exists_flags_a_cast_derived_raw_pointer_write() {
+    // NEGATIVE CONTROL (D2): `_2 = _1 as *const u8; _3 = _2 as *mut u8; (*_3) = 9` —
+    // `CastKind::PtrToPtr` lowers to a bare `Rvalue::Cast`, so NO `AddressOf` exists
+    // for the old "choke point" to catch. Both predicates must fail closed; the twin
+    // without any cast must stay FALSE (tightness).
+    use trust_types::{
+        BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
+        Statement, Terminator, Ty, VerifiableBody,
+    };
+    let u8_ty = || Ty::Int { width: 8, signed: false };
+    let shared_ref = || Ty::Ref { mutable: false, inner: Box::new(u8_ty()) };
+    let raw = |mutable| Ty::RawPtr { mutable, pointee: Box::new(u8_ty()) };
+    let body_with = |stmts| VerifiableBody {
+        locals: vec![
+            LocalDecl { index: 0, ty: u8_ty(), name: None },
+            LocalDecl { index: 1, ty: shared_ref(), name: Some("p".into()) },
+            LocalDecl { index: 2, ty: raw(false), name: Some("q_const".into()) },
+            LocalDecl { index: 3, ty: raw(true), name: Some("q_mut".into()) },
+        ],
+        blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
+        arg_count: 1,
+        return_ty: u8_ty(),
+        datatype_defs: Default::default(),
+    };
+    let cast = |destination, source, ty| Statement::Assign {
+        place: Place::local(destination),
+        rvalue: Rvalue::Cast(Operand::Copy(Place::local(source)), ty),
+        span: SourceSpan::default(),
+    };
+    let write_through = Statement::Assign {
+        place: Place { local: 3, projections: vec![Projection::Deref] },
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+        span: SourceSpan::default(),
+    };
+    let leak = body_with(vec![cast(2, 1, raw(false)), cast(3, 2, raw(true)), write_through.clone()]);
+    assert!(
+        raw_exposure_exists(&leak, 1),
+        "a cast-derived raw pointer to the referent must be flagged as raw exposure"
+    );
+    // DOCUMENTED GAP, not a defect fix: `deref_write_exists` does NOT see a write through a
+    // Cast-derived raw pointer. An arm closing it was landed and reverted the same day --
+    // the predicate has ~20 consumers and the ptr-offset lane's `into_iter` fixture
+    // legitimately casts an alias through `NonNull`, so 12 pins broke. The lane that must
+    // refuse this body is model transport, fenced by the affirmative allow-list
+    // `prove::body_is_read_only` (refuses every non-scalar Cast by name). This assertion
+    // pins WHICH gate carries the case: not this one.
+    assert!(
+        !deref_write_exists(&leak, 1),
+        "deref_write_exists is a Use-only alias closure and cannot see a Cast-laundered write; \
+         if this ever flips, re-run the ptr-offset lane pins before trusting it"
+    );
+    // Tightness twin: no cast of the base at all — a raw write through an UNRELATED
+    // pointer local is not exposure of `_1`.
+    let unrelated = body_with(vec![write_through]);
+    assert!(!raw_exposure_exists(&unrelated, 1), "tightness: no cast of the base, no exposure");
+    assert!(!deref_write_exists(&unrelated, 1), "tightness: no alias of the base is written");
+}
+
+#[test]
 fn deref_write_exists_follows_shared_ref_copy_alias_chains_cycle_safely() {
     use trust_types::{
         BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,

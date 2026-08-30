@@ -1240,13 +1240,20 @@ impl RustcWrappingRefutationCarrier {
 }
 
 /// The refutation-only wrapping operation authenticated by rustc.
+///
+/// `Mul` was added 2026-08-29 (verified-sysroot §5 step 1 slice): every
+/// consumer decides its own capability per op, fail-closed — the TrustIr
+/// bridge lowers all three to the defining modular `BinOp`, while the LIA
+/// assert-refutation model keeps declining `Mul` (nonlinear) so a mul-marked
+/// callee stays ungrounded there rather than mis-decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RustcWrappingRefutationOp {
     Add,
     Sub,
+    Mul,
 }
 
-/// An exact compiler-authenticated `core` integer wrapping add/sub method.
+/// An exact compiler-authenticated `core` integer wrapping add/sub/mul method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RustcWrappingRefutationMethod {
     pub op: RustcWrappingRefutationOp,
@@ -1289,6 +1296,7 @@ impl RustcWrappingRefutationMethod {
         let op = match method {
             "wrapping_add" => RustcWrappingRefutationOp::Add,
             "wrapping_sub" => RustcWrappingRefutationOp::Sub,
+            "wrapping_mul" => RustcWrappingRefutationOp::Mul,
             _ => return None,
         };
         Some(Self { op, carrier })
@@ -1383,6 +1391,23 @@ mod rustc_total_primitive_method_tests {
                 RustcWrappingRefutationOp::Sub,
                 RustcWrappingRefutationCarrier::PointerSized { signed: true },
             ),
+            // The two carriers the 2026-08-29 rustc-hash measurement named as
+            // absent callees, plus the signed fixed-width case.
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl usize>::wrapping_mul",
+                RustcWrappingRefutationOp::Mul,
+                RustcWrappingRefutationCarrier::PointerSized { signed: false },
+            ),
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl u128>::wrapping_mul",
+                RustcWrappingRefutationOp::Mul,
+                RustcWrappingRefutationCarrier::Fixed { width: 128, signed: false },
+            ),
+            (
+                "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_mul",
+                RustcWrappingRefutationOp::Mul,
+                RustcWrappingRefutationCarrier::Fixed { width: 32, signed: true },
+            ),
         ] {
             assert_eq!(
                 RustcWrappingRefutationMethod::classify(path),
@@ -1393,7 +1418,7 @@ mod rustc_total_primitive_method_tests {
         for path in [
             "core::num::<impl i32>::wrapping_add",
             "@trust-rustc-wrapping-refutation-method::core::num::<impl f32>::wrapping_add",
-            "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_mul",
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_div",
             "@trust-rustc-wrapping-refutation-method::core::num::<impl i32>::wrapping_add::suffix",
             "@trust-rustc-wrapping-refutation-method::evil::num::<impl i32>::wrapping_add",
             "@trust-rustc-total-primitive-method::core::num::<impl i32>::wrapping_add",

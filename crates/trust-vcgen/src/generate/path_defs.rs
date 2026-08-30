@@ -1579,11 +1579,26 @@ fn entry_sentinel_ties(
 ///    bare side. Where the subject renders bare the tie would re-mint `n == n / 3` —
 ///    n pinned to 0, the original false proof, split across two conjuncts where
 ///    `self_referential_definition` cannot see it.
-///    DEAD under the MINT-SIDE clause above — deleting it alone leaves the WHOLE
-///    suite green (re-measured 2026-08-28: 3977 passed, 0 failed) and no fixture
-///    isolates it.
+///    DEAD GIVEN STEP (0) BELOW — and only given it. This previously read "provably
+///    dead … no fixture isolates it", which was FALSE: the argument's step (3)
+///    silently assumed a def's version GEN-KEY is its PIN SUBJECT.
+///    `block_def_subject` SPLITS the lhs name at '#' while `block_written_names`
+///    keys the gen-set on the WHOLE name (`formula_def_name`), so a def of a local
+///    named `n#x` gens `n#x` and ships a fact whose subject is BARE `n` — a name
+///    the entry-version dataflow never saw written. Measured 2026-08-29: the
+///    `debug_assert!` below FIRED, mint side passing while this clause decided.
+///    `no_pin_when_the_defs_gen_key_is_not_its_subject` is the fixture.
+///    The repair was to enforce the missing premise at the mint site rather than to
+///    lean on this clause, and the clause is KEPT: `debug_assert!` compiles out
+///    under `-C debug-assertions=off`, so the `return false` below is the only thing
+///    that fails closed in a release trustc.
 ///    Recorded as the argument rather than as a suspicion, in the order a future
 ///    edit breaks it:
+///      0. `formula_def_name(def) == block_def_subject(def)` — a def is pinned ONLY
+///         where its gen-key is its subject. ENFORCED at the mint site by
+///         `pin_in_place_update_reads`; guarded by
+///         `no_pin_when_the_defs_gen_key_is_not_its_subject`. This is the premise
+///         step (3) needs and did not have.
 ///      1. `v2_terminator_targets` ⊆ the fixpoint's enqueue set on EVERY
 ///         `Terminator` variant — they differ only by the unwind edges the
 ///         fixpoint adds. Guarded by `entry_sentinel_tie_subsumption_tests`.
@@ -1591,8 +1606,9 @@ fn entry_sentinel_ties(
 ///         consumer whose set is exactly `{e}` has no v2-ancestor writing `base`.
 ///      3. `base#e` has ONE mint site — `stamp_entry_valued_recurrent_read`, via
 ///         `pin_in_place_update_reads` inside this fixpoint's own gen-set
-///         construction — and it stamps only a def SUBJECT, so only a block the
-///         entry-version dataflow counts as a base-WRITER can gen one.
+///         construction — and it stamps only a def SUBJECT, so BY (0) only a block
+///         the entry-version dataflow counts as a base-WRITER can gen one. Without
+///         (0) this step is false, which is precisely how it failed.
 ///    A `base#e` fact must therefore cross a v2 in-edge of the consumer; by (1)
 ///    the fixpoint explores that edge and intersects its outflow in, and by (2)+(3)
 ///    that predecessor gens none — so the intersection removes it. An unwind edge
@@ -1602,9 +1618,12 @@ fn entry_sentinel_ties(
 ///    bare-subject pinned def) and 6 hand-built shapes incl. all three
 ///    unwind-bearing terminators; the three unwind shapes are the negative
 ///    controls in `entry_sentinel_tie_subsumption_tests`.
-///    Kept because dropping a refusal is never the safer direction. What is TESTED
-///    is the IMPLICATION that makes it dead (the `debug_assert!` below) — not the
-///    clause, which must not be cited as an independently falsified guarantee.
+///    Kept because dropping a refusal is never the safer direction — and here that
+///    is concrete, not a slogan: the `debug_assert!` below is inert in release, so
+///    retiring the clause would leave the shipped trustc with NO fail-closed check
+///    where one fired on real input. What is TESTED is the mint-site invariant (0)
+///    that makes the clause dead, plus the IMPLICATION itself (the `debug_assert!`).
+///    The clause must not be cited as an independently falsified guarantee.
 ///  * COLLAPSE. If the base's version tokens all normalize back to the bare name,
 ///    the tie degenerates to the tautology `x == x`, which the recurrence scanners
 ///    report as an offending self-referential definition. Nothing is lost: both
@@ -1687,13 +1706,22 @@ fn pin_in_place_update_reads(
     if subj.starts_with("arr$") {
         return def;
     }
-    // FLOAT defs wrap the subject in `FpFromBits`, which `block_def_subject`
-    // unwraps (block_defs.rs:695) but the KILLS' own extractor does not
-    // (`formula_def_name`, and `writes_until` at :787). The bare-subject
-    // invariant this repair rests on therefore does NOT hold for them, so pass
-    // them through byte-identical rather than reason about a kill that was never
-    // watching the subject. (Found by adversarial review, 2026-08-27.)
-    if matches!(&def, Formula::Eq(l, _) if matches!(&**l, Formula::FpFromBits { .. })) {
+    // GEN-KEY == SUBJECT, the invariant this whole repair rests on. The repair
+    // rebinds the subject to BARE `subj`, while every kill and version token keyed
+    // on this def uses `formula_def_name` — the WHOLE lhs name. `block_def_subject`
+    // SPLITS that name at '#' (block_defs.rs:688), so the two disagree exactly when
+    // the lhs name contains '#', and then the shipped bare subject names a place the
+    // entry-version dataflow never saw written. Repair only where they AGREE.
+    //
+    // Subsumes the FLOAT case: an `FpFromBits` lhs is not a `Var` at all, so
+    // `formula_def_name` is `None` (the kills never watched that subject either —
+    // `writes_until` at :787 does not unwrap it). And it closes the '#'-in-a-local-
+    // name case: a def of a local literally named `n#x` gens the token for `n#x` yet
+    // ships a fact whose subject is `n`. The COLLISION check below refuses only the
+    // exact spelling `subj#e`, so that near-miss walked straight past it and left
+    // the consumer-side clause of `entry_sentinel_tie_is_sound` as the only refusal
+    // standing — see `no_pin_when_the_defs_gen_key_is_not_its_subject`.
+    if formula_def_name(&def) != Some(subj.as_str()) {
         return def;
     }
     // The `#e` symbol must be FRESH. `validate_function` does not reserve `#` in

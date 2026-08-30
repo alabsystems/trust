@@ -12,5 +12,14 @@ fn main() {
         .actual_text("actual", out)
         // replace the channel type in the URL with $CHANNEL
         .normalize(r"nightly/|beta/|stable/|1\.[0-9]+\.[0-9]+/", "$$CHANNEL/")
+        // Trust: the usage line names the driver that was INVOKED -- `trustdoc`
+        // on the branded lane, `rustdoc` under `--trust-vanilla` -- and one
+        // snapshot is compared by both lanes, so it stays pristine and the name
+        // is folded here. The OTHER Trust wording in this snapshot (`--cfg to
+        // trustc`, "this documentation tool's version") is static in
+        // src/librustdoc/lib.rs, identical in both lanes, and is ledgered
+        // rather than folded.
+        .normalize(r"(?m)^trustdoc \[options\]", "rustdoc [options]")
+        .normalize(r"documentation for trustdoc\.", "documentation for rustdoc.")
         .run();
 }

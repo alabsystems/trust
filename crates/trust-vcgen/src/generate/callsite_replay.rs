@@ -278,7 +278,7 @@ fn temp_is_repairable_under_one_disjunctive_pin(
 ///   * a residual `X#tok` versioned read of a reassigned local, a
 ///     `__trust_sigma_*` fresh var, or any name that resolves to no unique
 ///     caller local — unclassifiable, hence unconstrained.
-pub fn composed_formula_is_caller_entry_grounded(
+pub(super) fn composed_formula_is_caller_entry_grounded(
     func: &VerifiableFunction,
     formula: &Formula,
 ) -> bool {

@@ -1,5 +1,23 @@
-//! The premises the CONSUMER-SIDE clause of `entry_sentinel_tie_is_sound` is dead
-//! under, and the three shapes that cannot isolate it.
+//! The premises the CONSUMER-SIDE clause of `entry_sentinel_tie_is_sound` was
+//! believed dead under — and the counterexample that RETIRED that belief.
+//!
+//! CORRECTED 2026-08-29, and the correction is the point of this header. This
+//! module previously said the clause was provably dead and that no fixture could
+//! isolate it. The death certificate had a HOLE: step (3) assumed the kill's
+//! gen-set key equals the pin's subject, but `block_def_subject` splits at '#', so
+//! a local whose NAME contains '#' separates them.
+//! `tests/entry_sentinel_tie_guards.rs::split_subject_escape` builds that shape and
+//! the production `debug_assert!` fires on the PRE-FIX code —
+//! "mint-side passed yet `n` still renders BARE at BlockId(3)/1".
+//!
+//! The clause is dead AGAIN only because `pin_in_place_update_reads` now ENFORCES
+//! the missing premise (0) at the mint site, guarded by
+//! `no_pin_when_the_defs_gen_key_is_not_its_subject`. The deadness therefore rests
+//! on a tested invariant rather than an unexamined assumption — which is the whole
+//! difference between this and what shipped before.
+//!
+//! The shapes below still cannot isolate it, and remain worth pinning: they record
+//! which routes are closed. What is no longer claimed is that every route is.
 //!
 //! `tests/entry_sentinel_tie_guards.rs` owns the tie's own planted violations and
 //! the corpus driver for the `debug_assert!`. What lives HERE is everything that

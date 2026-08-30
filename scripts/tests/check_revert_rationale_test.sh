@@ -254,8 +254,15 @@ HOOK="$REPO_ROOT/scripts/hooks-pin/pre-push"
 
 E="$TMP/e2e"
 BARE_REMOTE="$TMP/e2e-remote.git"
-git init -q --bare "$BARE_REMOTE"
-git init -q "$E"
+# `-b main` is not decoration: every push and every remote read below names
+# `main` literally, while a bare `git init` uses the MACHINE's
+# `init.defaultBranch` — which git leaves at `master` when nobody sets it.
+# On such a clone W0 died with `src refspec main does not match any`, and
+# because W0 is the accept control, W1-W3 (the real bare-revert refusal, the
+# explained-revert acceptance, and the remote-did-not-move assertion) never
+# executed at all. Pin the branch here rather than depend on ambient config.
+git init -q --bare -b main "$BARE_REMOTE"
+git init -q -b main "$E"
 git -C "$E" config user.name test
 git -C "$E" config user.email test@example.invalid
 git -C "$E" config commit.gpgsign false

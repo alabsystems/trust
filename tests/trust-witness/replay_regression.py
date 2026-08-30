@@ -41,6 +41,22 @@ WORK = os.path.join(REPO, "build", "trust-witness-regression")
 BASE = ["-Zthreads=1", "-Ztrust-verify=off", "--edition", "2021",
         "--crate-type=lib", "--emit=metadata,obj", "-Ztrust-witness=off"]
 
+# `-Ztrust-verify=off` in BASE makes the compiler emit one deliberately
+# non-suppressible deauthorization note per crate (trust_verify.rs, landed
+# 2026-08-13). It is a statement about the FLAG, not a diagnostic about the
+# fixture, and it is identical in the mint/no-flag/replay runs — so it cancels
+# in the same-answers comparison but it is NOT empty output. Without naming it,
+# `EXPECT_EMPTY_STDERR` below fires on the banner and can no longer see whether
+# the lint expectation was silently fulfilled, which is the question it asks.
+VERIFY_OFF_NOTE = "note: compiled WITHOUT Trust verification — 0 obligations checked"
+
+
+def diagnostics_only(stderr):
+    """Compiler diagnostics about the fixture, with the flag banner removed."""
+    return "\n".join(
+        l for l in stderr.splitlines() if l.strip() != VERIFY_OFF_NOTE
+    )
+
 
 def run(args, outdir, store_flag=None, stats=False):
     os.makedirs(outdir, exist_ok=True)
@@ -182,7 +198,7 @@ for name, (at_risk, expect_error) in CASES.items():
         probs.append("mint stderr differs from no-flag")
     if norm(replay.stderr) != norm(noflag.stderr):
         probs.append("replay stderr differs from no-flag (diagnostic masked/changed)")
-    if name in EXPECT_EMPTY_STDERR and norm(noflag.stderr).strip():
+    if name in EXPECT_EMPTY_STDERR and diagnostics_only(norm(noflag.stderr)).strip():
         probs.append("no-flag build did not silently fulfill its lint expectation")
     if not expect_error:
         baseline_digests = digests(noflag_dir)

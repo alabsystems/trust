@@ -2415,6 +2415,16 @@ fn version_at_macro_invocation_with_frontend_policy(
     // ecosystem's version-sniffing build scripts assert it; see the block
     // comment above), so this parenthetical is where trustc introduces
     // itself honestly instead of wearing the compat token as its name.
+    //
+    // Trust: this is NOT suppressed under `RUSTC_OVERRIDE_VERSION_STRING`, and
+    // that was tried and reverted. The variable overrides the VERSION; the
+    // parenthetical is the tool's IDENTITY, which is a different fact. The
+    // leading token is already the hardcoded compat `rustc` and the version is
+    // already fully operator-supplied, so the brand is the LAST signal that this
+    // binary is a verifying compiler rather than stock rustc — and suppressing it
+    // on an environment variable would let anything that sets one obtain a Trust
+    // compiler that reports as upstream. Provenance is exactly what a verifying
+    // toolchain must not make settable.
     let trust_brand = if display_binary == "rustc" {
         String::new()
     } else {

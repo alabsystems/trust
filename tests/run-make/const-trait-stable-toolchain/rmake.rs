@@ -15,6 +15,11 @@ fn main() {
         .stderr_utf8();
     diff()
         .expected_file("const-super-trait-stable-enabled.stderr")
+        // Trust: the `--explain` hint names the driver that was INVOKED
+        // (`trustc` branded, `rustc` under `--trust-vanilla`), and one
+        // snapshot is compared by both lanes. Fold it so the snapshot
+        // stays upstream-pristine.
+        .normalize(r"trustc --explain", "rustc --explain")
         .normalize(
             "may not be used on the .* release channel",
             "may not be used on the NIGHTLY release channel",
@@ -31,6 +36,11 @@ fn main() {
         .stderr_utf8();
     diff()
         .expected_file("const-super-trait-nightly-enabled.stderr")
+        // Trust: the `--explain` hint names the driver that was INVOKED
+        // (`trustc` branded, `rustc` under `--trust-vanilla`), and one
+        // snapshot is compared by both lanes. Fold it so the snapshot
+        // stays upstream-pristine.
+        .normalize(r"trustc --explain", "rustc --explain")
         .actual_text("(rustc)", &out)
         .run();
     let out = rustc()
@@ -42,6 +52,11 @@ fn main() {
         .stderr_utf8();
     diff()
         .expected_file("const-super-trait-stable-disabled.stderr")
+        // Trust: the `--explain` hint names the driver that was INVOKED
+        // (`trustc` branded, `rustc` under `--trust-vanilla`), and one
+        // snapshot is compared by both lanes. Fold it so the snapshot
+        // stays upstream-pristine.
+        .normalize(r"trustc --explain", "rustc --explain")
         .actual_text("(rustc)", &out)
         .run();
     let out = rustc()
@@ -52,6 +67,11 @@ fn main() {
         .stderr_utf8();
     diff()
         .expected_file("const-super-trait-nightly-disabled.stderr")
+        // Trust: the `--explain` hint names the driver that was INVOKED
+        // (`trustc` branded, `rustc` under `--trust-vanilla`), and one
+        // snapshot is compared by both lanes. Fold it so the snapshot
+        // stays upstream-pristine.
+        .normalize(r"trustc --explain", "rustc --explain")
         .actual_text("(rustc)", &out)
         .run();
 }

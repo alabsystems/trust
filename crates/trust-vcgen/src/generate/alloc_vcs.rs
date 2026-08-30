@@ -1595,9 +1595,99 @@ pub(crate) fn conjoin_arg_type_ranges(func: &VerifiableFunction, formula: Formul
         };
         bounds.push(range);
     }
+    bounds.extend(versioned_param_type_ranges(func, &formula));
     if bounds.is_empty() {
         return formula;
     }
     bounds.push(formula);
     Formula::And(bounds)
+}
+
+/// Bound the VERSIONED spellings of a parameter — `n#s1_0`, the entry sentinel
+/// `n#e`, the mixed join token `n#e_s1_t` — the way the two sibling helpers already
+/// bound versioned locals and fields.
+///
+/// The loop above bounds only the BARE name, so a parameter read that SSA versioning
+/// renamed floats free on `Sort::Int` and the solver fabricates an out-of-type-range
+/// value for it. `conjoin_datatype_field_ranges_excluding` carries the comment
+/// describing this exact bug for FIELDS ("Looking up by `name` silently dropped every
+/// range as soon as SSA versioning was present, allowing out-of-type-range false
+/// witnesses"); the parameter arm is the last of the three that never got the repair.
+/// MEASURED on a `u32` parameter whose only carrier is a pinned in-place update
+/// (`n#s0_5 == n#e / 3`): the row was `Failed` with `n#e = 4294967298`, three above
+/// `u32::MAX`, falsely refuting provably-safe code.
+///
+/// SOUNDNESS: a type range is a property of the local's DECLARED TYPE, not of a
+/// program point. Rust guarantees a `u32` local's storage holds an inhabitant of
+/// `u32` at EVERY point of the body, so `0 <= X <= u32::MAX` is true of every version
+/// token naming a value of that local. That point-independence is the whole argument,
+/// and it is what makes this unlike the entry-sentinel TIE: `Eq(n#e, n)` is a
+/// point-to-point IDENTITY and needs three refusals, while this asserts nothing about
+/// which point the symbol came from. Monotone — a pure `And` of a true fact can only
+/// delete impossible counterexamples, never hide a real violation (whose witness is a
+/// real execution, whose parameter values respect their type ranges).
+fn versioned_param_type_ranges(func: &VerifiableFunction, formula: &Formula) -> Vec<Formula> {
+    // Keyed by `place_to_var_name`, the shadow/collision-aware spelling the formula
+    // actually uses — the bare loop above keys on `decl.name`, so a SHADOWED
+    // parameter has its bound attached to the wrong symbol there.
+    let mut param_tys: FxHashMap<String, &Ty> = FxHashMap::default();
+    for decl in &func.body.locals {
+        if decl.index < 1 || decl.index > func.body.arg_count {
+            continue;
+        }
+        param_tys.insert(place_to_var_name(func, &Place::local(decl.index)), &decl.ty);
+    }
+    if param_tys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut occurrences: Vec<(String, trust_types::Sort)> = Vec::new();
+    collect_var_sorts(formula, &mut occurrences);
+
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut bounds = Vec::new();
+    for (name, sort) in occurrences {
+        // Only VERSIONED spellings; the bare name is already bounded above.
+        if !name.contains('#') {
+            continue;
+        }
+        // SORT guard: emit only where the symbol occurs at `Sort::Int`, so a
+        // bitvector-encoded symbol is not re-declared at a second sort. Stricter
+        // than the two siblings, which build `Var(name, Sort::Int)` unconditionally.
+        if sort != trust_types::Sort::Int {
+            continue;
+        }
+        // COLLISION guard, the same refusal `pin_in_place_update_reads` and
+        // `entry_sentinel_ties` make: `validate_function` does not reserve `#` in
+        // local names and `place_to_var_name` permits it, so `n#e` may be a REAL,
+        // differently-typed local. Bounding it by `n`'s type would be a FALSE bound,
+        // not a weakening. Fail closed.
+        if func.body.locals.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
+            continue;
+        }
+        let Some(ty) = name.split('#').next().and_then(|base| param_tys.get(base)) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(range) = crate::range::rust_type_range_constraint(
+            &Formula::Var(name.clone(), trust_types::Sort::Int),
+            ty,
+        ) {
+            bounds.push(range);
+        }
+    }
+    bounds
+}
+
+/// Every `Var` occurrence with the sort it occurs AT. `collect_formula_var_names`
+/// discards the sort, which the sort guard above needs.
+fn collect_var_sorts(f: &Formula, out: &mut Vec<(String, trust_types::Sort)>) {
+    if let Formula::Var(name, sort) = f {
+        out.push((name.clone(), sort.clone()));
+    }
+    for child in f.children() {
+        collect_var_sorts(child, out);
+    }
 }

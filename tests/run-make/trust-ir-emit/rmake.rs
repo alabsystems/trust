@@ -97,23 +97,51 @@ fn main() {
     assert_eq!(array_field(add, "unsupported"), Some(""), "`add` must lower cleanly: {add}");
     assert_eq!(array_field(add, "collect_primary"), Some(""));
 
-    // `evens` is outside it (an RPIT return type and a closure in value
-    // position). Its first-fail inventory and its collect-all leaf demand must
-    // BOTH be published: the first-fail prefix attributes a whole subtree to one
-    // masking tag, which is the entire reason the second histogram exists.
+    // `evens` LOWERS now, and the way it is excluded is the point. It carries
+    // an unrevealed opaque (RPIT), so it is lowered for COVERAGE but never
+    // spliced into the executable module — `symbolic` records exactly that, and
+    // `splice_ok` reads it. Asserting the pair keeps the distinction pinned: a
+    // body that lowers is not thereby a body that ships.
+    //
+    // This assertion previously demanded that `evens` FAIL to lower. That
+    // stopped being true when the lowering improved, and the honest update is
+    // not to weaken it but to move the histogram guarantee to a body that still
+    // declines (below) — otherwise the improvement silently retires the check.
     let evens = body_row(&cov, "evens");
-    assert_ne!(
+    assert_eq!(
         array_field(evens, "unsupported"),
         Some(""),
-        "`evens` must record unsupported shapes: {evens}"
+        "`evens` no longer records unsupported shapes; if that regressed, the coverage \
+         win this row pins has been lost: {evens}"
     );
-    let primary = array_field(evens, "collect_primary")
+    assert!(
+        evens.contains("\"symbolic\": true"),
+        "`evens` must be marked symbolic — it mentions an unrevealed opaque, and that is \
+         what keeps it OUT of the spliced executable module: {evens}"
+    );
+    assert!(
+        evens.contains("\"spliced\": false"),
+        "`evens` lowered but must NOT be spliced: a body reading a value-less global in \
+         the assembled module would be a lie: {evens}"
+    );
+
+    // `dyn_call` is outside the lowerable fragment (no static callee). Its
+    // first-fail inventory and its collect-all leaf demand must BOTH be
+    // published: the first-fail prefix attributes a whole subtree to one masking
+    // tag, which is the entire reason the second histogram exists.
+    let dyn_call = body_row(&cov, "dyn_call");
+    assert_ne!(
+        array_field(dyn_call, "unsupported"),
+        Some(""),
+        "`dyn_call` must record unsupported shapes: {dyn_call}"
+    );
+    let primary = array_field(dyn_call, "collect_primary")
         .expect("coverage row must carry a collect_primary field");
     assert!(
         !primary.is_empty(),
-        "`evens` failed to lower but published an EMPTY collect_primary histogram — the \
+        "`dyn_call` failed to lower but published an EMPTY collect_primary histogram — the \
          collect-all measurement pass never ran for a pure `--emit=trust-ir` invocation, so the \
-         artifact reports a failed body as demanding no leaf shapes: {evens}"
+         artifact reports a failed body as demanding no leaf shapes: {dyn_call}"
     );
 
     // Analysis-only means no code generation; it does not mean deferred

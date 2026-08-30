@@ -7,7 +7,14 @@ use std::str;
 use run_make_support::{rfs, rustc, target};
 
 fn is_stable_crate(name: &str) -> bool {
-    matches!(name, "std" | "alloc" | "core" | "proc_macro")
+    // Trust: `trust_bignum` is the I6 bignum carrier runtime — the runtime half
+    // of Clean/Lean `Nat`. It ships in the sysroot and declares its surface
+    // stable ON PURPOSE (crates/trust-bignum/src/lib.rs, "Plan step 8 as
+    // amended by review defect 4"): the std build passes
+    // `-Zforce-unstable-if-unmarked`, which would otherwise gate the crate
+    // behind `rustc_private`, and the carrier is meant to be nameable. Twelve
+    // in-tree `clean_origin_*` ui tests name it with no feature gate.
+    matches!(name, "std" | "alloc" | "core" | "proc_macro" | "trust_bignum")
 }
 
 fn main() {

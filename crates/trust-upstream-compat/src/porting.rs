@@ -2017,6 +2017,18 @@ fn is_ui_testing_optout_expectation(path: &str) -> bool {
         "error-emitter/trimmed_multiline_suggestion",
         "modules/issue-107649",
         "consts/missing_span_in_backtrace",
+        // Trust: run-make snapshots are invocation-derived for the SAME reason,
+        // and worse — one snapshot is compared by BOTH lanes. `--trust-vanilla`
+        // sets `explain_binary` to `rustc` so upstream-compatibility output
+        // stays byte-for-byte upstream, while the branded lane emits `trustc`,
+        // so a rebranded snapshot fails vanilla and a pristine one fails
+        // verified. These stay pristine and their recipes fold the name with
+        // `diff().normalize(..)`, which keeps the fold visible in the test that
+        // needs it instead of blinding every run-make snapshot to a drop-in
+        // naming regression.
+        "run-make/unknown-mod-stdin",
+        "run-make/const-trait-stable-toolchain",
+        "run-make/issue-149402-suggest-unresolve",
     ];
     UI_TESTING_OPTOUT_STEMS.iter().any(|stem| path.contains(stem))
 }

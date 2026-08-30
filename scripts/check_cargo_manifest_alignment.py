@@ -4,11 +4,14 @@
 The Trust repository has several Cargo entry points for different developer
 workflows. Four separate jobs live here, and only the second is about drift:
 
-1. Patch-table equality across the root, `crates/` and `targo-trust`
+1. Patch-table coverage across the root, `crates/` and `targo-trust`
    manifests. Cargo patches are per-workspace and not transitive, so a source
-   redirect present in one entry point and missing from another lets that
+   redirect present in one entry point and missing from another can let that
    workspace resolve a sibling from its live remote instead of the checked-out
-   submodule. Root is the baseline; the others must match it exactly.
+   submodule. Root is the baseline. A narrowly enumerated omission is permitted
+   only while the omitted package is absent from that workspace's committed
+   lock; this avoids Cargo's nondeterministic `[[patch.unused]]` churn without
+   weakening any reachable dependency edge.
 
 2. Root/`crates/` workspace membership. The two workspaces deliberately
    overlap and deliberately do not coincide (see the header comments in both
@@ -58,6 +61,37 @@ MANIFESTS = {
     "root": REPO_ROOT / "Cargo.toml",
     "crates": REPO_ROOT / "crates" / "Cargo.toml",
     "targo-trust": REPO_ROOT / "targo-trust" / "Cargo.toml",
+}
+
+WORKSPACE_LOCKS = {
+    "root": REPO_ROOT / "Cargo.lock",
+    "crates": REPO_ROOT / "crates" / "Cargo.lock",
+    "targo-trust": REPO_ROOT / "targo-trust" / "Cargo.lock",
+}
+
+# These packages are intentionally absent from the named workspace graphs.
+# Keeping their patches anyway creates `[[patch.unused]]` rows whose ordering
+# Cargo does not stabilize across lock regeneration. This is not a blanket
+# patch-alignment waiver: check_patch_alignment accepts one of these omissions
+# only while the package name is absent from that workspace's committed lock.
+# If a feature or dependency makes the package reachable, the same check turns
+# red and requires the local patch before publication.
+_TRUST_IR_SOURCES = (
+    "https://github.com/alabsystems/trust-ir",
+    "https://github.com/alabsystems/trust-ir.git",
+    "ssh://git@github.com/alabsystems/trust-ir.git",
+    "ssh://git@github.com:22/alabsystems/trust-ir.git",
+)
+DORMANT_PATCH_OMISSIONS = {
+    "crates": frozenset(
+        (source, "trust-ir-conformance") for source in _TRUST_IR_SOURCES
+    ),
+    "targo-trust": frozenset(
+        [
+            *((source, "trust-ir-conformance") for source in _TRUST_IR_SOURCES),
+            ("https://github.com/ufmg-smite/carcara", "carcara"),
+        ]
+    ),
 }
 
 TEMPORAL_MANIFEST = REPO_ROOT / "crates" / "trust-spec-temporal" / "Cargo.toml"
@@ -861,19 +895,58 @@ def check_dependency_fanout_policy(manifests: dict[str, dict[str, Any]]) -> list
     return errors
 
 
-def check_patch_alignment(manifests: dict[str, dict[str, Any]]) -> list[str]:
+def locked_package_names(lock_path: Path) -> set[str]:
+    """Return package names from one committed Cargo lock, fail closed."""
+    lock = load_manifest(lock_path)
+    packages = lock.get("package", [])
+    if not isinstance(packages, list):
+        raise ValueError(f"{relative_display(lock_path)} has no package array")
+    names: set[str] = set()
+    for package in packages:
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            raise ValueError(
+                f"{relative_display(lock_path)} has a malformed package row"
+            )
+        names.add(package["name"])
+    return names
+
+
+def check_patch_alignment(
+    manifests: dict[str, dict[str, Any]],
+    *,
+    lock_packages: dict[str, set[str]] | None = None,
+) -> list[str]:
     errors: list[str] = []
     by_manifest = {
         name: patch_entries(name, MANIFESTS[name], manifest)
         for name, manifest in manifests.items()
     }
 
+    if lock_packages is None:
+        try:
+            lock_packages = {
+                name: locked_package_names(path)
+                for name, path in WORKSPACE_LOCKS.items()
+            }
+        except (OSError, ValueError) as error:
+            return [f"cannot audit dormant patch omissions against locks: {error}"]
+
     baseline_name = "root"
     baseline = by_manifest[baseline_name]
     for name, entries in by_manifest.items():
         if name == baseline_name:
             continue
-        missing = sorted(baseline - entries, key=lambda entry: (entry.source, entry.crate))
+        missing_all = baseline - entries
+        omissions = DORMANT_PATCH_OMISSIONS.get(name, frozenset())
+        missing = sorted(
+            (
+                entry
+                for entry in missing_all
+                if (entry.source, entry.crate) not in omissions
+                or entry.crate in lock_packages.get(name, set())
+            ),
+            key=lambda entry: (entry.source, entry.crate),
+        )
         extra = sorted(entries - baseline, key=lambda entry: (entry.source, entry.crate))
         if missing or extra:
             errors.append(f"{name} patch table drifts from {baseline_name}:")
@@ -980,6 +1053,40 @@ def self_check_error_contains(
 
 def run_self_check() -> list[str]:
     failures: list[str] = []
+    manifests = {
+        name: load_manifest(path)
+        for name, path in MANIFESTS.items()
+    }
+    lock_packages = {
+        name: locked_package_names(path)
+        for name, path in WORKSPACE_LOCKS.items()
+    }
+    patch_errors = check_patch_alignment(
+        manifests, lock_packages=lock_packages
+    )
+    if patch_errors:
+        failures.append(
+            "current patch coverage should pass: " + "; ".join(patch_errors)
+        )
+
+    case_locks = copy.deepcopy(lock_packages)
+    case_locks["targo-trust"].add("carcara")
+    self_check_error_contains(
+        check_patch_alignment(manifests, lock_packages=case_locks),
+        "missing https://github.com/ufmg-smite/carcara carcara",
+        failures,
+        "dormant patch becomes reachable",
+    )
+
+    case = copy.deepcopy(manifests)
+    del case["crates"]["patch"]["https://github.com/alabsystems/ay"]["ay"]
+    self_check_error_contains(
+        check_patch_alignment(case, lock_packages=lock_packages),
+        "missing https://github.com/alabsystems/ay ay",
+        failures,
+        "reachable patch omission",
+    )
+
     local_patch_manifests = {
         name: load_manifest(path)
         for name, path in LOCAL_PATCH_MANIFESTS.items()

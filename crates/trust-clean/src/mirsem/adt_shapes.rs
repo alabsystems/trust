@@ -2515,16 +2515,25 @@ pub(super) fn slice_ref_projection_of_ref_place(
 /// can be `Cast` to `*mut` and written — invalidating the value-slot denotation
 /// (`*(&s[i])` would no longer equal `idxElem(s,i)`). Mirror [`tcc_scan_rvalue`]'s
 /// BOTH-mutabilities `AddressOf` discipline: fail closed if ANY `Rvalue::AddressOf(_,
-/// place)` — const OR mut — targets the base or any member of its shared-ref alias set
-/// (the base is a shared-ref PARAMETER, so a raw pointer can alias its referent only by
-/// first addressing the base or one of its shared-ref views — the `AddressOf` is the
-/// choke point).
-pub(super) fn raw_exposure_exists(body: &trust_types::VerifiableBody, base: usize) -> bool {
+/// place)` — const OR mut — targets the base or any member of its shared-ref alias set.
+///
+/// RETRACTED (D2, 2026-08-29): this doc used to claim "the `AddressOf` is the choke
+/// point — a raw pointer can alias the referent only by first addressing the base or
+/// one of its shared-ref views". That is FALSE, verified in-tree: `CastKind::PtrToPtr`
+/// lowers to a bare `Rvalue::Cast` (trust-mir-extract `convert.rs`), so
+/// `p as *const u8 as *mut u8` produces a `*mut` to the referent with NO `AddressOf`
+/// anywhere in the body — and a shared reborrow `&(*p)` is a fresh handle the
+/// `Use`-only closure never saw. The closure therefore now ALSO (i) adds the
+/// destination of any shared `Ref`/`AddressOf(false)` rooted at an alias, and (ii)
+/// treats any `Cast`/`CopyForDeref` whose source is an alias as an escape (`true`),
+/// exactly as [`deref_write_exists`] does. No alias analysis beyond that — nothing to
+/// launder.
+pub(crate) fn raw_exposure_exists(body: &trust_types::VerifiableBody, base: usize) -> bool {
     use std::collections::{HashSet, VecDeque};
 
     use trust_types::{Operand, Rvalue, Statement, Ty};
-    // The shared-ref alias set — the SAME whole-local shared-ref Use-copy closure
-    // `deref_write_exists` computes.
+    // The shared-ref alias set — the SAME shared-ref closure `deref_write_exists`
+    // computes.
     let shared_ref_types_match = |source: usize, destination: usize| {
         let (Some(source_ty), Some(destination_ty)) = (
             body.locals.get(source).map(|decl| &decl.ty),
@@ -2536,6 +2545,9 @@ pub(super) fn raw_exposure_exists(body: &trust_types::VerifiableBody, base: usiz
             && matches!(destination_ty, Ty::Ref { mutable: false, .. })
             && source_ty.eq_ignoring_disc_index_safe(destination_ty)
     };
+    let scalar_ty = |ty: &Ty| {
+        matches!(ty, Ty::Bool | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Char | Ty::Float { .. })
+    };
     let mut aliases = HashSet::from([base]);
     let mut pending = VecDeque::from([base]);
     let mut processed = 0usize;
@@ -2545,11 +2557,31 @@ pub(super) fn raw_exposure_exists(body: &trust_types::VerifiableBody, base: usiz
             return true; // internally inconsistent alias graph — fail closed.
         }
         for statement in body.blocks.iter().flat_map(|block| &block.stmts) {
-            let Statement::Assign {
-                place: destination,
-                rvalue: Rvalue::Use(Operand::Copy(source_place) | Operand::Move(source_place)),
-                ..
-            } = statement
+            let Statement::Assign { place: destination, rvalue, .. } = statement else {
+                continue;
+            };
+            match rvalue {
+                Rvalue::Cast(Operand::Copy(source_place) | Operand::Move(source_place), ty)
+                    if source_place.local == source
+                        && (source_place.projections.is_empty() || !scalar_ty(ty)) =>
+                {
+                    return true; // (ii) cast-derived raw pointer — fail closed.
+                }
+                Rvalue::CopyForDeref(source_place) if source_place.local == source => {
+                    return true; // (ii) compiler-inserted alias copy — fail closed.
+                }
+                Rvalue::Ref { mutable: false, place: source_place }
+                | Rvalue::AddressOf(false, source_place)
+                    if source_place.local == source && destination.projections.is_empty() =>
+                {
+                    // (i) a shared reborrow is a fresh handle to the same referent.
+                    if aliases.insert(destination.local) {
+                        pending.push_back(destination.local);
+                    }
+                }
+                _ => {}
+            }
+            let Rvalue::Use(Operand::Copy(source_place) | Operand::Move(source_place)) = rvalue
             else {
                 continue;
             };

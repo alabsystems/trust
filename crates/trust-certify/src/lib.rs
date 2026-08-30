@@ -54,6 +54,8 @@ use clean_kernel::{
 use sha2::{Digest, Sha256};
 use trust_types::{Formula, Sort, VerificationCondition};
 
+mod branch_clamp;
+
 /// Canonical wire encoding used by every closed `CleanCic` lane in this crate.
 /// Recheckers compare bytes, not merely the decoded value: a public lineage hash
 /// is an integrity checksum and cannot authorize attacker-chosen encodings.
@@ -656,6 +658,16 @@ fn certify_with_identity(
     violation: &Formula,
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    // Certificate recognizers reason about a typed Boolean proposition.  The
+    // ordinary compiler producer emits well-sorted formulas, but this crate's
+    // public formula-only entry point also accepts constructed/deserialized
+    // values.  Reject an ill-sorted tree before the memo as well as before any
+    // syntactic entailment rule (in particular Bool-reification unfolding), so
+    // no cached payload can bypass the gate.
+    if !branch_clamp::formula_is_well_sorted_bool(violation) {
+        return None;
+    }
+
     if !certify_memo_enabled() {
         return certify_with_identity_uncached(violation, identity);
     }
@@ -5115,6 +5127,19 @@ enum DisjunctRefutation<'a> {
     /// `var` is the pair's shared Int variable NAME, so the certificate
     /// declares it even when no context atom mentions it.
     InternalAndPair { var: String, left: Expr, right: Expr, kind: InternalPairKind },
+    /// An `And` disjunct whose selected order atoms contradict the shared
+    /// context only when used together.  The hypothesis is the right-nested
+    /// conjunction of `props`; every proposition is an `And` projection of the
+    /// authored disjunct, so replacing the full disjunct with this subset is a
+    /// sound weakening for an UNSAT proof.
+    ChainAtoms { atoms: Vec<(&'a Formula, &'a Formula, bool)>, props: Vec<Expr> },
+    /// The branch-clamp extension of [`Self::ChainAtoms`].  These atoms can be
+    /// consequences derived from Bool reifications and implications, so they
+    /// are owned rather than borrowed from the authored disjunct.  The carrier
+    /// proposition is still only their right-nested conjunction; the recognizer
+    /// admits a derived member only after proving the syntactic entailment rule
+    /// described by the branch-clamp consequence-closure module.
+    DerivedChainAtoms { atoms: Vec<(Formula, Formula, bool)>, props: Vec<Expr> },
 }
 
 /// How an [`DisjunctRefutation::InternalAndPair`]'s two projected conjuncts
@@ -5175,6 +5200,31 @@ fn refute_disjunct(d: &Disjunct<'_>, context: &[OrderEdge], h: Expr) -> Option<E
                     refute_false_eq(*a, *b, eq_ab)
                 }
             }
+        }
+        DisjunctRefutation::ChainAtoms { atoms, props } => {
+            // Keep the canonical R171 constructor byte-for-byte stable.  The
+            // branch-clamp k-cycle closer lives in its separate derived arm.
+            let mut edges = context.to_vec();
+            let mut rest_proof = h;
+            for index in 0..atoms.len() {
+                let (a, b, strict) = atoms[index];
+                let proof = if index + 1 == atoms.len() {
+                    rest_proof.clone()
+                } else {
+                    let tail = build_and_prop(&props[index + 1..])?;
+                    let left = const_app(
+                        "And.left",
+                        [props[index].clone(), tail.clone(), rest_proof.clone()],
+                    );
+                    rest_proof = const_app("And.right", [props[index].clone(), tail, rest_proof]);
+                    left
+                };
+                edges.extend(build_order_edges(a, b, strict, proof));
+            }
+            refute_via_chain_edges(&edges)
+        }
+        DisjunctRefutation::DerivedChainAtoms { atoms, props } => {
+            branch_clamp::refute_derived_chain_atoms(atoms, props, context, h)
         }
     }
 }
@@ -5266,6 +5316,13 @@ fn build_disjunctive_false(
 /// atom, a closed-false equality, or a context-chain order atom. `None` for
 /// anything else (the whole disjunctive certification then declines).
 fn parse_disjunct(di: &Formula) -> Option<Disjunct<'_>> {
+    parse_disjunct_with_and(di, parse_and_disjunct_order_atoms)
+}
+
+fn parse_disjunct_with_and<'a>(
+    di: &'a Formula,
+    parse_and: fn(&'a Formula) -> Option<Disjunct<'a>>,
+) -> Option<Disjunct<'a>> {
     let fits = |n: i128| i64::try_from(n).is_ok();
     // Closed false order atom (e.g. `8 < 0`).
     if let Some(atom) = closed_order_atom(di) {
@@ -5288,10 +5345,15 @@ fn parse_disjunct(di: &Formula) -> Option<Disjunct<'_>> {
             });
         }
     }
-    // An `And`-disjunct carrying its own internal syntactic contradiction
-    // (branch-local `Eq`/`Not(Eq)` or conflicting literal equalities).
+    // An `And`-disjunct may close internally, or its supported order atoms may
+    // need to be combined with the shared context.  Keep the internal-pair
+    // shape first so persisted certificates for that existing lane do not
+    // change bytes.
     if matches!(di, Formula::And(_)) {
-        return parse_and_disjunct_internal_pair(di);
+        if let Some(disjunct) = parse_and_disjunct_internal_pair(di) {
+            return Some(disjunct);
+        }
+        return parse_and(di);
     }
     // Otherwise a single order atom refuted against the context.
     let atoms = normalize_atom(di)?;
@@ -5304,6 +5366,56 @@ fn parse_disjunct(di: &Formula) -> Option<Disjunct<'_>> {
         prop: linear_atom_prop(atom)?,
         smt: linear_atom_smt(atom)?,
         refutation: DisjunctRefutation::ChainAtom { a, b, strict },
+    })
+}
+
+/// Parse a conjunction as a set of order atoms that will be refuted together
+/// with the shared context.
+///
+/// Unsupported conjuncts are dropped.  This is sound in the direction used
+/// here: an authored conjunction entails the conjunction of any subset of its
+/// members, so UNSAT of the weakened branch implies UNSAT of the authored
+/// branch.  At least two atoms are required; a singleton belongs to the
+/// existing [`DisjunctRefutation::ChainAtom`] lane.  The cap bounds the
+/// right-nested projection term and the downstream edge search.
+fn parse_and_disjunct_order_atoms(di: &Formula) -> Option<Disjunct<'_>> {
+    const MAX_CHAIN_ATOMS: usize = 48;
+
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(di, &mut conjuncts);
+
+    let mut atoms = Vec::new();
+    let mut props = Vec::new();
+    let mut smts = Vec::new();
+    for conjunct in conjuncts {
+        let Some(normalized) = normalize_atom(conjunct) else {
+            continue;
+        };
+        let [atom] = normalized.as_slice() else {
+            continue;
+        };
+        let (Some(prop), Some(smt)) = (linear_atom_prop(atom), linear_atom_smt(atom)) else {
+            continue;
+        };
+        let (a, b, strict) = match atom {
+            Atom::Lt(a, b) => (*a, *b, true),
+            Atom::Le(a, b) => (*a, *b, false),
+        };
+        atoms.push((a, b, strict));
+        props.push(prop);
+        smts.push(smt);
+        if atoms.len() > MAX_CHAIN_ATOMS {
+            return None;
+        }
+    }
+    if atoms.len() < 2 {
+        return None;
+    }
+
+    Some(Disjunct {
+        prop: build_and_prop(&props)?,
+        smt: build_and_smt(&smts)?,
+        refutation: DisjunctRefutation::ChainAtoms { atoms, props },
     })
 }
 
@@ -7781,6 +7893,20 @@ fn certify_disjunctive_contradiction(
             ) {
                 return Some(ev);
             }
+
+            // R174 is isolated behind the canonical full-context miss so R171
+            // retains its accepted set and exact proof bytes.
+            let mut cand_hyps = hyps.clone();
+            let mut var_names = base_var_names.clone();
+            if let Some(ev) = branch_clamp::try_build_disjunctive_certificate(
+                disjuncts,
+                &context_edges,
+                &mut cand_hyps,
+                &mut var_names,
+                identity,
+            ) {
+                return Some(ev);
+            }
         }
     }
 
@@ -7837,12 +7963,30 @@ fn build_disjunctive_certificate(
     var_names: &mut BTreeSet<String>,
     identity: &ObligationIdentity,
 ) -> Option<trust_ir::ProofEvidence> {
+    build_disjunctive_certificate_with_parser(
+        disjuncts,
+        context_edges,
+        hyps,
+        var_names,
+        identity,
+        parse_disjunct,
+    )
+}
+
+fn build_disjunctive_certificate_with_parser(
+    disjuncts: &[Formula],
+    context_edges: &[OrderEdge],
+    hyps: &mut Vec<Hyp>,
+    var_names: &mut BTreeSet<String>,
+    identity: &ObligationIdentity,
+    parser: for<'a> fn(&'a Formula) -> Option<Disjunct<'a>>,
+) -> Option<trust_ir::ProofEvidence> {
     // Disjuncts: each is a closed-false atom/equality, or an order atom refuted
     // against the context. A disjunct outside these shapes declines the whole.
     let mut parsed: Vec<Disjunct<'_>> = Vec::new();
     let mut disjunct_smts: Vec<String> = Vec::new();
     for di in disjuncts {
-        let disjunct = parse_disjunct(di)?;
+        let disjunct = parser(di)?;
         match &disjunct.refutation {
             DisjunctRefutation::ChainAtom { a, b, .. } => {
                 collect_formula_int_vars(a, var_names);
@@ -7852,6 +7996,18 @@ fn build_disjunctive_certificate(
             // atom bounds it (its contradiction is branch-local).
             DisjunctRefutation::InternalAndPair { var, .. } => {
                 var_names.insert(var.clone());
+            }
+            DisjunctRefutation::ChainAtoms { atoms, .. } => {
+                for (a, b, _) in atoms {
+                    collect_formula_int_vars(a, var_names);
+                    collect_formula_int_vars(b, var_names);
+                }
+            }
+            DisjunctRefutation::DerivedChainAtoms { atoms, .. } => {
+                for (a, b, _) in atoms {
+                    collect_formula_int_vars(a, var_names);
+                    collect_formula_int_vars(b, var_names);
+                }
             }
             _ => {}
         }
@@ -12039,6 +12195,86 @@ mod tests {
         assert_formula_certificate_pairs(&guarded_add);
     }
 
+    /// A branch-clamp disjunct can need more than one of its own atoms before
+    /// it contradicts the shared context.  Neither `0 ≤ y` nor `y ≤ x`
+    /// alone contradicts `x < 0`; their conjunction does.  Both `Or` branches
+    /// use that shape, so this cannot fall through the older single-atom or
+    /// internal-equality-pair strategies.
+    fn multi_atom_disjunct_violation(satisfiable_second_branch: bool) -> Formula {
+        let v = |name: &str| Formula::Var(name.to_string(), Sort::Int);
+        let i = Formula::Int;
+        let lt = |a: Formula, b: Formula| Formula::Lt(Box::new(a), Box::new(b));
+        let le = |a: Formula, b: Formula| Formula::Le(Box::new(a), Box::new(b));
+
+        let first = Formula::And(vec![
+            le(i(0), v("y")),
+            // Unsupported branch-local clutter is deliberately projected out;
+            // the retained order atoms are an entailed weakening.
+            Formula::Bool(true),
+            le(v("y"), v("x")),
+        ]);
+        let second_tail =
+            if satisfiable_second_branch { le(v("x"), v("w")) } else { le(v("w"), v("x")) };
+        let second = Formula::And(vec![le(i(0), v("w")), second_tail]);
+        Formula::And(vec![lt(v("x"), i(0)), Formula::Or(vec![first, second])])
+    }
+
+    #[test]
+    fn certifies_multi_atom_and_disjuncts_with_real_clean_recheck() {
+        let violation = multi_atom_disjunct_violation(false);
+        assert_formula_certificate_pairs(&violation);
+
+        let ProofEvidence::CleanCic { term, context, lineage, .. } =
+            certify_violation(&violation).expect("multi-atom branches must certify")
+        else {
+            panic!("expected CleanCic evidence");
+        };
+        assert!(recheck_cleancic(&term, &context, &lineage, &violation));
+        let vars = ["w", "x", "y"].into_iter().map(str::to_string).collect();
+        assert!(
+            payload_roundtrip_rechecks(&vars, &term, &context),
+            "the serialized multi-atom proof must independently type-check as False"
+        );
+    }
+
+    #[test]
+    fn multi_atom_and_disjunct_clean_recheck_rejects_a_malformed_term() {
+        let violation = multi_atom_disjunct_violation(false);
+        let ProofEvidence::CleanCic { term, context, .. } =
+            certify_violation(&violation).expect("control proof must certify")
+        else {
+            panic!("expected CleanCic evidence");
+        };
+
+        // A serialized free-variable reference is a well-formed expression but
+        // is not a proof of False in the certificate context.  Re-lineage it so
+        // rejection cannot be credited merely to stale digest bytes, then check
+        // both the raw Clean kernel path and the public canonical rechecker.
+        let malformed = serialize_term(&Expr::bvar(0)).expect("serialize malformed term");
+        assert_ne!(malformed, term);
+        let vars = ["w", "x", "y"].into_iter().map(str::to_string).collect();
+        assert!(!payload_roundtrip_rechecks(&vars, &malformed, &context));
+        let identity = ObligationIdentity::from_violation(&violation).expect("identity");
+        let malformed_lineage = lineage_digest(&malformed, &context, &identity);
+        assert!(!recheck_cleancic(&malformed, &context, &malformed_lineage, &violation,));
+    }
+
+    #[test]
+    fn multi_atom_and_disjunct_declines_a_satisfiable_branch() {
+        let violation = multi_atom_disjunct_violation(true);
+        assert!(
+            certify_violation(&violation).is_none(),
+            "one satisfiable Or branch makes the violation satisfiable and must decline"
+        );
+    }
+
+    #[test]
+    fn multi_atom_and_disjunct_projection_is_bounded() {
+        let atom = Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+        let over_cap = Formula::And(vec![atom; 49]);
+        assert!(parse_and_disjunct_order_atoms(&over_cap).is_none());
+    }
+
     /// A modulo-index `s[i % 8]` on `[i32; 8]`: the VC conjoins the modulo
     /// result-bound fact `Or([8 = 0, _3 < 8])` (where `_3 = i % 8`) with the
     /// violation `_3 >= 8`. The `8 = 0` disjunct is a closed-false equality; the
@@ -14720,12 +14956,16 @@ mod tests {
                     // Nonneg-widening cast guard: `_4 ≥ 0 → _3 = _4`.
                     Formula::Implies(Box::new(ge(v("_4"), i(0))), Box::new(eq(v("_3"), v("_4")))),
                     // Reified bool (dropped by retain): `_5 ⟺ _3 < 3`.
-                    eq(v("_5#s0_3"), Formula::Lt(Box::new(v("_3")), Box::new(i(3)))),
+                    eq(
+                        Formula::Var("_5#s0_3".to_string(), Sort::Bool),
+                        Formula::Lt(Box::new(v("_3")), Box::new(i(3))),
+                    ),
                     // Negated goal: the OOB path requires `_3 ≥ 3`.
                     ge(v("_3"), i(3)),
                 ]),
             ]),
         ]);
+        assert_eq!(trust_types::smt_logic::check_formula_sort(&viol), Ok(Sort::Bool));
         assert!(
             certify_violation(&viol).is_some(),
             "enum-discriminant nonneg-widening cast must kernel-certify"

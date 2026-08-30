@@ -12864,75 +12864,471 @@ pub(crate) fn straight_line_fully_faithful_via_trustir_pub(func: &VerifiableFunc
 /// that the callee is pure, deterministic, or side-effect-free". So a model must carry its
 /// OWN fresh kernel evidence and its own type discipline. The gates:
 ///
-/// * **G1 — grounder-connected evidence.** `straight_line_ir_body` + a real
-///   [`crate::trustir_anchor::check_body_refinement`] pass. Deliberately NOT
-///   `check_body_refinement_model`, which is the MODEL-ONLY tier that admits
-///   `IrOperand::Field` = the untimed `idxElem` selector.
-/// * **G2 — an ALL-SCALAR signature.** Every parameter and the return are `Int`/`Bool`, so
-///   no reference, raw pointer or ADT crosses the boundary. This is what keeps the recorded
-///   "`idx_elem` carries NO TIME INDEX" hazard out: with no handle passed, a call on this
-///   lane cannot mutate a pointee the caller also reads. It is strictly stronger than the
-///   existing `param_is_mut_ref` gate, which is `&mut`-only and therefore misses exactly
-///   the shared-ref case CLAUDE.md records.
-/// * **G4 — a closed scalar term.** The model may mention only `Var(i)` for a real
-///   parameter `i` and `Const`. A `Field`/`Index`/`Len` leaf is refused: those are the
-///   untimed opaques, and a model containing one would import the hazard into the caller
-///   even under G2. Depth 1 — no transitive transport in this increment.
+/// * **G2' — the signature.** The return is `Int`/`Bool`; every parameter is scalar OR
+///   `&T` (`mutable: false`) with `T` not a raw pointer, and every slot carries ONE
+///   reading fixed by its declared type ([`RetModelSlot`]: `Value` for scalars and
+///   `&{int,bool}`, `Handle` for `&[T]`/`&str`/`&Adt`). `&mut` and raw pointers refuse.
+///   (Trust: EFHT, 2026-08-29 — this replaced the all-scalar G2. Its doc claimed the
+///   signature was what kept the hazards out; it was not — the LEAF SET keeps H2 out and
+///   the read-only fence keeps H1 out, and both are stated below.)
+/// * **G-PURE — the callee is READ-ONLY by the affirmative allow-list**
+///   ([`body_is_read_only`]): no Deref-rooted write on ANY local, no fail-closed
+///   statement class, no call/drop. This — not the signature — is the H1 defense
+///   ("a certified callee may MUTATE THROUGH A SHARED REFERENCE"). The deny-list fences
+///   (`deref_write_exists` / `raw_exposure_exists` / `param_reassigned_by_stmt` /
+///   `has_exposed_interior_mutability`) stay as belt-and-braces beside it, never instead.
+/// * **G-BUILDER.** `straight_line_ir_body` first, then `straight_line_ir_body_chain`.
+/// * **G4' + G-SLOT — leaf scope** ([`ret_model_leaves_respect_slots`]). `Const`,
+///   earlier temps, `Var(i)` ONLY on a `Value` slot, `Len(Var i)` / `Discr(i)` /
+///   `Field(i, f)` ONLY on a `Handle` slot, depth 1, `Index` refused. The LEAF SET is
+///   what keeps H2 ("`idx_elem` carries NO TIME INDEX") from turning into a false claim:
+///   an admitted selector names the callee formal's ENTRY referent, and both the callee
+///   and the caller are fenced read-only, so no admitted execution can move it between
+///   the caller's entry and the call. The time index is NOT supplied — it is made
+///   unnecessary on this lane alone, by the fence.
+/// * **G1' — tiered kernel evidence** ([`ret_model_kernel_verdict`]): a grounder-
+///   connected term → `check_body_refinement`; otherwise the MODEL-ONLY
+///   `check_body_refinement_model` / `_model_chain`. The tier is DERIVED from the term
+///   at both ends and is never a stored tag (`CalleeFact`'s shape is unchanged).
 ///
 /// A `None` return is today's behaviour (an opaque call result), never a decline.
-pub(crate) fn pure_scalar_ret_model(
+/// Trust: D3 — DUPLICATE-DEF-PATH GUARD on `ret_model`. The registry is keyed by
+/// def-path and `certified.insert` is last-certifier-wins, while the dumped corpus
+/// is KNOWN to hold duplicate def-paths (that is why the scheduler's `by_path` is
+/// a `VecDeque`). While `ret_model` was opaque a mis-resolution cost signature
+/// soundness only; transporting a VALUE would make it a false claim about what
+/// the callee returns — the caller would substitute body A's model for a call
+/// that resolves to body B. So a model is minted for the registry ONLY when
+/// `func.def_path` occurs EXACTLY ONCE among the dumped bodies (the
+/// `occurrences == 1` style of `facet_inference`); a duplicated path degrades to
+/// today's opaque behaviour (`None`), never to a model. `of_certified` itself is
+/// NOT gated — signature facts keep their existing disposition.
+pub(crate) fn unique_def_path_ret_model(
     func: &VerifiableFunction,
+    funcs: &[VerifiableFunction],
 ) -> Option<crate::trustir_anchor::IrBody> {
-    use crate::trustir_anchor::{IrOperand, IrRvalue, RefinementVerdict};
-    use trust_types::Ty;
-
-    let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
-    // G2 — the signature, checked BEFORE any kernel work.
-    if !scalar(&func.body.return_ty) {
+    let occurrences = funcs.iter().filter(|f| f.def_path == func.def_path).count();
+    if occurrences != 1 {
         return None;
     }
-    let arg_count = func.body.arg_count;
-    for i in 1..=arg_count {
-        if !func.body.locals.get(i).is_some_and(|l| scalar(&l.ty)) {
-            return None;
+    pure_scalar_ret_model(func)
+}
+
+/// Trust: THE READ-ONLY ALLOW-LIST (2026-08-29) — can this body write to memory other
+/// than its own locals? `Ok(())` says NO; `Err(reason)` names the FIRST statement or
+/// terminator class that could.
+///
+/// WHY AN ALLOW-LIST AND NOT A DENY-LIST. Every earlier "read-only" argument on the
+/// transport lane was a deny-list over `deref_write_exists` / `raw_exposure_exists`,
+/// whose alias closure follows ONLY `Rvalue::Use` between two `&T` locals and sees ONLY
+/// `AddressOf`. Three escapes are verified in-tree: `p as *const u8 as *mut u8` is an
+/// `Rvalue::Cast`, never an `AddressOf`; a shared reborrow `&(*_1)` is neither a write
+/// nor an alias the closure tracks; and `CopyNonOverlapping` / `Intrinsic` /
+/// `Unsupported` are write channels with no `Place` at all. So
+/// `fn leak(p:&u8)->u8 { let q = p as *const u8 as *mut u8; unsafe{*q=9;} *p }` read as
+/// "no deref write, no AddressOf" and minted `c(a) == *a`. That is CLAUDE.md's H1
+/// ("a certified callee may MUTATE THROUGH A SHARED REFERENCE") landing on the model
+/// transport lane, and it is what H2 ("`idx_elem` carries NO TIME INDEX") turns into a
+/// false claim: a pointee read before and after such a call denote the same term.
+///
+/// THE CLOSE. This predicate does NO alias analysis, so there is nothing to launder.
+/// It admits, by name, only statement classes that write a bare local (or nothing) and
+/// only terminators that transfer control; it refuses
+///
+///   * every `Assign` whose destination carries a `Projection::Deref` on ANY local —
+///     whatever the local's type or provenance, a reference, a raw pointer, a cast, a
+///     reborrow;
+///   * `SetDiscriminant` / `Retag` on a Deref-rooted place;
+///   * every statement whose [`trust_types::Statement::write_effect`] is
+///     `FailClosedOrBackstopped` (`Intrinsic`, `CopyNonOverlapping`, `Deinit`,
+///     `Unsupported`) — the channels with no `Place` to inspect;
+///   * every rvalue that manufactures a mutable capability or a pointer the body could
+///     later write through (`Ref { mutable: true }`, `AddressOf`, `Cast` to anything but
+///     `Int`/`Bool`, `PtrOffset`, `CopyForDeref`, `Repeat`, `Aggregate`,
+///     `UncheckedBinaryOp`, `Unsupported`). `Aggregate` is refused rather than admitted
+///     because a closure/coroutine aggregate captures an environment whose later use is
+///     not visible here; `UncheckedBinaryOp` is not a memory hazard but is outside the
+///     enumerated fragment and is refused BY NAME so admitting it is a decision, not a
+///     drift;
+///   * every `Call` / `TailCall` / `Drop` / `Opaque` / `Resume` terminator — a call is
+///     the ONE way a body writes memory without a statement of its own, and a drop runs
+///     arbitrary user code.
+///
+/// With no Deref-rooted write of any kind, no call, no drop and no fail-closed statement
+/// class, the only places the body assigns are bare locals (with `Field`/`Index`/
+/// `Downcast` projections into those same locals), so it cannot write to memory it did
+/// not allocate itself. A shared reborrow (`Ref { mutable: false }`) is therefore
+/// harmless: it can be READ through, and nothing admitted here can write through it.
+///
+/// SHAPE OF THE MATCHES. `Statement`, `Rvalue` and `Terminator` are `#[non_exhaustive]`
+/// in `trust-types`, so a match in THIS crate cannot omit the wildcard arm — the
+/// compiler requires it. The wildcard arms below REFUSE, so a variant added upstream
+/// fails CLOSED here; the "new variant fails to compile" property this repo relies on
+/// lives in `trust_types::Statement::write_effect`, which IS exhaustive in its own crate
+/// and is consulted for every statement before the by-name match. Every KNOWN variant is
+/// nevertheless named explicitly so a reader can audit the allow-list against the enum.
+///
+/// Apply this to BOTH sides of a transport: the callee (mint) and the caller (consume).
+pub(crate) fn body_is_read_only(
+    body: &trust_types::VerifiableBody,
+) -> Result<(), &'static str> {
+    use trust_types::{Place, Projection, Rvalue, Statement, Terminator, Ty, WriteEffect};
+    let deref_rooted =
+        |p: &Place| p.projections.iter().any(|pr| matches!(pr, Projection::Deref));
+    for block in &body.blocks {
+        for st in &block.stmts {
+            // The exhaustive-in-its-own-crate classifier first: any channel trust-types
+            // itself calls fail-closed is refused before we look at its shape.
+            if st.write_effect() == WriteEffect::FailClosedOrBackstopped {
+                return Err("statement classified FailClosedOrBackstopped by write_effect");
+            }
+            match st {
+                Statement::Assign { place, rvalue, .. } => {
+                    if deref_rooted(place) {
+                        return Err("Assign through a Deref projection");
+                    }
+                    match rvalue {
+                        Rvalue::Use(_)
+                        | Rvalue::BinaryOp(..)
+                        | Rvalue::CheckedBinaryOp(..)
+                        | Rvalue::UnaryOp(..)
+                        | Rvalue::Len(_)
+                        | Rvalue::Discriminant(_)
+                        | Rvalue::Ref { mutable: false, .. } => {}
+                        Rvalue::Cast(_, ty) => {
+                            if !matches!(ty, Ty::Int { .. } | Ty::Bool) {
+                                return Err("Cast to a non-scalar type");
+                            }
+                        }
+                        Rvalue::Ref { mutable: true, .. } => return Err("Ref { mutable: true }"),
+                        Rvalue::AddressOf(..) => return Err("AddressOf"),
+                        Rvalue::UncheckedBinaryOp(..) => return Err("UncheckedBinaryOp"),
+                        Rvalue::Aggregate(..) => return Err("Aggregate"),
+                        Rvalue::Repeat(..) => return Err("Repeat"),
+                        Rvalue::CopyForDeref(_) => return Err("CopyForDeref"),
+                        Rvalue::PtrOffset { .. } => return Err("PtrOffset"),
+                        Rvalue::Unsupported { .. } => return Err("Rvalue::Unsupported"),
+                        _ => return Err("Rvalue variant unknown to the allow-list"),
+                    }
+                }
+                Statement::SetDiscriminant { place, .. } => {
+                    if deref_rooted(place) {
+                        return Err("SetDiscriminant through a Deref projection");
+                    }
+                }
+                Statement::Retag { place } => {
+                    if deref_rooted(place) {
+                        return Err("Retag of a Deref-rooted place");
+                    }
+                }
+                Statement::Deinit { .. } => return Err("Deinit"),
+                Statement::Intrinsic { .. } => return Err("Intrinsic"),
+                Statement::CopyNonOverlapping { .. } => return Err("CopyNonOverlapping"),
+                Statement::Unsupported { .. } => return Err("Statement::Unsupported"),
+                Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::PlaceMention(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                _ => return Err("Statement variant unknown to the allow-list"),
+            }
+        }
+        match &block.terminator {
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Unreachable
+            | Terminator::Assert { .. } => {}
+            Terminator::Call { .. } => return Err("Call terminator"),
+            Terminator::TailCall { .. } => return Err("TailCall terminator"),
+            Terminator::Drop { .. } => return Err("Drop terminator"),
+            Terminator::Opaque { .. } => return Err("Opaque terminator"),
+            Terminator::Resume => return Err("Resume terminator"),
+            _ => return Err("Terminator variant unknown to the allow-list"),
         }
     }
-    let ir = straight_line_ir_body(func)?;
-    // G4 — every operand is a parameter read or a literal.
-    let operand_ok = |op: &IrOperand| matches!(op, IrOperand::Const(_))
-        || matches!(op, IrOperand::Var(i) if usize::try_from(*i).is_ok_and(|i| i < arg_count));
-    // A statement's own SSA index is bound by the body, so an operand may also name an
-    // EARLIER temp. Track what is in scope rather than refusing every temp read.
-    let mut bound: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for i in 0..arg_count {
-        bound.insert(u64::try_from(i).ok()?);
+    Ok(())
+}
+
+/// Trust: EFHT (ENTRY-FROZEN HANDLE TRANSPORT, 2026-08-29) — the ONE reading a
+/// parameter slot may carry across a call boundary, fixed by its DECLARED type and
+/// nothing else (G-SLOT). A model leaf that disagrees with its slot's reading is refused
+/// at BOTH ends of a transport.
+///
+/// * `Value` — the slot's `Var(i)` IS the parameter's value: a scalar, or the entry
+///   referent of a `&{int,bool}` (the same reading `ir_field_read_operand`'s `[Deref]`
+///   arm and the deref-temp chase already mint). `Field`/`Len`/`Discr` on it refuse.
+/// * `Handle` — `Var(i)` is an opaque ENTRY-TIME handle. Only the untimed selectors
+///   `Len(Var i)` / `Discr(i)` / `Field(i, f)` may name it; a bare `Var(i)` refuses,
+///   because nothing in this lane gives a handle an Int value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetModelSlot {
+    Value,
+    Handle,
+}
+
+/// Trust: EFHT G2' — the slot reading for one declared parameter type, or `None` when
+/// the type has no reading in this lane (the signature then refuses). `Int`/`Bool` and
+/// `&{Int,Bool}` read as `Value`; `&[T]`/`&str`/`&Adt` read as `Handle`. `&mut T` fails
+/// the `mutable: false` match; a raw pointer is not a `Ref` at all and is refused as an
+/// `inner` too (`&*T` has no reading); every other carrier (`&&T`, `&(A, B)`, `&[T; N]`,
+/// floats, chars, by-value ADTs) is outside the increment and refuses by falling through.
+pub(crate) fn ret_model_slot(ty: &trust_types::Ty) -> Option<RetModelSlot> {
+    use trust_types::Ty;
+    match ty {
+        Ty::Int { .. } | Ty::Bool => Some(RetModelSlot::Value),
+        Ty::Ref { mutable: false, inner } => match inner.as_ref() {
+            Ty::Int { .. } | Ty::Bool => Some(RetModelSlot::Value),
+            Ty::Slice { .. } | Ty::Str | Ty::Adt { .. } => Some(RetModelSlot::Handle),
+            _ => None,
+        },
+        _ => None,
     }
-    let in_scope = |op: &IrOperand, bound: &std::collections::BTreeSet<u64>| match op {
-        IrOperand::Const(_) => true,
-        IrOperand::Var(i) => bound.contains(i),
-        _ => false,
+}
+
+/// Trust: EFHT — the slot readings for a whole signature (`param_tys` in declaration
+/// order), or `None` if any slot has no reading.
+pub(crate) fn ret_model_slots(param_tys: &[trust_types::Ty]) -> Option<Vec<RetModelSlot>> {
+    param_tys.iter().map(ret_model_slot).collect()
+}
+
+/// Trust: EFHT G4' + G-SLOT — LEAF SCOPE, applied at BOTH ends (the minter over the
+/// callee's declared slots; the consumer over the registry's compiler-extracted
+/// `param_tys` AND, after substitution, over the caller's own slots). Every operand of
+/// every statement must be `Const`, `Var(t)` for an EARLIER-bound temp, `Var(i)` for a
+/// `Value` slot, or `Len(Var i)` / `Discr(i)` / `Field(i, f)` for a `Handle` slot.
+/// DEPTH 1 ONLY: `Len` of anything but a bare parameter `Var`, `Field`/`Discr` of a temp,
+/// and `Index` in any position refuse; so do the pre-op / cast / float carriers, which
+/// this lane never mints. `slots[i] == None` is a parameter with no reading — any leaf
+/// on it refuses. A statement may not rebind a parameter slot, and the returned index
+/// must be bound by a statement. The rvalue scope is `Use|Bin|Cmp|Un` (every
+/// `IrRvalue` there is).
+pub(crate) fn ret_model_leaves_respect_slots(
+    model: &crate::trustir_anchor::IrBody,
+    slots: &[Option<RetModelSlot>],
+) -> bool {
+    use crate::trustir_anchor::{IrOperand, IrRvalue};
+    let slot_of = |i: u64| -> Option<Option<RetModelSlot>> {
+        usize::try_from(i).ok().filter(|i| *i < slots.len()).map(|i| slots[i])
     };
-    for st in &ir.stmts {
+    let mut bound: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let leaf_ok = |op: &IrOperand, bound: &std::collections::BTreeSet<u64>| match op {
+        IrOperand::Const(_) => true,
+        IrOperand::Var(i) => match slot_of(*i) {
+            Some(reading) => reading == Some(RetModelSlot::Value),
+            None => bound.contains(i),
+        },
+        IrOperand::Len(inner) => matches!(
+            inner.as_ref(),
+            IrOperand::Var(i) if slot_of(*i) == Some(Some(RetModelSlot::Handle))
+        ),
+        IrOperand::Discr(i) | IrOperand::Field(i, _) => {
+            slot_of(*i) == Some(Some(RetModelSlot::Handle))
+        }
+        IrOperand::Index(..)
+        | IrOperand::PreOpNotAt(..)
+        | IrOperand::CastU(..)
+        | IrOperand::CastS(..)
+        | IrOperand::CastF { .. }
+        | IrOperand::CastFF { .. } => false,
+    };
+    for st in &model.stmts {
         let ops: Vec<&IrOperand> = match &st.rvalue {
             IrRvalue::Use(a) => vec![a],
             IrRvalue::Bin(_, a, b) | IrRvalue::Cmp(_, a, b) => vec![a, b],
             IrRvalue::Un(_, a) => vec![a],
-            // Any other rvalue form is outside this increment; fail closed.
-            _ => return None,
         };
-        if !ops.iter().all(|o| in_scope(o, &bound) || operand_ok(o)) {
-            return None;
+        if !ops.iter().all(|o| leaf_ok(o, &bound)) {
+            return false;
+        }
+        if slot_of(st.idx).is_some() {
+            return false; // a statement rebinding a parameter slot — not a model.
         }
         bound.insert(st.idx);
     }
-    if !bound.contains(&ir.ret) {
-        return None;
+    bound.contains(&model.ret)
+}
+
+/// Trust: EFHT G1' / G-TIER-MATCH — the kernel verdict for a model at the tier DERIVED
+/// FROM THE TERM, never from a stored tag (`CalleeFact` carries none, deliberately: a
+/// tag can drift from the term it labels; the term cannot). Grounder-connected (every
+/// leaf `Var`/`Const`) → [`crate::trustir_anchor::check_body_refinement`], the live
+/// grounder tier. Otherwise the MODEL-ONLY tier:
+/// [`crate::trustir_anchor::check_body_refinement_model`] for one statement,
+/// [`crate::trustir_anchor::check_body_refinement_model_chain`] for a chain. The
+/// consumer re-derives the tier from the SUBSTITUTED term, so a transport can never
+/// be checked at a tier the inlined body does not itself select.
+pub(crate) fn ret_model_kernel_verdict(
+    ir: &crate::trustir_anchor::IrBody,
+) -> crate::trustir_anchor::RefinementVerdict {
+    if ir.is_grounder_connected() {
+        crate::trustir_anchor::check_body_refinement(ir)
+    } else if ir.stmts.len() == 1 {
+        crate::trustir_anchor::check_body_refinement_model(ir)
+    } else {
+        crate::trustir_anchor::check_body_refinement_model_chain(ir)
     }
-    // G1 — the model carries its OWN kernel evidence, not the caller's trust in the registry.
-    if crate::trustir_anchor::check_body_refinement(&ir) != RefinementVerdict::ProvenModulo3 {
-        return None;
+}
+
+/// Trust: EFHT — the deny-list fences kept BESIDE the allow-list, never instead of it
+/// (belt-and-braces; [`body_is_read_only`] is the load-bearing conjunct on both sides
+/// and its doc records the three escapes these missed). For parameter `local`: no deref
+/// write through it or an alias, no raw exposure of it, no reassignment; and for a
+/// `Handle`, no interior-mutability channel anywhere in the referent type (a `&Cell<_>`
+/// referent can change under a shared reference without any write in THIS body).
+fn ret_model_param_fences_hold(
+    body: &trust_types::VerifiableBody,
+    local: usize,
+    slot: RetModelSlot,
+) -> bool {
+    use trust_types::Ty;
+    if crate::mirsem::deref_write_exists(body, local)
+        || crate::mirsem::raw_exposure_exists(body, local)
+        || crate::mirsem::param_reassigned_by_stmt(body, local)
+    {
+        return false;
     }
-    Some(ir)
+    if slot == RetModelSlot::Handle {
+        let Some(Ty::Ref { mutable: false, inner }) = body.locals.get(local).map(|l| &l.ty)
+        else {
+            return false;
+        };
+        if crate::trustir_fold_expr::has_exposed_interior_mutability(&body.datatype_defs, inner)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Trust: EFHT G-ACTUAL — the MIR-level actuals of the caller's sole RETURNING call.
+/// Returns the call's block and, per actual, `Some(local)` for `Copy(p)`/`Move(p)` with
+/// NO projections and `None` for anything else (a projected place, a constant, a
+/// symbolic or unsupported operand). Mirrors `sem_call_return_of_mir`'s call selection
+/// exactly: a `Call` with `target: None` is a divergence sink and is SKIPPED; a second
+/// RETURNING call refuses; no returning call refuses. Pinned against that recognizer by
+/// `sole_returning_call_arg_locals_agrees_with_the_recognizer` (same file).
+///
+/// WHY THE MIR OPERAND AND NOT MIRSEM'S. `sem_call_arg_operand` RESOLVES: a reborrow
+/// temp `_t = &(*_p)` reaches it as `SemOperand::Var(idx)` exactly like a bare `_p`
+/// (`sem_call_arg_ref_operand`, call_lift.rs), and so does a by-value enum borrowed for
+/// an `&self` callee. The transported selector denotes the callee formal's ENTRY
+/// referent, and the only caller term with that denotation is the caller's own entry
+/// parameter — so the HANDLE actual must be the parameter local itself, unprojected,
+/// read off the terminator and cross-checked against MirSem's reading.
+pub(crate) fn sole_returning_call_arg_locals(
+    body: &trust_types::VerifiableBody,
+) -> Option<(trust_types::BlockId, Vec<Option<usize>>)> {
+    use trust_types::{Operand, Terminator};
+    let mut found: Option<(trust_types::BlockId, Vec<Option<usize>>)> = None;
+    for block in &body.blocks {
+        let Terminator::Call { args, target, .. } = &block.terminator else { continue };
+        if target.is_none() {
+            continue; // divergence sink — `sem_call_return_of_mir` skips it too.
+        }
+        if found.is_some() {
+            return None; // a second RETURNING call — not the sole-call shape.
+        }
+        let locals = args
+            .iter()
+            .map(|a| match a {
+                Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => Some(p.local),
+                _ => None,
+            })
+            .collect();
+        found = Some((block.id, locals));
+    }
+    found
+}
+
+/// Trust: EFHT G-PURE (caller) — [`body_is_read_only`] over the caller with EXACTLY the
+/// sole returning `Call` excused. Implemented by REUSE, not by a second allow-list: on a
+/// scratch clone the call terminator is replaced by a `Goto` to its own return target
+/// and `body_is_read_only` runs unchanged — so a diverging sink call, a second call, a
+/// drop, and every statement-level write channel are refused by the same code the
+/// callee is judged by, and there is no second list to drift.
+pub(crate) fn body_is_read_only_except_sole_call(
+    body: &trust_types::VerifiableBody,
+) -> Result<(), &'static str> {
+    use trust_types::Terminator;
+    let Some((call_block, _)) = sole_returning_call_arg_locals(body) else {
+        return Err("no sole returning Call terminator");
+    };
+    let mut scratch = body.clone();
+    let Some(blk) = scratch.blocks.iter_mut().find(|b| b.id == call_block) else {
+        return Err("the call block is not in the body");
+    };
+    let Terminator::Call { target: Some(target), .. } = &blk.terminator else {
+        return Err("the call block does not end in a returning Call");
+    };
+    blk.terminator = Terminator::Goto(*target);
+    body_is_read_only(&scratch)
+}
+
+/// Trust: EFHT (2026-08-29) — the MINTER. See the gate list on the doc block above
+/// [`unique_def_path_ret_model`]; in order: G2' signature, G-PURE (the read-only
+/// allow-list over the whole callee, load-bearing) plus the deny-list fences, G-BUILDER
+/// (`straight_line_ir_body` then the chain), G4'/G-SLOT leaf scope, G1' tiered kernel
+/// evidence, then the D1 safety-discharge clauses. A `None` is today's behaviour (an
+/// opaque call result), never a decline.
+pub(crate) fn pure_scalar_ret_model_reasoned(
+    func: &VerifiableFunction,
+) -> Result<crate::trustir_anchor::IrBody, &'static str> {
+    use crate::trustir_anchor::RefinementVerdict;
+    use trust_types::Ty;
+
+    // G2' — the signature, checked BEFORE any kernel work. The return stays scalar;
+    // every parameter slot must have exactly one reading.
+    if !matches!(func.body.return_ty, Ty::Int { .. } | Ty::Bool) {
+        return Err("G2': return type not scalar");
+    }
+    let arg_count = func.body.arg_count;
+    let mut slots: Vec<Option<RetModelSlot>> = Vec::with_capacity(arg_count);
+    for i in 1..=arg_count {
+        let ty = &func.body.locals.get(i).ok_or("G2': param local missing")?.ty;
+        slots.push(Some(ret_model_slot(ty).ok_or("G2': a param has no reading (not scalar, not &T)")?));
+    }
+    // G-PURE — the H1 defense, and the LOAD-BEARING conjunct: the affirmative allow-list
+    // over the whole body. No alias analysis, so nothing to launder.
+    body_is_read_only(&func.body)?; // G-PURE allow-list: the reason names the refusing kind
+    for (i, slot) in slots.iter().enumerate() {
+        let Some(slot) = slot else { return Err("G2': a param has no reading (not scalar, not &T)") };
+        if !ret_model_param_fences_hold(&func.body, i + 1, *slot) {
+            return Err("G-PURE: deny-list fences fail on a param");
+        }
+    }
+    // G-BUILDER — the single-statement lane first, then the chain: `[u8]::is_empty`
+    // (2 assigns) and `Option::is_none` (3 assigns) exist only on the chain.
+    let ir = straight_line_ir_body(func).or_else(|| straight_line_ir_body_chain(func)).ok_or("G-BUILDER: neither straight_line_ir_body nor _chain lowers the body")?;
+    // G4' + G-SLOT — every leaf agrees with its slot's reading; depth 1; no `Index`.
+    if !ret_model_leaves_respect_slots(&ir, &slots) {
+        return Err("G4'/G-SLOT: a leaf disagrees with its slot");
+    }
+    // G1' — the model carries its OWN kernel evidence at the tier the TERM selects.
+    if ret_model_kernel_verdict(&ir) != RefinementVerdict::ProvenModulo3 {
+        return Err("G1': kernel verdict not ProvenModulo3");
+    }
+    // Trust: SAFETY-DISCHARGE PARITY (D1), mint side — a callee with an unmodeled or
+    // undischarged safety VC must not mint. Production was saved only by the registry's
+    // `fully_faithful > 0` condition, which every instrument bypasses by calling this
+    // minter directly; the gate belongs HERE, on the same two clauses the transport
+    // consumer and `call_return_fully_faithful_via_trustir` apply to the caller.
+    if crate::mirsem::function_emits_unmodeled_safety_vc_pub(func) {
+        return Err("D1: callee emits an unmodeled safety VC");
+    }
+    if !function_safety_vcs_all_discharged(func) {
+        return Err("D1: callee safety VCs not all discharged");
+    }
+    Ok(ir)
+}
+
+/// ONE implementation, two callers: the minter proper. Instruments sizing the mint call the
+/// `_reasoned` twin and read WHICH gate refused.
+pub(crate) fn pure_scalar_ret_model(
+    func: &VerifiableFunction,
+) -> Option<crate::trustir_anchor::IrBody> {
+    pure_scalar_ret_model_reasoned(func).ok()
 }
 
 fn straight_line_fully_faithful_via_trustir(func: &VerifiableFunction) -> bool {
@@ -13661,7 +14057,18 @@ fn sem_call_arg_to_ir(op: &crate::mirsem::SemOperand) -> Option<crate::trustir_a
 ///   cannot collide with a caller formal;
 /// * statement indices shift the same way, preserving the model's SSA order.
 ///
-/// Fail-closed on anything the model should not contain (G4 already refuses those at
+/// * Trust: EFHT (2026-08-29) — a HANDLE selector `Field(j, f)` / `Discr(j)` /
+///   `Len(Var j)` re-points at the caller's ENTRY PARAMETER carrying the handle, and at
+///   nothing else: it maps ONLY when `actuals[j]` is `Var(a)` with `a < caller_arg_count`.
+///   `IrOperand::Len`'s in-tree rule is the reason, quoted: "The body producer mints
+///   `Len` over a PARAMETER exclusively; `inline_operand_denotation`'s `_` arm is
+///   correct for exactly that case (params are env-invariant) and a Len-over-temp
+///   would FAIL CLOSED there — do not 'fix' that with a recursion arm unless the base
+///   really is threaded." `Field`/`Discr` rest on the same env-invariance. A `Const`
+///   or temp actual under a selector has no carrier and returns `None`; `Index` is
+///   never transported.
+///
+/// Fail-closed on anything the model should not contain (G4' already refuses those at
 /// minting; this refuses them again rather than trusting that).
 /// [`substitute_ret_model`] for probes.
 #[must_use]
@@ -13682,6 +14089,18 @@ fn substitute_ret_model(
 
     let shift = u64::try_from(caller_arg_count).ok()?;
     let callee_argc = u64::try_from(actuals.len()).ok()?;
+    // Trust: EFHT — a selector's base maps ONLY onto a caller ENTRY PARAMETER (see the
+    // doc's quoted `IrOperand::Len` rule). G-ACTUAL has already forced this for every
+    // HANDLE formal; these arms are redundant fences, written anyway.
+    let map_handle = |j: &u64| -> Option<u64> {
+        if *j >= callee_argc {
+            return None; // a selector over a callee temp — never minted, never mapped.
+        }
+        match actuals.get(usize::try_from(*j).ok()?)? {
+            IrOperand::Var(a) if *a < shift => Some(*a),
+            _ => None, // a `Const`/temp/projected actual has no carrier for a selector.
+        }
+    };
     let map_op = |op: &IrOperand| -> Option<IrOperand> {
         match op {
             IrOperand::Const(c) => Some(IrOperand::Const(*c)),
@@ -13689,6 +14108,15 @@ fn substitute_ret_model(
                 actuals.get(usize::try_from(*i).ok()?).cloned()
             }
             IrOperand::Var(t) => Some(IrOperand::Var(t.checked_add(shift)?)),
+            IrOperand::Field(j, f) => Some(IrOperand::Field(map_handle(j)?, *f)),
+            IrOperand::Discr(j) => Some(IrOperand::Discr(map_handle(j)?)),
+            IrOperand::Len(inner) => match inner.as_ref() {
+                IrOperand::Var(j) => {
+                    Some(IrOperand::Len(Box::new(IrOperand::Var(map_handle(j)?))))
+                }
+                _ => None, // depth 1 only — `Len` of anything but a bare parameter.
+            },
+            IrOperand::Index(..) => None, // never transported.
             _ => None,
         }
     };
@@ -13706,6 +14134,218 @@ fn substitute_ret_model(
     Some(IrBody { stmts, ret: model.ret.checked_add(shift)? })
 }
 
+/// Trust: EFHT-T G-ACTUAL-VALUE (2026-08-29) — may this lowered operand stand on a VALUE
+/// formal slot, given the MIR-read base the transport recognizer recorded for it?
+/// Applied to every Value actual AND to the tail's `other` operand. The operand and the
+/// base are judged TOGETHER, and the type is RE-DERIVED here off the caller's own local
+/// declarations — never accepted because a MirSem chase returned a `Field`
+/// (`sem_call_arg_field_read_operand`'s Case 1b admits a u64-newtype / transparent-chain
+/// field as an opaque token and its Case 2 an `&mut Closure` upvar).
+///
+/// * `Const` / `Const` — always.
+/// * `Var(i)` / `Param(p)`, `i == p-1` — `p` an entry parameter whose declared type is
+///   `Int`/`Bool` or `&{Int,Bool}` (the two `Value` readings), with the Value fences.
+/// * `Var(i)` / `DerefOf(p)` — the S4 deref temp: `p`'s declared type must be LITERALLY
+///   `Ref { mutable: false, inner: Int|Bool }` (matched on the type, never on the slot
+///   alone, so a later `ret_model_slot` widening cannot admit an `&Cell`-shaped referent
+///   through this arm), with `ret_model_param_fences_hold(.., Value)`.
+/// * `Field(i, f)` / `FieldOf(p, f)` — the S2/S3 field actual: `p` is `&Adt` (a STRUCT,
+///   not an enum, `mutable: false`), field `f` of that ADT — read off the inline
+///   definition or `datatype_defs` — is `Int`/`Bool`, the base slot reads as `Handle`,
+///   and `ret_model_param_fences_hold(.., Handle)` holds on `p`: that is the
+///   interior-mutability refusal the MirSem chase does not perform, and the property the
+///   H2 argument actually uses (the pointee cannot change between entry and the call).
+///
+/// Anything else — a `Field` whose base is not the entry parameter the MIR read named,
+/// a `Var` over a reborrow, a mismatched field index — refuses by name.
+fn efht_value_actual_ok(
+    body: &trust_types::VerifiableBody,
+    ir: &crate::trustir_anchor::IrOperand,
+    base: &crate::mirsem::ActualBase,
+) -> Result<(), &'static str> {
+    use crate::mirsem::ActualBase;
+    use crate::trustir_anchor::IrOperand;
+    use trust_types::Ty;
+    let argc = body.arg_count;
+    let entry_ty = |p: usize| -> Option<&Ty> {
+        if (1..=argc).contains(&p) { body.locals.get(p).map(|l| &l.ty) } else { None }
+    };
+    let slot_is = |i: u64, p: usize| usize::try_from(i).ok().and_then(|i| i.checked_add(1)) == Some(p);
+    match (ir, base) {
+        (IrOperand::Const(_), ActualBase::Const) => Ok(()),
+        (IrOperand::Var(i), ActualBase::Param(p)) => {
+            if !slot_is(*i, *p) {
+                return Err("Value actual: MirSem slot disagrees with the MIR parameter");
+            }
+            let Some(ty) = entry_ty(*p) else { return Err("Value actual: Param base is not an entry parameter") };
+            let value_typed = match ty {
+                Ty::Int { .. } | Ty::Bool => true,
+                Ty::Ref { mutable: false, inner } => matches!(inner.as_ref(), Ty::Int { .. } | Ty::Bool),
+                _ => false,
+            };
+            if !value_typed {
+                return Err("Value actual: Param base is not Int/Bool or &{Int,Bool}");
+            }
+            if !ret_model_param_fences_hold(body, *p, RetModelSlot::Value) {
+                return Err("Value actual: deny-list fences fail on the Param base");
+            }
+            Ok(())
+        }
+        (IrOperand::Var(i), ActualBase::DerefOf(p)) => {
+            if !slot_is(*i, *p) {
+                return Err("Value actual: MirSem slot disagrees with the MIR deref base");
+            }
+            match entry_ty(*p) {
+                Some(Ty::Ref { mutable: false, inner })
+                    if matches!(inner.as_ref(), Ty::Int { .. } | Ty::Bool) => {}
+                _ => return Err("Value actual: DerefOf base is not a shared reference to Int/Bool"),
+            }
+            if !ret_model_param_fences_hold(body, *p, RetModelSlot::Value) {
+                return Err("Value actual: deny-list fences fail on the DerefOf base");
+            }
+            Ok(())
+        }
+        (IrOperand::Field(i, f), ActualBase::FieldOf(p, f2)) => {
+            if !slot_is(*i, *p) || f != f2 {
+                return Err("Value actual: Field leaf disagrees with the MIR field read");
+            }
+            let Some(pty) = entry_ty(*p) else { return Err("Value actual: Field base is not an entry parameter") };
+            let Ty::Ref { mutable: false, inner } = pty else {
+                return Err("Value actual: Field base is not a shared reference");
+            };
+            let Ty::Adt { name, fields, variants, .. } = inner.as_ref() else {
+                return Err("Value actual: Field base referent is not an ADT");
+            };
+            if !variants.is_empty() {
+                return Err("Value actual: Field base referent is an enum");
+            }
+            let Ok(fidx) = usize::try_from(*f) else { return Err("Value actual: field index out of range") };
+            let field_ty = fields.get(fidx).map(|(_, t)| t).or_else(|| match body.datatype_defs.get(name) {
+                Some(Ty::Adt { fields, variants, .. }) if variants.is_empty() => fields.get(fidx).map(|(_, t)| t),
+                _ => None,
+            });
+            let Some(field_ty) = field_ty else { return Err("Value actual: field index not in the ADT definition") };
+            if !matches!(field_ty, Ty::Int { .. } | Ty::Bool) {
+                return Err("Value actual: field type is not Int|Bool");
+            }
+            if ret_model_slot(pty) != Some(RetModelSlot::Handle) {
+                return Err("Value actual: Field base slot is not Handle");
+            }
+            if !ret_model_param_fences_hold(body, *p, RetModelSlot::Handle) {
+                return Err("Value actual: Field base fails the Handle fences");
+            }
+            Ok(())
+        }
+        _ => Err("Value actual: operand/base pair outside G-ACTUAL-VALUE"),
+    }
+}
+
+/// Test-only re-export of [`efht_value_actual_ok`].
+#[cfg(test)]
+pub(crate) fn efht_value_actual_ok_for_test(
+    body: &trust_types::VerifiableBody,
+    ir: &crate::trustir_anchor::IrOperand,
+    base: &crate::mirsem::ActualBase,
+) -> Result<(), &'static str> {
+    efht_value_actual_ok(body, ir, base)
+}
+
+/// Trust: EFHT-T — the one op mapping the tail uses, written out by name so the value
+/// oracle in the test module can pin all six against the trust-ir predicate names.
+fn trustir_cmpop_of_sem(op: crate::mirsem::SemCmpOp) -> crate::trustir_anchor::TrustIrCmpOp {
+    use crate::mirsem::SemCmpOp as S;
+    use crate::trustir_anchor::TrustIrCmpOp as T;
+    match op {
+        S::Lt => T::Lt,
+        S::Le => T::Le,
+        S::Eq => T::Eq,
+        S::Ne => T::Ne,
+        S::Gt => T::Gt,
+        S::Ge => T::Ge,
+    }
+}
+
+/// Test-only re-export of [`trustir_cmpop_of_sem`].
+#[cfg(test)]
+pub(crate) fn trustir_cmpop_of_sem_for_test(
+    op: crate::mirsem::SemCmpOp,
+) -> crate::trustir_anchor::TrustIrCmpOp {
+    trustir_cmpop_of_sem(op)
+}
+
+/// Trust: EFHT-T (2026-08-29) — append the Return block's statement over the call result
+/// to the SUBSTITUTED body. Pure; `None` is a refusal.
+///
+/// The inlined body's `ret` is the callee model's returned SSA index shifted into caller
+/// space — a BOUND index (the minter's G4' requires `bound.contains(model.ret)`), and it
+/// must be bound here too or the tail would read an unassigned index. The tail statement
+/// takes index `k = max(caller_argc, 1 + max inlined idx)` — above every inlined index
+/// and every caller parameter slot (G-TAIL-INDEX) — so no binder is captured or
+/// shadowed, and `ret := k`.
+///
+/// * `None` — identity (an `other` here is a caller bug and refuses).
+/// * `NotBool` — `k := Cmp(Eq, Var(ret), Const 0)`: logical negation on the 0/1 carrier
+///   is `x == 0`, the ONLY Bool-`Not` reading this crate uses (the chain builder's
+///   `UnOp::Not` arm; the pureop lane's `Not(_t) ≡ _t == 0`). An integer `Not` never
+///   reaches here — the recognizer refuses it by name — because `IrRvalue::Un(Not)`
+///   denotes the opaque `bnot`.
+/// * `Cmp { op, call_is_lhs }` — `k := Cmp(op, Var(ret), other)` or `Cmp(op, other,
+///   Var(ret))`, the SAME op mapping (`sem_cmpop_of_mir` → [`trustir_cmpop_of_sem`]) the
+///   chain builder certifies, so no new operator semantics is introduced. No `Bin` tail
+///   exists in this landing.
+///
+/// Like every model-tier refinement, the tailed body is then proved AGAINST ITSELF by
+/// `Eq.refl` (`ret_model_kernel_verdict`), so the kernel cannot catch a wrong mapping here
+/// any more than it can in the chain builder; the value claim rests on the recognizer
+/// mapping plus the minted model, and the oracles in the test module are what defend it.
+fn append_transport_tail(
+    inlined: crate::trustir_anchor::IrBody,
+    tail: &crate::mirsem::SemTransportTail,
+    caller_argc: usize,
+    other: Option<crate::trustir_anchor::IrOperand>,
+) -> Option<crate::trustir_anchor::IrBody> {
+    use crate::mirsem::SemTransportTail;
+    use crate::trustir_anchor::{IrBody, IrOperand, IrRvalue, IrStmt, TrustIrCmpOp};
+    if !inlined.stmts.iter().any(|s| s.idx == inlined.ret) {
+        return None; // the returned index is not bound by an inlined statement.
+    }
+    let call_result = IrOperand::Var(inlined.ret);
+    let rvalue = match tail {
+        SemTransportTail::None => return if other.is_none() { Some(inlined) } else { None },
+        SemTransportTail::NotBool => {
+            if other.is_some() {
+                return None;
+            }
+            IrRvalue::Cmp(TrustIrCmpOp::Eq, call_result, IrOperand::Const(0))
+        }
+        SemTransportTail::Cmp { op, call_is_lhs, .. } => {
+            let other = other?;
+            let op = trustir_cmpop_of_sem(*op);
+            if *call_is_lhs { IrRvalue::Cmp(op, call_result, other) } else { IrRvalue::Cmp(op, other, call_result) }
+        }
+    };
+    let shift = u64::try_from(caller_argc).ok()?;
+    let max_idx = inlined.stmts.iter().map(|s| s.idx).max()?;
+    let k = max_idx.checked_add(1)?.max(shift);
+    if k < shift || inlined.stmts.iter().any(|s| s.idx == k) {
+        return None;
+    }
+    let mut stmts = inlined.stmts;
+    stmts.push(IrStmt { idx: k, rvalue });
+    Some(IrBody { stmts, ret: k })
+}
+
+/// Test-only re-export of [`append_transport_tail`].
+#[cfg(test)]
+pub(crate) fn append_transport_tail_for_test(
+    inlined: crate::trustir_anchor::IrBody,
+    tail: &crate::mirsem::SemTransportTail,
+    caller_argc: usize,
+    other: Option<crate::trustir_anchor::IrOperand>,
+) -> Option<crate::trustir_anchor::IrBody> {
+    append_transport_tail(inlined, tail, caller_argc, other)
+}
+
 /// Trust: POSTCONDITION TRANSPORT (2026-08-27) — the CONSUMER. A body whose `_0` is a sole
 /// call to a callee carrying a transportable return model is certified by inlining that
 /// model, so the caller's theorem states what the call actually RETURNS instead of ∀-binding
@@ -13713,7 +14353,13 @@ fn substitute_ret_model(
 ///
 /// SOUNDNESS rests on three things, none of them new machinery:
 /// * the callee's model was minted by [`pure_scalar_ret_model`], which required its own
-///   `check_body_refinement` pass and an all-scalar signature (see its gates);
+///   kernel pass at the tier the term selects, a signature whose every slot has one
+///   reading, and — the load-bearing conjunct — the read-only allow-list over the whole
+///   callee (see its gates); and Trust: EFHT (2026-08-29) — the CALLER is held to the
+///   same allow-list with only the transported call excused, every HANDLE actual must be
+///   the caller's own unprojected ENTRY parameter, and no `&mut`/raw-pointer parameter
+///   may exist anywhere in the caller, so the handle a selector names is the entry
+///   handle at both ends and nothing admitted can have moved its referent;
 /// * `callResult (Call.mk _ _ X)` ι-reduces to `X` for ANY `X`, so instantiating at a
 ///   concrete term introduces no lemma, constant or axiom;
 /// * **no uninterpreted symbol is created.** Nothing declares `f : Int → Int`. Each site
@@ -13722,8 +14368,39 @@ fn substitute_ret_model(
 ///   callee's own kernel-checked body, not the assumption `trustir_adt.rs` forbids.
 ///
 /// The caller's own obligation is then checked from scratch: the substituted body is
-/// submitted to [`crate::trustir_anchor::check_body_refinement`], the same grounder-connected
-/// check the callee passed. Nothing is inherited on trust.
+/// submitted to the kernel at the tier the INLINED term selects
+/// ([`ret_model_kernel_verdict`] — grounder-connected `check_body_refinement`, else the
+/// MODEL-ONLY `_model`/`_model_chain`; G-TIER-MATCH). Nothing is inherited on trust.
+///
+/// Trust: EFHT-T (2026-08-29). The shape now comes FIRST from the transport lane's own
+/// recognizer (`mirsem::sem_transported_call_of_mir_diag`, `mirsem/transport_lift.rs`),
+/// which admits — inside the fence above and nowhere else — a FIELD-READ actual
+/// `_t = (*_p).f` (S2/S3), a DEREF-TEMP actual `_t = *_p` (S4), and a Return-block TAIL
+/// over the call result: `Cmp(op, _r, other)` / `Cmp(op, other, _r)` and Bool `Not(_r)`
+/// (desugared to `_r == 0`). No arithmetic tail is admitted in this landing. When it
+/// declines, the shared `sem_call_return_of_mir_diag` path runs byte-identically to
+/// before. The value claim this adds rests on:
+/// * H1 — registry membership is NOT read as purity. A `ret_model` is minted only after
+///   `body_is_read_only(callee)`, so a callee that writes through its `&S` (CLAUDE.md's
+///   `poke`) has no model and this lane declines it exactly as today; for S2/S4 the
+///   callee additionally receives a scalar COPY, so even a hypothetical mutating callee
+///   could not alter the value passed. The residual is unchanged: a forged or stale
+///   registry row carrying a `ret_model`, and call-target resolution by def-path string
+///   (`unique_def_path_ret_model` refuses a duplicated path at mint) — a VALUE claim now
+///   rides on that uniqueness for three more shapes.
+/// * H2 — every handle-rooted leaf in the final theorem (the `Field(p-1, f)` actual, the
+///   callee model's selectors re-pointed onto caller entry parameters, a tail `other`
+///   read of a handle) is a read of a pointee that provably equals its ENTRY content:
+///   the caller is read-only except the sole call, no `&mut`/raw parameter exists, the
+///   base has passed `ret_model_param_fences_hold(.., Handle)` at THIS call (the
+///   interior-mutability refusal — `efht_value_actual_ok`), and the callee is read-only
+///   by H1. The chain of custody is read off MIR (`ActualBase`), not off MirSem: a
+///   reborrow-based read is refused by the recognizer, and every actual temp is written
+///   exactly once.
+/// * NO-UB PREMISE — that argument assumes Rust's shared-reference aliasing guarantee:
+///   no foreign writer to a live `&S` referent. The fence closes every Trust-VISIBLE
+///   write channel; a hand-built or `unsafe`-derived body that violates the aliasing
+///   rules is outside the claim.
 /// [`transported_call_return_fully_faithful_via_trustir`] for measurement — does the
 /// TRANSPORT lane accept this body ON ITS OWN, independent of the disjunction it sits in?
 /// "Accepts nothing" and "accepts only bodies another lane already covered" are different
@@ -13736,44 +14413,235 @@ pub(crate) fn transported_call_return_for_test(
     transported_call_return_fully_faithful_via_trustir(func, callees)
 }
 
+fn transported_call_return_fully_faithful_via_trustir_reasoned(
+    func: &VerifiableFunction,
+    callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+) -> Result<(), &'static str> {
+    use crate::trustir_anchor::{IrOperand, RefinementVerdict};
+    use trust_types::Ty;
+
+    // Trust: EFHT-T (2026-08-29) — the transport lane's OWN recognizer is tried FIRST
+    // (`mirsem::sem_transported_call_of_mir_diag`: S2 field-read actuals, S4 deref-temp
+    // actuals, S3/S4 `Cmp`/`NotBool` tails, all inside the fence). When it declines, the
+    // shared `sem_call_return_of_mir_diag` is consulted exactly as before, with NO tail and
+    // NO bases — that path is byte-identical to the pre-EFHT-T consumer, so a body the
+    // shared recognizer admits keeps its verdict. `bases` is `Some` ONLY on the transport
+    // recognizer's path; G-ACTUAL-VALUE below keys on it.
+    let mut transport_why: Option<&'static str> = None;
+    let transported = crate::mirsem::sem_transported_call_of_mir_diag(func, callees, &mut transport_why);
+    let (call, bases, tail): (
+        crate::mirsem::SemCallReturn,
+        Option<(trust_types::BlockId, Vec<crate::mirsem::ActualBase>)>,
+        crate::mirsem::SemTransportTail,
+    ) = if let Some(shape) = transported {
+        (shape.call, Some((shape.call_block, shape.bases)), shape.tail)
+    } else {
+    // Trust: the FIRST exit consults the `_diag` twin so the refusing recognizer gate is
+    // NAMED (26 first-gate reasons); the boolean wrapper is unchanged. Each reason is
+    // mapped to a `recognizer: <reason>` static -- Rust cannot concatenate a runtime
+    // `&'static str`, and the instrument keys on the `recognizer` prefix.
+    let mut why: Option<&'static str> = None;
+    let Some(call) = crate::mirsem::sem_call_return_of_mir_diag(func, callees, &mut why) else {
+        let _ = transport_why; // the shared recognizer's reason is the measured one.
+        return Err(match why {
+            Some("abi-foreign-or-atomic-or-unsafe-sig") => "recognizer: abi-foreign-or-atomic-or-unsafe-sig",
+            Some("argument-outside-modeled-operand-fragment") => "recognizer: argument-outside-modeled-operand-fragment",
+            Some("call-diverges-no-return-edge") => "recognizer: call-diverges-no-return-edge",
+            Some("call-has-no-arguments") => "recognizer: call-has-no-arguments",
+            Some("call-not-on-the-returning-path") => "recognizer: call-not-on-the-returning-path",
+            Some("call-overwrites-a-parameter") => "recognizer: call-overwrites-a-parameter",
+            Some("callee-not-resolvable-in-registry") => "recognizer: callee-not-resolvable-in-registry",
+            Some("callee-signature-mismatch") => "recognizer: callee-signature-mismatch",
+            Some("cycle-on-the-returning-path") => "recognizer: cycle-on-the-returning-path",
+            Some("dest-has-projections") => "recognizer: dest-has-projections",
+            Some("dest-is-_0-but-other-writes-to-_0") => "recognizer: dest-is-_0-but-other-writes-to-_0",
+            Some("entry-cannot-return") => "recognizer: entry-cannot-return",
+            Some("no-call-terminator-at-all") => "recognizer: no-call-terminator-at-all",
+            Some("no-certified-callee-in-registry") => "recognizer: no-certified-callee-in-registry",
+            Some("no-Return-block") => "recognizer: no-Return-block",
+            Some("not-a-unique-Return-block") => "recognizer: not-a-unique-Return-block",
+            Some("return-block-does-not-move-the-temp-into-_0") => "recognizer: return-block-does-not-move-the-temp-into-_0",
+            Some("return-block-never-writes-_0") => "recognizer: return-block-never-writes-_0",
+            Some("returning-path-dead-ends") => "recognizer: returning-path-dead-ends",
+            Some("returning-path-names-a-missing-block") => "recognizer: returning-path-names-a-missing-block",
+            Some("second-returning-call") => "recognizer: second-returning-call",
+            Some("self-recursion") => "recognizer: self-recursion",
+            Some("temp-dest-write-profile-mismatch") => "recognizer: temp-dest-write-profile-mismatch",
+            Some("terminator-outside-modeled-spine") => "recognizer: terminator-outside-modeled-spine",
+            Some("two-arms-can-return-a-join") => "recognizer: two-arms-can-return-a-join",
+            Some("Unsupported-statement-in-body") => "recognizer: Unsupported-statement-in-body",
+            Some(_) => "recognizer: sem_call_return_of_mir declined (reason not in the static table)",
+            None => "recognizer: sem_call_return_of_mir declined the caller shape",
+        });
+    };
+        (call, None, crate::mirsem::SemTransportTail::None)
+    };
+    let Some(fact) = callees.get(&call.callee) else { return Err("callee not in the certified registry") };
+    let Some(model) = fact.ret_model.as_ref() else { return Err("callee minted no ret_model") };
+    if fact.arg_count != call.args.len() || fact.param_tys.len() != call.args.len() {
+        return Err("arity: fact vs call args disagree");
+    }
+    let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
+    if !scalar(&func.body.return_ty) {
+        return Err("caller return type not scalar");
+    }
+    // Trust: EFHT G-SLOT + G4' at the CONSUMER — the formal slots are re-derived from the
+    // registry's compiler-extracted `param_tys`, never from the model, and the model's
+    // leaves are re-checked against them. A forged, stale or mis-resolved registry entry
+    // whose leaves disagree with its own signature is refused here whatever minted it.
+    let Some(formal_slots) = ret_model_slots(&fact.param_tys) else { return Err("formal slots: a callee param has no reading") };
+    let formal_slots: Vec<Option<RetModelSlot>> = formal_slots.into_iter().map(Some).collect();
+    if !ret_model_leaves_respect_slots(model, &formal_slots) {
+        return Err("model leaves disagree with the formal slots");
+    }
+    // Trust: EFHT G-PURE (caller) — read-only by the allow-list EXCEPT the single
+    // transported call. This is the H2 defense's load-bearing half on the caller side:
+    // with no admitted write anywhere in the caller and no other call, a handle's
+    // referent at the call is its referent at entry.
+    let Some((mir_call_block, mir_arg_locals)) = sole_returning_call_arg_locals(&func.body) else {
+        return Err("sole_returning_call_arg_locals: no sole returning call");
+    };
+    if mir_arg_locals.len() != call.args.len() {
+        return Err("recognizer and terminator disagree on arity"); // the recognizer and the terminator disagree on arity — fail closed.
+    }
+    // Trust: EFHT-T — the transport recognizer is a SECOND spine walk; it must have
+    // selected the same call the MIR-level reader did.
+    if bases.as_ref().is_some_and(|(b, _)| *b != mir_call_block) {
+        return Err("transport recognizer and sole_returning_call_arg_locals disagree on the call block");
+    }
+    if body_is_read_only_except_sole_call(&func.body).is_err() {
+        return Err("caller body not read-only except the sole call");
+    }
+    // Trust: EFHT G-FROZEN (signature) — no raw-pointer or `&mut` PARAMETER anywhere in
+    // the caller: a second parameter aliasing a transported handle's referent is the
+    // cross-parameter route to a moved pointee, and it needs no write in THIS body.
+    let caller_argc = func.body.arg_count;
+    for i in 1..=caller_argc {
+        match func.body.locals.get(i).map(|l| &l.ty) {
+            Some(Ty::RawPtr { .. }) | Some(Ty::Ref { mutable: true, .. }) | None => return Err("G-FROZEN: caller has a RawPtr or &mut parameter"),
+            Some(_) => {}
+        }
+    }
+    // G3 + Trust: EFHT G-ACTUAL — every actual lowers to `Var`/`Const`; for a HANDLE
+    // formal the MIR actual must be `Copy`/`Move` of an UNPROJECTED caller PARAMETER
+    // local, MirSem's reading of the same operand must name exactly that parameter's
+    // slot, the caller's own slot must read as a handle, and the deny-list fences hold
+    // on it (G-FROZEN pointee, belt-and-braces beside the allow-list).
+    let mut actuals = Vec::with_capacity(call.args.len());
+    for (j, a) in call.args.iter().enumerate() {
+        let Some(ir) = sem_call_arg_to_ir_pinned(a, &func.body) else { return Err("an actual does not lower via sem_call_arg_to_ir_pinned") };
+        match formal_slots.get(j).copied().flatten() {
+            Some(RetModelSlot::Value) => {
+                // Trust: EFHT-T G-ACTUAL-VALUE — on the transport recognizer's path the
+                // operand is judged TOGETHER with its MIR-read base (a `Field` actual is
+                // admitted only with the field type re-derived as Int/Bool and the Handle
+                // fences on its base; a deref temp only over a literal `&{Int,Bool}`).
+                // The shared recognizer's path keeps the pre-EFHT-T `Var`/`Const` gate.
+                if let Some((_, bases)) = bases.as_ref() {
+                    let Some(base) = bases.get(j) else { return Err("Value actual: transport recognizer recorded no base") };
+                    efht_value_actual_ok(&func.body, &ir, base)?;
+                } else if !matches!(ir, IrOperand::Var(_) | IrOperand::Const(_)) {
+                    return Err("Value actual is not Var/Const");
+                }
+            }
+            Some(RetModelSlot::Handle) => {
+                let Some(Some(p)) = mir_arg_locals.get(j) else { return Err("Handle actual: no MIR arg local at that position") };
+                let p = *p;
+                if !(1..=caller_argc).contains(&p) {
+                    return Err("G-ACTUAL: Handle actual is not an unprojected caller parameter"); // a reborrow temp, a non-parameter local — refused.
+                }
+                if bases.as_ref().is_some_and(|(_, b)| b.get(j) != Some(&crate::mirsem::ActualBase::Param(p))) {
+                    return Err("Handle actual: transport base is not the MIR parameter");
+                }
+                let IrOperand::Var(i) = ir else { return Err("Handle actual: lowered operand is not Var") };
+                if usize::try_from(i).ok() != Some(p - 1) {
+                    return Err("Handle actual: MirSem resolved it to a different slot"); // MirSem resolved the operand to a different slot.
+                }
+                let Some(pty) = func.body.locals.get(p).map(|l| &l.ty) else { return Err("Handle actual: caller local type missing") };
+                if ret_model_slot(pty) != Some(RetModelSlot::Handle) {
+                    return Err("Handle actual: caller slot is not Handle");
+                }
+                if !ret_model_param_fences_hold(&func.body, p, RetModelSlot::Handle) {
+                    return Err("Handle actual: deny-list fences fail on the caller param");
+                }
+            }
+            None => return Err("formal slot missing"),
+        }
+        actuals.push(ir);
+    }
+    let Some(inlined) = substitute_ret_model(model, &actuals, caller_argc) else {
+        return Err("substitute_ret_model declined");
+    };
+    // Trust: EFHT-T — the Return block's statement over the call result is APPENDED to
+    // the substituted body as one more `IrStmt` at a fresh index above every inlined
+    // index and every caller parameter slot (G-TAIL-INDEX); its `other` operand goes
+    // through the SAME G-ACTUAL-VALUE predicate as an actual (a handle read in the tail
+    // must have passed the Handle fences at THIS call). Every gate below — G-BINDER,
+    // the caller-slot leaf check, D1, requires, G-TIER-MATCH — runs on the TAILED body.
+    let tail_other_ir = match &tail {
+        crate::mirsem::SemTransportTail::Cmp { other: (sem, base), .. } => {
+            let Some(ir) = sem_call_arg_to_ir_pinned(sem, &func.body) else {
+                return Err("tail other does not lower via sem_call_arg_to_ir_pinned");
+            };
+            efht_value_actual_ok(&func.body, &ir, base)?;
+            Some(ir)
+        }
+        _ => None,
+    };
+    let Some(inlined) = append_transport_tail(inlined, &tail, caller_argc, tail_other_ir) else {
+        return Err("append_transport_tail declined");
+    };
+    // Trust: EFHT G-BINDER — no binder of the substituted body may be a leaked callee
+    // temp: every index it reads unassigned must be a caller parameter, else the
+    // theorem would ∀-quantify a value the caller never binds.
+    if inlined
+        .param_indices()
+        .iter()
+        .any(|i| usize::try_from(*i).map_or(true, |i| i >= caller_argc))
+    {
+        return Err("G-BINDER: inlined body binds a leaked index");
+    }
+    // ... and every inlined leaf must respect the CALLER's own slot readings.
+    let caller_slots: Vec<Option<RetModelSlot>> =
+        (1..=caller_argc).map(|i| func.body.locals.get(i).and_then(|l| ret_model_slot(&l.ty))).collect();
+    if !ret_model_leaves_respect_slots(&inlined, &caller_slots) {
+        return Err("inlined leaves disagree with the caller slots");
+    }
+    // Trust: SAFETY-DISCHARGE PARITY (D1) — the CALLER's own safety clauses, in the same
+    // position and order as the sibling `call_return_fully_faithful_via_trustir` (its
+    // clause (c)). This lane used to lack BOTH, so a caller with an unmodeled or
+    // undischarged safety VC could certify through a transported model while the same
+    // caller fail-closed on the opaque lane — an asymmetry, not a design.
+    if crate::mirsem::function_emits_unmodeled_safety_vc_pub(func) {
+        return Err("caller emits an unmodeled safety VC");
+    }
+    if !function_safety_vcs_all_discharged(func) {
+        return Err("caller safety VCs not all discharged");
+    }
+    // (d) the callee's precondition must still be established at this site — unchanged.
+    // NOTE (Trust: EFHT): `call_site_requires_established` lowers each actual through
+    // `sem_actual_to_formula`, whose `S::Var` arm REFUSES a non-`Int`/`Bool` parameter
+    // (the "TYPE-BLIND ACTUAL" soundness note in this file) — so a widened callee that
+    // declares a real `#[requires]` over a handle DECLINES here rather than having its
+    // pointee-precondition discharged against a handle-valued term. That is the intended
+    // disposition until the requires vocabulary gains a pointee term.
+    if !call_site_requires_established(func, &call, fact) {
+        return Err("call_site_requires not established");
+    }
+    // Trust: EFHT G-TIER-MATCH — re-checked at the tier the INLINED term selects.
+    if ret_model_kernel_verdict(&inlined) != RefinementVerdict::ProvenModulo3 {
+        return Err("G-TIER-MATCH: inlined body not ProvenModulo3 at its own tier");
+    }
+    Ok(())
+}
+
+/// The production gate: ONE implementation, two callers. Every instrument that sizes this
+/// lane must call the `_reasoned` twin above and read WHICH conjunct refused, never this.
 fn transported_call_return_fully_faithful_via_trustir(
     func: &VerifiableFunction,
     callees: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
 ) -> bool {
-    use crate::trustir_anchor::RefinementVerdict;
-    use trust_types::Ty;
-
-    let Some(call) = crate::mirsem::sem_call_return_of_mir(func, callees) else { return false };
-    let Some(fact) = callees.get(&call.callee) else { return false };
-    let Some(model) = fact.ret_model.as_ref() else { return false };
-    if fact.arg_count != call.args.len() {
-        return false;
-    }
-    // G3 — every actual must lower as a SCALAR operand. The opaque-handle arm is exactly
-    // what would let a reference reach the callee, and G2 exists to prevent that.
-    let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
-    if !scalar(&func.body.return_ty) {
-        return false;
-    }
-    let mut actuals = Vec::with_capacity(call.args.len());
-    for a in &call.args {
-        let Some(ir) = sem_call_arg_to_ir_pinned(a, &func.body) else { return false };
-        if !matches!(
-            ir,
-            crate::trustir_anchor::IrOperand::Var(_) | crate::trustir_anchor::IrOperand::Const(_)
-        ) {
-            return false;
-        }
-        actuals.push(ir);
-    }
-    let Some(inlined) = substitute_ret_model(model, &actuals, func.body.arg_count) else {
-        return false;
-    };
-    // (d) the callee's precondition must still be established at this site — unchanged.
-    if !call_site_requires_established(func, &call, fact) {
-        return false;
-    }
-    crate::trustir_anchor::check_body_refinement(&inlined) == RefinementVerdict::ProvenModulo3
+    transported_call_return_fully_faithful_via_trustir_reasoned(func, callees).is_ok()
 }
 
 /// [`call_return_fully_faithful_via_trustir`] for measurement — used to tell "the transport
@@ -18686,7 +19554,7 @@ pub fn prove_dump_dir_with_budget_and_bodies(
                         // establishes nothing about the return value); see
                         // `pure_scalar_ret_model` for the gates.
                         crate::mirsem::CalleeFact::of_certified(func)
-                            .with_ret_model(pure_scalar_ret_model(func)),
+                            .with_ret_model(unique_def_path_ret_model(func, &funcs)),
                     );
             }
             sc.merge_fragment(frag);
@@ -18721,7 +19589,7 @@ pub fn prove_dump_dir_with_budget_and_bodies(
                     certified.insert(
                         func.def_path.clone(),
                         crate::mirsem::CalleeFact::of_certified(func)
-                            .with_ret_model(pure_scalar_ret_model(func)),
+                            .with_ret_model(unique_def_path_ret_model(func, &funcs)),
                     );
                 }
                 sc.merge_fragment(frag);
@@ -46250,11 +47118,13 @@ mod vc_kind_formula_hash_domain_tripwire {
     // ─────────────────────────────────────────────────────────────────────────
     // Trust: POSTCONDITION TRANSPORT (2026-08-27) — the probe suite.
     //
-    // The increment inlines a callee's certified return model at a call site. Its whole
-    // soundness argument is that gate G2 (an ALL-SCALAR signature) keeps any handle from
-    // crossing the boundary, which is what keeps CLAUDE.md's probe-confirmed hazards out:
-    // a certified callee may still MUTATE THROUGH A SHARED REFERENCE, and `idx_elem`
-    // carries no time index. These probes pin both halves.
+    // The increment inlines a callee's certified return model at a call site. Its
+    // soundness argument USED to be gate G2 (an ALL-SCALAR signature); Trust: EFHT
+    // (2026-08-29) widened the signature to `&T` handles, and the argument now rests on
+    // the read-only ALLOW-LIST fencing both bodies plus the depth-1 LEAF SET — which is
+    // what keeps CLAUDE.md's probe-confirmed hazards out: a certified callee may still
+    // MUTATE THROUGH A SHARED REFERENCE, and `idx_elem` carries no time index. These
+    // probes pin both halves; the EFHT pins further down pin the widening.
     // ─────────────────────────────────────────────────────────────────────────
 
     /// `fn f(x: i64) -> i64 { x + 1 }` — a pure scalar leaf, the shape that SHOULD mint.
@@ -46291,7 +47161,13 @@ mod vc_kind_formula_hash_domain_tripwire {
                 datatype_defs: Default::default(),
             },
             contracts: vec![],
-            preconditions: vec![],
+            // Trust: D1 — the mint side now applies the safety-discharge gates, so the
+            // POSITIVE fixture must discharge its own Add-overflow VC: `x < 1_000_000`
+            // is the same guard `unsafe_add`'s checked sibling carries.
+            preconditions: vec![trust_types::Formula::Lt(
+                Box::new(trust_types::Formula::Var("x".into(), trust_types::Sort::Int)),
+                Box::new(trust_types::Formula::Int(1_000_000)),
+            )],
             postconditions: vec![],
             spec: Default::default(),
         }
@@ -46300,22 +47176,44 @@ mod vc_kind_formula_hash_domain_tripwire {
     /// The same leaf, but taking `&S` — the CLAUDE.md `poke` shape's signature. A body like
     /// this may certify AND mutate through the shared reference, so it must never carry a
     /// transportable model.
+    ///
+    /// Trust: D1 TIGHTENING — the previous fixture (`c: &S`, body `_0 = Add(_1, 1)`) was
+    /// VACUOUS: it declined inside `straight_line_ir_body`'s `place_type` Int/Bool check,
+    /// never reaching G2, so deleting G2 left the pin green. This body is the shape the
+    /// DEREF-TEMP CHASE admits — `_2 = (*_1); _0 = _2` with `_1: &u8` — which
+    /// `straight_line_ir_body` resolves to `Use(Var(0))`, so ONLY G2 stands between it
+    /// and a minted model. The test asserts that resolution as its tightness witness.
     fn shared_ref_leaf_func(name: &str) -> trust_types::VerifiableFunction {
-        use trust_types::{LocalDecl, Ty, VariantDef};
-        let i64t = Ty::Int { width: 64, signed: true };
-        let s_ty = Ty::Adt {
-            adt_kind: None,
-            layout: None,
-            name: "S".into(),
-            fields: vec![("x".into(), i64t.clone())],
-            variants: Vec::<VariantDef>::new(),
-            disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+        use trust_types::{LocalDecl, Operand, Place, Projection, Rvalue, Statement, Ty};
+        let u8t = Ty::Int { width: 8, signed: false };
         let mut f = scalar_leaf_func(name);
-        f.body.locals[1] =
-            LocalDecl { index: 1, name: Some("c".into()), ty: Ty::Ref { mutable: false, inner: Box::new(s_ty) } };
+        f.body.return_ty = u8t.clone();
+        f.body.locals = vec![
+            LocalDecl { index: 0, name: None, ty: u8t.clone() },
+            LocalDecl {
+                index: 1,
+                name: Some("p".into()),
+                ty: Ty::Ref { mutable: false, inner: Box::new(u8t.clone()) },
+            },
+            LocalDecl { index: 2, name: None, ty: u8t },
+        ];
+        f.body.blocks[0].stmts = vec![
+            Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::Use(Operand::Copy(Place {
+                    local: 1,
+                    projections: vec![Projection::Deref],
+                })),
+                span: Default::default(),
+            },
+            // A plain `Use` of the temp: no arithmetic, so NO overflow VC — the D1 safety
+            // gates on the mint side have nothing to refuse, and G2 alone carries the pin.
+            Statement::Assign {
+                place: Place::local(0),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                span: Default::default(),
+            },
+        ];
         f
     }
 
@@ -46329,19 +47227,325 @@ mod vc_kind_formula_hash_domain_tripwire {
         assert!(!model.stmts.is_empty(), "the model must carry the body's computation");
     }
 
-    /// THE SOUNDNESS PROBE. A callee whose parameter is a SHARED REFERENCE must mint NO
-    /// model, whatever else is true of it. CLAUDE.md records, probe-confirmed, that such a
-    /// callee can certify FULLY_FAITHFUL while storing through the reference — so transport
-    /// keyed on certification alone would be unsound. G2 is the gate that stops it, and it
-    /// is strictly stronger than the existing `&mut`-only check, which would MISS this.
+    /// THE SOUNDNESS PROBE, re-cut for Trust: EFHT (2026-08-29). A callee whose parameter
+    /// is a SHARED REFERENCE used to mint NO model (the all-scalar G2). It now mints when
+    /// — and only when — the read-only ALLOW-LIST admits its whole body: the read twin
+    /// (`_2 = (*_1); _0 = _2`, a `Value` slot) mints `Use(Var 0)`, and the twin that ALSO
+    /// stores through a `*mut u8` of unknown provenance mints nothing. TIGHTNESS: that
+    /// storing twin still LOWERS (`assert_refused_but_lowers` measures `lowers == true`
+    /// for it), so `body_is_read_only` is the ONLY gate standing between it and a minted
+    /// `c(a) == *a` — CLAUDE.md's H1 landing on this lane, refused by the fence and not
+    /// by the signature.
     #[test]
-    fn a_shared_reference_callee_mints_no_model() {
-        let f = shared_ref_leaf_func("probe::poke");
+    fn a_read_only_shared_ref_callee_mints_and_a_storing_twin_does_not() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement, Ty};
+        let f = shared_ref_leaf_func("probe::read_twin");
+        assert!(crate::prove::straight_line_ir_body(&f).is_some());
+        let model = crate::prove::pure_scalar_ret_model(&f)
+            .expect("a read-only `&u8` callee mints under EFHT (a `Value` slot)");
         assert!(
-            crate::prove::pure_scalar_ret_model(&f).is_none(),
-            "a `&S` parameter must block model transport — a certified callee may still \
-             mutate through a shared reference, and no handle may cross this boundary"
+            model.stmts.iter().any(|st| matches!(
+                st.rvalue,
+                crate::trustir_anchor::IrRvalue::Use(crate::trustir_anchor::IrOperand::Var(0))
+            )),
+            "the `&u8` slot reads as its entry referent's VALUE: `Use(Var 0)`"
         );
+        let mptr = Ty::RawPtr { mutable: true, pointee: Box::new(Ty::Int { width: 8, signed: false }) };
+        let g = shared_ref_leaf_with(
+            "probe::read_twin_store",
+            vec![mptr],
+            vec![Statement::Assign {
+                place: Place { local: 3, projections: vec![Projection::Deref] },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+                span: Default::default(),
+            }],
+        );
+        assert_refused_but_lowers(&g, "Assign through a Deref projection", true);
+        assert!(
+            crate::prove::pure_scalar_ret_model(&g).is_none(),
+            "a body that stores through ANY Deref must mint nothing, whatever the deny-lists \
+             can see of the pointer's provenance"
+        );
+    }
+
+    /// D3 — DUPLICATE-DEF-PATH GUARD. Two dumped bodies sharing a def-path resolve to ONE
+    /// registry slot (last-certifier-wins), so a transported model could name the wrong
+    /// body's return value. The registered fact for a duplicated path must carry NO
+    /// model, even though each body on its own would mint one.
+    #[test]
+    fn a_duplicated_def_path_registers_no_ret_model() {
+        let a = scalar_leaf_func("probe::dup");
+        let b = scalar_leaf_func("probe::dup");
+        let funcs = vec![a, b];
+        for f in &funcs {
+            // TIGHTNESS: each body mints on its own — only the occurrence count blocks it.
+            assert!(crate::prove::pure_scalar_ret_model(f).is_some());
+            let fact = crate::mirsem::CalleeFact::of_certified(f)
+                .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs));
+            assert!(
+                fact.ret_model.is_none(),
+                "a def-path occurring twice among the dumped bodies must degrade to the \
+                 opaque fact, never to a value model"
+            );
+        }
+    }
+
+    /// Twin of the above: a UNIQUE def-path keeps its model, so the guard is a duplicate
+    /// gate and not a blanket refusal.
+    #[test]
+    fn a_unique_def_path_registers_a_ret_model() {
+        let funcs = vec![scalar_leaf_func("probe::only"), scalar_leaf_func("probe::other")];
+        let f = &funcs[0];
+        let fact = crate::mirsem::CalleeFact::of_certified(f)
+            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs));
+        assert!(fact.ret_model.is_some(), "a unique def-path must keep its transportable model");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: THE READ-ONLY ALLOW-LIST (2026-08-29) — negative controls.
+    //
+    // Every design candidate for the transport lane "proved" read-only with a deny-list
+    // and every one fell into the same hole. Each control below is ONE escape from that
+    // hole, built on the H1 base body (`_2 = (*_1); _0 = _2`, `_1: &u8`), which is the
+    // passing twin: `body_is_read_only` is `Ok` on it and `Err` on each mutation.
+    // TIGHTNESS: each control also asserts `straight_line_ir_body(&f).is_some()` — the
+    // lowering still admits the body, so the allow-list is the ONLY thing standing
+    // between it and a minted `c(a) == *a`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The H1 base: a shared-ref READ and nothing else. Read-only, and lowers.
+    #[test]
+    fn read_only_allow_list_admits_the_shared_ref_read_twin() {
+        let f = shared_ref_leaf_func("probe::read_twin");
+        assert!(crate::prove::straight_line_ir_body(&f).is_some());
+        assert_eq!(crate::prove::body_is_read_only(&f.body), Ok(()));
+        // And the pure scalar leaf, which is what the lane mints today.
+        assert_eq!(crate::prove::body_is_read_only(&scalar_leaf_func("probe::leaf").body), Ok(()));
+    }
+
+    /// `p: &u8`, plus one extra local of type `ty` at index 3 and the given statements
+    /// spliced in FRONT of the base's `_2 = (*_1); _0 = _2` pair.
+    fn shared_ref_leaf_with(
+        name: &str,
+        extra_locals: Vec<trust_types::Ty>,
+        prefix: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::LocalDecl;
+        let mut f = shared_ref_leaf_func(name);
+        for (k, ty) in extra_locals.into_iter().enumerate() {
+            f.body.locals.push(LocalDecl { index: 3 + k, name: None, ty });
+        }
+        let mut stmts = prefix;
+        stmts.extend(f.body.blocks[0].stmts.drain(..));
+        f.body.blocks[0].stmts = stmts;
+        f
+    }
+
+    /// `lowers`: whether `straight_line_ir_body` still admits the control. It DOES for the
+    /// no-`Place` write channels (`CopyNonOverlapping` / `Intrinsic` / `Unsupported` are
+    /// not `Assign`s, and the lowering never looks at them — measured 2026-08-29), so
+    /// for those the allow-list is the ONLY gate. It does NOT for a Deref store any more:
+    /// `deref_write_exists` (D2, same day) now treats a `Cast`/`CopyForDeref` of an alias
+    /// as an escape and follows shared reborrows, so `ir_deref_temp_source` declines the
+    /// read of `_1`. That is the deny-list closing its own hole, not this predicate; the
+    /// assertion is kept EXACT in both directions so a later lowering widening that
+    /// re-admits a Deref store shows up here as a flipped `lowers` — and the allow-list
+    /// still refuses the body regardless.
+    fn assert_refused_but_lowers(
+        f: &trust_types::VerifiableFunction,
+        reason: &str,
+        lowers: bool,
+    ) {
+        assert_eq!(
+            crate::prove::straight_line_ir_body(f).is_some(),
+            lowers,
+            "{}: `straight_line_ir_body` admission changed; re-read the tightness argument",
+            f.def_path
+        );
+        match crate::prove::body_is_read_only(&f.body) {
+            Ok(()) => panic!("{}: the allow-list admitted a body that writes memory", f.def_path),
+            Err(e) => assert!(
+                e.contains(reason),
+                "{}: refused for `{e}`, expected a reason naming `{reason}`",
+                f.def_path
+            ),
+        }
+    }
+
+    /// `fn leak(p:&u8)->u8 { let q = p as *const u8 as *mut u8; unsafe{*q=9;} *p }` — the
+    /// Cast launder. No `AddressOf`, no deref write ON A `&T` LOCAL: the deny-lists saw
+    /// nothing. The allow-list refuses the raw-pointer Cast before it even reaches the
+    /// store.
+    #[test]
+    fn read_only_allow_list_refuses_the_cast_launder() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement, Ty};
+        let u8t = Ty::Int { width: 8, signed: false };
+        let cptr = Ty::RawPtr { mutable: false, pointee: Box::new(u8t.clone()) };
+        let mptr = Ty::RawPtr { mutable: true, pointee: Box::new(u8t.clone()) };
+        let assign = |place, rvalue| Statement::Assign { place, rvalue, span: Default::default() };
+        let f = shared_ref_leaf_with(
+            "probe::leak",
+            vec![cptr.clone(), mptr.clone()],
+            vec![
+                assign(Place::local(3), Rvalue::Cast(Operand::Copy(Place::local(1)), cptr)),
+                assign(Place::local(4), Rvalue::Cast(Operand::Copy(Place::local(3)), mptr.clone())),
+                assign(
+                    Place { local: 4, projections: vec![Projection::Deref] },
+                    Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+                ),
+            ],
+        );
+        // `lowers == true`: `deref_write_exists` does NOT see a Cast-laundered write (an
+        // arm that did was landed and REVERTED -- it broke 12 ptr-offset-lane pins), so
+        // `straight_line_ir_body` ADMITS this body and the allow-list is the ONLY gate
+        // standing between it and a minted model. That is the strongest tightness
+        // statement this pin can make; if `lowers` ever reads false again, some other
+        // predicate started carrying the case and the argument must be re-read.
+        assert_refused_but_lowers(&f, "Cast to a non-scalar type", true);
+        // The store alone, through a `*mut u8` local the body never DERIVES from `_1`:
+        // `deref_write_exists`'s alias closure cannot connect `_3` to `_1`, so the
+        // lowering STILL ADMITS this body (measured 2026-08-29: `lowers == true`) and
+        // would mint `c(a) == *a` for a function that stores through a pointer of
+        // unknown provenance. Only the allow-list stands here — a Deref write is refused
+        // on ANY local, whatever its provenance, which is the whole H1 close.
+        let g = shared_ref_leaf_with(
+            "probe::leak_store_only",
+            vec![mptr],
+            vec![assign(
+                Place { local: 3, projections: vec![Projection::Deref] },
+                Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+            )],
+        );
+        assert_refused_but_lowers(&g, "Assign through a Deref projection", true);
+    }
+
+    /// A shared REBORROW `_3 = &(*_1)` followed by a store through `_3`. The reborrow is
+    /// neither a write nor an `AddressOf`, and the alias closure did not follow it.
+    #[test]
+    fn read_only_allow_list_refuses_the_reborrow_then_write() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement, Ty};
+        let u8t = Ty::Int { width: 8, signed: false };
+        let sref = Ty::Ref { mutable: false, inner: Box::new(u8t) };
+        let assign = |place, rvalue| Statement::Assign { place, rvalue, span: Default::default() };
+        let reborrow = assign(
+            Place::local(3),
+            Rvalue::Ref { mutable: false, place: Place { local: 1, projections: vec![Projection::Deref] } },
+        );
+        let f = shared_ref_leaf_with(
+            "probe::reborrow_write",
+            vec![sref.clone()],
+            vec![
+                reborrow.clone(),
+                assign(
+                    Place { local: 3, projections: vec![Projection::Deref] },
+                    Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+                ),
+            ],
+        );
+        assert_refused_but_lowers(&f, "Assign through a Deref projection", false);
+        // Twin: the reborrow WITHOUT the store is admitted — a shared reborrow is harmless
+        // once nothing in the body can write through it.
+        let g = shared_ref_leaf_with("probe::reborrow_only", vec![sref], vec![reborrow]);
+        assert!(crate::prove::straight_line_ir_body(&g).is_some());
+        assert_eq!(crate::prove::body_is_read_only(&g.body), Ok(()));
+    }
+
+    /// `copy_nonoverlapping(src, dst, 1)` — a write channel with no `Place`.
+    #[test]
+    fn read_only_allow_list_refuses_copy_nonoverlapping() {
+        use trust_types::{ConstValue, Operand, Place, Statement, Ty};
+        let u8t = Ty::Int { width: 8, signed: false };
+        let f = shared_ref_leaf_with(
+            "probe::copy_nonoverlapping",
+            vec![],
+            vec![Statement::CopyNonOverlapping {
+                src: Operand::Copy(Place::local(1)),
+                dst: Operand::Copy(Place::local(1)),
+                count: Operand::Constant(ConstValue::Int(1)),
+                elem_ty: u8t,
+                span: Default::default(),
+            }],
+        );
+        assert_refused_but_lowers(&f, "FailClosedOrBackstopped", true);
+    }
+
+    /// A non-diverging intrinsic statement with a pointer argument.
+    #[test]
+    fn read_only_allow_list_refuses_an_intrinsic_statement() {
+        use trust_types::{Operand, Place, Statement};
+        let f = shared_ref_leaf_with(
+            "probe::intrinsic",
+            vec![],
+            vec![Statement::Intrinsic {
+                name: "volatile_store".into(),
+                args: vec![Operand::Copy(Place::local(1))],
+            }],
+        );
+        assert_refused_but_lowers(&f, "FailClosedOrBackstopped", true);
+    }
+
+    /// `Statement::Unsupported` — the sentinel for a MIR class trust-types did not model.
+    #[test]
+    fn read_only_allow_list_refuses_an_unsupported_statement() {
+        use trust_types::Statement;
+        let f = shared_ref_leaf_with(
+            "probe::unsupported",
+            vec![],
+            vec![Statement::Unsupported {
+                kind: "InlineAsm".into(),
+                detail: "asm!".into(),
+                operands: vec![],
+                span: Default::default(),
+            }],
+        );
+        assert_refused_but_lowers(&f, "FailClosedOrBackstopped", true);
+    }
+
+    /// A `Call` terminator ahead of the return block. The call is the one way a body
+    /// writes memory with no statement of its own.
+    #[test]
+    fn read_only_allow_list_refuses_a_call_terminator() {
+        use trust_types::{BasicBlock, BlockId, Operand, Place, Terminator, UnwindEdge};
+        let mut f = shared_ref_leaf_func("probe::calls");
+        let ret = std::mem::replace(&mut f.body.blocks[0].stmts, vec![]);
+        f.body.blocks[0].terminator = Terminator::Call {
+            func: "probe::sink".into(),
+            args: vec![Operand::Copy(Place::local(1))],
+            dest: Place::local(2),
+            target: Some(BlockId(1)),
+            unwind: UnwindEdge::Unreachable,
+            span: Default::default(),
+            atomic: None,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
+        };
+        f.body.blocks.push(BasicBlock { id: BlockId(1), stmts: ret, terminator: Terminator::Return });
+        // A body with a call does not lower through `straight_line_ir_body` (the spine is
+        // call-free by construction), so tightness here is the twin: the same two blocks
+        // joined by a `Goto` lower AND are admitted.
+        assert_eq!(crate::prove::body_is_read_only(&f.body), Err("Call terminator"));
+        let mut g = f.clone();
+        g.body.blocks[0].terminator = Terminator::Goto(BlockId(1));
+        assert!(crate::prove::straight_line_ir_body(&g).is_some());
+        assert_eq!(crate::prove::body_is_read_only(&g.body), Ok(()));
+    }
+
+    /// The plain CLAUDE.md `poke`: `(*_1) = 99; _0 = 0` with `_1: &S`. Here as
+    /// `(*_1) = 99; _2 = (*_1); _0 = _2` so it lowers.
+    #[test]
+    fn read_only_allow_list_refuses_poke() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        let f = shared_ref_leaf_with(
+            "probe::poke",
+            vec![],
+            vec![Statement::Assign {
+                place: Place { local: 1, projections: vec![Projection::Deref] },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(99))),
+                span: Default::default(),
+            }],
+        );
+        assert_refused_but_lowers(&f, "Assign through a Deref projection", false);
     }
 
     /// ADVERSARIAL: substitution must not silently drop a parameter or reuse a caller's
@@ -46375,6 +47579,5100 @@ mod vc_kind_formula_hash_domain_tripwire {
             "swapping the actuals must change the inlined body — a subtraction is not \
              symmetric, and a transport that lost argument order would claim it is"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT (ENTRY-FROZEN HANDLE TRANSPORT, 2026-08-29) — the pins.
+    //
+    // Three positive end-to-end shapes (`[u8]::len`, `[u8]::is_empty`,
+    // `Option::<bool>::is_none`) plus the struct-field shape, and one negative per
+    // gate. Every fixture is built inline; every negative names the gate it pins and,
+    // where the gate is not the first to refuse, asserts what the earlier recognizer
+    // says so the pin is TIGHT (the design's rule: a fixture that declines earlier
+    // pins nothing about the gate it claims to test).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn efht_u8() -> trust_types::Ty {
+        trust_types::Ty::Int { width: 8, signed: false }
+    }
+    fn efht_usize() -> trust_types::Ty {
+        trust_types::Ty::Int { width: 64, signed: false }
+    }
+    fn efht_i64() -> trust_types::Ty {
+        trust_types::Ty::Int { width: 64, signed: true }
+    }
+    fn efht_u8_slice_ref() -> trust_types::Ty {
+        trust_types::Ty::Ref {
+            mutable: false,
+            inner: Box::new(trust_types::Ty::Slice { elem: Box::new(efht_u8()) }),
+        }
+    }
+    fn efht_option_bool() -> trust_types::Ty {
+        use trust_types::{Ty, VariantDef};
+        Ty::adt_enum(
+            "core::option::Option<bool>",
+            vec![
+                VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), Ty::Bool)],
+                },
+            ],
+        )
+    }
+    fn efht_struct_s() -> trust_types::Ty {
+        trust_types::Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "probe::S".into(),
+            fields: vec![("x".into(), efht_i64())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
+    }
+    fn efht_ref(inner: trust_types::Ty) -> trust_types::Ty {
+        trust_types::Ty::Ref { mutable: false, inner: Box::new(inner) }
+    }
+    fn efht_assign(local: usize, rvalue: trust_types::Rvalue) -> trust_types::Statement {
+        trust_types::Statement::Assign {
+            place: trust_types::Place::local(local),
+            rvalue,
+            span: Default::default(),
+        }
+    }
+    fn efht_func(
+        name: &str,
+        locals: Vec<(Option<&str>, trust_types::Ty)>,
+        arg_count: usize,
+        blocks: Vec<trust_types::BasicBlock>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{LocalDecl, VerifiableBody, VerifiableFunction};
+        let return_ty = locals[0].1.clone();
+        VerifiableFunction {
+            name: name.into(),
+            def_path: name.into(),
+            span: Default::default(),
+            body: VerifiableBody {
+                locals: locals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (n, ty))| LocalDecl { index, name: n.map(Into::into), ty })
+                    .collect(),
+                blocks,
+                arg_count,
+                return_ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+    fn efht_leaf(
+        name: &str,
+        locals: Vec<(Option<&str>, trust_types::Ty)>,
+        stmts: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{BasicBlock, BlockId, Terminator};
+        efht_func(name, locals, 1, vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }])
+    }
+    /// `fn len(s: &[u8]) -> usize { _2 = PtrMetadata(_1); _0 = _2 }` — the length shape as
+    /// the chain admits it (the single-statement lane has no `PtrMetadata` arm).
+    fn efht_len_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Rvalue, UnOp};
+        efht_leaf(
+            "probe::len",
+            vec![(None, efht_usize()), (Some("s"), efht_u8_slice_ref()), (None, efht_usize())],
+            vec![
+                efht_assign(2, Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::local(1)))),
+                efht_assign(0, Rvalue::Use(Operand::Copy(Place::local(2)))),
+            ],
+        )
+    }
+    /// `fn is_empty(s: &[u8]) -> bool { _2 = PtrMetadata(_1); _0 = Eq(_2, 0) }`.
+    fn efht_is_empty_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Rvalue, UnOp};
+        efht_leaf(
+            "probe::is_empty",
+            vec![(None, trust_types::Ty::Bool), (Some("s"), efht_u8_slice_ref()), (None, efht_usize())],
+            vec![
+                efht_assign(2, Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::local(1)))),
+                efht_assign(
+                    0,
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Uint(0, 64)),
+                    ),
+                ),
+            ],
+        )
+    }
+    /// `fn is_none(o: &Option<bool>) -> bool { _2 = discriminant(*_1); _3 = Eq(_2, 1); _0 = !_3 }`.
+    fn efht_is_none_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Projection, Rvalue, Ty, UnOp};
+        efht_leaf(
+            "probe::is_none",
+            vec![
+                (None, Ty::Bool),
+                (Some("o"), efht_ref(efht_option_bool())),
+                (None, Ty::isize()),
+                (None, Ty::Bool),
+            ],
+            vec![
+                efht_assign(
+                    2,
+                    Rvalue::Discriminant(Place { local: 1, projections: vec![Projection::Deref] }),
+                ),
+                efht_assign(
+                    3,
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Constant(ConstValue::Int(1)),
+                    ),
+                ),
+                efht_assign(0, Rvalue::UnaryOp(UnOp::Not, Operand::Copy(Place::local(3)))),
+            ],
+        )
+    }
+    /// `fn get_x(p: &S) -> i64 { _2 = (*_1).x; _0 = _2 }` — the field-read shape.
+    fn efht_field_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Projection, Rvalue};
+        efht_leaf(
+            "probe::get_x",
+            vec![(None, efht_i64()), (Some("p"), efht_ref(efht_struct_s())), (None, efht_i64())],
+            vec![
+                efht_assign(
+                    2,
+                    Rvalue::Use(Operand::Copy(Place {
+                        local: 1,
+                        projections: vec![Projection::Deref, Projection::Field(0)],
+                    })),
+                ),
+                efht_assign(0, Rvalue::Use(Operand::Copy(Place::local(2)))),
+            ],
+        )
+    }
+    /// A caller whose `_0` is one call to `callee` with `args`, after `prefix`. Locals
+    /// `_1..=_n` are the `params`; `extra` are appended after them.
+    fn efht_caller(
+        name: &str,
+        callee: &str,
+        ret: trust_types::Ty,
+        params: Vec<(Option<&str>, trust_types::Ty)>,
+        extra: Vec<trust_types::Ty>,
+        args: Vec<trust_types::Operand>,
+        prefix: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{BasicBlock, BlockId, Place, Terminator, UnwindEdge};
+        let arg_count = params.len();
+        let mut locals = vec![(None, ret)];
+        locals.extend(params);
+        locals.extend(extra.into_iter().map(|t| (None, t)));
+        efht_func(
+            name,
+            locals,
+            arg_count,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: prefix,
+                    terminator: Terminator::Call {
+                        func: callee.into(),
+                        args,
+                        dest: Place::local(0),
+                        target: Some(BlockId(1)),
+                        unwind: UnwindEdge::Unreachable,
+                        span: Default::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+        )
+    }
+    fn efht_registry(
+        callee: &trust_types::VerifiableFunction,
+    ) -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+        let fact = crate::mirsem::CalleeFact::of_certified(callee)
+            .with_ret_model(crate::prove::pure_scalar_ret_model(callee));
+        std::iter::once((callee.def_path.clone(), fact)).collect()
+    }
+    /// The straight-through caller `fn c(s) -> R { callee(s) }` for a one-handle callee.
+    fn efht_passthrough_caller(
+        callee: &trust_types::VerifiableFunction,
+        extra_params: Vec<(Option<&str>, trust_types::Ty)>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place};
+        let mut params = vec![(Some("s"), callee.body.locals[1].ty.clone())];
+        params.extend(extra_params);
+        efht_caller(
+            &format!("{}::caller", callee.def_path),
+            &callee.def_path,
+            callee.body.return_ty.clone(),
+            params,
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![],
+        )
+    }
+    /// Mint, assert the model carries the expected HANDLE selector, assert the tier the
+    /// TERM selects is MODEL-ONLY (the grounder tier refuses it — G1'/G-TIER-MATCH are
+    /// load-bearing, not decoration), then transport it through the passthrough caller.
+    fn efht_assert_transports(
+        callee: &trust_types::VerifiableFunction,
+        expect_leaf: &dyn Fn(&crate::trustir_anchor::IrOperand) -> bool,
+    ) {
+        use crate::trustir_anchor::{IrRvalue, RefinementVerdict};
+        let registry = efht_registry(callee);
+        let model = registry[&callee.def_path]
+            .ret_model
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: must mint under EFHT", callee.def_path));
+        let has_leaf = model.stmts.iter().any(|st| match &st.rvalue {
+            IrRvalue::Use(a) | IrRvalue::Un(_, a) => expect_leaf(a),
+            IrRvalue::Bin(_, a, b) | IrRvalue::Cmp(_, a, b) => expect_leaf(a) || expect_leaf(b),
+        });
+        assert!(has_leaf, "{}: the model must carry the handle selector: {model:?}", callee.def_path);
+        assert!(!model.is_grounder_connected(), "{}: a selector is MODEL-ONLY", callee.def_path);
+        assert_ne!(
+            crate::trustir_anchor::check_body_refinement(model),
+            RefinementVerdict::ProvenModulo3,
+            "{}: the GROUNDER tier must refuse a selector-bearing term — G1' is what admits it",
+            callee.def_path
+        );
+        assert_eq!(crate::prove::ret_model_kernel_verdict(model), RefinementVerdict::ProvenModulo3);
+        let caller = efht_passthrough_caller(callee, vec![]);
+        assert!(
+            crate::mirsem::sem_call_return_of_mir(&caller, &registry).is_some(),
+            "{}: the passthrough caller must be the recognized call shape",
+            callee.def_path
+        );
+        assert!(
+            crate::prove::transported_call_return_for_test(&caller, &registry),
+            "{}: the passthrough caller must certify through the transported model",
+            callee.def_path
+        );
+    }
+
+    /// POSITIVE — `[u8]::len`. Also measures the named `str::len` gap honestly: a `&str`
+    /// handle mints NOTHING today, because `slice_len_of_param_place` admits `Ty::Slice`
+    /// only and the real `str::len` (`_2 = _1 as &[u8]; _0 = PtrMetadata(_2)`) leaves the
+    /// chain one statement short once the cast temp is skipped. Recognizer gaps, not
+    /// EFHT gates; the pin is over the shape the recognizers admit.
+    #[test]
+    fn efht_len_shape_transports_end_to_end() {
+        use crate::trustir_anchor::IrOperand;
+        efht_assert_transports(&efht_len_callee(), &|op| {
+            matches!(op, IrOperand::Len(inner) if **inner == IrOperand::Var(0))
+        });
+        let mut str_len = efht_len_callee();
+        str_len.def_path = "probe::str_len".into();
+        str_len.body.locals[1].ty = efht_ref(trust_types::Ty::Str);
+        assert!(
+            crate::prove::pure_scalar_ret_model(&str_len).is_none(),
+            "a `&str` handle has no length resolver today — measured, not a gate"
+        );
+    }
+
+    /// POSITIVE — `[u8]::is_empty`.
+    #[test]
+    fn efht_is_empty_shape_transports_end_to_end() {
+        use crate::trustir_anchor::IrOperand;
+        efht_assert_transports(&efht_is_empty_callee(), &|op| {
+            matches!(op, IrOperand::Len(inner) if **inner == IrOperand::Var(0))
+        });
+    }
+
+    /// POSITIVE — `Option::<bool>::is_none`.
+    #[test]
+    fn efht_is_none_shape_transports_end_to_end() {
+        use crate::trustir_anchor::IrOperand;
+        efht_assert_transports(&efht_is_none_callee(), &|op| matches!(op, IrOperand::Discr(0)));
+    }
+
+    /// POSITIVE — a struct field through `&S`, and the H2 NEGATIVE beside it: the SAME
+    /// caller with a store through the handle BEFORE the call is refused, and the same
+    /// caller with a `CopyNonOverlapping` over the handle — a write channel the deny-lists
+    /// never see, so `sem_call_return_of_mir` still ADMITS it — is refused by the
+    /// allow-list alone.
+    #[test]
+    fn efht_field_shape_transports_and_a_write_through_the_handle_refuses() {
+        use crate::trustir_anchor::IrOperand;
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        let callee = efht_field_callee();
+        efht_assert_transports(&callee, &|op| matches!(op, IrOperand::Field(0, 0)));
+        let registry = efht_registry(&callee);
+        let store = Statement::Assign {
+            place: Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] },
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(99))),
+            span: Default::default(),
+        };
+        let writes = efht_caller(
+            "probe::get_x::writer",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), efht_ref(efht_struct_s()))],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![store],
+        );
+        assert!(
+            crate::prove::body_is_read_only_except_sole_call(&writes.body).is_err(),
+            "a store through the handle before the call must fail the caller allow-list"
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&writes, &registry));
+        // The tight twin: no `Place`, so nothing for `deref_write_exists` to see.
+        let copies = efht_caller(
+            "probe::get_x::copier",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), efht_ref(efht_struct_s()))],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![Statement::CopyNonOverlapping {
+                src: Operand::Copy(Place::local(1)),
+                dst: Operand::Copy(Place::local(1)),
+                count: Operand::Constant(ConstValue::Int(1)),
+                elem_ty: efht_struct_s(),
+                span: Default::default(),
+            }],
+        );
+        assert!(
+            crate::mirsem::sem_call_return_of_mir(&copies, &registry).is_some(),
+            "TIGHTNESS: the recognizer admits the CopyNonOverlapping caller — only the \
+             allow-list stands"
+        );
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&copies.body),
+            Err("statement classified FailClosedOrBackstopped by write_effect")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&copies, &registry));
+    }
+
+    /// NEGATIVE — G-ACTUAL: a REBORROW actual. `fn c(o: Option<bool>) -> bool
+    /// { is_none(&o) }` lowers to `_2 = &_1; is_none(move _2)`, which
+    /// `sem_call_arg_ref_operand` RESOLVES to `Var(0)` exactly as a bare parameter would
+    /// — so the recognizer admits it (asserted) and G-ACTUAL alone refuses: `_2` is not
+    /// a caller parameter, and the selector `Discr(0)` would be re-pointed at a by-value
+    /// enum the callee never received.
+    #[test]
+    fn efht_reborrow_actual_refuses() {
+        use trust_types::{Operand, Place, Rvalue};
+        let callee = efht_is_none_callee();
+        let registry = efht_registry(&callee);
+        let caller = efht_caller(
+            "probe::is_none::reborrow",
+            "probe::is_none",
+            trust_types::Ty::Bool,
+            vec![(Some("o"), efht_option_bool())],
+            vec![efht_ref(efht_option_bool())],
+            vec![Operand::Move(Place::local(2))],
+            vec![efht_assign(2, Rvalue::Ref { mutable: false, place: Place::local(1) })],
+        );
+        let call = crate::mirsem::sem_call_return_of_mir(&caller, &registry)
+            .expect("TIGHTNESS: the recognizer resolves the reborrow to the referent");
+        assert_eq!(call.args, vec![crate::mirsem::SemOperand::Var(0)]);
+        assert_eq!(
+            crate::prove::sole_returning_call_arg_locals(&caller.body).map(|(_, l)| l),
+            Some(vec![Some(2)]),
+            "the MIR actual is the reborrow TEMP, not the parameter"
+        );
+        assert!(crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok());
+        assert!(!crate::prove::transported_call_return_for_test(&caller, &registry));
+    }
+
+    /// NEGATIVE — a `Const` (or temp) actual under a HANDLE selector has no carrier.
+    /// G-ACTUAL makes these unreachable from a real caller, so the substitution's own
+    /// fences are pinned directly.
+    #[test]
+    fn efht_const_actual_on_a_handle_slot_refuses() {
+        use crate::trustir_anchor::{IrBody, IrOperand, IrRvalue, IrStmt};
+        let one = |op: IrOperand| IrBody { stmts: vec![IrStmt { idx: 2, rvalue: IrRvalue::Use(op) }], ret: 2 };
+        for model in [
+            one(IrOperand::Len(Box::new(IrOperand::Var(0)))),
+            one(IrOperand::Field(0, 0)),
+            one(IrOperand::Discr(0)),
+        ] {
+            assert!(
+                crate::prove::substitute_ret_model_for_test(&model, &[IrOperand::Const(3)], 1)
+                    .is_none(),
+                "a Const actual under a selector: {model:?}"
+            );
+            assert!(
+                crate::prove::substitute_ret_model_for_test(&model, &[IrOperand::Var(7)], 1)
+                    .is_none(),
+                "a temp (index >= caller arg count) under a selector: {model:?}"
+            );
+            let ok = crate::prove::substitute_ret_model_for_test(&model, &[IrOperand::Var(0)], 1)
+                .expect("an entry-parameter actual maps");
+            assert_eq!(ok.stmts[0].rvalue, model.stmts[0].rvalue, "re-pointed at caller slot 0");
+        }
+        // `Index` is never transported, and `Len` is depth 1.
+        let idx = one(IrOperand::Index(Box::new(IrOperand::Var(0)), Box::new(IrOperand::Const(0))));
+        assert!(crate::prove::substitute_ret_model_for_test(&idx, &[IrOperand::Var(0)], 1).is_none());
+        let deep = one(IrOperand::Len(Box::new(IrOperand::Field(0, 0))));
+        assert!(crate::prove::substitute_ret_model_for_test(&deep, &[IrOperand::Var(0)], 1).is_none());
+    }
+
+    /// NEGATIVE — G-FROZEN (signature): a `&mut` PARAMETER anywhere in the caller, even
+    /// one the call never touches, refuses. The recognizer admits it (asserted), the
+    /// caller is read-only, and every other gate holds — the twin with an `i64` in that
+    /// slot transports.
+    #[test]
+    fn efht_caller_with_a_mut_ref_param_refuses() {
+        let callee = efht_is_empty_callee();
+        let registry = efht_registry(&callee);
+        let mut_ref = trust_types::Ty::Ref { mutable: true, inner: Box::new(efht_i64()) };
+        let caller = efht_passthrough_caller(&callee, vec![(Some("m"), mut_ref)]);
+        assert!(crate::mirsem::sem_call_return_of_mir(&caller, &registry).is_some());
+        assert!(crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok());
+        assert!(!crate::prove::transported_call_return_for_test(&caller, &registry));
+        let twin = efht_passthrough_caller(&callee, vec![(Some("m"), efht_i64())]);
+        assert!(crate::prove::transported_call_return_for_test(&twin, &registry));
+        let raw = trust_types::Ty::RawPtr { mutable: false, pointee: Box::new(efht_i64()) };
+        let raw_caller = efht_passthrough_caller(&callee, vec![(Some("q"), raw)]);
+        assert!(!crate::prove::transported_call_return_for_test(&raw_caller, &registry));
+    }
+
+    /// NEGATIVE — G-SLOT at the CONSUMER: a `Field` leaf on a VALUE slot. No builder can
+    /// mint one (a `&u8` referent has no field), so the registry entry is FORGED: the
+    /// genuine `&u8` read-twin callee with its model replaced by `Use(Field(0, 0))`. The
+    /// consumer re-derives the slot from the registry's `param_tys` and refuses; the
+    /// same entry with its genuinely minted model transports.
+    #[test]
+    fn efht_field_leaf_on_a_value_slot_refuses() {
+        use crate::trustir_anchor::{IrBody, IrOperand, IrRvalue, IrStmt};
+        use crate::prove::RetModelSlot;
+        let mut callee = shared_ref_leaf_func("probe::read_u8");
+        // The base fixture inherits `scalar_leaf_func`'s `x < 1_000_000` guard for an
+        // overflow VC this body does not emit; left in place it names a formal the body
+        // lacks and `of_certified` (rightly) records the precondition as UNKNOWN.
+        callee.preconditions.clear();
+        let genuine = crate::prove::pure_scalar_ret_model(&callee).expect("mints");
+        let forged = IrBody {
+            stmts: vec![IrStmt { idx: 2, rvalue: IrRvalue::Use(IrOperand::Field(0, 0)) }],
+            ret: 2,
+        };
+        assert!(!crate::prove::ret_model_leaves_respect_slots(&forged, &[Some(RetModelSlot::Value)]));
+        assert!(crate::prove::ret_model_leaves_respect_slots(&forged, &[Some(RetModelSlot::Handle)]));
+        assert!(crate::prove::ret_model_leaves_respect_slots(&genuine, &[Some(RetModelSlot::Value)]));
+        assert!(!crate::prove::ret_model_leaves_respect_slots(&genuine, &[Some(RetModelSlot::Handle)]));
+        let caller = efht_passthrough_caller(&callee, vec![]);
+        let mut registry = efht_registry(&callee);
+        assert!(crate::prove::transported_call_return_for_test(&caller, &registry));
+        registry.get_mut(&callee.def_path).unwrap().ret_model = Some(forged);
+        assert!(
+            !crate::prove::transported_call_return_for_test(&caller, &registry),
+            "a selector on a `Value` slot must be refused however it reached the registry"
+        );
+    }
+
+    /// NEGATIVE — a callee with a real `#[requires]` over a handle DECLINES: clause (d)
+    /// lowers the actual through `sem_actual_to_formula`, whose `S::Var` arm refuses a
+    /// non-scalar parameter (the "TYPE-BLIND ACTUAL" note), so the pointee precondition
+    /// is never discharged against a handle-valued term. The requires-free twin
+    /// transports.
+    #[test]
+    fn efht_callee_with_a_requires_declines() {
+        use trust_types::{Formula, Sort};
+        let callee = efht_is_empty_callee();
+        let caller = efht_passthrough_caller(&callee, vec![]);
+        let mut registry = efht_registry(&callee);
+        assert!(crate::prove::transported_call_return_for_test(&caller, &registry));
+        registry.get_mut(&callee.def_path).unwrap().requires = Some(vec![Formula::Lt(
+            Box::new(Formula::Var("s".into(), Sort::Int)),
+            Box::new(Formula::Int(10)),
+        )]);
+        assert!(!crate::prove::transported_call_return_for_test(&caller, &registry));
+        registry.get_mut(&callee.def_path).unwrap().requires = None;
+        assert!(!crate::prove::transported_call_return_for_test(&caller, &registry));
+    }
+
+    /// PIN — `sole_returning_call_arg_locals` against `sem_call_return_of_mir`: equal
+    /// arity on the recognized shape, the same block, and a `target: None` divergence
+    /// sink SKIPPED by both — while a second RETURNING call makes both decline. The
+    /// transport itself still refuses the sink-bearing caller (G-FROZEN: no other call
+    /// anywhere), asserted last.
+    #[test]
+    fn sole_returning_call_arg_locals_agrees_with_the_recognizer() {
+        use trust_types::{BasicBlock, BlockId, Operand, Place, Terminator, Ty, UnwindEdge};
+        let callee = efht_is_empty_callee();
+        let registry = efht_registry(&callee);
+        let mut caller = efht_passthrough_caller(&callee, vec![]);
+        caller.body.locals.push(trust_types::LocalDecl { index: 2, name: None, ty: Ty::Unit });
+        let sink = |id: usize, target: Option<BlockId>| BasicBlock {
+            id: BlockId(id),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                func: "core::panicking::panic".into(),
+                args: vec![],
+                dest: Place::local(2),
+                target,
+                unwind: UnwindEdge::Unreachable,
+                span: Default::default(),
+                atomic: None,
+                is_unsafe_sig: false,
+                is_foreign: false,
+                callee_identity: None,
+            },
+        };
+        caller.body.blocks.push(sink(2, None));
+        let call = crate::mirsem::sem_call_return_of_mir(&caller, &registry)
+            .expect("the recognizer skips a divergence sink");
+        let (block, locals) = crate::prove::sole_returning_call_arg_locals(&caller.body)
+            .expect("so does the MIR-level reader");
+        assert_eq!(block, BlockId(0));
+        assert_eq!(locals.len(), call.args.len());
+        assert_eq!(locals, vec![Some(1)]);
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&caller.body),
+            Err("Call terminator"),
+            "the sink is still a Call the allow-list refuses"
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&caller, &registry));
+        caller.body.blocks.pop();
+        caller.body.blocks.push(sink(2, Some(BlockId(1))));
+        assert!(crate::mirsem::sem_call_return_of_mir(&caller, &registry).is_none());
+        assert!(crate::prove::sole_returning_call_arg_locals(&caller.body).is_none());
+        let _ = Operand::Copy(Place::local(1));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT — LENS H2 (adversarial battery, 2026-08-29). Caller+callee pairs built
+    // to make the TRANSPORTED claim `caller(args) == model(entry args)` FALSE at runtime
+    // — a handle whose referent moves between the caller's entry and the call, a handle
+    // rebound to another handle, a value borrowed from a rebound local, two reads of one
+    // pointee straddling a write. Every pair must be refused by the transport lane, and
+    // each pin names the gate that refuses it and asserts what the EARLIER recognizer
+    // says, so the pin is tight (a fixture the recognizer already declines pins nothing
+    // about the gate it claims to test). Every pin also carries a write-free TWIN that
+    // transports, so a refusal is never the vacuous kind. A test here that PASSES the
+    // transport is a hole; it stays failing.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `S2 { x: i64, y: i64 }` — a two-field referent.
+    fn efht_struct_s2() -> trust_types::Ty {
+        trust_types::Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "probe::S2".into(),
+            fields: vec![("x".into(), efht_i64()), ("y".into(), efht_i64())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
+    }
+    /// `(*_local).field`.
+    fn efht_deref_field(local: usize, field: usize) -> trust_types::Place {
+        trust_types::Place {
+            local,
+            projections: vec![trust_types::Projection::Deref, trust_types::Projection::Field(field)],
+        }
+    }
+    /// `(*_local).field = const v`.
+    fn efht_store(local: usize, field: usize, v: i128) -> trust_types::Statement {
+        trust_types::Statement::Assign {
+            place: efht_deref_field(local, field),
+            rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
+                trust_types::ConstValue::Int(v),
+            )),
+            span: Default::default(),
+        }
+    }
+    /// `fn same(p: &S2) -> bool { _2 = (*_1).x; _3 = (*_1).y; _0 = Eq(_2, _3) }` — TWO reads
+    /// of one pointee in one read-only body (`Eq`, so no overflow VC for D1 to refuse).
+    fn efht_two_field_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        efht_leaf(
+            "probe::same",
+            vec![
+                (None, Ty::Bool),
+                (Some("p"), efht_ref(efht_struct_s2())),
+                (None, efht_i64()),
+                (None, efht_i64()),
+            ],
+            vec![
+                efht_assign(2, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))),
+                efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 1)))),
+                efht_assign(
+                    0,
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::local(2)),
+                        Operand::Copy(Place::local(3)),
+                    ),
+                ),
+            ],
+        )
+    }
+    /// The `&u8` read callee `fn read(p: &u8) -> u8 { *p }` with the inherited guard cleared
+    /// (see `efht_field_leaf_on_a_value_slot_refuses` for why).
+    fn efht_read_u8_callee() -> trust_types::VerifiableFunction {
+        let mut callee = shared_ref_leaf_func("probe::read_u8");
+        callee.preconditions.clear();
+        callee
+    }
+
+    /// H2 ATTACK 1 — the caller MOVES the referent before the call through a channel the
+    /// deny-list alias closure does not follow: (A) a plain copy alias `_2 = _1` then
+    /// `(*_2).x = 99`; (B) a shared REBORROW `_2 = &(*_1)` then `(*_2).x = 99` (the
+    /// brief named this an escape of `deref_write_exists`; MEASURED here, the deny-list
+    /// sees it too, and its sight is printed rather than assumed); (C) a
+    /// `SetDiscriminant` through the handle on the enum callee (no `Assign` at all).
+    /// Runtime returns the post-write value; the transported selector names the entry
+    /// referent. Each is refused by the caller allow-list, whatever the deny-list sees.
+    #[test]
+    fn efht_h2_moving_the_referent_before_the_call_refuses() {
+        use trust_types::{Operand, Place, Projection, Rvalue, Statement};
+        let field_callee = efht_field_callee();
+        let field_registry = efht_registry(&field_callee);
+        let p_s = efht_ref(efht_struct_s());
+        // (A) alias copy, then write through the alias.
+        let alias = efht_caller(
+            "probe::get_x::alias_writer",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), p_s.clone())],
+            vec![p_s.clone()],
+            vec![Operand::Copy(Place::local(1))],
+            vec![efht_assign(2, Rvalue::Use(Operand::Copy(Place::local(1)))), efht_store(2, 0, 99)],
+        );
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&alias.body),
+            Err("Assign through a Deref projection")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&alias, &field_registry));
+        // (B) shared reborrow, then write through the reborrow.
+        let reborrow = efht_caller(
+            "probe::get_x::reborrow_writer",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), p_s.clone())],
+            vec![p_s.clone()],
+            vec![Operand::Copy(Place::local(1))],
+            vec![
+                efht_assign(
+                    2,
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: Place { local: 1, projections: vec![Projection::Deref] },
+                    },
+                ),
+                efht_store(2, 0, 99),
+            ],
+        );
+        eprintln!(
+            "reborrow_writer: deref_write_exists(p) = {}",
+            crate::mirsem::deref_write_exists(&reborrow.body, 1)
+        );
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&reborrow.body),
+            Err("Assign through a Deref projection")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&reborrow, &field_registry));
+        // (C) SetDiscriminant through the enum handle — no Assign anywhere.
+        let none_callee = efht_is_none_callee();
+        let none_registry = efht_registry(&none_callee);
+        let set_discr = efht_caller(
+            "probe::is_none::set_discr",
+            "probe::is_none",
+            trust_types::Ty::Bool,
+            vec![(Some("o"), efht_ref(efht_option_bool()))],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![Statement::SetDiscriminant {
+                place: Place { local: 1, projections: vec![Projection::Deref] },
+                variant_index: 0,
+            }],
+        );
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&set_discr.body),
+            Err("SetDiscriminant through a Deref projection")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&set_discr, &none_registry));
+        // Non-vacuity: the write-free twins transport.
+        assert!(crate::prove::transported_call_return_for_test(
+            &efht_passthrough_caller(&field_callee, vec![]),
+            &field_registry
+        ));
+        assert!(crate::prove::transported_call_return_for_test(
+            &efht_passthrough_caller(&none_callee, vec![]),
+            &none_registry
+        ));
+    }
+
+    /// H2 ATTACK 2 — a `&mut S` PARAMETER aliasing the handle's referent (MIR does not
+    /// know they are disjoint): with a write through it before the call, and without one.
+    /// The written twin fails the allow-list; the write-free twin is admitted by the
+    /// recognizer and is read-only (asserted), so G-FROZEN alone refuses it. Beside them,
+    /// the `&mut S` hidden INSIDE a by-value ADT parameter — outside G-FROZEN's top-level
+    /// match — with a write through it: the allow-list is what refuses that one.
+    #[test]
+    fn efht_h2_mut_ref_param_aliasing_the_handle_refuses() {
+        use trust_types::{Operand, Place, Projection, Rvalue, Ty};
+        let callee = efht_field_callee();
+        let registry = efht_registry(&callee);
+        let p_s = efht_ref(efht_struct_s());
+        let m_s = Ty::Ref { mutable: true, inner: Box::new(efht_struct_s()) };
+        let written = efht_caller(
+            "probe::get_x::mut_alias_writer",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), p_s.clone()), (Some("m"), m_s.clone())],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![efht_store(2, 0, 5)],
+        );
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&written.body),
+            Err("Assign through a Deref projection")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&written, &registry));
+        let unwritten = efht_caller(
+            "probe::get_x::mut_alias",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), p_s.clone()), (Some("m"), m_s.clone())],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![],
+        );
+        assert!(crate::mirsem::sem_call_return_of_mir(&unwritten, &registry).is_some());
+        assert!(crate::prove::body_is_read_only_except_sole_call(&unwritten.body).is_ok());
+        assert!(
+            !crate::prove::transported_call_return_for_test(&unwritten, &registry),
+            "G-FROZEN: a `&mut S` parameter beside the handle must refuse even unwritten"
+        );
+        // A `&mut S` reached through a by-value ADT parameter's field.
+        let w = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "probe::W".into(),
+            fields: vec![("m".into(), m_s.clone())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let hidden = efht_caller(
+            "probe::get_x::hidden_mut_writer",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), p_s), (Some("w"), w)],
+            vec![m_s],
+            vec![Operand::Copy(Place::local(1))],
+            vec![
+                efht_assign(
+                    3,
+                    Rvalue::Use(Operand::Copy(Place {
+                        local: 2,
+                        projections: vec![Projection::Field(0)],
+                    })),
+                ),
+                efht_store(3, 0, 5),
+            ],
+        );
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&hidden.body),
+            Err("Assign through a Deref projection")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&hidden, &registry));
+    }
+
+    /// H2 ATTACK 3 — TWO calls to the same callee STRADDLING a write through the handle
+    /// (`_2 = get_x(p); (*p).x = 5; _0 = get_x(p)`), the write-free straddle, and the
+    /// order where `_0` is bound FIRST. No transport admits a second returning call: the
+    /// recognizer, the MIR-level reader and the allow-list all refuse.
+    #[test]
+    fn efht_h2_two_calls_straddling_a_write_refuse() {
+        use trust_types::{BasicBlock, BlockId, Operand, Place, Terminator, UnwindEdge};
+        let callee = efht_field_callee();
+        let registry = efht_registry(&callee);
+        let call = |dest: usize, target: usize| Terminator::Call {
+            func: "probe::get_x".into(),
+            args: vec![Operand::Copy(Place::local(1))],
+            dest: Place::local(dest),
+            target: Some(BlockId(target)),
+            unwind: UnwindEdge::Unreachable,
+            span: Default::default(),
+            atomic: None,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
+        };
+        let build = |name: &str, first_dest: usize, middle: Vec<trust_types::Statement>, second_dest: usize| {
+            efht_func(
+                name,
+                vec![(None, efht_i64()), (Some("p"), efht_ref(efht_struct_s())), (None, efht_i64())],
+                1,
+                vec![
+                    BasicBlock { id: BlockId(0), stmts: vec![], terminator: call(first_dest, 1) },
+                    BasicBlock { id: BlockId(1), stmts: middle, terminator: call(second_dest, 2) },
+                    BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+                ],
+            )
+        };
+        for (name, first, middle, second) in [
+            ("probe::get_x::straddle", 2, vec![efht_store(1, 0, 5)], 0),
+            ("probe::get_x::straddle_free", 2, vec![], 0),
+            ("probe::get_x::straddle_ret_first", 0, vec![efht_store(1, 0, 5)], 2),
+        ] {
+            let caller = build(name, first, middle, second);
+            assert!(crate::mirsem::sem_call_return_of_mir(&caller, &registry).is_none(), "{name}");
+            assert!(crate::prove::sole_returning_call_arg_locals(&caller.body).is_none(), "{name}");
+            assert_eq!(
+                crate::prove::body_is_read_only_except_sole_call(&caller.body),
+                Err("no sole returning Call terminator"),
+                "{name}"
+            );
+            assert!(!crate::prove::transported_call_return_for_test(&caller, &registry), "{name}");
+        }
+    }
+
+    /// H2 ATTACK 4 — the HANDLE actual is not the caller's entry parameter: (A) an alias
+    /// copy `_2 = _1`; (B) a shared reborrow of the whole referent `_2 = &(*_1)`; (C) a
+    /// reborrow of a NESTED field `_2 = &(*_1).inner` on `&Outer { inner: S }` (a real
+    /// `get_x(&o.inner)`). The MIR-level reader sees the temp in every case (asserted),
+    /// so G-ACTUAL refuses whatever the recognizer resolves the operand to.
+    #[test]
+    fn efht_h2_alias_and_projected_reborrow_actuals_refuse() {
+        use trust_types::{Operand, Place, Projection, Rvalue, Ty};
+        let callee = efht_field_callee();
+        let registry = efht_registry(&callee);
+        let p_s = efht_ref(efht_struct_s());
+        let outer = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "probe::Outer".into(),
+            fields: vec![("inner".into(), efht_struct_s())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        let cases = [
+            (
+                "probe::get_x::alias_actual",
+                p_s.clone(),
+                efht_assign(2, Rvalue::Use(Operand::Copy(Place::local(1)))),
+            ),
+            (
+                "probe::get_x::reborrow_actual",
+                p_s.clone(),
+                efht_assign(
+                    2,
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: Place { local: 1, projections: vec![Projection::Deref] },
+                    },
+                ),
+            ),
+            (
+                "probe::get_x::nested_reborrow_actual",
+                efht_ref(outer),
+                efht_assign(2, Rvalue::Ref { mutable: false, place: efht_deref_field(1, 0) }),
+            ),
+        ];
+        for (name, param_ty, prefix) in cases {
+            let caller = efht_caller(
+                name,
+                "probe::get_x",
+                efht_i64(),
+                vec![(Some("p"), param_ty)],
+                vec![p_s.clone()],
+                vec![Operand::Move(Place::local(2))],
+                vec![prefix],
+            );
+            assert_eq!(
+                crate::prove::sole_returning_call_arg_locals(&caller.body).map(|(_, l)| l),
+                Some(vec![Some(2)]),
+                "{name}: the MIR actual is the temp, not the parameter"
+            );
+            assert!(crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok(), "{name}");
+            let recognized = crate::mirsem::sem_call_return_of_mir(&caller, &registry).is_some();
+            eprintln!("{name}: recognizer admits = {recognized}");
+            assert!(
+                !crate::prove::transported_call_return_for_test(&caller, &registry),
+                "{name}: a non-parameter handle actual must never transport"
+            );
+        }
+    }
+
+    /// H2 ATTACK 5 — a callee whose model reads TWO fields of one pointee. The read-only
+    /// callee mints and transports (both selectors name the entry referent, and nothing
+    /// admitted between the reads can move it). Its twins with a STORE between the reads —
+    /// direct `(*_1).y = _2`, and through a shared reborrow `_4 = &(*_1); (*_4).y = _2` —
+    /// return `true` at runtime for every input while the model would say `x == y`: each
+    /// must mint NOTHING. Both twins still LOWER to a chain (asserted), so the allow-list
+    /// is the gate; the deny-list's sight of each write is measured and printed.
+    #[test]
+    fn efht_h2_two_field_callee_mints_only_without_a_write_between_the_reads() {
+        use crate::trustir_anchor::IrOperand;
+        use trust_types::{Operand, Place, Projection, Rvalue, Statement};
+        let callee = efht_two_field_callee();
+        efht_assert_transports(&callee, &|op| matches!(op, IrOperand::Field(0, 1)));
+        let model = crate::prove::pure_scalar_ret_model(&callee).expect("mints");
+        let has = |leaf: IrOperand| {
+            model.stmts.iter().any(|st| match &st.rvalue {
+                crate::trustir_anchor::IrRvalue::Use(a) | crate::trustir_anchor::IrRvalue::Un(_, a) => {
+                    *a == leaf
+                }
+                crate::trustir_anchor::IrRvalue::Bin(_, a, b)
+                | crate::trustir_anchor::IrRvalue::Cmp(_, a, b) => *a == leaf || *b == leaf,
+            })
+        };
+        assert!(
+            has(IrOperand::Field(0, 0)) && has(IrOperand::Field(0, 1)),
+            "both untimed selectors ride the model: {model:?}"
+        );
+        let store_y_from_x = Statement::Assign {
+            place: efht_deref_field(1, 1),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+            span: Default::default(),
+        };
+        let mut direct = callee.clone();
+        direct.def_path = "probe::same::direct_store".into();
+        direct.body.blocks[0].stmts.insert(1, store_y_from_x);
+        let mut via_reborrow = callee.clone();
+        via_reborrow.def_path = "probe::same::reborrow_store".into();
+        via_reborrow.body.locals.push(trust_types::LocalDecl {
+            index: 4,
+            name: None,
+            ty: efht_ref(efht_struct_s2()),
+        });
+        via_reborrow.body.blocks[0].stmts.insert(
+            1,
+            efht_assign(
+                4,
+                Rvalue::Ref {
+                    mutable: false,
+                    place: Place { local: 1, projections: vec![Projection::Deref] },
+                },
+            ),
+        );
+        via_reborrow.body.blocks[0].stmts.insert(
+            2,
+            Statement::Assign {
+                place: efht_deref_field(4, 1),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                span: Default::default(),
+            },
+        );
+        for twin in [&direct, &via_reborrow] {
+            let lowers = crate::prove::straight_line_ir_body(twin).is_some()
+                || crate::prove::straight_line_ir_body_chain(twin).is_some();
+            eprintln!(
+                "{}: lowers = {lowers}; deref_write_exists(p) = {}",
+                twin.def_path,
+                crate::mirsem::deref_write_exists(&twin.body, 1)
+            );
+            assert_eq!(
+                crate::prove::body_is_read_only(&twin.body),
+                Err("Assign through a Deref projection"),
+                "{}",
+                twin.def_path
+            );
+            assert!(
+                crate::prove::pure_scalar_ret_model(twin).is_none(),
+                "{}: a write between two reads of one pointee must mint nothing",
+                twin.def_path
+            );
+        }
+    }
+
+    /// H2 ATTACK 6 — the brief's counterexample verbatim: `fn leak(p: &u8) -> u8 { let q =
+    /// p as *const u8 as *mut u8; unsafe { *q = 9 }; *p }`, which would mint `c(a) == *a`
+    /// while returning 9. The cast is `Rvalue::Cast` (never `AddressOf`); the brief named
+    /// it an escape of `raw_exposure_exists`, and the deny-lists' sight of it is MEASURED
+    /// and printed rather than assumed (both saw it in the tree this landed on). The
+    /// allow-list refuses the cast itself, before the store is even reached.
+    #[test]
+    fn efht_h2_the_raw_cast_leak_counterexample_mints_nothing() {
+        use trust_types::{ConstValue, LocalDecl, Operand, Place, Projection, Rvalue, Statement, Ty};
+        let mut leak = efht_read_u8_callee();
+        leak.def_path = "probe::leak".into();
+        let raw = |mutable: bool| Ty::RawPtr { mutable, pointee: Box::new(efht_u8()) };
+        leak.body.locals.push(LocalDecl { index: 3, name: None, ty: raw(false) });
+        leak.body.locals.push(LocalDecl { index: 4, name: None, ty: raw(true) });
+        let prefix = vec![
+            efht_assign(3, Rvalue::Cast(Operand::Copy(Place::local(1)), raw(false))),
+            efht_assign(4, Rvalue::Cast(Operand::Copy(Place::local(3)), raw(true))),
+            Statement::Assign {
+                place: Place { local: 4, projections: vec![Projection::Deref] },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(9, 8))),
+                span: Default::default(),
+            },
+        ];
+        let tail = std::mem::take(&mut leak.body.blocks[0].stmts);
+        leak.body.blocks[0].stmts = prefix.into_iter().chain(tail).collect();
+        eprintln!(
+            "leak: raw_exposure_exists(p) = {}; deref_write_exists(p) = {}; lowers = {}",
+            crate::mirsem::raw_exposure_exists(&leak.body, 1),
+            crate::mirsem::deref_write_exists(&leak.body, 1),
+            crate::prove::straight_line_ir_body(&leak).is_some()
+                || crate::prove::straight_line_ir_body_chain(&leak).is_some()
+        );
+        assert_eq!(crate::prove::body_is_read_only(&leak.body), Err("Cast to a non-scalar type"));
+        assert!(crate::prove::pure_scalar_ret_model(&leak).is_none(), "`leak` must mint nothing");
+        // And as a CALLER: the same body around a transported `read_u8(p)` call.
+        let callee = efht_read_u8_callee();
+        let registry = efht_registry(&callee);
+        let mut caller = efht_passthrough_caller(&callee, vec![]);
+        caller.body.locals.push(LocalDecl { index: 2, name: None, ty: raw(false) });
+        caller.body.locals.push(LocalDecl { index: 3, name: None, ty: raw(true) });
+        caller.body.blocks[0].stmts = vec![
+            efht_assign(2, Rvalue::Cast(Operand::Copy(Place::local(1)), raw(false))),
+            efht_assign(3, Rvalue::Cast(Operand::Copy(Place::local(2)), raw(true))),
+            Statement::Assign {
+                place: Place { local: 3, projections: vec![Projection::Deref] },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(9, 8))),
+                span: Default::default(),
+            },
+        ];
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&caller.body),
+            Err("Cast to a non-scalar type")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&caller, &registry));
+        assert!(crate::prove::transported_call_return_for_test(
+            &efht_passthrough_caller(&callee, vec![]),
+            &registry
+        ));
+    }
+
+    /// H2 ATTACK 7 — the VALUE-slot path, where G-ACTUAL does not apply: legal Rust
+    /// `fn g(mut x: u8) -> u8 { x = 7; read_u8(&x) }` lowers to `_1 = 7; _2 = &_1;
+    /// read_u8(move _2)`; runtime returns 7 while the resolved actual would be `Var(0)` —
+    /// the ENTRY `x`. Also the borrow-first order (`_2 = &_1; _1 = 7`), which borrowck
+    /// rejects but MIR admits. Both are read-only by the allow-list (a plain local write),
+    /// so what refuses is the recognizer's `param_reassigned_by_stmt` on the referent
+    /// inside `sem_call_arg_ref_operand` — pinned here as the ONLY gate; the write-free
+    /// twin transports.
+    #[test]
+    fn efht_h2_value_actual_borrowed_from_a_rebound_param_refuses() {
+        use trust_types::{ConstValue, Operand, Place, Rvalue};
+        let callee = efht_read_u8_callee();
+        let registry = efht_registry(&callee);
+        let rebind = efht_assign(1, Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 8))));
+        let borrow = efht_assign(2, Rvalue::Ref { mutable: false, place: Place::local(1) });
+        let build = |name: &str, prefix: Vec<trust_types::Statement>| {
+            efht_caller(
+                name,
+                &callee.def_path,
+                efht_u8(),
+                vec![(Some("x"), efht_u8())],
+                vec![efht_ref(efht_u8())],
+                vec![Operand::Move(Place::local(2))],
+                prefix,
+            )
+        };
+        let twin = build("probe::read_u8::borrow_param", vec![borrow.clone()]);
+        assert_eq!(
+            crate::mirsem::sem_call_return_of_mir(&twin, &registry).map(|c| c.args),
+            Some(vec![crate::mirsem::SemOperand::Var(0)]),
+            "non-vacuity: `&x` resolves to the entry `x` (the ref chase drops the Move wrapper)"
+        );
+        assert!(crate::prove::transported_call_return_for_test(&twin, &registry));
+        for (name, prefix) in [
+            ("probe::read_u8::rebind_then_borrow", vec![rebind.clone(), borrow.clone()]),
+            ("probe::read_u8::borrow_then_rebind", vec![borrow.clone(), rebind.clone()]),
+        ] {
+            let caller = build(name, prefix);
+            assert!(crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok(), "{name}");
+            assert!(crate::mirsem::param_reassigned_by_stmt(&caller.body, 1), "{name}");
+            assert!(
+                crate::mirsem::sem_call_return_of_mir(&caller, &registry).is_none(),
+                "{name}: the recognizer must not resolve `&x` to the entry `x` once `x` is rebound"
+            );
+            assert!(
+                !crate::prove::transported_call_return_for_test(&caller, &registry),
+                "{name}: runtime returns 7, the entry model returns x"
+            );
+        }
+    }
+
+    /// H2 ATTACK 8 — the HANDLE parameter itself is REBOUND to another handle before the
+    /// call: legal Rust `fn g(mut p: &S, q: &S) -> i64 { p = q; get_x(p) }` lowers to
+    /// `_1 = _2; get_x(_1)`. The MIR actual IS the unprojected parameter `_1` (G-ACTUAL's
+    /// shape), the body is read-only by the allow-list, and runtime returns `q.x` while
+    /// the selector `Field(0, 0)` names `p`'s ENTRY referent. What refuses is
+    /// `param_reassigned_by_stmt` — in the recognizer's opaque-value arm and again in the
+    /// consumer's `ret_model_param_fences_hold`; the rebind-free twin transports.
+    #[test]
+    fn efht_h2_handle_param_rebound_to_another_handle_refuses() {
+        use trust_types::{Operand, Place, Rvalue};
+        let callee = efht_field_callee();
+        let registry = efht_registry(&callee);
+        let p_s = efht_ref(efht_struct_s());
+        let build = |name: &str, prefix: Vec<trust_types::Statement>| {
+            efht_caller(
+                name,
+                "probe::get_x",
+                efht_i64(),
+                vec![(Some("p"), p_s.clone()), (Some("q"), p_s.clone())],
+                vec![],
+                vec![Operand::Copy(Place::local(1))],
+                prefix,
+            )
+        };
+        let twin = build("probe::get_x::two_handles", vec![]);
+        assert!(crate::prove::transported_call_return_for_test(&twin, &registry));
+        let rebound = build(
+            "probe::get_x::rebound_handle",
+            vec![efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(2))))],
+        );
+        assert_eq!(
+            crate::prove::sole_returning_call_arg_locals(&rebound.body).map(|(_, l)| l),
+            Some(vec![Some(1)]),
+            "the MIR actual is the parameter local — G-ACTUAL's shape holds"
+        );
+        assert!(crate::prove::body_is_read_only_except_sole_call(&rebound.body).is_ok());
+        assert!(crate::mirsem::param_reassigned_by_stmt(&rebound.body, 1));
+        assert!(crate::mirsem::sem_call_return_of_mir(&rebound, &registry).is_none());
+        assert!(
+            !crate::prove::transported_call_return_for_test(&rebound, &registry),
+            "runtime returns q.x; the entry model returns p.x"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT — the AUTHORITY pins (2026-08-29). What TIER a transported claim is
+    // checked at, at BOTH ends, read off the kernel verdicts themselves; that the tier
+    // is derived from the TERM (a grounder-connected model still takes
+    // `check_body_refinement`, byte-identically to before EFHT); that a Model-tier
+    // claim never becomes a callee model for a third body; and the tightness twins the
+    // allow-list negatives above were missing (the `Cast` rule, `UncheckedBinaryOp`, and
+    // the H2 two-reads shape).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The grounder tier's refusal is a DECLINE of the statement, never a kernel
+    /// rejection of a proof: `check_refinement_decl`'s `None`-statement arm.
+    fn efht_is_grounder_decline(v: &crate::trustir_anchor::RefinementVerdict) -> bool {
+        matches!(v, crate::trustir_anchor::RefinementVerdict::KernelRejected(m)
+            if m.contains("live ground_int declined"))
+    }
+
+    /// TRACE — every EFHT positive shape lands on `check_body_refinement_model_chain`
+    /// at BOTH ends, and on nothing else. Measured 2026-08-29: each minted model is a
+    /// ≥2-statement chain (`_2 := <selector>; _3 := …`), so `ret_model_kernel_verdict`'s
+    /// three arms resolve as: the grounder tier DECLINES the statement (a selector has
+    /// no live `ground_int`), the single-statement model tier `check_body_refinement_model`
+    /// is KERNEL-REJECTED (its RHS is the return statement's own denotation, which for a
+    /// chain names an earlier temp the env never bound — a `check_type` mismatch, not a
+    /// proof), and only `_model_chain` proves. The SUBSTITUTED body selects the same arm.
+    /// So the TCB row's "MODEL-ONLY tier (`check_body_refinement_model` / `_model_chain`)"
+    /// is, for every shape the lane mints today, the `_model_chain` theorem
+    /// `Trust.TrustIr.Refinement.body_model_chain` — and the verdict that licenses the
+    /// transport is never the grounder-connected `body_adequacy` one.
+    #[test]
+    fn efht_selector_transport_lands_on_the_model_chain_tier_at_both_ends() {
+        use crate::trustir_anchor::{
+            check_body_refinement, check_body_refinement_model, check_body_refinement_model_chain,
+            IrOperand, RefinementVerdict,
+        };
+        for callee in [
+            efht_field_callee(),
+            efht_len_callee(),
+            efht_is_empty_callee(),
+            efht_is_none_callee(),
+        ] {
+            let dp = callee.def_path.clone();
+            let registry = efht_registry(&callee);
+            let model = registry[&dp].ret_model.clone().expect("mints");
+            let caller = efht_passthrough_caller(&callee, vec![]);
+            assert!(crate::prove::transported_call_return_for_test(&caller, &registry), "{dp}");
+            let inlined = crate::prove::substitute_ret_model_for_test(&model, &[IrOperand::Var(0)], 1)
+                .expect("the passthrough substitution");
+            // The substitution is a pure index shift: same statement count, ret shifted by
+            // the caller's arg count (1), leaves re-pointed at caller slot 0.
+            assert_eq!(inlined.stmts.len(), model.stmts.len(), "{dp}");
+            assert_eq!(inlined.ret, model.ret + 1, "{dp}");
+            for (tag, body) in [("model", &model), ("inlined", &inlined)] {
+                assert!(body.stmts.len() >= 2, "{dp}/{tag}: a chain, so the `_model` arm is not selected");
+                assert!(!body.is_grounder_connected(), "{dp}/{tag}");
+                assert!(
+                    efht_is_grounder_decline(&check_body_refinement(body)),
+                    "{dp}/{tag}: the grounder tier must DECLINE a selector term, not prove it"
+                );
+                assert!(
+                    matches!(check_body_refinement_model(body), RefinementVerdict::KernelRejected(_)),
+                    "{dp}/{tag}: the single-statement model tier cannot state a chain"
+                );
+                assert_eq!(
+                    check_body_refinement_model_chain(body),
+                    RefinementVerdict::ProvenModulo3,
+                    "{dp}/{tag}: `_model_chain` is the ONE arm that admits"
+                );
+                assert_eq!(
+                    crate::prove::ret_model_kernel_verdict(body),
+                    RefinementVerdict::ProvenModulo3,
+                    "{dp}/{tag}"
+                );
+            }
+            // DISCLOSURE, upward: a caller certified THROUGH a Model-tier transport
+            // mints no model of its own — its body ends in the transported `Call`, which
+            // the allow-list refuses by name — so a transported selector never becomes a
+            // callee model a third body inlines. Twin: with only that call excused the
+            // same body is read-only, which is exactly what the consumer checked.
+            assert!(crate::prove::pure_scalar_ret_model(&caller).is_none(), "{dp}");
+            assert_eq!(crate::prove::body_is_read_only(&caller.body), Err("Call terminator"), "{dp}");
+            assert_eq!(crate::prove::body_is_read_only_except_sole_call(&caller.body), Ok(()), "{dp}");
+        }
+    }
+
+    /// BYTE-IDENTICAL — a grounder-connected model takes `check_body_refinement` exactly
+    /// as it did before EFHT, at both ends. The minted term IS `straight_line_ir_body`'s
+    /// term (the chain fallback never fires for it); the substituted term is the
+    /// pre-EFHT index shift `Bin(Add, Var 0, Const 1)` at `idx 2`; and both are proved at
+    /// the grounder tier. TIGHTNESS of the tier ORDER: `check_body_refinement_model` would
+    /// ALSO prove the grounder-connected body, so it is `ret_model_kernel_verdict`'s
+    /// grounder-first arm — not the kernel — that keeps a scalar transport on the
+    /// `body_adequacy` theorem; and swapping ONE leaf for a selector flips the term to
+    /// the model tier, so the tier is derived from the term and from nothing stored.
+    #[test]
+    fn efht_grounder_connected_model_still_takes_check_body_refinement_byte_identically() {
+        use crate::trustir_anchor::{
+            check_body_refinement, check_body_refinement_model, IrBody, IrOperand, IrRvalue, IrStmt,
+            RefinementVerdict,
+        };
+        let f = scalar_leaf_func("probe::leaf");
+        let pre_efht = crate::prove::straight_line_ir_body(&f).expect("the HEAD builder lowers it");
+        let model = crate::prove::pure_scalar_ret_model(&f).expect("mints");
+        assert_eq!(model, pre_efht, "the minted term is the pre-EFHT builder's term, unchanged");
+        assert!(model.is_grounder_connected());
+        assert_eq!(check_body_refinement(&model), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&model), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            check_body_refinement_model(&model),
+            RefinementVerdict::ProvenModulo3,
+            "TIGHTNESS: the model tier accepts this body too — the grounder-first ORDER is load-bearing"
+        );
+        let inlined = crate::prove::substitute_ret_model_for_test(&model, &[IrOperand::Var(0)], 1)
+            .expect("substitutes");
+        assert_eq!(
+            inlined,
+            IrBody {
+                stmts: vec![IrStmt {
+                    idx: 2,
+                    rvalue: IrRvalue::Bin(
+                        crate::trustir_anchor::TrustIrBinOp::Add,
+                        IrOperand::Var(0),
+                        IrOperand::Const(1)
+                    ),
+                }],
+                ret: 2,
+            },
+            "the pre-EFHT substitution: shift by the caller's arg count, formal 0 -> actual"
+        );
+        assert!(inlined.is_grounder_connected());
+        assert_eq!(check_body_refinement(&inlined), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&inlined), RefinementVerdict::ProvenModulo3);
+        // The flip: one selector leaf and the SAME body is model-only — the grounder
+        // tier declines it and the (single-statement) model tier is what proves it.
+        let flipped = IrBody {
+            stmts: vec![IrStmt {
+                idx: 2,
+                rvalue: IrRvalue::Bin(
+                    crate::trustir_anchor::TrustIrBinOp::Add,
+                    IrOperand::Field(0, 0),
+                    IrOperand::Const(1),
+                ),
+            }],
+            ret: 2,
+        };
+        assert!(!flipped.is_grounder_connected());
+        assert!(efht_is_grounder_decline(&check_body_refinement(&flipped)));
+        assert_eq!(check_body_refinement_model(&flipped), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&flipped), RefinementVerdict::ProvenModulo3);
+    }
+
+    /// H2 TWIN — two reads of ONE handle straddling the transported call. The caller
+    /// reads `(*p).x` into a temp BEFORE calling `get_x(p)`, which reads it again: the
+    /// exact shape CLAUDE.md's H2 says must supply a time index once a WRITE can sit
+    /// between the reads. Under the fence no write can, so it TRANSPORTS (the positive
+    /// twin of the `writer` negative in the sibling test). And the sibling's `writer`
+    /// negative, measured: the RECOGNIZER declines it first (`deref_write_exists` sees
+    /// a Deref-rooted store on `_1`), so it pins the deny-list; the allow-list refuses
+    /// it independently, and the tight allow-list-only negative stays the
+    /// `CopyNonOverlapping` twin.
+    #[test]
+    fn efht_two_reads_of_one_handle_across_a_read_only_call_transport() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        let callee = efht_field_callee();
+        let registry = efht_registry(&callee);
+        let field_of_p = || Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] };
+        let reads = efht_caller(
+            "probe::get_x::reader",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), efht_ref(efht_struct_s()))],
+            vec![efht_i64()],
+            vec![Operand::Copy(Place::local(1))],
+            vec![Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::Use(Operand::Copy(field_of_p())),
+                span: Default::default(),
+            }],
+        );
+        assert!(crate::mirsem::sem_call_return_of_mir(&reads, &registry).is_some());
+        assert_eq!(crate::prove::body_is_read_only_except_sole_call(&reads.body), Ok(()));
+        assert!(
+            crate::prove::transported_call_return_for_test(&reads, &registry),
+            "a read of the handle before a READ-ONLY call is admitted: nothing between the \
+             two reads can write, so the untimed selector is exact here"
+        );
+        let writes = efht_caller(
+            "probe::get_x::writer",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("p"), efht_ref(efht_struct_s()))],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            vec![Statement::Assign {
+                place: field_of_p(),
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(99))),
+                span: Default::default(),
+            }],
+        );
+        assert!(
+            crate::mirsem::sem_call_return_of_mir(&writes, &registry).is_none(),
+            "measured: the Deref-store caller declines at the RECOGNIZER, before the allow-list"
+        );
+        assert!(crate::mirsem::deref_write_exists(&writes.body, 1));
+        assert_eq!(
+            crate::prove::body_is_read_only_except_sole_call(&writes.body),
+            Err("Assign through a Deref projection")
+        );
+        assert!(!crate::prove::transported_call_return_for_test(&writes, &registry));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT-T (2026-08-29) — the transport lane's OWN recognizer
+    // (`mirsem::sem_transported_call_of_mir_diag`), the S2/S3/S4 positives, and one
+    // negative per gate, each with a TIGHTNESS TWIN (the same fixture minus the
+    // offending feature transports). Where a gate is not the first to refuse, the pin
+    // asserts what the earlier recognizer says.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `fn is_zero(n: i64) -> bool { _0 = Eq(_1, 0) }` — a Value-slot callee with no
+    /// safety VC, so D1 has nothing to refuse and no `requires` is inherited.
+    fn efht_t_is_zero_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Rvalue, Ty};
+        efht_leaf(
+            "probe::is_zero",
+            vec![(None, Ty::Bool), (Some("n"), efht_i64())],
+            vec![efht_assign(
+                0,
+                Rvalue::BinaryOp(
+                    BinOp::Eq,
+                    Operand::Copy(Place::local(1)),
+                    Operand::Constant(ConstValue::Int(0)),
+                ),
+            )],
+        )
+    }
+    /// `fn pass(n: i64) -> i64 { _2 = _1; _0 = _2 }`.
+    fn efht_t_pass_callee() -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Rvalue};
+        efht_leaf(
+            "probe::pass",
+            vec![(None, efht_i64()), (Some("n"), efht_i64()), (None, efht_i64())],
+            vec![
+                efht_assign(2, Rvalue::Use(Operand::Copy(Place::local(1)))),
+                efht_assign(0, Rvalue::Use(Operand::Copy(Place::local(2)))),
+            ],
+        )
+    }
+    /// A two-block caller: `bb0 { prefix; callee(args) -> _dest [bb1] }`, `bb1 { tail;
+    /// Return }`. Locals `_1..=_n` are `params`; `extra` follow.
+    #[allow(clippy::too_many_arguments)]
+    fn efht_t_caller(
+        name: &str,
+        callee: &str,
+        ret: trust_types::Ty,
+        params: Vec<(Option<&str>, trust_types::Ty)>,
+        extra: Vec<trust_types::Ty>,
+        args: Vec<trust_types::Operand>,
+        dest: usize,
+        prefix: Vec<trust_types::Statement>,
+        tail: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{BasicBlock, BlockId, Place, Terminator, UnwindEdge};
+        let arg_count = params.len();
+        let mut locals = vec![(None, ret)];
+        locals.extend(params);
+        locals.extend(extra.into_iter().map(|t| (None, t)));
+        efht_func(
+            name,
+            locals,
+            arg_count,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: prefix,
+                    terminator: Terminator::Call {
+                        func: callee.into(),
+                        args,
+                        dest: Place::local(dest),
+                        target: Some(BlockId(1)),
+                        unwind: UnwindEdge::Unreachable,
+                        span: Default::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: tail, terminator: Terminator::Return },
+            ],
+        )
+    }
+    fn efht_t_registry(
+        callees: &[&trust_types::VerifiableFunction],
+    ) -> std::collections::BTreeMap<String, crate::mirsem::CalleeFact> {
+        callees
+            .iter()
+            .map(|c| {
+                let fact = crate::mirsem::CalleeFact::of_certified(c)
+                    .with_ret_model(crate::prove::pure_scalar_ret_model(c));
+                (c.def_path.clone(), fact)
+            })
+            .collect()
+    }
+    /// The transport recognizer's FIRST refusal, or `None` when it accepts.
+    fn efht_t_reason(
+        f: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+    ) -> Option<&'static str> {
+        let mut why = None;
+        let shape = crate::mirsem::sem_transported_call_of_mir_diag(f, registry, &mut why);
+        assert_eq!(shape.is_none(), why.is_some(), "a refusal always carries its reason");
+        why
+    }
+    /// The shared recognizer's FIRST refusal, or `None` when it accepts.
+    fn efht_t_shared_reason(
+        f: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+    ) -> Option<&'static str> {
+        let mut why = None;
+        let _ = crate::mirsem::sem_call_return_of_mir_diag(f, registry, &mut why);
+        why
+    }
+    fn efht_t_deref(local: usize) -> trust_types::Place {
+        trust_types::Place { local, projections: vec![trust_types::Projection::Deref] }
+    }
+    /// S2 — `fn c(s: &S) -> bool { is_zero(s.x) }`: `_2 = (*_1).0; is_zero(copy _2) -> _0`.
+    fn efht_t_s2_caller() -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Rvalue, Ty};
+        efht_t_caller(
+            "probe::s2",
+            "probe::is_zero",
+            Ty::Bool,
+            vec![(Some("s"), efht_ref(efht_struct_s()))],
+            vec![efht_i64()],
+            vec![Operand::Copy(Place::local(2))],
+            0,
+            vec![efht_assign(2, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![],
+        )
+    }
+    /// S3 — `fn c(s: &S, k: i64) -> bool { pass(s.x) == k }`: `_4 = (*_1).0; pass(copy _4)
+    /// -> _3; _0 = Eq(copy _2, move _3)`.
+    fn efht_t_s3_caller() -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        efht_t_caller(
+            "probe::s3",
+            "probe::pass",
+            Ty::Bool,
+            vec![(Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64())],
+            vec![efht_i64(), efht_i64()],
+            vec![Operand::Copy(Place::local(4))],
+            3,
+            vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(2)), Operand::Move(Place::local(3))),
+            )],
+        )
+    }
+    /// S4 — `fn c(p: &i64) -> bool { !is_zero(*p) }`: `_2 = *_1; is_zero(copy _2) -> _3;
+    /// _0 = Not(move _3)`.
+    fn efht_t_s4_caller() -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Rvalue, Ty, UnOp};
+        efht_t_caller(
+            "probe::s4",
+            "probe::is_zero",
+            Ty::Bool,
+            vec![(Some("p"), efht_ref(efht_i64()))],
+            vec![efht_i64(), Ty::Bool],
+            vec![Operand::Copy(Place::local(2))],
+            3,
+            vec![efht_assign(2, Rvalue::Use(Operand::Copy(efht_t_deref(1))))],
+            vec![efht_assign(0, Rvalue::UnaryOp(UnOp::Not, Operand::Move(Place::local(3))))],
+        )
+    }
+    /// Rebuild what the consumer submits to the kernel for a recognized shape, from the
+    /// same pieces (`substitute_ret_model` then `append_transport_tail`), so a positive
+    /// can assert the TAILED TERM and its tier, not only the boolean verdict.
+    fn efht_t_tailed_body(
+        caller: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+    ) -> crate::trustir_anchor::IrBody {
+        let shape = crate::mirsem::sem_transported_call_of_mir(caller, registry).expect("recognized");
+        let model = registry[&shape.call.callee].ret_model.as_ref().expect("callee minted");
+        let actuals: Vec<_> = shape
+            .call
+            .args
+            .iter()
+            .map(|a| crate::prove::sem_call_arg_to_ir_pinned_for_test(a, &caller.body).expect("lowers"))
+            .collect();
+        let inlined = crate::prove::substitute_ret_model_for_test(model, &actuals, caller.body.arg_count)
+            .expect("substitutes");
+        let other = match &shape.tail {
+            crate::mirsem::SemTransportTail::Cmp { other: (sem, _), .. } => {
+                Some(crate::prove::sem_call_arg_to_ir_pinned_for_test(sem, &caller.body).expect("other lowers"))
+            }
+            _ => None,
+        };
+        crate::prove::append_transport_tail_for_test(inlined, &shape.tail, caller.body.arg_count, other)
+            .expect("tail appends")
+    }
+
+    /// POSITIVE S2 — a FIELD-READ actual on a Value formal. The SHARED recognizer admits
+    /// the shape too (asserted — its `Field` reading is what the pre-EFHT-T consumer's
+    /// `Var|Const` gate refused), the transport recognizer records `FieldOf(1, 0)`, the
+    /// inlined term carries `Field(0, 0)` and lands on the MODEL tier (the grounder
+    /// refuses it), and the caller transports.
+    #[test]
+    fn efht_t_s2_field_actual_transports() {
+        use crate::mirsem::{ActualBase, SemOperand, SemTransportTail};
+        use crate::trustir_anchor::{IrOperand, IrRvalue, RefinementVerdict};
+        let callee = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&callee]);
+        assert!(registry[&callee.def_path].ret_model.is_some(), "is_zero must mint");
+        let caller = efht_t_s2_caller();
+        assert_eq!(efht_t_shared_reason(&caller, &registry), None, "TIGHTNESS: the shared recognizer admits S2");
+        let shape = crate::mirsem::sem_transported_call_of_mir(&caller, &registry).expect("S2 is recognized");
+        assert_eq!(shape.bases, vec![ActualBase::FieldOf(1, 0)]);
+        assert_eq!(shape.tail, SemTransportTail::None);
+        assert_eq!(shape.dest, 0);
+        assert_eq!(shape.call.args, vec![SemOperand::Field(Box::new(SemOperand::Var(0)), 0)]);
+        let tailed = efht_t_tailed_body(&caller, &registry);
+        assert_eq!(tailed.stmts.len(), 1);
+        assert!(matches!(&tailed.stmts[0].rvalue, IrRvalue::Cmp(_, IrOperand::Field(0, 0), IrOperand::Const(0))), "{tailed:?}");
+        assert!(!tailed.is_grounder_connected());
+        assert_ne!(crate::trustir_anchor::check_body_refinement(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry),
+            Ok(())
+        );
+    }
+
+    /// POSITIVE S3 — call-then-COMPARE with a field-read actual and an entry-parameter
+    /// `other`. The shared recognizer refuses at its tail gate (asserted), so the
+    /// transport recognizer is the ONLY route; the tail `Cmp(Eq, Var(1), Var(r'))` with
+    /// `call_is_lhs = false` sits at an index above every inlined index and parameter.
+    #[test]
+    fn efht_t_s3_call_then_cmp_transports() {
+        use crate::mirsem::{ActualBase, SemCmpOp, SemOperand, SemTransportTail};
+        use crate::trustir_anchor::{IrOperand, IrRvalue, RefinementVerdict, TrustIrCmpOp};
+        let callee = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&callee]);
+        assert!(registry[&callee.def_path].ret_model.is_some(), "pass must mint");
+        let caller = efht_t_s3_caller();
+        assert_eq!(
+            efht_t_shared_reason(&caller, &registry),
+            Some("return-block-does-not-move-the-temp-into-_0"),
+            "TIGHTNESS: the shared recognizer refuses the tail"
+        );
+        let shape = crate::mirsem::sem_transported_call_of_mir(&caller, &registry).expect("S3 is recognized");
+        assert_eq!(shape.bases, vec![ActualBase::FieldOf(1, 0)]);
+        assert_eq!(shape.dest, 3);
+        assert_eq!(
+            shape.tail,
+            SemTransportTail::Cmp {
+                op: SemCmpOp::Eq,
+                other: (SemOperand::Var(1), ActualBase::Param(2)),
+                call_is_lhs: false,
+            }
+        );
+        let tailed = efht_t_tailed_body(&caller, &registry);
+        let last = tailed.stmts.last().expect("tail statement");
+        assert_eq!(tailed.ret, last.idx);
+        let inlined_max = tailed.stmts[..tailed.stmts.len() - 1].iter().map(|s| s.idx).max().unwrap();
+        assert!(last.idx > inlined_max && last.idx >= 2, "k above every inlined index and parameter slot");
+        let IrRvalue::Cmp(TrustIrCmpOp::Eq, IrOperand::Var(1), IrOperand::Var(r)) = &last.rvalue else {
+            panic!("tail must be Cmp(Eq, Var(1), Var(r')): {last:?}");
+        };
+        assert_eq!(*r, inlined_max, "the tail reads the inlined model's returned index");
+        assert!(tailed.stmts.iter().any(|s| matches!(s.rvalue, IrRvalue::Use(IrOperand::Field(0, 0)))));
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry),
+            Ok(())
+        );
+    }
+
+    /// POSITIVE S4 — a DEREF-TEMP actual and a Bool `Not` tail. The shared recognizer
+    /// refuses the actual (asserted); the actual lowers to `Var(0)` with base
+    /// `DerefOf(1)`, the tail is `Cmp(Eq, Var(r'), Const 0)`, and the tailed body is
+    /// grounder-connected (Var/Const only), so G-TIER-MATCH takes the LIVE grounder.
+    #[test]
+    fn efht_t_s4_call_then_not_transports() {
+        use crate::mirsem::{ActualBase, SemOperand, SemTransportTail};
+        use crate::trustir_anchor::{IrOperand, IrRvalue, RefinementVerdict, TrustIrCmpOp};
+        let callee = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let caller = efht_t_s4_caller();
+        assert_eq!(
+            efht_t_shared_reason(&caller, &registry),
+            Some("argument-outside-modeled-operand-fragment"),
+            "TIGHTNESS: the shared recognizer refuses the deref temp"
+        );
+        let shape = crate::mirsem::sem_transported_call_of_mir(&caller, &registry).expect("S4 is recognized");
+        assert_eq!(shape.bases, vec![ActualBase::DerefOf(1)]);
+        assert_eq!(shape.call.args, vec![SemOperand::Var(0)]);
+        assert_eq!(shape.tail, SemTransportTail::NotBool);
+        let tailed = efht_t_tailed_body(&caller, &registry);
+        let last = tailed.stmts.last().unwrap();
+        let IrRvalue::Cmp(TrustIrCmpOp::Eq, IrOperand::Var(r), IrOperand::Const(0)) = &last.rvalue else {
+            panic!("NotBool must desugar to Cmp(Eq, Var(r'), 0): {last:?}");
+        };
+        assert!(tailed.stmts.iter().any(|s| s.idx == *r), "r' is bound by an inlined statement");
+        assert!(tailed.is_grounder_connected());
+        assert_eq!(crate::trustir_anchor::check_body_refinement(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry),
+            Ok(())
+        );
+    }
+
+    /// NEGATIVE — P-TAIL-OTHER: the tail's `other` is a field read DEFINED AFTER the call
+    /// (in the Return block). Refused by name even though the fence would make it sound,
+    /// so relaxing it is a deliberate change. TWIN: the same read before the call
+    /// transports, and the `other` then carries base `FieldOf(1, 0)` on the same handle.
+    #[test]
+    fn efht_t_tail_other_defined_after_call_refuses() {
+        use crate::mirsem::{ActualBase, SemOperand, SemTransportTail};
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let callee = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let read5 = || efht_assign(5, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))));
+        let cmp = || {
+            efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(5))),
+            )
+        };
+        let build = |name: &str, prefix: Vec<trust_types::Statement>, tail: Vec<trust_types::Statement>| {
+            efht_t_caller(
+                name,
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s()))],
+                vec![efht_i64(), efht_i64(), efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(4))],
+                3,
+                prefix,
+                tail,
+            )
+        };
+        let read4 = || efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))));
+        let post = build("probe::s3::post", vec![read4()], vec![read5(), cmp()]);
+        assert_eq!(efht_t_reason(&post, &registry), Some("tail-other-not-pre-call"));
+        assert!(crate::prove::body_is_read_only_except_sole_call(&post.body).is_ok(), "the fence alone would admit it");
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&post, &registry).is_err());
+        let pre = build("probe::s3::pre", vec![read4(), read5()], vec![cmp()]);
+        let shape = crate::mirsem::sem_transported_call_of_mir(&pre, &registry).expect("TWIN: pre-call read");
+        assert_eq!(
+            shape.tail,
+            SemTransportTail::Cmp {
+                op: crate::mirsem::SemCmpOp::Eq,
+                other: (SemOperand::Field(Box::new(SemOperand::Var(0)), 0), ActualBase::FieldOf(1, 0)),
+                call_is_lhs: true,
+            }
+        );
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&pre, &registry), Ok(()));
+    }
+
+    /// NEGATIVE — P-TAIL-OTHER: the tail reads a field of a handle that is NOT the base
+    /// of any actual of this call. Refused by name, and the reason ORDER is pinned:
+    /// moving the read AFTER the call does not change it (handle-set check first,
+    /// pre-call check second). TWIN: the same read off the transported handle transports.
+    #[test]
+    fn efht_t_tail_reads_a_different_handle_refuses() {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let callee = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let read3 = || efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))));
+        let read5 = |base: usize| efht_assign(5, Rvalue::Use(Operand::Copy(efht_deref_field(base, 0))));
+        let cmp = || {
+            efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(4)), Operand::Copy(Place::local(5))),
+            )
+        };
+        let build = |name: &str, prefix: Vec<trust_types::Statement>, tail: Vec<trust_types::Statement>| {
+            efht_t_caller(
+                name,
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("t"), efht_ref(efht_struct_s()))],
+                vec![efht_i64(), efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(3))],
+                4,
+                prefix,
+                tail,
+            )
+        };
+        let other_pre = build("probe::s3::other_pre", vec![read3(), read5(2)], vec![cmp()]);
+        assert_eq!(efht_t_reason(&other_pre, &registry), Some("tail-reads-a-handle-not-transported"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&other_pre, &registry).is_err());
+        let other_post = build("probe::s3::other_post", vec![read3()], vec![read5(2), cmp()]);
+        assert_eq!(
+            efht_t_reason(&other_post, &registry),
+            Some("tail-reads-a-handle-not-transported"),
+            "ORDER PIN: the handle-set refusal fires before the pre-call refusal"
+        );
+        let same = build("probe::s3::same_handle", vec![read3(), read5(1)], vec![cmp()]);
+        assert_eq!(efht_t_reason(&same, &registry), None, "TWIN");
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&same, &registry), Ok(()));
+    }
+
+    /// NEGATIVE — P-TAIL: an ARITHMETIC tail is refused BY NAME in this landing
+    /// (`IrRvalue::Bin` denotes unbounded `Int.add` where release MIR wraps). TWIN: the
+    /// `Eq` tail over the same operands transports. Also pinned: a bitwise/shift tail
+    /// takes the other named exit, and a tail that does not read the call result at all
+    /// is refused before the op is looked at.
+    #[test]
+    fn efht_t_bin_tail_refused_by_name() {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let callee = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let build = |name: &str, ret: Ty, op: BinOp, a: Operand, b: Operand| {
+            efht_t_caller(
+                name,
+                "probe::pass",
+                ret,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64())],
+                vec![efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(4))],
+                3,
+                vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                vec![efht_assign(0, Rvalue::BinaryOp(op, a, b))],
+            )
+        };
+        let k = || Operand::Copy(Place::local(2));
+        let r = || Operand::Move(Place::local(3));
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+            let add = build("probe::s3::bin", efht_i64(), op, k(), r());
+            assert_eq!(efht_t_reason(&add, &registry), Some("bin-tail-not-admitted-in-the-first-landing"), "{op:?}");
+            assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&add, &registry).is_err());
+        }
+        let shl = build("probe::s3::shl", efht_i64(), BinOp::Shl, r(), k());
+        assert_eq!(efht_t_reason(&shl, &registry), Some("bin-tail-not-admitted-in-the-first-landing"));
+        let both = build("probe::s3::both", Ty::Bool, BinOp::Eq, r(), Operand::Copy(Place::local(3)));
+        assert_eq!(efht_t_reason(&both, &registry), Some("tail-both-operands-are-the-call-result"));
+        let neither = build("probe::s3::neither", Ty::Bool, BinOp::Eq, k(), k());
+        assert_eq!(efht_t_reason(&neither, &registry), Some("return-block-tail-does-not-consume-the-call-result"));
+        for (op, lhs) in [(BinOp::Eq, true), (BinOp::Ne, false), (BinOp::Lt, true), (BinOp::Le, false), (BinOp::Gt, true), (BinOp::Ge, false)] {
+            let (a, b) = if lhs { (r(), k()) } else { (k(), r()) };
+            let cmp = build("probe::s3::cmp", Ty::Bool, op, a, b);
+            assert_eq!(efht_t_reason(&cmp, &registry), None, "TWIN {op:?}");
+            let shape = crate::mirsem::sem_transported_call_of_mir(&cmp, &registry).unwrap();
+            assert!(matches!(shape.tail, crate::mirsem::SemTransportTail::Cmp { call_is_lhs, .. } if call_is_lhs == lhs));
+            assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&cmp, &registry), Ok(()), "{op:?}");
+        }
+    }
+
+    /// NEGATIVE — P-ACTUAL (c): a field actual whose base is a REBORROW temp `_2 = &(*_1)`.
+    /// The MirSem chase would resolve `(*_2).0` to `Field(Var 0, 0)` exactly as for `_1`
+    /// (`sem_call_arg_field_read_operand` follows the alias) — the chain of custody is
+    /// read off MIR instead, and the base local `_2` is not an entry parameter. TWIN:
+    /// the read off `_1` directly transports, the unused reborrow left in place.
+    #[test]
+    fn efht_t_field_actual_over_reborrow_base_refuses() {
+        use trust_types::{Operand, Place, Rvalue, Ty};
+        let callee = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let build = |name: &str, base: usize| {
+            efht_t_caller(
+                name,
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s()))],
+                vec![efht_ref(efht_struct_s()), efht_i64()],
+                vec![Operand::Copy(Place::local(3))],
+                0,
+                vec![
+                    efht_assign(2, Rvalue::Ref { mutable: false, place: efht_t_deref(1) }),
+                    efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(base, 0)))),
+                ],
+                vec![],
+            )
+        };
+        let reborrow = build("probe::s2::reborrow", 2);
+        assert_eq!(efht_t_reason(&reborrow, &registry), Some("field-actual-base-is-not-an-entry-parameter"));
+        assert!(crate::prove::body_is_read_only_except_sole_call(&reborrow.body).is_ok(), "the allow-list admits a shared reborrow");
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&reborrow, &registry).is_err());
+        let direct = build("probe::s2::direct", 1);
+        assert_eq!(efht_t_reason(&direct, &registry), None, "TWIN");
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&direct, &registry), Ok(()));
+    }
+
+    /// NEGATIVE — G-ACTUAL-VALUE re-derives the field type ITSELF: a `Field` actual on a
+    /// u64-NEWTYPE field (the shape `sem_call_arg_field_read_operand`'s Case 1b returns
+    /// as an opaque token), on an ENUM referent, on an `&mut` base, and with a mismatched
+    /// slot or field index all refuse by name; the plain `i64` field on `&S` is `Ok`.
+    /// Pinned on the predicate directly: no real signature lets a newtype actual reach it
+    /// (`callee_signature_matches` + G2' refuse first), which is exactly why the check
+    /// must not rest on that coincidence.
+    #[test]
+    fn efht_t_field_actual_on_a_newtype_field_refuses() {
+        use crate::mirsem::ActualBase;
+        use crate::trustir_anchor::IrOperand;
+        use trust_types::Ty;
+        let newtype = Ty::adt("probe::W", vec![("0".into(), efht_usize())]);
+        let sn = Ty::adt("probe::SN", vec![("w".into(), newtype)]);
+        let body_over = |p_ty: Ty| {
+            efht_t_caller(
+                "probe::unit",
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("s"), p_ty)],
+                vec![efht_i64()],
+                vec![trust_types::Operand::Copy(trust_types::Place::local(2))],
+                0,
+                vec![],
+                vec![],
+            )
+            .body
+        };
+        let ok = crate::prove::efht_value_actual_ok_for_test;
+        assert_eq!(ok(&body_over(efht_ref(sn.clone())), &IrOperand::Field(0, 0), &ActualBase::FieldOf(1, 0)), Err("Value actual: field type is not Int|Bool"));
+        assert_eq!(ok(&body_over(efht_ref(efht_option_bool())), &IrOperand::Field(0, 0), &ActualBase::FieldOf(1, 0)), Err("Value actual: Field base referent is an enum"));
+        assert_eq!(
+            ok(&body_over(Ty::Ref { mutable: true, inner: Box::new(efht_struct_s()) }), &IrOperand::Field(0, 0), &ActualBase::FieldOf(1, 0)),
+            Err("Value actual: Field base is not a shared reference")
+        );
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Field(0, 1), &ActualBase::FieldOf(1, 0)), Err("Value actual: Field leaf disagrees with the MIR field read"));
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Field(1, 0), &ActualBase::FieldOf(1, 0)), Err("Value actual: Field leaf disagrees with the MIR field read"));
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Field(0, 3), &ActualBase::FieldOf(1, 3)), Err("Value actual: field index not in the ADT definition"));
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Var(0), &ActualBase::FieldOf(1, 0)), Err("Value actual: operand/base pair outside G-ACTUAL-VALUE"));
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Field(0, 0), &ActualBase::FieldOf(1, 0)), Ok(()), "TWIN");
+        // The DerefOf arm matches the TYPE literally, never the slot: `&S` is a Handle
+        // slot and refuses; `&i64` is admitted; a by-value `i64` is not a deref base.
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Var(0), &ActualBase::DerefOf(1)), Err("Value actual: DerefOf base is not a shared reference to Int/Bool"));
+        assert_eq!(ok(&body_over(efht_i64()), &IrOperand::Var(0), &ActualBase::DerefOf(1)), Err("Value actual: DerefOf base is not a shared reference to Int/Bool"));
+        assert_eq!(ok(&body_over(efht_ref(efht_i64())), &IrOperand::Var(0), &ActualBase::DerefOf(1)), Ok(()));
+        // The Param arm: a handle parameter is not a Value.
+        assert_eq!(ok(&body_over(efht_ref(efht_struct_s())), &IrOperand::Var(0), &ActualBase::Param(1)), Err("Value actual: Param base is not Int/Bool or &{Int,Bool}"));
+        assert_eq!(ok(&body_over(efht_i64()), &IrOperand::Var(0), &ActualBase::Param(1)), Ok(()));
+        assert_eq!(ok(&body_over(efht_i64()), &IrOperand::Var(1), &ActualBase::Param(1)), Err("Value actual: MirSem slot disagrees with the MIR parameter"));
+    }
+
+    /// NEGATIVE — P-TAIL: an INTEGER `Not` is the opaque `bnot`, refused by name. The
+    /// opaque pureop lane's verdict on the same body is unchanged (it never admitted the
+    /// deref-temp actual). TWIN: the Bool `Not` (S4) transports.
+    #[test]
+    fn efht_t_integer_not_tail_refuses() {
+        use trust_types::{Operand, Place, Rvalue, UnOp};
+        let pass = efht_t_pass_callee();
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&pass, &is_zero]);
+        let int_not = efht_t_caller(
+            "probe::s4::int_not",
+            "probe::pass",
+            efht_i64(),
+            vec![(Some("p"), efht_ref(efht_i64()))],
+            vec![efht_i64(), efht_i64()],
+            vec![Operand::Copy(Place::local(2))],
+            3,
+            vec![efht_assign(2, Rvalue::Use(Operand::Copy(efht_t_deref(1))))],
+            vec![efht_assign(0, Rvalue::UnaryOp(UnOp::Not, Operand::Move(Place::local(3))))],
+        );
+        assert_eq!(efht_t_reason(&int_not, &registry), Some("integer-not-is-opaque-bnot"));
+        assert!(crate::mirsem::sem_call_then_pureop_of_mir(&int_not, &registry).is_none());
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&int_not, &registry).is_err());
+        let bool_not = efht_t_s4_caller();
+        assert!(crate::mirsem::sem_call_then_pureop_of_mir(&bool_not, &registry).is_none());
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&bool_not, &registry), Ok(()), "TWIN");
+    }
+
+    /// NEGATIVE — P-SPINE: a `SwitchInt` anywhere and a JOIN INTO the spine from an
+    /// off-path block are refused by name. TIGHTNESS: the shared recognizer ADMITS both
+    /// (a diverging-arm guard; an island it never walks), so for the tail-free
+    /// move-into-`_0` shape the consumer's FALLBACK path keeps the pre-EFHT-T verdict —
+    /// the guarded delegation still transports through the shared recognizer — while an
+    /// S3-shaped body with the island has no route and refuses. Twins without the guard /
+    /// island transport through the transport recognizer.
+    #[test]
+    fn efht_t_switchint_and_off_path_join_refuse() {
+        use trust_types::{BasicBlock, BlockId, Operand, Place, Rvalue, Terminator, Ty, UnwindEdge};
+        let get_x = efht_field_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&get_x, &pass]);
+        // Guard: bb0 { _2 = (*_1).x; switchInt(_2) [0: bb1, otherwise: bb2] }, bb1 { get_x(_1) -> _0 [bb3] }, bb2 { Unreachable }, bb3 { Return }.
+        let call = |id: usize| BasicBlock {
+            id: BlockId(id),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                func: "probe::get_x".into(),
+                args: vec![Operand::Copy(Place::local(1))],
+                dest: Place::local(0),
+                target: Some(BlockId(3)),
+                unwind: UnwindEdge::Unreachable,
+                span: Default::default(),
+                atomic: None,
+                is_unsafe_sig: false,
+                is_foreign: false,
+                callee_identity: None,
+            },
+        };
+        let guarded = efht_func(
+            "probe::get_x::guarded",
+            vec![(None, efht_i64()), (Some("s"), efht_ref(efht_struct_s())), (None, efht_i64())],
+            1,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![efht_assign(2, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(2)),
+                        targets: vec![(0, BlockId(1))],
+                        otherwise: BlockId(2),
+                        exhaustive_enum_unreachable: false,
+                        span: Default::default(),
+                    },
+                },
+                call(1),
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Unreachable },
+                BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+            ],
+        );
+        assert_eq!(efht_t_reason(&guarded, &registry), Some("terminator-outside-transport-spine"));
+        assert_eq!(efht_t_shared_reason(&guarded, &registry), None, "TIGHTNESS: the shared recognizer admits the guard");
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&guarded, &registry),
+            Ok(()),
+            "FALLBACK: the pre-EFHT-T verdict on a shared-recognizer shape is preserved"
+        );
+        // Off-path join: S3 plus an island `bb2 { Goto(bb1) }` into the Return block.
+        let mut island = efht_t_s3_caller();
+        island.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) });
+        assert_eq!(efht_t_reason(&island, &registry), Some("join-into-the-spine-from-off-path"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&island, &registry).is_err());
+        assert_eq!(efht_t_reason(&efht_t_s3_caller(), &registry), None, "TWIN");
+        // The same island on the move-into-_0 shape: the shared recognizer never walks
+        // the island (measured), so the fallback keeps that verdict; pinned as-is.
+        let mut plain_island = efht_passthrough_caller(&get_x, vec![]);
+        plain_island.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Goto(BlockId(1)) });
+        assert_eq!(efht_t_reason(&plain_island, &registry), Some("join-into-the-spine-from-off-path"));
+        assert_eq!(efht_t_shared_reason(&plain_island, &registry), None);
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&plain_island, &registry), Ok(()));
+        // A cycle on the spine is refused by name too.
+        let mut cyc = efht_t_s3_caller();
+        cyc.body.blocks[1].terminator = Terminator::Goto(BlockId(0));
+        cyc.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return });
+        assert_eq!(efht_t_reason(&cyc, &registry), Some("cycle-on-the-returning-path"));
+        let _ = Ty::Bool;
+    }
+
+    /// REGRESSION TWIN — every pre-EFHT-T positive still goes through the transport
+    /// recognizer with tail `None` and a `Param(1)` base, and the move-into-`_0` shape
+    /// (`_2 = g(s); _0 = move _2`) recognizes and transports identically.
+    #[test]
+    fn efht_t_move_into_0_shape_still_transports() {
+        use crate::mirsem::{ActualBase, SemTransportTail};
+        use trust_types::{Operand, Place, Rvalue};
+        for callee in [efht_len_callee(), efht_is_empty_callee(), efht_is_none_callee(), efht_field_callee()] {
+            let registry = efht_registry(&callee);
+            let caller = efht_passthrough_caller(&callee, vec![]);
+            let shape = crate::mirsem::sem_transported_call_of_mir(&caller, &registry)
+                .unwrap_or_else(|| panic!("{}: the passthrough caller is recognized", callee.def_path));
+            assert_eq!(shape.bases, vec![ActualBase::Param(1)]);
+            assert_eq!(shape.tail, SemTransportTail::None);
+            assert_eq!(shape.call, crate::mirsem::sem_call_return_of_mir(&caller, &registry).unwrap(), "same call record as the shared recognizer");
+            assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry), Ok(()));
+        }
+        let callee = efht_field_callee();
+        let registry = efht_registry(&callee);
+        let moved = efht_t_caller(
+            "probe::get_x::moved",
+            "probe::get_x",
+            efht_i64(),
+            vec![(Some("s"), efht_ref(efht_struct_s()))],
+            vec![efht_i64()],
+            vec![Operand::Copy(Place::local(1))],
+            2,
+            vec![],
+            vec![efht_assign(0, Rvalue::Use(Operand::Move(Place::local(2))))],
+        );
+        let shape = crate::mirsem::sem_transported_call_of_mir(&moved, &registry).expect("move-into-_0 is recognized");
+        assert_eq!(shape.dest, 2);
+        assert_eq!(shape.tail, SemTransportTail::None);
+        assert_eq!(shape.call, crate::mirsem::sem_call_return_of_mir(&moved, &registry).unwrap());
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&moved, &registry), Ok(()));
+    }
+
+    /// NEGATIVE — P-DEST: the call temp written a second time, and `_0` written twice,
+    /// each refuse by name; and a `_0` assign that is not the LAST statement of the
+    /// Return block refuses. TWIN: S3 as built.
+    #[test]
+    fn efht_t_dest_written_twice_refuses() {
+        use trust_types::{ConstValue, Operand, Rvalue};
+        let callee = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let mut twice_r = efht_t_s3_caller();
+        twice_r.body.blocks[0].stmts.insert(0, efht_assign(3, Rvalue::Use(Operand::Constant(ConstValue::Int(0)))));
+        assert_eq!(efht_t_reason(&twice_r, &registry), Some("temp-dest-write-profile-mismatch"));
+        let mut twice_0 = efht_t_s3_caller();
+        twice_0.body.blocks[1].stmts.insert(0, efht_assign(0, Rvalue::Use(Operand::Constant(ConstValue::Bool(false)))));
+        assert_eq!(efht_t_reason(&twice_0, &registry), Some("_0-write-profile-mismatch"));
+        let mut not_last = efht_t_s3_caller();
+        not_last.body.blocks[1].stmts.push(trust_types::Statement::Nop);
+        assert_eq!(efht_t_reason(&not_last, &registry), Some("_0-assign-not-last-in-return-block"));
+        assert_eq!(efht_t_reason(&efht_t_s3_caller(), &registry), None, "TWIN");
+    }
+
+    /// NEGATIVE — H1: a callee whose registry row carries NO `ret_model` is refused by the
+    /// NEW recognizer for S2, S3 and S4, before any actual is read; and CLAUDE.md's `poke`
+    /// — a FULLY_FAITHFUL-certifiable body that writes through its `&S` — mints no model
+    /// (the read-only allow-list), so its caller is refused the same way. TWIN: the same
+    /// registry rows with their minted models transport.
+    #[test]
+    fn efht_t_callee_without_ret_model_refuses() {
+        use trust_types::{ConstValue, Operand, Place, Rvalue};
+        let pass = efht_t_pass_callee();
+        let is_zero = efht_t_is_zero_callee();
+        let bare: std::collections::BTreeMap<String, crate::mirsem::CalleeFact> = [&pass, &is_zero]
+            .into_iter()
+            .map(|c| (c.def_path.clone(), crate::mirsem::CalleeFact::of_certified(c)))
+            .collect();
+        let minted = efht_t_registry(&[&pass, &is_zero]);
+        for caller in [efht_t_s2_caller(), efht_t_s3_caller(), efht_t_s4_caller()] {
+            assert_eq!(efht_t_reason(&caller, &bare), Some("callee-minted-no-ret_model"), "{}", caller.def_path);
+            assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &bare).is_err());
+            assert_eq!(efht_t_reason(&caller, &minted), None, "TWIN {}", caller.def_path);
+            assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &minted), Ok(()));
+        }
+        // `poke(c: &S) -> i64 { (*c).x = 99; 0 }`.
+        let poke = efht_leaf(
+            "probe::poke",
+            vec![(None, efht_i64()), (Some("c"), efht_ref(efht_struct_s()))],
+            vec![
+                efht_store(1, 0, 99),
+                efht_assign(0, Rvalue::Use(Operand::Constant(ConstValue::Int(0)))),
+            ],
+        );
+        assert_eq!(crate::prove::pure_scalar_ret_model_reasoned(&poke), Err("Assign through a Deref projection"));
+        let registry = efht_t_registry(&[&poke]);
+        let caller = efht_passthrough_caller(&poke, vec![]);
+        assert_eq!(efht_t_reason(&caller, &registry), Some("callee-minted-no-ret_model"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry).is_err());
+        let _ = Place::local(0);
+    }
+
+    /// PIN — P-SPINE refuses a DIVERGING SINK by name, while `sole_returning_call_arg_locals`
+    /// skips it (so the two spine walks are not equivalent, and the arity/block cross-check
+    /// in the consumer is what keeps them in lockstep); the shared recognizer admits it and
+    /// the caller allow-list refuses it, as before.
+    #[test]
+    fn efht_t_diverging_sink_refused_by_p_spine() {
+        use trust_types::{BasicBlock, BlockId, Operand, Place, Terminator, Ty, UnwindEdge};
+        let callee = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&callee]);
+        let mut caller = efht_t_s3_caller();
+        caller.body.locals.push(trust_types::LocalDecl { index: 5, name: None, ty: Ty::Unit });
+        caller.body.blocks.push(BasicBlock {
+            id: BlockId(2),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                func: "core::panicking::panic".into(),
+                args: vec![],
+                dest: Place::local(5),
+                target: None,
+                unwind: UnwindEdge::Unreachable,
+                span: Default::default(),
+                atomic: None,
+                is_unsafe_sig: false,
+                is_foreign: false,
+                callee_identity: None,
+            },
+        });
+        assert_eq!(efht_t_reason(&caller, &registry), Some("diverging-sink-call-outside-transport-spine"));
+        let (block, locals) = crate::prove::sole_returning_call_arg_locals(&caller.body).expect("the MIR reader skips the sink");
+        assert_eq!((block, locals), (BlockId(0), vec![Some(4)]));
+        assert_eq!(crate::prove::body_is_read_only_except_sole_call(&caller.body), Err("Call terminator"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry).is_err());
+        let _ = Operand::Copy(Place::local(0));
+    }
+
+    /// UNIT — G-TAIL-INDEX: over an inlined body with indices `{argc+3, argc+7}` the tail
+    /// takes `argc+8`, becomes `ret`, reads the inlined `ret`, and the tailed body still
+    /// respects the caller slots; a body whose `ret` is unbound, an `other` on a `None`
+    /// tail, and a missing `other` on a `Cmp` tail all refuse.
+    #[test]
+    fn efht_t_tail_index_allocation() {
+        use crate::mirsem::{ActualBase, SemCmpOp, SemOperand, SemTransportTail};
+        use crate::prove::RetModelSlot;
+        use crate::trustir_anchor::{IrBody, IrOperand, IrRvalue, IrStmt, TrustIrCmpOp};
+        let argc = 2usize;
+        let a = argc as u64;
+        let body = IrBody {
+            stmts: vec![
+                IrStmt { idx: a + 3, rvalue: IrRvalue::Use(IrOperand::Var(0)) },
+                IrStmt { idx: a + 7, rvalue: IrRvalue::Cmp(TrustIrCmpOp::Lt, IrOperand::Var(a + 3), IrOperand::Var(1)) },
+            ],
+            ret: a + 7,
+        };
+        let tailed = crate::prove::append_transport_tail_for_test(body.clone(), &SemTransportTail::NotBool, argc, None).unwrap();
+        assert_eq!(tailed.ret, a + 8);
+        assert_eq!(tailed.stmts.len(), 3);
+        assert_eq!(tailed.stmts[2], IrStmt { idx: a + 8, rvalue: IrRvalue::Cmp(TrustIrCmpOp::Eq, IrOperand::Var(a + 7), IrOperand::Const(0)) });
+        assert!(crate::prove::ret_model_leaves_respect_slots(&tailed, &[Some(RetModelSlot::Value), Some(RetModelSlot::Value)]));
+        let cmp = SemTransportTail::Cmp { op: SemCmpOp::Ge, other: (SemOperand::Const(4), ActualBase::Const), call_is_lhs: false };
+        let tailed = crate::prove::append_transport_tail_for_test(body.clone(), &cmp, argc, Some(IrOperand::Const(4))).unwrap();
+        assert_eq!(tailed.stmts[2].rvalue, IrRvalue::Cmp(TrustIrCmpOp::Ge, IrOperand::Const(4), IrOperand::Var(a + 7)));
+        assert!(crate::prove::append_transport_tail_for_test(body.clone(), &cmp, argc, None).is_none());
+        assert!(crate::prove::append_transport_tail_for_test(body.clone(), &SemTransportTail::None, argc, Some(IrOperand::Const(4))).is_none());
+        assert_eq!(crate::prove::append_transport_tail_for_test(body.clone(), &SemTransportTail::None, argc, None), Some(body.clone()));
+        // A small inlined body under a large caller argc: k is the argc, not max+1.
+        let small = IrBody { stmts: vec![IrStmt { idx: 1, rvalue: IrRvalue::Use(IrOperand::Const(1)) }], ret: 1 };
+        assert_eq!(crate::prove::append_transport_tail_for_test(small, &SemTransportTail::NotBool, 9, None).unwrap().ret, 9);
+        let unbound = IrBody { stmts: body.stmts.clone(), ret: a + 9 };
+        assert!(crate::prove::append_transport_tail_for_test(unbound, &SemTransportTail::NotBool, argc, None).is_none());
+    }
+
+    /// NEGATIVE — G-ACTUAL-VALUE applies the Handle fences to the FIELD ACTUAL'S BASE:
+    /// with `S { x: i64, k: Cell<i64> }` as the referent the recognizer still admits S2
+    /// (asserted — the chase is type-blind past the field) and the consumer refuses with
+    /// the interior-mutability reason; the same read on the tail `other` refuses too.
+    /// TWIN: the plain `S` transports.
+    #[test]
+    fn efht_t_interior_mutability_base_refuses() {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let cell = Ty::adt("core::cell::Cell<i64>", vec![("value".into(), efht_i64())]);
+        let s_cell = Ty::adt("probe::SCell", vec![("x".into(), efht_i64()), ("k".into(), cell)]);
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &pass]);
+        let mut s2 = efht_t_s2_caller();
+        s2.body.locals[1].ty = efht_ref(s_cell.clone());
+        assert_eq!(efht_t_reason(&s2, &registry), None, "the recognizer is type-blind past the field");
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&s2, &registry),
+            Err("Value actual: Field base fails the Handle fences")
+        );
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&efht_t_s2_caller(), &registry), Ok(()), "TWIN");
+        // The tail `other` read off a Cell-bearing handle: the actual is the scalar `k`,
+        // the compared field is `(*_1).x` on `&SCell`.
+        let tail_read = |p_ty: Ty| {
+            efht_t_caller(
+                "probe::s3::tail_cell",
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), p_ty), (Some("k"), efht_i64())],
+                vec![efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(2))],
+                3,
+                vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                vec![efht_assign(
+                    0,
+                    Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(4))),
+                )],
+            )
+        };
+        let over_cell = tail_read(efht_ref(s_cell));
+        assert_eq!(efht_t_reason(&over_cell, &registry), Some("tail-reads-a-handle-not-transported"), "the handle is no actual's base — the ordered first refusal");
+        let over_s = tail_read(efht_ref(efht_struct_s()));
+        assert_eq!(efht_t_reason(&over_s, &registry), Some("tail-reads-a-handle-not-transported"));
+        // With the handle ALSO passed as an actual it becomes transported, and then the
+        // consumer's fences on the tail read are what refuse the Cell-bearing referent.
+        let two_actuals = |p_ty: Ty, callee_two: &trust_types::VerifiableFunction| {
+            efht_t_caller(
+                "probe::s3::tail_cell2",
+                &callee_two.def_path,
+                Ty::Bool,
+                vec![(Some("s"), p_ty), (Some("k"), efht_i64())],
+                vec![efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+                3,
+                vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                vec![efht_assign(
+                    0,
+                    Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(4))),
+                )],
+            )
+        };
+        // `fn x_plus_k(s: &S, k: i64) -> i64 { _3 = (*_1).x; _0 = _3 }` (k unused).
+        let mk_callee = |name: &str, p_ty: Ty| {
+            use trust_types::{BasicBlock, BlockId, Terminator};
+            efht_func(
+                name,
+                vec![(None, efht_i64()), (Some("s"), p_ty), (Some("k"), efht_i64()), (None, efht_i64())],
+                2,
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))),
+                        efht_assign(0, Rvalue::Use(Operand::Copy(Place::local(3)))),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+            )
+        };
+        let plain_callee = mk_callee("probe::x_of", efht_ref(efht_struct_s()));
+        let plain_registry = efht_t_registry(&[&plain_callee]);
+        assert!(plain_registry[&plain_callee.def_path].ret_model.is_some(), "the two-param handle callee mints");
+        let plain = two_actuals(efht_ref(efht_struct_s()), &plain_callee);
+        assert_eq!(efht_t_reason(&plain, &plain_registry), None);
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&plain, &plain_registry), Ok(()), "TWIN");
+        let cell_callee = mk_callee("probe::x_of_cell", efht_ref(Ty::adt("probe::SCell", vec![("x".into(), efht_i64()), ("k".into(), Ty::adt("core::cell::Cell<i64>", vec![("value".into(), efht_i64())]))])));
+        assert!(crate::prove::pure_scalar_ret_model(&cell_callee).is_none(), "the minter's own Handle fence refuses a Cell-bearing referent");
+        // Forge the model past the minter to reach the consumer's tail-read fence.
+        let mut cell_registry = efht_t_registry(&[&cell_callee]);
+        cell_registry.get_mut(&cell_callee.def_path).unwrap().ret_model = plain_registry[&plain_callee.def_path].ret_model.clone();
+        let cell = two_actuals(efht_ref(Ty::adt("probe::SCell", vec![("x".into(), efht_i64()), ("k".into(), Ty::adt("core::cell::Cell<i64>", vec![("value".into(), efht_i64())]))])), &cell_callee);
+        assert_eq!(efht_t_reason(&cell, &cell_registry), None, "the recognizer admits it");
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&cell, &cell_registry),
+            Err("Handle actual: deny-list fences fail on the caller param"),
+            "the Handle actual's fence fires first; the tail read shares the base and would refuse next"
+        );
+    }
+
+    /// PIN — the SHARED recognizers are byte-unchanged on the transport fixtures:
+    /// `sem_call_return_of_mir_diag`'s first reason and `sem_call_then_pureop_of_mir`'s
+    /// Some/None per shape, measured at landing.
+    #[test]
+    fn efht_t_shared_recognizers_byte_unchanged() {
+        let pass = efht_t_pass_callee();
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&pass, &is_zero]);
+        let expect: [(trust_types::VerifiableFunction, Option<&str>, bool); 3] = [
+            (efht_t_s2_caller(), None, false),
+            (efht_t_s3_caller(), Some("return-block-does-not-move-the-temp-into-_0"), true),
+            (efht_t_s4_caller(), Some("argument-outside-modeled-operand-fragment"), false),
+        ];
+        for (caller, shared, pureop) in expect {
+            assert_eq!(efht_t_shared_reason(&caller, &registry), shared, "{}", caller.def_path);
+            assert_eq!(
+                crate::mirsem::sem_call_then_pureop_of_mir(&caller, &registry).is_some(),
+                pureop,
+                "{}: sem_call_then_pureop_of_mir",
+                caller.def_path
+            );
+        }
+    }
+
+    /// VALUE ORACLE — the tail's op mapping: each `SemCmpOp` maps to the `TrustIrCmpOp`
+    /// of the SAME name, and MIR's `BinOp` reaches it through `sem_cmpop_of_mir` exactly
+    /// as the chain builder's own comparison arm does (the kernel proves the tailed term
+    /// against itself, so this table is the defense).
+    #[test]
+    fn efht_t_cmpop_mapping_value_oracle() {
+        use crate::mirsem::SemCmpOp;
+        use trust_types::BinOp;
+        for (mir, sem, name) in [
+            (BinOp::Lt, SemCmpOp::Lt, "Lt"),
+            (BinOp::Le, SemCmpOp::Le, "Le"),
+            (BinOp::Eq, SemCmpOp::Eq, "Eq"),
+            (BinOp::Ne, SemCmpOp::Ne, "Ne"),
+            (BinOp::Gt, SemCmpOp::Gt, "Gt"),
+            (BinOp::Ge, SemCmpOp::Ge, "Ge"),
+        ] {
+            assert_eq!(crate::mirsem::sem_cmpop_of_mir(&mir), Some(sem));
+            assert_eq!(crate::prove::trustir_cmpop_of_sem_for_test(sem).trust_ir_name(), name);
+            assert_eq!(format!("{sem:?}"), name);
+        }
+        for mir in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::BitAnd, BinOp::Shl] {
+            assert_eq!(crate::mirsem::sem_cmpop_of_mir(&mir), None);
+        }
+    }
+
+    /// PIN — H1 residual: a callee whose def-path is DUPLICATED among the dumped bodies
+    /// mints NO model (`unique_def_path_ret_model`), so the value claim never rides on a
+    /// mis-resolved registry row; the unique twin mints.
+    #[test]
+    fn efht_t_duplicate_def_path_callee_mints_nothing() {
+        let is_zero = efht_t_is_zero_callee();
+        let twin = efht_t_is_zero_callee();
+        assert!(crate::prove::unique_def_path_ret_model(&is_zero, &[is_zero.clone()]).is_some());
+        assert!(crate::prove::unique_def_path_ret_model(&is_zero, &[is_zero.clone(), twin]).is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT-T H2 LENS (2026-08-29) — the S2 field-read actual and the S4 deref
+    // temp are UNTIMED reads (`idx_elem` carries no time index; the deref temp denotes
+    // the ENTRY referent). Every test below constructs a caller where the read happens,
+    // then SOMETHING WRITES THE POINTEE, then the call — through a channel named by the
+    // lens — and asserts NO TRANSPORT. Each carries a tightness twin (the same fixture
+    // minus the offending feature) that DOES transport, so a refusal is measured
+    // against a live positive, never against a fixture that was dead on arrival.
+    //
+    // The diagnostics printed by `efht_t_h2_refuses` are what the report reads: which
+    // of the four gates (transport recognizer, shared recognizer, caller allow-list,
+    // consumer) is the FIRST to refuse, so a refusal that rests on one gate alone is
+    // visible as such.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The four verdicts the H2 battery reads per fixture, printed and returned.
+    fn efht_t_h2_verdicts(
+        f: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+        label: &str,
+    ) -> (Option<&'static str>, Option<&'static str>, Result<(), &'static str>, Result<(), &'static str>) {
+        let transport = efht_t_reason(f, registry);
+        let shared = efht_t_shared_reason(f, registry);
+        let allow = crate::prove::body_is_read_only_except_sole_call(&f.body);
+        let consumer = crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(f, registry);
+        eprintln!(
+            "h2[{label}] transport={transport:?} shared={shared:?} allow_list={allow:?} consumer={consumer:?}"
+        );
+        (transport, shared, allow, consumer)
+    }
+    /// The load-bearing assertion of the lens: the fixture does NOT transport.
+    fn efht_t_h2_refuses(
+        f: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+        label: &str,
+    ) -> (Option<&'static str>, Option<&'static str>, Result<(), &'static str>, Result<(), &'static str>) {
+        let v = efht_t_h2_verdicts(f, registry, label);
+        assert!(
+            !crate::prove::transported_call_return_for_test(f, registry),
+            "H2 HOLE [{label}]: a caller with a write to the pointee between the untimed read and the call TRANSPORTED: {v:?}"
+        );
+        assert!(v.3.is_err(), "[{label}] the boolean and the reasoned consumer disagree: {v:?}");
+        v
+    }
+    /// The tightness twin: the same fixture minus the offending feature transports.
+    fn efht_t_h2_transports(
+        f: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+        label: &str,
+    ) {
+        let v = efht_t_h2_verdicts(f, registry, label);
+        assert_eq!(v.3, Ok(()), "TWIN [{label}] must transport, else the negative pins nothing: {v:?}");
+        assert!(crate::prove::transported_call_return_for_test(f, registry));
+    }
+    /// `(*_local) = const v` — the S4 pointee store.
+    fn efht_t_h2_deref_store(local: usize, v: i128) -> trust_types::Statement {
+        trust_types::Statement::Assign {
+            place: efht_t_deref(local),
+            rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(trust_types::ConstValue::Int(v))),
+            span: Default::default(),
+        }
+    }
+    /// The S2 attack frame: `fn c(s: &S, <second>) -> bool { _3 = (*_1).0; <between>;
+    /// is_zero(copy _3) -> _0 }` with `extra` locals after `_3`.
+    fn efht_t_h2_s2_frame(
+        name: &str,
+        second: Option<trust_types::Ty>,
+        extra: Vec<trust_types::Ty>,
+        between: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Rvalue, Ty};
+        let mut params = vec![(Some("s"), efht_ref(efht_struct_s()))];
+        let read_temp = if let Some(t) = second {
+            params.push((Some("m"), t));
+            3
+        } else {
+            2
+        };
+        let mut extras = vec![efht_i64()];
+        extras.extend(extra);
+        let mut prefix = vec![efht_assign(read_temp, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))];
+        prefix.extend(between);
+        efht_t_caller(
+            name,
+            "probe::is_zero",
+            Ty::Bool,
+            params,
+            extras,
+            vec![Operand::Copy(Place::local(read_temp))],
+            0,
+            prefix,
+            vec![],
+        )
+    }
+    /// The S4 attack frame: `fn c(p: &i64, <second>) -> bool { _t = *_1; <between>;
+    /// is_zero(copy _t) -> _r; _0 = Not(_r) }`.
+    fn efht_t_h2_s4_frame(
+        name: &str,
+        second: Option<trust_types::Ty>,
+        extra: Vec<trust_types::Ty>,
+        between: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{Operand, Place, Rvalue, Ty, UnOp};
+        let mut params = vec![(Some("p"), efht_ref(efht_i64()))];
+        let read_temp = if let Some(t) = second {
+            params.push((Some("m"), t));
+            3
+        } else {
+            2
+        };
+        let dest = read_temp + 1;
+        let mut extras = vec![efht_i64(), Ty::Bool];
+        extras.extend(extra);
+        let mut prefix = vec![efht_assign(read_temp, Rvalue::Use(Operand::Copy(efht_t_deref(1))))];
+        prefix.extend(between);
+        efht_t_caller(
+            name,
+            "probe::is_zero",
+            Ty::Bool,
+            params,
+            extras,
+            vec![Operand::Copy(Place::local(read_temp))],
+            dest,
+            prefix,
+            vec![efht_assign(0, Rvalue::UnaryOp(UnOp::Not, Operand::Move(Place::local(dest))))],
+        )
+    }
+
+    /// H2 ATTACK — a SECOND PARAMETER aliasing the pointee (`m: &mut S` / `*mut S`; MIR
+    /// does not know `s` and `m` are disjoint): the read, a write through `m`, then the
+    /// call. Written: the allow-list refuses. Unwritten: the recognizer ADMITS it and the
+    /// body is read-only (asserted), so G-FROZEN alone refuses. S4 likewise with
+    /// `m: &mut i64`. TWINS: a shared `&S` / `&i64` second parameter transports.
+    #[test]
+    fn efht_t_h2_second_param_alias_write_between_read_and_call_refuses() {
+        use trust_types::Ty;
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let m_s = Ty::Ref { mutable: true, inner: Box::new(efht_struct_s()) };
+        let raw_s = Ty::RawPtr { mutable: true, pointee: Box::new(efht_struct_s()) };
+        let m_i = Ty::Ref { mutable: true, inner: Box::new(efht_i64()) };
+        // S2, written through the `&mut S` alias between the read and the call.
+        let written = efht_t_h2_s2_frame("probe::h2::s2_alias_written", Some(m_s.clone()), vec![], vec![efht_store(2, 0, 7)]);
+        let v = efht_t_h2_refuses(&written, &registry, "s2 &mut alias written");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // S2, the alias merely PRESENT: recognizer admits, allow-list passes, G-FROZEN refuses.
+        let unwritten = efht_t_h2_s2_frame("probe::h2::s2_alias", Some(m_s.clone()), vec![], vec![]);
+        let v = efht_t_h2_refuses(&unwritten, &registry, "s2 &mut alias unwritten");
+        assert_eq!(v.0, None, "the recognizer admits the unwritten alias — G-FROZEN is the gate");
+        assert_eq!(v.2, Ok(()));
+        assert_eq!(v.3, Err("G-FROZEN: caller has a RawPtr or &mut parameter"));
+        let raw = efht_t_h2_s2_frame("probe::h2::s2_raw_alias", Some(raw_s), vec![], vec![]);
+        let v = efht_t_h2_refuses(&raw, &registry, "s2 *mut alias unwritten");
+        assert_eq!(v.3, Err("G-FROZEN: caller has a RawPtr or &mut parameter"));
+        // S4, written through the `&mut i64` alias.
+        let s4_written = efht_t_h2_s4_frame("probe::h2::s4_alias_written", Some(m_i.clone()), vec![], vec![efht_t_h2_deref_store(2, 7)]);
+        let v = efht_t_h2_refuses(&s4_written, &registry, "s4 &mut alias written");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        let s4_unwritten = efht_t_h2_s4_frame("probe::h2::s4_alias", Some(m_i), vec![], vec![]);
+        let v = efht_t_h2_refuses(&s4_unwritten, &registry, "s4 &mut alias unwritten");
+        assert_eq!(v.3, Err("G-FROZEN: caller has a RawPtr or &mut parameter"));
+        // TWINS — a SHARED second parameter is harmless and transports.
+        efht_t_h2_transports(&efht_t_h2_s2_frame("probe::h2::s2_shared_second", Some(efht_ref(efht_struct_s())), vec![], vec![]), &registry, "s2 &S second param");
+        efht_t_h2_transports(&efht_t_h2_s4_frame("probe::h2::s4_shared_second", Some(efht_ref(efht_i64())), vec![], vec![]), &registry, "s4 &i64 second param");
+    }
+
+    /// H2 ATTACK — a REBORROW of the handle between the read and the call: a shared
+    /// reborrow `_4 = &(*_1)` then a store through it; a shared reborrow of the FIELD
+    /// `_4 = &((*_1).0)` then a store through it; a `&mut` reborrow with no store at all.
+    /// S4 likewise. TWINS: an unwritten shared reborrow is a harmless alias and
+    /// transports (the deny-list follows it, asserted, and finds nothing).
+    #[test]
+    fn efht_t_h2_reborrow_write_between_read_and_call_refuses() {
+        use trust_types::{Place, Projection, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let reborrow = |local: usize, place: Place, mutable: bool| efht_assign(local, Rvalue::Ref { mutable, place });
+        // S2 + shared reborrow of the referent, then a store through it.
+        let whole = efht_t_h2_s2_frame(
+            "probe::h2::s2_reborrow_store",
+            None,
+            vec![efht_ref(efht_struct_s())],
+            vec![reborrow(3, efht_t_deref(1), false), efht_store(3, 0, 7)],
+        );
+        let v = efht_t_h2_refuses(&whole, &registry, "s2 shared reborrow + store");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        assert!(crate::mirsem::deref_write_exists(&whole.body, 1), "the deny-list follows the reborrow to the store too");
+        // S2 + shared reborrow of the FIELD, then a store through it.
+        let field = efht_t_h2_s2_frame(
+            "probe::h2::s2_field_reborrow_store",
+            None,
+            vec![efht_ref(efht_i64())],
+            vec![reborrow(3, efht_deref_field(1, 0), false), efht_t_h2_deref_store(3, 7)],
+        );
+        let v = efht_t_h2_refuses(&field, &registry, "s2 shared field reborrow + store");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // S2 + a `&mut` reborrow, no store: the allow-list refuses the borrow itself.
+        let mut_reborrow = efht_t_h2_s2_frame(
+            "probe::h2::s2_mut_reborrow",
+            None,
+            vec![Ty::Ref { mutable: true, inner: Box::new(efht_struct_s()) }],
+            vec![reborrow(3, efht_t_deref(1), true)],
+        );
+        let v = efht_t_h2_refuses(&mut_reborrow, &registry, "s2 &mut reborrow unwritten");
+        assert_eq!(v.2, Err("Ref { mutable: true }"));
+        // S4 + shared reborrow of the scalar referent, then a store through it.
+        let s4 = efht_t_h2_s4_frame(
+            "probe::h2::s4_reborrow_store",
+            None,
+            vec![efht_ref(efht_i64())],
+            vec![reborrow(4, efht_t_deref(1), false), efht_t_h2_deref_store(4, 7)],
+        );
+        let v = efht_t_h2_refuses(&s4, &registry, "s4 shared reborrow + store");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // TWINS — the unwritten shared reborrows transport.
+        efht_t_h2_transports(
+            &efht_t_h2_s2_frame("probe::h2::s2_reborrow", None, vec![efht_ref(efht_struct_s())], vec![reborrow(3, efht_t_deref(1), false)]),
+            &registry,
+            "s2 shared reborrow unwritten",
+        );
+        efht_t_h2_transports(
+            &efht_t_h2_s4_frame("probe::h2::s4_reborrow", None, vec![efht_ref(efht_i64())], vec![reborrow(4, efht_t_deref(1), false)]),
+            &registry,
+            "s4 shared reborrow unwritten",
+        );
+        let _ = Projection::Deref;
+    }
+
+    /// H2 ATTACK — a RAW POINTER to the pointee between the read and the call: a
+    /// `PtrToPtr` cast `_4 = _1 as *mut S` (no `AddressOf` anywhere — the D2 escape) then
+    /// a store; `&raw mut (*_1)` then a store; `&raw const (*_1)` alone; and the one the
+    /// allow-list ADMITS — a pointer-to-INTEGER cast `_4 = _1 as usize` — which only the
+    /// deny-list (`raw_exposure_exists`) sees. S4 likewise. TWIN: S2 as built.
+    #[test]
+    fn efht_t_h2_raw_pointer_cast_write_between_read_and_call_refuses() {
+        use trust_types::{Operand, Place, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let mut_s = Ty::RawPtr { mutable: true, pointee: Box::new(efht_struct_s()) };
+        let const_s = Ty::RawPtr { mutable: false, pointee: Box::new(efht_struct_s()) };
+        let mut_i = Ty::RawPtr { mutable: true, pointee: Box::new(efht_i64()) };
+        let cast = |local: usize, ty: Ty| efht_assign(local, Rvalue::Cast(Operand::Copy(Place::local(1)), ty));
+        // (a) PtrToPtr cast, then a store through the raw pointer.
+        let ptr_cast = efht_t_h2_s2_frame("probe::h2::s2_ptr_cast_store", None, vec![mut_s.clone()], vec![cast(3, mut_s.clone()), efht_store(3, 0, 7)]);
+        let v = efht_t_h2_refuses(&ptr_cast, &registry, "s2 ptr cast + store");
+        assert_eq!(v.2, Err("Cast to a non-scalar type"));
+        // (b) `&raw mut (*_1)`, then a store.
+        let raw_mut = efht_t_h2_s2_frame(
+            "probe::h2::s2_raw_mut_store",
+            None,
+            vec![mut_s.clone()],
+            vec![efht_assign(3, Rvalue::AddressOf(true, efht_t_deref(1))), efht_store(3, 0, 7)],
+        );
+        let v = efht_t_h2_refuses(&raw_mut, &registry, "s2 &raw mut + store");
+        assert_eq!(v.2, Err("AddressOf"));
+        // (c) `&raw const (*_1)` alone.
+        let raw_const = efht_t_h2_s2_frame("probe::h2::s2_raw_const", None, vec![const_s], vec![efht_assign(3, Rvalue::AddressOf(false, efht_t_deref(1)))]);
+        let v = efht_t_h2_refuses(&raw_const, &registry, "s2 &raw const");
+        assert_eq!(v.2, Err("AddressOf"));
+        // (d) pointer-to-integer cast: the allow-list admits a scalar `Cast`; only the
+        // deny-list fence on the field actual's base refuses.
+        let int_cast = efht_t_h2_s2_frame("probe::h2::s2_int_cast", None, vec![efht_usize()], vec![cast(3, efht_usize())]);
+        let v = efht_t_h2_refuses(&int_cast, &registry, "s2 ptr-to-int cast");
+        assert_eq!(v.2, Ok(()), "the allow-list ADMITS `p as usize`; the refusal rests on the deny-list");
+        assert!(crate::mirsem::raw_exposure_exists(&int_cast.body, 1));
+        // (e) S4: PtrToPtr cast, then a store through it.
+        let s4 = efht_t_h2_s4_frame("probe::h2::s4_ptr_cast_store", None, vec![mut_i.clone()], vec![cast(4, mut_i), efht_t_h2_deref_store(4, 7)]);
+        let v = efht_t_h2_refuses(&s4, &registry, "s4 ptr cast + store");
+        assert_eq!(v.2, Err("Cast to a non-scalar type"));
+        // (f) S4: pointer-to-integer cast alone.
+        let s4_int = efht_t_h2_s4_frame("probe::h2::s4_int_cast", None, vec![efht_usize()], vec![cast(4, efht_usize())]);
+        let v = efht_t_h2_refuses(&s4_int, &registry, "s4 ptr-to-int cast");
+        assert_eq!(v.2, Ok(()));
+        // TWINS.
+        efht_t_h2_transports(&efht_t_s2_caller(), &registry, "s2 as built");
+        efht_t_h2_transports(&efht_t_s4_caller(), &registry, "s4 as built");
+    }
+
+    /// H2 ATTACK — the write sits in a `SwitchInt` ARM: (a) S2 guarded before the call
+    /// with the store in the arm that joins the call block; (b) the same store in a DEAD
+    /// arm (`Unreachable`, never returns) — the allow-list is whole-body; (c) the
+    /// Handle-passthrough shape the consumer's FALLBACK path admits when guarded, with
+    /// the store in the other arm; (d) an S3 whose guard sits AFTER the call with the
+    /// store in an arm before the tail's read. TWIN: the guarded passthrough with a
+    /// write-free dead arm transports (through the shared recognizer, as pinned).
+    #[test]
+    fn efht_t_h2_write_in_a_switchint_arm_refuses() {
+        use trust_types::{BasicBlock, BinOp, BlockId, Operand, Place, Rvalue, Terminator, Ty, UnwindEdge};
+        let is_zero = efht_t_is_zero_callee();
+        let get_x = efht_field_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &get_x, &pass]);
+        let call = |id: usize, callee: &str, arg: usize, dest: usize, target: usize| BasicBlock {
+            id: BlockId(id),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                func: callee.into(),
+                args: vec![Operand::Copy(Place::local(arg))],
+                dest: Place::local(dest),
+                target: Some(BlockId(target)),
+                unwind: UnwindEdge::Unreachable,
+                span: Default::default(),
+                atomic: None,
+                is_unsafe_sig: false,
+                is_foreign: false,
+                callee_identity: None,
+            },
+        };
+        let switch = |discr: usize, zero: usize, otherwise: usize| Terminator::SwitchInt {
+            discr: Operand::Copy(Place::local(discr)),
+            targets: vec![(0, BlockId(zero))],
+            otherwise: BlockId(otherwise),
+            exhaustive_enum_unreachable: false,
+            span: Default::default(),
+        };
+        // (a)/(b) S2 guarded on `k`: bb0 { _3 = (*_1).0; switchInt(_2) } bb1 { is_zero(_3) -> _0 [bb3] } bb2 { store; <goto bb1 | Unreachable> } bb3 { Return }.
+        let s2_guarded = |name: &str, arm: BasicBlock| {
+            efht_func(
+                name,
+                vec![(None, Ty::Bool), (Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64()), (None, efht_i64())],
+                2,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                        terminator: switch(2, 1, 2),
+                    },
+                    call(1, "probe::is_zero", 3, 0, 3),
+                    arm,
+                    BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+                ],
+            )
+        };
+        let joining = s2_guarded("probe::h2::s2_switch_join_store", BasicBlock { id: BlockId(2), stmts: vec![efht_store(1, 0, 7)], terminator: Terminator::Goto(BlockId(1)) });
+        let v = efht_t_h2_refuses(&joining, &registry, "s2 switch arm store joins call");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        let dead = s2_guarded("probe::h2::s2_switch_dead_store", BasicBlock { id: BlockId(2), stmts: vec![efht_store(1, 0, 7)], terminator: Terminator::Unreachable });
+        let v = efht_t_h2_refuses(&dead, &registry, "s2 switch dead arm store");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // (c) the guarded Handle passthrough: bb0 { switchInt(_2) } bb1 { get_x(_1) -> _0 [bb3] } bb2 { store; goto bb1 } bb3 { Return }.
+        let passthrough_guarded = |name: &str, arm: BasicBlock| {
+            efht_func(
+                name,
+                vec![(None, efht_i64()), (Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64())],
+                2,
+                vec![
+                    BasicBlock { id: BlockId(0), stmts: vec![], terminator: switch(2, 1, 2) },
+                    call(1, "probe::get_x", 1, 0, 3),
+                    arm,
+                    BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+                ],
+            )
+        };
+        let pt_join = passthrough_guarded("probe::h2::pt_switch_join_store", BasicBlock { id: BlockId(2), stmts: vec![efht_store(1, 0, 7)], terminator: Terminator::Goto(BlockId(1)) });
+        let v = efht_t_h2_refuses(&pt_join, &registry, "passthrough switch arm store joins call");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        let pt_dead = passthrough_guarded("probe::h2::pt_switch_dead_store", BasicBlock { id: BlockId(2), stmts: vec![efht_store(1, 0, 7)], terminator: Terminator::Unreachable });
+        let v = efht_t_h2_refuses(&pt_dead, &registry, "passthrough switch dead arm store");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // (d) S3 with the guard AFTER the call: bb0 { _4 = (*_1).0; pass(_4) -> _3 [bb1] } bb1 { switchInt(_3) } bb2 { store; goto bb3 } bb3 { _0 = Eq(_2, _3); Return }.
+        let post = efht_func(
+            "probe::h2::s3_post_switch_store",
+            vec![(None, Ty::Bool), (Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64()), (None, efht_i64()), (None, efht_i64())],
+            2,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                    terminator: Terminator::Call {
+                        func: "probe::pass".into(),
+                        args: vec![Operand::Copy(Place::local(4))],
+                        dest: Place::local(3),
+                        target: Some(BlockId(1)),
+                        unwind: UnwindEdge::Unreachable,
+                        span: Default::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: switch(3, 2, 3) },
+                BasicBlock { id: BlockId(2), stmts: vec![efht_store(1, 0, 7)], terminator: Terminator::Goto(BlockId(3)) },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![efht_assign(0, Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(2)), Operand::Move(Place::local(3))))],
+                    terminator: Terminator::Return,
+                },
+            ],
+        );
+        let v = efht_t_h2_refuses(&post, &registry, "s3 post-call switch arm store");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // TWIN — the guarded passthrough with a write-free dead arm transports (fallback).
+        let twin = passthrough_guarded("probe::h2::pt_switch_dead", BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Unreachable });
+        efht_t_h2_transports(&twin, &registry, "guarded passthrough, write-free");
+    }
+
+    /// H2 ATTACK — pointee-write channels the caller allow-list CANNOT see, because
+    /// `body_is_read_only_except_sole_call` replaces the excused call with a `Goto` and
+    /// so never inspects the call's own `atomic`/`is_foreign`/`is_unsafe_sig`/`dest`:
+    /// (a) an atomic STORE through the handle carried on the sole call; (b) a foreign
+    /// callee; (c) an unsafe-signature callee; (d) the call's DEST is the pointee field
+    /// `(*_1).0`; (e) a PROJECTED write to the parameter local with no `Deref`
+    /// (`_1.0 = 7`, hand-built) — admitted by the allow-list, refused by the deny-list;
+    /// (f) a cleanup edge whose block stores through the handle. The allow-list verdict
+    /// is asserted per case so a refusal that rests on the recognizer alone is visible.
+    /// TWIN: S2 as built.
+    #[test]
+    fn efht_t_h2_pointee_write_channels_the_allow_list_cannot_see_refuse() {
+        use trust_types::{AtomicOpKind, AtomicOperation, AtomicOrdering, BasicBlock, BlockId, ConstValue, Operand, Place, Projection, Rvalue, Statement, Terminator, UnwindEdge};
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &pass]);
+        // (a) atomic store through the handle on the sole call.
+        let mut atomic = efht_t_s2_caller();
+        let Terminator::Call { atomic: slot, .. } = &mut atomic.body.blocks[0].terminator else { unreachable!() };
+        *slot = Some(AtomicOperation {
+            place: efht_deref_field(1, 0),
+            dest: None,
+            op_kind: AtomicOpKind::Store,
+            ordering: AtomicOrdering::SeqCst,
+            failure_ordering: None,
+            span: Default::default(),
+        });
+        let v = efht_t_h2_refuses(&atomic, &registry, "atomic store on the sole call");
+        assert_eq!(v.2, Ok(()), "the allow-list never sees the excused call's atomic place");
+        assert_eq!(v.0, Some("abi-foreign-or-atomic-or-unsafe-sig"));
+        assert_eq!(v.1, Some("abi-foreign-or-atomic-or-unsafe-sig"), "the fallback recognizer refuses it too");
+        // (b)/(c) foreign / unsafe-signature sole call.
+        for (label, foreign, unsafe_sig) in [("foreign sole call", true, false), ("unsafe-sig sole call", false, true)] {
+            let mut f = efht_t_s2_caller();
+            let Terminator::Call { is_foreign, is_unsafe_sig, .. } = &mut f.body.blocks[0].terminator else { unreachable!() };
+            *is_foreign = foreign;
+            *is_unsafe_sig = unsafe_sig;
+            let v = efht_t_h2_refuses(&f, &registry, label);
+            assert_eq!(v.2, Ok(()), "{label}: invisible to the allow-list");
+            assert_eq!(v.0, Some("abi-foreign-or-atomic-or-unsafe-sig"), "{label}");
+            assert_eq!(v.1, Some("abi-foreign-or-atomic-or-unsafe-sig"), "{label}");
+        }
+        // (d) the call's dest is the pointee field: `_3 = (*_1).0; pass(copy _3) -> (*_1).0`.
+        let mut dest_pointee = efht_t_caller(
+            "probe::h2::dest_is_pointee",
+            "probe::pass",
+            efht_i64(),
+            vec![(Some("s"), efht_ref(efht_struct_s()))],
+            vec![efht_i64()],
+            vec![Operand::Copy(Place::local(2))],
+            0,
+            vec![efht_assign(2, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![efht_assign(0, Rvalue::Use(Operand::Constant(ConstValue::Int(0))))],
+        );
+        let Terminator::Call { dest, .. } = &mut dest_pointee.body.blocks[0].terminator else { unreachable!() };
+        *dest = efht_deref_field(1, 0);
+        let v = efht_t_h2_refuses(&dest_pointee, &registry, "call dest is the pointee field");
+        assert_eq!(v.2, Ok(()), "the allow-list erases the call's dest with the call");
+        assert!(crate::mirsem::deref_write_exists(&dest_pointee.body, 1), "the deny-list sees the call-dest write");
+        // (e) a projected, non-Deref write to the parameter local (hand-built): admitted
+        // by the allow-list, caught by `param_reassigned_by_stmt` in the fences.
+        let projected = efht_t_h2_s2_frame(
+            "probe::h2::s2_projected_param_write",
+            None,
+            vec![],
+            vec![Statement::Assign {
+                place: Place { local: 1, projections: vec![Projection::Field(0)] },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(7))),
+                span: Default::default(),
+            }],
+        );
+        let v = efht_t_h2_refuses(&projected, &registry, "projected non-Deref write to the param");
+        assert_eq!(v.2, Ok(()), "the allow-list admits a non-Deref-rooted Assign");
+        assert!(crate::mirsem::param_reassigned_by_stmt(&projected.body, 1));
+        // (f) a cleanup edge whose block stores through the handle, then resumes.
+        let mut cleanup = efht_t_s2_caller();
+        let Terminator::Call { unwind, .. } = &mut cleanup.body.blocks[0].terminator else { unreachable!() };
+        *unwind = UnwindEdge::Cleanup(BlockId(2));
+        cleanup.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![efht_store(1, 0, 7)], terminator: Terminator::Resume });
+        let v = efht_t_h2_refuses(&cleanup, &registry, "cleanup block stores through the handle");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // TWIN.
+        efht_t_h2_transports(&efht_t_s2_caller(), &registry, "s2 as built");
+    }
+
+    /// H2 ATTACK — the HANDLE LOCAL is REBOUND to another handle, so the untimed read
+    /// `Field(0, 0)` / `Var(0)` would name the wrong referent: (a) S2 rebound BEFORE the
+    /// read (`_1 = copy _2; _3 = (*_1).0`) — the real value bug; (b) S2 rebound AFTER the
+    /// read, before the call (over-strict, pinned); (c) S4 rebound before the read;
+    /// (d) the handle rebound by the sole call's own DEST. Each rebind is an ordinary
+    /// `Use`/call-dest the allow-list admits (asserted). TWINS: two shared handles with
+    /// no rebind transport.
+    #[test]
+    fn efht_t_h2_handle_rebound_before_the_read_refuses() {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &pass]);
+        let rebind = efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(2))));
+        // (a) S2: `_1 = copy _2; _3 = (*_1).0; is_zero(_3) -> _0` with `_2: &S`.
+        let mut before = efht_t_h2_s2_frame("probe::h2::s2_rebound_before", Some(efht_ref(efht_struct_s())), vec![], vec![]);
+        before.body.blocks[0].stmts.insert(0, rebind.clone());
+        let v = efht_t_h2_refuses(&before, &registry, "s2 handle rebound before the read");
+        assert_eq!(v.2, Ok(()), "a whole-local `Use` rebind is admitted by the allow-list");
+        assert!(crate::mirsem::param_reassigned_by_stmt(&before.body, 1));
+        // (b) S2: rebound AFTER the read, before the call.
+        let after = efht_t_h2_s2_frame("probe::h2::s2_rebound_after", Some(efht_ref(efht_struct_s())), vec![], vec![rebind.clone()]);
+        let v = efht_t_h2_refuses(&after, &registry, "s2 handle rebound after the read");
+        assert_eq!(v.2, Ok(()));
+        // (c) S4: `_1 = copy _2; _3 = *_1; ...` with `_2: &i64`.
+        let mut s4 = efht_t_h2_s4_frame("probe::h2::s4_rebound_before", Some(efht_ref(efht_i64())), vec![], vec![]);
+        s4.body.blocks[0].stmts.insert(0, rebind.clone());
+        let v = efht_t_h2_refuses(&s4, &registry, "s4 handle rebound before the read");
+        assert_eq!(v.2, Ok(()));
+        // (d) the sole call's dest rebinds a parameter: `_4 = (*_1).0; pass(_4) -> _2; _0 = Eq(_2, 0)`.
+        let dest_param = efht_t_caller(
+            "probe::h2::s3_dest_rebinds_param",
+            "probe::pass",
+            Ty::Bool,
+            vec![(Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64())],
+            vec![efht_i64(), efht_i64()],
+            vec![Operand::Copy(Place::local(4))],
+            2,
+            vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![efht_assign(0, Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(2)), Operand::Constant(ConstValue::Int(0))))],
+        );
+        let v = efht_t_h2_refuses(&dest_param, &registry, "call dest rebinds a parameter");
+        assert_eq!(v.2, Ok(()), "the allow-list erases the call-dest rebind with the call");
+        assert_eq!(v.0, Some("call-overwrites-a-parameter"));
+        // TWINS.
+        efht_t_h2_transports(&efht_t_h2_s2_frame("probe::h2::s2_two_handles", Some(efht_ref(efht_struct_s())), vec![], vec![]), &registry, "s2 two shared handles, no rebind");
+        efht_t_h2_transports(&efht_t_h2_s4_frame("probe::h2::s4_two_handles", Some(efht_ref(efht_i64())), vec![], vec![]), &registry, "s4 two shared handles, no rebind");
+    }
+
+    /// H2 ATTACK — TWO field reads of the SAME base STRADDLING the call, the exact shape
+    /// CLAUDE.md says must carry a time index once a write can sit between them: (a) the
+    /// second read after the call feeds the tail (no write); (b) the same with a store
+    /// between the call and the second read; (c) both reads before the call with a store
+    /// BETWEEN THEM — both leaves would enter the theorem as one untimed term;
+    /// (d) S4's deref-temp twin of (a). TWIN: both reads BEFORE the call and no write
+    /// transports, and the tailed term carries `Field(0, 0)` twice — one untimed
+    /// selector, exact because nothing between entry and Return can move it.
+    #[test]
+    fn efht_t_h2_two_field_reads_of_one_base_straddling_the_call_refuse() {
+        use crate::trustir_anchor::{IrOperand, IrRvalue};
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&pass]);
+        let read = |t: usize| efht_assign(t, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))));
+        // `fn c(s: &S) -> bool { _4 = (*_1).0; pass(copy _4) -> _3; <post>; _0 = Eq(move _3, copy _5) }`.
+        let straddle = |name: &str, pre: Vec<trust_types::Statement>, post: Vec<trust_types::Statement>| {
+            let mut tail = post;
+            tail.push(efht_assign(0, Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(5)))));
+            efht_t_caller(
+                name,
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s()))],
+                vec![efht_i64(), efht_i64(), efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(4))],
+                3,
+                pre,
+                tail,
+            )
+        };
+        // (a) second read AFTER the call, no write.
+        let after = straddle("probe::h2::reads_straddle", vec![read(4)], vec![read(5)]);
+        let v = efht_t_h2_refuses(&after, &registry, "second read after the call");
+        assert_eq!(v.0, Some("tail-other-not-pre-call"));
+        // (b) second read after the call, with a store between the call and the read.
+        let after_written = straddle("probe::h2::reads_straddle_store", vec![read(4)], vec![efht_store(1, 0, 7), read(5)]);
+        let v = efht_t_h2_refuses(&after_written, &registry, "store between the call and the second read");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // (c) both reads before the call with a store BETWEEN THEM.
+        let between = straddle("probe::h2::reads_pre_store_between", vec![read(4), efht_store(1, 0, 7), read(5)], vec![]);
+        let v = efht_t_h2_refuses(&between, &registry, "store between two pre-call reads");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // (d) S4: `_2 = *_1; pass(_2) -> _3; _4 = *_1; _0 = Eq(move _3, copy _4)`.
+        let s4 = efht_t_caller(
+            "probe::h2::deref_reads_straddle",
+            "probe::pass",
+            Ty::Bool,
+            vec![(Some("p"), efht_ref(efht_i64()))],
+            vec![efht_i64(), efht_i64(), efht_i64()],
+            vec![Operand::Copy(Place::local(2))],
+            3,
+            vec![efht_assign(2, Rvalue::Use(Operand::Copy(efht_t_deref(1))))],
+            vec![
+                efht_assign(4, Rvalue::Use(Operand::Copy(efht_t_deref(1)))),
+                efht_assign(0, Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(4)))),
+            ],
+        );
+        let v = efht_t_h2_refuses(&s4, &registry, "s4 second deref read after the call");
+        assert_eq!(v.0, Some("tail-other-outside-fragment"), "a deref temp is not an admitted tail `other` at all");
+        // TWIN — both reads BEFORE the call, no write: transports, and the tailed term
+        // reads `Field(0, 0)` at both leaves.
+        let twin = straddle("probe::h2::reads_pre", vec![read(4), read(5)], vec![]);
+        efht_t_h2_transports(&twin, &registry, "two pre-call reads, no write");
+        let tailed = efht_t_tailed_body(&twin, &registry);
+        let field_leaves = tailed
+            .stmts
+            .iter()
+            .flat_map(|s| match &s.rvalue {
+                IrRvalue::Use(a) | IrRvalue::Un(_, a) => vec![a],
+                IrRvalue::Bin(_, a, b) | IrRvalue::Cmp(_, a, b) => vec![a, b],
+            })
+            .filter(|o| matches!(o, IrOperand::Field(0, 0)))
+            .count();
+        assert_eq!(field_leaves, 2, "both reads denote the ONE untimed selector: {tailed:?}");
+    }
+
+    /// H2 ATTACK — the READ TEMP itself is rewritten between the read and the call
+    /// (`_2 = (*_1).0; _2 = 7; is_zero(_2)`), rewritten after the call, or defined only
+    /// AFTER the call it feeds (a use-before-def body, the time-travel shape); S4
+    /// likewise. TWIN: S2/S4 as built.
+    #[test]
+    fn efht_t_h2_actual_temp_rewritten_between_read_and_call_refuses() {
+        use trust_types::{ConstValue, Operand, Rvalue};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let seven = |t: usize| efht_assign(t, Rvalue::Use(Operand::Constant(ConstValue::Int(7))));
+        // (a) rewritten between the read and the call.
+        let rewritten = efht_t_h2_s2_frame("probe::h2::s2_temp_rewritten", None, vec![], vec![seven(2)]);
+        let v = efht_t_h2_refuses(&rewritten, &registry, "s2 read temp rewritten before the call");
+        assert_eq!(v.2, Ok(()), "a temp rewrite is admitted by the allow-list; the recognizer's sole-definition gate refuses");
+        assert!(v.0.is_some());
+        // (b) rewritten after the call (the passed value is right; the write profile is not).
+        let mut after = efht_t_s2_caller();
+        after.body.blocks[1].stmts.push(seven(2));
+        let v = efht_t_h2_refuses(&after, &registry, "s2 read temp rewritten after the call");
+        assert!(v.0.is_some());
+        // (c) the read sits AFTER the call that consumes it.
+        let mut travel = efht_t_s2_caller();
+        let read = travel.body.blocks[0].stmts.remove(0);
+        travel.body.blocks[1].stmts.insert(0, read);
+        let v = efht_t_h2_refuses(&travel, &registry, "s2 read after the call it feeds");
+        assert_eq!(v.0, Some("actual-temp-has-no-unique-dominating-definition"));
+        // (d) S4 rewritten between the read and the call.
+        let s4 = efht_t_h2_s4_frame("probe::h2::s4_temp_rewritten", None, vec![], vec![seven(2)]);
+        let v = efht_t_h2_refuses(&s4, &registry, "s4 read temp rewritten before the call");
+        assert!(v.0.is_some());
+        // (e) S4 read after the call.
+        let mut s4_travel = efht_t_s4_caller();
+        let read = s4_travel.body.blocks[0].stmts.remove(0);
+        s4_travel.body.blocks[1].stmts.insert(0, read);
+        let v = efht_t_h2_refuses(&s4_travel, &registry, "s4 read after the call it feeds");
+        assert_eq!(v.0, Some("actual-temp-has-no-unique-dominating-definition"));
+        // TWINS.
+        efht_t_h2_transports(&efht_t_s2_caller(), &registry, "s2 as built");
+        efht_t_h2_transports(&efht_t_s4_caller(), &registry, "s4 as built");
+    }
+
+    /// H2 ATTACK — the store sits in an OFF-PATH block: one that `Goto`s INTO the spine
+    /// (at the Return block, and at the call block), and one that is DEAD (`Unreachable`,
+    /// no successor) — P-SPINE admits a dead island (the store-free twin transports), so
+    /// the whole-body deny-list in the chase and the whole-body allow-list are what
+    /// refuse that one. TWIN: a dead island with no store transports.
+    #[test]
+    fn efht_t_h2_off_path_store_refuses() {
+        use trust_types::{BasicBlock, BlockId, Terminator};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let with_island = |name: &str, stmts: Vec<trust_types::Statement>, terminator: Terminator| {
+            let mut f = efht_t_s2_caller();
+            f.def_path = name.into();
+            f.name = name.into();
+            f.body.blocks.push(BasicBlock { id: BlockId(2), stmts, terminator });
+            f
+        };
+        let into_ret = with_island("probe::h2::island_store_into_ret", vec![efht_store(1, 0, 7)], Terminator::Goto(BlockId(1)));
+        let v = efht_t_h2_refuses(&into_ret, &registry, "off-path store joining the Return block");
+        assert_eq!(v.0, Some("join-into-the-spine-from-off-path"));
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        let into_call = with_island("probe::h2::island_store_into_call", vec![efht_store(1, 0, 7)], Terminator::Goto(BlockId(0)));
+        let v = efht_t_h2_refuses(&into_call, &registry, "off-path store joining the call block");
+        assert_eq!(v.0, Some("join-into-the-spine-from-off-path"));
+        let dead = with_island("probe::h2::island_store_dead", vec![efht_store(1, 0, 7)], Terminator::Unreachable);
+        let v = efht_t_h2_refuses(&dead, &registry, "dead island store");
+        // MEASURED: P-SPINE admits the dead island (the store-free twin below transports),
+        // but the field-read chase runs the whole-body `deref_write_exists` and sees the
+        // dead store first; the allow-list refuses it independently.
+        assert_eq!(v.0, Some("field-actual-chase-declined"));
+        assert!(crate::mirsem::deref_write_exists(&dead.body, 1), "the deny-list sees a store in a dead block");
+        assert_eq!(v.2, Err("Assign through a Deref projection"));
+        // TWIN.
+        efht_t_h2_transports(&with_island("probe::h2::island_dead", vec![], Terminator::Unreachable), &registry, "dead island, no store");
+    }
+
+    /// H2 ATTACK — INTERIOR MUTABILITY hidden from the base's INLINE type: the referent
+    /// changes under a shared reference with no write in the body. (a) the base is a
+    /// COMPACTED `&Datatype { "probe::S" }` marker whose definition lives only in
+    /// `datatype_defs`; (b) an inline `S { x: i64, k: Slot }` where `Slot` carries a
+    /// compacted `UnsafeCell` marker; (c) the same with a compacted marker of an UNKNOWN
+    /// name (fail-closed: an unreadable definition is not evidence of immutability);
+    /// (d) the sibling field is a `&Cell<i64>` (a reference, not a value). S4's `&i64`
+    /// cannot carry any of these; a `&Cell<i64>` base for S4 is pinned refused. TWIN:
+    /// the plain inline `S` transports.
+    #[test]
+    fn efht_t_h2_interior_mutability_hidden_from_the_inline_type_refuses() {
+        use trust_types::Ty;
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let with_base = |name: &str, base: Ty, defs: Vec<(&str, Ty)>| {
+            let mut f = efht_t_h2_s2_frame(name, None, vec![], vec![]);
+            f.body.locals[1].ty = efht_ref(base);
+            for (k, v) in defs {
+                f.body.datatype_defs.insert(k.into(), v);
+            }
+            f
+        };
+        // (a) compacted base marker, definition in datatype_defs.
+        let compacted = with_base(
+            "probe::h2::compacted_base",
+            Ty::Datatype { name: "probe::S".into(), variants: vec![] },
+            vec![("probe::S", efht_struct_s())],
+        );
+        let _ = efht_t_h2_refuses(&compacted, &registry, "compacted &Datatype base");
+        // (b) inline S with a sibling field wrapping a compacted UnsafeCell marker.
+        let slot = Ty::adt("probe::Slot", vec![("v".into(), Ty::Datatype { name: "core::cell::UnsafeCell<i64>".into(), variants: vec![] })]);
+        let s_slot = Ty::adt("probe::S", vec![("x".into(), efht_i64()), ("k".into(), slot)]);
+        let hidden_cell = with_base("probe::h2::hidden_unsafecell", s_slot, vec![]);
+        let v = efht_t_h2_refuses(&hidden_cell, &registry, "sibling field wraps a compacted UnsafeCell");
+        assert_eq!(v.0, None, "the recognizer is type-blind past the field; the consumer's Handle fence refuses");
+        assert_eq!(v.3, Err("Value actual: Field base fails the Handle fences"));
+        // (c) a compacted marker of an unknown name in a sibling field.
+        let opaque = Ty::adt("probe::S", vec![("x".into(), efht_i64()), ("k".into(), Ty::Datatype { name: "probe::Opaque".into(), variants: vec![] })]);
+        let unknown = with_base("probe::h2::unknown_marker", opaque, vec![("probe::Opaque", efht_struct_s())]);
+        let v = efht_t_h2_refuses(&unknown, &registry, "sibling field is an unknown compacted marker");
+        assert_eq!(v.3, Err("Value actual: Field base fails the Handle fences"));
+        // (d) a `&Cell<i64>` sibling field.
+        let cell = Ty::adt("core::cell::Cell<i64>", vec![("value".into(), efht_i64())]);
+        let ref_cell = Ty::adt("probe::S", vec![("x".into(), efht_i64()), ("k".into(), efht_ref(cell.clone()))]);
+        let v = efht_t_h2_refuses(&with_base("probe::h2::ref_cell_sibling", ref_cell, vec![]), &registry, "sibling field is &Cell<i64>");
+        assert_eq!(v.3, Err("Value actual: Field base fails the Handle fences"));
+        // S4 over a `&Cell<i64>` base (the deref read of a Cell, hand-built).
+        let mut s4_cell = efht_t_s4_caller();
+        s4_cell.body.locals[1].ty = efht_ref(cell);
+        let _ = efht_t_h2_refuses(&s4_cell, &registry, "s4 base is &Cell<i64>");
+        // TWIN.
+        efht_t_h2_transports(&with_base("probe::h2::plain_inline_s", efht_struct_s(), vec![]), &registry, "plain inline S");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT-T LENS AUTHORITY + REGRESSION (2026-08-29). An S3 caller traced END
+    // TO END through the three `check_body_refinement*` arms; the H2 fences on the NEW
+    // actual arms and on the tail `other`; the negatives the design listed that the
+    // landing left unwritten (write-between, S1's OpaqueConst / projected reborrow);
+    // the missing twins; and two lockstep pins (Bool-`Cmp` tail vs the pureop lane,
+    // trailing `StorageDead` reach cost). Every negative carries a passing twin.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The Var-only S3 `fn c(k: i64, m: i64) -> bool { pass(k) == m }`:
+    /// `pass(copy _1) -> _3; _0 = Eq(copy _2, move _3)` — no handle anywhere.
+    fn efht_t_lens_s3_var_only_caller() -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        efht_t_caller(
+            "probe::s3::var_only",
+            "probe::pass",
+            Ty::Bool,
+            vec![(Some("k"), efht_i64()), (Some("m"), efht_i64())],
+            vec![efht_i64()],
+            vec![Operand::Copy(Place::local(1))],
+            3,
+            vec![],
+            vec![efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(2)), Operand::Move(Place::local(3))),
+            )],
+        )
+    }
+
+    /// TRACE (authority) — ONE S3 caller end to end, at every `ret_model_kernel_verdict`
+    /// arm. (i) The FIELD-LEAF S3 (`_4 = (*_1).0; pass(_4) -> _3; _0 = Eq(_2, _3)`): the
+    /// tailed body is a ≥2-statement chain with a `Field(0, 0)` leaf, so the grounder
+    /// tier DECLINES it (no live `ground_int` for a selector), the single-statement
+    /// model tier is KERNEL-REJECTED (it cannot state a chain), and ONLY
+    /// `check_body_refinement_model_chain` — the theorem
+    /// `Trust.TrustIr.Refinement.body_model_chain` — proves it; that is the verdict
+    /// G-TIER-MATCH consumes. (ii) The VAR-ONLY S3 (`pass(copy _1) -> _3; _0 = Eq(_2,
+    /// _3)`): the tailed body is grounder-connected and takes `check_body_refinement`
+    /// (`body_adequacy`) — TIGHTNESS: `_model_chain` would ALSO prove it, so it is the
+    /// grounder-first ORDER of `ret_model_kernel_verdict`, not the kernel, that keeps a
+    /// scalar transport on the grounder tier. (iii) BYTE-IDENTICAL: for the tail-free
+    /// scalar passthrough the tailed body IS the pre-EFHT substitution `[2 := Bin(Add,
+    /// Var 0, Const 1)]` — the same term the pre-EFHT-T pin
+    /// `efht_grounder_connected_model_still_takes_check_body_refinement_byte_identically`
+    /// asserts — and it takes the grounder tier exactly as before.
+    #[test]
+    fn efht_t_lens_s3_trace_field_leaf_takes_model_chain_var_only_takes_grounder() {
+        use crate::mirsem::{ActualBase, SemCmpOp, SemOperand, SemTransportTail};
+        use crate::trustir_anchor::{
+            check_body_refinement, check_body_refinement_model, check_body_refinement_model_chain,
+            IrBody, IrOperand, IrRvalue, IrStmt, RefinementVerdict, TrustIrBinOp,
+        };
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&pass]);
+
+        // (i) the field-leaf S3.
+        let field = efht_t_s3_caller();
+        let tailed = efht_t_tailed_body(&field, &registry);
+        assert!(tailed.stmts.len() >= 2, "a chain: the substituted model plus the tail");
+        assert!(tailed.stmts.iter().any(|s| matches!(s.rvalue, IrRvalue::Use(IrOperand::Field(0, 0)))));
+        assert!(!tailed.is_grounder_connected());
+        assert!(efht_is_grounder_decline(&check_body_refinement(&tailed)), "the grounder tier must DECLINE a selector term");
+        assert!(matches!(check_body_refinement_model(&tailed), RefinementVerdict::KernelRejected(_)), "the single-statement model tier cannot state a chain");
+        assert_eq!(check_body_refinement_model_chain(&tailed), RefinementVerdict::ProvenModulo3, "`_model_chain` is the ONE arm that admits");
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&field, &registry), Ok(()));
+
+        // (ii) the Var-only S3.
+        let var_only = efht_t_lens_s3_var_only_caller();
+        assert_eq!(efht_t_shared_reason(&var_only, &registry), Some("return-block-does-not-move-the-temp-into-_0"), "the shared recognizer refuses the tail");
+        let shape = crate::mirsem::sem_transported_call_of_mir(&var_only, &registry).expect("recognized");
+        assert_eq!(shape.bases, vec![ActualBase::Param(1)]);
+        assert_eq!(shape.call.args, vec![SemOperand::Var(0)]);
+        assert_eq!(
+            shape.tail,
+            SemTransportTail::Cmp { op: SemCmpOp::Eq, other: (SemOperand::Var(1), ActualBase::Param(2)), call_is_lhs: false }
+        );
+        let tailed = efht_t_tailed_body(&var_only, &registry);
+        assert!(tailed.stmts.len() >= 2);
+        assert!(tailed.is_grounder_connected(), "Var/Const leaves only: {tailed:?}");
+        assert_eq!(check_body_refinement(&tailed), RefinementVerdict::ProvenModulo3, "the LIVE grounder tier proves the tailed Var-only body");
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            check_body_refinement_model_chain(&tailed),
+            RefinementVerdict::ProvenModulo3,
+            "TIGHTNESS: the model-chain tier accepts this body too — the grounder-first ORDER is load-bearing"
+        );
+        assert!(matches!(check_body_refinement_model(&tailed), RefinementVerdict::KernelRejected(_)));
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&var_only, &registry), Ok(()));
+
+        // (iii) byte-identical: the scalar passthrough's tailed body is the pre-EFHT term.
+        // MEASURED: `scalar_leaf_func`'s `x + 1` mints ONLY with its inherited
+        // `x < 1_000_000` guard (stripped, D1 refuses the undischarged overflow VC), and
+        // WITH the guard the bare passthrough caller does not establish it — so the
+        // tail-free path still runs the requires gate and refuses by name; the
+        // requires-free grounder-connected passthrough (`is_zero`) is what transports.
+        let leaf = scalar_leaf_func("probe::leaf");
+        let leaf_registry = efht_registry(&leaf);
+        let model = leaf_registry[&leaf.def_path].ret_model.clone().expect("mints WITH its guard");
+        let passthrough = efht_passthrough_caller(&leaf, vec![]);
+        let shape = crate::mirsem::sem_transported_call_of_mir(&passthrough, &leaf_registry).expect("recognized");
+        assert_eq!(shape.bases, vec![ActualBase::Param(1)]);
+        assert_eq!(shape.tail, SemTransportTail::None);
+        assert_eq!(shape.call, crate::mirsem::sem_call_return_of_mir(&passthrough, &leaf_registry).unwrap());
+        let tailed = efht_t_tailed_body(&passthrough, &leaf_registry);
+        let pre_efht = crate::prove::substitute_ret_model_for_test(&model, &[IrOperand::Var(0)], 1).unwrap();
+        assert_eq!(tailed, pre_efht, "tail `None` is the identity: the tailed body IS the substituted body");
+        assert_eq!(
+            tailed,
+            IrBody {
+                stmts: vec![IrStmt { idx: 2, rvalue: IrRvalue::Bin(TrustIrBinOp::Add, IrOperand::Var(0), IrOperand::Const(1)) }],
+                ret: 2,
+            },
+            "the pre-EFHT substitution, byte for byte"
+        );
+        assert!(tailed.is_grounder_connected());
+        assert_eq!(check_body_refinement(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(
+            crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&passthrough, &leaf_registry),
+            Err("call_site_requires not established"),
+            "the tail-free path still runs the requires gate on the guarded leaf"
+        );
+        let mut unguarded = scalar_leaf_func("probe::leaf");
+        unguarded.preconditions.clear();
+        assert_eq!(crate::prove::pure_scalar_ret_model_reasoned(&unguarded), Err("D1: callee safety VCs not all discharged"));
+        let is_zero = efht_t_is_zero_callee();
+        let iz_registry = efht_t_registry(&[&is_zero]);
+        let iz_model = iz_registry[&is_zero.def_path].ret_model.clone().expect("mints");
+        let scalar = efht_t_caller(
+            "probe::is_zero::scalar",
+            "probe::is_zero",
+            trust_types::Ty::Bool,
+            vec![(Some("k"), efht_i64())],
+            vec![],
+            vec![trust_types::Operand::Copy(trust_types::Place::local(1))],
+            0,
+            vec![],
+            vec![],
+        );
+        let tailed = efht_t_tailed_body(&scalar, &iz_registry);
+        assert_eq!(tailed, crate::prove::substitute_ret_model_for_test(&iz_model, &[IrOperand::Var(0)], 1).unwrap());
+        assert!(tailed.is_grounder_connected());
+        assert_eq!(check_body_refinement(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::ret_model_kernel_verdict(&tailed), RefinementVerdict::ProvenModulo3);
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&scalar, &iz_registry), Ok(()));
+    }
+
+    /// NEGATIVE (the design's `write_between`, unwritten at landing) — a store through
+    /// the handle BETWEEN the field read and the call, on S2 and on the S3 tail-read
+    /// shape. Under H2 the read-before value is no longer the entry value; the caller
+    /// allow-list refuses the Deref-rooted store and the deny-list sees it too. TWINS:
+    /// the same bodies minus the store transport.
+    #[test]
+    fn efht_t_lens_write_between_read_and_call_refuses() {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &pass]);
+        // S2: `_2 = (*_1).0; (*_1).0 = 7; is_zero(copy _2) -> _0`.
+        let mut s2 = efht_t_s2_caller();
+        s2.body.blocks[0].stmts.push(efht_store(1, 0, 7));
+        assert!(crate::mirsem::deref_write_exists(&s2.body, 1), "the deny-list sees the store");
+        assert_eq!(crate::prove::body_is_read_only_except_sole_call(&s2.body), Err("Assign through a Deref projection"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&s2, &registry).is_err());
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&efht_t_s2_caller(), &registry), Ok(()), "TWIN");
+        // S3 tail read: `_4 = (*_1).0; _5 = (*_1).0; (*_1).0 = 7; pass(_4) -> _3; _0 = Eq(_3, _5)`.
+        let build = |with_store: bool| {
+            let mut prefix = vec![
+                efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))),
+                efht_assign(5, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))),
+            ];
+            if with_store {
+                prefix.push(efht_store(1, 0, 7));
+            }
+            efht_t_caller(
+                "probe::s3::store_between",
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s()))],
+                vec![efht_i64(), efht_i64(), efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(4))],
+                3,
+                prefix,
+                vec![efht_assign(
+                    0,
+                    Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(5))),
+                )],
+            )
+        };
+        let stored = build(true);
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&stored, &registry).is_err());
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&build(false), &registry), Ok(()), "TWIN");
+    }
+
+    /// NEGATIVE (the design's S1 family, unwritten at landing) — an `OpaqueConst` actual
+    /// and a PROJECTED reborrow actual `_2 = &(_1.0)` are both refused by the transport
+    /// recognizer, by name: the constant's operand type is `Unit`, so P-CALLEE's exact
+    /// signature match fires first; the reborrow temp's unique definition is a `Ref`,
+    /// not `Use(Copy(..))`, so P-ACTUAL refuses it. TWINS: the plain scalar actual and
+    /// the unprojected `&u8` handle transport.
+    #[test]
+    fn efht_t_lens_opaque_const_and_projected_reborrow_actuals_refuse() {
+        use crate::mirsem::ActualBase;
+        use trust_types::{ConstValue, Operand, Place, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let opaque = efht_t_caller(
+            "probe::s1::opaque",
+            "probe::is_zero",
+            Ty::Bool,
+            vec![(Some("k"), efht_i64())],
+            vec![],
+            vec![Operand::Constant(ConstValue::OpaqueConst)],
+            0,
+            vec![],
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&opaque, &registry), Some("callee-signature-mismatch"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&opaque, &registry).is_err());
+        let scalar = efht_t_caller(
+            "probe::s1::scalar",
+            "probe::is_zero",
+            Ty::Bool,
+            vec![(Some("k"), efht_i64())],
+            vec![],
+            vec![Operand::Copy(Place::local(1))],
+            0,
+            vec![],
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&scalar, &registry), None, "TWIN");
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&scalar, &registry), Ok(()));
+        // `fn c(s: SU8) -> u8 { read_u8(&s.0) }`: `_2 = &(_1.0); read_u8(move _2) -> _0`.
+        let read = efht_read_u8_callee();
+        let read_registry = efht_registry(&read);
+        assert!(read_registry[&read.def_path].ret_model.is_some(), "read_u8 mints");
+        let su8 = Ty::adt("probe::SU8", vec![("0".into(), efht_u8())]);
+        let reborrow = efht_t_caller(
+            "probe::s1::reborrow",
+            &read.def_path,
+            efht_u8(),
+            vec![(Some("s"), su8)],
+            vec![efht_ref(efht_u8())],
+            vec![Operand::Move(Place::local(2))],
+            0,
+            vec![efht_assign(
+                2,
+                Rvalue::Ref {
+                    mutable: false,
+                    place: Place { local: 1, projections: vec![trust_types::Projection::Field(0)] },
+                },
+            )],
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&reborrow, &read_registry), Some("argument-outside-transport-fragment"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&reborrow, &read_registry).is_err());
+        let handle = efht_passthrough_caller(&read, vec![]);
+        let shape = crate::mirsem::sem_transported_call_of_mir(&handle, &read_registry).expect("TWIN: the unprojected `&u8` handle");
+        assert_eq!(shape.bases, vec![ActualBase::Param(1)]);
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&handle, &read_registry), Ok(()));
+    }
+
+    /// NEGATIVE — H2 on the NEW actual arms: the base parameter REBOUND before the read.
+    /// (c) S2 with `_1 = copy _2` (a second `&S`) before `_3 = (*_1).0`: `Field(0, 0)`
+    /// names `_1`'s ENTRY referent while the runtime reads `_2`'s. (d) S4 with `_1 = &_4`
+    /// before `_2 = *_1`: `Var(0)` names the entry referent while the runtime reads a
+    /// local. Both refuse (`param_reassigned_by_stmt` is in every fence on the path, and
+    /// the recognizer's own chase refuses a rebound base). TWINS: the same bodies minus
+    /// the rebinding transport.
+    #[test]
+    fn efht_t_lens_rebound_base_refuses_for_field_and_deref_actuals() {
+        use trust_types::{Operand, Place, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let s2 = |rebind: bool| {
+            let mut prefix = vec![];
+            if rebind {
+                prefix.push(efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(2)))));
+            }
+            prefix.push(efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))));
+            efht_t_caller(
+                "probe::s2::rebound",
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("t"), efht_ref(efht_struct_s()))],
+                vec![efht_i64()],
+                vec![Operand::Copy(Place::local(3))],
+                0,
+                prefix,
+                vec![],
+            )
+        };
+        let rebound = s2(true);
+        assert!(crate::mirsem::param_reassigned_by_stmt(&rebound.body, 1));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&rebound, &registry).is_err());
+        assert_eq!(efht_t_reason(&s2(false), &registry), None, "TWIN");
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&s2(false), &registry), Ok(()));
+        let s4 = |rebind: bool| {
+            let mut prefix = vec![];
+            if rebind {
+                prefix.push(efht_assign(1, Rvalue::Ref { mutable: false, place: Place::local(4) }));
+            }
+            prefix.push(efht_assign(2, Rvalue::Use(Operand::Copy(efht_t_deref(1)))));
+            efht_t_caller(
+                "probe::s4::rebound",
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("p"), efht_ref(efht_i64()))],
+                vec![efht_i64(), Ty::Bool, efht_i64()],
+                vec![Operand::Copy(Place::local(2))],
+                3,
+                prefix,
+                vec![efht_assign(0, Rvalue::UnaryOp(trust_types::UnOp::Not, Operand::Move(Place::local(3))))],
+            )
+        };
+        let rebound = s4(true);
+        assert!(crate::mirsem::param_reassigned_by_stmt(&rebound.body, 1));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&rebound, &registry).is_err());
+        assert_eq!(efht_t_reason(&s4(false), &registry), None, "TWIN");
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&s4(false), &registry), Ok(()));
+    }
+
+    /// NEGATIVE — P-TAIL-OTHER's PARAMETER arm: the compared entry parameter is
+    /// REASSIGNED, before the call or after it, so `Var(1)` (its ENTRY value) is not what
+    /// the tail compares. `sem_operand_of_mir`'s entry-time gate refuses it by name.
+    /// TWIN: the Var-only S3 as built.
+    #[test]
+    fn efht_t_lens_tail_other_param_reassigned_refuses() {
+        use trust_types::{ConstValue, Operand, Rvalue};
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&pass]);
+        let reassign = || efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::Int(5))));
+        let mut before = efht_t_lens_s3_var_only_caller();
+        before.body.blocks[0].stmts.push(reassign());
+        assert_eq!(efht_t_reason(&before, &registry), Some("tail-other-param-fails-the-entry-fences"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&before, &registry).is_err());
+        let mut after = efht_t_lens_s3_var_only_caller();
+        after.body.blocks[1].stmts.insert(0, reassign());
+        assert_eq!(efht_t_reason(&after, &registry), Some("tail-other-param-fails-the-entry-fences"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&after, &registry).is_err());
+        assert_eq!(efht_t_reason(&efht_t_lens_s3_var_only_caller(), &registry), None, "TWIN");
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&efht_t_lens_s3_var_only_caller(), &registry), Ok(()));
+    }
+
+    /// NEGATIVE — P-ACTUAL (c) keys on DOMINANCE OF THE CALL BLOCK, not on the existence
+    /// of a definition: the field-read temp defined only in an unreachable island
+    /// (`bb2 { _2 = (*_1).0; Unreachable }`, which P-SPINE admits as an off-path
+    /// `Unreachable`) is refused by name. TWIN: S2 with the read on the spine.
+    #[test]
+    fn efht_t_lens_actual_temp_defined_only_off_path_refuses() {
+        use trust_types::{BasicBlock, BlockId, Terminator};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let mut island = efht_t_s2_caller();
+        let read = island.body.blocks[0].stmts.remove(0);
+        island.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![read], terminator: Terminator::Unreachable });
+        assert_eq!(efht_t_reason(&island, &registry), Some("actual-temp-has-no-unique-dominating-definition"));
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&island, &registry).is_err());
+        assert_eq!(efht_t_reason(&efht_t_s2_caller(), &registry), None, "TWIN");
+    }
+
+    /// TWINS + LOCKSTEP. (a) The twin the diverging-sink pin left implicit: S3 without
+    /// the sink is recognized. (b) A Bool-operand `Cmp` tail (`is_zero(k) -> _3: bool;
+    /// _0 = Eq(_3, b)` with `b: bool`) is admitted by the transport recognizer EXACTLY
+    /// where the opaque pureop lane — the precedent the design names for the tail's op
+    /// mapping — admits the same body (`sem_call_then_pureop_of_mir`'s "int or bool"
+    /// dest gate). The chain BUILDER refuses `bool == bool` for itself (its BOOL-OPERAND
+    /// GATE), so this is pinned as lockstep with the pureop lane, not with the builder:
+    /// on the 0/1 carrier `Int.beq`/`Int.lt` of two Bool values IS Rust's `==`/`<` on
+    /// `bool`, so the reading is value-correct, and a later decision to refuse it must
+    /// move both lanes together. (c) REACH COST, measured: a trailing `StorageDead`
+    /// after the `_0` assign — what real MIR emits for a moved call temp — is refused by
+    /// P-DEST's last-statement rule; the twin without it transports.
+    #[test]
+    fn efht_t_lens_sink_twin_bool_cmp_lockstep_and_trailing_storage_dead() {
+        use crate::mirsem::{ActualBase, SemOperand, SemTransportTail};
+        use trust_types::{BinOp, Operand, Place, Rvalue, Statement, Ty};
+        let pass = efht_t_pass_callee();
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&pass, &is_zero]);
+        // (a)
+        assert_eq!(efht_t_reason(&efht_t_s3_caller(), &registry), None, "TWIN of the diverging-sink pin");
+        // (b)
+        let bool_cmp = |op: BinOp| {
+            efht_t_caller(
+                "probe::s3::bool_cmp",
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("k"), efht_i64()), (Some("b"), Ty::Bool)],
+                vec![Ty::Bool],
+                vec![Operand::Copy(Place::local(1))],
+                3,
+                vec![],
+                vec![efht_assign(
+                    0,
+                    Rvalue::BinaryOp(op, Operand::Move(Place::local(3)), Operand::Copy(Place::local(2))),
+                )],
+            )
+        };
+        for op in [BinOp::Eq, BinOp::Ne, BinOp::Lt] {
+            let caller = bool_cmp(op);
+            let shape = crate::mirsem::sem_transported_call_of_mir(&caller, &registry).unwrap_or_else(|| panic!("{op:?}: admitted"));
+            assert!(matches!(shape.tail, SemTransportTail::Cmp { other: (SemOperand::Var(1), ActualBase::Param(2)), call_is_lhs: true, .. }));
+            assert!(
+                crate::mirsem::sem_call_then_pureop_of_mir(&caller, &registry).is_some(),
+                "{op:?}: LOCKSTEP — the pureop lane admits the same Bool-operand comparison"
+            );
+            assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&caller, &registry), Ok(()), "{op:?}");
+        }
+        // (c)
+        let mut trailing = efht_t_s3_caller();
+        trailing.body.blocks[1].stmts.push(Statement::StorageDead(3));
+        assert_eq!(efht_t_reason(&trailing, &registry), Some("_0-assign-not-last-in-return-block"), "REACH COST: real MIR's trailing StorageDead");
+        assert!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&trailing, &registry).is_err());
+        assert_eq!(crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(&efht_t_s3_caller(), &registry), Ok(()), "TWIN");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: EFHT-T LENS H1 ATTACKS (2026-08-29) — caller bodies built to PASS
+    // P-SPINE / P-ACTUAL / P-TAIL by shape while observing a mutation, each asserted
+    // NOT to transport at a NAMED gate, each with a tightness twin (the same fixture
+    // minus the offending feature transports). A failing test here is a hole.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The H1 consumer verdict, for the attacks below.
+    fn efht_t_h1_consumer(
+        f: &trust_types::VerifiableFunction,
+        registry: &std::collections::BTreeMap<String, crate::mirsem::CalleeFact>,
+    ) -> Result<(), &'static str> {
+        crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(f, registry)
+    }
+    /// `_local.field` (no deref) — a tuple/aggregate projection.
+    fn efht_t_h1_field(local: usize, field: usize) -> trust_types::Place {
+        trust_types::Place { local, projections: vec![trust_types::Projection::Field(field)] }
+    }
+    /// A one-handle callee `fn g(p: &S) -> i64` over `stmts` (extra locals after `_1`).
+    fn efht_t_h1_handle_callee(
+        name: &str,
+        extra: Vec<trust_types::Ty>,
+        stmts: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        let mut locals = vec![(None, efht_i64()), (Some("p"), efht_ref(efht_struct_s()))];
+        locals.extend(extra.into_iter().map(|t| (None, t)));
+        efht_leaf(name, locals, stmts)
+    }
+    /// The caller that passes its handle AND compares the result against a PRE-CALL
+    /// field read of the same handle: `fn c(s: &S) -> bool { _3 = (*_1).0; g(copy _1)
+    /// -> _2; _0 = Eq(move _2, copy _3) }`. If `g` could write `(*_1).0`, the tail's
+    /// `Field(0, 0)` would name a value the runtime no longer compares against.
+    fn efht_t_h1_handle_then_cmp_caller(callee: &str) -> trust_types::VerifiableFunction {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        efht_t_caller(
+            &format!("{callee}::h1_caller"),
+            callee,
+            Ty::Bool,
+            vec![(Some("s"), efht_ref(efht_struct_s()))],
+            vec![efht_i64(), efht_i64()],
+            vec![Operand::Copy(Place::local(1))],
+            2,
+            vec![efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(2)), Operand::Copy(Place::local(3))),
+            )],
+        )
+    }
+
+    /// H1 ATTACK 1 — a tail `other` that is a field read whose base the CALLEE could
+    /// write. Seven write channels through the callee's `&S` — a direct deref store
+    /// (CLAUDE.md's `poke`), a store through a shared reborrow, a `SetDiscriminant`
+    /// through the handle, a store through `&raw mut (*p)`, a store through `&mut (*p)`,
+    /// a `Retag` of the referent, and a call to a `Cell::set`-shaped method — each
+    /// refused by `body_is_read_only` BY NAME, so none mints a `ret_model`, and the
+    /// caller is refused at P-CALLEE before an actual is read. TWIN: the read-only
+    /// `get_x` callee transports with the tail `Cmp(Eq, r', Field(0, 0))`. The forged
+    /// registry row (a `ret_model` pasted onto `poke`) is the documented H1 residual and
+    /// is pinned as such — the lane trusts the row, not the body it cannot see.
+    #[test]
+    fn efht_t_h1_tail_other_field_base_the_callee_could_write_refuses() {
+        use crate::mirsem::{ActualBase, SemCmpOp, SemOperand, SemTransportTail};
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, Operand, Place, Rvalue, Statement, Terminator, Ty,
+            UnwindEdge,
+        };
+        let ret0 = || efht_assign(0, Rvalue::Use(Operand::Constant(ConstValue::Int(0))));
+        let store_through = |local: usize| efht_store(local, 0, 99);
+        let mut_s = Ty::Ref { mutable: true, inner: Box::new(efht_struct_s()) };
+        let raw_mut_s = Ty::RawPtr { mutable: true, pointee: Box::new(efht_struct_s()) };
+        let callees: Vec<(trust_types::VerifiableFunction, &str)> = vec![
+            (
+                efht_t_h1_handle_callee("probe::poke", vec![], vec![store_through(1), ret0()]),
+                "Assign through a Deref projection",
+            ),
+            (
+                efht_t_h1_handle_callee(
+                    "probe::poke_reborrow",
+                    vec![efht_ref(efht_struct_s())],
+                    vec![
+                        efht_assign(2, Rvalue::Ref { mutable: false, place: efht_t_deref(1) }),
+                        store_through(2),
+                        ret0(),
+                    ],
+                ),
+                "Assign through a Deref projection",
+            ),
+            (
+                efht_t_h1_handle_callee(
+                    "probe::poke_discr",
+                    vec![],
+                    vec![Statement::SetDiscriminant { place: efht_t_deref(1), variant_index: 0 }, ret0()],
+                ),
+                "SetDiscriminant through a Deref projection",
+            ),
+            (
+                efht_t_h1_handle_callee(
+                    "probe::poke_raw",
+                    vec![raw_mut_s],
+                    vec![efht_assign(2, Rvalue::AddressOf(true, efht_t_deref(1))), store_through(2), ret0()],
+                ),
+                "AddressOf",
+            ),
+            (
+                efht_t_h1_handle_callee(
+                    "probe::poke_mut_reborrow",
+                    vec![mut_s],
+                    vec![
+                        efht_assign(2, Rvalue::Ref { mutable: true, place: efht_t_deref(1) }),
+                        store_through(2),
+                        ret0(),
+                    ],
+                ),
+                "Ref { mutable: true }",
+            ),
+            (
+                efht_t_h1_handle_callee(
+                    "probe::poke_retag",
+                    vec![],
+                    vec![Statement::Retag { place: efht_t_deref(1) }, ret0()],
+                ),
+                "Retag of a Deref-rooted place",
+            ),
+        ];
+        let mut callees = callees;
+        // A callee that mutates by CALLING (`Cell::set`-shaped): no statement writes.
+        let via_call = efht_func(
+            "probe::poke_via_call",
+            vec![(None, efht_i64()), (Some("p"), efht_ref(efht_struct_s())), (None, Ty::Tuple(vec![]))],
+            1,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: "core::cell::Cell::<i64>::set".into(),
+                        args: vec![Operand::Copy(Place::local(1)), Operand::Constant(ConstValue::Int(99))],
+                        dest: Place::local(2),
+                        target: Some(BlockId(1)),
+                        unwind: UnwindEdge::Unreachable,
+                        span: Default::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![ret0()], terminator: Terminator::Return },
+            ],
+        );
+        callees.push((via_call, "Call terminator"));
+        for (callee, allow_list_reason) in &callees {
+            assert_eq!(
+                crate::prove::body_is_read_only(&callee.body),
+                Err(*allow_list_reason),
+                "{}: the allow-list refuses the write channel by name",
+                callee.def_path
+            );
+            assert!(
+                crate::prove::pure_scalar_ret_model(callee).is_none(),
+                "{}: a writing callee mints NO ret_model",
+                callee.def_path
+            );
+            let registry = efht_t_registry(&[callee]);
+            assert!(registry[&callee.def_path].ret_model.is_none());
+            let caller = efht_t_h1_handle_then_cmp_caller(&callee.def_path);
+            assert_eq!(
+                efht_t_reason(&caller, &registry),
+                Some("callee-minted-no-ret_model"),
+                "{}: refused at P-CALLEE, before any actual or the tail is read",
+                callee.def_path
+            );
+            assert!(
+                crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok(),
+                "{}: the CALLER is inside the fence — only the callee gate stands between the tail and the kernel",
+                callee.def_path
+            );
+            assert!(efht_t_h1_consumer(&caller, &registry).is_err(), "{}", callee.def_path);
+        }
+        // TWIN — the read-only callee over the same caller shape transports, and the
+        // tail is exactly the pre-call field read of the transported handle.
+        let get_x = efht_field_callee();
+        let registry = efht_t_registry(&[&get_x]);
+        let twin = efht_t_h1_handle_then_cmp_caller(&get_x.def_path);
+        let shape = crate::mirsem::sem_transported_call_of_mir(&twin, &registry).expect("TWIN recognized");
+        assert_eq!(shape.bases, vec![ActualBase::Param(1)]);
+        assert_eq!(
+            shape.tail,
+            SemTransportTail::Cmp {
+                op: SemCmpOp::Eq,
+                other: (SemOperand::Field(Box::new(SemOperand::Var(0)), 0), ActualBase::FieldOf(1, 0)),
+                call_is_lhs: true,
+            }
+        );
+        assert_eq!(efht_t_h1_consumer(&twin, &registry), Ok(()), "TWIN");
+        // RESIDUAL PIN (H1, documented in the consumer doc and the design's known gaps):
+        // a registry row that CARRIES a `ret_model` is trusted as evidence the callee is
+        // read-only; the consumer cannot re-run `body_is_read_only` on a body it does
+        // not have. Pasting `get_x`'s model onto `poke` therefore transports — the
+        // registry, not this lane, is where that row must never come from.
+        let poke = &callees[0].0;
+        let mut forged = efht_t_registry(&[poke]);
+        forged.get_mut(&poke.def_path).unwrap().ret_model = registry[&get_x.def_path].ret_model.clone();
+        let forged_caller = efht_t_h1_handle_then_cmp_caller(&poke.def_path);
+        assert_eq!(efht_t_reason(&forged_caller, &forged), None);
+        assert_eq!(
+            efht_t_h1_consumer(&forged_caller, &forged),
+            Ok(()),
+            "H1 RESIDUAL (unchanged from EFHT): a forged ret_model row is trusted — pinned so a change here is deliberate"
+        );
+    }
+
+    /// H1 ATTACK 2 — the S4 deref temp `_t = Copy(*_p)` with `_p` REBOUND between the
+    /// read and the call (and before the read, and after the call, and by a `&_local`
+    /// borrow, and by a `Retag`). The model's `Var(p-1)` names the ENTRY referent; a
+    /// rebinding makes the read or the call see another one. Every variant is refused
+    /// by the deref chase (`sem_operand_of_mir`'s reassigned-param gate), the direct
+    /// `Copy(*_p)` actual by the operand fragment. TWIN: the same body minus the
+    /// rebinding transports.
+    #[test]
+    fn efht_t_h1_deref_temp_base_rebound_between_read_and_call_refuses() {
+        use trust_types::{ConstValue, Operand, Place, Rvalue, Statement, Ty, UnOp};
+        let is_zero = efht_t_is_zero_callee();
+        let registry = efht_t_registry(&[&is_zero]);
+        let read = || efht_assign(3, Rvalue::Use(Operand::Copy(efht_t_deref(1))));
+        let rebind_to_q = || efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(2))));
+        let not_tail = || efht_assign(0, Rvalue::UnaryOp(UnOp::Not, Operand::Move(Place::local(4))));
+        // locals: _0 Bool, _1 p: &i64, _2 q: &i64, _3 i64 (deref temp), _4 Bool (call
+        // dest), _5 i64 (a local the handle can be re-pointed at).
+        let build = |name: &str, actual: Operand, prefix: Vec<Statement>, tail: Vec<Statement>| {
+            efht_t_caller(
+                name,
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("p"), efht_ref(efht_i64())), (Some("q"), efht_ref(efht_i64()))],
+                vec![efht_i64(), Ty::Bool, efht_i64()],
+                vec![actual],
+                4,
+                prefix,
+                tail,
+            )
+        };
+        let temp = || Operand::Copy(Place::local(3));
+        let cases: Vec<(trust_types::VerifiableFunction, &str)> = vec![
+            (
+                build("probe::s4::read_then_rebind", temp(), vec![read(), rebind_to_q()], vec![not_tail()]),
+                "deref-actual-chase-declined",
+            ),
+            (
+                build("probe::s4::rebind_then_read", temp(), vec![rebind_to_q(), read()], vec![not_tail()]),
+                "deref-actual-chase-declined",
+            ),
+            (
+                build(
+                    "probe::s4::rebind_to_local",
+                    temp(),
+                    vec![
+                        efht_assign(5, Rvalue::Use(Operand::Constant(ConstValue::Int(7)))),
+                        efht_assign(1, Rvalue::Ref { mutable: false, place: Place::local(5) }),
+                        read(),
+                    ],
+                    vec![not_tail()],
+                ),
+                "deref-actual-chase-declined",
+            ),
+            (
+                build("probe::s4::rebind_after_call", temp(), vec![read()], vec![rebind_to_q(), not_tail()]),
+                "deref-actual-chase-declined",
+            ),
+            (
+                build(
+                    "probe::s4::retag_between",
+                    temp(),
+                    vec![read(), Statement::Retag { place: Place::local(1) }],
+                    vec![not_tail()],
+                ),
+                "deref-actual-chase-declined",
+            ),
+            (
+                build(
+                    "probe::s4::direct_deref_rebound",
+                    Operand::Copy(efht_t_deref(1)),
+                    vec![rebind_to_q()],
+                    vec![not_tail()],
+                ),
+                "argument-outside-transport-fragment",
+            ),
+        ];
+        for (caller, reason) in &cases {
+            assert_eq!(efht_t_reason(caller, &registry), Some(*reason), "{}", caller.def_path);
+            assert!(
+                crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok(),
+                "{}: the allow-list alone admits a whole-local rebinding — the fences are what refuse it",
+                caller.def_path
+            );
+            assert!(efht_t_h1_consumer(caller, &registry).is_err(), "{}", caller.def_path);
+        }
+        let twin = build("probe::s4::twin", temp(), vec![read()], vec![not_tail()]);
+        assert_eq!(efht_t_reason(&twin, &registry), None, "TWIN");
+        assert_eq!(efht_t_h1_consumer(&twin, &registry), Ok(()), "TWIN");
+        let direct_twin = build("probe::s4::direct_twin", Operand::Copy(efht_t_deref(1)), vec![], vec![not_tail()]);
+        assert_eq!(efht_t_reason(&direct_twin, &registry), None, "TWIN (direct deref)");
+        assert_eq!(efht_t_h1_consumer(&direct_twin, &registry), Ok(()), "TWIN (direct deref)");
+    }
+
+    /// H1 ATTACK 3 — an S2 field actual whose base has a `&mut`/raw ALIAS PARAMETER in
+    /// the same signature (`fn c(s: &S, m: &mut S)`): the recognizer is type-blind past
+    /// the field and ADMITS the shape (asserted), so G-FROZEN at the consumer is the
+    /// only gate — pinned by its exact reason for `&mut S`, `*mut S`, and the S3 tail
+    /// variant. A `&mut S` hidden INSIDE a by-value tuple parameter is measured too: no
+    /// Trust-visible write channel exists in caller or callee, so the transported value
+    /// is the entry value and the lane's verdict on it is pinned as measured rather than
+    /// argued. TWIN: the same callers without the alias parameter transport.
+    #[test]
+    fn efht_t_h1_field_actual_base_with_a_mut_alias_param_refuses() {
+        use trust_types::{BinOp, Operand, Place, Rvalue, Ty};
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &pass]);
+        let mut_s = || Ty::Ref { mutable: true, inner: Box::new(efht_struct_s()) };
+        let raw_s = || Ty::RawPtr { mutable: true, pointee: Box::new(efht_struct_s()) };
+        // S2 with a second parameter: `fn c(s: &S, m: M) -> bool { _3 = (*_1).0; is_zero(copy _3) -> _0 }`.
+        let s2_with = |name: &str, m: Ty| {
+            efht_t_caller(
+                name,
+                "probe::is_zero",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("m"), m)],
+                vec![efht_i64()],
+                vec![Operand::Copy(Place::local(3))],
+                0,
+                vec![efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                vec![],
+            )
+        };
+        // S3 with a third parameter: `fn c(s: &S, k: i64, m: M) -> bool { _5 = (*_1).0;
+        // pass(copy _5) -> _4; _0 = Eq(copy _2, move _4) }`.
+        let s3_with = |name: &str, m: Ty| {
+            efht_t_caller(
+                name,
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64()), (Some("m"), m)],
+                vec![efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(5))],
+                4,
+                vec![efht_assign(5, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+                vec![efht_assign(
+                    0,
+                    Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(2)), Operand::Move(Place::local(4))),
+                )],
+            )
+        };
+        for caller in [
+            s2_with("probe::s2::mut_alias", mut_s()),
+            s2_with("probe::s2::raw_alias", raw_s()),
+            s3_with("probe::s3::mut_alias", mut_s()),
+            s3_with("probe::s3::raw_alias", raw_s()),
+        ] {
+            assert_eq!(efht_t_reason(&caller, &registry), None, "{}: the recognizer admits the shape", caller.def_path);
+            assert_eq!(
+                efht_t_h1_consumer(&caller, &registry),
+                Err("G-FROZEN: caller has a RawPtr or &mut parameter"),
+                "{}",
+                caller.def_path
+            );
+        }
+        // TWINS — the same signatures with a scalar in the alias slot transport.
+        assert_eq!(efht_t_h1_consumer(&s2_with("probe::s2::twin", efht_i64()), &registry), Ok(()), "TWIN S2");
+        assert_eq!(efht_t_h1_consumer(&s3_with("probe::s3::twin", efht_i64()), &registry), Ok(()), "TWIN S3");
+        // MEASURED, not argued: `(&mut S,)` by value passes G-FROZEN's top-level match.
+        // Its slot has no reading (`ret_model_slot == None`) and no inlined leaf names
+        // it; every write channel in the caller is refused by the allow-list and the
+        // callee is read-only, so the value transported is still the entry value. The
+        // verdict is pinned so a widening that starts to READ such a slot is visible.
+        let hidden = s2_with("probe::s2::tuple_hidden_mut", Ty::Tuple(vec![mut_s()]));
+        assert_eq!(efht_t_reason(&hidden, &registry), None);
+        assert_eq!(crate::prove::ret_model_slot(&Ty::Tuple(vec![mut_s()])), None);
+        assert_eq!(
+            efht_t_h1_consumer(&hidden, &registry),
+            Ok(()),
+            "MEASURED: a by-value aggregate carrying `&mut S` is not a G-FROZEN parameter; no write channel exists, so it transports"
+        );
+        // ... and the moment that tuple is USED to write, the allow-list refuses.
+        let mut hidden_write = s2_with("probe::s2::tuple_hidden_mut_write", Ty::Tuple(vec![mut_s()]));
+        hidden_write.body.locals.push(trust_types::LocalDecl { index: 4, name: None, ty: mut_s() });
+        hidden_write.body.blocks[0].stmts.insert(0, efht_assign(4, Rvalue::Use(Operand::Copy(efht_t_h1_field(2, 0)))));
+        hidden_write.body.blocks[0].stmts.insert(1, efht_store(4, 0, 99));
+        assert_eq!(efht_t_reason(&hidden_write, &registry), None, "the recognizer does not see the write");
+        assert_eq!(
+            efht_t_h1_consumer(&hidden_write, &registry),
+            Err("caller body not read-only except the sole call")
+        );
+    }
+
+    /// H1 ATTACK 4 — a `CheckedBinaryOp` smuggled as the tail, as the tail's `other`,
+    /// as the actual, and behind an `Assert` (overflow-checked debug MIR of `+`), plus
+    /// an `UncheckedBinaryOp` tail. The tail rule admits ONLY `Cmp` and Bool `Not`;
+    /// the `(value, overflowed)` pair never reaches `_0` through any admitted arm, and
+    /// its `.0` projection is outside every operand fragment. TWIN: the `Eq` tail over
+    /// the same operands transports.
+    #[test]
+    fn efht_t_h1_checked_binary_op_tail_refuses() {
+        use trust_types::{
+            AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Operand, Place, Rvalue, Statement,
+            Terminator, Ty, UnwindEdge,
+        };
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&pass]);
+        let pair = || Ty::Tuple(vec![efht_i64(), Ty::Bool]);
+        let read4 = || efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))));
+        // locals: _0 ret, _1 s: &S, _2 k: i64, _3 i64 (call dest), _4 i64 (field temp),
+        // _5 (i64, bool), _6 i64.
+        let build = |name: &str, ret: Ty, actual: Operand, prefix: Vec<Statement>, tail: Vec<Statement>| {
+            efht_t_caller(
+                name,
+                "probe::pass",
+                ret,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64())],
+                vec![efht_i64(), efht_i64(), pair(), efht_i64()],
+                vec![actual],
+                3,
+                prefix,
+                tail,
+            )
+        };
+        let checked = |dst: usize, a: Operand, b: Operand| efht_assign(dst, Rvalue::CheckedBinaryOp(BinOp::Add, a, b));
+        let cases: Vec<(trust_types::VerifiableFunction, &str)> = vec![
+            (
+                build(
+                    "probe::s3::checked_tail",
+                    pair(),
+                    Operand::Copy(Place::local(4)),
+                    vec![read4()],
+                    vec![checked(0, Operand::Move(Place::local(3)), Operand::Copy(Place::local(2)))],
+                ),
+                "return-block-tail-outside-fragment",
+            ),
+            (
+                build(
+                    "probe::s3::checked_then_cmp_projection",
+                    Ty::Bool,
+                    Operand::Copy(Place::local(4)),
+                    vec![read4()],
+                    vec![
+                        checked(5, Operand::Move(Place::local(3)), Operand::Copy(Place::local(2))),
+                        efht_assign(
+                            0,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(efht_t_h1_field(5, 0)),
+                                Operand::Constant(ConstValue::Int(0)),
+                            ),
+                        ),
+                    ],
+                ),
+                "return-block-tail-does-not-consume-the-call-result",
+            ),
+            (
+                build(
+                    "probe::s3::checked_actual",
+                    Ty::Bool,
+                    Operand::Copy(Place::local(6)),
+                    vec![
+                        checked(5, Operand::Copy(Place::local(2)), Operand::Constant(ConstValue::Int(1))),
+                        efht_assign(6, Rvalue::Use(Operand::Copy(efht_t_h1_field(5, 0)))),
+                    ],
+                    vec![efht_assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(2)), Operand::Move(Place::local(3))),
+                    )],
+                ),
+                "argument-outside-transport-fragment",
+            ),
+            (
+                build(
+                    "probe::s3::checked_tail_other",
+                    Ty::Bool,
+                    Operand::Copy(Place::local(4)),
+                    vec![
+                        read4(),
+                        checked(5, Operand::Copy(Place::local(2)), Operand::Constant(ConstValue::Int(1))),
+                        efht_assign(6, Rvalue::Use(Operand::Copy(efht_t_h1_field(5, 0)))),
+                    ],
+                    vec![efht_assign(
+                        0,
+                        Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(6))),
+                    )],
+                ),
+                "tail-other-outside-fragment",
+            ),
+            (
+                build(
+                    "probe::s3::unchecked_tail",
+                    efht_i64(),
+                    Operand::Copy(Place::local(4)),
+                    vec![read4()],
+                    vec![efht_assign(
+                        0,
+                        Rvalue::UncheckedBinaryOp(BinOp::Add, Operand::Move(Place::local(3)), Operand::Copy(Place::local(2))),
+                    )],
+                ),
+                // MEASURED: `assigned_local_rvalue` does not read an `UncheckedBinaryOp`
+                // as an assignment of `_0` at all, so P-DEST fires before P-TAIL.
+                "return-block-never-writes-_0",
+            ),
+        ];
+        for (caller, reason) in &cases {
+            assert_eq!(efht_t_reason(caller, &registry), Some(*reason), "{}", caller.def_path);
+            assert!(efht_t_h1_consumer(caller, &registry).is_err(), "{}", caller.def_path);
+        }
+        // Debug-MIR `+`: the checked pair, an `Assert` on `.1`, then `.0` compared.
+        let asserted = efht_func(
+            "probe::s3::checked_assert",
+            vec![
+                (None, Ty::Bool),
+                (Some("s"), efht_ref(efht_struct_s())),
+                (Some("k"), efht_i64()),
+                (None, efht_i64()),
+                (None, efht_i64()),
+                (None, pair()),
+                (None, efht_i64()),
+            ],
+            2,
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![read4()],
+                    terminator: Terminator::Call {
+                        func: "probe::pass".into(),
+                        args: vec![Operand::Copy(Place::local(4))],
+                        dest: Place::local(3),
+                        target: Some(BlockId(1)),
+                        unwind: UnwindEdge::Unreachable,
+                        span: Default::default(),
+                        atomic: None,
+                        is_unsafe_sig: false,
+                        is_foreign: false,
+                        callee_identity: None,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![checked(5, Operand::Move(Place::local(3)), Operand::Copy(Place::local(2)))],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(efht_t_h1_field(5, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(2),
+                        span: Default::default(),
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![
+                        efht_assign(6, Rvalue::Use(Operand::Copy(efht_t_h1_field(5, 0)))),
+                        efht_assign(
+                            0,
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Copy(Place::local(6)),
+                                Operand::Constant(ConstValue::Int(0)),
+                            ),
+                        ),
+                    ],
+                    terminator: Terminator::Return,
+                },
+            ],
+        );
+        assert_eq!(efht_t_reason(&asserted, &registry), Some("terminator-outside-transport-spine"));
+        assert!(
+            efht_t_shared_reason(&asserted, &registry).is_some(),
+            "the shared fallback refuses the Assert-guarded tail too: {:?}",
+            efht_t_shared_reason(&asserted, &registry)
+        );
+        assert!(efht_t_h1_consumer(&asserted, &registry).is_err());
+        // TWIN — the comparison tail over the same operands.
+        let twin = build(
+            "probe::s3::twin",
+            Ty::Bool,
+            Operand::Copy(Place::local(4)),
+            vec![read4()],
+            vec![efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(2))),
+            )],
+        );
+        assert_eq!(efht_t_reason(&twin, &registry), None, "TWIN");
+        assert_eq!(efht_t_h1_consumer(&twin, &registry), Ok(()), "TWIN");
+    }
+
+    /// H1 ATTACK 5 — a `SwitchInt` whose OTHER arm writes, then joins the call block:
+    /// (i) the arm re-points the handle (`_1 = copy _3`) before a handle actual; (ii)
+    /// the arm stores through the handle; (iii) the arm rewrites the field-read temp
+    /// that is the actual; (iv) the arm rewrites the Value parameter the tail compares
+    /// against. P-SPINE refuses every `SwitchInt` by name, so each attack lands on the
+    /// SHARED fallback — which is where it must ALSO be refused, and is, at a named
+    /// gate. TWIN: (i) minus the write transports through the fallback (the guarded
+    /// shape the shared recognizer admits), which is what makes the write the
+    /// refused feature.
+    #[test]
+    fn efht_t_h1_switchint_arm_writes_then_joins_refuses() {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, Operand, Place, Rvalue, Statement, Terminator, Ty,
+            UnwindEdge,
+        };
+        let get_x = efht_field_callee();
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&get_x, &is_zero, &pass]);
+        let call = |callee: &str, actual: usize, dest: usize| Terminator::Call {
+            func: callee.into(),
+            args: vec![Operand::Copy(Place::local(actual))],
+            dest: Place::local(dest),
+            target: Some(BlockId(3)),
+            unwind: UnwindEdge::Unreachable,
+            span: Default::default(),
+            atomic: None,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
+        };
+        // bb0 { prefix; switchInt [0: bb1, otherwise: bb4] } bb1 { arm; goto bb2 }
+        // bb2 { call -> bb3 } bb3 { tail; Return } bb4 { Unreachable }. The guarded arm
+        // is ON the returning spine — the shape the shared recognizer admits (its
+        // `otherwise` must be unreachable; a genuine two-arm join is pinned below).
+        let guarded = |name: &str,
+                       locals: Vec<(Option<&str>, Ty)>,
+                       argc: usize,
+                       switch_local: usize,
+                       prefix: Vec<Statement>,
+                       arm: Vec<Statement>,
+                       call: Terminator,
+                       tail: Vec<Statement>| {
+            efht_func(
+                name,
+                locals,
+                argc,
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: prefix,
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(switch_local)),
+                            targets: vec![(0, BlockId(1))],
+                            otherwise: BlockId(4),
+                            exhaustive_enum_unreachable: false,
+                            span: Default::default(),
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: arm, terminator: Terminator::Goto(BlockId(2)) },
+                    BasicBlock { id: BlockId(2), stmts: vec![], terminator: call },
+                    BasicBlock { id: BlockId(3), stmts: tail, terminator: Terminator::Return },
+                    BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Unreachable },
+                ],
+            )
+        };
+        // (i) `fn c(s: &S, k: i64, t: &S) -> i64`: the arm re-points `s` at `t`.
+        let handle_locals = || {
+            vec![
+                (None, efht_i64()),
+                (Some("s"), efht_ref(efht_struct_s())),
+                (Some("k"), efht_i64()),
+                (Some("t"), efht_ref(efht_struct_s())),
+            ]
+        };
+        let repoint = guarded(
+            "probe::guard::repoint_handle",
+            handle_locals(),
+            3,
+            2,
+            vec![],
+            vec![efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(3))))],
+            call("probe::get_x", 1, 0),
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&repoint, &registry), Some("terminator-outside-transport-spine"));
+        assert!(
+            crate::prove::body_is_read_only_except_sole_call(&repoint.body).is_ok(),
+            "a whole-local rebinding is inside the allow-list — the fences must refuse it"
+        );
+        let repoint_shared = efht_t_shared_reason(&repoint, &registry);
+        let repoint_verdict = efht_t_h1_consumer(&repoint, &registry);
+        assert!(repoint_verdict.is_err(), "(i) shared={repoint_shared:?} verdict={repoint_verdict:?}");
+        // TWIN (i) — the same guard with an empty arm transports through the fallback.
+        let twin = guarded(
+            "probe::guard::repoint_twin",
+            handle_locals(),
+            3,
+            2,
+            vec![],
+            vec![],
+            call("probe::get_x", 1, 0),
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&twin, &registry), Some("terminator-outside-transport-spine"));
+        assert_eq!(efht_t_shared_reason(&twin, &registry), None, "TWIN: the shared recognizer admits the guard");
+        assert_eq!(efht_t_h1_consumer(&twin, &registry), Ok(()), "TWIN: the fallback transports it");
+        // A GENUINE two-arm join into the call block (otherwise -> bb2, both arms
+        // returning) is outside BOTH recognizers whatever the arm holds — pinned, so
+        // the write-in-arm attacks below are measured on the admitted guard shape.
+        let mut join = guarded(
+            "probe::guard::two_arm_join",
+            handle_locals(),
+            3,
+            2,
+            vec![],
+            vec![],
+            call("probe::get_x", 1, 0),
+            vec![],
+        );
+        if let Terminator::SwitchInt { otherwise, .. } = &mut join.body.blocks[0].terminator {
+            *otherwise = BlockId(2);
+        }
+        assert_eq!(efht_t_reason(&join, &registry), Some("terminator-outside-transport-spine"));
+        assert_eq!(efht_t_shared_reason(&join, &registry), Some("two-arms-can-return-a-join"));
+        assert!(efht_t_h1_consumer(&join, &registry).is_err());
+        // (ii) the arm stores THROUGH the handle.
+        let store = guarded(
+            "probe::guard::store_through_handle",
+            handle_locals(),
+            3,
+            2,
+            vec![],
+            vec![efht_store(1, 0, 9)],
+            call("probe::get_x", 1, 0),
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&store, &registry), Some("terminator-outside-transport-spine"));
+        // MEASURED: the shared recognizer's deny-list (`deref_write_exists` on the handle
+        // actual) refuses the store before the allow-list is even consulted.
+        assert_eq!(efht_t_shared_reason(&store, &registry), Some("argument-outside-modeled-operand-fragment"));
+        assert!(crate::prove::body_is_read_only_except_sole_call(&store.body).is_err(), "and the allow-list refuses it too");
+        assert!(efht_t_h1_consumer(&store, &registry).is_err());
+        // (iii) `fn c(s: &S, k: i64) -> bool`: `_3 = (*_1).0` then the arm sets `_3 = 9`.
+        let temp_rewrite = guarded(
+            "probe::guard::rewrite_field_temp",
+            vec![(None, Ty::Bool), (Some("s"), efht_ref(efht_struct_s())), (Some("k"), efht_i64()), (None, efht_i64())],
+            2,
+            2,
+            vec![efht_assign(3, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![efht_assign(3, Rvalue::Use(Operand::Constant(ConstValue::Int(9))))],
+            call("probe::is_zero", 3, 0),
+            vec![],
+        );
+        assert_eq!(efht_t_reason(&temp_rewrite, &registry), Some("terminator-outside-transport-spine"));
+        let tr_shared = efht_t_shared_reason(&temp_rewrite, &registry);
+        let tr_verdict = efht_t_h1_consumer(&temp_rewrite, &registry);
+        assert!(tr_verdict.is_err(), "(iii) shared={tr_shared:?} verdict={tr_verdict:?}");
+        // (iv) `fn c(s: &S, k: i64) -> bool`: the arm sets `k = 9`, the tail compares `k`.
+        let param_rewrite = guarded(
+            "probe::guard::rewrite_tail_param",
+            vec![
+                (None, Ty::Bool),
+                (Some("s"), efht_ref(efht_struct_s())),
+                (Some("k"), efht_i64()),
+                (None, efht_i64()),
+                (None, efht_i64()),
+            ],
+            2,
+            2,
+            vec![efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))))],
+            vec![efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::Int(9))))],
+            call("probe::pass", 4, 3),
+            vec![efht_assign(
+                0,
+                Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::local(2)), Operand::Move(Place::local(3))),
+            )],
+        );
+        assert_eq!(efht_t_reason(&param_rewrite, &registry), Some("terminator-outside-transport-spine"));
+        let pr_shared = efht_t_shared_reason(&param_rewrite, &registry);
+        let pr_verdict = efht_t_h1_consumer(&param_rewrite, &registry);
+        assert!(pr_verdict.is_err(), "(iv) shared={pr_shared:?} verdict={pr_verdict:?}");
+    }
+
+    /// H1 ATTACK 6 — the actual temp or the tail temp is DEFINED TWICE on the spine
+    /// (`_t = (*_1).0; _t = 9`), or once more in an unreachable island the spine walk
+    /// tolerates: `unique_local_definition_dominating` refuses both, by name at the
+    /// actual and at the tail. TWIN: S2 / S3 as built.
+    #[test]
+    fn efht_t_h1_actual_temp_and_tail_temp_redefined_refuse() {
+        use trust_types::{BasicBlock, BlockId, ConstValue, Operand, Rvalue, Terminator};
+        let is_zero = efht_t_is_zero_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&is_zero, &pass]);
+        let nine = |local: usize| efht_assign(local, Rvalue::Use(Operand::Constant(ConstValue::Int(9))));
+        let mut twice = efht_t_s2_caller();
+        twice.body.blocks[0].stmts.push(nine(2));
+        assert_eq!(efht_t_reason(&twice, &registry), Some("actual-temp-has-no-unique-dominating-definition"));
+        assert!(efht_t_h1_consumer(&twice, &registry).is_err());
+        let mut island = efht_t_s2_caller();
+        island.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![nine(2)], terminator: Terminator::Unreachable });
+        assert_eq!(efht_t_reason(&island, &registry), Some("actual-temp-has-no-unique-dominating-definition"));
+        assert!(efht_t_h1_consumer(&island, &registry).is_err());
+        assert_eq!(efht_t_reason(&efht_t_s2_caller(), &registry), None, "TWIN S2");
+        // The tail temp: S3 with `_5 = (*_1).0; _5 = 9` pre-call and `_0 = Eq(move _3, copy _5)`.
+        let build = |redefine: bool| {
+            use trust_types::{BinOp, Place, Ty};
+            let mut prefix = vec![
+                efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))),
+                efht_assign(5, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0)))),
+            ];
+            if redefine {
+                prefix.push(nine(5));
+            }
+            efht_t_caller(
+                "probe::s3::tail_temp",
+                "probe::pass",
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s()))],
+                vec![efht_i64(), efht_i64(), efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(4))],
+                3,
+                prefix,
+                vec![efht_assign(
+                    0,
+                    Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), Operand::Copy(Place::local(5))),
+                )],
+            )
+        };
+        let tail_twice = build(true);
+        assert_eq!(efht_t_reason(&tail_twice, &registry), Some("tail-other-temp-has-no-unique-definition"));
+        assert!(efht_t_h1_consumer(&tail_twice, &registry).is_err());
+        assert_eq!(efht_t_reason(&build(false), &registry), None, "TWIN S3 tail temp");
+        assert_eq!(efht_t_h1_consumer(&build(false), &registry), Ok(()), "TWIN S3 tail temp");
+    }
+
+    /// H1 ATTACK 7 — the HANDLE is re-pointed between the pre-call field read and the
+    /// call (`_4 = (*_1).0; _1 = copy _2; g(copy _1) -> _3; _0 = Eq(_3, _4)`): the
+    /// callee reads the NEW referent while the tail compares the OLD one, and the
+    /// single untimed `Field(0, 0)` would name both. Refused at arm (b)'s entry fences
+    /// for the handle actual, at the field chase for a field actual over the re-pointed
+    /// base, and (conservatively) when the re-pointing is AFTER the call. TWIN: the same
+    /// bodies minus the rebinding transport.
+    #[test]
+    fn efht_t_h1_handle_rebound_between_field_read_and_call_refuses() {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Rvalue, Statement, Ty};
+        let get_x = efht_field_callee();
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&get_x, &pass]);
+        let read4 = || efht_assign(4, Rvalue::Use(Operand::Copy(efht_deref_field(1, 0))));
+        let repoint = || efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(2))));
+        let cmp_with = |other: Operand| {
+            efht_assign(0, Rvalue::BinaryOp(BinOp::Eq, Operand::Move(Place::local(3)), other))
+        };
+        // locals: _0 Bool, _1 s: &S, _2 t: &S, _3 i64 (dest), _4 i64 (field temp).
+        let build = |name: &str, callee: &str, actual: usize, prefix: Vec<Statement>, tail: Vec<Statement>| {
+            efht_t_caller(
+                name,
+                callee,
+                Ty::Bool,
+                vec![(Some("s"), efht_ref(efht_struct_s())), (Some("t"), efht_ref(efht_struct_s()))],
+                vec![efht_i64(), efht_i64()],
+                vec![Operand::Copy(Place::local(actual))],
+                3,
+                prefix,
+                tail,
+            )
+        };
+        let handle_between = build(
+            "probe::h::handle_between",
+            "probe::get_x",
+            1,
+            vec![read4(), repoint()],
+            vec![cmp_with(Operand::Copy(Place::local(4)))],
+        );
+        assert_eq!(efht_t_reason(&handle_between, &registry), Some("handle-actual-fails-the-entry-fences"));
+        assert!(crate::prove::body_is_read_only_except_sole_call(&handle_between.body).is_ok());
+        assert!(efht_t_h1_consumer(&handle_between, &registry).is_err());
+        let handle_after = build(
+            "probe::h::handle_after",
+            "probe::get_x",
+            1,
+            vec![read4()],
+            vec![repoint(), cmp_with(Operand::Copy(Place::local(4)))],
+        );
+        assert_eq!(efht_t_reason(&handle_after, &registry), Some("handle-actual-fails-the-entry-fences"));
+        assert!(efht_t_h1_consumer(&handle_after, &registry).is_err());
+        let field_between = build(
+            "probe::h::field_between",
+            "probe::pass",
+            4,
+            vec![read4(), repoint()],
+            vec![cmp_with(Operand::Constant(ConstValue::Int(0)))],
+        );
+        let fb_reason = efht_t_reason(&field_between, &registry);
+        assert!(
+            matches!(fb_reason, Some("field-actual-chase-declined") | Some("field-actual-chase-disagrees-with-mir")),
+            "field actual over a re-pointed base: {fb_reason:?}"
+        );
+        assert!(efht_t_h1_consumer(&field_between, &registry).is_err());
+        // TWINS.
+        let twin_handle = build(
+            "probe::h::twin_handle",
+            "probe::get_x",
+            1,
+            vec![read4()],
+            vec![cmp_with(Operand::Copy(Place::local(4)))],
+        );
+        assert_eq!(efht_t_reason(&twin_handle, &registry), None, "TWIN handle");
+        assert_eq!(efht_t_h1_consumer(&twin_handle, &registry), Ok(()), "TWIN handle");
+        let twin_field = build(
+            "probe::h::twin_field",
+            "probe::pass",
+            4,
+            vec![read4()],
+            vec![cmp_with(Operand::Constant(ConstValue::Int(0)))],
+        );
+        assert_eq!(efht_t_reason(&twin_field, &registry), None, "TWIN field");
+        assert_eq!(efht_t_h1_consumer(&twin_field, &registry), Ok(()), "TWIN field");
+    }
+
+    /// H1 ATTACK 8 — the tail's `other` is a VALUE entry parameter that is rebound
+    /// before the comparison (in the prefix, or in the Return block ahead of the `_0`
+    /// assign, or by a `Retag`): the tail would compare the runtime's `9` while the term
+    /// says `Var(1)`, the entry value. Refused by name at P-TAIL-OTHER. TWIN: S3.
+    #[test]
+    fn efht_t_h1_value_param_tail_other_rebound_refuses() {
+        use trust_types::{ConstValue, Operand, Place, Rvalue, Statement};
+        let pass = efht_t_pass_callee();
+        let registry = efht_t_registry(&[&pass]);
+        let nine = || efht_assign(2, Rvalue::Use(Operand::Constant(ConstValue::Int(9))));
+        let mut in_prefix = efht_t_s3_caller();
+        in_prefix.body.blocks[0].stmts.push(nine());
+        let mut in_return = efht_t_s3_caller();
+        in_return.body.blocks[1].stmts.insert(0, nine());
+        let mut retagged = efht_t_s3_caller();
+        retagged.body.blocks[0].stmts.push(Statement::Retag { place: Place::local(2) });
+        for caller in [&in_prefix, &in_return, &retagged] {
+            assert_eq!(efht_t_reason(caller, &registry), Some("tail-other-param-fails-the-entry-fences"));
+            assert!(crate::prove::body_is_read_only_except_sole_call(&caller.body).is_ok());
+            assert!(efht_t_h1_consumer(caller, &registry).is_err());
+        }
+        assert_eq!(efht_t_reason(&efht_t_s3_caller(), &registry), None, "TWIN");
+    }
+
+    /// TIGHTNESS TWINS for the allow-list's `Cast` rule, which the launder negative
+    /// above could not pin (D2's deny-list now declines `p as *const u8` before the
+    /// lowering, so `lowers == false` there). An int-to-raw-pointer cast of an UNRELATED
+    /// local is invisible to every deny-list, lowers, and is refused by the allow-list
+    /// alone; the scalar casts (`v as i64`, `*p as i64`) lower, pass, and mint.
+    #[test]
+    fn read_only_allow_list_cast_rule_is_tight() {
+        use trust_types::{Operand, Place, Projection, Rvalue, Statement, Ty};
+        let u8t = Ty::Int { width: 8, signed: false };
+        let i64t = Ty::Int { width: 64, signed: true };
+        let mptr = Ty::RawPtr { mutable: true, pointee: Box::new(u8t.clone()) };
+        let cptr = Ty::RawPtr { mutable: false, pointee: Box::new(u8t.clone()) };
+        let cast = |dst, src, ty| Statement::Assign {
+            place: Place::local(dst),
+            rvalue: Rvalue::Cast(Operand::Copy(src), ty),
+            span: Default::default(),
+        };
+        // POSITIVE — `_3: i64 = _4 as i64` (a scalar local): lowers, admitted, mints.
+        let int_cast = shared_ref_leaf_with(
+            "probe::cast_int",
+            vec![i64t.clone(), u8t.clone()],
+            vec![cast(3, Place::local(4), i64t.clone())],
+        );
+        assert!(crate::prove::straight_line_ir_body(&int_cast).is_some());
+        assert_eq!(crate::prove::body_is_read_only(&int_cast.body), Ok(()));
+        assert!(crate::prove::pure_scalar_ret_model(&int_cast).is_some());
+        // POSITIVE — `_3: i64 = (*_1) as i64`: a cast of the READ, not of the handle.
+        let deref_cast = shared_ref_leaf_with(
+            "probe::cast_deref_int",
+            vec![i64t.clone()],
+            vec![cast(3, Place { local: 1, projections: vec![Projection::Deref] }, i64t)],
+        );
+        assert!(crate::prove::straight_line_ir_body(&deref_cast).is_some());
+        assert_eq!(crate::prove::body_is_read_only(&deref_cast.body), Ok(()));
+        assert!(crate::prove::pure_scalar_ret_model(&deref_cast).is_some());
+        // NEGATIVE — `_3: *mut u8 = _4 as *mut u8` (int-to-pointer, unrelated to `_1`):
+        // no deny-list connects `_4` to the parameter, the lowering admits the body, and
+        // ONLY the allow-list refuses it.
+        let ptr_cast = shared_ref_leaf_with(
+            "probe::cast_ptr",
+            vec![mptr.clone(), u8t.clone()],
+            vec![cast(3, Place::local(4), mptr)],
+        );
+        assert_refused_but_lowers(&ptr_cast, "Cast to a non-scalar type", true);
+        assert!(crate::prove::pure_scalar_ret_model(&ptr_cast).is_none());
+        // NEGATIVE — `_3: *const u8 = _1 as *const u8` (the launder's first step alone):
+        // refused by the allow-list, AND declined by the lowering (D2's deny-list treats
+        // a cast of the parameter as an escape) — so this one is not the tight pin.
+        let param_cast = shared_ref_leaf_with(
+            "probe::cast_param_ptr",
+            vec![cptr.clone()],
+            vec![cast(3, Place::local(1), cptr)],
+        );
+        // `lowers == true`: `deref_write_exists` does NOT see a Cast-laundered write (an
+        // arm that did was landed and REVERTED -- it broke 12 ptr-offset-lane pins), so
+        // `straight_line_ir_body` ADMITS `param_cast` and the allow-list is the ONLY gate
+        // standing between it and a minted model. That is the strongest tightness
+        // statement this pin can make; if `lowers` ever reads false again, some other
+        // predicate started carrying the case and the argument must be re-read.
+        assert_refused_but_lowers(&param_cast, "Cast to a non-scalar type", true);
+    }
+
+    /// `UncheckedBinaryOp` is refused BY NAME, and the allow-list is the ONLY gate: the
+    /// lowering admits the body (measured 2026-08-29). This is a deliberate NARROWING of
+    /// the pre-EFHT scalar lane — such a body carries no memory hazard — and the pin
+    /// exists so admitting it later is a decision with a failing test, not a drift. Twin:
+    /// the same statement as a checked `BinaryOp` is admitted.
+    #[test]
+    fn read_only_allow_list_refuses_unchecked_binop_by_name_and_it_is_the_only_gate() {
+        use trust_types::{BinOp, ConstValue, Operand, Place, Rvalue, Statement, Ty};
+        let u8t = Ty::Int { width: 8, signed: false };
+        let stmt = |rvalue| Statement::Assign { place: Place::local(3), rvalue, span: Default::default() };
+        let unchecked = shared_ref_leaf_with(
+            "probe::unchecked",
+            vec![u8t.clone(), u8t.clone()],
+            vec![stmt(Rvalue::UncheckedBinaryOp(
+                BinOp::BitAnd,
+                Operand::Copy(Place::local(4)),
+                Operand::Constant(ConstValue::Int(1)),
+            ))],
+        );
+        assert_refused_but_lowers(&unchecked, "UncheckedBinaryOp", true);
+        assert!(crate::prove::pure_scalar_ret_model(&unchecked).is_none());
+        let checked = shared_ref_leaf_with(
+            "probe::checked",
+            vec![u8t.clone(), u8t],
+            vec![stmt(Rvalue::BinaryOp(
+                BinOp::BitAnd,
+                Operand::Copy(Place::local(4)),
+                Operand::Constant(ConstValue::Int(1)),
+            ))],
+        );
+        assert!(crate::prove::straight_line_ir_body(&checked).is_some());
+        assert_eq!(crate::prove::body_is_read_only(&checked.body), Ok(()));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Trust: LENS H1 over the EFHT MINTER (adversarial, 2026-08-29).
+    //
+    // CLAUDE.md H1: "a certified callee may MUTATE THROUGH A SHARED REFERENCE and
+    // nothing on the certification path notices". Every fixture below PASSES the G2'
+    // signature gate (asserted through `ret_model_slots`) and then mutates memory a
+    // caller could observe — or rebinds what the model names — through one channel the
+    // deny-lists were measured to miss. Each asserts `pure_scalar_ret_model` is `None`;
+    // where a write-free twin exists it is asserted to MINT, so the refusal is pinned to
+    // the write and not to an earlier recognizer. A `Some` on any attack IS a false
+    // verify: the failing test is the deliverable, leave it in place.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn h1_signature_gate_passes(f: &trust_types::VerifiableFunction) {
+        assert!(
+            matches!(f.body.return_ty, trust_types::Ty::Int { .. } | trust_types::Ty::Bool),
+            "{}: the attack must carry a scalar return or it never reaches G-PURE",
+            f.def_path
+        );
+        let tys: Vec<trust_types::Ty> =
+            (1..=f.body.arg_count).map(|i| f.body.locals[i].ty.clone()).collect();
+        assert!(
+            crate::prove::ret_model_slots(&tys).is_some(),
+            "{}: the attack must PASS the G2' signature gate, or it pins nothing about G-PURE",
+            f.def_path
+        );
+    }
+    fn h1_assert_no_mint(f: &trust_types::VerifiableFunction) {
+        h1_signature_gate_passes(f);
+        assert!(
+            crate::prove::pure_scalar_ret_model(f).is_none(),
+            "{}: FALSE VERIFY — a callee that mutates observable memory minted a return model",
+            f.def_path
+        );
+    }
+    fn h1_assert_mints(f: &trust_types::VerifiableFunction) {
+        h1_signature_gate_passes(f);
+        assert!(
+            crate::prove::pure_scalar_ret_model(f).is_some(),
+            "{}: the write-free twin must mint, or the attack pin beside it is vacuous",
+            f.def_path
+        );
+    }
+    fn h1_mptr(pointee: trust_types::Ty) -> trust_types::Ty {
+        trust_types::Ty::RawPtr { mutable: true, pointee: Box::new(pointee) }
+    }
+    fn h1_cptr(pointee: trust_types::Ty) -> trust_types::Ty {
+        trust_types::Ty::RawPtr { mutable: false, pointee: Box::new(pointee) }
+    }
+    /// `(*_local) = 9` — the store every attack ends in, on WHATEVER local it laundered.
+    fn h1_store_through(local: usize) -> trust_types::Statement {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        Statement::Assign {
+            place: Place { local, projections: vec![Projection::Deref] },
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+            span: Default::default(),
+        }
+    }
+
+    /// (1) CAST-LAUNDERED RAW WRITE — `p as *const u8 as *mut u8` is `Rvalue::Cast`,
+    /// never `AddressOf`; plus the int round-trip, a `*mut` of unknown provenance, and
+    /// a `PtrOffset`-derived pointer.
+    #[test]
+    fn h1_cast_laundered_raw_write_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Rvalue};
+        let cptr = h1_cptr(efht_u8());
+        let mptr = h1_mptr(efht_u8());
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::launder_ptr_to_ptr",
+            vec![cptr.clone(), mptr.clone()],
+            vec![
+                efht_assign(3, Rvalue::Cast(Operand::Copy(Place::local(1)), cptr)),
+                efht_assign(4, Rvalue::Cast(Operand::Copy(Place::local(3)), mptr.clone())),
+                h1_store_through(4),
+            ],
+        ));
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::launder_via_usize",
+            vec![efht_usize(), mptr.clone()],
+            vec![
+                efht_assign(3, Rvalue::Cast(Operand::Copy(Place::local(1)), efht_usize())),
+                efht_assign(4, Rvalue::Cast(Operand::Copy(Place::local(3)), mptr.clone())),
+                h1_store_through(4),
+            ],
+        ));
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::store_unknown_provenance",
+            vec![mptr.clone()],
+            vec![h1_store_through(3)],
+        ));
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::launder_ptr_offset",
+            vec![mptr],
+            vec![
+                efht_assign(
+                    3,
+                    Rvalue::PtrOffset {
+                        ptr: Operand::Copy(Place::local(1)),
+                        count: Operand::Constant(ConstValue::Int(0)),
+                    },
+                ),
+                h1_store_through(3),
+            ],
+        ));
+        h1_assert_mints(&shared_ref_leaf_func("h1::launder_twin"));
+    }
+
+    /// (2) REBORROW THEN WRITE — `_3 = &(*_1)` is neither a write nor an alias the
+    /// deny-list closure followed; then a store through `_3`, and through a cast of `_3`.
+    #[test]
+    fn h1_reborrow_then_write_mints_nothing() {
+        use trust_types::{Operand, Place, Projection, Rvalue};
+        let sref = efht_ref(efht_u8());
+        let mptr = h1_mptr(efht_u8());
+        let reborrow = efht_assign(
+            3,
+            Rvalue::Ref {
+                mutable: false,
+                place: Place { local: 1, projections: vec![Projection::Deref] },
+            },
+        );
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::reborrow_store",
+            vec![sref.clone()],
+            vec![reborrow.clone(), h1_store_through(3)],
+        ));
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::reborrow_cast_store",
+            vec![sref.clone(), mptr.clone()],
+            vec![
+                reborrow.clone(),
+                efht_assign(4, Rvalue::Cast(Operand::Copy(Place::local(3)), mptr)),
+                h1_store_through(4),
+            ],
+        ));
+        h1_assert_mints(&shared_ref_leaf_with("h1::reborrow_only", vec![sref], vec![reborrow]));
+    }
+
+    /// (3) `copy_nonoverlapping` INTO THE REFERENT — a write channel with no `Place`.
+    /// The lowering still admits both bodies (asserted), so the allow-list is the ONLY gate.
+    #[test]
+    fn h1_copy_nonoverlapping_into_the_referent_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Statement};
+        let mptr = h1_mptr(efht_u8());
+        let copy = |src: usize, dst: usize| Statement::CopyNonOverlapping {
+            src: Operand::Copy(Place::local(src)),
+            dst: Operand::Copy(Place::local(dst)),
+            count: Operand::Constant(ConstValue::Int(1)),
+            elem_ty: efht_u8(),
+            span: Default::default(),
+        };
+        let direct = shared_ref_leaf_with("h1::copy_into_param", vec![mptr.clone()], vec![copy(3, 1)]);
+        assert!(crate::prove::straight_line_ir_body(&direct).is_some(), "lowers — only the allow-list stands");
+        h1_assert_no_mint(&direct);
+        let laundered = shared_ref_leaf_with("h1::copy_via_unknown_ptr", vec![mptr], vec![copy(1, 3)]);
+        assert!(crate::prove::straight_line_ir_body(&laundered).is_some());
+        h1_assert_no_mint(&laundered);
+    }
+
+    /// (4) A non-diverging INTRINSIC statement carrying the parameter.
+    #[test]
+    fn h1_intrinsic_statement_carrying_the_param_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Statement};
+        for (name, args) in [
+            ("volatile_store", vec![Operand::Copy(Place::local(1)), Operand::Constant(ConstValue::Int(9))]),
+            (
+                "write_bytes",
+                vec![
+                    Operand::Copy(Place::local(1)),
+                    Operand::Constant(ConstValue::Int(0)),
+                    Operand::Constant(ConstValue::Int(1)),
+                ],
+            ),
+        ] {
+            let f = shared_ref_leaf_with(
+                &format!("h1::intrinsic_{name}"),
+                vec![],
+                vec![Statement::Intrinsic { name: name.into(), args }],
+            );
+            assert!(crate::prove::straight_line_ir_body(&f).is_some(), "lowers — only the allow-list stands");
+            h1_assert_no_mint(&f);
+        }
+    }
+
+    /// (5) `Statement::Unsupported` / `Rvalue::Unsupported` carrying the parameter — the
+    /// sentinels for MIR classes trust-types did not model (inline asm, thread-locals).
+    #[test]
+    fn h1_unsupported_carrying_the_param_mints_nothing() {
+        use trust_types::{Operand, Place, Rvalue, Statement};
+        let asm = shared_ref_leaf_with(
+            "h1::unsupported_stmt",
+            vec![],
+            vec![Statement::Unsupported {
+                kind: "InlineAsm".into(),
+                detail: "asm!(\"mov byte ptr [{0}], 9\", in(reg) p)".into(),
+                operands: vec![Operand::Copy(Place::local(1))],
+                span: Default::default(),
+            }],
+        );
+        assert!(crate::prove::straight_line_ir_body(&asm).is_some(), "lowers — only the allow-list stands");
+        h1_assert_no_mint(&asm);
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::unsupported_rvalue",
+            vec![h1_mptr(efht_u8())],
+            vec![
+                efht_assign(
+                    3,
+                    Rvalue::Unsupported {
+                        kind: "ThreadLocalRef".into(),
+                        detail: "&raw mut TLS".into(),
+                        operands: vec![Operand::Copy(Place::local(1))],
+                    },
+                ),
+                h1_store_through(3),
+            ],
+        ));
+    }
+
+    /// (6) `SetDiscriminant` / `Deinit` / a downcast-field store THROUGH `Deref` on the
+    /// `&Option<bool>` handle of the `is_none` shape, whose write-free twin mints.
+    #[test]
+    fn h1_set_discriminant_through_deref_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        let base = efht_is_none_callee();
+        h1_assert_mints(&base);
+        let deref_1 = || Place { local: 1, projections: vec![Projection::Deref] };
+        let with = |name: &str, st: Statement| {
+            let mut f = base.clone();
+            f.def_path = name.into();
+            f.name = name.into();
+            f.body.blocks[0].stmts.insert(0, st);
+            f
+        };
+        h1_assert_no_mint(&with(
+            "h1::set_discriminant",
+            Statement::SetDiscriminant { place: deref_1(), variant_index: 0 },
+        ));
+        h1_assert_no_mint(&with("h1::deinit", Statement::Deinit { place: deref_1() }));
+        h1_assert_no_mint(&with(
+            "h1::downcast_field_store",
+            Statement::Assign {
+                place: Place {
+                    local: 1,
+                    projections: vec![Projection::Deref, Projection::Downcast(1), Projection::Field(0)],
+                },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Bool(true))),
+                span: Default::default(),
+            },
+        ));
+        // And the whole-referent overwrite: `(*_1) = _4` from an own local of the enum type.
+        let mut whole = with(
+            "h1::whole_referent_store",
+            Statement::Assign {
+                place: deref_1(),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(4))),
+                span: Default::default(),
+            },
+        );
+        whole.body.locals.push(trust_types::LocalDecl { index: 4, name: None, ty: efht_option_bool() });
+        h1_assert_no_mint(&whole);
+    }
+
+    /// `fn f(p: &u8, q: &u8) -> u8 { prefix; _3 = (*_1); _0 = _3 }` with `extra` locals
+    /// appended after `_3`.
+    fn h1_two_ref_func(
+        name: &str,
+        extra: Vec<trust_types::Ty>,
+        prefix: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{BasicBlock, BlockId, Operand, Place, Projection, Rvalue, Terminator};
+        let mut locals = vec![
+            (None, efht_u8()),
+            (Some("p"), efht_ref(efht_u8())),
+            (Some("q"), efht_ref(efht_u8())),
+            (None, efht_u8()),
+        ];
+        locals.extend(extra.into_iter().map(|t| (None, t)));
+        let mut stmts = prefix;
+        stmts.push(efht_assign(
+            3,
+            Rvalue::Use(Operand::Copy(Place { local: 1, projections: vec![Projection::Deref] })),
+        ));
+        stmts.push(efht_assign(0, Rvalue::Use(Operand::Copy(Place::local(3)))));
+        efht_func(
+            name,
+            locals,
+            2,
+            vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
+        )
+    }
+
+    /// (7) A WRITE VIA A SECOND SHARED-REF PARAM that the caller may pass ALIASING the
+    /// first: `fn f(p: &u8, q: &u8) -> u8 { *q = 9; *p }` would mint `c(a, b) == *a`
+    /// while `f(x, x)` returns 9. Direct store, cast-laundered store, and a reborrow of
+    /// `q` stored through.
+    #[test]
+    fn h1_write_via_a_second_shared_ref_param_mints_nothing() {
+        use trust_types::{Operand, Place, Projection, Rvalue};
+        h1_assert_mints(&h1_two_ref_func("h1::two_refs_twin", vec![], vec![]));
+        h1_assert_no_mint(&h1_two_ref_func("h1::two_refs_store_q", vec![], vec![h1_store_through(2)]));
+        let mptr = h1_mptr(efht_u8());
+        h1_assert_no_mint(&h1_two_ref_func(
+            "h1::two_refs_launder_q",
+            vec![mptr.clone()],
+            vec![
+                efht_assign(4, Rvalue::Cast(Operand::Copy(Place::local(2)), mptr)),
+                h1_store_through(4),
+            ],
+        ));
+        h1_assert_no_mint(&h1_two_ref_func(
+            "h1::two_refs_reborrow_q",
+            vec![efht_ref(efht_u8())],
+            vec![
+                efht_assign(
+                    4,
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: Place { local: 2, projections: vec![Projection::Deref] },
+                    },
+                ),
+                h1_store_through(4),
+            ],
+        ));
+    }
+
+    /// `core::cell::Cell<u8>` as the extractor shapes it: a struct around `UnsafeCell<u8>`.
+    fn h1_cell_u8() -> trust_types::Ty {
+        use trust_types::Ty;
+        let unsafe_cell = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "core::cell::UnsafeCell<u8>".into(),
+            fields: vec![("value".into(), efht_u8())],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        };
+        Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "core::cell::Cell<u8>".into(),
+            fields: vec![("value".into(), unsafe_cell)],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
+    }
+    /// A user struct with an innocent name carrying a raw pointer: `probe::Slot { ptr: *mut u8 }`.
+    fn h1_slot_with_raw_ptr() -> trust_types::Ty {
+        trust_types::Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            name: "probe::Slot".into(),
+            fields: vec![("ptr".into(), h1_mptr(efht_u8()))],
+            variants: vec![],
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        }
+    }
+    fn h1_handle_func(
+        name: &str,
+        handle: trust_types::Ty,
+        extra: Vec<trust_types::Ty>,
+        stmts: Vec<trust_types::Statement>,
+    ) -> trust_types::VerifiableFunction {
+        let mut locals = vec![(None, efht_u8()), (Some("h"), efht_ref(handle)), (None, efht_u8())];
+        locals.extend(extra.into_iter().map(|t| (None, t)));
+        efht_leaf(name, locals, stmts)
+    }
+
+    /// (8) INTERIOR MUTABILITY BEHIND `&Adt` — the inlined `Cell::set` (`&(*c).value` →
+    /// `*const UnsafeCell<u8>` → `*mut u8` → store), and a raw-pointer field of an
+    /// innocently-named struct extracted and stored through. Each read-only twin is
+    /// ALSO asserted `None`: the Handle fence refuses a referent that can change under
+    /// a shared reference, whatever this body does.
+    #[test]
+    fn h1_interior_mutability_behind_an_adt_ref_mints_nothing() {
+        use trust_types::{Operand, Place, Projection, Rvalue, Ty};
+        let cell = h1_cell_u8();
+        let Ty::Adt { fields, .. } = &cell else { unreachable!() };
+        let unsafe_cell = fields[0].1.clone();
+        let read_back = |from: Place| {
+            vec![
+                efht_assign(2, Rvalue::Use(Operand::Copy(from))),
+                efht_assign(0, Rvalue::Use(Operand::Copy(Place::local(2)))),
+            ]
+        };
+        let mut set = vec![
+            efht_assign(
+                3,
+                Rvalue::Ref {
+                    mutable: false,
+                    place: Place { local: 1, projections: vec![Projection::Deref, Projection::Field(0)] },
+                },
+            ),
+            efht_assign(4, Rvalue::Cast(Operand::Copy(Place::local(3)), h1_cptr(unsafe_cell.clone()))),
+            efht_assign(5, Rvalue::Cast(Operand::Copy(Place::local(4)), h1_mptr(efht_u8()))),
+            h1_store_through(5),
+        ];
+        set.extend(read_back(Place { local: 5, projections: vec![Projection::Deref] }));
+        h1_assert_no_mint(&h1_handle_func(
+            "h1::cell_set",
+            cell.clone(),
+            vec![efht_ref(unsafe_cell.clone()), h1_cptr(unsafe_cell), h1_mptr(efht_u8())],
+            set,
+        ));
+        h1_assert_no_mint(&h1_handle_func(
+            "h1::cell_get_only",
+            cell,
+            vec![],
+            read_back(Place {
+                local: 1,
+                projections: vec![Projection::Deref, Projection::Field(0), Projection::Field(0)],
+            }),
+        ));
+        let slot = h1_slot_with_raw_ptr();
+        let load_ptr = efht_assign(
+            3,
+            Rvalue::Use(Operand::Copy(Place {
+                local: 1,
+                projections: vec![Projection::Deref, Projection::Field(0)],
+            })),
+        );
+        let mut through = vec![load_ptr.clone(), h1_store_through(3)];
+        through.extend(read_back(Place { local: 3, projections: vec![Projection::Deref] }));
+        h1_assert_no_mint(&h1_handle_func("h1::slot_store", slot.clone(), vec![h1_mptr(efht_u8())], through));
+        let mut read_only = vec![load_ptr];
+        read_only.extend(read_back(Place { local: 3, projections: vec![Projection::Deref] }));
+        h1_assert_no_mint(&h1_handle_func("h1::slot_read_only", slot, vec![h1_mptr(efht_u8())], read_only));
+    }
+
+    /// (9) An INDEX / CONSTANT-INDEX store through the `&[u8]` handle of the `len` shape.
+    #[test]
+    fn h1_index_store_through_a_slice_handle_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement};
+        let base = efht_len_callee();
+        h1_assert_mints(&base);
+        let store = |projections: Vec<Projection>| Statement::Assign {
+            place: Place { local: 1, projections },
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+            span: Default::default(),
+        };
+        let mut idx = base.clone();
+        idx.def_path = "h1::slice_index_store".into();
+        idx.body.locals.push(trust_types::LocalDecl { index: 3, name: None, ty: efht_usize() });
+        idx.body.blocks[0].stmts.insert(0, efht_assign(3, Rvalue::Use(Operand::Constant(ConstValue::Int(0)))));
+        idx.body.blocks[0].stmts.insert(1, store(vec![Projection::Deref, Projection::Index(3)]));
+        h1_assert_no_mint(&idx);
+        let mut cidx = base;
+        cidx.def_path = "h1::slice_constant_index_store".into();
+        cidx.body.blocks[0].stmts.insert(
+            0,
+            store(vec![
+                Projection::Deref,
+                Projection::ConstantIndex { offset: 0, min_length: 1, from_end: false },
+            ]),
+        );
+        h1_assert_no_mint(&cidx);
+    }
+
+    /// (10) A `Deref` NESTED UNDER a field projection — `(*(_3.0)) = 9` with `_3: (*mut u8,)`
+    /// — so a check that looked only at the FIRST projection would miss it.
+    #[test]
+    fn h1_deref_nested_under_a_field_projection_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Projection, Rvalue, Statement, Ty};
+        let f = shared_ref_leaf_with(
+            "h1::nested_deref_store",
+            vec![Ty::Tuple(vec![h1_mptr(efht_u8())])],
+            vec![Statement::Assign {
+                place: Place { local: 3, projections: vec![Projection::Field(0), Projection::Deref] },
+                rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(9))),
+                span: Default::default(),
+            }],
+        );
+        h1_assert_no_mint(&f);
+    }
+
+    /// (11) REBINDING THE PARAMETER — not a memory write, but the same false model:
+    /// `_1 = _3` / `_1 = &_4` makes `_2 = (*_1)` read something other than the entry
+    /// referent while the model would still say `c(a) == *a`.
+    #[test]
+    fn h1_rebinding_the_param_local_mints_nothing() {
+        use trust_types::{ConstValue, Operand, Place, Rvalue};
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::rebind_from_local",
+            vec![efht_ref(efht_u8())],
+            vec![efht_assign(1, Rvalue::Use(Operand::Copy(Place::local(3))))],
+        ));
+        h1_assert_no_mint(&shared_ref_leaf_with(
+            "h1::rebind_to_own_local",
+            vec![efht_u8()],
+            vec![
+                efht_assign(3, Rvalue::Use(Operand::Constant(ConstValue::Int(0)))),
+                efht_assign(1, Rvalue::Ref { mutable: false, place: Place::local(3) }),
+            ],
+        ));
+    }
+
+    /// (12) TERMINATOR channels — a mutating call on a NON-RETURNING branch (`target:
+    /// None`, the shape `sole_returning_call_arg_locals` skips on the caller side), a
+    /// returning call ahead of the return block, a `Drop` of the referent, and a
+    /// `TailCall`.
+    #[test]
+    fn h1_terminator_write_channels_mint_nothing() {
+        use trust_types::{
+            BasicBlock, BlockId, Operand, Place, Projection, Terminator, Ty, UnwindEdge,
+        };
+        let call = |target: Option<BlockId>| Terminator::Call {
+            func: "probe::poke".into(),
+            args: vec![Operand::Copy(Place::local(1))],
+            dest: Place::local(3),
+            target,
+            unwind: UnwindEdge::Unreachable,
+            span: Default::default(),
+            atomic: None,
+            is_unsafe_sig: false,
+            is_foreign: false,
+            callee_identity: None,
+        };
+        // (a) diverging sink on the `otherwise` branch: every RETURNING path is call-free.
+        let mut sink = shared_ref_leaf_with("h1::sink_call_branch", vec![Ty::Unit], vec![]);
+        sink.body.blocks[0].terminator = Terminator::SwitchInt {
+            discr: Operand::Copy(Place::local(2)),
+            targets: vec![(0, BlockId(1))],
+            otherwise: BlockId(2),
+            exhaustive_enum_unreachable: false,
+            span: Default::default(),
+        };
+        sink.body.blocks.push(BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return });
+        sink.body.blocks.push(BasicBlock { id: BlockId(2), stmts: vec![], terminator: call(None) });
+        h1_assert_no_mint(&sink);
+        // (b) a returning call between the read and the return.
+        let mut ret_call = shared_ref_leaf_with("h1::returning_call", vec![Ty::Unit], vec![]);
+        let tail = ret_call.body.blocks[0].stmts.split_off(1);
+        ret_call.body.blocks[0].terminator = call(Some(BlockId(1)));
+        ret_call.body.blocks.push(BasicBlock { id: BlockId(1), stmts: tail, terminator: Terminator::Return });
+        h1_assert_no_mint(&ret_call);
+        // (c) a Drop of the referent — runs arbitrary user code.
+        let mut drop = shared_ref_leaf_with("h1::drop_referent", vec![], vec![]);
+        let tail = drop.body.blocks[0].stmts.split_off(1);
+        drop.body.blocks[0].terminator = Terminator::Drop {
+            place: Place { local: 1, projections: vec![Projection::Deref] },
+            target: BlockId(1),
+            span: Default::default(),
+            unwind: UnwindEdge::Unreachable,
+        };
+        drop.body.blocks.push(BasicBlock { id: BlockId(1), stmts: tail, terminator: Terminator::Return });
+        h1_assert_no_mint(&drop);
+        // (d) `become poke(p)`.
+        let mut tailcall = shared_ref_leaf_with("h1::tail_call", vec![], vec![]);
+        tailcall.body.blocks[0].terminator = Terminator::TailCall {
+            func: "probe::poke".into(),
+            args: vec![Operand::Copy(Place::local(1))],
+            span: Default::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+        };
+        h1_assert_no_mint(&tailcall);
+        // Twin: the same read split across a `Goto` still mints.
+        let mut goto = shared_ref_leaf_with("h1::goto_twin", vec![], vec![]);
+        let tail = goto.body.blocks[0].stmts.split_off(1);
+        goto.body.blocks[0].terminator = Terminator::Goto(BlockId(1));
+        goto.body.blocks.push(BasicBlock { id: BlockId(1), stmts: tail, terminator: Terminator::Return });
+        h1_assert_mints(&goto);
     }
 
     /// Trust: does the TRANSPORT lane accept anything, and is any of it NEW?
@@ -46611,7 +52909,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -46802,7 +53109,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -46894,7 +53210,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -47064,7 +53389,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -47220,7 +53554,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -47712,7 +54055,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -47898,7 +54250,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             rounds += 1;
             println!("  fixpoint round {rounds:2}: {} certified (+{})",
@@ -48254,7 +54615,18 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model the way PRODUCTION does (prove_dump_dir_with_budget_and_bodies
+                    // uses `.with_ret_model(unique_def_path_ret_model(..))`). Every instrument
+                    // fixpoint here used bare `of_certified`, whose ret_model is None -- so the
+                    // transport lane could never fire under measurement and the A/B read +0 by
+                    // construction. The headline instrument is the A/B surface; it must match.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -48267,6 +54639,439 @@ mod vc_kind_formula_hash_domain_tripwire {
             certified.len(), 100.0 * certified.len() as f64 / total.max(1) as f64);
         println!("  AUTHORED bodies : {:6}   certified {auth_cov:6} ({:5.2}%)",
             auth.len(), 100.0 * auth_cov as f64 / auth.len().max(1) as f64);
+    }
+
+    /// Trust: THE CALLER-SIDE PRIZE — the number XLIV never measured.
+    ///
+    /// XLIV sized the G2 widening on the CALLEE side: 307 -> 617 called bodies could mint
+    /// a `ret_model`, "2.0x on 1.6%", and concluded the route was not worth building.
+    /// That conclusion used the wrong denominator. **Coverage counts CALLERS.** One
+    /// minting callee can unblock many delegating callers, so the callee count is an
+    /// input, never the prize.
+    ///
+    /// This asks the question directly: of the delegating bodies that reach no lane, how
+    /// many call a callee that WOULD mint under the widened gate? That is the population a
+    /// sound widening could actually convert — still an upper bound (each caller must also
+    /// pass its own gates), but the right upper bound.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn the_caller_side_prize_of_widening_g2() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::{Path, PathBuf};
+        use trust_types::{Rvalue, Statement, Terminator, Ty};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default")
+                || dp.ends_with("::assert_fields_are_eq")
+                || dp.ends_with("::zeroize_or_on_drop"))
+        }
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for p in &files {
+            if let Ok(b) = std::fs::read(p)
+                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
+            { funcs.push(f); paths.push(p.clone()); }
+        }
+        let path_of: BTreeMap<&str, &PathBuf> =
+            funcs.iter().zip(paths.iter()).map(|(f, p)| (f.def_path.as_str(), p)).collect();
+        let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
+        // Which bodies mint TODAY (G2 all-scalar), and which would mint WIDENED?
+        let (mut mints_today, mut mints_widened): (BTreeSet<&str>, BTreeSet<&str>) =
+            (Default::default(), Default::default());
+        for f in &funcs {
+            if crate::prove::pure_scalar_ret_model(f).is_some() {
+                mints_today.insert(&f.def_path);
+                mints_widened.insert(&f.def_path);
+                continue;
+            }
+            if !scalar(&f.body.return_ty) { continue; }
+            let params: Vec<&Ty> = (1..=f.body.arg_count)
+                .filter_map(|i| f.body.locals.get(i).map(|l| &l.ty)).collect();
+            let sig_ok = params.iter().all(|t| match t {
+                t if scalar(t) => true,
+                Ty::Ref { mutable: false, inner } => !matches!(**inner, Ty::RawPtr { .. }),
+                _ => false,
+            });
+            if !sig_ok { continue; }
+            let writes_deref = f.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s, Statement::Assign { place, .. }
+                    if place.projections.iter().any(|pr|
+                        matches!(pr, trust_types::Projection::Deref)))
+            });
+            let has_call = f.body.blocks.iter().any(|b| matches!(b.terminator,
+                Terminator::Call { .. } | Terminator::TailCall { .. }));
+            let has_raw = f.body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(s, Statement::Assign { rvalue: Rvalue::AddressOf(..), .. })
+            });
+            if !writes_deref && !has_call && !has_raw { mints_widened.insert(&f.def_path); }
+        }
+        // Now the CALLER side: delegating authored bodies, bucketed by whether the callees
+        // they wait on would mint.
+        let (mut deleg, mut all_today, mut all_widened, mut gained) = (0usize, 0, 0, 0);
+        let mut per_callee: BTreeMap<&str, usize> = Default::default();
+        for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+            let calls: Vec<&String> = f.body.blocks.iter().filter_map(|b| match &b.terminator {
+                Terminator::Call { func, .. } => Some(func), _ => None }).collect();
+            if calls.is_empty() { continue; }
+            deleg += 1;
+            let t = calls.iter().all(|c| mints_today.contains(c.as_str()));
+            let w = calls.iter().all(|c| mints_widened.contains(c.as_str()));
+            if t { all_today += 1; }
+            if w { all_widened += 1; }
+            if w && !t {
+                gained += 1;
+                for c in &calls {
+                    if mints_widened.contains(c.as_str()) && !mints_today.contains(c.as_str()) {
+                        *per_callee.entry(c.as_str()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        // FAST A/B SURFACE. The full-corpus coverage run is 35 minutes; an implementer
+        // cannot iterate on that. Emit the exact populations at stake -- every gained
+        // caller, every callee it names, and every widened-minting callee -- so a subset
+        // corpus of just those bodies gives a seconds-long before/after on the same gate.
+        if let Some(out) = std::env::var_os("TRUST_SUBSET_OUT") {
+            let mut keep: BTreeSet<&str> = Default::default();
+            for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+                let calls: Vec<&String> = f.body.blocks.iter().filter_map(|b| match &b.terminator {
+                    Terminator::Call { func, .. } => Some(func), _ => None }).collect();
+                if calls.is_empty() { continue; }
+                let w = calls.iter().all(|c| mints_widened.contains(c.as_str()));
+                let t = calls.iter().all(|c| mints_today.contains(c.as_str()));
+                if w && !t {
+                    keep.insert(&f.def_path);
+                    for c in &calls { keep.insert(c.as_str()); }
+                }
+            }
+            for c in &mints_widened { keep.insert(c); }
+            let mut lines = Vec::new();
+            for k in &keep { if let Some(p) = path_of.get(k) { lines.push(p.display().to_string()); } }
+            std::fs::write(&out, lines.join("\n") + "\n").expect("write subset list");
+            println!("  subset list: {} files -> {}", lines.len(), out.to_string_lossy());
+        }
+        println!("\n=== THE CALLER-SIDE PRIZE (authored delegating bodies) ===");
+        println!("  minting callees   today {:5}  widened {:5}",
+            mints_today.len(), mints_widened.len());
+        println!("  authored delegating bodies                 : {deleg}");
+        println!("  ALL callees mint TODAY                     : {all_today}");
+        println!("  ALL callees mint WIDENED                   : {all_widened}");
+        println!("  ** CALLERS GAINED by the widening          : {gained} **");
+        let mut v: Vec<_> = per_callee.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        println!("  top newly-minting callees by caller count:");
+        for (k, c) in v.iter().take(8) {
+            println!("    {c:4} callers <- {}", &k[..k.len().min(88)]);
+        }
+    }
+
+    /// Trust: THE REAL-GATE GO/NO-GO (2026-08-29) — how many delegating callers would the
+    /// transport lane gain under the ALLOW-LIST read-only predicate, on the production
+    /// gates, not the deny-list ones?
+    ///
+    /// The design review measured 28 callers on the full corpus with WEAKER gates
+    /// (deny-lists over `deref_write_exists`/`raw_exposure_exists`), and the lane that
+    /// shipped delivered +0. Every candidate design was unsound on the same hole, and
+    /// [`body_is_read_only`] is the close. Before anyone builds the widened transport on
+    /// it, this asks the only question that matters: with the SOUND predicate applied to
+    /// BOTH sides, how many callers are there?
+    ///
+    ///   (a) callees: `body_is_read_only` is `Ok`, a straight-line or chain lowering
+    ///       exists, scalar return, every param scalar or `&T` with `T` not a raw pointer.
+    ///   (b) callers: authored, NOT fully faithful after the 8-round fixpoint, scalar
+    ///       return, EXACTLY one `Call` (no `TailCall`), whose callee is in (a) AND
+    ///       resolves to exactly one dumped body by def-path, and whose own body passes
+    ///       `body_is_read_only` once that single call is replaced by a `Goto` to its
+    ///       target — the consume-side application of the same predicate.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn the_real_gate_go_no_go() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::{Path, PathBuf};
+        use trust_types::{BlockId, Terminator, Ty};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default")
+                || dp.ends_with("::assert_fields_are_eq")
+                || dp.ends_with("::zeroize_or_on_drop"))
+        }
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            if let Ok(b) = std::fs::read(p)
+                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
+            { funcs.push(f); }
+        }
+        println!("  corpus: {} bodies from {}", funcs.len(), root);
+        let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
+        for round in 1..=8 {
+            let before = certified.len();
+            for f in &funcs {
+                if certified.contains_key(&f.def_path) { continue; }
+                if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                    .fully_faithful
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
+            }
+            println!("  fixpoint round {round}: {} certified (+{})",
+                certified.len(), certified.len() - before);
+            if certified.len() == before { break; }
+        }
+        let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
+        let mut occurrences: BTreeMap<&str, usize> = Default::default();
+        for f in &funcs { *occurrences.entry(f.def_path.as_str()).or_default() += 1; }
+        // (a) — the callee side.
+        let mut set_a: BTreeSet<&str> = Default::default();
+        let mut a_refused: BTreeMap<&'static str, usize> = Default::default();
+        for f in &funcs {
+            if !scalar(&f.body.return_ty) { continue; }
+            let sig_ok = (1..=f.body.arg_count).all(|i| match f.body.locals.get(i).map(|l| &l.ty) {
+                Some(t) if scalar(t) => true,
+                Some(Ty::Ref { mutable: false, inner }) => !matches!(**inner, Ty::RawPtr { .. }),
+                _ => false,
+            });
+            if !sig_ok { continue; }
+            let lowers = crate::prove::straight_line_ir_body(f).is_some()
+                || crate::prove::straight_line_ir_body_chain(f).is_some();
+            if !lowers { continue; }
+            match crate::prove::body_is_read_only(&f.body) {
+                Ok(()) => { set_a.insert(&f.def_path); }
+                Err(why) => { *a_refused.entry(why).or_default() += 1; }
+            }
+        }
+        // (b) — the caller side.
+        let mut set_b = 0usize;
+        let mut per_callee: BTreeMap<&str, usize> = Default::default();
+        let mut b_refused: BTreeMap<&'static str, usize> = Default::default();
+        for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+            let calls: Vec<(usize, &String, Option<BlockId>)> = f.body.blocks.iter().enumerate()
+                .filter_map(|(i, b)| match &b.terminator {
+                    Terminator::Call { func, target, .. } => Some((i, func, *target)),
+                    _ => None,
+                }).collect();
+            if calls.is_empty() { continue; }
+            if !scalar(&f.body.return_ty) { *b_refused.entry("non-scalar return").or_default() += 1; continue; }
+            if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                .fully_faithful
+            { *b_refused.entry("already fully faithful").or_default() += 1; continue; }
+            if f.body.blocks.iter().any(|b| matches!(b.terminator, Terminator::TailCall { .. })) {
+                *b_refused.entry("has a TailCall").or_default() += 1; continue;
+            }
+            let [(blk, callee, target)] = calls.as_slice() else {
+                *b_refused.entry("more than one Call").or_default() += 1; continue;
+            };
+            if !set_a.contains(callee.as_str()) {
+                *b_refused.entry("callee not in set (a)").or_default() += 1; continue;
+            }
+            if occurrences.get(callee.as_str()).copied() != Some(1) {
+                *b_refused.entry("callee def-path not unique among dumped bodies").or_default() += 1;
+                continue;
+            }
+            // The consume side: the SAME predicate over the caller's body with its one call
+            // replaced by a Goto to the call's own target.
+            let mut own = f.body.clone();
+            own.blocks[*blk].terminator = match target {
+                Some(t) => Terminator::Goto(*t),
+                None => Terminator::Unreachable,
+            };
+            match crate::prove::body_is_read_only(&own) {
+                Ok(()) => {
+                    set_b += 1;
+                    *per_callee.entry(callee.as_str()).or_default() += 1;
+                }
+                Err(why) => { *b_refused.entry(why).or_default() += 1; }
+            }
+        }
+        println!("\n=== THE REAL-GATE GO/NO-GO ===");
+        println!("  (a) read-only, lowerable, scalar/&T-signature callees : {}", set_a.len());
+        println!("  (b) authored uncovered delegating callers GAINED     : {set_b}");
+        println!("  set (a) refusals by first reason (lowerable, sig-ok bodies only):");
+        let mut ar: Vec<_> = a_refused.into_iter().collect();
+        ar.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &ar { println!("    {c:5}  {k}"); }
+        println!("  set (b) refusals by first reason (authored delegating callers):");
+        let mut br: Vec<_> = b_refused.into_iter().collect();
+        br.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &br { println!("    {c:5}  {k}"); }
+        println!("  top callees of (b) by caller count:");
+        let mut v: Vec<_> = per_callee.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in v.iter().take(10) {
+            println!("    {c:4} callers <- {}", &k[..k.len().min(100)]);
+        }
+    }
+
+    /// Trust: WHY DO THE GAINED CALLERS NOT TRANSPORT? -- the per-gate tally.
+    ///
+    /// EFHT is built and refuted three ways, and the subset A/B with the transport lane LIVE
+    /// (ret_model minted exactly as production mints it) still reads +0. The consumer had 28
+    /// bare exits and the minter 9; both now have `_reasoned` twins. For every authored,
+    /// uncovered, sole-call caller whose callee is certified: the FIRST consumer gate that
+    /// refuses it, and -- when the callee minted nothing -- the first minter gate.
+    #[test]
+    #[ignore = "measurement instrument; needs TRUST_LANE_HISTOGRAM_DIR"]
+    fn why_do_the_gained_callers_not_transport() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use trust_types::{Terminator, Ty};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x| x.to_str()) == Some("json") { out.push(p); }
+            }
+        }
+        let root = std::env::var("TRUST_LANE_HISTOGRAM_DIR")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures").to_string());
+        let mut files = Vec::new();
+        walk(Path::new(&root), &mut files);
+        files.sort();
+        fn authored(dp: &str) -> bool {
+            !(dp.contains("core::fmt::")
+                || dp.contains("serde") || dp.contains("Deserializer") || dp.contains("Serializer")
+                || dp.contains("as core::clone::Clone>::clone")
+                || dp.contains("as core::cmp::PartialEq>::eq")
+                || dp.contains("as core::cmp::PartialOrd>::partial_cmp")
+                || dp.contains("as core::hash::Hash>::hash")
+                || dp.contains("as core::default::Default>::default")
+                || dp.ends_with("::assert_fields_are_eq")
+                || dp.ends_with("::zeroize_or_on_drop"))
+        }
+        let bodies = crate::trustir_fold::DumpBodies::new();
+        let mut funcs: Vec<trust_types::VerifiableFunction> = Vec::new();
+        for p in &files {
+            if let Ok(b) = std::fs::read(p)
+                && let Ok(f) = serde_json::from_slice::<trust_types::VerifiableFunction>(&b)
+            { funcs.push(f); }
+        }
+        let mut certified: BTreeMap<String, crate::mirsem::CalleeFact> = Default::default();
+        for _ in 0..8 {
+            let before = certified.len();
+            for f in &funcs {
+                if certified.contains_key(&f.def_path) { continue; }
+                if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
+                    .fully_faithful
+                {
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
+            }
+            if certified.len() == before { break; }
+        }
+        let by_path: BTreeMap<&str, &trust_types::VerifiableFunction> =
+            funcs.iter().map(|f| (f.def_path.as_str(), f)).collect();
+        let scalar = |t: &Ty| matches!(t, Ty::Int { .. } | Ty::Bool);
+        let mut consumer: BTreeMap<&'static str, usize> = Default::default();
+        let mut minter: BTreeMap<&'static str, usize> = Default::default();
+        // Trust: EFHT-T — the TRANSPORT recognizer's own first gate per caller, beside the
+        // shared recognizer's (the consumer reports the shared reason when both decline).
+        let mut transport: BTreeMap<&'static str, usize> = Default::default();
+        let (mut callers, mut minted_ok) = (0usize, 0usize);
+        let mut samples = 0usize;
+        for f in funcs.iter().filter(|f| authored(&f.def_path)) {
+            if !scalar(&f.body.return_ty) { continue; }
+            let calls: Vec<&String> = f.body.blocks.iter().filter_map(|b| match &b.terminator {
+                Terminator::Call { func, .. } => Some(func), _ => None }).collect();
+            let [callee] = calls.as_slice() else { continue };
+            if certified.contains_key(&f.def_path) { continue; }
+            let Some(fact) = certified.get(callee.as_str()) else { continue };
+            callers += 1;
+            let mut twhy: Option<&'static str> = None;
+            let tshape = crate::mirsem::sem_transported_call_of_mir_diag(f, &certified, &mut twhy);
+            *transport
+                .entry(if tshape.is_some() { "(ACCEPTED by the transport recognizer)" } else { twhy.unwrap_or("?") })
+                .or_default() += 1;
+            match crate::prove::transported_call_return_fully_faithful_via_trustir_reasoned(f, &certified) {
+                Ok(()) => *consumer.entry("(ACCEPTED by the consumer)").or_default() += 1,
+                Err(e) => {
+                    *consumer.entry(e).or_default() += 1;
+                    // Print the SHAPE of the first few recognizer refusals verbatim: what
+                    // follows the call, and how the body returns.
+                    if e.starts_with("recognizer") {
+                        samples += 1;
+                        println!("\n--- sample {samples}: {}  (callee {})", f.def_path, callee);
+                        println!("    ret {:?}  blocks {}  args {}  transport-recognizer: {:?}", f.body.return_ty, f.body.blocks.len(), f.body.arg_count, twhy);
+                        for (bi, b) in f.body.blocks.iter().enumerate() {
+                            for st in &b.stmts {
+                                if let trust_types::Statement::Assign { place, rvalue, .. } = st {
+                                    println!("    bb{bi}: _{}{:?} = {:?}", place.local, place.projections, rvalue);
+                                }
+                            }
+                            let t = format!("{:?}", b.terminator);
+                            println!("    bb{bi}: -> {}", &t[..t.len().min(160)]);
+                        }
+                    }
+                }
+            }
+            if fact.ret_model.is_some() { minted_ok += 1; }
+            else if let Some(cf) = by_path.get(callee.as_str()) {
+                match crate::prove::pure_scalar_ret_model_reasoned(cf) {
+                    Ok(_) => *minter.entry("(mints when called directly -- dup def_path?)").or_default() += 1,
+                    Err(e) => *minter.entry(e).or_default() += 1,
+                }
+            }
+        }
+        println!("\n=== {callers} authored uncovered sole-call callers with a CERTIFIED callee ===");
+        println!("=== consumer: first refusing gate ===");
+        let mut v: Vec<_> = consumer.into_iter().collect();
+        v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &v { println!("  {c:5}  {k}"); }
+        println!("=== transport recognizer (EFHT-T): first refusing gate ===");
+        let mut t: Vec<_> = transport.into_iter().collect();
+        t.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &t { println!("  {c:5}  {k}"); }
+        println!("=== callee minted a ret_model: {minted_ok}; for the rest, first MINTER gate ===");
+        let mut m: Vec<_> = minter.into_iter().collect();
+        m.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (k, c) in &m { println!("  {c:5}  {k}"); }
     }
 
     /// Trust: THE MULTI-BLOCKER CENSUS — how many INDEPENDENT gates refuse each body?
@@ -49076,7 +55881,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -49214,7 +56028,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -49309,7 +56132,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -49408,7 +56240,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }
@@ -49510,7 +56351,16 @@ mod vc_kind_formula_hash_domain_tripwire {
                 if certified.contains_key(&f.def_path) { continue; }
                 if crate::prove::diagnose_fully_faithful_gate_with_bodies(f, &certified, &bodies)
                     .fully_faithful
-                { certified.insert(f.def_path.clone(), crate::mirsem::CalleeFact::of_certified(f)); }
+                {
+                    // Mint ret_model as PRODUCTION does (`.with_ret_model(unique_def_path_ret_model)`).
+                    // A bare `of_certified` has ret_model None and silently disables the
+                    // transport lane under measurement -- the +0 that cost two A/B runs.
+                    certified.insert(
+                        f.def_path.clone(),
+                        crate::mirsem::CalleeFact::of_certified(f)
+                            .with_ret_model(crate::prove::unique_def_path_ret_model(f, &funcs)),
+                    );
+                }
             }
             if certified.len() == before { break; }
         }

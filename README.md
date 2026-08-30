@@ -166,17 +166,22 @@ Trust builds on top of a Trust-named stage0 seed — a previous Trust release, n
 upstream Rust nightly.
 
 ```bash
-# one login covers the repository, its submodules, and the seed release
+# the repository is public; one login covers the private seed release
 gh auth login
 
-# clone only the superproject; the recreator owns credential-scoped
-# initialization of the pinned backends under first-party/
+# clone only the superproject, then materialize the nine pinned backends —
+# the public snapshot ships first-party/PINS.txt, not submodule gitlinks
 gh repo clone https://github.com/alabsystems/trust -- --no-recurse-submodules
 cd trust
+scripts/fetch-first-party.sh   # clones the siblings at their pinned public releases
 
 # validate the admitted seed and build Stage2 without falling back to stock Rust
 python3 scripts/recreate_bootstrap.py --require-seed --fresh-seed --stage 2
 ```
+
+In a development checkout the backends under `first-party/` are real
+submodules and the recreator owns their credential-scoped initialization —
+skip `fetch-first-party.sh` there.
 
 The seed path is currently private and supports `aarch64-apple-darwin`; its
 payloads are checked against `src/stage0` and
@@ -217,8 +222,8 @@ byte-identical copies: `rustc` and `cargo`, because rustup requires them, and
 
 ### One command for the `trust` toolchain on a machine that has none
 
-Three repositories — `clean`, `trust-vc`, `aterm` — pin `channel = "trust"` in
-their `rust-toolchain.toml`, and their format and lint gates need `trustfmt` and
+Several sibling repositories — among them `clean`, `trust-vc`, and `aterm` —
+pin `channel = "trust"` in their `rust-toolchain.toml`, and their format and lint gates need `trustfmt` and
 `tippy` out of a Trust sysroot. Where that channel does not resolve those gates
 refuse to run rather than fall back to stock `rustfmt`/`clippy` and report a
 green from a different lint set. To make it resolve, from a Trust checkout:
@@ -431,7 +436,7 @@ exception carrying a reason, an issue link, and an `expires_on` date.
 ```
 trust/
 ├── compiler/       # rustc crates (upstream + Trust modifications marked `// Trust:`)
-├── crates/         # 70 Trust-owned packages: the verification pipeline, the
+├── crates/         # Trust-owned packages: the verification pipeline, the
 │                   #   Clean bridges, and the unwired TrustJS/TrustTS lanes
 ├── targo-trust/    # the `targo trust` verification driver
 ├── first-party/    # pinned submodules: ay, clean, ny, ty, trust-cg, trust-ir,
